@@ -216,7 +216,7 @@ pub(super) fn join_on_owner(
     // A registered channel being (re)created restores its retained topic.
     let newly_created = !state.channels.contains_key(&key);
     let restored_topic = if newly_created {
-        state.registered_topics.get(&key).cloned()
+        state.registered_topics.get(&key)
     } else {
         None
     };
@@ -288,8 +288,9 @@ pub(super) fn join_on_owner(
         });
     }
     let first = !chan.has_members();
-    chan.add_member(
+    chan.add_member_with_profile(
         actor.recipient,
+        actor.profile,
         actor.identity.clone(),
         MemberModes {
             op: first || is_founder || access_op,
@@ -435,6 +436,7 @@ fn emit_join_response(state: &mut ServerState, conn: ConnId, result: ChannelJoin
                 return;
             };
             session.channels.insert(join.key.clone());
+            state.membership_join(conn, join.key.clone());
             if !join.own_join.is_empty() {
                 state.send_timed(conn, &join.own_join);
             }
@@ -579,12 +581,30 @@ fn emit_part_response(state: &mut ServerState, conn: ConnId, result: ChannelPart
             if let Some(session) = state.sessions.get_mut(&conn) {
                 session.channels.remove(&key);
             }
+            state.membership_part(conn, &key);
         }
     }
 }
 
 pub(super) fn send_names(state: &mut ServerState, conn: ConnId, key: &ChanKey, echo: &str) {
+    let caps = state.local_recipient(conn).caps();
+    send_names_with_caps(state, conn, caps, key, echo);
+}
+
+fn send_names_with_caps(
+    state: &mut ServerState,
+    conn: ConnId,
+    requester_caps: crate::core::state::Caps,
+    key: &ChanKey,
+    echo: &str,
+) {
     let Some(chan) = state.channels.get(key) else {
+        state.numeric(
+            conn,
+            RPL_ENDOFNAMES,
+            &[clip_echo(echo)],
+            Some("End of /NAMES list"),
+        );
         return;
     };
     let display = chan.name.clone();
@@ -604,7 +624,6 @@ pub(super) fn send_names(state: &mut ServerState, conn: ConnId, key: &ChanKey, e
         );
         return;
     }
-    let requester_caps = state.sessions[&conn].caps;
     let requester_is_member = chan.is_member(conn);
     let mut names: Vec<String> = chan
         .member_identities()
@@ -661,21 +680,58 @@ pub(super) fn cmd_names(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     match p.first().filter(|_| has_target) {
         Some(&targets) => {
             for target in targets.split(',').filter(|t| !t.is_empty()) {
-                let key = state.chan_key(target);
-                if state.channels.contains_key(&key) {
+                let owner = state.channel_owner(target);
+                if state.owns_channel(&owner) {
+                    let key = state.chan_key(target);
                     send_names(state, conn, &key, target);
                 } else {
-                    state.numeric(
-                        conn,
-                        RPL_ENDOFNAMES,
-                        &[clip_echo(target)],
-                        Some("End of /NAMES list"),
-                    );
+                    let label = state.channel_reply_label(conn, &owner);
+                    state.route_channel_command(crate::core::state::ChannelCommand::new(
+                        owner,
+                        state.channel_actor(conn),
+                        target.to_string(),
+                        crate::core::state::ChannelCommandOperation::Names,
+                        label,
+                    ));
                 }
             }
         }
         None => state.numeric(conn, RPL_ENDOFNAMES, &["*"], Some("End of /NAMES list")),
     }
+}
+
+pub(super) fn names_on_owner(
+    state: &mut ServerState,
+    command: crate::core::state::ChannelCommand,
+) -> crate::core::state::ChannelCommandReplies {
+    let (owner, actor, target, operation) = command.into_parts();
+    debug_assert!(matches!(
+        operation,
+        crate::core::state::ChannelCommandOperation::Names
+    ));
+    let key = state.chan_key(&target);
+    assert_eq!(owner.key(), &key, "NAMES owner does not match target");
+    debug_assert!(
+        state.capture.is_none(),
+        "channel owner must not have a capture"
+    );
+    state.capture = Some(crate::core::state::Capture {
+        conn: actor.recipient.conn(),
+        lines: Vec::new(),
+        reply_target: Some(actor.identity.nick),
+        reply_caps: Some(actor.recipient.caps()),
+        label: None,
+        deferred: false,
+    });
+    send_names_with_caps(
+        state,
+        actor.recipient.conn(),
+        actor.recipient.caps(),
+        &key,
+        &target,
+    );
+    let lines = state.capture.take().expect("NAMES capture installed").lines;
+    crate::core::state::ChannelCommandReplies { lines }
 }
 
 /// One message delivery: the payload plus its sender/tag context. Bundled
@@ -1129,7 +1185,7 @@ pub(super) fn channel_topic_set(
     if retained && state.is_registered(&key) {
         match &new_topic {
             Some(topic) => {
-                state.registered_topics.insert(key.clone(), topic.clone());
+                state.registered_topics.set(key.clone(), topic.clone());
             }
             None => {
                 state.registered_topics.remove(&key);
@@ -1207,9 +1263,269 @@ pub(super) fn cmd_mode(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     if target.starts_with('#') {
-        channel_mode(state, conn, target, &p[1..]);
+        if p.len() == 1 {
+            route_mode_query(
+                state,
+                conn,
+                target,
+                crate::core::state::ChannelCommandOperation::ModeQuery,
+            );
+        } else if let Some(modes) = mode_list_query_modes(&p[1..]) {
+            route_mode_query(
+                state,
+                conn,
+                target,
+                crate::core::state::ChannelCommandOperation::ModeListQuery(modes),
+            );
+        } else {
+            route_mode_change(state, conn, target, &p[1..]);
+        }
     } else {
         user_mode(state, conn, target, &p[1..]);
+    }
+}
+
+fn route_mode_change(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&str]) {
+    let owner = state.channel_owner(target);
+    if state.owns_channel(&owner) {
+        channel_mode(state, conn, target, rest);
+        return;
+    }
+    let label = state.channel_reply_label(conn, &owner);
+    state.route_channel_command(crate::core::state::ChannelCommand::new(
+        owner,
+        state.channel_actor(conn),
+        target.to_string(),
+        crate::core::state::ChannelCommandOperation::ModeChange(
+            crate::core::state::ChannelModeChange {
+                modes: rest[0].to_string(),
+                arguments: rest[1..]
+                    .iter()
+                    .map(|argument| (*argument).to_string())
+                    .collect(),
+            },
+        ),
+        label,
+    ));
+}
+
+fn mode_list_query_modes(rest: &[&str]) -> Option<String> {
+    let [token] = rest else {
+        return None;
+    };
+    let modes = token.strip_prefix('+').unwrap_or(token);
+    (!modes.is_empty()
+        && modes
+            .chars()
+            .all(|mode| matches!(mode, 'b' | 'q' | 'e' | 'I')))
+    .then(|| modes.to_string())
+}
+
+fn route_mode_query(
+    state: &mut ServerState,
+    conn: ConnId,
+    target: &str,
+    operation: crate::core::state::ChannelCommandOperation,
+) {
+    let owner = state.channel_owner(target);
+    let label = state.channel_reply_label(conn, &owner);
+    let command = crate::core::state::ChannelCommand::new(
+        owner,
+        state.channel_actor(conn),
+        target.into(),
+        operation,
+        label,
+    );
+    if !state.owns_channel(command.owner()) {
+        state.route_channel_command(command);
+        return;
+    }
+    match command.operation() {
+        crate::core::state::ChannelCommandOperation::ModeQuery => {
+            let result = mode_query_on_owner(state, command);
+            emit_mode_query_result_now(state, conn, result);
+        }
+        crate::core::state::ChannelCommandOperation::ModeListQuery(_) => {
+            let result = mode_list_query_on_owner(state, command);
+            emit_mode_list_query_result_now(state, conn, result);
+        }
+        _ => unreachable!("MODE query must carry a MODE query operation"),
+    }
+}
+
+pub(super) fn mode_query_on_owner(
+    state: &mut ServerState,
+    command: crate::core::state::ChannelCommand,
+) -> crate::core::state::ChannelModeQueryResult {
+    let (owner, actor, target, operation) = command.into_parts();
+    debug_assert!(matches!(
+        operation,
+        crate::core::state::ChannelCommandOperation::ModeQuery
+    ));
+    let key = state.chan_key(&target);
+    assert_eq!(owner.key(), &key, "MODE owner does not match target");
+    let Some(chan) = state.channels.get(&key) else {
+        return crate::core::state::ChannelModeQueryResult::NoSuchChannel { target };
+    };
+    if chan.hidden_from(actor.recipient.conn()).is_some() {
+        return crate::core::state::ChannelModeQueryResult::Hidden { target };
+    }
+    crate::core::state::ChannelModeQueryResult::Modes {
+        display: chan.name.clone(),
+        modes: chan
+            .modes
+            .to_string_with_args(chan.is_member(actor.recipient.conn())),
+        created: chan.created_at_secs.to_string(),
+    }
+}
+
+pub(super) fn mode_list_query_on_owner(
+    state: &mut ServerState,
+    command: crate::core::state::ChannelCommand,
+) -> crate::core::state::ChannelModeListQueryResult {
+    let (owner, actor, target, operation) = command.into_parts();
+    let crate::core::state::ChannelCommandOperation::ModeListQuery(modes) = operation else {
+        unreachable!("MODE list query requires its operation")
+    };
+    let key = state.chan_key(&target);
+    assert_eq!(owner.key(), &key, "MODE owner does not match target");
+    let Some(chan) = state.channels.get(&key) else {
+        return crate::core::state::ChannelModeListQueryResult::NoSuchChannel { target };
+    };
+    let conn = actor.recipient.conn();
+    if chan.hidden_from(conn).is_some() {
+        return crate::core::state::ChannelModeListQueryResult::Hidden { target };
+    }
+    let is_op = chan.member(conn).is_some_and(|member| member.op);
+    if !is_op && modes.chars().any(|mode| matches!(mode, 'e' | 'I')) {
+        return crate::core::state::ChannelModeListQueryResult::NotOperator { target };
+    }
+    let lists = modes
+        .chars()
+        .map(|mode| crate::core::state::ChannelModeList {
+            mode,
+            masks: channel_list_masks(chan, mode, is_op).expect("validated list mode"),
+        })
+        .collect();
+    crate::core::state::ChannelModeListQueryResult::Lists {
+        display: chan.name.clone(),
+        lists,
+    }
+}
+
+pub(super) fn emit_mode_query_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelModeQueryResult,
+    label: Option<String>,
+) {
+    state.emit_deferred_labeled(conn, label, |state| {
+        emit_mode_query_result_now(state, conn, result)
+    });
+}
+
+fn emit_mode_query_result_now(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelModeQueryResult,
+) {
+    match result {
+        crate::core::state::ChannelModeQueryResult::NoSuchChannel { target }
+        | crate::core::state::ChannelModeQueryResult::Hidden { target } => {
+            state.err_nosuchchannel(conn, super::clip_echo(&target))
+        }
+        crate::core::state::ChannelModeQueryResult::Modes {
+            display,
+            modes,
+            created,
+        } => {
+            state.numeric(conn, RPL_CHANNELMODEIS, &[&display, &modes], None);
+            state.numeric(conn, RPL_CREATIONTIME, &[&display, &created], None);
+        }
+    }
+}
+
+pub(super) fn mode_change_on_owner(
+    state: &mut ServerState,
+    command: crate::core::state::ChannelCommand,
+) -> crate::core::state::ChannelCommandReplies {
+    let (owner, actor, target, operation) = command.into_parts();
+    let crate::core::state::ChannelCommandOperation::ModeChange(change) = operation else {
+        unreachable!("MODE mutation requires its operation")
+    };
+    let key = state.chan_key(&target);
+    assert_eq!(owner.key(), &key, "MODE owner does not match target");
+    debug_assert!(
+        state.capture.is_none(),
+        "channel owner must not have a capture"
+    );
+    state.capture = Some(crate::core::state::Capture {
+        conn: actor.recipient.conn(),
+        lines: Vec::new(),
+        reply_target: Some(actor.identity.nick.clone()),
+        reply_caps: Some(actor.recipient.caps()),
+        label: None,
+        deferred: false,
+    });
+    let mut arguments = Vec::with_capacity(change.arguments.len() + 1);
+    arguments.push(change.modes);
+    arguments.extend(change.arguments);
+    channel_mode_with_prefix(
+        state,
+        actor.recipient.conn(),
+        &target,
+        &arguments,
+        &actor.identity.prefix,
+    );
+    let lines = state.capture.take().expect("MODE capture installed").lines;
+    crate::core::state::ChannelCommandReplies { lines }
+}
+
+pub(super) fn emit_channel_command_replies(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelCommandReplies,
+    label: Option<String>,
+) {
+    state.emit_deferred_labeled(conn, label, |state| {
+        for line in result.lines {
+            state.send_bytes(conn, line);
+        }
+    });
+}
+
+pub(super) fn emit_mode_list_query_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelModeListQueryResult,
+    label: Option<String>,
+) {
+    state.emit_deferred_labeled(conn, label, |state| {
+        emit_mode_list_query_result_now(state, conn, result)
+    });
+}
+
+fn emit_mode_list_query_result_now(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelModeListQueryResult,
+) {
+    match result {
+        crate::core::state::ChannelModeListQueryResult::NoSuchChannel { target }
+        | crate::core::state::ChannelModeListQueryResult::Hidden { target } => {
+            state.err_nosuchchannel(conn, super::clip_echo(&target))
+        }
+        crate::core::state::ChannelModeListQueryResult::NotOperator { target } => state.numeric(
+            conn,
+            ERR_CHANOPRIVSNEEDED,
+            &[&target],
+            Some("You're not a channel operator"),
+        ),
+        crate::core::state::ChannelModeListQueryResult::Lists { display, lists } => {
+            for list in lists {
+                emit_channel_list_rows(state, conn, &display, list.mode, &list.masks);
+            }
+        }
     }
 }
 
@@ -1243,7 +1559,7 @@ pub(super) fn set_chan_bool_mode(modes: &mut crate::core::state::ChanModes, c: c
 /// that differ from the lock and broadcast the resulting MODE from ChanServ.
 /// A no-op when the channel has no lock or is already compliant.
 pub(super) fn apply_mlock(state: &mut ServerState, key: &ChanKey) {
-    let Some(m) = state.channel_mlock.get(key).cloned() else {
+    let Some(m) = state.channel_options.mlock(key) else {
         return;
     };
     let Some(chan) = state.channels.get(key) else {
@@ -1319,6 +1635,7 @@ pub(super) fn user_mode(state: &mut ServerState, conn: ConnId, target: &str, res
     let mut applied = String::new();
     let mut last_sign = ' ';
     let mut unknown = false;
+    let mut member_profile_changed = false;
     for c in rest.join("").chars() {
         match c {
             '+' => adding = true,
@@ -1326,6 +1643,7 @@ pub(super) fn user_mode(state: &mut ServerState, conn: ConnId, target: &str, res
             'i' => {
                 state.sessions.get_mut(&conn).expect("registered").invisible = adding;
                 push_mode(&mut applied, &mut last_sign, adding, 'i');
+                member_profile_changed = true;
             }
             'w' => {
                 state.sessions.get_mut(&conn).expect("registered").wallops = adding;
@@ -1334,10 +1652,12 @@ pub(super) fn user_mode(state: &mut ServerState, conn: ConnId, target: &str, res
             'B' => {
                 state.sessions.get_mut(&conn).expect("registered").bot = adding;
                 push_mode(&mut applied, &mut last_sign, adding, 'B');
+                member_profile_changed = true;
             }
             'o' if !adding => {
                 state.sessions.get_mut(&conn).expect("registered").oper = false;
                 push_mode(&mut applied, &mut last_sign, false, 'o');
+                member_profile_changed = true;
             }
             'o' => {} // +o only via OPER
             _ => unknown = true,
@@ -1353,6 +1673,9 @@ pub(super) fn user_mode(state: &mut ServerState, conn: ConnId, target: &str, res
             .expect("registered");
         let server = state.config.server_name.clone();
         state.send(conn, &format!(":{server} MODE {nick} :{applied}"));
+    }
+    if member_profile_changed {
+        state.sync_channel_member(conn, crate::core::state::ChannelMemberChange::Identity);
     }
 }
 
@@ -1382,52 +1705,94 @@ fn emit_channel_list(
     is_op: bool,
 ) -> ListQuery {
     let chan = &state.channels[key];
-    let (masks, item_code, end_code, infix, end_text) = match mode {
+    let Some(masks) = channel_list_masks(chan, mode, is_op) else {
+        return ListQuery::NotAList;
+    };
+    if matches!(mode, 'e' | 'I') && !is_op {
+        return ListQuery::Forbidden;
+    }
+    emit_channel_list_rows(state, conn, display, mode, &masks);
+    ListQuery::Dumped
+}
+
+fn channel_list_masks(
+    chan: &crate::core::state::Channel,
+    mode: char,
+    is_op: bool,
+) -> Option<Vec<String>> {
+    let masks = match mode {
+        'b' => &chan.bans,
+        'q' => &chan.quiets,
+        'e' if is_op => &chan.ban_exceptions,
+        'I' if is_op => &chan.invite_exceptions,
+        'e' | 'I' => return Some(Vec::new()),
+        _ => return None,
+    };
+    Some(masks.iter().map(|mask| mask.as_str().to_string()).collect())
+}
+
+fn emit_channel_list_rows(
+    state: &mut ServerState,
+    conn: ConnId,
+    display: &str,
+    mode: char,
+    masks: &[String],
+) {
+    let (item_code, end_code, infix, end_text) = match mode {
         'b' => (
-            chan.bans.clone(),
             RPL_BANLIST,
             RPL_ENDOFBANLIST,
             None,
             "End of Channel Ban List",
         ),
         'q' => (
-            chan.quiets.clone(),
             RPL_QUIETLIST,
             RPL_ENDOFQUIETLIST,
             Some("q"),
             "End of Channel Quiet List",
         ),
-        'e' | 'I' if !is_op => return ListQuery::Forbidden,
         'e' => (
-            chan.ban_exceptions.clone(),
             RPL_EXCEPTLIST,
             RPL_ENDOFEXCEPTLIST,
             None,
             "End of Channel Exception List",
         ),
         'I' => (
-            chan.invite_exceptions.clone(),
             RPL_INVITELIST,
             RPL_ENDOFINVITELIST,
             None,
-            "End of Channel Invite Exception List",
+            "End of Channel Invite List",
         ),
-        _ => return ListQuery::NotAList,
+        _ => unreachable!("MODE list rows require a list mode"),
     };
     for mask in masks {
         match infix {
-            Some(ch) => state.numeric(conn, item_code, &[display, ch, mask.as_str()], None),
-            None => state.numeric(conn, item_code, &[display, mask.as_str()], None),
+            Some(ch) => state.numeric(conn, item_code, &[display, ch, mask], None),
+            None => state.numeric(conn, item_code, &[display, mask], None),
         }
     }
     match infix {
         Some(ch) => state.numeric(conn, end_code, &[display, ch], Some(end_text)),
         None => state.numeric(conn, end_code, &[display], Some(end_text)),
     }
-    ListQuery::Dumped
 }
 
 pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&str]) {
+    let prefix = state.sessions[&conn].prefix();
+    let arguments: Vec<String> = rest
+        .iter()
+        .map(|argument| (*argument).to_string())
+        .collect();
+    channel_mode_with_prefix(state, conn, target, &arguments, &prefix);
+}
+
+fn channel_mode_with_prefix(
+    state: &mut ServerState,
+    conn: ConnId,
+    target: &str,
+    rest: &[String],
+    prefix: &str,
+) {
     let casemap = state.casemap;
     let Some((key, chan)) = require_channel(state, conn, target) else {
         return;
@@ -1485,7 +1850,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
     }
 
     let mut adding = true;
-    let mut args = rest[1..].iter();
+    let mut args = rest[1..].iter().map(String::as_str);
     // Each applied change as (adding, mode char, optional arg). Collected rather
     // than formatted inline so the broadcast can be split across as many MODE
     // lines as the 512-byte wire limit needs — a single line of many bans is
@@ -1508,9 +1873,9 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                         .map(|ch| ch.name.clone())
                         .unwrap_or_default();
                     let locked = state
-                        .channel_mlock
-                        .get(&key)
-                        .map(crate::core::state::MlockModes::render)
+                        .channel_options
+                        .mlock(&key)
+                        .map(|modes| modes.render())
                         .unwrap_or_default();
                     let modestr = format!("{}{c}", if adding { '+' } else { '-' });
                     state.numeric(
@@ -1544,7 +1909,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
             'k' => {
                 let chan = state.channels.get_mut(&key).expect("checked");
                 if adding {
-                    let Some(&k) = args.next() else {
+                    let Some(k) = args.next() else {
                         state.err_needmoreparams(conn, "MODE");
                         // Skip this mode but keep processing the string —
                         // `break`ing would also drop any *param-less* mode after
@@ -1596,7 +1961,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
             'l' => {
                 let chan = state.channels.get_mut(&key).expect("checked");
                 if adding {
-                    let Some(&l) = args.next() else {
+                    let Some(l) = args.next() else {
                         state.err_needmoreparams(conn, "MODE");
                         // Skip, don't `break` — a later param-less mode must
                         // still apply (see the `+k` arm).
@@ -1628,7 +1993,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                 }
             }
             'b' | 'q' | 'e' | 'I' => {
-                let Some(&raw_mask) = args.next() else {
+                let Some(raw_mask) = args.next() else {
                     // No mask: a list *query* for this mode (e.g. `MODE #c be`
                     // views bans and exceptions), not a silent no-op. Op context
                     // here (the apply loop is op-gated), so `e`/`I` are viewable.
@@ -1715,25 +2080,29 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                 }
             }
             'o' | 'v' => {
-                let Some(&who) = args.next() else {
+                let Some(who) = args.next() else {
                     state.err_needmoreparams(conn, "MODE");
                     // Skip, don't `break` — a later param-less mode must still
                     // apply (see the `+k` arm).
                     continue;
                 };
                 let nick_key = state.nick_key(who);
-                let Some(member_conn) = state.nick_connection(&nick_key) else {
-                    state.err_nosuchnick(conn, clip_echo(who));
+                let Some((member_conn, _, identity)) =
+                    state.channels[&key].member_named(state.casemap, who)
+                else {
+                    if state.registered_nick_owner(&nick_key).is_none() {
+                        state.err_nosuchnick(conn, clip_echo(who));
+                    } else {
+                        state.numeric(
+                            conn,
+                            ERR_USERNOTINCHANNEL,
+                            &[who, &display],
+                            Some("They aren't on that channel"),
+                        );
+                    }
                     continue;
                 };
-                // Echo the target's canonical nick, not the raw input casing, so
-                // `+o bob` on member `Bob` broadcasts `+o Bob` — captured before
-                // the mutable channel borrow below.
-                let member_nick = state
-                    .sessions
-                    .get(&member_conn)
-                    .and_then(|s| s.nick().map(String::from))
-                    .unwrap_or_else(|| who.to_string());
+                let member_nick = identity.nick.clone();
                 let chan = state.channels.get_mut(&key).expect("checked");
                 let Some(member) = chan.member_mut(member_conn) else {
                     state.numeric(
@@ -1771,8 +2140,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
     }
 
     if !changes.is_empty() {
-        let prefix = state.sessions[&conn].prefix();
-        broadcast_mode_changes(state, &key, &prefix, &display, &changes);
+        broadcast_mode_changes(state, &key, prefix, &display, &changes);
     }
 }
 

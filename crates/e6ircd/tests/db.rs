@@ -3022,53 +3022,11 @@ async fn channel_registration_stores_initial_topic_in_its_insert() {
     db::create_account(&pool, "boss", "pw")
         .await
         .expect("account");
-    let (request_tx, request_rx) = queue::<DbRequest>(QueueConfig {
-        name: "register-topic-db",
-        capacity: 8,
-        policy: Policy::Fifo,
-    });
-    let (core_tx, mut core_rx) = queue::<Input>(QueueConfig {
-        name: "register-topic-core",
-        capacity: 8,
-        policy: Policy::Fifo,
-    });
-    tokio::spawn(db::run_worker(
-        pool.clone(),
-        request_rx,
-        CoreIngress::single(core_tx),
-    ));
-    let conn = e6ircd::core::ConnId(17);
     let topic = ("initial".to_string(), "boss!b@h".to_string(), 1000);
-    request_tx
-        .push(DbRequest::RegisterChannel {
-            conn,
-            channel: "#c".into(),
-            founder_account: "boss".into(),
-            topic: Some(topic.clone()),
-            label: None,
-        })
+    let result = db::persist_channel_registration(&pool, "#c", "boss", &Some(topic.clone()))
         .await
-        .expect("push");
-    let Some(envelope) = core_rx.pop().await else {
-        panic!("worker died")
-    };
-    let Input::DbReply {
-        conn: got_conn,
-        reply,
-    } = envelope.payload
-    else {
-        panic!("unexpected worker reply")
-    };
-    assert_eq!(got_conn, conn);
-    assert_eq!(
-        reply,
-        DbReply::ChannelRegistered {
-            channel: "#c".into(),
-            founder_account: "boss".into(),
-            topic: Some(topic),
-            label: None,
-        }
-    );
+        .expect("registration");
+    assert_eq!(result, e6ircd::core::ChannelRegistrationResult::Registered);
     assert_eq!(
         db::list_channel_topics(&pool).await.expect("topics"),
         vec![(

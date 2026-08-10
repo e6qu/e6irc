@@ -187,131 +187,171 @@ fn emit_kick_result_now(
     }
 }
 
-/// Resolve a channel by name, answering NOSUCHCHANNEL and returning the
-/// key + display name. The display is cloned so the caller is free to mutate
-/// state without holding the channels borrow.
-fn resolve_channel(
-    state: &mut ServerState,
-    conn: ConnId,
-    target: &str,
-) -> Option<(ChanKey, String)> {
-    let key = state.chan_key(target);
-    let Some(chan) = state.channels.get(&key) else {
-        state.err_nosuchchannel(conn, clip_echo(target));
-        return None;
-    };
-    Some((key, chan.name.clone()))
-}
-
 pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let (Some(&who), Some(&target)) = (p.first(), p.get(1)) else {
         state.err_needmoreparams(conn, "INVITE");
         return;
     };
-    let Some((key, display)) = resolve_channel(state, conn, target) else {
-        return;
-    };
-    if !state.channels[&key].is_member(conn) {
-        state.err_notonchannel(conn, target);
-        return;
-    }
-    let is_op = state.channels[&key].member(conn).is_some_and(|m| m.op);
-    if state.channels[&key].modes.invite_only && !is_op {
-        state.numeric(
-            conn,
-            ERR_CHANOPRIVSNEEDED,
-            &[target],
-            Some("You're not a channel operator"),
-        );
-        return;
-    }
-    let who_key = state.nick_key(who);
-    let Some(invitee) = state.registered_peer(&who_key) else {
+    let Some(invitee) = state.registered_nick_owner(&state.nick_key(who)) else {
         state.err_nosuchnick(conn, clip_echo(who));
         return;
     };
-    if state.channels[&key].is_member(invitee) {
-        state.numeric(
-            conn,
-            ERR_USERONCHANNEL,
-            &[who, &display],
-            Some("is already on channel"),
-        );
-        return;
+    let owner = state.channel_owner(target);
+    let label = state.channel_reply_label(conn, &owner);
+    let command = crate::core::state::ChannelCommand::new(
+        owner,
+        state.channel_actor(conn),
+        target.into(),
+        crate::core::state::ChannelCommandOperation::Invite(
+            crate::core::state::ChannelInvitee::new(invitee, who.into()),
+        ),
+        label,
+    );
+    if state.owns_channel(command.owner()) {
+        let result = invite_on_owner(state, command);
+        emit_invite_result_now(state, conn, result);
+    } else {
+        state.route_channel_command(command);
     }
-    let invitee_nick = state.sessions[&invitee]
-        .nick()
-        .map(String::from)
-        .expect("registered");
-    // Bound the channel's pending-invite set — INVITE would otherwise grow it
-    // without limit (invites to since-disconnected sessions linger). Drop
-    // entries for dead connections first; if still at the cap, evict an
-    // arbitrary old invite so the set stays bounded while the new one still
-    // lands (invites are low-value and the invitee can be re-invited).
-    if state.channels[&key].invited.len() >= INVITE_LIMIT {
-        let stale: Vec<ConnId> = state.channels[&key]
-            .invited
-            .iter()
-            .filter(|c| !state.sessions.contains_key(c))
-            .copied()
-            .collect();
-        let invited = &mut state.channels.get_mut(&key).expect("checked").invited;
-        for c in &stale {
-            invited.remove(c);
-        }
-        while invited.len() >= INVITE_LIMIT {
-            let Some(victim) = invited.iter().next().copied() else {
-                break;
-            };
-            invited.remove(&victim);
-        }
+}
+
+pub(super) fn invite_on_owner(
+    state: &mut ServerState,
+    command: crate::core::state::ChannelCommand,
+) -> crate::core::state::ChannelInviteResult {
+    let (owner, actor, target, operation) = command.into_parts();
+    let crate::core::state::ChannelCommandOperation::Invite(invitee) = operation else {
+        unreachable!("INVITE command operation");
+    };
+    let key = state.chan_key(&target);
+    assert_eq!(owner.key(), &key, "INVITE owner does not match target");
+    let Some(chan) = state.channels.get(&key) else {
+        return crate::core::state::ChannelInviteResult::NoSuchChannel { target };
+    };
+    let display = chan.name.clone();
+    if !chan.is_member(actor.recipient.conn()) {
+        return crate::core::state::ChannelInviteResult::NotOnChannel { target };
     }
-    state
-        .channels
-        .get_mut(&key)
-        .expect("checked")
-        .invited
-        .insert(invitee);
-    state.numeric(conn, RPL_INVITING, &[&invitee_nick, &display], None);
-    let prefix = state.sessions[&conn].prefix();
-    let sender_account = state.sessions[&conn].account.clone();
-    let body = format!(":{prefix} INVITE {invitee_nick} :{display}");
-    // The invitee always sees the invite; invite-notify adds the channel's
-    // other cap-holding members. Both honor the recipient's server-time and
-    // account-tag caps: the IRCv3 account-tag spec covers INVITE from an
-    // identified sender, and irctest's AccountTag suite asserts it.
-    let mut recipients = vec![invitee];
-    let watchers: Vec<ConnId> = state.channels[&key]
+    if chan.modes.invite_only && !chan.member(actor.recipient.conn()).is_some_and(|m| m.op) {
+        return crate::core::state::ChannelInviteResult::NotOperator { target };
+    }
+    if chan.is_member(invitee.owner().conn()) {
+        return crate::core::state::ChannelInviteResult::UserOnChannel {
+            invitee: invitee.requested_nick().into(),
+            channel: display,
+        };
+    }
+    let recipients: Vec<_> = chan
         .recipients()
         .iter()
-        .map(|recipient| recipient.conn())
-        .filter(|c| *c != conn && *c != invitee)
-        .filter(|c| state.sessions.get(c).is_some_and(|s| s.caps.invite_notify))
+        .copied()
+        .filter(|recipient| {
+            recipient.conn() != actor.recipient.conn()
+                && recipient.conn() != invitee.owner().conn()
+                && recipient.caps().invite_notify
+        })
         .collect();
-    recipients.extend(watchers);
+    let invited = &mut state.channels.get_mut(&key).expect("checked").invited;
+    while invited.len() >= INVITE_LIMIT && !invited.contains(&invitee.owner().conn()) {
+        let victim = *invited.iter().next().expect("non-empty at invite cap");
+        invited.remove(&victim);
+    }
+    invited.insert(invitee.owner().conn());
     for recipient in recipients {
-        let Some(session) = state.sessions.get(&recipient) else {
-            continue;
-        };
-        let caps = session.caps;
-        let mut tags: Vec<String> = Vec::new();
-        if caps.server_time {
-            tags.push(format!("time={}", state.time_tag()));
+        let body = format!(
+            ":{} INVITE {} :{display}",
+            actor.identity.prefix,
+            invitee.requested_nick()
+        );
+        let line = invite_tags(state, recipient, &actor.account, &body);
+        state.send_recipient_uncaptured(recipient, bytes::Bytes::from(format!("{line}\r\n")));
+    }
+    let event = crate::core::state::ChannelSessionEvent::Invitation {
+        inviter_prefix: actor.identity.prefix,
+        inviter_account: actor.account,
+        channel: display.clone(),
+    };
+    if state.owns_session(invitee.owner()) {
+        emit_invitation(state, invitee.owner().conn(), event);
+    } else {
+        state.route_channel_session_event(invitee.owner(), event);
+    }
+    crate::core::state::ChannelInviteResult::Invited {
+        invitee: invitee.requested_nick().into(),
+        channel: display,
+    }
+}
+
+pub(super) fn invite_tags(
+    state: &ServerState,
+    recipient: crate::core::state::Recipient,
+    account: &Option<String>,
+    body: &str,
+) -> String {
+    let mut tags = Vec::new();
+    if recipient.caps().server_time {
+        tags.push(format!("time={}", state.time_tag()));
+    }
+    if recipient.caps().account_tag
+        && let Some(account) = account
+    {
+        tags.push(format!(
+            "account={}",
+            e6irc_proto::message::escape_tag_value(account)
+        ));
+    }
+    if tags.is_empty() {
+        body.into()
+    } else {
+        format!("@{} {body}", tags.join(";"))
+    }
+}
+
+pub(super) fn emit_invitation(
+    state: &mut ServerState,
+    conn: ConnId,
+    event: crate::core::state::ChannelSessionEvent,
+) {
+    let crate::core::state::ChannelSessionEvent::Invitation {
+        inviter_prefix,
+        inviter_account,
+        channel,
+    } = event;
+    let nick = state.sessions[&conn].nick().unwrap_or("*");
+    let body = format!(":{inviter_prefix} INVITE {nick} :{channel}");
+    let recipient = state.local_recipient(conn);
+    let line = invite_tags(state, recipient, &inviter_account, &body);
+    state.send(conn, &line);
+}
+
+pub(super) fn emit_invite_result_now(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelInviteResult,
+) {
+    match result {
+        crate::core::state::ChannelInviteResult::Invited { invitee, channel } => {
+            state.numeric(conn, RPL_INVITING, &[&invitee, &channel], None)
         }
-        if caps.account_tag
-            && let Some(account) = &sender_account
-        {
-            tags.push(format!(
-                "account={}",
-                e6irc_proto::message::escape_tag_value(account)
-            ));
+        crate::core::state::ChannelInviteResult::NoSuchChannel { target } => {
+            state.err_nosuchchannel(conn, clip_echo(&target))
         }
-        let line = if tags.is_empty() {
-            body.clone()
-        } else {
-            format!("@{} {body}", tags.join(";"))
-        };
-        state.send(recipient, &line);
+        crate::core::state::ChannelInviteResult::NotOnChannel { target } => {
+            state.err_notonchannel(conn, &target)
+        }
+        crate::core::state::ChannelInviteResult::NotOperator { target } => state.numeric(
+            conn,
+            ERR_CHANOPRIVSNEEDED,
+            &[&target],
+            Some("You're not a channel operator"),
+        ),
+        crate::core::state::ChannelInviteResult::UserOnChannel { invitee, channel } => state
+            .numeric(
+                conn,
+                ERR_USERONCHANNEL,
+                &[&invitee, &channel],
+                Some("is already on channel"),
+            ),
     }
 }
 
@@ -353,42 +393,96 @@ pub(super) fn cmd_away(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     if !changed {
         return;
     }
+    state.sync_channel_member(conn, crate::core::state::ChannelMemberChange::Identity);
     notify_event(state, conn, &notify, |c| c.away_notify, false);
 }
 
 pub(super) fn cmd_list(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    // A non-empty first argument is a comma-separated channel list; when
-    // present LIST reports only those channels (Modern IRC `LIST <channels>`)
-    // instead of enumerating every channel.
-    let filter: Option<std::collections::HashSet<ChanKey>> =
-        p.first().filter(|s| !s.is_empty()).map(|s| {
-            s.split(',')
-                .filter(|t| !t.is_empty())
-                .map(|t| state.chan_key(t))
+    state.numeric(conn, RPL_LISTSTART, &["Channel"], Some("Users  Name"));
+    let targets = p
+        .first()
+        .filter(|target| !target.is_empty())
+        .map(|targets| {
+            targets
+                .split(',')
+                .filter(|target| !target.is_empty())
+                .map(str::to_string)
                 .collect()
         });
-    state.numeric(conn, RPL_LISTSTART, &["Channel"], Some("Users  Name"));
-    let rows: Vec<(String, usize, String)> = state
+    let label = state.defer_channel_reply(conn);
+    let request = state.start_channel_list(conn, label, targets);
+    if state.has_single_channel_shard() {
+        channel_list(state, request);
+    } else {
+        state.route_channel_list(request);
+    }
+}
+
+pub(crate) fn channel_list(
+    state: &mut ServerState,
+    request: crate::core::state::ChannelListRequest,
+) {
+    let conn = request.actor().recipient.conn();
+    let rows = state
         .channels
         .iter()
-        .filter(|(k, _)| match &filter {
-            Some(f) => f.contains(*k),
-            None => true,
+        .filter(|(key, _)| {
+            request
+                .targets()
+                .is_none_or(|targets| targets.contains(key))
         })
-        .map(|(_, c)| c)
-        .filter(|c| c.hidden_from(conn).is_none())
-        .map(|c| {
-            (
-                c.name.clone(),
-                c.member_count(),
-                c.topic.as_ref().map(|t| t.text.clone()).unwrap_or_default(),
-            )
+        .map(|(_, channel)| channel)
+        .filter(|channel| channel.hidden_from(conn).is_none())
+        .map(|channel| crate::core::state::ChannelListRow {
+            name: channel.name.clone(),
+            members: channel.member_count(),
+            topic: channel
+                .topic
+                .as_ref()
+                .map(|topic| topic.text.clone())
+                .unwrap_or_default(),
         })
         .collect();
-    for (name, count, topic) in rows {
-        state.numeric(conn, RPL_LIST, &[&name, &count.to_string()], Some(&topic));
+    let result = crate::core::state::ChannelListResult {
+        id: request.id(),
+        session: request.session(),
+        rows,
+    };
+    if state.has_single_channel_shard() {
+        channel_list_result(state, result);
+    } else {
+        state.route_channel_list_result(result);
     }
-    state.numeric(conn, RPL_LISTEND, &[], Some("End of /LIST"));
+}
+
+pub(crate) fn channel_list_result(
+    state: &mut ServerState,
+    result: crate::core::state::ChannelListResult,
+) {
+    let session = result.session;
+    let Some((label, prefix, mut rows)) = state.take_channel_list(result) else {
+        return;
+    };
+    rows.sort_by(|left, right| left.name.cmp(&right.name));
+    state.emit_deferred_labeled(session.conn(), label, |state| {
+        if !prefix.is_empty() {
+            state
+                .capture
+                .as_mut()
+                .expect("labeled LIST capture exists")
+                .lines
+                .extend(prefix);
+        }
+        for row in rows {
+            state.numeric(
+                session.conn(),
+                RPL_LIST,
+                &[&row.name, &row.members.to_string()],
+                Some(&row.topic),
+            );
+        }
+        state.numeric(session.conn(), RPL_LISTEND, &[], Some("End of /LIST"));
+    });
 }
 
 /// Build the `nick[*]=<+|->user@host` entries shared by USERHOST and USERIP
@@ -512,59 +606,119 @@ pub(super) fn cmd_knock(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.err_needmoreparams(conn, "KNOCK");
         return;
     };
-    let Some((key, display)) = resolve_channel(state, conn, target) else {
-        return;
+    let owner = state.channel_owner(target);
+    let label = if state.owns_channel(&owner) {
+        state
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.label.clone())
+    } else {
+        state.defer_channel_reply(conn)
     };
+    let command = crate::core::state::ChannelCommand::new(
+        owner,
+        state.channel_actor(conn),
+        target.to_string(),
+        crate::core::state::ChannelCommandOperation::Knock,
+        label,
+    );
+    if state.owns_channel(command.owner()) {
+        let result = knock_on_owner(state, command);
+        emit_knock_result_now(state, conn, result);
+    } else {
+        state.route_channel_command(command);
+    }
+}
+
+pub(super) fn knock_on_owner(
+    state: &mut ServerState,
+    command: crate::core::state::ChannelCommand,
+) -> crate::core::state::ChannelKnockResult {
+    let (owner, actor, target, operation) = command.into_parts();
+    debug_assert!(matches!(
+        operation,
+        crate::core::state::ChannelCommandOperation::Knock
+    ));
+    let key = state.chan_key(&target);
+    assert_eq!(owner.key(), &key, "KNOCK owner does not match target");
+    let Some(chan) = state.channels.get(&key) else {
+        return crate::core::state::ChannelKnockResult::NoSuchChannel { target };
+    };
+    let display = chan.name.clone();
     // A secret channel is hidden: look non-existent to a non-member.
-    if let Some(proof) = state.channels[&key].hidden_from(conn) {
-        super::deny_hidden(state, conn, target, proof);
-        return;
+    if chan.hidden_from(actor.recipient.conn()).is_some() {
+        return crate::core::state::ChannelKnockResult::Hidden { target };
     }
-    if state.channels[&key].is_member(conn) {
-        state.numeric(
-            conn,
-            ERR_KNOCKONCHAN,
-            &[&display],
-            Some("You are on that channel"),
-        );
-        return;
+    if chan.is_member(actor.recipient.conn()) {
+        return crate::core::state::ChannelKnockResult::AlreadyOnChannel { display };
     }
-    if !state.channels[&key].modes.invite_only {
-        state.numeric(conn, ERR_CHANOPEN, &[&display], Some("Channel is open"));
-        return;
+    if !chan.modes.invite_only {
+        return crate::core::state::ChannelKnockResult::ChannelOpen { display };
     }
     // A banned user cannot knock (Solanum refuses with ERR_CANNOTSENDTOCHAN):
     // otherwise +b is no barrier to spamming the channel's ops with knock
     // requests they can't act on.
     let casemap = state.casemap;
-    let user_prefix = state.sessions[&conn].prefix();
-    if state.channels[&key].is_banned(casemap, &user_prefix) {
-        state.numeric(
+    if chan.is_banned(casemap, &actor.identity.prefix) {
+        return crate::core::state::ChannelKnockResult::CannotSend { display };
+    }
+    // Deliver the knock to the channel's operators, then confirm to the knocker.
+    let ops = chan.operator_recipients();
+    for (recipient, nick) in ops {
+        let line = format!(
+            ":{} {} {} {} {} :has asked for an invite",
+            state.config.server_name,
+            e6irc_proto::numerics::code_str(RPL_KNOCK),
+            nick,
+            display,
+            actor.identity.prefix,
+        );
+        state.send_timed_recipient(recipient, &line);
+    }
+    crate::core::state::ChannelKnockResult::KnockDelivered
+}
+
+pub(super) fn emit_knock_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelKnockResult,
+    label: Option<String>,
+) {
+    state.emit_deferred_labeled(conn, label, |state| {
+        emit_knock_result_now(state, conn, result)
+    });
+}
+
+fn emit_knock_result_now(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelKnockResult,
+) {
+    match result {
+        crate::core::state::ChannelKnockResult::KnockDelivered => state.numeric(
+            conn,
+            RPL_KNOCKDLVR,
+            &[],
+            Some("Your KNOCK has been delivered"),
+        ),
+        crate::core::state::ChannelKnockResult::NoSuchChannel { target }
+        | crate::core::state::ChannelKnockResult::Hidden { target } => {
+            state.err_nosuchchannel(conn, clip_echo(&target));
+        }
+        crate::core::state::ChannelKnockResult::AlreadyOnChannel { display } => state.numeric(
+            conn,
+            ERR_KNOCKONCHAN,
+            &[&display],
+            Some("You are on that channel"),
+        ),
+        crate::core::state::ChannelKnockResult::ChannelOpen { display } => {
+            state.numeric(conn, ERR_CHANOPEN, &[&display], Some("Channel is open"))
+        }
+        crate::core::state::ChannelKnockResult::CannotSend { display } => state.numeric(
             conn,
             ERR_CANNOTSENDTOCHAN,
             &[&display],
             Some("Cannot knock on channel (+b)"),
-        );
-        return;
+        ),
     }
-    // Deliver the knock to the channel's operators, then confirm to the knocker.
-    let ops: Vec<ConnId> = state.channels[&key]
-        .members()
-        .filter(|(_, m)| m.op)
-        .map(|(c, _)| c)
-        .collect();
-    for op in ops {
-        state.numeric(
-            op,
-            RPL_KNOCK,
-            &[&display, &user_prefix],
-            Some("has asked for an invite"),
-        );
-    }
-    state.numeric(
-        conn,
-        RPL_KNOCKDLVR,
-        &[&display],
-        Some("Your KNOCK has been delivered"),
-    );
 }

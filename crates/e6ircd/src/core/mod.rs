@@ -25,13 +25,14 @@ use bytes::Bytes;
 #[cfg(test)]
 use e6irc_queue::Envelope;
 use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
-use state::ServerState;
 use state::{
-    ChannelActor, ChannelJoinResult, ChannelKick, ChannelKickResult, ChannelMessage,
+    ChannelActor, ChannelCommand, ChannelCommandResult, ChannelJoinResult, ChannelKick,
+    ChannelKickResult, ChannelListRequest, ChannelListResult, ChannelMemberUpdate, ChannelMessage,
     ChannelMessageResult, ChannelMultiline, ChannelMultilineResult, ChannelOwner,
     ChannelPartResult, ChannelQuit, ChannelTagmsg, ChannelTagmsgResult, ChannelTopic,
     ChannelTopicResult,
 };
+use state::{CoreDirectories, ServerState};
 
 use crate::observability::{LatencyKind, Telemetry};
 
@@ -59,6 +60,10 @@ impl CoreShardCount {
 
     pub fn single() -> Self {
         Self(NonZeroUsize::MIN)
+    }
+
+    pub(crate) fn len(self) -> usize {
+        self.0.get()
     }
 
     fn shard_for(self, conn: ConnId) -> CoreShardId {
@@ -110,6 +115,7 @@ impl SessionOwner {
 pub struct CoreIngress {
     shards: Arc<[Sender<Input>]>,
     count: CoreShardCount,
+    directories: CoreDirectories,
 }
 
 impl CoreIngress {
@@ -117,6 +123,7 @@ impl CoreIngress {
         Self {
             shards: Arc::from([sender]),
             count: CoreShardCount::single(),
+            directories: CoreDirectories::default(),
         }
     }
 
@@ -135,6 +142,7 @@ impl CoreIngress {
         Self {
             shards: shards.into(),
             count: CoreShardCount::new(count),
+            directories: CoreDirectories::default(),
         }
     }
 
@@ -156,6 +164,13 @@ impl CoreIngress {
             Input::ChannelTopic { topic } => topic.owner().shard(),
             Input::ChannelTopicResult { session, .. } => session.shard(),
             Input::ChannelTopicPersisted { owner, .. } => owner.shard(),
+            Input::ChannelCommand { command } => command.owner().shard(),
+            Input::ChannelCommandResult { session, .. } => session.shard(),
+            Input::ChannelRegistrationPersisted { owner, .. } => owner.shard(),
+            Input::ChannelListResult { result } => result.session.shard(),
+            Input::ChannelList { .. } => panic!("whole-network LIST must be broadcast"),
+            Input::ChannelSessionEvent { session, .. } => session.shard(),
+            Input::ChannelMemberUpdate { update } => update.owner().shard(),
             Input::ChannelKick { kick } => kick.owner().shard(),
             Input::ChannelKickResult { session, .. } => session.shard(),
             Input::SessionChannelRemoved { session, .. } => session.shard(),
@@ -167,17 +182,24 @@ impl CoreIngress {
             Input::ChannelTagmsgResult { session, .. } => session.shard(),
             Input::Tick { .. }
             | Input::Shutdown
-            | Input::Admin { .. }
-            | Input::ChannelDropResult { .. }
             | Input::ServerBanResult { .. }
-            | Input::ChannelControlResult { .. }
-            | Input::OwnedChannelRegistrationResult { .. } => CoreShardId(0),
+            | Input::Admin { .. } => CoreShardId(0),
+            Input::ChannelDropResult { requester, .. } => match requester {
+                ChannelDropRequester::ChanServ { session, .. } => session.shard(),
+                ChannelDropRequester::Admin { .. } => CoreShardId(0),
+            },
+            Input::ChannelControlResult { owner, .. }
+            | Input::OwnedChannelRegistrationResult { owner, .. } => owner.shard(),
         };
         self.shards[shard.0].push(input).await
     }
 
     pub fn monitor(&self) -> QueueMonitor {
         self.shards[0].monitor()
+    }
+
+    pub(crate) fn directories(&self) -> CoreDirectories {
+        self.directories.clone()
     }
 }
 
@@ -411,6 +433,40 @@ pub enum Input {
         session: Option<SessionOwner>,
         result: ChannelTopicPersistence,
     },
+    /// A channel command whose mutation and authorization belong to its owner.
+    ChannelCommand {
+        command: ChannelCommand,
+    },
+    /// A channel command answer, processed only by the requester's session owner.
+    ChannelCommandResult {
+        session: SessionOwner,
+        result: ChannelCommandResult,
+        label: Option<String>,
+    },
+    ChannelRegistrationPersisted {
+        owner: ChannelOwner,
+        session: SessionOwner,
+        channel: String,
+        founder_account: String,
+        topic: Option<(String, String, u64)>,
+        label: Option<String>,
+        result: ChannelRegistrationResult,
+    },
+    /// One shard's answer to a whole-network LIST request.
+    ChannelListResult {
+        result: ChannelListResult,
+    },
+    /// A whole-network LIST request, delivered once to every channel shard.
+    ChannelList {
+        request: ChannelListRequest,
+    },
+    ChannelSessionEvent {
+        session: SessionOwner,
+        event: state::ChannelSessionEvent,
+    },
+    ChannelMemberUpdate {
+        update: ChannelMemberUpdate,
+    },
     ChannelKick {
         kick: ChannelKick,
     },
@@ -521,6 +577,7 @@ pub enum Input {
     /// re-checks ownership before writing; only an applied verdict changes the
     /// core's hot founder/topic/mode/access mirrors.
     ChannelControlResult {
+        owner: ChannelOwner,
         request_id: u64,
         channel: String,
         mutation: PersistedChannelMutation,
@@ -531,6 +588,7 @@ pub enum Input {
     /// the typed verdict applies the same hot founder/topic transition as
     /// ChanServ only after PostgreSQL confirms the insert.
     OwnedChannelRegistrationResult {
+        owner: ChannelOwner,
         request_id: u64,
         channel: String,
         founder_account: String,
@@ -617,6 +675,17 @@ pub enum AdminRequest {
     /// Register a live channel currently operated by an authenticated session
     /// belonging to `actor`.
     RegisterOwnedChannel { channel: String, actor: String },
+}
+
+impl AdminRequest {
+    fn channel(&self) -> Option<&str> {
+        match self {
+            Self::DropChannel { channel, .. }
+            | Self::MutateOwnedChannel { channel, .. }
+            | Self::RegisterOwnedChannel { channel, .. } => Some(channel),
+            _ => None,
+        }
+    }
 }
 
 /// User-facing registered-channel mutations accepted by the HTTP control
@@ -801,7 +870,7 @@ pub enum BanControlError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelDropRequester {
     ChanServ {
-        conn: ConnId,
+        session: SessionOwner,
         display: String,
         label: Option<String>,
     },
@@ -947,7 +1016,8 @@ pub enum DbRequest {
         origin: AccountOrigin,
     },
     RegisterChannel {
-        conn: ConnId,
+        owner: ChannelOwner,
+        session: SessionOwner,
         channel: String,
         founder_account: String,
         /// The live topic at request time. Registration and its initial retained
@@ -960,6 +1030,7 @@ pub enum DbRequest {
     /// Register a channel through the owner HTTP control plane. The core has
     /// already verified that an `actor` session operates the live channel.
     RegisterOwnedChannel {
+        owner: ChannelOwner,
         request_id: u64,
         channel: String,
         founder_account: String,
@@ -1079,6 +1150,7 @@ pub enum DbRequest {
     /// id maps the verdict back to a core-owned oneshot sender without putting
     /// the non-clonable sender on this queue.
     MutateOwnedChannel {
+        owner: ChannelOwner,
         request_id: u64,
         channel: String,
         actor: String,
@@ -1495,83 +1567,14 @@ pub struct Core {
 }
 
 pub(crate) enum CoreEffect {
+    /// A typed event for another core owner.
+    Input(Input),
+    BroadcastChannelList {
+        request: ChannelListRequest,
+    },
     Delivery {
         owner: SessionOwner,
         line: Bytes,
-    },
-    ChannelJoin {
-        owner: ChannelOwner,
-        actor: ChannelActor,
-        name: String,
-        join_key: Option<String>,
-        label: Option<String>,
-    },
-    ChannelJoinResult {
-        session: SessionOwner,
-        result: ChannelJoinResult,
-        label: Option<String>,
-    },
-    ChannelPart {
-        owner: ChannelOwner,
-        actor: ChannelActor,
-        name: String,
-        reason: Option<String>,
-        label: Option<String>,
-    },
-    ChannelPartResult {
-        session: SessionOwner,
-        result: ChannelPartResult,
-        label: Option<String>,
-    },
-    ChannelQuit(ChannelQuit),
-    ChannelTopic {
-        topic: ChannelTopic,
-    },
-    ChannelTopicResult {
-        session: SessionOwner,
-        result: ChannelTopicResult,
-        label: Option<String>,
-    },
-    ChannelTopicPersisted {
-        owner: ChannelOwner,
-        conn: ConnId,
-        session: Option<SessionOwner>,
-        result: ChannelTopicPersistence,
-    },
-    ChannelKick {
-        kick: ChannelKick,
-    },
-    ChannelKickResult {
-        session: SessionOwner,
-        result: ChannelKickResult,
-        label: Option<String>,
-    },
-    SessionChannelRemoved {
-        session: SessionOwner,
-        key: state::ChanKey,
-    },
-    ChannelMessage {
-        message: ChannelMessage,
-    },
-    ChannelMessageResult {
-        session: SessionOwner,
-        result: ChannelMessageResult,
-        label: Option<String>,
-    },
-    ChannelMultiline {
-        message: ChannelMultiline,
-    },
-    ChannelMultilineResult {
-        session: SessionOwner,
-        result: ChannelMultilineResult,
-    },
-    ChannelTagmsg {
-        tagmsg: ChannelTagmsg,
-    },
-    ChannelTagmsgResult {
-        session: SessionOwner,
-        result: ChannelTagmsgResult,
-        label: Option<String>,
     },
 }
 
@@ -1600,114 +1603,27 @@ impl CoreWorker {
                 input: envelope.payload,
             });
             for effect in self.core.take_effects() {
+                if let CoreEffect::BroadcastChannelList { request } = effect {
+                    for shard in self.ingress.shards.iter() {
+                        if shard
+                            .push(Input::ChannelList {
+                                request: request.clone(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            panic!("cross-shard target closed");
+                        }
+                    }
+                    continue;
+                }
                 let input = match effect {
+                    CoreEffect::Input(input) => input,
                     CoreEffect::Delivery { owner, line } => Input::Delivery {
                         conn: owner.conn(),
                         line,
                     },
-                    CoreEffect::ChannelJoin {
-                        owner,
-                        actor,
-                        name,
-                        join_key,
-                        label,
-                    } => Input::ChannelJoin {
-                        owner,
-                        actor,
-                        name,
-                        join_key,
-                        label,
-                    },
-                    CoreEffect::ChannelJoinResult {
-                        session,
-                        result,
-                        label,
-                    } => Input::ChannelJoinResult {
-                        session,
-                        result,
-                        label,
-                    },
-                    CoreEffect::ChannelPart {
-                        owner,
-                        actor,
-                        name,
-                        reason,
-                        label,
-                    } => Input::ChannelPart {
-                        owner,
-                        actor,
-                        name,
-                        reason,
-                        label,
-                    },
-                    CoreEffect::ChannelPartResult {
-                        session,
-                        result,
-                        label,
-                    } => Input::ChannelPartResult {
-                        session,
-                        result,
-                        label,
-                    },
-                    CoreEffect::ChannelQuit(quit) => Input::ChannelQuit { quit },
-                    CoreEffect::ChannelTopic { topic } => Input::ChannelTopic { topic },
-                    CoreEffect::ChannelTopicResult {
-                        session,
-                        result,
-                        label,
-                    } => Input::ChannelTopicResult {
-                        session,
-                        result,
-                        label,
-                    },
-                    CoreEffect::ChannelTopicPersisted {
-                        owner,
-                        conn,
-                        session,
-                        result,
-                    } => Input::ChannelTopicPersisted {
-                        owner,
-                        conn,
-                        session,
-                        result,
-                    },
-                    CoreEffect::SessionChannelRemoved { session, key } => {
-                        Input::SessionChannelRemoved { session, key }
-                    }
-                    CoreEffect::ChannelKick { kick } => Input::ChannelKick { kick },
-                    CoreEffect::ChannelKickResult {
-                        session,
-                        result,
-                        label,
-                    } => Input::ChannelKickResult {
-                        session,
-                        result,
-                        label,
-                    },
-                    CoreEffect::ChannelMessage { message } => Input::ChannelMessage { message },
-                    CoreEffect::ChannelMessageResult {
-                        session,
-                        result,
-                        label,
-                    } => Input::ChannelMessageResult {
-                        session,
-                        result,
-                        label,
-                    },
-                    CoreEffect::ChannelMultiline { message } => Input::ChannelMultiline { message },
-                    CoreEffect::ChannelMultilineResult { session, result } => {
-                        Input::ChannelMultilineResult { session, result }
-                    }
-                    CoreEffect::ChannelTagmsg { tagmsg } => Input::ChannelTagmsg { tagmsg },
-                    CoreEffect::ChannelTagmsgResult {
-                        session,
-                        result,
-                        label,
-                    } => Input::ChannelTagmsgResult {
-                        session,
-                        result,
-                        label,
-                    },
+                    CoreEffect::BroadcastChannelList { .. } => unreachable!("handled above"),
                 };
                 if self.ingress.push(input).await.is_err() {
                     panic!("cross-shard target closed");
@@ -1730,24 +1646,35 @@ impl Core {
         db_tx: Sender<DbRequest>,
         telemetry: Arc<Telemetry>,
     ) -> Self {
-        Self::with_telemetry_on_shard(
+        Self::with_telemetry_with_directories(config, db_tx, telemetry, CoreDirectories::default())
+    }
+
+    pub(crate) fn with_telemetry_with_directories(
+        config: CoreConfig,
+        db_tx: Sender<DbRequest>,
+        telemetry: Arc<Telemetry>,
+        directories: CoreDirectories,
+    ) -> Self {
+        Self::with_telemetry_on_shard_with_directories(
             config,
             db_tx,
             telemetry,
             CoreShardId(0),
             CoreShardCount::single(),
+            directories,
         )
     }
 
-    fn with_telemetry_on_shard(
+    fn with_telemetry_on_shard_with_directories(
         config: CoreConfig,
         db_tx: Sender<DbRequest>,
         telemetry: Arc<Telemetry>,
         shard: CoreShardId,
         shards: CoreShardCount,
+        directories: CoreDirectories,
     ) -> Self {
         Self {
-            state: ServerState::new(shard, shards, config, db_tx, telemetry),
+            state: ServerState::new(shard, shards, config, db_tx, telemetry, directories),
             shard,
             next_sequence: 0,
         }
@@ -1924,6 +1851,77 @@ impl Core {
                 );
                 handler::channel_topic_persisted(&mut self.state, conn, session, result);
             }
+            Input::ChannelCommand { command } => {
+                assert_eq!(
+                    command.owner().shard(),
+                    self.shard,
+                    "channel command reached wrong channel shard"
+                );
+                handler::channel_command(&mut self.state, command);
+            }
+            Input::ChannelCommandResult {
+                session,
+                result,
+                label,
+            } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "channel command result reached wrong session shard"
+                );
+                handler::channel_command_result(&mut self.state, session.conn(), result, label);
+            }
+            Input::ChannelRegistrationPersisted {
+                owner,
+                session,
+                channel,
+                founder_account,
+                topic,
+                label,
+                result,
+            } => {
+                assert_eq!(
+                    owner.shard(),
+                    self.shard,
+                    "registration reached wrong channel shard"
+                );
+                handler::services::channel_registration_persisted(
+                    &mut self.state,
+                    session,
+                    channel,
+                    founder_account,
+                    topic,
+                    label,
+                    result,
+                );
+            }
+            Input::ChannelList { request } => {
+                handler::channel_list(&mut self.state, request);
+            }
+            Input::ChannelListResult { result } => {
+                assert_eq!(
+                    result.session.shard(),
+                    self.shard,
+                    "LIST result reached wrong session shard"
+                );
+                handler::channel_list_result(&mut self.state, result);
+            }
+            Input::ChannelSessionEvent { session, event } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "channel event reached wrong session shard"
+                );
+                handler::channel_session_event(&mut self.state, session.conn(), event);
+            }
+            Input::ChannelMemberUpdate { update } => {
+                assert_eq!(
+                    update.owner().shard(),
+                    self.shard,
+                    "member update reached wrong channel shard"
+                );
+                self.state.apply_channel_member_update(update);
+            }
             Input::SessionChannelRemoved { session, key } => {
                 assert_eq!(
                     session.shard(),
@@ -2047,6 +2045,13 @@ impl Core {
             // DB write path so the buffered history flushes.
             Input::Shutdown => self.state.broadcast_shutdown("Server shutting down"),
             Input::Admin { req, reply } => {
+                if let Some(channel) = req.channel() {
+                    let owner = self.state.channel_owner(channel);
+                    if owner.shard() != self.shard {
+                        self.state.route_input(Input::Admin { req, reply });
+                        return;
+                    }
+                }
                 handler::admin::handle(&mut self.state, req, reply);
             }
             Input::ChannelDropResult {
@@ -2064,11 +2069,17 @@ impl Core {
                 handler::oper::server_ban_result(&mut self.state, mutation, requester, result);
             }
             Input::ChannelControlResult {
+                owner,
                 request_id,
                 channel,
                 mutation,
                 result,
             } => {
+                assert_eq!(
+                    owner.shard(),
+                    self.shard,
+                    "channel control reached wrong shard"
+                );
                 handler::admin::channel_control_result(
                     &mut self.state,
                     request_id,
@@ -2078,12 +2089,18 @@ impl Core {
                 );
             }
             Input::OwnedChannelRegistrationResult {
+                owner,
                 request_id,
                 channel,
                 founder_account,
                 topic,
                 result,
             } => {
+                assert_eq!(
+                    owner.shard(),
+                    self.shard,
+                    "channel registration reached wrong shard"
+                );
                 handler::admin::owned_channel_registration_result(
                     &mut self.state,
                     request_id,
@@ -2195,11 +2212,15 @@ mod connection_id_allocator_tests {
 #[cfg(test)]
 mod ingress_tests {
     use super::{
-        ConnId, ConnectionTransport, Core, CoreConfig, CoreIngress, CoreScheduler, CoreShardCount,
-        CoreShardId, CoreTraceStep, CoreWorker, Input, ReplayError, SessionOwner,
+        ConnId, ConnectionTransport, Core, CoreConfig, CoreDirectories, CoreIngress, CoreScheduler,
+        CoreShardCount, CoreShardId, CoreTraceStep, CoreWorker, Input, ReplayError, SessionOwner,
+    };
+    use crate::core::state::{
+        Caps, ChanModes, Channel, ChannelActor, ChannelCommand, ChannelCommandOperation,
+        ChannelMemberProfile, MemberIdentity, MemberModes, Recipient,
     };
     use bytes::Bytes;
-    use e6irc_queue::{Config, Policy, queue};
+    use e6irc_queue::{Config, Envelope, Policy, Receiver, Sender, queue};
     use std::num::NonZeroUsize;
     use std::sync::Arc;
 
@@ -2231,16 +2252,164 @@ mod ingress_tests {
         }
     }
 
+    struct TwoWorkerHarness {
+        first: Core,
+        second: Core,
+        first_tx: Sender<Input>,
+        first_rx: Receiver<Input>,
+        second_tx: Sender<Input>,
+        second_rx: Receiver<Input>,
+        ingress: CoreIngress,
+    }
+
+    fn two_worker_harness() -> TwoWorkerHarness {
+        let config = Config {
+            name: "two-worker-routing",
+            capacity: 64,
+            policy: Policy::Fifo,
+        };
+        let (first_tx, first_rx) = queue(config);
+        let (second_tx, second_rx) = queue(config);
+        let ingress = CoreIngress::with_shards(first_tx.clone(), vec![second_tx.clone()]);
+        let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
+        let directories = ingress.directories();
+        let (first_db, _first_db_rx) = queue(Config {
+            name: "two-worker-first-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let (second_db, _second_db_rx) = queue(Config {
+            name: "two-worker-second-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let first = Core::with_telemetry_on_shard_with_directories(
+            core_config(),
+            first_db,
+            Arc::new(crate::observability::Telemetry::new()),
+            CoreShardId(0),
+            shards,
+            directories.clone(),
+        );
+        let second = Core::with_telemetry_on_shard_with_directories(
+            core_config(),
+            second_db,
+            Arc::new(crate::observability::Telemetry::new()),
+            CoreShardId(1),
+            shards,
+            directories,
+        );
+        TwoWorkerHarness {
+            first,
+            second,
+            first_tx,
+            first_rx,
+            second_tx,
+            second_rx,
+            ingress,
+        }
+    }
+
+    #[test]
+    fn registered_channel_ownership_is_shared_by_core_shards() {
+        let TwoWorkerHarness {
+            mut first, second, ..
+        } = two_worker_harness();
+        first.preload_founders(vec![("#chat".into(), "alice".into())]);
+        let key = second.state.chan_key("#chat");
+        assert!(second.state.is_founder(&key, "alice"));
+        assert!(second.state.is_registered(&key));
+    }
+
+    #[test]
+    fn retained_topics_are_shared_by_core_shards() {
+        let TwoWorkerHarness {
+            mut first, second, ..
+        } = two_worker_harness();
+        first.preload_topics(vec![(
+            "#chat".into(),
+            "Retained topic".into(),
+            "alice".into(),
+            42,
+        )]);
+        let key = second.state.chan_key("#chat");
+        assert_eq!(
+            second.state.registered_topics.get(&key).map(|topic| (
+                topic.text,
+                topic.set_by,
+                topic.set_at_secs
+            )),
+            Some(("Retained topic".into(), "alice".into(), 42))
+        );
+    }
+
+    #[test]
+    fn durable_channel_options_are_shared_by_core_shards() {
+        let TwoWorkerHarness {
+            mut first, second, ..
+        } = two_worker_harness();
+        first.preload_keeptopic_off(vec!["#chat".into()]);
+        first
+            .preload_mlock(vec![("#chat".into(), "+im".into())])
+            .expect("valid mode lock");
+        first.preload_access(vec![("#chat".into(), "alice".into(), "ov".into())]);
+
+        let key = second.state.chan_key("#chat");
+        assert!(!second.state.channel_options.keeptopic_enabled(&key));
+        assert_eq!(
+            second
+                .state
+                .channel_options
+                .mlock(&key)
+                .map(|modes| modes.render()),
+            Some("+im".into())
+        );
+        assert_eq!(second.state.access_modes(&key, "alice"), (true, true));
+    }
+
+    #[test]
+    fn owner_channel_admin_request_reaches_its_channel_shard() {
+        let TwoWorkerHarness {
+            mut first, second, ..
+        } = two_worker_harness();
+        let channel = ["#alpha", "#beta", "#gamma"]
+            .into_iter()
+            .find(|name| first.state.channel_owner(name).shard() == CoreShardId(1))
+            .expect("a channel owned by shard one");
+        let (reply, _response) = tokio::sync::oneshot::channel();
+        first.handle(Input::Admin {
+            req: super::AdminRequest::RegisterOwnedChannel {
+                channel: channel.into(),
+                actor: "alice".into(),
+            },
+            reply,
+        });
+        assert!(matches!(
+            first.take_effects().as_slice(),
+            [super::CoreEffect::Input(Input::Admin { .. })]
+        ));
+        assert_eq!(second.shard, CoreShardId(1));
+    }
+
+    async fn next_output(rx: &mut Receiver<super::Output>) -> Envelope<super::Output> {
+        loop {
+            if let Some(output) = rx.try_pop() {
+                return output;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     #[tokio::test]
     async fn connection_events_keep_one_deterministic_owner() {
         let (first, mut first_rx) = queue(Config {
             name: "first-core-shard",
-            capacity: 2,
+            capacity: 3,
             policy: Policy::Fifo,
         });
         let (second, mut second_rx) = queue(Config {
             name: "second-core-shard",
-            capacity: 2,
+            capacity: 3,
             policy: Policy::Fifo,
         });
         let ingress = CoreIngress::with_shards(first, vec![second]);
@@ -2288,44 +2457,462 @@ mod ingress_tests {
     }
 
     #[tokio::test]
-    async fn remote_channel_message_reaches_the_destination_workers_sendq() {
-        use crate::core::state::{
-            Caps, ChanModes, Channel, MemberIdentity, MemberModes, Recipient,
-        };
-
+    async fn channel_commands_reach_their_channel_owner() {
         let config = Config {
-            name: "two-worker-core",
-            capacity: 4,
+            name: "channel-command-routing",
+            capacity: 2,
             policy: Policy::Fifo,
         };
-        let (first_tx, first_rx) = queue(config);
-        let (second_tx, second_rx) = queue(config);
-        let ingress = CoreIngress::with_shards(first_tx.clone(), vec![second_tx.clone()]);
+        let (first_tx, _first_rx) = queue(config);
+        let (second_tx, mut second_rx) = queue(config);
+        let ingress = CoreIngress::with_shards(first_tx, vec![second_tx]);
         let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
-        let (first_db, _first_db_rx) = queue(Config {
-            name: "first-worker-db",
+        let (db_tx, _db_rx) = queue(Config {
+            name: "channel-command-db",
             capacity: 1,
             policy: Policy::Fifo,
         });
-        let (second_db, _second_db_rx) = queue(Config {
-            name: "second-worker-db",
-            capacity: 1,
-            policy: Policy::Fifo,
-        });
-        let mut first = Core::with_telemetry_on_shard(
+        let core = Core::with_telemetry_on_shard_with_directories(
             core_config(),
-            first_db,
+            db_tx,
             Arc::new(crate::observability::Telemetry::new()),
             CoreShardId(0),
             shards,
+            ingress.directories(),
         );
-        let mut second = Core::with_telemetry_on_shard(
-            core_config(),
-            second_db,
-            Arc::new(crate::observability::Telemetry::new()),
-            CoreShardId(1),
-            shards,
+        let target = ["#alpha", "#beta", "#gamma"]
+            .into_iter()
+            .find(|name| core.state.channel_owner(name).shard() == CoreShardId(1))
+            .expect("a target owned by shard one");
+        let command = ChannelCommand::new(
+            core.state.channel_owner(target),
+            ChannelActor {
+                recipient: Recipient::new(
+                    SessionOwner::new(ConnId(2), CoreShardId(0)),
+                    Caps::default(),
+                ),
+                identity: MemberIdentity::new(
+                    "requester".into(),
+                    "requester!u@host.test".into(),
+                    false,
+                ),
+                account: None,
+                realname: "Requester".into(),
+                away: None,
+                bot: false,
+                profile: ChannelMemberProfile {
+                    user: "u".into(),
+                    host: "host.test".into(),
+                    realname: "Requester".into(),
+                    account: None,
+                    away: false,
+                    oper: false,
+                    bot: false,
+                    last_active: mono_clock(),
+                },
+            },
+            target.into(),
+            ChannelCommandOperation::ChanServOp {
+                target_nick: "target".into(),
+            },
+            None,
         );
+
+        ingress
+            .push(Input::ChannelCommand { command })
+            .await
+            .expect("channel command routed");
+        assert!(matches!(
+            second_rx.pop().await.expect("channel owner event").payload,
+            Input::ChannelCommand { command }
+                if matches!(
+                    command.operation(),
+                    ChannelCommandOperation::ChanServOp { .. }
+                )
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_knock_runs_on_the_channel_owner() {
+        let TwoWorkerHarness {
+            mut first,
+            mut second,
+            first_tx,
+            first_rx,
+            second_tx,
+            second_rx,
+            ingress,
+        } = two_worker_harness();
+        let output_config = Config {
+            name: "remote-knock-output",
+            capacity: 64,
+            policy: Policy::Fifo,
+        };
+        let (alice_tx, mut alice_rx) = queue(output_config);
+        let (bob_tx, mut bob_rx) = queue(output_config);
+        first.state.open(
+            ConnId(2),
+            alice_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        second.state.open(
+            ConnId(1),
+            bob_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        for (core, conn, nick) in [
+            (&mut first, ConnId(2), "alice"),
+            (&mut second, ConnId(1), "bob"),
+        ] {
+            core.handle(Input::Line {
+                conn,
+                line: format!("NICK {nick}").into_bytes(),
+            });
+            core.handle(Input::Line {
+                conn,
+                line: format!("USER {nick} 0 * :{nick}").into_bytes(),
+            });
+        }
+        while alice_rx.try_pop().is_some() {}
+        while bob_rx.try_pop().is_some() {}
+        {
+            let bob = second
+                .state
+                .sessions
+                .get_mut(&ConnId(1))
+                .expect("bob session");
+            bob.caps.batch = true;
+            bob.caps.chathistory = true;
+        }
+        let key = first.state.chan_key("#chat");
+        assert_eq!(first.state.channel_owner("#chat").shard(), CoreShardId(0));
+        let modes = ChanModes {
+            invite_only: true,
+            ..ChanModes::default()
+        };
+        let mut channel = Channel::new("#chat".into(), None, modes, 0);
+        channel.add_member(
+            Recipient::new(
+                SessionOwner::new(ConnId(2), CoreShardId(0)),
+                Caps::default(),
+            ),
+            MemberIdentity::new("alice".into(), "alice!alice@host.test".into(), false),
+            MemberModes {
+                op: true,
+                voice: false,
+            },
+        );
+        first.state.channels.entry(key).or_insert(channel);
+        let other = ["#delta", "#echo", "#foxtrot"]
+            .into_iter()
+            .find(|name| second.state.channel_owner(name).shard() == CoreShardId(1))
+            .expect("a channel owned by shard one");
+        let other_key = second.state.chan_key(other);
+        second
+            .state
+            .channels
+            .entry(other_key)
+            .or_insert(Channel::new(other.into(), None, ChanModes::default(), 0));
+        let first_worker = tokio::spawn(CoreWorker::new(first, first_rx, ingress.clone()).run());
+        let second_worker = tokio::spawn(CoreWorker::new(second, second_rx, ingress.clone()).run());
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"KNOCK #chat".to_vec(),
+            })
+            .expect("knock queued");
+        let operator = next_output(&mut alice_rx).await;
+        assert!(
+            operator
+                .payload
+                .0
+                .ends_with(b" 710 alice #chat bob!bob@host.test :has asked for an invite\r\n")
+        );
+        let result = next_output(&mut bob_rx).await;
+        assert!(
+            result
+                .payload
+                .0
+                .ends_with(b" 711 bob :Your KNOCK has been delivered\r\n")
+        );
+        first_tx
+            .try_push(Input::Line {
+                conn: ConnId(2),
+                line: b"INVITE bob #chat".to_vec(),
+            })
+            .expect("invite queued");
+        let inviter = next_output(&mut alice_rx).await;
+        assert!(inviter.payload.0.ends_with(b" 341 alice bob #chat\r\n"));
+        let invitee = next_output(&mut bob_rx).await;
+        assert!(
+            invitee
+                .payload
+                .0
+                .ends_with(b":alice!alice@host.test INVITE bob :#chat\r\n")
+        );
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"JOIN #chat".to_vec(),
+            })
+            .expect("join queued");
+        loop {
+            let output = next_output(&mut bob_rx).await;
+            if output
+                .payload
+                .0
+                .ends_with(b" 366 bob #chat :End of /NAMES list\r\n")
+            {
+                break;
+            }
+        }
+        let joined = next_output(&mut alice_rx).await;
+        assert!(
+            joined
+                .payload
+                .0
+                .ends_with(b":bob!bob@host.test JOIN #chat\r\n")
+        );
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"NICK robert".to_vec(),
+            })
+            .expect("nick queued");
+        let renamed_self = next_output(&mut bob_rx).await;
+        assert!(
+            renamed_self
+                .payload
+                .0
+                .ends_with(b":bob!bob@host.test NICK robert\r\n")
+        );
+        let renamed = next_output(&mut alice_rx).await;
+        assert!(
+            renamed
+                .payload
+                .0
+                .ends_with(b":bob!bob@host.test NICK robert\r\n")
+        );
+        first_tx
+            .try_push(Input::Line {
+                conn: ConnId(2),
+                line: b"MODE #chat +b bad!*@*".to_vec(),
+            })
+            .expect("mode change queued");
+        let _ = next_output(&mut alice_rx).await;
+        let _ = next_output(&mut bob_rx).await;
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"MODE #chat +b".to_vec(),
+            })
+            .expect("mode list queued");
+        let ban = next_output(&mut bob_rx).await;
+        assert!(ban.payload.0.ends_with(b" 367 robert #chat bad!*@*\r\n"));
+        let end = next_output(&mut bob_rx).await;
+        assert!(
+            end.payload
+                .0
+                .ends_with(b" 368 robert #chat :End of Channel Ban List\r\n")
+        );
+        first_tx
+            .try_push(Input::Line {
+                conn: ConnId(2),
+                line: b"MODE #chat +o robert".to_vec(),
+            })
+            .expect("grant operator queued");
+        let _ = next_output(&mut alice_rx).await;
+        let _ = next_output(&mut bob_rx).await;
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"MODE #chat +k".to_vec(),
+            })
+            .expect("remote mode error queued");
+        let mode_error = next_output(&mut bob_rx).await;
+        assert!(
+            mode_error
+                .payload
+                .0
+                .ends_with(b" 461 robert MODE :Not enough parameters\r\n")
+        );
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"MODE #chat +m".to_vec(),
+            })
+            .expect("remote mode change queued");
+        let changed = next_output(&mut bob_rx).await;
+        assert!(
+            changed
+                .payload
+                .0
+                .ends_with(b":robert!bob@host.test MODE #chat +m\r\n")
+        );
+        let observed = next_output(&mut alice_rx).await;
+        assert!(
+            observed
+                .payload
+                .0
+                .ends_with(b":robert!bob@host.test MODE #chat +m\r\n")
+        );
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"NAMES #chat".to_vec(),
+            })
+            .expect("remote names queued");
+        let names = next_output(&mut bob_rx).await;
+        assert!(
+            names
+                .payload
+                .0
+                .ends_with(b" 353 robert = #chat :@alice @robert\r\n")
+        );
+        let end = next_output(&mut bob_rx).await;
+        assert!(
+            end.payload
+                .0
+                .ends_with(b" 366 robert #chat :End of /NAMES list\r\n")
+        );
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"AWAY :testing".to_vec(),
+            })
+            .expect("remote away queued");
+        let away = next_output(&mut bob_rx).await;
+        assert!(
+            away.payload
+                .0
+                .ends_with(b" 306 robert :You have been marked as being away\r\n")
+        );
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"WHO #chat".to_vec(),
+            })
+            .expect("remote who queued");
+        let first_who = next_output(&mut bob_rx).await;
+        let second_who = next_output(&mut bob_rx).await;
+        let who_end = next_output(&mut bob_rx).await;
+        let who_rows = [first_who.payload.0, second_who.payload.0];
+        assert!(who_rows.iter().any(|line| {
+            line.ends_with(b" 352 robert #chat alice host.test irc.test alice H@ :0 alice\r\n")
+        }));
+        assert!(who_rows.iter().any(|line| {
+            line.ends_with(b" 352 robert #chat bob host.test irc.test robert G@ :0 bob\r\n")
+        }));
+        assert!(
+            who_end
+                .payload
+                .0
+                .ends_with(b" 315 robert #chat :End of /WHO list\r\n")
+        );
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"PRIVMSG #chat :historic".to_vec(),
+            })
+            .expect("remote history message queued");
+        let historic = next_output(&mut alice_rx).await;
+        assert!(historic.payload.0.ends_with(b"PRIVMSG #chat :historic\r\n"));
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"CHATHISTORY LATEST #chat * 1".to_vec(),
+            })
+            .expect("remote chathistory queued");
+        let history = [
+            next_output(&mut bob_rx).await,
+            next_output(&mut bob_rx).await,
+            next_output(&mut bob_rx).await,
+        ];
+        assert!(history.iter().any(|output| {
+            output
+                .payload
+                .0
+                .windows(17)
+                .any(|part| part == b"chathistory #chat")
+        }));
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"LIST #chat".to_vec(),
+            })
+            .expect("remote list queued");
+        let list_start = next_output(&mut bob_rx).await;
+        let list_row = next_output(&mut bob_rx).await;
+        let list_end = next_output(&mut bob_rx).await;
+        assert!(
+            list_start
+                .payload
+                .0
+                .ends_with(b" 321 robert Channel :Users  Name\r\n")
+        );
+        assert!(list_row.payload.0.ends_with(b" 322 robert #chat 2 :\r\n"));
+        assert!(
+            list_end
+                .payload
+                .0
+                .ends_with(b" 323 robert :End of /LIST\r\n")
+        );
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"LIST".to_vec(),
+            })
+            .expect("whole-network list queued");
+        let list_start = next_output(&mut bob_rx).await;
+        let first_row = next_output(&mut bob_rx).await;
+        let second_row = next_output(&mut bob_rx).await;
+        let list_end = next_output(&mut bob_rx).await;
+        assert!(
+            list_start
+                .payload
+                .0
+                .ends_with(b" 321 robert Channel :Users  Name\r\n")
+        );
+        assert!(first_row.payload.0.ends_with(b" 322 robert #chat 2 :\r\n"));
+        assert!(
+            first_row
+                .payload
+                .0
+                .ends_with(format!(" 322 robert {other} 0 :\r\n").as_bytes())
+                || second_row
+                    .payload
+                    .0
+                    .ends_with(format!(" 322 robert {other} 0 :\r\n").as_bytes())
+        );
+        assert!(
+            first_row.payload.0.ends_with(b" 322 robert #chat 2 :\r\n")
+                || second_row.payload.0.ends_with(b" 322 robert #chat 2 :\r\n")
+        );
+        assert!(
+            list_end
+                .payload
+                .0
+                .ends_with(b" 323 robert :End of /LIST\r\n")
+        );
+        first_tx.try_push(Input::Shutdown).expect("stop first");
+        second_tx.try_push(Input::Shutdown).expect("stop second");
+        first_worker.await.expect("first worker");
+        second_worker.await.expect("second worker");
+    }
+
+    #[tokio::test]
+    async fn remote_channel_message_reaches_the_destination_workers_sendq() {
+        let TwoWorkerHarness {
+            mut first,
+            mut second,
+            first_tx,
+            first_rx,
+            second_tx,
+            second_rx,
+            ingress,
+        } = two_worker_harness();
         let (out_tx, mut out_rx) = queue(Config {
             name: "remote-member-sendq",
             capacity: 8,
@@ -2403,43 +2990,15 @@ mod ingress_tests {
 
     #[tokio::test]
     async fn remote_join_returns_to_the_session_owner() {
-        use crate::core::state::{
-            Caps, ChanModes, Channel, MemberIdentity, MemberModes, Recipient,
-        };
-
-        let config = Config {
-            name: "two-worker-join",
-            capacity: 8,
-            policy: Policy::Fifo,
-        };
-        let (first_tx, first_rx) = queue(config);
-        let (second_tx, second_rx) = queue(config);
-        let ingress = CoreIngress::with_shards(first_tx.clone(), vec![second_tx.clone()]);
-        let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
-        let (first_db, _first_db_rx) = queue(Config {
-            name: "first-worker-db",
-            capacity: 1,
-            policy: Policy::Fifo,
-        });
-        let (second_db, _second_db_rx) = queue(Config {
-            name: "second-worker-db",
-            capacity: 1,
-            policy: Policy::Fifo,
-        });
-        let mut first = Core::with_telemetry_on_shard(
-            core_config(),
-            first_db,
-            Arc::new(crate::observability::Telemetry::new()),
-            CoreShardId(0),
-            shards,
-        );
-        let mut second = Core::with_telemetry_on_shard(
-            core_config(),
-            second_db,
-            Arc::new(crate::observability::Telemetry::new()),
-            CoreShardId(1),
-            shards,
-        );
+        let TwoWorkerHarness {
+            mut first,
+            mut second,
+            first_tx,
+            first_rx,
+            second_tx,
+            second_rx,
+            ingress,
+        } = two_worker_harness();
         assert_eq!(first.state.channel_owner("#chat").shard(), CoreShardId(0));
 
         let (peer_tx, mut peer_rx) = queue(Config {
@@ -2860,12 +3419,13 @@ mod ingress_tests {
             capacity: 1,
             policy: Policy::Fifo,
         });
-        let core = Core::with_telemetry_on_shard(
+        let core = Core::with_telemetry_on_shard_with_directories(
             core_config(),
             db_tx,
             Arc::new(crate::observability::Telemetry::new()),
             CoreShardId(1),
             CoreShardCount::new(NonZeroUsize::new(2).expect("nonzero shard count")),
+            CoreDirectories::default(),
         );
         let (tx, rx) = queue(Config {
             name: "nonzero-core-shard-input",

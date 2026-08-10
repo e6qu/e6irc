@@ -17,15 +17,22 @@ fn unmonitor(state: &mut ServerState, conn: ConnId, key: &crate::core::state::Ni
     }
 }
 
+fn monitor_watchers(state: &ServerState, nick: &str) -> Option<Vec<ConnId>> {
+    let key = state.nick_key(nick);
+    state
+        .monitors
+        .get(&key)
+        .map(|watchers| watchers.iter().copied().collect())
+}
+
 /// Notify everyone monitoring `nick` that it is now (`online`) or no
 /// longer (`offline`) present. `subject` is the full prefix when
 /// online, the bare nick when offline (per the monitor spec).
 pub(crate) fn monitor_notify(state: &mut ServerState, nick: &str, online: bool) {
     let key = state.nick_key(nick);
-    let Some(watchers) = state.monitors.get(&key) else {
+    let Some(watchers) = monitor_watchers(state, nick) else {
         return;
     };
-    let watchers: Vec<ConnId> = watchers.iter().copied().collect();
     let subject = if online {
         state
             .registered_peer(&key)
@@ -56,11 +63,9 @@ pub(crate) fn monitor_event(
     event_cap: fn(&crate::core::state::Caps) -> bool,
     already: &std::collections::HashSet<ConnId>,
 ) {
-    let key = state.nick_key(nick);
-    let Some(watchers) = state.monitors.get(&key) else {
+    let Some(watchers) = monitor_watchers(state, nick) else {
         return;
     };
-    let watchers: Vec<ConnId> = watchers.iter().copied().collect();
     for watcher in watchers {
         if already.contains(&watcher) {
             continue;

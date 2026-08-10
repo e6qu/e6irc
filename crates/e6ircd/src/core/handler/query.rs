@@ -96,6 +96,13 @@ pub(super) fn who_flags(session: &crate::core::state::Session, sigil: &str) -> S
     format!("{here}{star}{bot}{sigil}")
 }
 
+fn who_flags_profile(profile: &crate::core::state::ChannelMemberProfile, sigil: &str) -> String {
+    let here = if profile.away { "G" } else { "H" };
+    let star = if profile.oper { "*" } else { "" };
+    let bot = if profile.bot { "B" } else { "" };
+    format!("{here}{star}{bot}{sigil}")
+}
+
 struct WhoRowData {
     user: String,
     host: String,
@@ -111,6 +118,24 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(conn, RPL_ENDOFWHO, &["*"], Some("End of /WHO list"));
         return;
     };
+    if mask.starts_with('#') {
+        let owner = state.channel_owner(mask);
+        if !state.owns_channel(&owner) {
+            let label = state.channel_reply_label(conn, &owner);
+            state.route_channel_command(crate::core::state::ChannelCommand::new(
+                owner,
+                state.channel_actor(conn),
+                mask.to_string(),
+                crate::core::state::ChannelCommandOperation::Who(
+                    crate::core::state::ChannelWhoQuery {
+                        argument: p.get(1).copied().unwrap_or("").to_string(),
+                    },
+                ),
+                label,
+            ));
+            return;
+        }
+    }
     // The RFC 2812 `o` flag restricts matches to operators; Solanum also
     // accepts it combined with a WHOX spec (`WHO * o%nf`). Anything else in
     // the flags position is ignored, as before.
@@ -120,7 +145,7 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         _ => (false, arg),
     };
     let whox = parse_whox(whox_part);
-    let requester_multi_prefix = state.sessions[&conn].caps.multi_prefix;
+    let requester_multi_prefix = state.reply_caps(conn).multi_prefix;
     let server = state.config.server_name.clone();
     // Monotonic: idle is elapsed time since `last_active` (also monotonic).
     let now = (state.config.mono_clock)();
@@ -134,19 +159,18 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             let rows: Vec<WhoRowData> = if hidden {
                 Vec::new()
             } else {
-                chan.members()
+                chan.member_profiles()
                     // An invisible member is hidden from a WHO by someone who
                     // shares no channel with them (and isn't them) — the same
                     // rule the wildcard/host branch below applies. A fellow
                     // member always shares this channel, so members still see
                     // each other; only an outsider WHOing a public channel is
                     // filtered. Without this, `+i` leaks through channel WHO.
-                    .filter(|(m, _)| {
-                        *m == conn || !state.sessions[m].invisible || state.share_channel(conn, *m)
+                    .filter(|(m, _, identity, _)| {
+                        *m == conn || !identity.invisible || state.share_channel(conn, *m)
                     })
-                    .filter(|(m, _)| !opers_only || state.sessions[m].oper)
-                    .map(|(m, modes)| {
-                        let s = &state.sessions[&m];
+                    .filter(|(_, _, _, profile)| !opers_only || profile.oper)
+                    .map(|(_, modes, identity, profile)| {
                         let sigil = match (modes.op, modes.voice, requester_multi_prefix) {
                             (true, true, true) => "@+",
                             (true, _, _) => "@",
@@ -154,13 +178,13 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                             _ => "",
                         };
                         WhoRowData {
-                            user: s.user().map(String::from).expect("registered"),
-                            host: s.host.clone(),
-                            nick: s.nick().map(String::from).expect("registered"),
-                            flags: who_flags(s, sigil),
-                            realname: s.realname().map(String::from).expect("registered"),
-                            account: s.account.clone(),
-                            idle_secs: now.saturating_sub(s.last_active).as_secs(),
+                            user: profile.user.clone(),
+                            host: profile.host.clone(),
+                            nick: identity.nick.clone(),
+                            flags: who_flags_profile(profile, sigil),
+                            realname: profile.realname.clone(),
+                            account: profile.account.clone(),
+                            idle_secs: now.saturating_sub(profile.last_active).as_secs(),
                         }
                     })
                     .collect()
@@ -275,6 +299,37 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         &[clip_echo(mask)],
         Some("End of /WHO list"),
     );
+}
+
+pub(super) fn who_on_owner(
+    state: &mut ServerState,
+    command: crate::core::state::ChannelCommand,
+) -> crate::core::state::ChannelCommandReplies {
+    let (owner, actor, target, operation) = command.into_parts();
+    let crate::core::state::ChannelCommandOperation::Who(query) = operation else {
+        unreachable!("WHO requires its operation")
+    };
+    let key = state.chan_key(&target);
+    assert_eq!(owner.key(), &key, "WHO owner does not match target");
+    debug_assert!(
+        state.capture.is_none(),
+        "channel owner must not have a capture"
+    );
+    state.capture = Some(crate::core::state::Capture {
+        conn: actor.recipient.conn(),
+        lines: Vec::new(),
+        reply_target: Some(actor.identity.nick),
+        reply_caps: Some(actor.recipient.caps()),
+        label: None,
+        deferred: false,
+    });
+    cmd_who(
+        state,
+        actor.recipient.conn(),
+        &[target.as_str(), query.argument.as_str()],
+    );
+    let lines = state.capture.take().expect("WHO capture installed").lines;
+    crate::core::state::ChannelCommandReplies { lines }
 }
 
 pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {

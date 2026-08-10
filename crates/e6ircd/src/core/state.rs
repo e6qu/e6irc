@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Index;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use e6irc_proto::casemap::CaseMapping;
@@ -40,28 +40,118 @@ impl NickKey {
     }
 }
 
-/// The sole owner of nick reservations and their worker assignment.
-#[derive(Default)]
+/// Process-wide nick reservations and their session owners.
+#[derive(Clone, Default)]
 pub(crate) struct NickDirectory {
-    by_key: HashMap<NickKey, SessionOwner>,
+    by_key: Arc<Mutex<HashMap<NickKey, NickReservation>>>,
+}
+
+#[derive(Clone, Copy)]
+struct NickReservation {
+    owner: SessionOwner,
+    registered: bool,
 }
 
 impl NickDirectory {
     pub(crate) fn owner(&self, key: &NickKey) -> Option<SessionOwner> {
-        self.by_key.get(key).copied()
+        self.by_key
+            .lock()
+            .expect("nick directory poisoned")
+            .get(key)
+            .map(|reservation| reservation.owner)
     }
 
-    pub(crate) fn reserve(&mut self, key: NickKey, owner: SessionOwner) {
-        self.by_key.insert(key, owner);
+    pub(crate) fn registered_owner(&self, key: &NickKey) -> Option<SessionOwner> {
+        self.by_key
+            .lock()
+            .expect("nick directory poisoned")
+            .get(key)
+            .and_then(|reservation| reservation.registered.then_some(reservation.owner))
     }
 
-    pub(crate) fn release_if_owned(&mut self, key: &NickKey, conn: ConnId) -> bool {
-        if self.owner(key).is_some_and(|owner| owner.conn() == conn) {
-            self.by_key.remove(key);
-            true
-        } else {
-            false
+    pub(crate) fn claim(&self, key: NickKey, owner: SessionOwner, registered: bool) -> bool {
+        let mut by_key = self.by_key.lock().expect("nick directory poisoned");
+        match by_key.get(&key) {
+            Some(existing) if existing.owner.conn() != owner.conn() => false,
+            _ => {
+                by_key.insert(key, NickReservation { owner, registered });
+                true
+            }
         }
+    }
+
+    pub(crate) fn release_if_owned(&self, key: &NickKey, conn: ConnId) -> bool {
+        let mut by_key = self.by_key.lock().expect("nick directory poisoned");
+        if by_key
+            .get(key)
+            .is_some_and(|owner| owner.owner.conn() == conn)
+        {
+            by_key.remove(key);
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn mark_registered(&self, key: &NickKey, conn: ConnId) {
+        if let Some(reservation) = self
+            .by_key
+            .lock()
+            .expect("nick directory poisoned")
+            .get_mut(key)
+            && reservation.owner.conn() == conn
+        {
+            reservation.registered = true;
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct MembershipDirectory {
+    by_conn: Arc<Mutex<HashMap<ConnId, HashSet<ChanKey>>>>,
+}
+
+impl MembershipDirectory {
+    pub(crate) fn join(&self, conn: ConnId, key: ChanKey) {
+        self.by_conn
+            .lock()
+            .expect("membership directory poisoned")
+            .entry(conn)
+            .or_default()
+            .insert(key);
+    }
+
+    pub(crate) fn part(&self, conn: ConnId, key: &ChanKey) {
+        let mut by_conn = self.by_conn.lock().expect("membership directory poisoned");
+        let Some(channels) = by_conn.get_mut(&conn) else {
+            return;
+        };
+        channels.remove(key);
+        if channels.is_empty() {
+            by_conn.remove(&conn);
+        }
+    }
+
+    pub(crate) fn release(&self, conn: ConnId) {
+        self.by_conn
+            .lock()
+            .expect("membership directory poisoned")
+            .remove(&conn);
+    }
+
+    pub(crate) fn shares(&self, a: ConnId, b: ConnId) -> bool {
+        let by_conn = self.by_conn.lock().expect("membership directory poisoned");
+        let (Some(a), Some(b)) = (by_conn.get(&a), by_conn.get(&b)) else {
+            return false;
+        };
+        a.intersection(b).next().is_some()
+    }
+
+    pub(crate) fn contains(&self, conn: ConnId, key: &ChanKey) -> bool {
+        self.by_conn
+            .lock()
+            .expect("membership directory poisoned")
+            .get(&conn)
+            .is_some_and(|channels| channels.contains(key))
     }
 }
 
@@ -131,6 +221,244 @@ impl AccountKey {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Process-wide authoritative registered-channel ownership.
+#[derive(Clone, Default)]
+pub(crate) struct FounderDirectory {
+    by_channel: Arc<Mutex<HashMap<ChanKey, AccountKey>>>,
+}
+
+impl FounderDirectory {
+    pub(crate) fn replace(&self, rows: impl IntoIterator<Item = (ChanKey, AccountKey)>) {
+        *self.by_channel.lock().expect("founder directory poisoned") = rows.into_iter().collect();
+    }
+
+    pub(crate) fn founder(&self, key: &ChanKey) -> Option<AccountKey> {
+        self.by_channel
+            .lock()
+            .expect("founder directory poisoned")
+            .get(key)
+            .cloned()
+    }
+
+    pub(crate) fn set(&self, key: ChanKey, founder: AccountKey) {
+        self.by_channel
+            .lock()
+            .expect("founder directory poisoned")
+            .insert(key, founder);
+    }
+
+    pub(crate) fn remove(&self, key: &ChanKey) {
+        self.by_channel
+            .lock()
+            .expect("founder directory poisoned")
+            .remove(key);
+    }
+
+    pub(crate) fn count(&self, account: &AccountKey) -> usize {
+        self.by_channel
+            .lock()
+            .expect("founder directory poisoned")
+            .values()
+            .filter(|founder| *founder == account)
+            .count()
+    }
+}
+
+/// Process-wide retained topics for registered channels.
+#[derive(Clone, Default)]
+pub(crate) struct RetainedTopicDirectory {
+    by_channel: Arc<Mutex<HashMap<ChanKey, Topic>>>,
+}
+
+impl RetainedTopicDirectory {
+    pub(crate) fn replace(&self, rows: impl IntoIterator<Item = (ChanKey, Topic)>) {
+        *self
+            .by_channel
+            .lock()
+            .expect("retained topic directory poisoned") = rows.into_iter().collect();
+    }
+
+    pub(crate) fn get(&self, key: &ChanKey) -> Option<Topic> {
+        self.by_channel
+            .lock()
+            .expect("retained topic directory poisoned")
+            .get(key)
+            .cloned()
+    }
+
+    pub(crate) fn set(&self, key: ChanKey, topic: Topic) {
+        self.by_channel
+            .lock()
+            .expect("retained topic directory poisoned")
+            .insert(key, topic);
+    }
+
+    pub(crate) fn remove(&self, key: &ChanKey) {
+        self.by_channel
+            .lock()
+            .expect("retained topic directory poisoned")
+            .remove(key);
+    }
+}
+
+/// Process-wide durable options for registered channels.
+#[derive(Clone, Default)]
+pub(crate) struct ChannelOptionsDirectory {
+    inner: Arc<Mutex<ChannelOptions>>,
+}
+
+#[derive(Default)]
+struct ChannelOptions {
+    keeptopic_off: HashSet<ChanKey>,
+    mlock: HashMap<ChanKey, MlockModes>,
+    access: HashMap<ChanKey, HashMap<AccountKey, String>>,
+}
+
+impl ChannelOptionsDirectory {
+    pub(crate) fn replace_keeptopic_off(&self, names: impl IntoIterator<Item = ChanKey>) {
+        self.inner
+            .lock()
+            .expect("channel options directory poisoned")
+            .keeptopic_off = names.into_iter().collect();
+    }
+
+    pub(crate) fn set_keeptopic(&self, key: ChanKey, enabled: bool) {
+        let mut options = self
+            .inner
+            .lock()
+            .expect("channel options directory poisoned");
+        if enabled {
+            options.keeptopic_off.remove(&key);
+        } else {
+            options.keeptopic_off.insert(key);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keeptopic_enabled(&self, key: &ChanKey) -> bool {
+        !self
+            .inner
+            .lock()
+            .expect("channel options directory poisoned")
+            .keeptopic_off
+            .contains(key)
+    }
+
+    pub(crate) fn replace_mlock(&self, mlock: HashMap<ChanKey, MlockModes>) {
+        self.inner
+            .lock()
+            .expect("channel options directory poisoned")
+            .mlock = mlock;
+    }
+
+    pub(crate) fn mlock(&self, key: &ChanKey) -> Option<MlockModes> {
+        self.inner
+            .lock()
+            .expect("channel options directory poisoned")
+            .mlock
+            .get(key)
+            .cloned()
+    }
+
+    pub(crate) fn set_mlock(&self, key: ChanKey, mlock: Option<MlockModes>) {
+        let mut options = self
+            .inner
+            .lock()
+            .expect("channel options directory poisoned");
+        match mlock {
+            Some(mlock) => {
+                options.mlock.insert(key, mlock);
+            }
+            None => {
+                options.mlock.remove(&key);
+            }
+        }
+    }
+
+    pub(crate) fn replace_access(
+        &self,
+        rows: impl IntoIterator<Item = (ChanKey, AccountKey, String)>,
+    ) {
+        let mut access = HashMap::<ChanKey, HashMap<AccountKey, String>>::new();
+        for (channel, account, flags) in rows {
+            access.entry(channel).or_default().insert(account, flags);
+        }
+        self.inner
+            .lock()
+            .expect("channel options directory poisoned")
+            .access = access;
+    }
+
+    pub(crate) fn access_entries(&self, key: &ChanKey) -> Vec<(AccountKey, String)> {
+        self.inner
+            .lock()
+            .expect("channel options directory poisoned")
+            .access
+            .get(key)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(a, f)| (a.clone(), f.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn access_flags(&self, key: &ChanKey, account: &AccountKey) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("channel options directory poisoned")
+            .access
+            .get(key)
+            .and_then(|entries| entries.get(account))
+            .cloned()
+    }
+
+    pub(crate) fn set_access(&self, key: ChanKey, account: AccountKey, flags: Option<String>) {
+        let mut options = self
+            .inner
+            .lock()
+            .expect("channel options directory poisoned");
+        match flags {
+            Some(flags) => {
+                options
+                    .access
+                    .entry(key)
+                    .or_default()
+                    .insert(account, flags);
+            }
+            None => {
+                if let Some(entries) = options.access.get_mut(&key) {
+                    entries.remove(&account);
+                    if entries.is_empty() {
+                        options.access.remove(&key);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn remove(&self, key: &ChanKey) {
+        let mut options = self
+            .inner
+            .lock()
+            .expect("channel options directory poisoned");
+        options.keeptopic_off.remove(key);
+        options.mlock.remove(key);
+        options.access.remove(key);
+    }
+}
+
+/// Process-wide directories shared by all core shards.
+#[derive(Clone, Default)]
+pub(crate) struct CoreDirectories {
+    pub(crate) nicks: NickDirectory,
+    pub(crate) memberships: MembershipDirectory,
+    pub(crate) founders: FounderDirectory,
+    pub(crate) topics: RetainedTopicDirectory,
+    pub(crate) channel_options: ChannelOptionsDirectory,
 }
 
 pub struct CoreConfig {
@@ -683,6 +1011,39 @@ pub(crate) struct MemberIdentity {
     pub(crate) invisible: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ChannelMemberProfile {
+    pub(crate) user: String,
+    pub(crate) host: String,
+    pub(crate) realname: String,
+    pub(crate) account: Option<String>,
+    pub(crate) away: bool,
+    pub(crate) oper: bool,
+    pub(crate) bot: bool,
+    pub(crate) last_active: e6irc_proto::time::MonoMillis,
+}
+
+impl ChannelMemberProfile {
+    #[cfg(test)]
+    fn derived(identity: &MemberIdentity) -> Self {
+        let (_, user_host) = identity
+            .prefix
+            .split_once('!')
+            .unwrap_or((&identity.nick, ""));
+        let (user, host) = user_host.split_once('@').unwrap_or(("", ""));
+        Self {
+            user: user.to_string(),
+            host: host.to_string(),
+            realname: identity.nick.clone(),
+            account: None,
+            away: false,
+            oper: false,
+            bot: false,
+            last_active: e6irc_proto::time::MonoMillis::default(),
+        }
+    }
+}
+
 impl MemberIdentity {
     pub(crate) fn new(nick: String, prefix: String, invisible: bool) -> Self {
         Self {
@@ -702,6 +1063,7 @@ pub struct ChannelActor {
     pub(crate) realname: String,
     pub(crate) away: Option<String>,
     pub(crate) bot: bool,
+    pub(crate) profile: ChannelMemberProfile,
 }
 
 impl ChannelActor {
@@ -754,29 +1116,150 @@ pub struct ChannelQuit {
     line: String,
 }
 
-/// A parsed TOPIC request, owned by its channel shard.
+/// A parsed request, owned by its channel shard.
 #[derive(Debug, Clone)]
-pub struct ChannelTopic {
+pub struct ChannelRequest<Operation> {
     owner: ChannelOwner,
     actor: ChannelActor,
     target: String,
-    operation: ChannelTopicOperation,
+    operation: Operation,
     label: Option<String>,
 }
 
-/// A TOPIC request has exactly one operation.
+pub type ChannelTopic = ChannelRequest<ChannelTopicOperation>;
+
+/// A channel command that must execute on the channel owner.
+pub type ChannelCommand = ChannelRequest<ChannelCommandOperation>;
+
+/// Closed channel-command operations.
 #[derive(Debug, Clone)]
-pub enum ChannelTopicOperation {
-    Query,
-    Set(String),
+pub enum ChannelCommandOperation {
+    Knock,
+    Invite(ChannelInvitee),
+    ChanServRegister,
+    ChanServOp { target_nick: String },
+    Names,
+    Who(ChannelWhoQuery),
+    History(ChannelHistoryRequest),
+    ModeQuery,
+    ModeListQuery(String),
+    ModeChange(ChannelModeChange),
 }
 
-impl ChannelTopic {
+#[derive(Debug, Clone)]
+pub struct ChannelWhoQuery {
+    pub(crate) argument: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelHistoryRequest {
+    pub(crate) parameters: Vec<String>,
+}
+
+/// One whole-network LIST request. Each channel shard answers once.
+#[derive(Debug, Clone)]
+pub struct ChannelListRequest {
+    id: ChannelListRequestId,
+    session: SessionOwner,
+    actor: ChannelActor,
+    targets: Option<Vec<ChanKey>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChannelListRequestId(u64);
+
+impl ChannelListRequest {
+    fn new(
+        id: ChannelListRequestId,
+        session: SessionOwner,
+        actor: ChannelActor,
+        targets: Option<Vec<ChanKey>>,
+    ) -> Self {
+        Self {
+            id,
+            session,
+            actor,
+            targets,
+        }
+    }
+
+    pub(crate) fn id(&self) -> ChannelListRequestId {
+        self.id
+    }
+
+    pub(crate) fn session(&self) -> SessionOwner {
+        self.session
+    }
+
+    pub(crate) fn actor(&self) -> &ChannelActor {
+        &self.actor
+    }
+
+    pub(crate) fn targets(&self) -> Option<&[ChanKey]> {
+        self.targets.as_deref()
+    }
+}
+
+/// One visible channel row returned by a channel shard.
+#[derive(Debug, Clone)]
+pub struct ChannelListRow {
+    pub(crate) name: String,
+    pub(crate) members: usize,
+    pub(crate) topic: String,
+}
+
+/// A channel shard's complete contribution to a whole-network LIST request.
+#[derive(Debug)]
+pub struct ChannelListResult {
+    pub(crate) id: ChannelListRequestId,
+    pub(crate) session: SessionOwner,
+    pub(crate) rows: Vec<ChannelListRow>,
+}
+
+struct PendingChannelList {
+    session: SessionOwner,
+    remaining: usize,
+    label: Option<String>,
+    prefix: Vec<Bytes>,
+    rows: Vec<ChannelListRow>,
+}
+
+/// A parsed channel MODE mutation, with its mode token separate from arguments.
+#[derive(Debug, Clone)]
+pub struct ChannelModeChange {
+    pub(crate) modes: String,
+    pub(crate) arguments: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelInvitee {
+    owner: SessionOwner,
+    requested_nick: String,
+}
+
+impl ChannelInvitee {
+    pub(crate) fn new(owner: SessionOwner, requested_nick: String) -> Self {
+        Self {
+            owner,
+            requested_nick,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> SessionOwner {
+        self.owner
+    }
+
+    pub(crate) fn requested_nick(&self) -> &str {
+        &self.requested_nick
+    }
+}
+
+impl<Operation> ChannelRequest<Operation> {
     pub(crate) fn new(
         owner: ChannelOwner,
         actor: ChannelActor,
         target: String,
-        operation: ChannelTopicOperation,
+        operation: Operation,
         label: Option<String>,
     ) -> Self {
         Self {
@@ -791,15 +1274,182 @@ impl ChannelTopic {
     pub(crate) fn owner(&self) -> &ChannelOwner {
         &self.owner
     }
+
     pub(crate) fn actor(&self) -> &ChannelActor {
         &self.actor
     }
+
     pub(crate) fn label(&self) -> Option<String> {
         self.label.clone()
     }
-    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, String, ChannelTopicOperation) {
+
+    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, String, Operation) {
         (self.owner, self.actor, self.target, self.operation)
     }
+}
+
+impl<Operation: Clone> ChannelRequest<Operation> {
+    pub(crate) fn operation(&self) -> Operation {
+        self.operation.clone()
+    }
+}
+
+/// A channel command's reply to its requester.
+#[derive(Debug)]
+pub enum ChannelCommandResult {
+    Knock(ChannelKnockResult),
+    Invite(ChannelInviteResult),
+    ChanServRegister(ChanServRegisterResult),
+    ChanServOp(ChanServOpResult),
+    Names(ChannelCommandReplies),
+    Who(ChannelCommandReplies),
+    History(ChannelHistoryResult),
+    ModeQuery(ChannelModeQueryResult),
+    ModeListQuery(ChannelModeListQueryResult),
+    ModeChange(ChannelCommandReplies),
+}
+
+#[derive(Debug)]
+pub enum ChanServRegisterResult {
+    NotChannelOperator { channel: String },
+    RegistrationPending { channel: String },
+    RegistrationLimit,
+    Registered { channel: String },
+    Exists,
+    Unavailable,
+}
+
+/// Direct replies produced by the channel owner for the session owner.
+#[derive(Debug)]
+pub struct ChannelCommandReplies {
+    pub(crate) lines: Vec<Bytes>,
+}
+
+#[derive(Debug)]
+pub enum ChannelHistoryResult {
+    Replies(ChannelCommandReplies),
+    Deferred,
+}
+
+#[derive(Debug)]
+pub enum ChannelKnockResult {
+    KnockDelivered,
+    NoSuchChannel { target: String },
+    Hidden { target: String },
+    AlreadyOnChannel { display: String },
+    ChannelOpen { display: String },
+    CannotSend { display: String },
+}
+
+#[derive(Debug)]
+pub enum ChannelInviteResult {
+    Invited { invitee: String, channel: String },
+    NoSuchChannel { target: String },
+    NotOnChannel { target: String },
+    NotOperator { target: String },
+    UserOnChannel { invitee: String, channel: String },
+}
+
+#[derive(Debug)]
+pub enum ChanServOpResult {
+    NotRegistered { channel: String },
+    NoAccess { channel: String },
+    TargetOffline { target: String },
+    TargetNotOnChannel { target: String, channel: String },
+    AlreadyOpped { target: String },
+    Opped { target: String, channel: String },
+}
+
+#[derive(Debug)]
+pub enum ChannelModeQueryResult {
+    NoSuchChannel {
+        target: String,
+    },
+    Hidden {
+        target: String,
+    },
+    Modes {
+        display: String,
+        modes: String,
+        created: String,
+    },
+}
+
+#[derive(Debug)]
+pub enum ChannelModeListQueryResult {
+    NoSuchChannel {
+        target: String,
+    },
+    Hidden {
+        target: String,
+    },
+    NotOperator {
+        target: String,
+    },
+    Lists {
+        display: String,
+        lists: Vec<ChannelModeList>,
+    },
+}
+
+#[derive(Debug)]
+pub struct ChannelModeList {
+    pub(crate) mode: char,
+    pub(crate) masks: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ChannelSessionEvent {
+    Invitation {
+        inviter_prefix: String,
+        inviter_account: Option<String>,
+        channel: String,
+    },
+}
+
+/// A current session snapshot applied by the owner of one of its channels.
+#[derive(Debug, Clone)]
+pub struct ChannelMemberUpdate {
+    owner: ChannelOwner,
+    recipient: Recipient,
+    identity: MemberIdentity,
+    profile: ChannelMemberProfile,
+    change: ChannelMemberChange,
+}
+
+#[derive(Debug, Clone)]
+pub enum ChannelMemberChange {
+    Identity,
+    Nick { previous_prefix: String },
+}
+
+impl ChannelMemberUpdate {
+    fn new(
+        owner: ChannelOwner,
+        recipient: Recipient,
+        identity: MemberIdentity,
+        profile: ChannelMemberProfile,
+        change: ChannelMemberChange,
+    ) -> Self {
+        Self {
+            owner,
+            recipient,
+            identity,
+            profile,
+            change,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> &ChannelOwner {
+        &self.owner
+    }
+}
+
+/// A TOPIC request has exactly one operation.
+#[derive(Debug, Clone)]
+pub enum ChannelTopicOperation {
+    Query,
+    Set(String),
 }
 
 /// A channel owner's TOPIC answer, delivered only to the requester's session owner.
@@ -1026,46 +1676,7 @@ pub enum ChannelMultilineResult {
 }
 
 /// A parsed channel TAGMSG, owned by its channel shard.
-#[derive(Debug, Clone)]
-pub struct ChannelTagmsg {
-    owner: ChannelOwner,
-    actor: ChannelActor,
-    target: String,
-    client_tags: String,
-    label: Option<String>,
-}
-
-impl ChannelTagmsg {
-    pub(crate) fn new(
-        owner: ChannelOwner,
-        actor: ChannelActor,
-        target: String,
-        client_tags: String,
-        label: Option<String>,
-    ) -> Self {
-        Self {
-            owner,
-            actor,
-            target,
-            client_tags,
-            label,
-        }
-    }
-
-    pub(crate) fn owner(&self) -> &ChannelOwner {
-        &self.owner
-    }
-    pub(crate) fn actor(&self) -> &ChannelActor {
-        &self.actor
-    }
-    pub(crate) fn label(&self) -> Option<String> {
-        self.label.clone()
-    }
-
-    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, String, String) {
-        (self.owner, self.actor, self.target, self.client_tags)
-    }
-}
+pub type ChannelTagmsg = ChannelRequest<String>;
 
 /// The channel owner's answer to a parsed channel TAGMSG.
 #[derive(Debug)]
@@ -1097,6 +1708,7 @@ struct ChannelMember {
     modes: MemberModes,
     recipient: Recipient,
     identity: MemberIdentity,
+    profile: ChannelMemberProfile,
 }
 
 #[derive(Default)]
@@ -1492,9 +2104,25 @@ impl Channel {
         recipients
     }
 
+    #[cfg(test)]
     pub fn add_member(
         &mut self,
         recipient: Recipient,
+        identity: MemberIdentity,
+        modes: MemberModes,
+    ) {
+        self.add_member_with_profile(
+            recipient,
+            ChannelMemberProfile::derived(&identity),
+            identity,
+            modes,
+        );
+    }
+
+    pub fn add_member_with_profile(
+        &mut self,
+        recipient: Recipient,
+        profile: ChannelMemberProfile,
         identity: MemberIdentity,
         modes: MemberModes,
     ) {
@@ -1504,6 +2132,7 @@ impl Channel {
                 modes,
                 recipient,
                 identity,
+                profile,
             },
         );
         self.recipients.get_mut().take();
@@ -1515,6 +2144,27 @@ impl Channel {
             self.recipients.get_mut().take();
         }
         removed
+    }
+
+    pub fn update_member(
+        &mut self,
+        recipient: Recipient,
+        identity: MemberIdentity,
+        profile: ChannelMemberProfile,
+    ) -> bool {
+        let Some(member) = self.members.get_mut(&recipient.conn()) else {
+            return false;
+        };
+        if member.recipient.owner() != recipient.owner() {
+            return false;
+        }
+        if member.recipient != recipient {
+            member.recipient = recipient;
+            self.recipients.get_mut().take();
+        }
+        member.identity = identity;
+        member.profile = profile;
+        true
     }
 
     pub fn update_recipient(&mut self, recipient: Recipient) {
@@ -1533,6 +2183,22 @@ impl Channel {
         self.members
             .iter()
             .map(|(conn, member)| (*conn, &member.modes, &member.identity))
+    }
+
+    pub fn member_profiles(
+        &self,
+    ) -> impl Iterator<Item = (ConnId, &MemberModes, &MemberIdentity, &ChannelMemberProfile)> {
+        self.members
+            .iter()
+            .map(|(conn, member)| (*conn, &member.modes, &member.identity, &member.profile))
+    }
+
+    pub fn operator_recipients(&self) -> Vec<(Recipient, String)> {
+        self.members
+            .values()
+            .filter(|member| member.modes.op)
+            .map(|member| (member.recipient, member.identity.nick.clone()))
+            .collect()
     }
 
     /// Resolve a member from channel-owned identity data.
@@ -1646,6 +2312,10 @@ impl ChannelDirectory {
         }
     }
 
+    pub(crate) fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
     pub(crate) fn owner(&self, key: &ChanKey) -> ChannelOwner {
         ChannelOwner {
             key: key.clone(),
@@ -1700,6 +2370,7 @@ pub(crate) struct ServerState {
     pub casemap: CaseMapping,
     pub sessions: SessionStore,
     nicks: NickDirectory,
+    memberships: MembershipDirectory,
     pub channels: ChannelDirectory,
     /// Connections whose SendQ overflowed during this event; swept (and
     /// killed) by `Core::handle` after the event completes.
@@ -1731,7 +2402,7 @@ pub(crate) struct ServerState {
     /// Registered channels → founder account (both casefolded). The hot
     /// copy of the `channels` table's ownership, boot-loaded and updated
     /// on registration; a founder rejoining their channel is re-opped.
-    pub registered_founders: HashMap<ChanKey, AccountKey>,
+    pub registered_founders: FounderDirectory,
     /// Channel registrations waiting for a database verdict, keyed by channel
     /// and carrying the founder reservation. A pending name cannot be queued
     /// twice, and pending reservations count toward the per-account cap.
@@ -1739,7 +2410,7 @@ pub(crate) struct ServerState {
     /// Registered channels → retained topic. Boot-loaded and kept in sync
     /// on TOPIC; restored when a registered channel is recreated so its
     /// topic survives the channel going empty.
-    pub registered_topics: HashMap<ChanKey, Topic>,
+    pub registered_topics: RetainedTopicDirectory,
     /// Latest requested TOPIC per registered channel while its database
     /// verdict is pending. The revision prevents an older reply from clearing
     /// a newer request. SET KEEPTOPIC reads this overlay instead of a stale
@@ -1747,17 +2418,8 @@ pub(crate) struct ServerState {
     pub pending_channel_topics: HashMap<ChanKey, (u64, Option<Topic>)>,
     /// Monotonic revision source for `pending_channel_topics`.
     pub channel_topic_revision: u64,
-    /// Registered channels whose ChanServ KEEPTOPIC option is OFF. Topic
-    /// retention is on by default (absence ⇒ on), so only the exceptions
-    /// live here; boot-loaded and updated on `SET KEEPTOPIC`.
-    pub keeptopic_off: HashSet<ChanKey>,
-    /// Registered channels with a ChanServ mode lock. Boot-loaded and
-    /// updated on `SET MLOCK`; enforced on MODE and on channel creation.
-    pub channel_mlock: HashMap<ChanKey, MlockModes>,
-    /// Per-channel access: channel → (folded account → flag chars, e.g.
-    /// "ov"). Boot-loaded and kept in sync on ChanServ FLAGS; drives
-    /// auto-op / auto-voice on join.
-    pub channel_access: HashMap<ChanKey, HashMap<AccountKey, String>>,
+    /// Process-wide durable KEEPTOPIC, MLOCK, and access state.
+    pub channel_options: ChannelOptionsDirectory,
     /// Server bans (oper K/D/X-lines) refused at registration. Boot-loaded
     /// and kept in sync on KLINE/DLINE/XLINE and their removals.
     pub server_bans: Vec<ServerBan>,
@@ -1799,6 +2461,8 @@ pub(crate) struct ServerState {
     pub pending_channel_controls: HashMap<u64, tokio::sync::oneshot::Sender<super::AdminReply>>,
     /// Monotonic request ID source for `pending_channel_controls`.
     pub channel_control_id: u64,
+    pending_channel_lists: HashMap<ChannelListRequestId, PendingChannelList>,
+    channel_list_id: u64,
 }
 
 /// Hard ceiling on the account-creation bucket map, mirroring the HTTP
@@ -1816,6 +2480,9 @@ const REGISTRATION_REFILL_WINDOW_MS: u64 = 60 * 60 * 1000;
 pub(crate) struct Capture {
     pub conn: ConnId,
     pub lines: Vec<Bytes>,
+    /// The nick used in replies when the connection lives on another shard.
+    pub reply_target: Option<String>,
+    pub reply_caps: Option<Caps>,
     /// The escaped `label` value, so a command whose response is produced
     /// asynchronously (CHATHISTORY falling back to PostgreSQL) can carry the
     /// label into that deferred reply instead of losing it.
@@ -1857,6 +2524,20 @@ impl ServerState {
         )
     }
 
+    pub fn local_member_profile(&self, conn: ConnId) -> ChannelMemberProfile {
+        let session = &self.sessions[&conn];
+        ChannelMemberProfile {
+            user: session.user().expect("registered member").to_string(),
+            host: session.host.clone(),
+            realname: session.realname().expect("registered member").to_string(),
+            account: session.account.clone(),
+            away: session.away.is_some(),
+            oper: session.oper,
+            bot: session.bot,
+            last_active: session.last_active,
+        }
+    }
+
     pub fn channel_actor(&self, conn: ConnId) -> ChannelActor {
         let session = &self.sessions[&conn];
         ChannelActor {
@@ -1866,6 +2547,7 @@ impl ServerState {
             realname: session.realname().expect("registered session").to_string(),
             away: session.away.clone(),
             bot: session.bot,
+            profile: self.local_member_profile(conn),
         }
     }
 
@@ -1875,6 +2557,16 @@ impl ServerState {
 
     pub fn owns_channel(&self, owner: &ChannelOwner) -> bool {
         owner.shard() == self.shard
+    }
+
+    pub fn channel_reply_label(&mut self, conn: ConnId, owner: &ChannelOwner) -> Option<String> {
+        if self.owns_channel(owner) {
+            self.capture
+                .as_ref()
+                .and_then(|capture| capture.label.clone())
+        } else {
+            self.defer_channel_reply(conn)
+        }
     }
 
     pub fn owns_session(&self, owner: SessionOwner) -> bool {
@@ -1889,13 +2581,14 @@ impl ServerState {
         join_key: Option<String>,
         label: Option<String>,
     ) {
-        self.effects.push(CoreEffect::ChannelJoin {
-            owner,
-            actor,
-            name,
-            join_key,
-            label,
-        });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelJoin {
+                owner,
+                actor,
+                name,
+                join_key,
+                label,
+            }));
     }
 
     pub fn route_join_result(
@@ -1904,11 +2597,12 @@ impl ServerState {
         result: ChannelJoinResult,
         label: Option<String>,
     ) {
-        self.effects.push(CoreEffect::ChannelJoinResult {
-            session,
-            result,
-            label,
-        });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelJoinResult {
+                session,
+                result,
+                label,
+            }));
     }
 
     pub fn route_part(
@@ -1919,13 +2613,14 @@ impl ServerState {
         reason: Option<String>,
         label: Option<String>,
     ) {
-        self.effects.push(CoreEffect::ChannelPart {
-            owner,
-            actor,
-            name,
-            reason,
-            label,
-        });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelPart {
+                owner,
+                actor,
+                name,
+                reason,
+                label,
+            }));
     }
 
     pub fn route_part_result(
@@ -1934,19 +2629,24 @@ impl ServerState {
         result: ChannelPartResult,
         label: Option<String>,
     ) {
-        self.effects.push(CoreEffect::ChannelPartResult {
-            session,
-            result,
-            label,
-        });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelPartResult {
+                session,
+                result,
+                label,
+            }));
     }
 
     pub fn route_quit(&mut self, quit: ChannelQuit) {
-        self.effects.push(CoreEffect::ChannelQuit(quit));
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelQuit { quit }));
     }
 
     pub fn route_topic(&mut self, topic: ChannelTopic) {
-        self.effects.push(CoreEffect::ChannelTopic { topic });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelTopic {
+                topic,
+            }));
     }
 
     pub fn route_topic_result(
@@ -1955,11 +2655,12 @@ impl ServerState {
         result: ChannelTopicResult,
         label: Option<String>,
     ) {
-        self.effects.push(CoreEffect::ChannelTopicResult {
-            session,
-            result,
-            label,
-        });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelTopicResult {
+                session,
+                result,
+                label,
+            }));
     }
 
     pub fn route_topic_persisted(
@@ -1969,23 +2670,143 @@ impl ServerState {
         session: Option<SessionOwner>,
         result: crate::core::ChannelTopicPersistence,
     ) {
-        self.effects
-            .push(crate::core::CoreEffect::ChannelTopicPersisted {
+        self.effects.push(crate::core::CoreEffect::Input(
+            crate::core::Input::ChannelTopicPersisted {
                 owner,
                 conn,
                 session,
                 result,
-            });
+            },
+        ));
+    }
+
+    pub fn route_channel_command(&mut self, command: ChannelCommand) {
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelCommand {
+                command,
+            }));
+    }
+
+    pub(crate) fn route_input(&mut self, input: crate::core::Input) {
+        self.effects.push(CoreEffect::Input(input));
+    }
+
+    pub fn route_channel_command_result(
+        &mut self,
+        session: SessionOwner,
+        result: ChannelCommandResult,
+        label: Option<String>,
+    ) {
+        self.effects.push(CoreEffect::Input(
+            crate::core::Input::ChannelCommandResult {
+                session,
+                result,
+                label,
+            },
+        ));
+    }
+
+    pub fn start_channel_list(
+        &mut self,
+        conn: ConnId,
+        label: Option<String>,
+        targets: Option<Vec<String>>,
+    ) -> ChannelListRequest {
+        let id = ChannelListRequestId(self.channel_list_id);
+        self.channel_list_id = self
+            .channel_list_id
+            .checked_add(1)
+            .expect("channel LIST request identifiers exhausted");
+        let session = SessionOwner::new(conn, self.shard);
+        let targets = targets.map(|targets| {
+            targets
+                .into_iter()
+                .map(|target| self.chan_key(&target))
+                .collect()
+        });
+        let request = ChannelListRequest::new(id, session, self.channel_actor(conn), targets);
+        let previous = self.pending_channel_lists.insert(
+            id,
+            PendingChannelList {
+                session,
+                remaining: self.channels.shard_count(),
+                prefix: if label.is_some() {
+                    std::mem::take(
+                        &mut self
+                            .capture
+                            .as_mut()
+                            .expect("labeled LIST capture exists")
+                            .lines,
+                    )
+                } else {
+                    Vec::new()
+                },
+                label,
+                rows: Vec::new(),
+            },
+        );
+        assert!(previous.is_none(), "channel LIST request identifier reused");
+        request
+    }
+
+    pub fn route_channel_list(&mut self, request: ChannelListRequest) {
+        self.effects
+            .push(CoreEffect::BroadcastChannelList { request });
+    }
+
+    pub(crate) fn has_single_channel_shard(&self) -> bool {
+        self.channels.shard_count() == 1
+    }
+
+    pub fn route_channel_list_result(&mut self, result: ChannelListResult) {
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelListResult {
+                result,
+            }));
+    }
+
+    pub fn take_channel_list(
+        &mut self,
+        result: ChannelListResult,
+    ) -> Option<(Option<String>, Vec<Bytes>, Vec<ChannelListRow>)> {
+        let pending = self.pending_channel_lists.get_mut(&result.id)?;
+        assert!(
+            pending.remaining > 0,
+            "LIST received too many shard results"
+        );
+        pending.remaining -= 1;
+        pending.rows.extend(result.rows);
+        (pending.remaining == 0).then(|| {
+            let pending = self
+                .pending_channel_lists
+                .remove(&result.id)
+                .expect("completed channel LIST request exists");
+            (pending.label, pending.prefix, pending.rows)
+        })
+    }
+
+    pub fn route_channel_session_event(
+        &mut self,
+        session: SessionOwner,
+        event: ChannelSessionEvent,
+    ) {
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelSessionEvent {
+                session,
+                event,
+            }));
     }
 
     pub fn route_session_channel_removed(&mut self, session: SessionOwner, key: ChanKey) {
-        self.effects
-            .push(crate::core::CoreEffect::SessionChannelRemoved { session, key });
+        self.effects.push(crate::core::CoreEffect::Input(
+            crate::core::Input::SessionChannelRemoved { session, key },
+        ));
     }
 
     pub fn route_kick(&mut self, kick: ChannelKick) {
-        self.effects
-            .push(crate::core::CoreEffect::ChannelKick { kick });
+        self.effects.push(crate::core::CoreEffect::Input(
+            crate::core::Input::ChannelKick { kick },
+        ));
     }
 
     pub fn route_kick_result(
@@ -1994,22 +2815,43 @@ impl ServerState {
         result: ChannelKickResult,
         label: Option<String>,
     ) {
-        self.effects
-            .push(crate::core::CoreEffect::ChannelKickResult {
+        self.effects.push(crate::core::CoreEffect::Input(
+            crate::core::Input::ChannelKickResult {
                 session,
                 result,
                 label,
-            });
+            },
+        ));
     }
 
     pub fn remove_session_channel(&mut self, conn: ConnId, key: &ChanKey) {
         if let Some(session) = self.sessions.get_mut(&conn) {
             session.channels.remove(key);
         }
+        self.memberships.part(conn, key);
+    }
+
+    pub fn membership_join(&self, conn: ConnId, key: ChanKey) {
+        self.memberships.join(conn, key);
+    }
+
+    pub fn membership_part(&self, conn: ConnId, key: &ChanKey) {
+        self.memberships.part(conn, key);
+    }
+
+    pub fn is_channel_member(&self, conn: ConnId, key: &ChanKey) -> bool {
+        self.memberships.contains(conn, key)
+            || self
+                .channels
+                .get(key)
+                .is_some_and(|channel| channel.is_member(conn))
     }
 
     pub fn route_message(&mut self, message: ChannelMessage) {
-        self.effects.push(CoreEffect::ChannelMessage { message });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelMessage {
+                message,
+            }));
     }
 
     pub fn route_message_result(
@@ -2018,15 +2860,20 @@ impl ServerState {
         result: ChannelMessageResult,
         label: Option<String>,
     ) {
-        self.effects.push(CoreEffect::ChannelMessageResult {
-            session,
-            result,
-            label,
-        });
+        self.effects.push(CoreEffect::Input(
+            crate::core::Input::ChannelMessageResult {
+                session,
+                result,
+                label,
+            },
+        ));
     }
 
     pub fn route_multiline(&mut self, message: ChannelMultiline) {
-        self.effects.push(CoreEffect::ChannelMultiline { message });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelMultiline {
+                message,
+            }));
     }
 
     pub fn route_multiline_result(
@@ -2034,12 +2881,16 @@ impl ServerState {
         session: SessionOwner,
         result: ChannelMultilineResult,
     ) {
-        self.effects
-            .push(CoreEffect::ChannelMultilineResult { session, result });
+        self.effects.push(CoreEffect::Input(
+            crate::core::Input::ChannelMultilineResult { session, result },
+        ));
     }
 
     pub fn route_tagmsg(&mut self, tagmsg: ChannelTagmsg) {
-        self.effects.push(CoreEffect::ChannelTagmsg { tagmsg });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelTagmsg {
+                tagmsg,
+            }));
     }
 
     pub fn route_tagmsg_result(
@@ -2048,19 +2899,79 @@ impl ServerState {
         result: ChannelTagmsgResult,
         label: Option<String>,
     ) {
-        self.effects.push(CoreEffect::ChannelTagmsgResult {
-            session,
-            result,
-            label,
-        });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelTagmsgResult {
+                session,
+                result,
+                label,
+            }));
     }
 
     pub fn refresh_recipient(&mut self, conn: ConnId) {
+        if !self.sessions[&conn].is_registered() {
+            let recipient = self.local_recipient(conn);
+            let channels: Vec<_> = self.sessions[&conn].channels.iter().cloned().collect();
+            for key in channels {
+                if let Some(channel) = self.channels.get_mut(&key) {
+                    channel.update_recipient(recipient);
+                }
+            }
+            return;
+        }
+        self.sync_channel_member(conn, ChannelMemberChange::Identity);
+    }
+
+    pub fn sync_channel_member(&mut self, conn: ConnId, change: ChannelMemberChange) {
+        if !self.sessions[&conn].is_registered() {
+            return;
+        }
         let recipient = self.local_recipient(conn);
+        let identity = self.local_member_identity(conn);
+        let profile = self.local_member_profile(conn);
         let channels: Vec<_> = self.sessions[&conn].channels.iter().cloned().collect();
         for key in channels {
-            if let Some(channel) = self.channels.get_mut(&key) {
-                channel.update_recipient(recipient);
+            let update = ChannelMemberUpdate::new(
+                self.channels.owner(&key),
+                recipient,
+                identity.clone(),
+                profile.clone(),
+                change.clone(),
+            );
+            if self.owns_channel(update.owner()) {
+                self.apply_channel_member_update(update);
+            } else {
+                self.effects
+                    .push(CoreEffect::Input(crate::core::Input::ChannelMemberUpdate {
+                        update,
+                    }));
+            }
+        }
+    }
+
+    pub fn apply_channel_member_update(&mut self, update: ChannelMemberUpdate) {
+        assert_eq!(
+            update.owner.shard(),
+            self.shard,
+            "member update reached wrong shard"
+        );
+        let key = update.owner.key().clone();
+        let updated = self.channels.get_mut(&key).is_some_and(|channel| {
+            channel.update_member(
+                update.recipient,
+                update.identity.clone(),
+                update.profile.clone(),
+            )
+        });
+        if !updated {
+            return;
+        }
+        let ChannelMemberChange::Nick { previous_prefix } = update.change else {
+            return;
+        };
+        let line = format!(":{previous_prefix} NICK {}", update.identity.nick);
+        for recipient in self.channels[&key].recipients().iter().copied() {
+            if recipient.conn() != update.recipient.conn() {
+                self.send_timed_recipient(recipient, &line);
             }
         }
     }
@@ -2075,6 +2986,7 @@ impl ServerState {
         config: CoreConfig,
         db_tx: Sender<super::DbRequest>,
         telemetry: Arc<Telemetry>,
+        directories: CoreDirectories,
     ) -> Self {
         let started_at = (config.clock)();
         Self {
@@ -2083,7 +2995,8 @@ impl ServerState {
             config,
             casemap: CaseMapping::Rfc1459,
             sessions: SessionStore::new(),
-            nicks: NickDirectory::default(),
+            nicks: directories.nicks,
+            memberships: directories.memberships,
             channels: ChannelDirectory::new(shards),
             doomed: Vec::new(),
             effects: Vec::new(),
@@ -2095,14 +3008,12 @@ impl ServerState {
             monitors: HashMap::new(),
             read_markers: HashMap::new(),
             pending_read_markers: HashMap::new(),
-            registered_founders: HashMap::new(),
+            registered_founders: directories.founders,
             pending_channel_registrations: HashMap::new(),
-            registered_topics: HashMap::new(),
+            registered_topics: directories.topics,
             pending_channel_topics: HashMap::new(),
             channel_topic_revision: 0,
-            keeptopic_off: HashSet::new(),
-            channel_mlock: HashMap::new(),
-            channel_access: HashMap::new(),
+            channel_options: directories.channel_options,
             server_bans: Vec::new(),
             pending_server_bans: HashSet::new(),
             whowas: std::collections::VecDeque::new(),
@@ -2117,6 +3028,8 @@ impl ServerState {
             admin_server_ban_id: 0,
             pending_channel_controls: HashMap::new(),
             channel_control_id: 0,
+            pending_channel_lists: HashMap::new(),
+            channel_list_id: 0,
         }
     }
 
@@ -2268,6 +3181,9 @@ impl ServerState {
 
     /// Whether two connections share at least one channel.
     pub fn share_channel(&self, a: ConnId, b: ConnId) -> bool {
+        if self.memberships.shares(a, b) {
+            return true;
+        }
         let (Some(sa), Some(sb)) = (self.sessions.get(&a), self.sessions.get(&b)) else {
             return false;
         };
@@ -2326,29 +3242,27 @@ impl ServerState {
     /// Load persisted channel ownership as `(name_folded, founder_folded)`
     /// rows (both already casefolded, so they key directly).
     pub fn preload_founders(&mut self, rows: Vec<(String, String)>) {
-        self.registered_founders = rows
-            .into_iter()
-            .map(|(name_folded, founder)| (ChanKey(name_folded), AccountKey(founder)))
-            .collect();
+        self.registered_founders.replace(
+            rows.into_iter()
+                .map(|(name_folded, founder)| (ChanKey(name_folded), AccountKey(founder))),
+        );
     }
 
     /// Record a channel's founder (called when registration succeeds).
     pub fn set_founder(&mut self, channel: &str, founder_account: &str) {
         let key = self.chan_key(channel);
         let founder = self.account_key(founder_account);
-        self.registered_founders.insert(key, founder);
+        self.registered_founders.set(key, founder);
     }
 
     /// Whether `account` is the registered founder of channel `key`.
     pub fn is_founder(&self, key: &ChanKey, account: &str) -> bool {
-        self.registered_founders
-            .get(key)
-            .is_some_and(|f| *f == self.account_key(account))
+        self.registered_founders.founder(key) == Some(self.account_key(account))
     }
 
     /// Whether channel `key` is registered (ownership recorded).
     pub fn is_registered(&self, key: &ChanKey) -> bool {
-        self.registered_founders.contains_key(key)
+        self.registered_founders.founder(key).is_some()
     }
 
     /// How many channels `account` currently founds or has reserved by an
@@ -2356,16 +3270,12 @@ impl ServerState {
     /// burst from stepping around the permanent-map cap before verdicts land.
     pub fn channels_founded_by(&self, account: &str) -> usize {
         let account_key = self.account_key(account);
-        let committed = self
-            .registered_founders
-            .values()
-            .filter(|f| **f == account_key)
-            .count();
+        let committed = self.registered_founders.count(&account_key);
         let pending = self
             .pending_channel_registrations
             .iter()
             .filter(|(channel, founder)| {
-                **founder == account_key && !self.registered_founders.contains_key(*channel)
+                **founder == account_key && self.registered_founders.founder(channel).is_none()
             })
             .count();
         committed + pending
@@ -2379,9 +3289,8 @@ impl ServerState {
     /// Load persisted channel topics as `(name_folded, text, setter,
     /// set_at_secs)` rows into the hot retained-topic map.
     pub fn preload_topics(&mut self, rows: Vec<(String, String, String, u64)>) {
-        self.registered_topics = rows
-            .into_iter()
-            .map(|(name_folded, text, set_by, set_at_secs)| {
+        self.registered_topics.replace(rows.into_iter().map(
+            |(name_folded, text, set_by, set_at_secs)| {
                 (
                     ChanKey(name_folded),
                     Topic {
@@ -2390,13 +3299,14 @@ impl ServerState {
                         set_at_secs,
                     },
                 )
-            })
-            .collect();
+            },
+        ));
     }
 
     /// Load the registered channels whose KEEPTOPIC is OFF (by folded name).
     pub fn preload_keeptopic_off(&mut self, names: Vec<String>) {
-        self.keeptopic_off = names.into_iter().map(ChanKey).collect();
+        self.channel_options
+            .replace_keeptopic_off(names.into_iter().map(ChanKey));
     }
 
     /// Load persisted mode locks as `(name_folded, spec)`. Corrupt storage
@@ -2417,14 +3327,14 @@ impl ServerState {
             }
             locks.insert(ChanKey(name), modes);
         }
-        self.channel_mlock = locks;
+        self.channel_options.replace_mlock(locks);
         Ok(())
     }
 
     /// Whether setting boolean mode `c` to `adding` would violate `key`'s
     /// mode lock (locked-off mode set on, or locked-on mode set off).
     pub fn mlock_conflict(&self, key: &ChanKey, c: char, adding: bool) -> bool {
-        match self.channel_mlock.get(key) {
+        match self.channel_options.mlock(key) {
             Some(m) => (adding && m.off.contains(c)) || (!adding && m.on.contains(c)),
             None => false,
         }
@@ -2433,13 +3343,10 @@ impl ServerState {
     /// Load persisted channel access as `(name_folded, account_folded,
     /// flags)` rows into the hot access map.
     pub fn preload_access(&mut self, rows: Vec<(String, String, String)>) {
-        self.channel_access.clear();
-        for (name_folded, account_folded, flags) in rows {
-            self.channel_access
-                .entry(ChanKey(name_folded))
-                .or_default()
-                .insert(AccountKey(account_folded), flags);
-        }
+        self.channel_options.replace_access(
+            rows.into_iter()
+                .map(|(channel, account, flags)| (ChanKey(channel), AccountKey(account), flags)),
+        );
     }
 
     /// Seed the read-marker mirror from persisted `(account, target, millis)`
@@ -2458,7 +3365,7 @@ impl ServerState {
     /// The `(auto_op, auto_voice)` flags `account` holds on channel `key`.
     pub fn access_modes(&self, key: &ChanKey, account: &str) -> (bool, bool) {
         let account = self.account_key(account);
-        match self.channel_access.get(key).and_then(|m| m.get(&account)) {
+        match self.channel_options.access_flags(key, &account) {
             Some(flags) => (flags.contains('o'), flags.contains('v')),
             None => (false, false),
         }
@@ -2521,14 +3428,28 @@ impl ServerState {
         NickKey(self.casemap.casefold(nick))
     }
 
-    /// Reserve `key` for this worker's connection.
-    pub fn reserve_nick(&mut self, key: NickKey, conn: ConnId) {
-        self.nicks.reserve(key, SessionOwner::new(conn, self.shard));
+    /// Claim `key` for this connection if no other connection owns it.
+    pub fn claim_nick(&self, key: NickKey, conn: ConnId) -> bool {
+        self.nicks.claim(
+            key,
+            SessionOwner::new(conn, self.shard),
+            self.sessions[&conn].is_registered(),
+        )
     }
 
     /// The reservation for `key`, including a remote worker assignment.
     pub fn nick_reservation(&self, key: &NickKey) -> Option<SessionOwner> {
         self.nicks.owner(key)
+    }
+
+    pub fn registered_nick_owner(&self, key: &NickKey) -> Option<SessionOwner> {
+        self.nicks.registered_owner(key)
+    }
+
+    pub fn mark_nick_registered(&self, conn: ConnId) {
+        if let Some(nick) = self.sessions[&conn].nick() {
+            self.nicks.mark_registered(&self.nick_key(nick), conn);
+        }
     }
 
     /// The local connection owning `key`.
@@ -2634,8 +3555,9 @@ impl ServerState {
     /// expectations honest — an unregistered holder can never be prefix-built
     /// (that would panic the shared core worker and take down the server).
     pub fn registered_peer(&self, key: &NickKey) -> Option<ConnId> {
-        self.nick_connection(key)
-            .filter(|conn| self.sessions.get(conn).is_some_and(|s| s.is_registered()))
+        self.registered_nick_owner(key)
+            .filter(|owner| owner.shard() == self.shard)
+            .map(SessionOwner::conn)
     }
 
     pub fn open(
@@ -2862,6 +3784,8 @@ impl ServerState {
         self.capture = Some(Capture {
             conn,
             lines: Vec::new(),
+            reply_target: None,
+            reply_caps: None,
             label: Some(label.clone()),
             deferred: false,
         });
@@ -2898,6 +3822,8 @@ impl ServerState {
                 self.capture = Some(Capture {
                     conn,
                     lines: Vec::new(),
+                    reply_target: None,
+                    reply_caps: None,
                     label: Some(label.clone()),
                     deferred: false,
                 });
@@ -2938,12 +3864,29 @@ impl ServerState {
     /// than each numeric separately.
     const NUMERIC_MIDDLE_MAX: usize = 100;
 
+    fn reply_target(&self, conn: ConnId) -> String {
+        self.capture
+            .as_ref()
+            .filter(|capture| capture.conn == conn)
+            .and_then(|capture| capture.reply_target.clone())
+            .or_else(|| {
+                self.sessions
+                    .get(&conn)
+                    .and_then(|session| session.nick().map(String::from))
+            })
+            .unwrap_or_else(|| "*".into())
+    }
+
+    pub fn reply_caps(&self, conn: ConnId) -> Caps {
+        self.capture
+            .as_ref()
+            .filter(|capture| capture.conn == conn)
+            .and_then(|capture| capture.reply_caps)
+            .unwrap_or_else(|| self.sessions[&conn].caps)
+    }
+
     pub fn numeric(&mut self, conn: ConnId, code: u16, middle: &[&str], trailing: Option<&str>) {
-        let target = self
-            .sessions
-            .get(&conn)
-            .and_then(|s| s.nick().map(String::from))
-            .unwrap_or_else(|| "*".into());
+        let target = self.reply_target(conn);
         let mut line = format!(
             ":{} {} {}",
             self.config.server_name,
@@ -3059,11 +4002,7 @@ impl ServerState {
         // Measure the fixed part of every line exactly as `numeric` frames it —
         // ":{server} {code} {target}" + each middle + " :" + CRLF — so the
         // budget can never drift from the line actually sent.
-        let target = self
-            .sessions
-            .get(&conn)
-            .and_then(|s| s.nick().map(String::from))
-            .unwrap_or_else(|| "*".into());
+        let target = self.reply_target(conn);
         let mut overhead = 1
             + self.config.server_name.len()
             + 1
@@ -3233,6 +4172,8 @@ impl ServerState {
         let Some(session) = self.sessions.get(&conn) else {
             return;
         };
+        self.pending_channel_lists
+            .retain(|_, pending| pending.session.conn() != conn);
         let was_registered = session.is_registered();
         // Output withheld behind an in-flight deferred DB reply (a CHATHISTORY
         // ring miss, say) would be dropped with the session — including the
@@ -3283,6 +4224,7 @@ impl ServerState {
             }
         }
         let session = self.sessions.remove(&conn).expect("checked above");
+        self.memberships.release(conn);
         for key in session.monitoring.keys() {
             if let Some(watchers) = self.monitors.get_mut(key) {
                 watchers.remove(&conn);
@@ -3539,7 +4481,24 @@ mod session_store_tests {
             },
             db_tx,
             Arc::new(Telemetry::new()),
+            CoreDirectories::default(),
         )
+    }
+
+    #[test]
+    fn membership_directory_tracks_shared_channels_and_departures() {
+        let directory = MembershipDirectory::default();
+        let channel = ChanKey("#chat".into());
+        let alice = ConnId(1);
+        let bob = ConnId(2);
+        directory.join(alice, channel.clone());
+        directory.join(bob, channel.clone());
+        assert!(directory.shares(alice, bob));
+        directory.part(bob, &channel);
+        assert!(!directory.shares(alice, bob));
+        directory.join(bob, channel);
+        directory.release(alice);
+        assert!(!directory.shares(alice, bob));
     }
 
     fn open(state: &mut ServerState, conn: ConnId) {
@@ -3558,11 +4517,11 @@ mod session_store_tests {
 
     #[test]
     fn nick_reservation_retains_its_worker() {
-        let mut directory = NickDirectory::default();
+        let directory = NickDirectory::default();
         let key = NickKey("alice".into());
         let owner = SessionOwner::new(ConnId(7), CoreShardId(3));
 
-        directory.reserve(key.clone(), owner);
+        assert!(directory.claim(key.clone(), owner, true));
 
         assert_eq!(directory.owner(&key), Some(owner));
         assert_eq!(
@@ -3573,6 +4532,30 @@ mod session_store_tests {
         assert_eq!(directory.owner(&key), Some(owner));
         assert!(directory.release_if_owned(&key, ConnId(7)));
         assert_eq!(directory.owner(&key), None);
+    }
+
+    #[test]
+    fn nick_claim_cannot_replace_another_session() {
+        let directory = NickDirectory::default();
+        let key = NickKey("alice".into());
+        let first = SessionOwner::new(ConnId(7), CoreShardId(0));
+        let second = SessionOwner::new(ConnId(8), CoreShardId(1));
+
+        assert!(directory.claim(key.clone(), first, true));
+        assert!(!directory.claim(key.clone(), second, true));
+        assert_eq!(directory.owner(&key), Some(first));
+    }
+
+    #[test]
+    fn nick_reservation_is_not_registered_until_marked() {
+        let directory = NickDirectory::default();
+        let key = NickKey("alice".into());
+        let owner = SessionOwner::new(ConnId(7), CoreShardId(1));
+
+        assert!(directory.claim(key.clone(), owner, false));
+        assert_eq!(directory.registered_owner(&key), None);
+        directory.mark_registered(&key, ConnId(7));
+        assert_eq!(directory.registered_owner(&key), Some(owner));
     }
 
     #[test]

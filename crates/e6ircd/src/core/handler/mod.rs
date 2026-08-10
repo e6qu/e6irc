@@ -24,7 +24,7 @@ mod sasl;
 pub(super) mod services;
 
 use channel::*;
-use chanops::*;
+pub(crate) use chanops::*;
 pub(crate) use history::*;
 use message::*;
 pub(crate) use monitor::*;
@@ -42,7 +42,7 @@ fn replace_registered_topic(
 ) {
     match topic {
         Some((text, set_by, set_at_secs)) => {
-            state.registered_topics.insert(
+            state.registered_topics.set(
                 key.clone(),
                 Topic {
                     text,
@@ -127,6 +127,124 @@ pub(crate) fn channel_topic_persisted(
     result: crate::core::ChannelTopicPersistence,
 ) {
     channel::topic_persisted_on_owner(state, conn, session, result);
+}
+
+pub(crate) fn channel_command(
+    state: &mut ServerState,
+    command: crate::core::state::ChannelCommand,
+) {
+    let session = command.actor().session_owner();
+    let label = command.label();
+    let result = match command.operation() {
+        crate::core::state::ChannelCommandOperation::Knock => {
+            Some(crate::core::state::ChannelCommandResult::Knock(
+                chanops::knock_on_owner(state, command),
+            ))
+        }
+        crate::core::state::ChannelCommandOperation::Invite(_) => {
+            Some(crate::core::state::ChannelCommandResult::Invite(
+                chanops::invite_on_owner(state, command),
+            ))
+        }
+        crate::core::state::ChannelCommandOperation::ChanServRegister => {
+            services::chanserv_register_on_owner(state, command)
+                .map(crate::core::state::ChannelCommandResult::ChanServRegister)
+        }
+        crate::core::state::ChannelCommandOperation::ChanServOp { .. } => {
+            Some(crate::core::state::ChannelCommandResult::ChanServOp(
+                services::chanserv_op_on_owner(state, command),
+            ))
+        }
+        crate::core::state::ChannelCommandOperation::Names => {
+            Some(crate::core::state::ChannelCommandResult::Names(
+                channel::names_on_owner(state, command),
+            ))
+        }
+        crate::core::state::ChannelCommandOperation::Who(_) => Some(
+            crate::core::state::ChannelCommandResult::Who(query::who_on_owner(state, command)),
+        ),
+        crate::core::state::ChannelCommandOperation::History(_) => {
+            Some(crate::core::state::ChannelCommandResult::History(
+                history::history_on_owner(state, command),
+            ))
+        }
+        crate::core::state::ChannelCommandOperation::ModeQuery => {
+            Some(crate::core::state::ChannelCommandResult::ModeQuery(
+                channel::mode_query_on_owner(state, command),
+            ))
+        }
+        crate::core::state::ChannelCommandOperation::ModeListQuery(_) => {
+            Some(crate::core::state::ChannelCommandResult::ModeListQuery(
+                channel::mode_list_query_on_owner(state, command),
+            ))
+        }
+        crate::core::state::ChannelCommandOperation::ModeChange(_) => {
+            Some(crate::core::state::ChannelCommandResult::ModeChange(
+                channel::mode_change_on_owner(state, command),
+            ))
+        }
+    };
+    if let Some(result) = result {
+        if state.owns_session(session) {
+            channel_command_result(state, session.conn(), result, label);
+        } else {
+            state.route_channel_command_result(session, result, label);
+        }
+    }
+}
+
+pub(crate) fn channel_command_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelCommandResult,
+    label: Option<String>,
+) {
+    match result {
+        crate::core::state::ChannelCommandResult::Knock(result) => {
+            chanops::emit_knock_result(state, conn, result, label)
+        }
+        crate::core::state::ChannelCommandResult::Invite(result) => {
+            state.emit_deferred_labeled(conn, label, |state| {
+                chanops::emit_invite_result_now(state, conn, result)
+            })
+        }
+        crate::core::state::ChannelCommandResult::ChanServRegister(result) => {
+            services::emit_chanserv_register_result(state, conn, result, label)
+        }
+        crate::core::state::ChannelCommandResult::ChanServOp(result) => state
+            .emit_deferred_labeled(conn, label, |state| {
+                services::emit_chanserv_op_result(state, conn, result)
+            }),
+        crate::core::state::ChannelCommandResult::Names(result) => {
+            channel::emit_channel_command_replies(state, conn, result, label)
+        }
+        crate::core::state::ChannelCommandResult::Who(result) => {
+            channel::emit_channel_command_replies(state, conn, result, label)
+        }
+        crate::core::state::ChannelCommandResult::History(result) => match result {
+            crate::core::state::ChannelHistoryResult::Replies(replies) => {
+                channel::emit_channel_command_replies(state, conn, replies, label)
+            }
+            crate::core::state::ChannelHistoryResult::Deferred => {}
+        },
+        crate::core::state::ChannelCommandResult::ModeQuery(result) => {
+            channel::emit_mode_query_result(state, conn, result, label)
+        }
+        crate::core::state::ChannelCommandResult::ModeListQuery(result) => {
+            channel::emit_mode_list_query_result(state, conn, result, label)
+        }
+        crate::core::state::ChannelCommandResult::ModeChange(result) => {
+            channel::emit_channel_command_replies(state, conn, result, label)
+        }
+    }
+}
+
+pub(crate) fn channel_session_event(
+    state: &mut ServerState,
+    conn: ConnId,
+    event: crate::core::state::ChannelSessionEvent,
+) {
+    chanops::emit_invitation(state, conn, event);
 }
 
 pub(crate) fn channel_kick(state: &mut ServerState, kick: crate::core::state::ChannelKick) {
@@ -239,6 +357,8 @@ pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {
         state.capture = Some(super::state::Capture {
             conn,
             lines: Vec::new(),
+            reply_target: None,
+            reply_caps: None,
             label: Some(label.to_string()),
             deferred: false,
         });
@@ -498,14 +618,22 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
     // is alive, so it answers an outstanding liveness PING: the reaper must not
     // close an actively-sending client merely because its traffic happened to
     // be its own PINGs and never a literal PONG (a real class of minimal bots).
-    if let Some(session) = state.sessions.get_mut(&conn) {
+    let refresh_member_profile = if let Some(session) = state.sessions.get_mut(&conn) {
         session.awaiting_pong = false;
         // WHOIS idle / WHOX `l`, on the other hand, measures time since real
         // activity, so a keepalive must not reset it — only a non-keepalive
         // command bumps `last_active`.
         if command != "PING" && command != "PONG" {
             session.last_active = (state.config.mono_clock)();
+            session.is_registered()
+        } else {
+            false
         }
+    } else {
+        false
+    };
+    if refresh_member_profile {
+        state.sync_channel_member(conn, crate::core::state::ChannelMemberChange::Identity);
     }
 
     // Commands legal before registration.

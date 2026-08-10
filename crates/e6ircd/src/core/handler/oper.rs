@@ -66,6 +66,15 @@ fn require_oper(state: &mut ServerState, conn: ConnId) -> bool {
     false
 }
 
+fn server_and_registered_nick(state: &ServerState, conn: ConnId) -> (String, String) {
+    let server = state.config.server_name.clone();
+    let nick = state.sessions[&conn]
+        .nick()
+        .map(String::from)
+        .expect("registered");
+    (server, nick)
+}
+
 // ---- KILL ---------------------------------------------------------------
 
 pub(super) fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
@@ -323,11 +332,7 @@ pub(super) fn cmd_add_ban(
         return;
     }
     let label = kind.label();
-    let server = state.config.server_name.clone();
-    let nick = state.sessions[&conn]
-        .nick()
-        .map(String::from)
-        .expect("registered");
+    let (server, nick) = server_and_registered_nick(state, conn);
     if p.is_empty() {
         // List current bans of this kind.
         let lines: Vec<String> = state
@@ -746,11 +751,7 @@ pub(super) fn cmd_remove_ban(state: &mut ServerState, conn: ConnId, kind: BanKin
         _ => p[0].to_string(),
     };
     let mask = crate::core::state::MaskKey::new(&ban_mask(kind, &raw_mask), casemap);
-    let server = state.config.server_name.clone();
-    let nick = state.sessions[&conn]
-        .nick()
-        .map(String::from)
-        .expect("registered");
+    let (server, nick) = server_and_registered_nick(state, conn);
     let exists = state
         .server_bans
         .iter()

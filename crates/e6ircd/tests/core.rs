@@ -1094,6 +1094,18 @@ fn names_on_secret_channel_does_not_leak_existence_via_casing() {
 }
 
 #[test]
+fn names_on_missing_channel_terminates() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "NAMES #missing");
+    assert!(
+        s.drain(alice)
+            .iter()
+            .any(|line| line.contains(" 366 ") && line.contains("#missing")),
+    );
+}
+
+#[test]
 fn service_nicks_are_reserved() {
     let mut s = TestServer::new();
     let c = s.connect(1);
@@ -2893,16 +2905,16 @@ fn chanserv_register_flow() {
     s.drain(alice);
     s.line(alice, "PRIVMSG ChanServ :REGISTER #mine");
     let req = s.db_requests();
-    assert_eq!(
-        req,
-        vec![e6ircd::core::DbRequest::RegisterChannel {
-            conn: alice,
-            channel: "#mine".into(),
-            founder_account: "alice".into(),
+    assert!(matches!(
+        req.as_slice(),
+        [e6ircd::core::DbRequest::RegisterChannel {
+            channel,
+            founder_account,
             topic: None,
             label: None,
-        }]
-    );
+            ..
+        }] if channel == "#mine" && founder_account == "alice"
+    ));
     s.core.handle(Input::DbReply {
         conn: alice,
         reply: e6ircd::core::DbReply::ChannelRegistered {
@@ -3707,6 +3719,25 @@ fn away_flow() {
     assert_eq!(s.drain(alice).len(), 1, "message still delivered");
     s.line(alice, "AWAY");
     assert!(has_numeric(&s.drain(alice), "305"));
+}
+
+#[test]
+fn channel_who_reports_away_members() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    s.line(alice, "JOIN #room");
+    s.line(bob, "JOIN #room");
+    s.drain(alice);
+    s.drain(bob);
+    s.line(alice, "AWAY :brb");
+    s.drain(alice);
+    s.line(bob, "WHO #room");
+    assert!(
+        s.drain(bob)
+            .iter()
+            .any(|line| line.contains(" 352 ") && line.contains(" alice G")),
+    );
 }
 
 /// Messaging yourself while away must not trigger an away auto-reply about
@@ -7722,21 +7753,21 @@ fn chanserv_drop_unregisters_channel() {
         s.drain(boss).is_empty(),
         "DROP must not confirm before PostgreSQL deletes the row"
     );
-    let dropped = s.db_requests().into_iter().any(|r| {
-        matches!(r,
-            e6ircd::core::DbRequest::DropChannel {
-                channel,
-                requester: e6ircd::core::ChannelDropRequester::ChanServ { conn, .. },
-            } if channel == "#room" && conn == boss)
-    });
-    assert!(dropped, "DropChannel not queued");
+    let requester = s
+        .db_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            e6ircd::core::DbRequest::DropChannel { channel, requester } if channel == "#room" => {
+                Some(requester)
+            }
+            _ => None,
+        });
+    let Some(requester) = requester else {
+        panic!("DropChannel not queued");
+    };
     s.core.handle(Input::ChannelDropResult {
         channel: "#room".into(),
-        requester: e6ircd::core::ChannelDropRequester::ChanServ {
-            conn: boss,
-            display: "#room".into(),
-            label: None,
-        },
+        requester,
         result: e6ircd::core::ChannelDropResult::Dropped,
     });
     let out = s.drain(boss);
@@ -7780,14 +7811,19 @@ fn chanserv_drop_clears_the_mode_lock() {
     // Drop it, empty it, then recreate it.
     s.line(boss, "PRIVMSG ChanServ :DROP #reg2");
     assert!(s.drain(boss).is_empty());
-    s.db_requests();
+    let requester = s
+        .db_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            e6ircd::core::DbRequest::DropChannel { requester, .. } => Some(requester),
+            _ => None,
+        });
+    let Some(requester) = requester else {
+        panic!("DropChannel not queued");
+    };
     s.core.handle(Input::ChannelDropResult {
         channel: "#reg2".into(),
-        requester: e6ircd::core::ChannelDropRequester::ChanServ {
-            conn: boss,
-            display: "#reg2".into(),
-            label: None,
-        },
+        requester,
         result: e6ircd::core::ChannelDropResult::Dropped,
     });
     s.drain(boss);
@@ -7813,23 +7849,29 @@ fn chanserv_drop_store_failure_is_loud_labeled_and_non_mutating() {
 
     s.line(boss, "@label=drop7 PRIVMSG ChanServ :DROP #room");
     assert!(s.drain(boss).is_empty());
-    assert!(matches!(
-        s.db_requests().as_slice(),
-        [e6ircd::core::DbRequest::DropChannel {
-            requester: e6ircd::core::ChannelDropRequester::ChanServ {
-                label: Some(label),
-                ..
-            },
-            ..
-        }] if label == "drop7"
-    ));
+    let requester = s
+        .db_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            e6ircd::core::DbRequest::DropChannel { requester, .. }
+                if matches!(
+                    &requester,
+                    e6ircd::core::ChannelDropRequester::ChanServ {
+                        label: Some(label),
+                        ..
+                    } if label == "drop7"
+                ) =>
+            {
+                Some(requester)
+            }
+            _ => None,
+        });
+    let Some(requester) = requester else {
+        panic!("labeled DropChannel not queued");
+    };
     s.core.handle(Input::ChannelDropResult {
         channel: "#room".into(),
-        requester: e6ircd::core::ChannelDropRequester::ChanServ {
-            conn: boss,
-            display: "#room".into(),
-            label: Some("drop7".into()),
-        },
+        requester,
         result: e6ircd::core::ChannelDropResult::Unavailable,
     });
     let out = s.drain(boss);
@@ -7920,10 +7962,11 @@ fn owner_channel_control_waits_for_storage_and_updates_the_hot_access_map() {
         Err(tokio::sync::oneshot::error::TryRecvError::Empty)
     ));
     let request = s.db_requests();
-    let (request_id, mutation) = match request.as_slice() {
+    let (request_id, owner, mutation) = match request.as_slice() {
         [
             e6ircd::core::DbRequest::MutateOwnedChannel {
                 request_id,
+                owner,
                 channel,
                 actor,
                 mutation,
@@ -7931,7 +7974,7 @@ fn owner_channel_control_waits_for_storage_and_updates_the_hot_access_map() {
         ] => {
             assert_eq!(channel, "#room");
             assert_eq!(actor, "BoSs");
-            (*request_id, mutation.clone())
+            (*request_id, owner.clone(), mutation.clone())
         }
         other => panic!("channel control did not queue its typed write: {other:#?}"),
     };
@@ -7944,6 +7987,7 @@ fn owner_channel_control_waits_for_storage_and_updates_the_hot_access_map() {
         "access flags were not canonicalized at the core boundary"
     );
     s.core.handle(Input::ChannelControlResult {
+        owner,
         request_id,
         channel: "#room".into(),
         mutation,
@@ -8015,10 +8059,11 @@ fn owner_channel_registration_requires_live_operator_and_waits_for_storage() {
         Err(tokio::sync::oneshot::error::TryRecvError::Empty)
     ));
     let requests = s.db_requests();
-    let (request_id, topic) = match requests.as_slice() {
+    let (request_id, owner, topic) = match requests.as_slice() {
         [
             e6ircd::core::DbRequest::RegisterOwnedChannel {
                 request_id,
+                owner,
                 channel,
                 founder_account,
                 topic,
@@ -8026,7 +8071,7 @@ fn owner_channel_registration_requires_live_operator_and_waits_for_storage() {
         ] => {
             assert_eq!(channel, "#web");
             assert_eq!(founder_account, "BoSs");
-            (*request_id, topic.clone())
+            (*request_id, owner.clone(), topic.clone())
         }
         other => panic!("owner registration did not queue its typed write: {other:#?}"),
     };
@@ -8035,6 +8080,7 @@ fn owner_channel_registration_requires_live_operator_and_waits_for_storage() {
         Some("from the console")
     );
     s.core.handle(Input::OwnedChannelRegistrationResult {
+        owner,
         request_id,
         channel: "#web".into(),
         founder_account: "BoSs".into(),

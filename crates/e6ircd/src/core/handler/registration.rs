@@ -36,18 +36,6 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
-    if let Some(owner) = state.nick_reservation(&key)
-        && owner.conn() != conn
-    {
-        state.numeric(
-            conn,
-            ERR_NICKNAMEINUSE,
-            &[nick],
-            Some("Nickname is already in use"),
-        );
-        return;
-    }
-    // same owner: casing change falls through as a normal change
     let (registered, prefix, old_key, old_nick_display) = {
         let session = &state.sessions[&conn];
         (
@@ -63,6 +51,15 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     if registered && old_nick_display.as_deref() == Some(nick) {
         return;
     }
+    if !state.claim_nick(key.clone(), conn) {
+        state.numeric(
+            conn,
+            ERR_NICKNAMEINUSE,
+            &[nick],
+            Some("Nickname is already in use"),
+        );
+        return;
+    }
     // A pure case change keeps the same monitor/nick key.
     let case_change_only = old_key.as_ref() == Some(&key);
     if registered && !case_change_only {
@@ -73,21 +70,21 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .get_mut(&conn)
         .expect("checked")
         .set_nick(nick.to_string());
-    if let Some(old_key) = old_key {
+    if let Some(old_key) = old_key.filter(|old_key| old_key != &key) {
         state.release_nick(&old_key, conn);
     }
-    state.reserve_nick(key, conn);
 
     if registered {
-        let line = format!(":{} NICK {nick}", prefix.expect("registered"));
+        let previous_prefix = prefix.expect("registered");
+        let line = format!(":{previous_prefix} NICK {nick}");
         // Route through send_timed (self and each peer) so server-time clients
         // get an @time= tag, like every other membership event — a raw
         // send_bytes loop would silently omit it for NICK alone.
         state.send_timed(conn, &line);
-        let peers = state.channel_peers(conn);
-        for peer in peers {
-            state.send_timed(peer, &line);
-        }
+        state.sync_channel_member(
+            conn,
+            crate::core::state::ChannelMemberChange::Nick { previous_prefix },
+        );
         if !case_change_only {
             if let Some(old_nick) = old_nick_display {
                 monitor_notify(state, &old_nick, false);
