@@ -1361,6 +1361,16 @@ async fn repeated_registration_rejection_parks_the_driver() {
 #[tokio::test(flavor = "multi_thread")]
 async fn full_buffer_evicts_oldest() {
     let addr = upstream().await;
+    let mut peer = e6irc_client::Connection::connect(&addr.to_string())
+        .await
+        .unwrap();
+    peer.register("speaker", "speaker").await.unwrap();
+    peer.send_line("JOIN #ring").await.unwrap();
+    loop {
+        if peer.next_message().await.unwrap().unwrap().command == "366" {
+            break;
+        }
+    }
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
         nick: "bncbot".into(),
@@ -1370,14 +1380,18 @@ async fn full_buffer_evicts_oldest() {
     });
     let mut events = handle.subscribe();
     wait_connected(&handle, &mut events).await;
-
-    let mut peer = e6irc_client::Connection::connect(&addr.to_string())
-        .await
-        .unwrap();
-    peer.register("speaker", "speaker").await.unwrap();
-    peer.send_line("JOIN #ring").await.unwrap();
     loop {
-        if peer.next_message().await.unwrap().unwrap().command == "366" {
+        let message = peer.next_message().await.unwrap().unwrap();
+        if message.command == "JOIN"
+            && message
+                .params
+                .first()
+                .is_some_and(|channel| channel == "#ring")
+            && message
+                .source
+                .as_deref()
+                .is_some_and(|source| source.starts_with("bncbot!"))
+        {
             break;
         }
     }
