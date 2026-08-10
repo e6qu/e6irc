@@ -2223,6 +2223,19 @@ async fn owned_channel_api_covers_configuration_access_transfer_and_drop() {
     )
     .await;
     assert_eq!(status, 201, "owner API registration failed: {body}");
+    let (status, _, body) = request(
+        http,
+        &api("GET", "/api/v1/me/channels/%23Api", &boss_token, None),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "registered channel was not immediately readable: {body}"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).expect("registered channel")["founder"],
+        "boss"
+    );
 
     for body in [r#"{"flags":""}"#, r#"{"flags":"oo"}"#] {
         let (status, _, response) = request(

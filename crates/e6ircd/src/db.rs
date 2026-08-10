@@ -2043,9 +2043,6 @@ async fn handle_request(
                 .push(Input::OwnedChannelRegistrationResult {
                     owner,
                     request_id,
-                    channel,
-                    founder_account,
-                    topic,
                     result,
                 })
                 .await
@@ -2369,8 +2366,6 @@ async fn handle_request(
                 .push(Input::ChannelControlResult {
                     owner,
                     request_id,
-                    channel,
-                    mutation,
                     result,
                 })
                 .await

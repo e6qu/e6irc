@@ -597,8 +597,6 @@ pub enum Input {
     ChannelControlResult {
         owner: ChannelOwner,
         request_id: u64,
-        channel: String,
-        mutation: PersistedChannelMutation,
         result: ChannelControlResult,
     },
     /// A founder registration requested through the owner REST/console
@@ -608,9 +606,6 @@ pub enum Input {
     OwnedChannelRegistrationResult {
         owner: ChannelOwner,
         request_id: u64,
-        channel: String,
-        founder_account: String,
-        topic: Option<(String, String, u64)>,
         result: ChannelRegistrationResult,
     },
 }
@@ -2155,8 +2150,6 @@ impl Core {
             Input::ChannelControlResult {
                 owner,
                 request_id,
-                channel,
-                mutation,
                 result,
             } => {
                 assert_eq!(
@@ -2164,20 +2157,11 @@ impl Core {
                     self.shard,
                     "channel control reached wrong shard"
                 );
-                handler::admin::channel_control_result(
-                    &mut self.state,
-                    request_id,
-                    channel,
-                    mutation,
-                    result,
-                );
+                handler::admin::channel_control_result(&mut self.state, request_id, result);
             }
             Input::OwnedChannelRegistrationResult {
                 owner,
                 request_id,
-                channel,
-                founder_account,
-                topic,
                 result,
             } => {
                 assert_eq!(
@@ -2188,9 +2172,6 @@ impl Core {
                 handler::admin::owned_channel_registration_result(
                     &mut self.state,
                     request_id,
-                    channel,
-                    founder_account,
-                    topic,
                     result,
                 );
             }
@@ -2297,7 +2278,8 @@ mod connection_id_allocator_tests {
 mod ingress_tests {
     use super::{
         ConnId, ConnectionTransport, Core, CoreConfig, CoreDirectories, CoreIngress, CoreScheduler,
-        CoreShardCount, CoreShardId, CoreTraceStep, CoreWorker, Input, ReplayError, SessionOwner,
+        CoreShardCount, CoreShardId, CoreTraceStep, CoreWorker, Input, Output, ReplayError,
+        SessionOwner,
     };
     use crate::core::state::{
         Caps, ChanModes, Channel, ChannelActor, ChannelCommand, ChannelCommandOperation,
@@ -2307,6 +2289,7 @@ mod ingress_tests {
     use e6irc_queue::{Config, Envelope, Policy, Receiver, Sender, queue};
     use std::num::NonZeroUsize;
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn wall_clock() -> e6irc_proto::time::Millis {
         e6irc_proto::time::Millis::from_millis(0)
@@ -2391,6 +2374,44 @@ mod ingress_tests {
             second_tx,
             second_rx,
             ingress,
+        }
+    }
+
+    fn channel_on_second(core: &Core) -> &'static str {
+        ["#alpha", "#beta", "#gamma"]
+            .into_iter()
+            .find(|name| core.state.channel_owner(name).shard() == CoreShardId(1))
+            .expect("a channel owned by shard one")
+    }
+
+    fn open_session_on_first(
+        first: &mut Core,
+        name: &'static str,
+    ) -> (SessionOwner, Receiver<Output>) {
+        let (output_tx, output_rx) = queue(Config {
+            name,
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        let session = SessionOwner::new(ConnId(2), CoreShardId(0));
+        first.state.open(
+            session.conn(),
+            output_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        (session, output_rx)
+    }
+
+    fn take_service_result(core: &mut Core, session: SessionOwner) -> Input {
+        let mut effects = core.take_effects();
+        match effects.pop() {
+            Some(super::CoreEffect::Input(
+                result @ Input::ChannelServiceResult {
+                    session: received, ..
+                },
+            )) if received == session && effects.is_empty() => result,
+            _ => panic!("owner did not produce one requester result"),
         }
     }
 
@@ -2596,6 +2617,121 @@ mod ingress_tests {
         assert!(matches!(
             first_rx.pop().await.expect("session reply").payload,
             Input::ChannelServiceResult { session: received, .. } if received == session
+        ));
+    }
+
+    #[test]
+    fn persistence_commits_on_the_channel_owner_after_requester_disconnects() {
+        let TwoWorkerHarness {
+            mut first,
+            mut second,
+            ..
+        } = two_worker_harness();
+        let channel = channel_on_second(&second);
+        first.preload_founders(vec![(channel.into(), "boss".into())]);
+        let (session, mut output_rx) =
+            open_session_on_first(&mut first, "persistence-disconnect-output");
+
+        second.handle(Input::ChannelServicePersisted {
+            owner: second.state.channel_owner(channel),
+            session,
+            result: super::ChannelServicePersistence::AccessSet {
+                channel: channel.into(),
+                display: channel.into(),
+                account: "alice".into(),
+                flags: Some("o".into()),
+                applied: true,
+                label: None,
+            },
+        });
+        assert_eq!(
+            second
+                .state
+                .access_modes(&second.state.chan_key(channel), "alice"),
+            (true, false)
+        );
+        let result = take_service_result(&mut second, session);
+
+        first.handle(Input::Closed {
+            conn: session.conn(),
+            reason: "gone".into(),
+        });
+        first.handle(result);
+        assert!(
+            output_rx.try_pop().is_none(),
+            "a disconnected session received a stale reply"
+        );
+    }
+
+    #[test]
+    fn persistence_failure_returns_only_to_the_requester_session() {
+        let TwoWorkerHarness {
+            mut first,
+            mut second,
+            ..
+        } = two_worker_harness();
+        let channel = channel_on_second(&second);
+        let (session, mut output_rx) =
+            open_session_on_first(&mut first, "persistence-failure-output");
+        second.handle(Input::ChannelServicePersisted {
+            owner: second.state.channel_owner(channel),
+            session,
+            result: super::ChannelServicePersistence::AccessUnavailable {
+                channel: channel.into(),
+                display: channel.into(),
+                label: None,
+            },
+        });
+        let result = take_service_result(&mut second, session);
+        first.handle(result);
+        let output = output_rx
+            .try_pop()
+            .expect("requester receives persistence failure");
+        assert!(
+            std::str::from_utf8(&output.payload.0)
+                .expect("wire output")
+                .contains("temporarily unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_backpressure_preserves_the_owner_queue_order() {
+        let config = Config {
+            name: "ingress-backpressure",
+            capacity: 1,
+            policy: Policy::Fifo,
+        };
+        let (first_tx, mut first_rx) = queue(config);
+        let (second_tx, _second_rx) = queue(config);
+        let ingress = CoreIngress::with_shards(first_tx, vec![second_tx]);
+        ingress
+            .push(Input::Line {
+                conn: ConnId(2),
+                line: b"PING :first".to_vec(),
+            })
+            .await
+            .expect("first event queued");
+        let second = ingress.push(Input::Line {
+            conn: ConnId(2),
+            line: b"PING :second".to_vec(),
+        });
+        tokio::pin!(second);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut second)
+                .await
+                .is_err(),
+            "a full owner queue must apply backpressure"
+        );
+        assert!(matches!(
+            first_rx.pop().await.expect("first event").payload,
+            Input::Line { line, .. } if line == b"PING :first"
+        ));
+        second
+            .await
+            .expect("second event queued after capacity frees");
+        assert!(matches!(
+            first_rx.pop().await.expect("second event").payload,
+            Input::Line { line, .. } if line == b"PING :second"
         ));
     }
 
