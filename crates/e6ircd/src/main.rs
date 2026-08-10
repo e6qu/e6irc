@@ -197,11 +197,11 @@ fn run(args: &[String]) -> ExitCode {
                         ExitCode::FAILURE
                     }
                     net::ShutdownOutcome::CoreTimedOut => {
-                        eprintln!("e6ircd: core worker did not stop before shutdown timeout");
+                        eprintln!("e6ircd: a core worker did not stop before shutdown timeout");
                         ExitCode::FAILURE
                     }
                     net::ShutdownOutcome::CorePanicked => {
-                        eprintln!("e6ircd: core worker panicked during shutdown");
+                        eprintln!("e6ircd: a core worker panicked during shutdown");
                         ExitCode::FAILURE
                     }
                 }

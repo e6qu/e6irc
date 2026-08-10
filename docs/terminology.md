@@ -289,9 +289,9 @@ of how far a user has read, set via `MARKREAD` and synced across clients.
 
 ## Internal architecture
 
-**Core worker** — the single share-nothing task that owns all chat state and
-processes every client event serially (the degenerate N=1 of a sharded
-design). It never touches the database directly.
+**Core worker** — one share-nothing task that owns its chat-state shard and
+processes its events serially. The configured count defaults to one. It never
+touches the database directly.
 
 **Database worker** — the task that owns the PostgreSQL pool and answers the
 core worker's requests, keeping slow I/O off the core.

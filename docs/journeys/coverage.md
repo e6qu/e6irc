@@ -34,7 +34,7 @@ a design target rather than current behavior.
 | [Recover from PostgreSQL interruption](deployment-and-recovery.md#recover-from-postgresql-interruption) | Proven | Named PostgreSQL stop/start under real daemon, probe, database-backed HTTP, and hot IRC traffic proves bounded failure and recovery | — |
 | [Back up and restore PostgreSQL](deployment-and-recovery.md#back-up-and-restore-postgresql) | Proven | Guarded shell contract plus real custom-format PostgreSQL archive, destructive proof mutation, transactional restore, and daemon reboot journey | External master-key/config backup storage remains the operator’s responsibility |
 | [Recover from secret-key loss or rotation](deployment-and-recovery.md#recover-from-secret-key-loss-or-rotation) | Proven | Keyring/open/seal/wrong-key startup and CLI tests plus atomic PostgreSQL all-secret rotation/rollback/audit proof | Irrecoverable key loss still requires a key backup or explicit credential replacement |
-| [Qualify high scale](deployment-and-recovery.md#qualify-high-scale) | Unproven | Exact-delivery 64-client CI gate, daemon RSS/connection threshold, lazy SendQ allocation, deterministic two-worker routing, and recorded 2,000-client baselines | 100,000-client tuned-host result, runtime N>1 startup, and production thresholds are absent |
+| [Qualify high scale](deployment-and-recovery.md#qualify-high-scale) | Unproven | Exact-delivery 64-client CI gate, daemon RSS/connection threshold, lazy SendQ allocation, runtime N=2/N=3 routing, and recorded 2,000-client baselines | 100,000-client tuned-host result and production thresholds are absent |
 | [Sign in with a local password](identity-and-access.md#sign-in-with-a-local-password) | Proven | Chromium adds a password, signs out, and completes real local login against e6ircd/PostgreSQL | — |
 | [Sign in with OpenID Connect](identity-and-access.md#sign-in-with-openid-connect) | Proven | Real e6ircd, PostgreSQL, Dex, and Chromium plus exact Shauth journey | Provider diversity beyond Dex/Shauth |
 | [Link or unlink an OpenID Connect identity](identity-and-access.md#link-or-unlink-an-openid-connect-identity) | Proven | Real Dex/PostgreSQL conflict and console/API lifecycle tests | — |
@@ -96,9 +96,9 @@ without suppressing other console, page, or transport failures.
 
 ### Target-scale architecture
 
-The daemon runs one worker. Typed shard ownership, routing, and deterministic
-two-worker scheduling/replay are proven in core tests, but runtime N>1 startup
-and production qualification are not. The reduced CI run has numeric
+The daemon runs a configured nonzero number of core workers. Typed shard
+ownership and runtime N=2/N=3 routing are proven, but production qualification
+is not. The reduced CI run has numeric
 catastrophic-regression thresholds, but there are no production-host acceptance
 thresholds, production-qualified per-connection RSS budget, or 100k result.
 The Linux smoke enforces a deliberately generous incremental RSS/connection

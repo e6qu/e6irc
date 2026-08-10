@@ -947,6 +947,7 @@ async fn openapi_spec_is_served() {
             "nicklen",
             "sendq",
             "core_queue",
+            "core_workers",
             "max_hot_channels",
             "listeners",
             "registration",
@@ -4134,6 +4135,7 @@ async fn admin_connection_directory_and_disconnect_controls() {
             admin_accounts: vec!["alice".into()],
         }),
         database: Some(DatabaseConfig { url }),
+        core_workers: 3,
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");

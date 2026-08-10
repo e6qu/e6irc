@@ -279,11 +279,45 @@ pub(super) fn read_marker_stored(
                 state.send(peer, &line);
             }
         }
+        state.broadcast_read_marker(account.clone(), target.clone(), display.clone(), marker_ms);
     }
     if state.sessions.contains_key(&conn) {
         state.emit_deferred_labeled(conn, label, move |state| {
             state.send(conn, &line);
         });
+    }
+}
+
+pub(crate) fn apply_stored_marker(
+    state: &mut ServerState,
+    account: &str,
+    target: &str,
+    display: &str,
+    marker_ms: e6irc_proto::time::Millis,
+) {
+    let key = (state.account_key(account), state.chan_key(target));
+    if state
+        .read_markers
+        .get(&key)
+        .is_some_and(|current| *current >= marker_ms)
+    {
+        return;
+    }
+    state.read_markers.insert(key, marker_ms);
+    let server = state.config.server_name.clone();
+    let line = format!(
+        ":{server} MARKREAD {} timestamp={}",
+        clip_echo(display),
+        e6irc_proto::time::server_time(marker_ms)
+    );
+    for peer in state.account_connections(account) {
+        if state
+            .sessions
+            .get(&peer)
+            .is_some_and(|session| session.is_registered() && session.caps.read_marker)
+        {
+            state.send(peer, &line);
+        }
     }
 }
 

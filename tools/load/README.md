@@ -35,8 +35,8 @@ large deployment spreads users across many channels. Measured locally
 | 1 channel     | 290 c/s  | 59k msg/s   | 131 ms      |
 | 200 channels  | 6042 c/s | 122k msg/s  | 37 ms       |
 
-The residual latency at scale comes from the single core worker serializing
-every channel's fan-out.
+The residual latency at scale comes from each channel owner's core shard
+serializing that channel's fan-out.
 
 Output:
 
@@ -104,7 +104,8 @@ must name a new directory; it creates one JSON result per client count.
 
 `qualify-linux.sh` runs one explicit-budget campaign and writes `result.json`
 and `host.txt`. It requires a clean source tree and records the source revision,
-the load and server executable hashes, host limits, and exact workload/budgets.
+the load and server executable hashes, host limits, configured core-worker count,
+and exact workload/budgets.
 It rejects a non-e6ircd PID, insufficient file-descriptor limits, a target
 listener owned by another process, ephemeral-port capacity, or listen backlog
 before it starts. It is a single-load-host tool; its client count cannot exceed
@@ -113,14 +114,14 @@ directory must not exist, so it cannot overwrite prior evidence. A failed
 harness run still writes `result.json`; preflight failures create no evidence.
 
 ```
-tools/load/qualify-linux.sh 127.0.0.1:6667 "$SERVER_PID" 20000 200 20 results/20000 \
+tools/load/qualify-linux.sh 127.0.0.1:6667 "$SERVER_PID" 2 20000 200 20 results/20000 \
   100 1000 500 262144
 ```
 
-The final four values are minimum connect rate, minimum fan-out rate, maximum
-P99 milliseconds, and maximum incremental server resident bytes per requested
-connection. The result records the SHA-256 digest of `host.txt`; verify it
-before publishing a claim.
+The third value is the configured core-worker count. The final four values are
+minimum connect rate, minimum fan-out rate, maximum P99 milliseconds, and
+maximum incremental server resident bytes per requested connection. The result
+records the SHA-256 digest of `host.txt`; verify it before publishing a claim.
 
 CI runs 64 clients across eight channels with a four-message burst against a
 real debug daemon, requiring exact fan-out, at least 10 connections/second,

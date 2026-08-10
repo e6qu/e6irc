@@ -8965,11 +8965,13 @@ fn server_ban_store_failure_is_loud_labeled_and_non_mutating() {
                 mutation,
                 requester:
                     requester @ e6ircd::core::ServerBanRequester::Oper {
-                        conn,
+                        session,
                         label: Some(label),
                     },
             },
-        ] if *conn == op && label == "ban7" => (mutation.clone(), requester.clone()),
+        ] if session.connection_id() == op && label == "ban7" => {
+            (mutation.clone(), requester.clone())
+        }
         other => panic!("KLINE did not preserve its requester/label: {other:#?}"),
     };
     assert!(

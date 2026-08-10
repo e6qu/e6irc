@@ -7,10 +7,7 @@
 //! same disconnection of matching sessions, same audit row — rather than a
 //! second, divergent implementation.
 
-use super::oper::{
-    BanMask, BanReject, QueueServerBanError, apply_server_ban_hot, ban_mask, notify_opers,
-    queue_server_ban_mutation, remove_server_ban_hot,
-};
+use super::oper::{BanMask, BanReject, QueueServerBanError, ban_mask, queue_server_ban_mutation};
 use super::*;
 use crate::core::state::{BanKind, MaskKey};
 use crate::core::{AdminReply, AdminRequest};
@@ -43,7 +40,9 @@ pub(crate) fn handle(
         AdminRequest::DropChannel { channel, actor } => {
             return begin_drop_channel(state, &channel, actor, reply);
         }
-        AdminRequest::ListConnections { query } => list_connections(state, query),
+        AdminRequest::ListConnections { query } => {
+            return begin_connection_list(state, query, reply);
+        }
         AdminRequest::DisconnectConnection {
             connection_id,
             reason,
@@ -81,10 +80,32 @@ fn set_account_suspended(
     reason: &str,
     actor: &str,
 ) -> AdminReply {
+    let disconnected = apply_account_suspension(state, account, suspended, reason, actor);
+    state.broadcast_account_suspension(
+        account.to_string(),
+        suspended,
+        reason.to_string(),
+        actor.to_string(),
+    );
+    if !suspended {
+        return AdminReply::Ok(format!("Reactivated live authentication for {account}"));
+    }
+    AdminReply::Ok(format!(
+        "Disconnected {disconnected} live connection(s) for {account}"
+    ))
+}
+
+pub(crate) fn apply_account_suspension(
+    state: &mut ServerState,
+    account: &str,
+    suspended: bool,
+    reason: &str,
+    actor: &str,
+) -> usize {
     let account_key = state.account_key(account);
     if !suspended {
         state.suspended_accounts.remove(&account_key);
-        return AdminReply::Ok(format!("Reactivated live authentication for {account}"));
+        return 0;
     }
     state.suspended_accounts.insert(account_key.clone());
     let connections: Vec<ConnId> = state
@@ -104,9 +125,7 @@ fn set_account_suspended(
             disconnected += 1;
         }
     }
-    AdminReply::Ok(format!(
-        "Disconnected {disconnected} live connection(s) for {account}"
-    ))
+    disconnected
 }
 
 fn begin_owned_channel_registration(
@@ -463,7 +482,34 @@ fn live_connection_matches(
 /// Build a newest-first live-connection page while retaining at most one page
 /// plus its cursor sentinel. The core still examines live state once, but a
 /// request can never allocate a vector proportional to the whole server.
-fn list_connections(state: &ServerState, query: crate::core::LiveConnectionQuery) -> AdminReply {
+fn begin_connection_list(
+    state: &mut ServerState,
+    query: crate::core::LiveConnectionQuery,
+    reply: tokio::sync::oneshot::Sender<AdminReply>,
+) {
+    let Some(request_id) = state.admin_connection_list_id.checked_add(1) else {
+        let _ = reply.send(AdminReply::Err(
+            "connection-list request ID space exhausted".into(),
+        ));
+        return;
+    };
+    state.admin_connection_list_id = request_id;
+    state.pending_connection_lists.insert(
+        request_id,
+        crate::core::state::PendingConnectionList {
+            query: query.clone(),
+            remaining: state.channels.shard_count(),
+            entries: Vec::new(),
+            reply,
+        },
+    );
+    state.broadcast_connection_list(request_id, query);
+}
+
+pub(crate) fn connection_list_entries(
+    state: &ServerState,
+    query: &crate::core::LiveConnectionQuery,
+) -> Vec<crate::core::LiveConnectionInfo> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
@@ -501,9 +547,7 @@ fn list_connections(state: &ServerState, query: crate::core::LiveConnectionQuery
         .map(|Reverse(connection_id)| connection_id)
         .collect();
     connection_ids.sort_unstable_by(|left, right| right.cmp(left));
-    let next_before_id = (connection_ids.len() > page_size).then(|| connection_ids[page_size - 1]);
-    connection_ids.truncate(page_size);
-    let entries = connection_ids
+    connection_ids
         .into_iter()
         .map(|connection_id| {
             let session = &state.sessions[&crate::core::ConnId(connection_id)];
@@ -526,11 +570,43 @@ fn list_connections(state: &ServerState, query: crate::core::LiveConnectionQuery
                 channels,
             }
         })
-        .collect();
-    AdminReply::Connections(crate::core::LiveConnectionPage {
-        entries,
-        next_before_id,
-    })
+        .collect()
+}
+
+pub(crate) fn connection_list_result(
+    state: &mut ServerState,
+    request_id: u64,
+    mut entries: Vec<crate::core::LiveConnectionInfo>,
+) {
+    let Some(pending) = state.pending_connection_lists.get_mut(&request_id) else {
+        eprintln!("core: connection-list result for unknown admin request {request_id}");
+        return;
+    };
+    pending.entries.append(&mut entries);
+    pending.remaining = pending
+        .remaining
+        .checked_sub(1)
+        .expect("each core shard replies once to a connection list");
+    if pending.remaining != 0 {
+        return;
+    }
+    let mut pending = state
+        .pending_connection_lists
+        .remove(&request_id)
+        .expect("checked present");
+    let page_size = pending.query.page_size.value();
+    pending
+        .entries
+        .sort_unstable_by_key(|entry| std::cmp::Reverse(entry.id));
+    let next_before_id =
+        (pending.entries.len() > page_size).then(|| pending.entries[page_size - 1].id);
+    pending.entries.truncate(page_size);
+    let _ = pending
+        .reply
+        .send(AdminReply::Connections(crate::core::LiveConnectionPage {
+            entries: pending.entries,
+            next_before_id,
+        }));
 }
 
 fn disconnect_connection(
@@ -629,19 +705,11 @@ fn begin_add_ban(
     };
     let mask = MaskKey::new(parsed.as_str(), state.casemap);
     if !state.config.sasl_enabled {
-        let disconnected =
-            apply_server_ban_hot(state, mask.clone(), kind, reason, &actor, kind.label());
-        notify_opers(
-            state,
-            None,
-            &format!(
-                "{actor} (console) added {} for {} ({reason})",
-                kind.label(),
-                mask.as_str()
-            ),
-        );
+        let mutation = crate::core::ServerBanMutation::add(&mask, kind, reason.to_string(), actor);
+        super::oper::apply_committed_server_ban(state, mutation.clone());
+        state.broadcast_server_ban_after_local_apply(mutation);
         let _ = reply.send(AdminReply::Ok(format!(
-            "Added {} for {} — {disconnected} session(s) disconnected",
+            "Added {} for {}",
             kind.label(),
             mask.as_str()
         )));
@@ -682,7 +750,10 @@ fn begin_remove_ban(
         return;
     }
     if !state.config.sasl_enabled {
-        remove_server_ban_hot(state, &mask, kind);
+        let mutation =
+            crate::core::ServerBanMutation::remove_with_id(&mask, kind, actor, expected_id);
+        super::oper::apply_committed_server_ban(state, mutation.clone());
+        state.broadcast_server_ban_after_local_apply(mutation);
         let _ = reply.send(AdminReply::Ok(format!(
             "Removed {} for {}",
             kind.label(),

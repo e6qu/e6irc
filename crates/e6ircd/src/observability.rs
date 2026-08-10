@@ -332,11 +332,12 @@ impl Telemetry {
     }
 
     pub(crate) fn observing_queues(
-        core: e6irc_queue::QueueMonitor,
+        core: impl IntoIterator<Item = e6irc_queue::QueueMonitor>,
         database: e6irc_queue::QueueMonitor,
     ) -> Self {
         let mut telemetry = Self::new();
-        telemetry.queue_monitors = vec![core, database];
+        telemetry.queue_monitors = core.into_iter().collect();
+        telemetry.queue_monitors.push(database);
         telemetry
     }
 
@@ -417,14 +418,21 @@ impl Telemetry {
         self.error_last_seen_ms[kind.index()].store(epoch_millis(), Ordering::Relaxed);
     }
 
-    pub(crate) fn update_core_gauges(&self, active: usize, registered: usize, channels: usize) {
-        self.active_connections
-            .store(active as u64, Ordering::Relaxed);
-        self.registered_connections
-            .store(registered as u64, Ordering::Relaxed);
-        self.unregistered_connections
-            .store(active.saturating_sub(registered) as u64, Ordering::Relaxed);
-        self.channels.store(channels as u64, Ordering::Relaxed);
+    pub(crate) fn adjust_core_gauges(
+        &self,
+        previous: (usize, usize, usize),
+        current: (usize, usize, usize),
+    ) {
+        adjust_gauge(&self.active_connections, previous.0, current.0);
+        adjust_gauge(&self.registered_connections, previous.1, current.1);
+        adjust_gauge(&self.channels, previous.2, current.2);
+        let previous_unregistered = previous.0.saturating_sub(previous.1);
+        let current_unregistered = current.0.saturating_sub(current.1);
+        adjust_gauge(
+            &self.unregistered_connections,
+            previous_unregistered,
+            current_unregistered,
+        );
         self.core_seen.store(true, Ordering::Relaxed);
         self.core_heartbeat_elapsed_ms.store(
             self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
@@ -678,6 +686,14 @@ impl Telemetry {
     }
 }
 
+fn adjust_gauge(gauge: &AtomicU64, previous: usize, current: usize) {
+    if current >= previous {
+        gauge.fetch_add((current - previous) as u64, Ordering::Relaxed);
+    } else {
+        gauge.fetch_sub((previous - current) as u64, Ordering::Relaxed);
+    }
+}
+
 fn render_queues(out: &mut String, queues: &BTreeMap<String, QueueSnapshot>) {
     out.push_str("# HELP e6irc_queue_depth Events currently waiting in a runtime queue.\n");
     out.push_str("# TYPE e6irc_queue_depth gauge\n");
@@ -863,7 +879,7 @@ mod tests {
         telemetry.record_error(ErrorKind::Read);
         telemetry.observe_latency(LatencyKind::Core, Duration::from_micros(900));
         telemetry.observe_latency(LatencyKind::Core, Duration::from_micros(4_000));
-        telemetry.update_core_gauges(3, 2, 1);
+        telemetry.adjust_core_gauges((0, 0, 0), (3, 2, 1));
 
         let snapshot = telemetry.snapshot(4, 3);
         assert_eq!(snapshot.schema_version, SNAPSHOT_SCHEMA_VERSION);
@@ -909,7 +925,7 @@ mod tests {
             capacity: 8,
             policy: e6irc_queue::Policy::Fifo,
         });
-        let telemetry = Telemetry::observing_queues(core_tx.monitor(), database_tx.monitor());
+        let telemetry = Telemetry::observing_queues([core_tx.monitor()], database_tx.monitor());
         core_tx.try_push(1).unwrap();
         core_tx.try_push(2).unwrap();
 
@@ -942,7 +958,7 @@ mod tests {
     fn readiness_requires_a_core_heartbeat() {
         let telemetry = Telemetry::new();
         assert!(!telemetry.core_is_fresh(Duration::from_secs(45)));
-        telemetry.update_core_gauges(0, 0, 0);
+        telemetry.adjust_core_gauges((0, 0, 0), (0, 0, 0));
         assert!(telemetry.core_is_fresh(Duration::from_secs(45)));
     }
 

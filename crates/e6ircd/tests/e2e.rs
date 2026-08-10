@@ -92,6 +92,42 @@ async fn two_clients_join_and_message() {
 }
 
 #[tokio::test]
+async fn runtime_shards_deliver_and_stop_together() {
+    for core_workers in [2, 3] {
+        let mut config = test_config();
+        config.core_workers = core_workers;
+        let running = net::start(config).await.expect("start sharded server");
+        let addr = running.addrs[0];
+        let mut clients = Vec::new();
+        for index in 0..12 {
+            let mut client = Client::connect(addr).await;
+            client
+                .register(&format!("shard{core_workers}_{index}"))
+                .await;
+            client.send("JOIN #runtime").await;
+            client.expect(" 366 ").await;
+            clients.push(client);
+        }
+
+        clients[0]
+            .send("PRIVMSG #runtime :cross-shard runtime delivery")
+            .await;
+        for client in clients.iter_mut().skip(1) {
+            let line = client
+                .expect("PRIVMSG #runtime :cross-shard runtime delivery")
+                .await;
+            assert!(line.contains("shard"), "unexpected delivery: {line}");
+        }
+
+        assert_eq!(
+            running.shutdown.run().await,
+            net::ShutdownOutcome::Flushed,
+            "all {core_workers} shards must stop cleanly"
+        );
+    }
+}
+
+#[tokio::test]
 async fn whois_reports_idle_and_signon() {
     let running = net::start(test_config()).await.expect("start");
     let addr = running.addrs[0];

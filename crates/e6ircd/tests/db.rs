@@ -3580,7 +3580,10 @@ async fn server_ban_worker_mutates_and_audits_atomically() {
         set_by: "god".into(),
         kind: "kline".into(),
     };
-    let requester = e6ircd::core::ServerBanRequester::Oper { conn, label: None };
+    let requester = e6ircd::core::ServerBanRequester::Oper {
+        session: e6ircd::core::CoreShardCount::single().session_owner(conn),
+        label: None,
+    };
     request_tx
         .push(DbRequest::MutateServerBan {
             mutation: add.clone(),

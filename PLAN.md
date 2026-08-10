@@ -14,12 +14,11 @@ and integration claims.
 
 ### Stage F — Scale architecture and qualification
 
-- The daemon runs one core worker. Deterministic two-worker tests prove typed
-  ownership/routing, ordering, backpressure, persistence verdicts, disconnected
-  requesters, and owner API controls.
+- The daemon runs a configured nonzero number of core workers (default 1).
+  Runtime N=2/N=3 tests cover ownership, routing, delivery, and shutdown.
 - Controlled Linux campaigns record source, executable, host, workload,
-  budgets, and a closed passed/rejected/failed outcome. Runtime N>1 startup and
-  tuned-host campaigns remain required before scale claims or enablement.
+  configured worker count, budgets, and a closed passed/rejected/failed outcome.
+  Tuned-host campaigns remain required before scale claims.
 
 ## Remaining qualification
 

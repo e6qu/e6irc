@@ -461,6 +461,7 @@ pub(crate) struct CoreDirectories {
     pub(crate) channel_options: ChannelOptionsDirectory,
 }
 
+#[derive(Clone)]
 pub struct CoreConfig {
     pub server_name: String,
     pub network_name: String,
@@ -2306,6 +2307,13 @@ pub(crate) struct PendingChannelControl {
     pub(crate) kind: PendingChannelControlKind,
 }
 
+pub(crate) struct PendingConnectionList {
+    pub(crate) query: super::LiveConnectionQuery,
+    pub(crate) remaining: usize,
+    pub(crate) entries: Vec<super::LiveConnectionInfo>,
+    pub(crate) reply: tokio::sync::oneshot::Sender<super::AdminReply>,
+}
+
 impl ChannelOwner {
     pub(crate) fn shard(&self) -> CoreShardId {
         self.shard
@@ -2474,6 +2482,8 @@ pub(crate) struct ServerState {
     pub pending_admin_server_bans: HashMap<u64, tokio::sync::oneshot::Sender<super::AdminReply>>,
     /// Monotonic request ID source for `pending_admin_server_bans`.
     pub admin_server_ban_id: u64,
+    pub pending_connection_lists: HashMap<u64, PendingConnectionList>,
+    pub admin_connection_list_id: u64,
     /// Founder-owned HTTP channel controls awaiting a matching database verdict.
     pub pending_channel_controls: HashMap<u64, PendingChannelControl>,
     /// Monotonic request ID source for `pending_channel_controls`.
@@ -2997,6 +3007,61 @@ impl ServerState {
         std::mem::take(&mut self.effects)
     }
 
+    pub(crate) fn broadcast_server_ban_after_local_apply(
+        &mut self,
+        mutation: super::ServerBanMutation,
+    ) {
+        self.effects.push(CoreEffect::BroadcastServerBan {
+            source: self.shard,
+            mutation,
+        });
+    }
+
+    pub(crate) fn broadcast_account_suspension(
+        &mut self,
+        account: String,
+        suspended: bool,
+        reason: String,
+        actor: String,
+    ) {
+        self.effects.push(CoreEffect::BroadcastAccountSuspension {
+            source: self.shard,
+            account,
+            suspended,
+            reason,
+            actor,
+        });
+    }
+
+    pub(crate) fn broadcast_read_marker(
+        &mut self,
+        account: String,
+        target: String,
+        display: String,
+        marker_ms: e6irc_proto::time::Millis,
+    ) {
+        self.effects.push(CoreEffect::BroadcastReadMarker {
+            source: self.shard,
+            account,
+            target,
+            display,
+            marker_ms,
+        });
+    }
+
+    pub(crate) fn broadcast_connection_list(
+        &mut self,
+        request_id: u64,
+        query: super::LiveConnectionQuery,
+    ) {
+        self.effects
+            .push(CoreEffect::BroadcastAdminConnectionList { request_id, query });
+    }
+
+    pub(crate) fn session_owner(&self, conn: ConnId) -> SessionOwner {
+        SessionOwner::new(conn, self.shard)
+    }
+
     pub fn new(
         shard: CoreShardId,
         shards: CoreShardCount,
@@ -3043,6 +3108,8 @@ impl ServerState {
             admin_channel_drop_id: 0,
             pending_admin_server_bans: HashMap::new(),
             admin_server_ban_id: 0,
+            pending_connection_lists: HashMap::new(),
+            admin_connection_list_id: 0,
             pending_channel_controls: HashMap::new(),
             channel_control_id: 0,
             pending_channel_lists: HashMap::new(),

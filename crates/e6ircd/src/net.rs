@@ -20,8 +20,8 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::config::{Config, TlsConfig};
 use crate::core::{
-    ConnId, ConnectionIdAllocator, Core, CoreConfig, CoreIngress, CoreWorker, Input, Output,
-    TimerWheel,
+    ConnId, ConnectionIdAllocator, Core, CoreConfig, CoreIngress, CoreShardId, CoreWorker, Input,
+    Output, TimerWheel,
 };
 use crate::observability::{ErrorKind, Telemetry};
 use e6irc_proto::framing::LineBuffer;
@@ -70,6 +70,10 @@ const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 /// restart forever.
 const SHUTDOWN_DB_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+fn core_queue_name(index: usize) -> &'static str {
+    Box::leak(format!("core-{index}").into_boxed_str())
+}
+
 pub struct Running {
     /// Bound IRC addresses, in listener-config order (useful with port 0).
     pub addrs: Vec<SocketAddr>,
@@ -109,10 +113,10 @@ pub struct ShutdownHandle {
     listeners: Vec<tokio::task::AbortHandle>,
     /// The core worker's input sender. Pushing [`Input::Shutdown`] makes the
     /// core notify clients and then stop, which drops the DB request sender.
-    core_tx: CoreIngress,
-    /// The core is the authority for all live state. Main watches this handle
-    /// while serving and treats any pre-shutdown completion as fatal.
-    core_worker: Option<tokio::task::JoinHandle<()>>,
+    core_tx: Option<CoreIngress>,
+    /// Every core shard is authoritative for its owned state. Main watches the
+    /// supervised exits while serving and joins every shard on shutdown.
+    core_workers: tokio::task::JoinSet<()>,
     /// The DB worker task, awaited (bounded) so its buffered `log_batch` reaches
     /// PostgreSQL before exit. `None` when no `[database]` is configured (there
     /// is then no worker and nothing buffered to lose).
@@ -145,32 +149,22 @@ pub enum ShutdownOutcome {
 impl ShutdownHandle {
     /// Wait until a critical task exits before shutdown was requested.
     pub async fn wait_for_critical_failure(&mut self) -> CriticalTaskFailure {
-        let core_worker = self
-            .core_worker
-            .as_mut()
-            .expect("critical-failure wait is called only while the core is running");
         if let Some(db_worker) = self.db_worker.as_mut() {
             tokio::select! {
-                result = core_worker => {
-                    self.core_worker = None;
-                    critical_join_failure("IRC core", result)
-                }
                 result = db_worker => {
                     self.db_worker = None;
                     critical_join_failure("PostgreSQL worker", result)
                 }
+                failure = next_core_failure(&mut self.core_workers) => failure,
                 failure = self.critical_failures.recv() => {
                     failure.expect("listener supervisors remain alive while serving")
                 }
             }
         } else {
             tokio::select! {
-                result = core_worker => {
-                    self.core_worker = None;
-                    critical_join_failure("IRC core", result)
-                }
+                failure = next_core_failure(&mut self.core_workers) => failure,
                 failure = self.critical_failures.recv() => {
-                    failure.expect("listener supervisors remain alive while serving")
+                    failure.expect("core and listener supervisors remain alive while serving")
                 }
             }
         }
@@ -180,7 +174,7 @@ impl ShutdownHandle {
     /// connections, ask the core to notify clients and stop, then wait for the
     /// DB worker to flush its buffered history. Returns once the worker has
     /// drained or the bounded timeout elapses.
-    pub async fn run(self) -> ShutdownOutcome {
+    pub async fn run(mut self) -> ShutdownOutcome {
         // 1. Stop accepting: abort every listener task up front so nothing new
         //    is admitted while we drain.
         for listener in &self.listeners {
@@ -194,21 +188,30 @@ impl ShutdownHandle {
         //    core is already gone — nothing more to ask of it.
         // Queue closure means the core already stopped, which is the requested
         // shutdown state.
-        drop(self.core_tx.push(Input::Shutdown).await);
+        let core_tx = self.core_tx.take().expect("shutdown core ingress present");
+        if core_tx.broadcast_shutdown().await.is_err() {
+            eprintln!("e6ircd: core ingress closed before shutdown broadcast");
+        }
         // Drop our own sender clone so it isn't left keeping the core queue's
         // producer count up. (The core breaks on the Shutdown event regardless;
         // this just keeps the shutdown intent honest.)
-        drop(self.core_tx);
-        if let Some(worker) = self.core_worker {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), worker).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_join_error)) => return ShutdownOutcome::CorePanicked,
+        drop(core_tx);
+        while !self.core_workers.is_empty() {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.core_workers.join_next(),
+            )
+            .await
+            {
+                Ok(Some(Ok(()))) => {}
+                Ok(Some(Err(_join_error))) => return ShutdownOutcome::CorePanicked,
+                Ok(None) => break,
                 Err(_elapsed) => return ShutdownOutcome::CoreTimedOut,
             }
         }
         // 3. Wait for the DB worker to observe its now-dropped sender, drain,
         //    and flush. Bounded so a wedged database can't hang the shutdown.
-        let Some(worker) = self.db_worker else {
+        let Some(worker) = self.db_worker.take() else {
             return ShutdownOutcome::Flushed;
         };
         match tokio::time::timeout(SHUTDOWN_DB_FLUSH_TIMEOUT, worker).await {
@@ -216,6 +219,12 @@ impl ShutdownHandle {
             Ok(Err(_join_err)) => ShutdownOutcome::WorkerPanicked,
             Err(_elapsed) => ShutdownOutcome::FlushTimedOut,
         }
+    }
+}
+
+impl Drop for ShutdownHandle {
+    fn drop(&mut self) {
+        self.core_workers.detach_all();
     }
 }
 
@@ -230,6 +239,16 @@ fn critical_join_failure(
         Err(error) => format!("failed: {error}"),
     };
     CriticalTaskFailure { task, reason }
+}
+
+async fn next_core_failure(workers: &mut tokio::task::JoinSet<()>) -> CriticalTaskFailure {
+    critical_join_failure(
+        "IRC core shard",
+        workers
+            .join_next()
+            .await
+            .expect("core shards remain supervised"),
+    )
 }
 
 fn supervise_listener(
@@ -419,7 +438,7 @@ pub fn install_crypto_provider() {
     });
 }
 
-/// Bind all listeners, spawn the core worker and acceptor tasks.
+/// Bind listeners, spawn core workers, and start acceptors.
 pub async fn start(mut config: Config) -> io::Result<Running> {
     install_crypto_provider();
     // Resolve once and reuse for the control-plane import plus BNC secrets.
@@ -474,19 +493,31 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         None => (None, None),
     };
 
-    let (core_sender, core_rx) = queue::<Input>(e6irc_queue::Config {
-        name: "core",
+    let mut core_receivers = Vec::with_capacity(config.core_workers);
+    let (first_core_sender, first_core_receiver) = queue::<Input>(e6irc_queue::Config {
+        name: core_queue_name(0),
         capacity: config.core_queue,
         policy: Policy::Fifo,
     });
-    let core_tx = CoreIngress::single(core_sender);
+    core_receivers.push(first_core_receiver);
+    let mut remaining_core_senders = Vec::with_capacity(config.core_workers.saturating_sub(1));
+    for index in 1..config.core_workers {
+        let (sender, receiver) = queue::<Input>(e6irc_queue::Config {
+            name: core_queue_name(index),
+            capacity: config.core_queue,
+            policy: Policy::Fifo,
+        });
+        remaining_core_senders.push(sender);
+        core_receivers.push(receiver);
+    }
+    let core_tx = CoreIngress::with_shards(first_core_sender, remaining_core_senders);
     let (db_tx, db_rx) = queue::<crate::core::DbRequest>(e6irc_queue::Config {
         name: "db",
         capacity: 1024,
         policy: Policy::Fifo,
     });
     let telemetry = Arc::new(Telemetry::observing_queues(
-        core_tx.monitor(),
+        core_tx.monitors(),
         db_tx.monitor(),
     ));
     let (critical_tx, critical_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -743,90 +774,96 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         None => None,
     };
 
-    let mut core = Core::with_telemetry_with_directories(
-        CoreConfig {
-            server_name: config.server_name.clone(),
-            network_name: config.network_name.clone(),
-            description: config.description.clone(),
-            registration_before_connect: config.registration.before_connect,
-            registration_require_email: config.registration.require_email,
-            sendq: config.sendq,
-            motd: config.motd.clone(),
-            nicklen: config.nicklen,
-            sasl_enabled,
-            max_hot_channels: config.max_hot_channels,
-            opers: config
-                .opers
-                .iter()
-                .map(|o| (o.name.clone(), o.password.clone()))
-                .collect(),
-            clock: wall_clock,
-            mono_clock,
-            command_burst: config.limits.command_burst,
-            registration_burst: config.limits.registration_burst,
-        },
-        db_tx,
-        telemetry.clone(),
-        core_tx.directories(),
-    );
+    let core_config = CoreConfig {
+        server_name: config.server_name.clone(),
+        network_name: config.network_name.clone(),
+        description: config.description.clone(),
+        registration_before_connect: config.registration.before_connect,
+        registration_require_email: config.registration.require_email,
+        sendq: config.sendq,
+        motd: config.motd.clone(),
+        nicklen: config.nicklen,
+        sasl_enabled,
+        max_hot_channels: config.max_hot_channels,
+        opers: config
+            .opers
+            .iter()
+            .map(|o| (o.name.clone(), o.password.clone()))
+            .collect(),
+        clock: wall_clock,
+        mono_clock,
+        command_burst: config.limits.command_burst,
+        registration_burst: config.limits.registration_burst,
+    };
+    let shard_count = core_tx.shard_count();
+    let mut cores = (0..shard_count.len())
+        .map(|index| {
+            Core::on_shard(
+                core_config.clone(),
+                db_tx.clone(),
+                telemetry.clone(),
+                CoreShardId::new(index),
+                shard_count,
+                core_tx.directories(),
+            )
+        })
+        .collect::<Vec<_>>();
     // Seed registered-channel ownership and retained topics so a founder
     // is re-opped and the topic restored on join after a restart, not only
     // within the run that registered them.
     if let Some(pool) = &pool {
-        core.preload_founders(
-            crate::db::list_registered_channels(pool)
-                .await
-                .map_err(io::Error::other)?,
-        );
-        core.preload_topics(
-            crate::db::list_channel_topics(pool)
-                .await
-                .map_err(io::Error::other)?,
-        );
-        core.preload_keeptopic_off(
-            crate::db::list_keeptopic_off(pool)
-                .await
-                .map_err(io::Error::other)?,
-        );
-        core.preload_mlock(
-            crate::db::list_channel_mlock(pool)
-                .await
-                .map_err(io::Error::other)?,
-        )
-        .map_err(io::Error::other)?;
-        core.preload_access(
-            crate::db::list_channel_access(pool)
-                .await
-                .map_err(io::Error::other)?,
-        );
-        core.preload_server_bans(
-            crate::db::list_server_bans(pool)
-                .await
-                .map_err(io::Error::other)?,
-        );
+        let founders = crate::db::list_registered_channels(pool)
+            .await
+            .map_err(io::Error::other)?;
+        let topics = crate::db::list_channel_topics(pool)
+            .await
+            .map_err(io::Error::other)?;
+        let keeptopic_off = crate::db::list_keeptopic_off(pool)
+            .await
+            .map_err(io::Error::other)?;
+        let mlock = crate::db::list_channel_mlock(pool)
+            .await
+            .map_err(io::Error::other)?;
+        let access = crate::db::list_channel_access(pool)
+            .await
+            .map_err(io::Error::other)?;
+        let bans = crate::db::list_server_bans(pool)
+            .await
+            .map_err(io::Error::other)?;
         // The read-marker mirror must be seeded too, or MARKREAD queries report
         // `*` after a restart and a stale set could move a marker backwards.
-        core.preload_read_markers(
-            crate::db::list_all_read_markers(pool)
-                .await
-                .map_err(io::Error::other)?
-                .into_iter()
-                .map(|(account, target, ms)| {
-                    (
-                        account,
-                        target,
-                        e6irc_proto::time::Millis::from_millis(ms.max(0) as u64),
-                    )
-                })
-                .collect(),
-        );
-        core.preload_suspended_accounts(
-            crate::db::list_suspended_accounts(pool)
-                .await
-                .map_err(io::Error::other)?,
-        );
+        let read_markers = crate::db::list_all_read_markers(pool)
+            .await
+            .map_err(io::Error::other)?
+            .into_iter()
+            .map(|(account, target, ms)| {
+                (
+                    account,
+                    target,
+                    e6irc_proto::time::Millis::from_millis(ms.max(0) as u64),
+                )
+            })
+            .collect::<Vec<_>>();
+        let suspended = crate::db::list_suspended_accounts(pool)
+            .await
+            .map_err(io::Error::other)?;
+        for core in &mut cores {
+            core.preload_founders(founders.clone());
+            core.preload_topics(topics.clone());
+            core.preload_keeptopic_off(keeptopic_off.clone());
+            core.preload_mlock(mlock.clone())
+                .map_err(io::Error::other)?;
+            core.preload_access(access.clone());
+            core.preload_server_bans(bans.clone());
+            core.preload_read_markers(read_markers.clone());
+            core.preload_suspended_accounts(suspended.clone());
+        }
     }
-    let core_worker = tokio::spawn(core_worker(core, core_rx, core_tx.clone()));
+    drop(db_tx);
+    let mut core_workers = tokio::task::JoinSet::new();
+    for (core, receiver) in cores.into_iter().zip(core_receivers) {
+        core_workers.spawn(core_worker(core, receiver, core_tx.clone()));
+    }
 
     // Liveness reaper tick: drives the core's registration deadline and idle
     // PING/PONG timeout so a silent connection can't hold a session forever.
@@ -849,7 +886,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 let now = mono_clock();
                 for () in wheel.advance(now) {
                     wheel.schedule(now.saturating_add_millis(REAP_TICK_MILLIS), ());
-                    if core_tx.push(Input::Tick { now }).await.is_err() {
+                    if core_tx.broadcast_tick(now).await.is_err() {
                         return;
                     }
                 }
@@ -913,8 +950,8 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         bnc_addr,
         shutdown: ShutdownHandle {
             listeners,
-            core_tx,
-            core_worker: Some(core_worker),
+            core_tx: Some(core_tx),
+            core_workers,
             db_worker,
             critical_failures: critical_rx,
             bnc_listener,

@@ -18,6 +18,7 @@ trap cleanup EXIT
 printf '%s\n' \
   'server_name = "irc.load.test"' \
   'network_name = "LoadTest"' \
+  'core_workers = 2' \
   '[[listeners]]' \
   'addr = "127.0.0.1:16671"' \
   > "$test_dir/e6ircd.toml"

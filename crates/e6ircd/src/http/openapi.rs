@@ -210,7 +210,7 @@ fn document() -> serde_json::Value {
         "additionalProperties": false,
         "required": [
             "server_name", "network_name", "description", "motd", "nicklen", "sendq",
-            "core_queue", "max_hot_channels", "listeners", "registration", "limits",
+            "core_queue", "core_workers", "max_hot_channels", "listeners", "registration", "limits",
             "observability", "storage", "bnc_addr", "public_url", "secure_cookies",
             "admin_accounts"
         ],
@@ -222,6 +222,7 @@ fn document() -> serde_json::Value {
             "nicklen": { "type": "integer", "minimum": 1, "maximum": 64 },
             "sendq": { "type": "integer", "minimum": 1 },
             "core_queue": { "type": "integer", "minimum": 1 },
+            "core_workers": { "type": "integer", "minimum": 1 },
             "max_hot_channels": { "type": "integer", "minimum": 1 },
             "listeners": { "type": "array", "items": listener_schema },
             "registration": registration_schema,
