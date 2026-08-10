@@ -465,9 +465,12 @@ async fn oidc(target: &str) -> ProbeReport {
     ) else {
         return rejected();
     };
-    let Some(issuer) = safe_url(target) else {
+    let Some(mut issuer) = safe_url(target) else {
         return rejected();
     };
+    if !issuer.path().ends_with('/') {
+        issuer.set_path(&format!("{}/", issuer.path()));
+    }
     let discovery = match issuer.join(".well-known/openid-configuration") {
         Ok(url) => url,
         Err(_) => return rejected(),
