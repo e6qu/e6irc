@@ -1094,6 +1094,18 @@ fn names_on_secret_channel_does_not_leak_existence_via_casing() {
 }
 
 #[test]
+fn names_on_missing_channel_terminates() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "NAMES #missing");
+    assert!(
+        s.drain(alice)
+            .iter()
+            .any(|line| line.contains(" 366 ") && line.contains("#missing")),
+    );
+}
+
+#[test]
 fn service_nicks_are_reserved() {
     let mut s = TestServer::new();
     let c = s.connect(1);
@@ -3707,6 +3719,25 @@ fn away_flow() {
     assert_eq!(s.drain(alice).len(), 1, "message still delivered");
     s.line(alice, "AWAY");
     assert!(has_numeric(&s.drain(alice), "305"));
+}
+
+#[test]
+fn channel_who_reports_away_members() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    s.line(alice, "JOIN #room");
+    s.line(bob, "JOIN #room");
+    s.drain(alice);
+    s.drain(bob);
+    s.line(alice, "AWAY :brb");
+    s.drain(alice);
+    s.line(bob, "WHO #room");
+    assert!(
+        s.drain(bob)
+            .iter()
+            .any(|line| line.contains(" 352 ") && line.contains(" alice G")),
+    );
 }
 
 /// Messaging yourself while away must not trigger an away auto-reply about
