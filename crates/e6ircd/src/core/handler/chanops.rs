@@ -410,7 +410,11 @@ pub(super) fn cmd_list(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         });
     let label = state.defer_channel_reply(conn);
     let request = state.start_channel_list(conn, label, targets);
-    state.route_channel_list(request);
+    if state.has_single_channel_shard() {
+        channel_list(state, request);
+    } else {
+        state.route_channel_list(request);
+    }
 }
 
 pub(crate) fn channel_list(
@@ -438,11 +442,16 @@ pub(crate) fn channel_list(
                 .unwrap_or_default(),
         })
         .collect();
-    state.route_channel_list_result(crate::core::state::ChannelListResult {
+    let result = crate::core::state::ChannelListResult {
         id: request.id(),
         session: request.session(),
         rows,
-    });
+    };
+    if state.has_single_channel_shard() {
+        channel_list_result(state, result);
+    } else {
+        state.route_channel_list_result(result);
+    }
 }
 
 pub(crate) fn channel_list_result(
