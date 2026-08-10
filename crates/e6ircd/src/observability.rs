@@ -943,6 +943,34 @@ mod tests {
     }
 
     #[test]
+    fn queue_snapshots_preserve_each_core_shard() {
+        let (first_tx, _first_rx) = e6irc_queue::queue::<u8>(e6irc_queue::Config {
+            name: "core-0",
+            capacity: 4,
+            policy: e6irc_queue::Policy::Fifo,
+        });
+        let (second_tx, _second_rx) = e6irc_queue::queue::<u8>(e6irc_queue::Config {
+            name: "core-1",
+            capacity: 8,
+            policy: e6irc_queue::Policy::Fifo,
+        });
+        let (database_tx, _database_rx) = e6irc_queue::queue::<u8>(e6irc_queue::Config {
+            name: "db",
+            capacity: 16,
+            policy: e6irc_queue::Policy::Fifo,
+        });
+        let telemetry = Telemetry::observing_queues(
+            [first_tx.monitor(), second_tx.monitor()],
+            database_tx.monitor(),
+        );
+
+        let snapshot = telemetry.snapshot(0, 0);
+        assert_eq!(snapshot.queues["core-0"].capacity, 4);
+        assert_eq!(snapshot.queues["core-1"].capacity, 8);
+        assert_eq!(snapshot.queues["db"].capacity, 16);
+    }
+
+    #[test]
     fn version_two_history_without_queue_data_remains_readable() {
         let mut encoded = serde_json::to_value(Telemetry::new().snapshot(0, 0)).unwrap();
         let object = encoded.as_object_mut().unwrap();
