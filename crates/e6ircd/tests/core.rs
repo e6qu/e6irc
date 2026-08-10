@@ -17,6 +17,7 @@ struct TestServer {
     core: Core,
     conns: Vec<(ConnId, Receiver<Output>)>,
     db_rx: Receiver<e6ircd::core::DbRequest>,
+    channel_service_route: Option<(e6ircd::core::ChannelOwner, e6ircd::core::SessionOwner)>,
 }
 
 impl TestServer {
@@ -94,6 +95,7 @@ impl TestServer {
             ),
             conns: Vec::new(),
             db_rx,
+            channel_service_route: None,
         }
     }
 
@@ -101,9 +103,32 @@ impl TestServer {
     fn db_requests(&mut self) -> Vec<e6ircd::core::DbRequest> {
         let mut out = Vec::new();
         while let Some(env) = self.db_rx.try_pop() {
+            match &env.payload {
+                e6ircd::core::DbRequest::SetChannelFounder { owner, session, .. }
+                | e6ircd::core::DbRequest::SetChannelKeeptopic { owner, session, .. }
+                | e6ircd::core::DbRequest::SetChannelMlock { owner, session, .. }
+                | e6ircd::core::DbRequest::SetChannelAccess { owner, session, .. } => {
+                    self.channel_service_route = Some((owner.clone(), *session));
+                }
+                _ => {}
+            }
             out.push(env.payload);
         }
         out
+    }
+
+    fn channel_service_persisted(&mut self, result: e6ircd::core::ChannelServicePersistence) {
+        let (owner, session) = self
+            .channel_service_route
+            .take()
+            .expect("ChanServ persistence request");
+        self.core.handle(Input::ChannelServicePersisted {
+            owner,
+            session,
+            result: result.clone(),
+        });
+        self.core
+            .handle(Input::ChannelServiceResult { session, result });
     }
 
     fn connect(&mut self, id: u64) -> ConnId {
@@ -2853,16 +2878,54 @@ fn channel_access_reply_for_unregistered_channel_is_not_phantom_inserted() {
     // phantom would silently auto-op the account if the name were later
     // re-registered by anyone. The grant is reported void instead.
     let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#ghost".to_string(), "alice".to_string())]);
     let alice = s.register(1, "alice");
-    s.drain(alice);
-    // `#ghost` is not in `registered_founders` (models the dropped channel).
-    s.core.handle(Input::DbReply {
-        conn: alice,
-        reply: e6ircd::core::DbReply::ChannelAccessSet {
+    identify(&mut s, alice, "alice");
+    s.line(alice, "PRIVMSG ChanServ :FLAGS #ghost bob +o");
+    assert!(
+        s.db_requests()
+            .iter()
+            .any(|request| matches!(request, e6ircd::core::DbRequest::SetChannelAccess { .. }))
+    );
+    // Models a DROP that committed after the FLAGS write but before its verdict.
+    let owner = s
+        .channel_service_route
+        .as_ref()
+        .expect("FLAGS persistence route")
+        .0
+        .clone();
+    s.core.handle(Input::ChannelDropResult {
+        owner,
+        channel: "#ghost".into(),
+        requester: e6ircd::core::ChannelDropRequester::Admin {
+            request_id: 0,
+            actor: "test".into(),
+        },
+        result: e6ircd::core::ChannelDropResult::Dropped,
+    });
+    s.core.preload_founders(vec![]);
+    let (owner, session) = s
+        .channel_service_route
+        .take()
+        .expect("FLAGS persistence route");
+    s.core.handle(Input::ChannelServicePersisted {
+        owner,
+        session,
+        result: e6ircd::core::ChannelServicePersistence::AccessSet {
             channel: "#ghost".into(),
+            display: "#ghost".into(),
             account: "bob".into(),
             flags: Some("o".into()),
             applied: true,
+            label: None,
+        },
+    });
+    s.core.handle(Input::ChannelServiceResult {
+        session,
+        result: e6ircd::core::ChannelServicePersistence::AccessMissing {
+            display: "#ghost".into(),
+            label: None,
         },
     });
     let out = s.drain(alice);
@@ -6017,13 +6080,19 @@ fn chanserv_register_db_unavailable_notifies() {
 #[test]
 fn founder_transfer_db_error_reports_unavailable_not_missing() {
     let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
     let boss = s.register(1, "boss");
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::FounderChangeUnavailable {
+    identify(&mut s, boss, "boss");
+    s.line(boss, "PRIVMSG ChanServ :SET #room FOUNDER alice");
+    s.db_requests();
+    s.channel_service_persisted(
+        e6ircd::core::ChannelServicePersistence::FounderUnavailable {
             channel: "#room".to_string(),
+            display: "#room".to_string(),
+            label: None,
         },
-    });
+    );
     let out = s.drain(boss);
     assert!(
         out.iter().any(|l| l.contains("temporarily unavailable")),
@@ -6787,16 +6856,13 @@ fn chanserv_set_keeptopic_off_stops_topic_retention() {
         ),
         "KEEPTOPIC OFF must be one atomic request: {reqs:#?}"
     );
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::ChannelKeeptopicSet {
-            channel: "#reg".into(),
-            display: "#reg".into(),
-            keeptopic: false,
-            topic: None,
-            applied: true,
-            label: None,
-        },
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::KeeptopicSet {
+        channel: "#reg".into(),
+        display: "#reg".into(),
+        keeptopic: false,
+        topic: None,
+        applied: true,
+        label: None,
     });
     let out = s.drain(boss);
     assert!(
@@ -6847,16 +6913,13 @@ fn chanserv_set_keeptopic_off_stops_topic_retention() {
             ..
         } if channel == "#reg" && text == "while off"
     )));
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::ChannelKeeptopicSet {
-            channel: "#reg".into(),
-            display: "#reg".into(),
-            keeptopic: true,
-            topic: Some(("while off".into(), "boss!u@127.0.0.1".into(), 1)),
-            applied: true,
-            label: None,
-        },
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::KeeptopicSet {
+        channel: "#reg".into(),
+        display: "#reg".into(),
+        keeptopic: true,
+        topic: Some(("while off".into(), "boss!u@127.0.0.1".into(), 1)),
+        applied: true,
+        label: None,
     });
     s.drain(boss);
     s.line(boss, "TOPIC #reg :back on");
@@ -6884,16 +6947,13 @@ fn chanserv_set_keeptopic_on_recaptures_the_live_topic() {
     s.drain(boss);
     s.line(boss, "PRIVMSG ChanServ :SET #reg KEEPTOPIC OFF");
     s.db_requests();
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::ChannelKeeptopicSet {
-            channel: "#reg".into(),
-            display: "#reg".into(),
-            keeptopic: false,
-            topic: None,
-            applied: true,
-            label: None,
-        },
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::KeeptopicSet {
+        channel: "#reg".into(),
+        display: "#reg".into(),
+        keeptopic: false,
+        topic: None,
+        applied: true,
+        label: None,
     });
     s.drain(boss);
     // A topic set while KEEPTOPIC is off: live, but not retained.
@@ -6968,15 +7028,12 @@ fn chanserv_set_mlock_enforces_modes() {
             if channel == "#reg" && spec == "+m-t")),
         "mlock not persisted"
     );
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::ChannelMlockSet {
-            channel: "#reg".into(),
-            display: "#reg".into(),
-            mlock: Some("+m-t".into()),
-            applied: true,
-            label: None,
-        },
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::MlockSet {
+        channel: "#reg".into(),
+        display: "#reg".into(),
+        mlock: Some("+m-t".into()),
+        applied: true,
+        label: None,
     });
     let out = s.drain(boss);
     assert!(
@@ -7080,13 +7137,13 @@ fn chanserv_metadata_store_failures_are_loud_labeled_and_non_mutating() {
             ..
         }] if label == "keep9"
     ));
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::ChannelKeeptopicUnavailable {
+    s.channel_service_persisted(
+        e6ircd::core::ChannelServicePersistence::KeeptopicUnavailable {
+            channel: "#reg".into(),
             display: "#reg".into(),
             label: Some("keep9".into()),
         },
-    });
+    );
     let out = s.drain(boss);
     assert!(
         out.iter().any(|line| {
@@ -7107,12 +7164,10 @@ fn chanserv_metadata_store_failures_are_loud_labeled_and_non_mutating() {
             ..
         }] if label == "lock9"
     ));
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::ChannelMlockUnavailable {
-            display: "#reg".into(),
-            label: Some("lock9".into()),
-        },
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::MlockUnavailable {
+        channel: "#reg".into(),
+        display: "#reg".into(),
+        label: Some("lock9".into()),
     });
     let out = s.drain(boss);
     assert!(
@@ -7757,17 +7812,36 @@ fn chanserv_drop_unregisters_channel() {
         .db_requests()
         .into_iter()
         .find_map(|request| match request {
-            e6ircd::core::DbRequest::DropChannel { channel, requester } if channel == "#room" => {
-                Some(requester)
-            }
+            e6ircd::core::DbRequest::DropChannel {
+                owner,
+                channel,
+                requester,
+            } if channel == "#room" => Some((owner, requester)),
             _ => None,
         });
-    let Some(requester) = requester else {
+    let Some((owner, requester)) = requester else {
         panic!("DropChannel not queued");
     };
+    let (session, display, label) = match &requester {
+        e6ircd::core::ChannelDropRequester::ChanServ {
+            session,
+            display,
+            label,
+        } => (*session, display.clone(), label.clone()),
+        e6ircd::core::ChannelDropRequester::Admin { .. } => {
+            panic!("ChanServ DROP lost its requester session")
+        }
+    };
     s.core.handle(Input::ChannelDropResult {
+        owner,
         channel: "#room".into(),
         requester,
+        result: e6ircd::core::ChannelDropResult::Dropped,
+    });
+    s.core.handle(Input::ChannelDropReply {
+        session,
+        display,
+        label,
         result: e6ircd::core::ChannelDropResult::Dropped,
     });
     let out = s.drain(boss);
@@ -7815,13 +7889,16 @@ fn chanserv_drop_clears_the_mode_lock() {
         .db_requests()
         .into_iter()
         .find_map(|request| match request {
-            e6ircd::core::DbRequest::DropChannel { requester, .. } => Some(requester),
+            e6ircd::core::DbRequest::DropChannel {
+                owner, requester, ..
+            } => Some((owner, requester)),
             _ => None,
         });
-    let Some(requester) = requester else {
+    let Some((owner, requester)) = requester else {
         panic!("DropChannel not queued");
     };
     s.core.handle(Input::ChannelDropResult {
+        owner,
         channel: "#reg2".into(),
         requester,
         result: e6ircd::core::ChannelDropResult::Dropped,
@@ -7853,25 +7930,43 @@ fn chanserv_drop_store_failure_is_loud_labeled_and_non_mutating() {
         .db_requests()
         .into_iter()
         .find_map(|request| match request {
-            e6ircd::core::DbRequest::DropChannel { requester, .. }
-                if matches!(
-                    &requester,
-                    e6ircd::core::ChannelDropRequester::ChanServ {
-                        label: Some(label),
-                        ..
-                    } if label == "drop7"
-                ) =>
+            e6ircd::core::DbRequest::DropChannel {
+                owner, requester, ..
+            } if matches!(
+                &requester,
+                e6ircd::core::ChannelDropRequester::ChanServ {
+                    label: Some(label),
+                    ..
+                } if label == "drop7"
+            ) =>
             {
-                Some(requester)
+                Some((owner, requester))
             }
             _ => None,
         });
-    let Some(requester) = requester else {
+    let Some((owner, requester)) = requester else {
         panic!("labeled DropChannel not queued");
     };
+    let (session, display, label) = match &requester {
+        e6ircd::core::ChannelDropRequester::ChanServ {
+            session,
+            display,
+            label,
+        } => (*session, display.clone(), label.clone()),
+        e6ircd::core::ChannelDropRequester::Admin { .. } => {
+            panic!("ChanServ DROP lost its requester session")
+        }
+    };
     s.core.handle(Input::ChannelDropResult {
+        owner,
         channel: "#room".into(),
         requester,
+        result: e6ircd::core::ChannelDropResult::Unavailable,
+    });
+    s.core.handle(Input::ChannelDropReply {
+        session,
+        display,
+        label,
         result: e6ircd::core::ChannelDropResult::Unavailable,
     });
     let out = s.drain(boss);
@@ -7912,17 +8007,19 @@ fn admin_channel_drop_waits_for_the_database_verdict() {
         "admin DROP replied before persistence"
     );
     let requests = s.db_requests();
-    let (request_id, actor) = match requests.as_slice() {
+    let (owner, request_id, actor) = match requests.as_slice() {
         [
             e6ircd::core::DbRequest::DropChannel {
+                owner,
                 channel,
                 requester: e6ircd::core::ChannelDropRequester::Admin { request_id, actor },
             },
-        ] if channel == "#room" => (*request_id, actor.clone()),
+        ] if channel == "#room" => (owner.clone(), *request_id, actor.clone()),
         other => panic!("admin DROP did not use the shared DB request: {other:#?}"),
     };
     assert_eq!(actor, "root", "DROP request lost its atomic audit actor");
     s.core.handle(Input::ChannelDropResult {
+        owner,
         channel: "#room".into(),
         requester: e6ircd::core::ChannelDropRequester::Admin { request_id, actor },
         result: e6ircd::core::ChannelDropResult::Dropped,
@@ -8150,14 +8247,13 @@ fn chanserv_flags_auto_ops_on_join() {
 
     // The DB confirms the write applied; only now is the hot map updated and
     // the founder notified.
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::ChannelAccessSet {
-            channel: "#chan".to_string(),
-            account: "alice".to_string(),
-            flags: Some("o".to_string()),
-            applied: true,
-        },
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessSet {
+        channel: "#chan".to_string(),
+        display: "#chan".to_string(),
+        account: "alice".to_string(),
+        flags: Some("o".to_string()),
+        applied: true,
+        label: None,
     });
     assert!(
         s.drain(boss).iter().any(|l| l.contains("are now +o")),
@@ -8214,14 +8310,13 @@ fn chanserv_flags_unregistered_account_leaves_no_phantom_access() {
     assert!(persisted, "SetChannelAccess not queued");
 
     // The DB reports the write did not apply (no such account).
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::ChannelAccessSet {
-            channel: "#chan".to_string(),
-            account: "ghost".to_string(),
-            flags: Some("o".to_string()),
-            applied: false,
-        },
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessSet {
+        channel: "#chan".to_string(),
+        display: "#chan".to_string(),
+        account: "ghost".to_string(),
+        flags: Some("o".to_string()),
+        applied: false,
+        label: None,
     });
     assert!(
         s.drain(boss)
@@ -8277,14 +8372,13 @@ fn chanserv_flags_revocation_applies_after_requester_disconnect() {
     // Grant +o to alice, DB-confirmed, so the hot map holds an entry.
     s.line(boss, "PRIVMSG ChanServ :FLAGS #chan alice +o");
     s.db_requests();
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::ChannelAccessSet {
-            channel: "#chan".to_string(),
-            account: "alice".to_string(),
-            flags: Some("o".to_string()),
-            applied: true,
-        },
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessSet {
+        channel: "#chan".to_string(),
+        display: "#chan".to_string(),
+        account: "alice".to_string(),
+        flags: Some("o".to_string()),
+        applied: true,
+        label: None,
     });
     s.drain(boss);
 
@@ -8297,14 +8391,13 @@ fn chanserv_flags_revocation_applies_after_requester_disconnect() {
     });
     // The DB committed the DELETE and replies to the now-dead conn; removals
     // always report applied: true.
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::ChannelAccessSet {
-            channel: "#chan".to_string(),
-            account: "alice".to_string(),
-            flags: None,
-            applied: true,
-        },
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessSet {
+        channel: "#chan".to_string(),
+        display: "#chan".to_string(),
+        account: "alice".to_string(),
+        flags: None,
+        applied: true,
+        label: None,
     });
 
     // alice joins: the revocation must have landed — no auto-op.
@@ -8338,11 +8431,10 @@ fn chanserv_flags_db_fault_reports_unavailable_not_unregistered() {
 
     s.line(boss, "PRIVMSG ChanServ :FLAGS #chan alice +o");
     s.db_requests();
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::ChannelAccessUnavailable {
-            channel: "#chan".to_string(),
-        },
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessUnavailable {
+        channel: "#chan".to_string(),
+        display: "#chan".to_string(),
+        label: None,
     });
     let lines = s.drain(boss);
     assert!(
@@ -8416,12 +8508,11 @@ fn chanserv_set_founder_transfers_ownership() {
     assert!(queued, "SetChannelFounder not queued");
 
     // The DB confirms; ownership moves in the hot map.
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::FounderChanged {
-            channel: "#room".to_string(),
-            account: "alice".to_string(),
-        },
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::FounderChanged {
+        channel: "#room".to_string(),
+        account: "alice".to_string(),
+        display: "#room".to_string(),
+        label: None,
     });
     assert!(
         s.drain(boss).iter().any(|l| l.contains("transferred to")),
@@ -8448,11 +8539,12 @@ fn chanserv_set_founder_transfers_ownership() {
     assert!(names.contains("@alice"), "new founder not opped: {names}");
 
     // A failed transfer (no such account) is reported, not silently dropped.
-    s.core.handle(Input::DbReply {
-        conn: alice,
-        reply: e6ircd::core::DbReply::FounderChangeFailed {
-            channel: "#room".to_string(),
-        },
+    s.line(alice, "PRIVMSG ChanServ :SET #room FOUNDER ghost");
+    s.db_requests();
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::FounderMissing {
+        channel: "#room".to_string(),
+        display: "#room".to_string(),
+        label: None,
     });
     assert!(
         s.drain(alice).iter().any(|l| l.contains("no such account")),

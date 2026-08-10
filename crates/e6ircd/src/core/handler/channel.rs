@@ -962,7 +962,8 @@ fn topic_set_on_owner(
         .as_ref()
         .map(|t| (t.text.clone(), t.set_by.clone(), t.set_at_secs));
     let request = crate::core::DbRequest::SetChannelTopic {
-        conn,
+        owner: state.channel_owner(key.as_str()),
+        session: state.channel_actor(conn).session_owner(),
         channel: key.as_str().to_string(),
         display: display.clone(),
         prefix,

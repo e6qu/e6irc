@@ -14,7 +14,7 @@ mod timer;
 
 pub(crate) use timer::TimerWheel;
 
-pub use state::{ConnId, CoreConfig, dm_conversation_key};
+pub use state::{ChannelOwner, ConnId, CoreConfig, dm_conversation_key};
 
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
@@ -28,9 +28,8 @@ use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
 use state::{
     ChannelActor, ChannelCommand, ChannelCommandResult, ChannelJoinResult, ChannelKick,
     ChannelKickResult, ChannelListRequest, ChannelListResult, ChannelMemberUpdate, ChannelMessage,
-    ChannelMessageResult, ChannelMultiline, ChannelMultilineResult, ChannelOwner,
-    ChannelPartResult, ChannelQuit, ChannelTagmsg, ChannelTagmsgResult, ChannelTopic,
-    ChannelTopicResult,
+    ChannelMessageResult, ChannelMultiline, ChannelMultilineResult, ChannelPartResult, ChannelQuit,
+    ChannelTagmsg, ChannelTagmsgResult, ChannelTopic, ChannelTopicResult,
 };
 use state::{CoreDirectories, ServerState};
 
@@ -164,6 +163,8 @@ impl CoreIngress {
             Input::ChannelTopic { topic } => topic.owner().shard(),
             Input::ChannelTopicResult { session, .. } => session.shard(),
             Input::ChannelTopicPersisted { owner, .. } => owner.shard(),
+            Input::ChannelServicePersisted { owner, .. } => owner.shard(),
+            Input::ChannelServiceResult { session, .. } => session.shard(),
             Input::ChannelCommand { command } => command.owner().shard(),
             Input::ChannelCommandResult { session, .. } => session.shard(),
             Input::ChannelRegistrationPersisted { owner, .. } => owner.shard(),
@@ -184,10 +185,8 @@ impl CoreIngress {
             | Input::Shutdown
             | Input::ServerBanResult { .. }
             | Input::Admin { .. } => CoreShardId(0),
-            Input::ChannelDropResult { requester, .. } => match requester {
-                ChannelDropRequester::ChanServ { session, .. } => session.shard(),
-                ChannelDropRequester::Admin { .. } => CoreShardId(0),
-            },
+            Input::ChannelDropResult { owner, .. } => owner.shard(),
+            Input::ChannelDropReply { session, .. } => session.shard(),
             Input::ChannelControlResult { owner, .. }
             | Input::OwnedChannelRegistrationResult { owner, .. } => owner.shard(),
         };
@@ -433,6 +432,18 @@ pub enum Input {
         session: Option<SessionOwner>,
         result: ChannelTopicPersistence,
     },
+    /// A durable ChanServ verdict applied by the channel owner before the
+    /// requester receives its response.
+    ChannelServicePersisted {
+        owner: ChannelOwner,
+        session: SessionOwner,
+        result: ChannelServicePersistence,
+    },
+    /// A ChanServ persistence response delivered only by the requester session.
+    ChannelServiceResult {
+        session: SessionOwner,
+        result: ChannelServicePersistence,
+    },
     /// A channel command whose mutation and authorization belong to its owner.
     ChannelCommand {
         command: ChannelCommand,
@@ -562,8 +573,15 @@ pub enum Input {
     /// may belong to an IRC connection or an HTTP admin request, so its typed
     /// requester travels with it instead of inventing a sentinel `ConnId`.
     ChannelDropResult {
+        owner: ChannelOwner,
         channel: String,
         requester: ChannelDropRequester,
+        result: ChannelDropResult,
+    },
+    ChannelDropReply {
+        session: SessionOwner,
+        display: String,
+        label: Option<String>,
         result: ChannelDropResult,
     },
     /// A server-ban add/remove verdict. Like channel deletion, the requester
@@ -991,9 +1009,88 @@ pub enum ChannelTopicPersistence {
     },
 }
 
-/// Work the core asks the DB worker to do. The worker answers by
-/// pushing an [`Input::DbReply`] back into the core queue — the core
-/// itself never blocks on the database.
+/// A database-confirmed ChanServ mutation. The channel owner applies its live
+/// state before the requester receives a reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelServicePersistence {
+    FounderChanged {
+        channel: String,
+        account: String,
+        display: String,
+        label: Option<String>,
+    },
+    FounderMissing {
+        channel: String,
+        display: String,
+        label: Option<String>,
+    },
+    FounderUnavailable {
+        channel: String,
+        display: String,
+        label: Option<String>,
+    },
+    AccessSet {
+        channel: String,
+        display: String,
+        account: String,
+        flags: Option<String>,
+        applied: bool,
+        label: Option<String>,
+    },
+    AccessUnavailable {
+        channel: String,
+        display: String,
+        label: Option<String>,
+    },
+    AccessMissing {
+        display: String,
+        label: Option<String>,
+    },
+    AccessLimitReached {
+        channel: String,
+        display: String,
+        label: Option<String>,
+    },
+    KeeptopicSet {
+        channel: String,
+        display: String,
+        keeptopic: bool,
+        topic: Option<(String, String, u64)>,
+        applied: bool,
+        label: Option<String>,
+    },
+    KeeptopicUnavailable {
+        channel: String,
+        display: String,
+        label: Option<String>,
+    },
+    KeeptopicMissing {
+        display: String,
+        label: Option<String>,
+    },
+    MlockSet {
+        channel: String,
+        display: String,
+        mlock: Option<String>,
+        applied: bool,
+        label: Option<String>,
+    },
+    MlockUnavailable {
+        channel: String,
+        display: String,
+        label: Option<String>,
+    },
+    MlockMissing {
+        display: String,
+        label: Option<String>,
+    },
+    MlockInvalid {
+        label: Option<String>,
+    },
+}
+
+/// Work the core asks the DB worker to do. The worker returns a typed core
+/// event; the core never blocks on the database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbRequest {
     VerifyPassword {
@@ -1038,18 +1135,20 @@ pub enum DbRequest {
     },
     /// Unregister a channel (ChanServ DROP).
     DropChannel {
+        owner: ChannelOwner,
         /// Casefolded channel name.
         channel: String,
         requester: ChannelDropRequester,
     },
     /// Transfer a registered channel's founder (ChanServ SET FOUNDER).
-    /// Answered with `FounderChanged` or `FounderChangeFailed`.
     SetChannelFounder {
-        conn: ConnId,
+        owner: ChannelOwner,
+        session: SessionOwner,
         /// Channel name as typed (for the reply notice).
         channel: String,
         /// New founder account, casefolded.
         new_founder: String,
+        label: Option<String>,
     },
     /// Page history from PostgreSQL when the request reaches past the
     /// in-memory ring. Answered with [`Input::HistoryPage`].
@@ -1100,7 +1199,8 @@ pub enum DbRequest {
     /// whether the row still exists and has KEEPTOPIC enabled; the live topic
     /// and retained hot mirror change only after that verdict.
     SetChannelTopic {
-        conn: ConnId,
+        owner: ChannelOwner,
+        session: SessionOwner,
         /// Casefolded channel name.
         channel: String,
         /// Display spelling used in the eventual TOPIC line.
@@ -1114,7 +1214,8 @@ pub enum DbRequest {
     /// Persist a registered channel's KEEPTOPIC option and the retained topic
     /// it implies as one database transition.
     SetChannelKeeptopic {
-        conn: ConnId,
+        owner: ChannelOwner,
+        session: SessionOwner,
         /// Casefolded channel name.
         channel: String,
         /// Display spelling used in the service verdict.
@@ -1127,7 +1228,8 @@ pub enum DbRequest {
     /// Persist a registered channel's mode lock. `mlock` is the canonical spec
     /// string; `None` clears the lock.
     SetChannelMlock {
-        conn: ConnId,
+        owner: ChannelOwner,
+        session: SessionOwner,
         /// Casefolded channel name.
         channel: String,
         /// Display spelling used in the service verdict.
@@ -1141,10 +1243,13 @@ pub enum DbRequest {
     /// entry). `flags: None` removes the entry. `channel`/`account` are as
     /// typed; the worker folds them.
     SetChannelAccess {
-        conn: ConnId,
+        owner: ChannelOwner,
+        session: SessionOwner,
         channel: String,
+        display: String,
         account: String,
         flags: Option<String>,
+        label: Option<String>,
     },
     /// Persist a founder-owned HTTP control-plane mutation. The numeric request
     /// id maps the verdict back to a core-owned oneshot sender without putting
@@ -1417,49 +1522,6 @@ pub enum DbReply {
         channel: String,
         label: Option<String>,
     },
-    /// A founder transfer succeeded: `channel` as typed, `account`
-    /// casefolded (updates the hot ownership map).
-    FounderChanged {
-        channel: String,
-        account: String,
-    },
-    /// A founder transfer failed — the target account or channel is gone (a
-    /// definitive negative, distinct from a store fault).
-    FounderChangeFailed {
-        channel: String,
-    },
-    /// A founder transfer could not be attempted — the store failed. Kept
-    /// separate from `FounderChangeFailed` so a DB fault is never reported to
-    /// the founder as "no such account".
-    FounderChangeUnavailable {
-        channel: String,
-    },
-    /// A ChanServ FLAGS change was persisted (or not). The hot access map is
-    /// updated only when `applied` is true, so a grant to an unregistered
-    /// account can't leave a phantom entry that would auto-op a later
-    /// registration of that name. `channel`/`account` are as typed (the reply
-    /// re-folds them for the map key and shows them in the notice).
-    ChannelAccessSet {
-        channel: String,
-        account: String,
-        flags: Option<String>,
-        applied: bool,
-    },
-    /// A ChanServ FLAGS change could not be attempted — the store failed.
-    /// Kept separate from `applied: false` (a definitive "no such account")
-    /// for the same reason `FounderChangeUnavailable` exists: reporting a DB
-    /// fault as "account is not registered" tells the operator a lie they
-    /// might act on.
-    ChannelAccessUnavailable {
-        channel: String,
-    },
-    /// A ChanServ FLAGS grant was refused because the channel's access list is at
-    /// its cap. Distinct from `ChannelAccessUnavailable` (a store fault) and from
-    /// `applied: false` (account not registered) so the founder is told the real
-    /// reason and can revoke an entry rather than retry.
-    ChannelAccessLimitReached {
-        channel: String,
-    },
     /// A TOPIC request reached the registered-channel row. `retained` is the
     /// row's KEEPTOPIC value: the live topic is valid either way, while only a
     /// retained topic enters the restart-surviving hot mirror.
@@ -1478,29 +1540,6 @@ pub enum DbReply {
         revision: u64,
         label: Option<String>,
         failure: ChannelTopicFailure,
-    },
-    ChannelKeeptopicSet {
-        channel: String,
-        display: String,
-        keeptopic: bool,
-        topic: Option<(String, String, u64)>,
-        applied: bool,
-        label: Option<String>,
-    },
-    ChannelKeeptopicUnavailable {
-        display: String,
-        label: Option<String>,
-    },
-    ChannelMlockSet {
-        channel: String,
-        display: String,
-        mlock: Option<String>,
-        applied: bool,
-        label: Option<String>,
-    },
-    ChannelMlockUnavailable {
-        display: String,
-        label: Option<String>,
     },
     /// A read marker was durably stored. `marker_ms` is the value PostgreSQL
     /// returned after applying the monotonic `GREATEST`, not merely the value
@@ -1851,6 +1890,26 @@ impl Core {
                 );
                 handler::channel_topic_persisted(&mut self.state, conn, session, result);
             }
+            Input::ChannelServicePersisted {
+                owner,
+                session,
+                result,
+            } => {
+                assert_eq!(
+                    owner.shard(),
+                    self.shard,
+                    "ChanServ verdict reached wrong channel shard"
+                );
+                handler::services::channel_service_persisted(&mut self.state, session, result);
+            }
+            Input::ChannelServiceResult { session, result } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "ChanServ verdict reached wrong session shard"
+                );
+                handler::services::channel_service_result(&mut self.state, session.conn(), result);
+            }
             Input::ChannelCommand { command } => {
                 assert_eq!(
                     command.owner().shard(),
@@ -2055,11 +2114,36 @@ impl Core {
                 handler::admin::handle(&mut self.state, req, reply);
             }
             Input::ChannelDropResult {
+                owner,
                 channel,
                 requester,
                 result,
             } => {
+                assert_eq!(
+                    owner.shard(),
+                    self.shard,
+                    "DROP verdict reached wrong channel shard"
+                );
                 handler::services::channel_drop_result(&mut self.state, channel, requester, result);
+            }
+            Input::ChannelDropReply {
+                session,
+                display,
+                label,
+                result,
+            } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "DROP reply reached wrong session shard"
+                );
+                handler::services::channel_drop_reply(
+                    &mut self.state,
+                    session,
+                    display,
+                    label,
+                    result,
+                );
             }
             Input::ServerBanResult {
                 mutation,
@@ -2453,6 +2537,65 @@ mod ingress_tests {
                 conn: ConnId(5),
                 ..
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn persistence_callbacks_follow_channel_then_session_owners() {
+        let config = Config {
+            name: "persistence-callback-routing",
+            capacity: 2,
+            policy: Policy::Fifo,
+        };
+        let (first_tx, mut first_rx) = queue(config);
+        let (second_tx, mut second_rx) = queue(config);
+        let ingress = CoreIngress::with_shards(first_tx, vec![second_tx]);
+        let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
+        let (db_tx, _db_rx) = queue(Config {
+            name: "persistence-callback-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let core = Core::with_telemetry_on_shard_with_directories(
+            core_config(),
+            db_tx,
+            Arc::new(crate::observability::Telemetry::new()),
+            CoreShardId(0),
+            shards,
+            ingress.directories(),
+        );
+        let owner = ["#alpha", "#beta", "#gamma"]
+            .into_iter()
+            .map(|name| core.state.channel_owner(name))
+            .find(|owner| owner.shard() == CoreShardId(1))
+            .expect("a channel owned by shard one");
+        let session = SessionOwner::new(ConnId(2), CoreShardId(0));
+        let result = super::ChannelServicePersistence::FounderUnavailable {
+            channel: "#alpha".into(),
+            display: "#alpha".into(),
+            label: None,
+        };
+
+        ingress
+            .push(Input::ChannelServicePersisted {
+                owner: owner.clone(),
+                session,
+                result: result.clone(),
+            })
+            .await
+            .expect("owner callback routed");
+        assert!(matches!(
+            second_rx.pop().await.expect("owner callback").payload,
+            Input::ChannelServicePersisted { owner: received, .. } if received == owner
+        ));
+
+        ingress
+            .push(Input::ChannelServiceResult { session, result })
+            .await
+            .expect("session reply routed");
+        assert!(matches!(
+            first_rx.pop().await.expect("session reply").payload,
+            Input::ChannelServiceResult { session: received, .. } if received == session
         ));
     }
 

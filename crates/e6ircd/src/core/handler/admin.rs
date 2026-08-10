@@ -761,6 +761,7 @@ fn begin_drop_channel(
         return;
     };
     let request = crate::core::DbRequest::DropChannel {
+        owner: state.channel_owner(key.as_str()),
         channel: key.as_str().to_string(),
         requester: crate::core::ChannelDropRequester::Admin { request_id, actor },
     };

@@ -1929,6 +1929,22 @@ fn record_database_error(telemetry: Option<&Telemetry>) {
     }
 }
 
+async fn push_channel_service_persisted(
+    core_tx: &crate::core::CoreIngress,
+    owner: crate::core::ChannelOwner,
+    session: crate::core::SessionOwner,
+    result: crate::core::ChannelServicePersistence,
+) -> bool {
+    core_tx
+        .push(Input::ChannelServicePersisted {
+            owner,
+            session,
+            result,
+        })
+        .await
+        .is_ok()
+}
+
 /// Handle one non-history request; false = core gone, stop the worker.
 async fn handle_request(
     pool: &PgPool,
@@ -2035,7 +2051,11 @@ async fn handle_request(
                 .await
                 .is_ok()
         }
-        DbRequest::DropChannel { channel, requester } => {
+        DbRequest::DropChannel {
+            owner,
+            channel,
+            requester,
+        } => {
             let dropped = match &requester {
                 crate::core::ChannelDropRequester::Admin { actor, .. } => {
                     drop_channel_audited(pool, &channel, actor).await
@@ -2055,6 +2075,7 @@ async fn handle_request(
             };
             core_tx
                 .push(Input::ChannelDropResult {
+                    owner,
                     channel,
                     requester,
                     result,
@@ -2063,23 +2084,36 @@ async fn handle_request(
                 .is_ok()
         }
         DbRequest::SetChannelFounder {
-            conn,
+            owner,
+            session,
             channel,
             new_founder,
+            label,
         } => {
-            let reply = match set_channel_founder(pool, &channel, &new_founder).await {
-                Ok(true) => DbReply::FounderChanged {
+            let display = channel.clone();
+            let result = match set_channel_founder(pool, &channel, &new_founder).await {
+                Ok(true) => crate::core::ChannelServicePersistence::FounderChanged {
                     channel,
                     account: new_founder,
+                    display,
+                    label,
                 },
-                Ok(false) => DbReply::FounderChangeFailed { channel },
+                Ok(false) => crate::core::ChannelServicePersistence::FounderMissing {
+                    channel,
+                    display,
+                    label,
+                },
                 Err(e) => {
                     record_database_error(telemetry);
                     eprintln!("db: founder transfer failed: {e}");
-                    DbReply::FounderChangeUnavailable { channel }
+                    crate::core::ChannelServicePersistence::FounderUnavailable {
+                        channel,
+                        display,
+                        label,
+                    }
                 }
             };
-            core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
+            push_channel_service_persisted(core_tx, owner, session, result).await
         }
         DbRequest::QueryHistory {
             conn,
@@ -2168,7 +2202,8 @@ async fn handle_request(
             core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
         DbRequest::SetChannelTopic {
-            conn,
+            owner,
+            session,
             channel,
             display,
             prefix,
@@ -2176,8 +2211,8 @@ async fn handle_request(
             revision,
             label,
         } => {
-            let reply = match set_channel_topic(pool, &channel, topic.clone()).await {
-                Ok(Some(retained)) => DbReply::ChannelTopicSet {
+            let result = match set_channel_topic(pool, &channel, topic.clone()).await {
+                Ok(Some(retained)) => crate::core::ChannelTopicPersistence::Set {
                     channel,
                     display,
                     prefix,
@@ -2186,7 +2221,7 @@ async fn handle_request(
                     retained,
                     label,
                 },
-                Ok(None) => DbReply::ChannelTopicFailed {
+                Ok(None) => crate::core::ChannelTopicPersistence::Failed {
                     channel,
                     display,
                     revision,
@@ -2196,7 +2231,7 @@ async fn handle_request(
                 Err(e) => {
                     record_database_error(telemetry);
                     eprintln!("db: channel topic persistence failed: {e}");
-                    DbReply::ChannelTopicFailed {
+                    crate::core::ChannelTopicPersistence::Failed {
                         channel,
                         display,
                         revision,
@@ -2205,19 +2240,28 @@ async fn handle_request(
                     }
                 }
             };
-            core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
+            core_tx
+                .push(Input::ChannelTopicPersisted {
+                    owner,
+                    conn: session.conn(),
+                    session: Some(session),
+                    result,
+                })
+                .await
+                .is_ok()
         }
         DbRequest::SetChannelKeeptopic {
-            conn,
+            owner,
+            session,
             channel,
             display,
             keeptopic,
             topic,
             label,
         } => {
-            let reply = match set_channel_keeptopic(pool, &channel, keeptopic, topic.clone()).await
+            let result = match set_channel_keeptopic(pool, &channel, keeptopic, topic.clone()).await
             {
-                Ok(applied) => DbReply::ChannelKeeptopicSet {
+                Ok(applied) => crate::core::ChannelServicePersistence::KeeptopicSet {
                     channel,
                     display,
                     keeptopic,
@@ -2228,20 +2272,25 @@ async fn handle_request(
                 Err(e) => {
                     record_database_error(telemetry);
                     eprintln!("db: channel keeptopic persistence failed: {e}");
-                    DbReply::ChannelKeeptopicUnavailable { display, label }
+                    crate::core::ChannelServicePersistence::KeeptopicUnavailable {
+                        channel,
+                        display,
+                        label,
+                    }
                 }
             };
-            core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
+            push_channel_service_persisted(core_tx, owner, session, result).await
         }
         DbRequest::SetChannelMlock {
-            conn,
+            owner,
+            session,
             channel,
             display,
             mlock,
             label,
         } => {
-            let reply = match set_channel_mlock(pool, &channel, mlock.clone()).await {
-                Ok(applied) => DbReply::ChannelMlockSet {
+            let result = match set_channel_mlock(pool, &channel, mlock.clone()).await {
+                Ok(applied) => crate::core::ChannelServicePersistence::MlockSet {
                     channel,
                     display,
                     mlock,
@@ -2251,37 +2300,54 @@ async fn handle_request(
                 Err(e) => {
                     record_database_error(telemetry);
                     eprintln!("db: channel mlock persistence failed: {e}");
-                    DbReply::ChannelMlockUnavailable { display, label }
+                    crate::core::ChannelServicePersistence::MlockUnavailable {
+                        channel,
+                        display,
+                        label,
+                    }
                 }
             };
-            core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
+            push_channel_service_persisted(core_tx, owner, session, result).await
         }
         DbRequest::SetChannelAccess {
-            conn,
+            owner,
+            session,
             channel,
+            display,
             account,
             flags,
+            label,
         } => {
             // A store fault is not "account is not registered" — those are
             // different replies, so the operator is never told a definitive
             // negative that was really a transient DB failure.
-            let reply = match set_channel_access(pool, &channel, &account, flags.clone()).await {
-                Ok(applied) => DbReply::ChannelAccessSet {
+            let result = match set_channel_access(pool, &channel, &account, flags.clone()).await {
+                Ok(applied) => crate::core::ChannelServicePersistence::AccessSet {
                     channel,
+                    display,
                     account,
                     flags,
                     applied,
+                    label,
                 },
                 Err(DbError::TooManyAccessEntries) => {
-                    DbReply::ChannelAccessLimitReached { channel }
+                    crate::core::ChannelServicePersistence::AccessLimitReached {
+                        channel,
+                        display,
+                        label,
+                    }
                 }
                 Err(e) => {
                     record_database_error(telemetry);
                     eprintln!("db: channel access persistence failed: {e}");
-                    DbReply::ChannelAccessUnavailable { channel }
+                    crate::core::ChannelServicePersistence::AccessUnavailable {
+                        channel,
+                        display,
+                        label,
+                    }
                 }
             };
-            core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
+            push_channel_service_persisted(core_tx, owner, session, result).await
         }
         DbRequest::MutateOwnedChannel {
             owner,
