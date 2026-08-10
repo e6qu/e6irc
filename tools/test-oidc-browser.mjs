@@ -872,7 +872,7 @@ try {
   assert.equal(observabilityBody.current.schema_version, 3);
   // Queue allocation is restart-required. Telemetry must describe the
   // capacity actually enforcing backpressure now, not the next-start value.
-  assert.equal(observabilityBody.current.queues.core.capacity, 65_536);
+  assert.equal(observabilityBody.current.queues["core-0"].capacity, 65_536);
   assert.equal(observabilityBody.current.queues.db.capacity, 1_024);
   assert.equal(
     applicationRequests.some((url) => url.includes("/console/monitoring/panel")),
@@ -1216,7 +1216,7 @@ try {
     `${applicationOrigin}/api/v1/admin/observability?minutes=60`,
   );
   assert.equal(restartedObservability.status(), 200);
-  assert.equal((await restartedObservability.json()).current.queues.core.capacity, 32_768);
+  assert.equal((await restartedObservability.json()).current.queues["core-0"].capacity, 32_768);
 
   await page.goto(`${applicationOrigin}/`);
   await page.locator("#network-select").waitFor();

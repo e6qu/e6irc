@@ -1634,10 +1634,10 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     let body: serde_json::Value = serde_json::from_str(&body).expect("observability JSON");
     assert!(body["current"]["active_connections"].is_u64());
     assert!(body["current"]["core_latency"]["p95_us"].is_u64());
-    assert!(body["current"]["queues"]["core"]["depth"].is_u64());
-    assert_eq!(body["current"]["queues"]["core"]["capacity"], 65_536);
+    assert!(body["current"]["queues"]["core-0"]["depth"].is_u64());
+    assert_eq!(body["current"]["queues"]["core-0"]["capacity"], 65_536);
     assert_eq!(body["current"]["queues"]["db"]["capacity"], 1_024);
-    assert_eq!(body["current"]["queues"]["core"]["mode"], "fifo");
+    assert_eq!(body["current"]["queues"]["core-0"]["mode"], "fifo");
     assert!(body["history"].is_array());
     let monitoring_api = format!(
         "GET /api/v1/admin/monitoring?minutes=60 HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
