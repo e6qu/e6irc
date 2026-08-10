@@ -595,18 +595,16 @@ strip = "symbols"
 
 ### 7.3 Queue-based core: state model at 100k+ connections
 
-**Current implementation and target boundary.** The shipped server has one
+**Current implementation and target boundary.** The daemon starts one
 single-threaded core worker (N=1) owning all sessions, nicks, and channels.
 Connection tasks and the database writer communicate through bounded queues;
 the driver/attach layer also uses bounded tokio channels. `e6irc-queue`
 provides the delivered-or-returned, sequence, manual-pop, adaptive-mode, and
-loom-checked contracts below. Typed shard ownership, deterministic queue
-scheduling and replay tests, a timer-wheel reaper, dense generation-safe
-sessions, CoW recipient snapshots, batched accepts, and reusable write batches
-are shipped foundations. Runtime N>1 workers and cross-shard command and
-delivery routing remain required before any multi-worker claim. Current
-qualification evidence and journey impact are tracked in `tools/load/README.md`
-and `docs/journeys/coverage.md`.
+loom-checked contracts below. The core has typed shard ownership and
+cross-shard routing, exercised by deterministic two-worker scheduling and
+replay tests. Runtime N>1 startup wiring and production qualification remain
+unfinished. Current qualification evidence and journey impact are tracked in
+`tools/load/README.md` and `docs/journeys/coverage.md`.
 
 **Target architecture rule.** The server is a set of **single-threaded event
 loops ("workers") that own their state exclusively**; the *only*

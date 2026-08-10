@@ -14,24 +14,12 @@ and integration claims.
 
 ### Stage F — Scale architecture and qualification
 
-- Complete typed cross-shard channel ownership. JOIN, PART, QUIT, KICK, TOPIC,
-  single-line messages, TAGMSG, batches/multiline, KNOCK, and INVITE route to
-  the channel owner. Nick reservations are process-wide and atomically claimed.
-  Member identity and recipient capabilities now synchronize to every channel
-  owner, so remote NICK and visibility changes cannot leave stale members.
-  Process-wide membership records make cross-shard membership and shared-channel
-  visibility explicit rather than reading a foreign session table.
-  All MODE reads and mutations, NAMES, channel WHO, channel CHATHISTORY, and
-  LIST route through typed channel-owner requests; unrestricted LIST fans out
-  to every shard and merges one ordered response. Durable registration metadata
-  (founders, retained topics, KEEPTOPIC, MLOCK, and access grants) is shared
-  through controlled process-wide directories. HTTP controls and every
-  ChanServ persistence callback apply live state on the channel owner and
-  reply through the captured session owner.
-- Deterministic two-worker tests cover ordering, backpressure, persistence
-  success/failure, requester disconnects, and owner API controls. Qualify
-  production N>1 workers with load campaigns before enabling them.
-- Run reproducible tuned-Linux scale campaigns before making scale claims.
+- The daemon runs one core worker. Deterministic two-worker tests prove typed
+  ownership/routing, ordering, backpressure, persistence verdicts, disconnected
+  requesters, and owner API controls.
+- Controlled Linux campaigns record source, executable, host, workload,
+  budgets, and a closed passed/rejected/failed outcome. Runtime N>1 startup and
+  tuned-host campaigns remain required before scale claims or enablement.
 
 ## Remaining qualification
 

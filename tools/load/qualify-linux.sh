@@ -59,6 +59,10 @@ somaxconn="$(cat /proc/sys/net/core/somaxconn)"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 load_bin="$root/target/release/e6irc-load"
+[[ -z "$(git -C "$root" status --porcelain)" ]] || {
+  echo "qualification requires a clean source tree" >&2
+  exit 2
+}
 if [[ ! -x "$load_bin" ]]; then
   (cd "$root" && cargo build --release -p e6irc-load >&2)
 fi
@@ -73,13 +77,19 @@ host="$output_dir/host.txt"
   uname -a
   nproc
   grep -E '^(Model name|MemTotal):' /proc/cpuinfo /proc/meminfo
+  printf 'load_executable=%s\n' "$load_bin"
+  sha256sum "$load_bin"
   printf 'server_executable=%s\n' "$server_executable"
   sha256sum "$server_executable"
   printf 'load_nofile=%s\nserver_nofile=%s\nrequired_fds=%s\n' "$load_nofile" "$server_nofile" "$required_fds"
   printf 'ephemeral_port_range=%s %s\nephemeral_port_capacity=%s\nsomaxconn=%s\n' "$port_low" "$port_high" "$port_capacity" "$somaxconn"
+  printf 'addr=%s\nclients=%s\nchannels=%s\nburst=%s\n' "$addr" "$clients" "$channels" "$burst"
+  printf 'minimum_connect_rate=%s\nminimum_fanout_rate=%s\nmaximum_p99_ms=%s\nmaximum_rss_per_connection=%s\n' \
+    "$minimum_connect_rate" "$minimum_fanout_rate" "$maximum_p99_ms" "$maximum_rss_per_connection"
 } > "$host"
 host_sha256="$(sha256sum "$host" | awk '{print $1}')"
 
+set +e
 "$load_bin" \
   --addr "$addr" \
   --server-pid "$server_pid" \
@@ -92,5 +102,11 @@ host_sha256="$(sha256sum "$host" | awk '{print $1}')"
   --maximum-server-rss-per-connection-bytes "$maximum_rss_per_connection" \
   --host-provenance-sha256 "$host_sha256" \
   --report-json "$result"
+status=$?
+set -e
 
+if [[ "$status" -ne 0 ]]; then
+  echo "qualification failed; evidence: $result and $host" >&2
+  exit "$status"
+fi
 echo "qualification evidence: $result and $host"

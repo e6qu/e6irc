@@ -350,7 +350,9 @@ and host process/memory/CPU telemetry is available.
    budget so the harness samples and enforces daemon memory rather than relying
    on an operator to transcribe it.
 5. Use `qualify-linux.sh` for controlled Linux runs. It validates host budgets
-   and stores a versioned JSON result with host provenance.
+   and stores a synced versioned JSON result with host provenance. A harness
+   failure still records the requested campaign and its error; a preflight
+   failure creates no evidence.
 
 **Visible failures and recovery.** The harness has results through 2,000
 local clients. CI runs a real-daemon 64-client/eight-channel smoke and requires
@@ -362,9 +364,10 @@ violation. Linux CI also rejects incremental server RSS above 1 MiB per
 requested connection, and the queue contract proves an empty SendQ does not
 preallocate its maximum envelope count. The shared-runner thresholds catch
 catastrophic regressions without claiming production-host performance. The
-runtime has one core worker (the N=1 form of the target topology); core
-sharding, timer-wheel scheduling, production performance targets, and a
-tuned-host 100k run are not implemented or qualified.
+runtime has one core worker (the N=1 form of the target topology). Deterministic
+two-worker simulations cover typed ownership and routing, but runtime N>1
+startup, production performance targets, and a tuned-host 100k run are not
+implemented or qualified.
 
 **Security and observability.** The harness uses synthetic bounded payloads and
 reports aggregate rates/latency rather than credentials or user content. Exact

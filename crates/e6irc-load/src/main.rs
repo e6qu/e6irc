@@ -231,6 +231,19 @@ fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, 
     if args.maximum_server_rss_per_connection_bytes.is_some() && args.server_pid.is_none() {
         return Err("--maximum-server-rss-per-connection-bytes requires --server-pid".to_string());
     }
+    if args.host_provenance_sha256.is_some()
+        && (args.report_json.is_none()
+            || args.server_pid.is_none()
+            || args.maximum_server_rss_per_connection_bytes.is_none()
+            || args.minimum_connect_rate.is_none()
+            || args.minimum_fanout_rate.is_none()
+            || args.maximum_p99_ms.is_none())
+    {
+        return Err(
+            "--host-provenance-sha256 requires --report-json, --server-pid, and all acceptance thresholds"
+                .to_string(),
+        );
+    }
     Ok(args)
 }
 
@@ -283,10 +296,10 @@ fn main() -> ExitCode {
         .build()
         .expect("tokio runtime");
     let report = match runtime.block_on(run(args.clone())) {
-        Ok(report) => report,
+        Ok(report) => RunReport::Completed(report),
         Err(error) => {
             eprintln!("e6irc-load: {error}");
-            return ExitCode::FAILURE;
+            RunReport::Failed(FailedRunReport::new(&args, error))
         }
     };
     if let Some(path) = args.report_json.as_deref()
@@ -295,7 +308,7 @@ fn main() -> ExitCode {
         eprintln!("e6irc-load: failed to write {}: {error}", path.display());
         return ExitCode::FAILURE;
     }
-    if report.passed {
+    if report.passed() {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -327,13 +340,60 @@ struct ServerRssReport {
 }
 
 #[derive(Serialize)]
-struct RunReport {
-    format_version: u8,
+struct RunRequest {
     addr: String,
     clients: usize,
     channels: usize,
     burst: usize,
     tls: bool,
+    host_provenance_sha256: Option<Sha256Digest>,
+    thresholds: Thresholds,
+}
+
+impl RunRequest {
+    fn from_args(args: &Args) -> Self {
+        Self {
+            addr: args.addr.clone(),
+            clients: args.workload.clients,
+            channels: args.workload.channels,
+            burst: args.workload.burst,
+            tls: args.tls,
+            host_provenance_sha256: args.host_provenance_sha256.clone(),
+            thresholds: Thresholds {
+                minimum_connect_rate: args.minimum_connect_rate,
+                minimum_fanout_rate: args.minimum_fanout_rate,
+                maximum_p99_ms: args.maximum_p99_ms,
+                maximum_server_rss_per_connection_bytes: args
+                    .maximum_server_rss_per_connection_bytes,
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", content = "report", rename_all = "snake_case")]
+enum RunReport {
+    Completed(CompletedRunReport),
+    Failed(FailedRunReport),
+}
+
+impl RunReport {
+    fn passed(&self) -> bool {
+        matches!(self, Self::Completed(report) if report.outcome == CompletedOutcome::Passed)
+    }
+}
+
+#[derive(Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CompletedOutcome {
+    Passed,
+    Rejected,
+}
+
+#[derive(Serialize)]
+struct CompletedRunReport {
+    format_version: u8,
+    request: RunRequest,
     successful_clients: usize,
     failed_clients: usize,
     expected_deliveries: u64,
@@ -344,9 +404,24 @@ struct RunReport {
     fanout_rate: f64,
     latency: Option<LatencyReport>,
     server_rss: Option<ServerRssReport>,
-    host_provenance_sha256: Option<Sha256Digest>,
-    thresholds: Thresholds,
-    passed: bool,
+    outcome: CompletedOutcome,
+}
+
+#[derive(Serialize)]
+struct FailedRunReport {
+    format_version: u8,
+    request: RunRequest,
+    error: String,
+}
+
+impl FailedRunReport {
+    fn new(args: &Args, error: String) -> Self {
+        Self {
+            format_version: 2,
+            request: RunRequest::from_args(args),
+            error,
+        }
+    }
 }
 
 fn write_report(path: &Path, report: &RunReport) -> std::io::Result<()> {
@@ -356,7 +431,8 @@ fn write_report(path: &Path, report: &RunReport) -> std::io::Result<()> {
         .write(true)
         .create_new(true)
         .open(path)?;
-    file.write_all(&bytes)
+    file.write_all(&bytes)?;
+    file.sync_all()
 }
 
 /// Shared timing/counters across the client tasks.
@@ -463,7 +539,7 @@ impl DeliverySet {
     }
 }
 
-async fn run(args: Args) -> Result<RunReport, String> {
+async fn run(args: Args) -> Result<CompletedRunReport, String> {
     let args = Arc::new(args);
     println!(
         "e6irc-load: {} clients across {} channel(s) -> {} (burst {})",
@@ -647,13 +723,9 @@ async fn run(args: Args) -> Result<RunReport, String> {
             }
         }
     }
-    Ok(RunReport {
-        format_version: 1,
-        addr: args.addr.clone(),
-        clients: args.workload.clients,
-        channels: args.workload.channels,
-        burst: args.workload.burst,
-        tls: args.tls,
+    Ok(CompletedRunReport {
+        format_version: 2,
+        request: RunRequest::from_args(&args),
         successful_clients: ok,
         failed_clients: failures,
         expected_deliveries: expected,
@@ -664,14 +736,11 @@ async fn run(args: Args) -> Result<RunReport, String> {
         fanout_rate,
         latency,
         server_rss,
-        host_provenance_sha256: args.host_provenance_sha256.clone(),
-        thresholds: Thresholds {
-            minimum_connect_rate: args.minimum_connect_rate,
-            minimum_fanout_rate: args.minimum_fanout_rate,
-            maximum_p99_ms: args.maximum_p99_ms,
-            maximum_server_rss_per_connection_bytes: args.maximum_server_rss_per_connection_bytes,
+        outcome: if failures == 0 && delivered == expected && thresholds_met {
+            CompletedOutcome::Passed
+        } else {
+            CompletedOutcome::Rejected
         },
-        passed: failures == 0 && delivered == expected && thresholds_met,
     })
 }
 
@@ -848,14 +917,23 @@ mod tests {
         parse_args_from(values.iter().map(|value| (*value).to_owned()))
     }
 
-    fn sample_report() -> RunReport {
-        RunReport {
-            format_version: 1,
-            addr: "127.0.0.1:6667".into(),
-            clients: 64,
-            channels: 8,
-            burst: 4,
-            tls: false,
+    fn sample_report() -> CompletedRunReport {
+        CompletedRunReport {
+            format_version: 2,
+            request: RunRequest {
+                addr: "127.0.0.1:6667".into(),
+                clients: 64,
+                channels: 8,
+                burst: 4,
+                tls: false,
+                host_provenance_sha256: None,
+                thresholds: Thresholds {
+                    minimum_connect_rate: Some(10.0),
+                    minimum_fanout_rate: Some(100.0),
+                    maximum_p99_ms: Some(5_000.0),
+                    maximum_server_rss_per_connection_bytes: Some(1_048_576),
+                },
+            },
             successful_clients: 64,
             failed_clients: 0,
             expected_deliveries: 224,
@@ -866,14 +944,7 @@ mod tests {
             fanout_rate: 224.0,
             latency: None,
             server_rss: None,
-            host_provenance_sha256: None,
-            thresholds: Thresholds {
-                minimum_connect_rate: Some(10.0),
-                minimum_fanout_rate: Some(100.0),
-                maximum_p99_ms: Some(5_000.0),
-                maximum_server_rss_per_connection_bytes: Some(1_048_576),
-            },
-            passed: true,
+            outcome: CompletedOutcome::Passed,
         }
     }
 
@@ -885,6 +956,13 @@ mod tests {
         assert!(args(&["--maximum-p99-ms", "NaN"]).is_err());
         assert!(args(&["--maximum-server-rss-per-connection-bytes", "1048576"]).is_err());
         assert!(args(&["--server-pid", "0"]).is_err());
+        assert!(
+            args(&[
+                "--host-provenance-sha256",
+                "a3b4c5d6e7f80910a3b4c5d6e7f80910a3b4c5d6e7f80910a3b4c5d6e7f80910",
+            ])
+            .is_err()
+        );
         let parsed = args(&[
             "--clients",
             "64",
@@ -981,18 +1059,55 @@ mod tests {
 
     #[test]
     fn report_has_a_versioned_machine_contract() {
-        let json = serde_json::to_value(sample_report()).expect("serialize report");
-        assert_eq!(json["format_version"], 1);
-        assert_eq!(json["expected_deliveries"], 224);
-        assert_eq!(json["thresholds"]["maximum_p99_ms"], 5_000.0);
-        assert_eq!(json["passed"], true);
-        assert!(json["host_provenance_sha256"].is_null());
+        let json =
+            serde_json::to_value(RunReport::Completed(sample_report())).expect("serialize report");
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["report"]["format_version"], 2);
+        assert_eq!(json["report"]["expected_deliveries"], 224);
+        assert_eq!(
+            json["report"]["request"]["thresholds"]["maximum_p99_ms"],
+            5_000.0
+        );
+        assert_eq!(json["report"]["outcome"], "passed");
+        assert!(json["report"]["request"]["host_provenance_sha256"].is_null());
+    }
+
+    #[test]
+    fn failed_report_keeps_the_requested_contract() {
+        let report = RunReport::Failed(FailedRunReport::new(
+            &args(&["--clients", "64", "--channels", "8"]).expect("valid arguments"),
+            "server RSS measurement failed before the run: no such process".into(),
+        ));
+        let json = serde_json::to_value(report).expect("serialize failed report");
+        assert_eq!(json["status"], "failed");
+        assert_eq!(json["report"]["format_version"], 2);
+        assert_eq!(json["report"]["request"]["clients"], 64);
+        assert!(
+            json["report"]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("RSS"))
+        );
+    }
+
+    #[test]
+    fn only_a_completed_passed_report_succeeds() {
+        assert!(RunReport::Completed(sample_report()).passed());
+        let mut rejected = sample_report();
+        rejected.outcome = CompletedOutcome::Rejected;
+        assert!(!RunReport::Completed(rejected).passed());
+        assert!(
+            !RunReport::Failed(FailedRunReport::new(
+                &args(&[]).expect("default arguments"),
+                "connection failed".into(),
+            ))
+            .passed()
+        );
     }
 
     #[test]
     fn report_does_not_replace_prior_evidence() {
         let path = std::env::temp_dir().join(format!("e6irc-load-report-{}", std::process::id()));
-        let report = sample_report();
+        let report = RunReport::Completed(sample_report());
         write_report(&path, &report).expect("write report");
         assert!(write_report(&path, &report).is_err());
         std::fs::remove_file(path).expect("remove report");
