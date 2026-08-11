@@ -192,6 +192,7 @@ export function apiContractLoader(fetcher) {
 export async function getOperationJson(fetcher, document, method, url, options = {}) {
   const response = await fetcher(url, {
     ...options,
+    method,
     headers: { Accept: "application/json", ...options.headers },
   });
   if (!response.ok) await apiFailure(response);

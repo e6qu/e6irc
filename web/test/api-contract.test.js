@@ -77,9 +77,17 @@ test("schema parser enforces response status, constants, and array bounds", asyn
     },
   };
   const response = new Response(JSON.stringify({ created: true, ids: [1, 2] }), { status: 201 });
-  assert.deepEqual(await getOperationJson(async () => response, document, "POST", "/api/v1/me/widgets"), {
+  let request;
+  assert.deepEqual(await getOperationJson(async (url, options) => {
+    request = { url, options };
+    return response;
+  }, document, "POST", "/api/v1/me/widgets", { method: "GET" }), {
     created: true,
     ids: [1, 2],
+  });
+  assert.deepEqual(request, {
+    url: "/api/v1/me/widgets",
+    options: { method: "POST", headers: { Accept: "application/json" } },
   });
   for (const value of [
     { created: false, ids: [1] },

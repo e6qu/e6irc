@@ -399,14 +399,14 @@ try {
   const profileMutationErrorStart = applicationErrors.length;
   await contactEmail.fill("retry-contact@example.test");
   assert.equal(await contactEmail.evaluate((input) => input.checkValidity()), true);
-  await Promise.all([
+  const [profileResponse] = await Promise.all([
     page.waitForResponse(
       (response) => response.url() === profileURL
-        && response.request().method() === "PATCH"
-        && response.status() === 204,
+        && response.request().method() === "PATCH",
     ),
     page.getByRole("button", { name: "Save contact email", exact: true }).click(),
   ]);
+  assert.equal(profileResponse.status(), 204);
   await expectStatus(page, /Profile updated/);
   assert.equal(await page.evaluate(() => performance.timeOrigin), accountDocument);
   assert.equal(await contactEmail.inputValue(), "retry-contact@example.test");
