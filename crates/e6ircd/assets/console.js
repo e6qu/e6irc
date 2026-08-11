@@ -1524,6 +1524,7 @@ import { apiContractLoader, getOperationJson } from "/console-contract.js";
   let refreshAccountAccess;
   let refreshContactEmail;
   let refreshTokens;
+  let profileReadRevision = 0;
 
   const accountRoot = document.querySelector("[data-api-account-read]");
   if (accountRoot instanceof HTMLElement) {
@@ -1674,6 +1675,7 @@ import { apiContractLoader, getOperationJson } from "/console-contract.js";
   for (const form of document.querySelectorAll("[data-api-account-profile]")) {
     form.addEventListener("submit", (event) => {
       event.preventDefault();
+      profileReadRevision += 1;
       const email = fieldValue(new FormData(form), "contact_email");
       void mutateAccount(form, "PATCH", { contact_email: email || null }, "Profile update failed.")
         .then(async (result) => {
@@ -1693,12 +1695,15 @@ import { apiContractLoader, getOperationJson } from "/console-contract.js";
     const form = accountContactEmail.form;
     if (form instanceof HTMLFormElement) preserveFormEdits(form);
     refreshContactEmail = async () => {
+      const revision = ++profileReadRevision;
       try {
         const profile = await apiRead("/api/v1/me/profile");
+        if (revision !== profileReadRevision) return true;
         if (accountContactEmail.dataset.apiEdited !== "true") {
           accountContactEmail.value = profile.contact_email ?? "";
         }
       } catch (error) {
+        if (revision !== profileReadRevision) return true;
         accountLoadFailure(error, () => void refreshContactEmail());
         return false;
       }
