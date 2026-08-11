@@ -424,7 +424,8 @@ try {
   const profileFailureErrorStart = applicationErrors.length;
   rejectProfileMutation = true;
   await contactEmail.fill("retry-contact@example.test");
-  await page.getByRole("button", { name: "Save contact email", exact: true }).click();
+  assert.equal(await contactEmail.evaluate((input) => input.checkValidity()), true);
+  await contactEmail.evaluate((input) => input.form.requestSubmit());
   await profileFailure;
   await expectStatus(page, /Profile storage unavailable/);
   assert.equal(await page.evaluate(() => performance.timeOrigin), accountDocument);
