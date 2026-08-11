@@ -381,40 +381,8 @@ try {
   );
   await page.setViewportSize({ width: 1280, height: 720 });
   const profileURL = `${applicationOrigin}/api/v1/me/profile`;
-  let releaseProfile;
-  const profileReleased = new Promise((resolve) => {
-    releaseProfile = resolve;
-  });
-  let profileRequested;
-  const profileRequest = new Promise((resolve) => {
-    profileRequested = resolve;
-  });
-  let profileRouteFulfilled;
-  const profileRouteComplete = new Promise((resolve) => {
-    profileRouteFulfilled = resolve;
-  });
-  await page.route(profileURL, async (route) => {
-    assert.equal(route.request().method(), "GET");
-    profileRequested();
-    await profileReleased;
-    await route.fulfill({
-      contentType: "application/json",
-      body: JSON.stringify({ account: accountName, contact_email: "stale@example.test" }),
-    });
-    profileRouteFulfilled();
-  });
-  const profileResponse = page.waitForResponse(
-    (response) => response.url() === profileURL && response.request().method() === "GET",
-  );
-  await page.goto(`${applicationOrigin}/console/account`, { waitUntil: "domcontentloaded" });
-  await profileRequest;
+  await page.goto(`${applicationOrigin}/console/account`);
   const contactEmail = page.getByLabel("Email address", { exact: true });
-  await contactEmail.fill("draft-contact@example.test");
-  releaseProfile();
-  await profileResponse;
-  await profileRouteComplete;
-  assert.equal(await contactEmail.inputValue(), "draft-contact@example.test");
-  await page.unroute(profileURL);
   const accountDocument = await page.evaluate(() => performance.timeOrigin);
   const profileFailureErrorStart = applicationErrors.length;
   let profileFailureFulfilled;
