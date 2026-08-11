@@ -386,30 +386,35 @@ try {
   );
   await page.setViewportSize({ width: 1280, height: 720 });
   const profileURL = `${applicationOrigin}/api/v1/me/profile`;
-  await page.goto(`${applicationOrigin}/console/account`);
+  await Promise.all([
+    page.waitForResponse(
+      (response) => response.url() === profileURL
+        && response.request().method() === "GET"
+        && response.status() === 200,
+    ),
+    page.goto(`${applicationOrigin}/console/account`),
+  ]);
   const contactEmail = page.getByLabel("Email address", { exact: true });
   const accountDocument = await page.evaluate(() => performance.timeOrigin);
   const profileFailureErrorStart = applicationErrors.length;
   await page.route(profileURL, async (route) => {
-    if (route.request().method() === "PATCH") {
-      await route.fulfill({
-        status: 503,
-        contentType: "application/problem+json",
-        body: JSON.stringify({ status: 503, title: "Profile storage unavailable" }),
-      });
-      return;
-    }
-    await route.continue();
+    assert.equal(route.request().method(), "PATCH");
+    await route.fulfill({
+      status: 503,
+      contentType: "application/problem+json",
+      body: JSON.stringify({ status: 503, title: "Profile storage unavailable" }),
+    });
   });
-  const profileFailure = page.waitForResponse(
-    (response) => response.url() === profileURL
-      && response.request().method() === "PATCH"
-      && response.status() === 503,
-  );
   await contactEmail.fill("retry-contact@example.test");
   assert.equal(await contactEmail.evaluate((input) => input.checkValidity()), true);
-  await page.getByRole("button", { name: "Save contact email", exact: true }).click();
-  await profileFailure;
+  await Promise.all([
+    page.waitForResponse(
+      (response) => response.url() === profileURL
+        && response.request().method() === "PATCH"
+        && response.status() === 503,
+    ),
+    page.getByRole("button", { name: "Save contact email", exact: true }).click(),
+  ]);
   await expectStatus(page, /Profile storage unavailable/);
   assert.equal(await page.evaluate(() => performance.timeOrigin), accountDocument);
   assert.equal(await contactEmail.inputValue(), "retry-contact@example.test");
