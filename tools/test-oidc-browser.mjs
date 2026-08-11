@@ -381,6 +381,20 @@ try {
   );
   await page.setViewportSize({ width: 1280, height: 720 });
   const profileURL = `${applicationOrigin}/api/v1/me/profile`;
+  await page.addInitScript(() => {
+    const addEventListener = EventTarget.prototype.addEventListener;
+    window.__e6ircProfileSubmit = { registered: 0, invoked: 0 };
+    EventTarget.prototype.addEventListener = function (type, listener, options) {
+      if (type !== "submit" || !this.matches?.("[data-api-account-profile]")) {
+        return addEventListener.call(this, type, listener, options);
+      }
+      window.__e6ircProfileSubmit.registered += 1;
+      return addEventListener.call(this, type, function (event) {
+        window.__e6ircProfileSubmit.invoked += 1;
+        return listener.call(this, event);
+      }, options);
+    };
+  });
   let releaseProfile;
   const profileReleased = new Promise((resolve) => {
     releaseProfile = resolve;
@@ -408,6 +422,7 @@ try {
   );
   await page.goto(`${applicationOrigin}/console/account`);
   await profileRequest;
+  assert.deepEqual(await page.evaluate(() => window.__e6ircProfileSubmit), { registered: 1, invoked: 0 });
   const contactEmail = page.getByLabel("Email address", { exact: true });
   await contactEmail.fill("draft-contact@example.test");
   releaseProfile();
@@ -436,6 +451,8 @@ try {
   await contactEmail.fill("retry-contact@example.test");
   assert.equal(await contactEmail.evaluate((input) => input.checkValidity()), true);
   await page.getByRole("button", { name: "Save contact email", exact: true }).click();
+  await page.waitForTimeout(250);
+  assert.deepEqual(await page.evaluate(() => window.__e6ircProfileSubmit), { registered: 1, invoked: 1 });
   await profileFailure;
   await expectStatus(page, /Profile storage unavailable/);
   assert.equal(await page.evaluate(() => performance.timeOrigin), accountDocument);
