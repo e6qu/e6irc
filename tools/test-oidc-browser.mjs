@@ -389,17 +389,19 @@ try {
   const profileRequest = new Promise((resolve) => {
     profileRequested = resolve;
   });
-  let profileRouteContinued;
+  let profileRouteFulfilled;
   const profileRouteComplete = new Promise((resolve) => {
-    profileRouteContinued = resolve;
+    profileRouteFulfilled = resolve;
   });
   await page.route(profileURL, async (route) => {
-    if (route.request().method() === "GET") {
-      profileRequested();
-      await profileReleased;
-    }
-    await route.continue();
-    profileRouteContinued();
+    assert.equal(route.request().method(), "GET");
+    profileRequested();
+    await profileReleased;
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ account: accountName, contact_email: "stale@example.test" }),
+    });
+    profileRouteFulfilled();
   });
   const profileResponse = page.waitForResponse(
     (response) => response.url() === profileURL && response.request().method() === "GET",
