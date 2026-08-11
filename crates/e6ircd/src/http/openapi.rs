@@ -12,6 +12,80 @@ fn document() -> serde_json::Value {
     let ok_json = serde_json::json!({
         "200": { "description": "OK", "content": { "application/json": {} } }
     });
+    let json_response = |description: &str, schema: serde_json::Value| {
+        serde_json::json!({
+            "200": { "description": description, "content": {
+                "application/json": { "schema": schema }
+            } }
+        })
+    };
+    let json_response_status = |status: u16, description: &str, schema: serde_json::Value| {
+        serde_json::json!({
+            status.to_string(): { "description": description, "content": {
+                "application/json": { "schema": schema }
+            } }
+        })
+    };
+    let ok_detail_schema = serde_json::json!({
+        "type": "object", "additionalProperties": false, "required": ["ok", "detail"],
+        "properties": { "ok": { "const": true }, "detail": { "type": "string" } }
+    });
+    let message_schema = serde_json::json!({
+        "type": "object", "additionalProperties": false, "required": ["message"],
+        "properties": { "message": { "type": "string" } }
+    });
+    let app_password_created_response = json_response_status(
+        201,
+        "the app password, shown once",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["app_password", "label", "note"],
+            "properties": { "app_password": { "type": "string", "minLength": 1 }, "label": { "type": "string" }, "note": { "type": "string" } }
+        }),
+    );
+    let token_created_response = json_response_status(
+        201,
+        "token material, exact scopes, and bounded lifetime",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["token", "label", "scopes", "expires_in_days", "note"],
+            "properties": { "token": { "type": "string", "minLength": 1 }, "label": { "type": "string" }, "scopes": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["read", "write", "administrator", "irc"] } }, "expires_in_days": { "type": "integer", "minimum": 1, "maximum": 365 }, "note": { "type": "string" } }
+        }),
+    );
+    let revision_response = json_response(
+        "configuration revision advanced",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["revision", "message"],
+            "properties": { "revision": { "type": "integer", "minimum": 0 }, "message": { "type": "string" } }
+        }),
+    );
+    let configuration_patch_response = json_response(
+        "configuration revision advanced and restart_required indicator",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["revision", "restart_required"],
+            "properties": { "revision": { "type": "integer", "minimum": 0 }, "restart_required": { "type": "boolean" } }
+        }),
+    );
+    let network_created_response = json_response_status(
+        201,
+        "created",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["name", "attach"],
+            "properties": { "name": { "type": "string", "minLength": 1 }, "attach": { "type": "string", "minLength": 1 } }
+        }),
+    );
+    let network_enabled_response = json_response(
+        "new enabled state",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["name", "enabled"],
+            "properties": { "name": { "type": "string", "minLength": 1 }, "enabled": { "type": "boolean" } }
+        }),
+    );
+    let admin_network_enabled_response = json_response(
+        "network lifecycle updated",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["owner", "name", "enabled"],
+            "properties": { "owner": { "type": "string", "minLength": 1 }, "name": { "type": "string", "minLength": 1 }, "enabled": { "type": "boolean" } }
+        }),
+    );
     let identity_response = serde_json::json!({
         "200": { "description": "authenticated identity", "content": { "application/json": {
             "schema": { "type": "object", "required": ["account"], "additionalProperties": false,
@@ -27,28 +101,78 @@ fn document() -> serde_json::Value {
             }
         } } }
     });
-    let network_summary = serde_json::json!({
-        "type": "object", "required": ["name", "enabled", "connected", "runtime"],
+    let network_response_schema = serde_json::json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["name", "kind", "addr", "tls", "nick", "realname", "autojoin", "sasl_account", "has_sasl_account", "has_sasl_password", "enabled", "connected", "runtime"],
         "properties": {
             "name": { "type": "string", "minLength": 1 },
-            "enabled": { "type": "boolean" },
-            "connected": { "type": ["boolean", "null"] },
+            "kind": { "type": "string", "enum": ["irc", "matrix", "discord", "slack"] },
+            "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" },
+            "realname": { "type": ["string", "null"] },
+            "autojoin": { "type": "array", "items": { "type": "string" } },
+            "sasl_account": { "type": ["string", "null"] },
+            "has_sasl_account": { "type": "boolean" }, "has_sasl_password": { "type": "boolean" },
+            "enabled": { "type": "boolean" }, "connected": { "type": ["boolean", "null"] },
             "runtime": { "oneOf": [
                 { "type": "null" },
-                { "type": "object", "required": ["state"], "additionalProperties": true,
-                    "properties": { "state": { "type": "string", "enum": [
-                        "connecting", "connected", "reconnecting", "authentication_failed", "registration_failed"
-                    ] } } }
+                { "type": "object", "additionalProperties": false,
+                    "required": ["state", "state_changed_at", "next_retry_at", "recent_failures", "connected_at", "last_input_at", "last_output_at", "last_error_at", "last_error", "connect_latency_ms", "connection_attempts", "errors", "attached_clients", "traffic", "buffer"],
+                    "properties": {
+                        "state": { "type": "string", "enum": ["connecting", "connected", "reconnecting", "authentication_failed", "registration_failed"] },
+                        "state_changed_at": { "type": "string" }, "next_retry_at": { "type": ["string", "null"] },
+                        "recent_failures": { "type": "array", "items": {
+                            "type": "object", "additionalProperties": false, "required": ["at", "code", "summary"],
+                            "properties": { "at": { "type": "string" }, "code": { "type": "string" }, "summary": { "type": "string" } }
+                        } },
+                        "connected_at": { "type": ["string", "null"] }, "last_input_at": { "type": ["string", "null"] },
+                        "last_output_at": { "type": ["string", "null"] }, "last_error_at": { "type": ["string", "null"] },
+                        "last_error": { "oneOf": [
+                            { "type": "null" },
+                            { "type": "object", "additionalProperties": false, "required": ["code", "summary"],
+                                "properties": { "code": { "type": "string" }, "summary": { "type": "string" } } }
+                        ] },
+                        "connect_latency_ms": { "type": ["integer", "null"], "minimum": 0 },
+                        "connection_attempts": { "type": "integer", "minimum": 0 }, "errors": { "type": "integer", "minimum": 0 },
+                        "attached_clients": { "type": "integer", "minimum": 0 },
+                        "traffic": { "type": "object", "additionalProperties": false, "required": ["lines_in", "bytes_in", "lines_out", "bytes_out"],
+                            "properties": { "lines_in": { "type": "integer", "minimum": 0 }, "bytes_in": { "type": "integer", "minimum": 0 }, "lines_out": { "type": "integer", "minimum": 0 }, "bytes_out": { "type": "integer", "minimum": 0 } } },
+                        "buffer": { "type": "object", "additionalProperties": false, "required": ["lines", "capacity"],
+                            "properties": { "lines": { "type": "integer", "minimum": 0 }, "capacity": { "type": "integer", "minimum": 1 } } }
+                    }
+                }
             ] }
         }
     });
     let network_list_response = serde_json::json!({
         "200": { "description": "owner-scoped network summaries", "content": { "application/json": {
             "schema": { "type": "object", "required": ["networks"], "additionalProperties": false,
-                "properties": { "networks": { "type": "array", "items": network_summary } }
+                "properties": { "networks": { "type": "array", "items": network_response_schema.clone() } }
             }
         } } }
     });
+    let mut owned_admin_network_schema = network_response_schema.clone();
+    owned_admin_network_schema["properties"]
+        .as_object_mut()
+        .expect("network response properties are an object")
+        .insert(
+            "owner".into(),
+            serde_json::json!({ "type": "string", "minLength": 1 }),
+        );
+    owned_admin_network_schema["required"]
+        .as_array_mut()
+        .expect("network response required fields are an array")
+        .push(serde_json::json!("owner"));
+    let admin_networks_response = json_response(
+        "networks with runtime snapshots",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["networks"],
+            "properties": { "networks": { "type": "array", "items": { "oneOf": [
+                owned_admin_network_schema,
+                { "type": "object", "additionalProperties": false, "required": ["owner", "name", "kind", "enabled", "connected", "runtime", "shared"],
+                    "properties": { "owner": { "const": "shared" }, "name": { "type": "string", "minLength": 1 }, "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] }, "enabled": { "const": true }, "connected": { "type": "boolean" }, "runtime": network_response_schema["properties"]["runtime"].clone(), "shared": { "const": true } } }
+            ] } } }
+        }),
+    );
     let buffer_response = serde_json::json!({
         "200": { "description": "buffered lines", "content": { "application/json": {
             "schema": { "type": "object", "required": ["lines"], "additionalProperties": false,
@@ -56,6 +180,234 @@ fn document() -> serde_json::Value {
             }
         } } }
     });
+    let network_response = json_response(
+        "stored network configuration and runtime",
+        network_response_schema,
+    );
+    let network_operations_response = json_response(
+        "network Operations projection",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false,
+            "required": ["state", "connected", "state_changed", "next_retry", "recent_failures", "connected_since", "last_input", "last_output", "last_error", "last_error_reason", "connect_latency", "connection_attempts", "errors", "attached_clients", "traffic_in", "traffic_out", "lines_in", "lines_out", "memory_buffer", "stored_lines", "stored_oldest", "stored_newest", "recent_lines"],
+            "properties": {
+                "state": { "type": "string" }, "connected": { "type": "boolean" }, "state_changed": { "type": "string" }, "next_retry": { "type": "string" },
+                "recent_failures": { "type": "array", "items": { "type": "string" } }, "connected_since": { "type": "string" },
+                "last_input": { "type": "string" }, "last_output": { "type": "string" }, "last_error": { "type": "string" },
+                "last_error_reason": { "type": "string" }, "connect_latency": { "type": "string" },
+                "connection_attempts": { "type": "integer", "minimum": 0 }, "errors": { "type": "integer", "minimum": 0 },
+                "attached_clients": { "type": "integer", "minimum": 0 }, "traffic_in": { "type": "string" }, "traffic_out": { "type": "string" },
+                "lines_in": { "type": "integer", "minimum": 0 }, "lines_out": { "type": "integer", "minimum": 0 },
+                "memory_buffer": { "type": "string" }, "stored_lines": { "type": "integer", "minimum": 0 },
+                "stored_oldest": { "type": "string" }, "stored_newest": { "type": "string" }, "recent_lines": { "type": "array", "items": { "type": "string" } }
+            }
+        }),
+    );
+    let profile_response = json_response(
+        "account and optional contact email",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false,
+            "required": ["account", "contact_email"],
+            "properties": {
+                "account": { "type": "string", "minLength": 1 },
+                "contact_email": { "type": ["string", "null"] }
+            }
+        }),
+    );
+    let browser_sessions_response = json_response(
+        "unexpired browser sessions, current first",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["sessions"],
+            "properties": { "sessions": { "type": "array", "items": {
+                "type": "object", "additionalProperties": false,
+                "required": ["id", "created_at", "expires_at", "method", "provider", "user_agent", "current"],
+                "properties": {
+                    "id": { "type": "integer", "minimum": 1 },
+                    "created_at": { "type": "string" },
+                    "expires_at": { "type": "string" },
+                    "method": { "type": "string", "enum": ["local", "oidc"] },
+                    "provider": { "type": ["string", "null"] },
+                    "user_agent": { "type": ["string", "null"] },
+                    "current": { "type": "boolean" }
+                }
+            } } }
+        }),
+    );
+    let connection_page_response = json_response(
+        "connection posture entries and next_before_id cursor",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false,
+            "required": ["connections", "next_before_id"],
+            "properties": {
+                "connections": { "type": "array", "items": {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["id", "nick", "user", "host", "account", "oper", "transport", "connected_at", "idle_seconds", "channels"],
+                    "properties": {
+                        "id": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+                        "nick": { "type": "string" }, "user": { "type": "string" }, "host": { "type": "string" },
+                        "account": { "type": ["string", "null"] }, "oper": { "type": "boolean" },
+                        "transport": { "type": "string", "enum": ["tcp", "tls", "websocket", "local"] },
+                        "connected_at": { "type": "string" }, "idle_seconds": { "type": "integer", "minimum": 0 },
+                        "channels": { "type": "array", "items": { "type": "string" } }
+                    }
+                } },
+                "next_before_id": { "type": ["string", "null"], "pattern": "^[1-9][0-9]*$" }
+            }
+        }),
+    );
+    let credentials_response = json_response(
+        "account credential metadata",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["credentials"],
+            "properties": { "credentials": { "type": "array", "items": {
+                "type": "object", "additionalProperties": false,
+                "required": ["id", "kind", "label", "created_at", "last_used_at"],
+                "properties": {
+                    "id": { "type": "integer", "minimum": 1 },
+                    "kind": { "type": "string", "enum": ["local_password", "app_password"] },
+                    "label": { "type": ["string", "null"] },
+                    "created_at": { "type": "string" }, "last_used_at": { "type": ["string", "null"] }
+                }
+            } } }
+        }),
+    );
+    let identities_response = json_response(
+        "linked identity and provider metadata",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["identities", "link_providers"],
+            "properties": {
+                "identities": { "type": "array", "items": {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["id", "issuer", "subject", "created_at"],
+                    "properties": {
+                        "id": { "type": "integer", "minimum": 1 }, "issuer": { "type": "string" },
+                        "subject": { "type": "string" }, "created_at": { "type": "string" }
+                    }
+                } },
+                "link_providers": { "type": "array", "items": { "type": "string" } }
+            }
+        }),
+    );
+    let tokens_response = json_response(
+        "personal access token metadata",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["tokens"],
+            "properties": { "tokens": { "type": "array", "items": {
+                "type": "object", "additionalProperties": false,
+                "required": ["id", "label", "created_at", "expires_at", "scopes"],
+                "properties": {
+                    "id": { "type": "integer", "minimum": 1 }, "label": { "type": "string" },
+                    "created_at": { "type": "string" }, "expires_at": { "type": "string" },
+                    "scopes": { "type": "array", "items": { "type": "string", "enum": ["read", "write", "administrator", "irc"] } }
+                }
+            } } }
+        }),
+    );
+    let security_activity_response = json_response(
+        "security activity entries and next_before_id cursor",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false,
+            "required": ["activity", "next_before_id"],
+            "properties": {
+                "activity": { "type": "array", "items": {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["id", "actor", "action", "target", "detail", "at"],
+                    "properties": {
+                        "id": { "type": "integer", "minimum": 1 }, "actor": { "type": "string" },
+                        "action": { "type": "string" }, "target": { "type": "string" },
+                        "detail": { "type": "string" }, "at": { "type": "string" }
+                    }
+                } },
+                "next_before_id": { "type": ["integer", "null"], "minimum": 1 }
+            }
+        }),
+    );
+    let read_markers_response = json_response(
+        "read markers",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["markers"],
+            "properties": { "markers": { "type": "array", "items": {
+                "type": "object", "additionalProperties": false,
+                "required": ["target", "timestamp"],
+                "properties": { "target": { "type": "string" }, "timestamp": { "type": "string" } }
+            } } }
+        }),
+    );
+    let accounts_response = json_response(
+        "account posture entries and next_before_id cursor",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["accounts", "next_before_id"],
+            "properties": {
+                "accounts": { "type": "array", "items": { "type": "object", "additionalProperties": false,
+                    "required": ["id", "name", "created_at", "authentication", "resources", "administrator", "administrator_sources", "suspended", "current"],
+                    "properties": {
+                        "id": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "created_at": { "type": "string" },
+                        "authentication": { "type": "object", "additionalProperties": false, "required": ["local_password", "app_passwords", "api_tokens", "oidc_identities", "browser_sessions"],
+                            "properties": { "local_password": { "type": "boolean" }, "app_passwords": { "type": "integer", "minimum": 0 }, "api_tokens": { "type": "integer", "minimum": 0 }, "oidc_identities": { "type": "integer", "minimum": 0 }, "browser_sessions": { "type": "integer", "minimum": 0 } } },
+                        "resources": { "type": "object", "additionalProperties": false, "required": ["networks", "founded_channels"], "properties": { "networks": { "type": "integer", "minimum": 0 }, "founded_channels": { "type": "integer", "minimum": 0 } } },
+                        "administrator": { "type": "boolean" }, "administrator_sources": { "type": "object", "additionalProperties": false, "required": ["durable", "configuration"], "properties": { "durable": { "type": "boolean" }, "configuration": { "type": "boolean" } } },
+                        "suspended": { "type": "boolean" }, "current": { "type": "boolean" }
+                    }
+                } }, "next_before_id": { "type": ["integer", "null"], "minimum": 1 }
+            }
+        }),
+    );
+    let invitations_response = json_response(
+        "pending invitation metadata and next_before_id cursor",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["invitations", "next_before_id"],
+            "properties": { "invitations": { "type": "array", "items": { "type": "object", "additionalProperties": false,
+                "required": ["id", "account", "contact_email", "administrator", "created_by", "created_at", "expires_at"],
+                "properties": { "id": { "type": "integer", "minimum": 1 }, "account": { "type": "string" }, "contact_email": { "type": ["string", "null"] }, "administrator": { "type": "boolean" }, "created_by": { "type": "string" }, "created_at": { "type": "string" }, "expires_at": { "type": "string" } }
+            } }, "next_before_id": { "type": ["integer", "null"], "minimum": 1 } }
+        }),
+    );
+    let channels_response = json_response(
+        "registered-channel posture and next_before_id cursor",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["channels", "next_before_id"],
+            "properties": { "channels": { "type": "array", "items": { "type": "object", "additionalProperties": false,
+                "required": ["id", "name", "founder", "created_at", "policy"],
+                "properties": { "id": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "founder": { "type": "string" }, "created_at": { "type": "string" }, "policy": { "type": "object", "additionalProperties": false, "required": ["keeptopic", "topic_retained", "mlock", "access_entries"], "properties": { "keeptopic": { "type": "boolean" }, "topic_retained": { "type": ["string", "null"] }, "mlock": { "type": "string" }, "access_entries": { "type": "integer", "minimum": 0 } } } }
+            } }, "next_before_id": { "type": ["integer", "null"], "minimum": 1 } }
+        }),
+    );
+    let bans_response = json_response(
+        "server-ban policy and next_before_id cursor",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["bans", "next_before_id"],
+            "properties": { "bans": { "type": "array", "items": { "type": "object", "additionalProperties": false,
+                "required": ["id", "mask", "reason", "set_by", "kind", "created_at"],
+                "properties": { "id": { "type": "integer", "minimum": 1 }, "mask": { "type": "string" }, "reason": { "type": "string" }, "set_by": { "type": "string" }, "kind": { "type": "string", "enum": ["kline", "dline", "xline"] }, "created_at": { "type": "string" } }
+            } }, "next_before_id": { "type": ["integer", "null"], "minimum": 1 } }
+        }),
+    );
+    let audit_response = json_response(
+        "audit entries and next_before_id cursor",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["audit", "next_before_id"],
+            "properties": { "audit": { "type": "array", "items": { "type": "object", "additionalProperties": false,
+                "required": ["id", "actor", "action", "target", "detail", "at"],
+                "properties": { "id": { "type": "integer", "minimum": 1 }, "actor": { "type": "string" }, "action": { "type": "string" }, "target": { "type": "string" }, "detail": { "type": "string" }, "at": { "type": "string" } }
+            } }, "next_before_id": { "type": ["integer", "null"], "minimum": 1 } }
+        }),
+    );
+    let owned_channel_schema = serde_json::json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["name", "founder", "keeptopic", "topic", "topic_setter", "topic_set_at", "mlock", "access"],
+        "properties": {
+            "name": { "type": "string" }, "founder": { "type": "string" }, "keeptopic": { "type": "boolean" },
+            "topic": { "type": ["string", "null"] }, "topic_setter": { "type": ["string", "null"] }, "topic_set_at": { "type": ["integer", "null"], "minimum": 0 }, "mlock": { "type": ["string", "null"] },
+            "access": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["account", "flags"], "properties": { "account": { "type": "string" }, "flags": { "type": "string", "enum": ["o", "v", "ov", "vo"] } } } }
+        }
+    });
+    let owned_channels_response = json_response(
+        "founder-owned channels",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["channels"],
+            "properties": { "channels": { "type": "array", "items": owned_channel_schema.clone() } }
+        }),
+    );
+    let owned_channel_response = json_response("founder-owned channel", owned_channel_schema);
     let channel_name_parameter = serde_json::json!([
         { "name": "name", "in": "path", "required": true,
             "schema": { "type": "string" } }
@@ -235,6 +587,78 @@ fn document() -> serde_json::Value {
             "admin_accounts": { "type": "array", "items": { "type": "string" } }
         }
     });
+    let mut configuration_settings_schema = scalar_settings_schema.clone();
+    let configuration_properties = configuration_settings_schema["properties"]
+        .as_object_mut()
+        .expect("configuration settings properties are an object");
+    configuration_properties.insert("opers".into(), serde_json::json!({
+        "type": "array", "items": { "type": "object", "additionalProperties": false,
+            "required": ["name", "password"], "properties": { "name": { "type": "string" }, "password": { "type": "string" } } }
+    }));
+    configuration_properties.insert("oidc_providers".into(), serde_json::json!({
+        "type": "array", "items": { "type": "object", "additionalProperties": false,
+            "required": ["name", "issuer_url", "client_id", "client_secret", "scopes", "allowed_email_domains", "end_session_endpoint", "token_endpoint_auth_method"],
+            "properties": { "name": { "type": "string" }, "issuer_url": { "type": "string" }, "client_id": { "type": "string" }, "client_secret": { "type": "string" }, "scopes": { "type": "array", "items": { "type": "string" } }, "allowed_email_domains": { "type": "array", "items": { "type": "string" } }, "end_session_endpoint": { "type": ["string", "null"] }, "token_endpoint_auth_method": { "type": "string", "enum": ["client_secret_basic", "client_secret_post"] } } }
+    }));
+    configuration_properties.insert("networks".into(), serde_json::json!({
+        "type": "array", "items": { "type": "object", "additionalProperties": false,
+            "required": ["name", "owner", "kind", "addr", "tls", "nick", "realname", "autojoin", "buffer_cap", "sasl_account", "sasl_password"],
+            "properties": { "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "realname": { "type": ["string", "null"] }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] } } }
+    }));
+    configuration_settings_schema["required"]
+        .as_array_mut()
+        .expect("configuration settings required fields are an array")
+        .extend([
+            serde_json::json!("opers"),
+            serde_json::json!("oidc_providers"),
+            serde_json::json!("networks"),
+        ]);
+    let configuration_response = json_response(
+        "redacted settings, revision, and runtime/bootstrap status",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["revision", "updated_by", "updated_at", "settings", "runtime"],
+            "properties": {
+                "revision": { "type": "integer", "minimum": 0 }, "updated_by": { "type": "string" }, "updated_at": { "type": "string" }, "settings": configuration_settings_schema,
+                "runtime": { "type": "object", "additionalProperties": false, "required": ["bound_bnc_addr", "http_bind", "has_master_key", "master_key_count", "release_revision", "network_drivers"],
+                    "properties": { "bound_bnc_addr": { "type": ["string", "null"] }, "http_bind": { "type": ["string", "null"] }, "has_master_key": { "type": "boolean" }, "master_key_count": { "type": "integer", "minimum": 0 }, "release_revision": { "type": ["string", "null"] }, "network_drivers": { "type": "array", "items": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] } } }
+                }
+            }
+        }),
+    );
+    let monitoring_response = json_response(
+        "monitoring view",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false,
+            "required": ["core_ready", "database_ready", "active_connections", "registered_connections", "channels", "opened_total", "rejected_total", "traffic_in", "traffic_out", "upstream_in", "upstream_out", "inbound_rate", "outbound_rate", "upstream_inbound_rate", "upstream_outbound_rate", "http_requests", "database_requests", "bnc_connected", "bnc_networks", "upstreams_ready", "upstreams_degraded", "bnc_clients", "error_total", "sendq_kills", "core_p50", "core_p95", "core_p99", "database_p50", "database_p95", "database_p99", "http_p50", "http_p95", "http_p99", "traffic_bars", "upstream_traffic_bars", "connection_bars", "upstream_bars", "error_bars", "latency_bars", "queue_bars", "queues", "errors", "sampled_age", "history_samples", "window_label", "window_minutes", "window_links"],
+            "properties": {
+                "core_ready": { "type": "boolean" }, "database_ready": { "type": "boolean" }, "active_connections": { "type": "integer", "minimum": 0 }, "registered_connections": { "type": "integer", "minimum": 0 }, "channels": { "type": "integer", "minimum": 0 }, "opened_total": { "type": "integer", "minimum": 0 }, "rejected_total": { "type": "integer", "minimum": 0 },
+                "traffic_in": { "type": "string" }, "traffic_out": { "type": "string" }, "upstream_in": { "type": "string" }, "upstream_out": { "type": "string" }, "inbound_rate": { "type": "string" }, "outbound_rate": { "type": "string" }, "upstream_inbound_rate": { "type": "string" }, "upstream_outbound_rate": { "type": "string" },
+                "http_requests": { "type": "integer", "minimum": 0 }, "database_requests": { "type": "integer", "minimum": 0 }, "bnc_connected": { "type": "integer", "minimum": 0 }, "bnc_networks": { "type": "integer", "minimum": 0 }, "upstreams_ready": { "type": "boolean" }, "upstreams_degraded": { "type": "boolean" }, "bnc_clients": { "type": "integer", "minimum": 0 }, "error_total": { "type": "integer", "minimum": 0 }, "sendq_kills": { "type": "integer", "minimum": 0 },
+                "core_p50": { "type": "string" }, "core_p95": { "type": "string" }, "core_p99": { "type": "string" }, "database_p50": { "type": "string" }, "database_p95": { "type": "string" }, "database_p99": { "type": "string" }, "http_p50": { "type": "string" }, "http_p95": { "type": "string" }, "http_p99": { "type": "string" },
+                "traffic_bars": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["inbound_height", "outbound_height", "title"], "properties": { "inbound_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "outbound_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "title": { "type": "string" } } } },
+                "upstream_traffic_bars": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["inbound_height", "outbound_height", "title"], "properties": { "inbound_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "outbound_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "title": { "type": "string" } } } },
+                "connection_bars": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["irc_height", "bnc_height", "title"], "properties": { "irc_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "bnc_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "title": { "type": "string" } } } },
+                "upstream_bars": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["height", "status_class", "title"], "properties": { "height": { "type": "integer", "minimum": 0, "maximum": 100 }, "status_class": { "type": "string", "enum": ["bar-off", "bar-ok", "bar-warn"] }, "title": { "type": "string" } } } },
+                "error_bars": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["height", "title"], "properties": { "height": { "type": "integer", "minimum": 0, "maximum": 100 }, "title": { "type": "string" } } } },
+                "latency_bars": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["core_height", "database_height", "http_height", "title"], "properties": { "core_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "database_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "http_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "title": { "type": "string" } } } },
+                "queue_bars": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["core_height", "database_height", "title"], "properties": { "core_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "database_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "title": { "type": "string" } } } },
+                "queues": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["label", "depth", "capacity", "pressure", "mode", "mode_switches"], "properties": { "label": { "type": "string" }, "depth": { "type": "integer", "minimum": 0 }, "capacity": { "type": "integer", "minimum": 1 }, "pressure": { "type": "integer", "minimum": 0, "maximum": 100 }, "mode": { "type": "string" }, "mode_switches": { "type": "integer", "minimum": 0 } } } },
+                "errors": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["kind", "count", "last_seen"], "properties": { "kind": { "type": "string" }, "count": { "type": "integer", "minimum": 1 }, "last_seen": { "type": "string" } } } },
+                "sampled_age": { "type": "string" }, "history_samples": { "type": "integer", "minimum": 0 }, "window_label": { "type": "string" }, "window_minutes": { "type": "integer", "enum": [60, 360, 1440, 10080] }, "window_links": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["label", "minutes", "active"], "properties": { "label": { "type": "string" }, "minutes": { "type": "integer", "enum": [60, 360, 1440, 10080] }, "active": { "type": "boolean" } } } }
+            }
+        }),
+    );
+    let stats_response = json_response(
+        "counts, server identity, and live totals",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false,
+            "required": ["server", "network", "accounts", "registered_channels", "server_bans", "version", "live"],
+            "properties": {
+                "server": { "type": "string" }, "network": { "type": "string" }, "accounts": { "type": "integer", "minimum": 0 }, "registered_channels": { "type": "integer", "minimum": 0 }, "server_bans": { "type": "integer", "minimum": 0 }, "version": { "type": "string" },
+                "live": { "type": "object", "additionalProperties": false, "required": ["connections", "connected_upstreams", "upstreams", "traffic", "errors"], "properties": { "connections": { "type": "integer", "minimum": 0 }, "connected_upstreams": { "type": "integer", "minimum": 0 }, "upstreams": { "type": "integer", "minimum": 0 }, "traffic": { "type": "integer", "minimum": 0 }, "errors": { "type": "integer", "minimum": 0 } } }
+            }
+        }),
+    );
     serde_json::json!({
         "openapi": "3.1.0",
         "info": {
@@ -309,7 +733,7 @@ fn document() -> serde_json::Value {
                 "get": {
                     "summary": "Read your private account profile",
                     "security": authenticated,
-                    "responses": { "200": { "description": "account and optional contact_email" } }
+                    "responses": profile_response
                 },
                 "patch": {
                     "summary": "Replace or remove your private contact email",
@@ -368,7 +792,7 @@ fn document() -> serde_json::Value {
                     "security": authenticated,
                     "parameters": admin_cursor_parameters(),
                     "responses": {
-                        "200": { "description": "activity entries and next_before_id cursor" },
+                        "200": security_activity_response["200"],
                         "400": { "description": "invalid limit or cursor" },
                         "503": { "description": "database unavailable" }
                     }
@@ -380,7 +804,7 @@ fn document() -> serde_json::Value {
                     "description": "Returns at most 32 owner-scoped stable IDs, creation/expiry times, login method, provider, bounded User-Agent provenance, and whether a row is the request's current cookie session. A new login atomically revokes the oldest active row at the cap. Session tokens and hashes are never returned.",
                     "security": authenticated,
                     "responses": {
-                        "200": { "description": "unexpired browser sessions, current first" },
+                        "200": browser_sessions_response["200"],
                         "503": { "description": "database unavailable" }
                     }
                 },
@@ -419,7 +843,7 @@ fn document() -> serde_json::Value {
                     "security": authenticated,
                     "parameters": own_connection_parameters,
                     "responses": {
-                        "200": { "description": "owner-scoped connection posture and next_before_id cursor" },
+                        "200": connection_page_response["200"],
                         "400": { "description": "invalid limit, cursor, or exact filter" },
                         "401": { "description": "authentication required" },
                         "503": { "description": "live core unavailable" }
@@ -520,7 +944,7 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/me/identities": {
                 "get": { "summary": "List OIDC identities linked to your account and available link providers",
-                    "security": authenticated, "responses": ok_json }
+                    "security": authenticated, "responses": identities_response }
             },
             "/api/v1/me/identities/{id}": {
                 "delete": {
@@ -572,7 +996,7 @@ fn document() -> serde_json::Value {
                 "get": {
                     "summary": "List your expiring scoped personal access tokens (never the token)",
                     "description": "Returns the stable identifier, label, creation and expiry timestamps, and the closed scope set. Token material and hashes are never returned.",
-                    "security": authenticated, "responses": ok_json },
+                    "security": authenticated, "responses": tokens_response },
                 "post": {
                     "summary": "Mint an expiring scoped personal access token (shown once)",
                     "description": "Requires a browser session and its X-E6IRC-CSRF header. Existing bearer tokens cannot expand their own grant.",
@@ -598,7 +1022,7 @@ fn document() -> serde_json::Value {
                         }
                     } } },
                     "responses": {
-                        "201": { "description": "token material, exact scopes, and bounded lifetime" },
+                        "201": token_created_response["201"],
                         "400": { "description": "invalid label, empty/unknown scopes, or lifetime" },
                         "403": { "description": "the issuing bearer lacks write scope" },
                         "409": { "description": "the account token cap is reached" }
@@ -613,7 +1037,7 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/me/read-markers": {
                 "get": { "summary": "List your read markers (draft/read-marker) per target",
-                    "security": authenticated, "responses": ok_json }
+                    "security": authenticated, "responses": read_markers_response }
             },
             "/api/v1/me/password": {
                 "put": {
@@ -645,7 +1069,7 @@ fn document() -> serde_json::Value {
                     "summary": "List registered channels you founded with durable configuration",
                     "security": authenticated,
                     "responses": {
-                        "200": { "description": "channels, retained topics, KEEPTOPIC, MLOCK, and access grants" },
+                        "200": owned_channels_response["200"],
                         "503": { "description": "database unavailable" }
                     }
                 },
@@ -664,7 +1088,7 @@ fn document() -> serde_json::Value {
                         }
                     } } },
                     "responses": {
-                        "201": { "description": "registered and applied" },
+                        "201": json_response_status(201, "registered and applied", ok_detail_schema.clone())["201"],
                         "400": { "description": "invalid channel name" },
                         "409": { "description": "not joined as an operator, already registered, registration pending, or account cap reached" },
                         "503": { "description": "core or database unavailable" }
@@ -677,7 +1101,7 @@ fn document() -> serde_json::Value {
                     "security": authenticated,
                     "parameters": channel_name_parameter,
                     "responses": {
-                        "200": { "description": "durable channel configuration" },
+                        "200": owned_channel_response["200"],
                         "404": { "description": "no such channel owned by this account" }
                     }
                 },
@@ -736,7 +1160,7 @@ fn document() -> serde_json::Value {
                         }
                     } } },
                     "responses": {
-                        "200": { "description": "stored and applied" },
+                        "200": json_response("stored and applied", ok_detail_schema.clone())["200"],
                         "400": { "description": "invalid operation or value" },
                         "404": { "description": "no such owned channel or target account" },
                         "409": { "description": "retained topic requested while KEEPTOPIC is off" },
@@ -748,7 +1172,7 @@ fn document() -> serde_json::Value {
                     "security": authenticated,
                     "parameters": channel_name_parameter,
                     "responses": {
-                        "200": { "description": "unregistered" },
+                        "200": json_response("unregistered", ok_detail_schema.clone())["200"],
                         "404": { "description": "no such owned channel" },
                         "503": { "description": "core or database unavailable" }
                     }
@@ -769,7 +1193,7 @@ fn document() -> serde_json::Value {
                             } }
                     } } },
                     "responses": {
-                        "200": { "description": "stored and applied" },
+                        "200": json_response("stored and applied", ok_detail_schema.clone())["200"],
                         "400": { "description": "invalid flags" },
                         "404": { "description": "no such owned channel or registered account" },
                         "409": { "description": "access list is full" }
@@ -780,14 +1204,14 @@ fn document() -> serde_json::Value {
                     "security": authenticated,
                     "parameters": channel_access_parameters,
                     "responses": {
-                        "200": { "description": "removed" },
+                        "200": json_response("removed", ok_detail_schema.clone())["200"],
                         "404": { "description": "no such owned channel" }
                     }
                 }
             },
             "/api/v1/me/credentials": {
                 "get": { "summary": "List the account's credentials", "security": authenticated,
-                    "responses": ok_json },
+                    "responses": credentials_response },
                 "post": {
                     "summary": "Mint an app password for the current browser-session account",
                     "description": "Requires a cookie-authenticated browser session and session-bound CSRF. Bearer tokens cannot mint credentials.",
@@ -797,7 +1221,7 @@ fn document() -> serde_json::Value {
                             "properties": { "label": { "type": "string", "minLength": 1, "maxLength": 64 } } }
                     } } },
                     "responses": {
-                        "201": { "description": "the app password, shown once" },
+                        "201": app_password_created_response["201"],
                         "400": { "description": "invalid label" },
                         "401": { "description": "browser session required" },
                         "403": { "description": "invalid or missing CSRF token" },
@@ -833,7 +1257,7 @@ fn document() -> serde_json::Value {
                                 "autojoin": { "type": "array", "items": { "type": "string" } },
                                 "sasl_account": { "type": "string" },
                                 "sasl_password": { "type": "string" } } } } } },
-                    "responses": { "201": { "description": "created" },
+                    "responses": { "201": network_created_response["201"],
                         "409": { "description": "duplicate name, or upstream secret with no master key" } } }
             },
             "/api/v1/me/networks/preflight": {
@@ -878,7 +1302,7 @@ fn document() -> serde_json::Value {
                 "get": { "summary": "Read one BNC network and its live runtime diagnostics",
                     "security": authenticated,
                     "parameters": network_name_parameter,
-                    "responses": { "200": { "description": "stored configuration and runtime counters; secrets are presence booleans only" },
+                    "responses": { "200": network_response["200"],
                         "404": { "description": "no such network" } } },
                 "put": { "summary": "Replace a BNC network's mutable configuration and restart its driver",
                     "description": "The stored kind selects the same IRC/Matrix/Discord/Slack field contract documented on create. The credential action is required and explicit: `keep` preserves write-only values; `remove` clears paired IRC SASL and is rejected for bridges; `set` replaces supplied values. IRC requires account and may omit password to preserve it. Matrix/Discord accept only password. Slack accepts account, password, or both and preserves an omitted token.",
@@ -921,7 +1345,7 @@ fn document() -> serde_json::Value {
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "type": "object", "additionalProperties": false, "required": ["enabled"],
                             "properties": { "enabled": { "type": "boolean" } } } } } },
-                    "responses": { "200": { "description": "new enabled state" },
+                    "responses": { "200": network_enabled_response["200"],
                         "404": { "description": "no such network" },
                         "409": { "description": "cannot start (stored secret, no master key)" } } },
                 "delete": { "summary": "Delete a BNC network and stop its driver",
@@ -951,7 +1375,7 @@ fn document() -> serde_json::Value {
                     "description": "Returns stable account IDs newest-first. before_id selects strictly older accounts, so concurrent registration cannot duplicate or skip rows. The optional name filter is exact under RFC1459 case-folding. Counts omit expired browser sessions and personal access tokens; no credential, token, session, identity-subject, or network-secret material is returned.",
                     "security": authenticated,
                     "parameters": account_directory_parameters,
-                    "responses": { "200": { "description": "account posture entries and next_before_id cursor" },
+                    "responses": { "200": accounts_response["200"],
                         "400": { "description": "invalid limit, cursor, or exact account filter" },
                         "403": { "description": "not an admin account" } } },
                 "post": {
@@ -983,7 +1407,7 @@ fn document() -> serde_json::Value {
                     "description": "Returns the owner-scoped, render-ready Operations projection: live lifecycle and traffic, bounded failure history, persisted backlog summary, and the newest 100 detached upstream lines. Secret material is never returned.",
                     "security": authenticated,
                     "parameters": network_name_parameter,
-                    "responses": { "200": { "description": "network Operations projection" },
+                    "responses": { "200": network_operations_response["200"],
                         "404": { "description": "no such network" },
                         "503": { "description": "database unavailable" } } }
             },
@@ -1050,7 +1474,7 @@ fn document() -> serde_json::Value {
                     "security": authenticated,
                     "parameters": admin_cursor_parameters(),
                     "responses": {
-                        "200": { "description": "pending, unexpired invitation metadata and next_before_id cursor" },
+                        "200": invitations_response["200"],
                         "400": { "description": "invalid limit or cursor" },
                         "403": { "description": "not an admin account" }
                     }
@@ -1102,7 +1526,7 @@ fn document() -> serde_json::Value {
                     "security": authenticated,
                     "parameters": admin_connection_parameters,
                     "responses": {
-                        "200": { "description": "connection posture entries and next_before_id cursor" },
+                        "200": connection_page_response["200"],
                         "400": { "description": "invalid limit, cursor, or exact filter" },
                         "403": { "description": "not an admin account" },
                         "503": { "description": "live core unavailable" }
@@ -1129,7 +1553,7 @@ fn document() -> serde_json::Value {
                     "description": "Returns stable registration IDs newest-first. before_id selects strictly older rows, so concurrent registration cannot duplicate or skip entries. Optional channel and founder filters are exact under RFC1459 case-folding.",
                     "security": authenticated,
                     "parameters": registered_channel_parameters,
-                    "responses": { "200": { "description": "registered-channel posture and next_before_id cursor" },
+                    "responses": { "200": channels_response["200"],
                         "400": { "description": "invalid limit, cursor, channel, or founder filter" },
                         "403": { "description": "not an admin account" } } }
             },
@@ -1154,7 +1578,7 @@ fn document() -> serde_json::Value {
                     "description": "Returns stable policy IDs newest-first. before_id selects strictly older rows, so concurrent policy additions cannot duplicate or skip entries. Kind is a closed exact filter; mask matching is exact under RFC1459 case-folding while display casing is preserved.",
                     "security": authenticated,
                     "parameters": server_ban_parameters,
-                    "responses": { "200": { "description": "server-ban policy and next_before_id cursor" },
+                    "responses": { "200": bans_response["200"],
                         "400": { "description": "invalid limit, cursor, kind, or mask filter" },
                         "403": { "description": "not an admin account" } } }
                 ,"post": { "summary": "Create or refresh a K/D/X-line policy (admin only)",
@@ -1164,7 +1588,7 @@ fn document() -> serde_json::Value {
                         "type": "object", "additionalProperties": false, "required": ["kind", "mask"],
                         "properties": { "kind": { "type": "string", "enum": ["kline", "dline", "xline"] }, "mask": { "type": "string" }, "reason": { "type": "string" } }
                     } } } },
-                    "responses": { "201": { "description": "server ban created" }, "400": { "description": "invalid kind or mask" }, "403": { "description": "not an admin account" }, "409": { "description": "conflicting policy mutation" }, "503": { "description": "server-ban control unavailable" } } }
+                    "responses": { "201": json_response_status(201, "server ban created", message_schema.clone())["201"], "400": { "description": "invalid kind or mask" }, "403": { "description": "not an admin account" }, "409": { "description": "conflicting policy mutation" }, "503": { "description": "server-ban control unavailable" } } }
             },
             "/api/v1/admin/bans/{id}": {
                 "delete": { "summary": "Delete one immutable server-ban resource (admin only)",
@@ -1178,63 +1602,63 @@ fn document() -> serde_json::Value {
                     "description": "Returns stable audit entry IDs newest-first. before_id selects strictly older entries, so concurrent appends cannot duplicate or skip rows. Actor, action, and target filters are exact.",
                     "security": authenticated,
                     "parameters": audit_parameters,
-                    "responses": { "200": { "description": "audit entries and next_before_id cursor" },
+                    "responses": { "200": audit_response["200"],
                         "400": { "description": "invalid limit, cursor, or exact filter" },
                         "403": { "description": "not an admin account" } } }
             },
             "/api/v1/admin/stats": {
                 "get": { "summary": "Aggregate server counts and live totals (admin only)",
                     "security": authenticated,
-                    "responses": { "200": { "description": "counts, server identity, and live totals" },
+                    "responses": { "200": stats_response["200"],
                         "403": { "description": "not an admin account" } } }
             },
             "/api/v1/admin/configuration": {
                 "get": { "summary": "Read revisioned managed configuration (admin only)",
                     "description": "Returns the compare-and-swap revision, redacted operational settings, and the configuration console's secret-free runtime/bootstrap status. OIDC client secrets, oper passwords, upstream SASL passwords, and secret bridge accounts are never returned.",
                     "security": authenticated,
-                    "responses": { "200": { "description": "redacted settings, revision, and runtime/bootstrap status" }, "403": { "description": "not an admin account" }, "503": { "description": "managed configuration unavailable" } } },
+                    "responses": { "200": configuration_response["200"], "403": { "description": "not an admin account" }, "503": { "description": "managed configuration unavailable" } } },
                 "patch": { "summary": "Update revisioned scalar managed configuration", "description": "Updates typed scalar settings while retaining OIDC, operator, and network credential collections from the current revision. A live BNC listener change is applied before persistence and rolled back if persistence fails.", "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision", "settings"], "properties": { "revision": { "type": "integer" }, "settings": scalar_settings_schema } } } } },
-                    "responses": { "200": { "description": "configuration revision advanced and restart_required indicator" }, "400": { "description": "invalid settings or BNC listener" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration or BNC listener unavailable" } } }
+                    "responses": { "200": configuration_patch_response["200"], "400": { "description": "invalid settings or BNC listener" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration or BNC listener unavailable" } } }
             },
             "/api/v1/admin/configuration/opers": {
                 "post": { "summary": "Add an IRC operator to managed configuration", "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision", "name", "password"], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "password": { "type": "string", "writeOnly": true } } } } } },
-                    "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid operator" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision or master key unavailable" }, "503": { "description": "configuration unavailable" } } }
+                    "responses": { "200": revision_response["200"], "400": { "description": "invalid operator" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision or master key unavailable" }, "503": { "description": "configuration unavailable" } } }
             },
             "/api/v1/admin/configuration/opers/{name}": {
                 "delete": { "summary": "Remove an IRC operator from managed configuration", "security": authenticated,
                     "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
                     "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision"], "properties": { "revision": { "type": "integer" } } } } } },
-                    "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid operator" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration unavailable" } } }
+                    "responses": { "200": revision_response["200"], "400": { "description": "invalid operator" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration unavailable" } } }
             },
             "/api/v1/admin/configuration/oidc-providers": {
                 "post": { "summary": "Add an OIDC provider to managed configuration", "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision", "name", "issuer_url", "client_id", "client_secret", "token_endpoint_auth_method"], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "issuer_url": { "type": "string" }, "client_id": { "type": "string" }, "client_secret": { "type": "string", "writeOnly": true }, "scopes": { "type": "array", "items": { "type": "string" } }, "allowed_email_domains": { "type": "array", "items": { "type": "string" } }, "end_session_endpoint": { "type": "string" }, "token_endpoint_auth_method": { "type": "string", "enum": ["client_secret_basic", "client_secret_post"] } } } } } },
-                    "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid provider" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision or master key unavailable" }, "503": { "description": "configuration unavailable" } } }
+                    "responses": { "200": revision_response["200"], "400": { "description": "invalid provider" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision or master key unavailable" }, "503": { "description": "configuration unavailable" } } }
             },
             "/api/v1/admin/configuration/oidc-providers/{name}": {
                 "delete": { "summary": "Remove an OIDC provider from managed configuration", "security": authenticated,
                     "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
                     "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision"], "properties": { "revision": { "type": "integer" } } } } } },
-                    "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid provider" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration unavailable" } } }
+                    "responses": { "200": revision_response["200"], "400": { "description": "invalid provider" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration unavailable" } } }
             },
             "/api/v1/admin/configuration/networks": {
                 "post": { "summary": "Add a managed server network", "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision", "name", "kind", "tls", "buffer_cap"], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": "string" }, "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": "string", "writeOnly": true }, "sasl_password": { "type": "string", "writeOnly": true } } } } } },
-                    "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid network" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision or master key unavailable" }, "503": { "description": "configuration unavailable" } } }
+                    "responses": { "200": revision_response["200"], "400": { "description": "invalid network" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision or master key unavailable" }, "503": { "description": "configuration unavailable" } } }
             },
             "/api/v1/admin/configuration/networks/{name}": {
                 "delete": { "summary": "Remove a managed server network", "security": authenticated,
                     "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
                     "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision", "owner"], "properties": { "revision": { "type": "integer" }, "owner": { "type": ["string", "null"] } } } } } },
-                    "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid network" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration unavailable" } } }
+                    "responses": { "200": revision_response["200"], "400": { "description": "invalid network" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration unavailable" } } }
             },
             "/api/v1/admin/networks": {
                 "get": { "summary": "Fleet-wide BNC network inventory (admin only)",
                     "description": "Every account's networks with stored configuration (credentials as presence booleans only) and live driver runtime state, ordered by owner and network name.",
                     "security": authenticated,
-                    "responses": { "200": { "description": "networks with runtime snapshots" },
+                    "responses": { "200": admin_networks_response["200"],
                         "403": { "description": "not an admin account" } } }
             },
             "/api/v1/admin/networks/{owner}/{name}": {
@@ -1243,7 +1667,7 @@ fn document() -> serde_json::Value {
                     "security": authenticated,
                     "parameters": [{ "name": "owner", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
                     "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["enabled"], "properties": { "enabled": { "type": "boolean" } } } } } },
-                    "responses": { "200": { "description": "network lifecycle updated" }, "403": { "description": "not an admin account" }, "404": { "description": "network or bouncer missing" }, "503": { "description": "database unavailable" } } }
+                    "responses": { "200": admin_network_enabled_response["200"], "403": { "description": "not an admin account" }, "404": { "description": "network or bouncer missing" }, "503": { "description": "database unavailable" } } }
             },
             "/api/v1/admin/observability": {
                 "get": { "summary": "Live telemetry and bounded history (admin only)",
@@ -1261,7 +1685,7 @@ fn document() -> serde_json::Value {
                     "description": "Returns the bounded administrator monitoring view used by API clients, including current health, historical charts, queue state, latency, and the fixed error ledger.",
                     "security": authenticated,
                     "parameters": [{ "name": "minutes", "in": "query", "schema": { "type": "integer", "enum": [60, 360, 1440, 10080], "default": 60 } }],
-                    "responses": { "200": { "description": "monitoring view" }, "400": { "description": "unsupported monitoring window" }, "403": { "description": "not an admin account" } }
+                    "responses": { "200": monitoring_response["200"], "400": { "description": "unsupported monitoring window" }, "403": { "description": "not an admin account" } }
                 }
             },
             "/api/v1/admin/metrics": {
@@ -1334,9 +1758,44 @@ pub(super) async fn openapi() -> Response {
 
 #[cfg(test)]
 mod tests {
+    const CONSOLE_READ_OPERATIONS: &[(&str, &str)] = &[
+        ("/api/v1/admin/monitoring", "get"),
+        ("/api/v1/admin/stats", "get"),
+        ("/api/v1/admin/accounts", "get"),
+        ("/api/v1/admin/invitations", "get"),
+        ("/api/v1/admin/connections", "get"),
+        ("/api/v1/admin/channels", "get"),
+        ("/api/v1/admin/bans", "get"),
+        ("/api/v1/admin/audit", "get"),
+        ("/api/v1/admin/configuration", "get"),
+        ("/api/v1/admin/networks", "get"),
+        ("/api/v1/me/profile", "get"),
+        ("/api/v1/me/sessions", "get"),
+        ("/api/v1/me/connections", "get"),
+        ("/api/v1/me/identities", "get"),
+        ("/api/v1/me/tokens", "get"),
+        ("/api/v1/me/read-markers", "get"),
+        ("/api/v1/me/credentials", "get"),
+        ("/api/v1/me/networks", "get"),
+        ("/api/v1/me/networks/{name}", "get"),
+        ("/api/v1/me/networks/{name}/operations", "get"),
+        ("/api/v1/me/channels", "get"),
+    ];
+
     #[test]
     fn openapi_covers_every_documented_router_operation_exactly() {
         let spec = super::document();
         assert_eq!(super::validate_documented_operations(&spec), Ok(()));
+    }
+
+    #[test]
+    fn console_reads_have_closed_json_response_schemas() {
+        let spec = super::document();
+        for (path, method) in CONSOLE_READ_OPERATIONS {
+            let schema = &spec["paths"][path][method]["responses"]["200"]["content"]["application/json"]
+                ["schema"];
+            assert_eq!(schema["type"], "object", "{method} {path}");
+            assert_eq!(schema["additionalProperties"], false, "{method} {path}");
+        }
     }
 }

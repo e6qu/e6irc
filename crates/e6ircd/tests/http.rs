@@ -836,6 +836,11 @@ async fn console_runtime_is_served_in_every_build() {
         body.contains("/api/v1/admin/configuration/networks"),
         "{body}"
     );
+    assert!(body.contains("/console-contract.js"), "{body}");
+
+    let (status, headers, body) = request(http, &get("/console-contract.js")).await;
+    assert_eq!(status, 200, "{headers}");
+    assert!(body.contains("readApiJson"), "{body}");
 }
 
 #[tokio::test]
@@ -882,7 +887,25 @@ async fn openapi_spec_is_served() {
     assert_eq!(network_list_schema["additionalProperties"], false);
     assert_eq!(
         network_list_schema["properties"]["networks"]["items"]["required"],
-        serde_json::json!(["name", "enabled", "connected", "runtime"])
+        serde_json::json!([
+            "name",
+            "kind",
+            "addr",
+            "tls",
+            "nick",
+            "realname",
+            "autojoin",
+            "sasl_account",
+            "has_sasl_account",
+            "has_sasl_password",
+            "enabled",
+            "connected",
+            "runtime",
+        ])
+    );
+    assert_eq!(
+        network_list_schema["properties"]["networks"]["items"]["additionalProperties"],
+        false
     );
     assert_eq!(
         network_list_schema["properties"]["networks"]["items"]["properties"]["runtime"]["oneOf"][1]

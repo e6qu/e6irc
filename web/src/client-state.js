@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { ApiError, getApiObject } from "./api-contract.js";
+
+export { ApiError };
+
 export const SETTINGS_KEY = "e6irc.settings";
 export const DEFAULT_SETTINGS = Object.freeze({
   theme: "auto",
@@ -26,7 +30,6 @@ const IDENTITY_KEYS = new Set([
 ]);
 const NETWORK_LIST_KEYS = new Set(["networks"]);
 const BACKLOG_KEYS = new Set(["lines"]);
-const MAX_API_JSON_BYTES = 1024 * 1024;
 
 function defaults() {
   return { ...DEFAULT_SETTINGS };
@@ -92,53 +95,8 @@ export function saveSettings(storage, settings) {
   }
 }
 
-export class ApiError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.name = "ApiError";
-    this.status = status;
-  }
-}
-
-async function apiJson(response) {
-  const length = Number(response.headers.get("content-length"));
-  if (Number.isFinite(length) && length > MAX_API_JSON_BYTES) {
-    throw new ApiError(response.status, "The API response is too large. Reload and try again.");
-  }
-  const text = await response.text();
-  if (new TextEncoder().encode(text).byteLength > MAX_API_JSON_BYTES) {
-    throw new ApiError(response.status, "The API response is too large. Reload and try again.");
-  }
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new ApiError(response.status, "The API response contains invalid JSON. Reload and try again.");
-  }
-}
-
-function apiObject(value, status) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new ApiError(status, "The API response is invalid. Reload and try again.");
-  }
-  return value;
-}
-
 export async function getJson(fetcher, url) {
-  const response = await fetcher(url, { headers: { Accept: "application/json" } });
-  if (!response.ok) {
-    let detail = "";
-    try {
-      const problem = await apiJson(response);
-      detail =
-        typeof problem.detail === "string"
-          ? problem.detail
-          : typeof problem.title === "string"
-            ? problem.title
-            : "";
-    } catch {}
-    throw new ApiError(response.status, detail || `Request failed with HTTP ${response.status}`);
-  }
-  return apiObject(await apiJson(response), response.status);
+  return getApiObject(fetcher, url);
 }
 
 function optionalString(value) {

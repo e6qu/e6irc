@@ -1,3 +1,5 @@
+import { getOperationJson, loadApiContract, readApiJson, requireApiObject } from "/console-contract.js";
+
 (() => {
   "use strict";
 
@@ -202,80 +204,71 @@
   }
 
   const configurationResult = document.getElementById("configuration-api-result");
+  let apiContract;
 
-  const MAX_API_JSON_BYTES = 1024 * 1024;
-  const apiText = async (response) => {
-    const length = Number(response.headers.get("content-length"));
-    if (Number.isFinite(length) && length > MAX_API_JSON_BYTES) {
-      throw new Error("The API response is too large. Reload and try again.");
-    }
-    const text = await response.text();
-    if (new TextEncoder().encode(text).byteLength > MAX_API_JSON_BYTES) {
-      throw new Error("The API response is too large. Reload and try again.");
-    }
-    return text;
-  };
   const apiJson = async (response) => {
-    const text = await apiText(response);
-    if (!text) return undefined;
-    try {
-      return JSON.parse(text);
-    } catch (_) {
-      throw new Error("The API response is invalid. Reload and try again.");
-    }
+    if (response.status === 204) return undefined;
+    return readApiJson(response);
   };
   const apiObject = async (response) => {
-    const value = await apiJson(response);
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error("The API response is invalid. Reload and try again.");
-    }
-    return value;
+    return requireApiObject(await apiJson(response), response.status);
   };
   const apiProblem = async (response) => {
-    try {
-      const problem = await apiJson(response);
-      if (problem && typeof problem === "object") {
-        if (typeof problem.detail === "string") return problem.detail;
-        if (typeof problem.title === "string") return problem.title;
-      }
-    } catch (_) {}
-    return `Request failed with HTTP ${response.status}.`;
+    const problem = requireApiObject(
+      await readApiJson(response),
+      response.status,
+      "The server returned an invalid error response. Reload and try again.",
+    );
+    if (typeof problem.detail === "string") return problem.detail;
+    if (typeof problem.title === "string") return problem.title;
+    throw new Error("The server returned an invalid error response. Reload and try again.");
   };
 
   const apiRoute = (path, ...methods) => Object.freeze({ path, methods: Object.freeze(methods) });
-  const consoleMutationRoutes = Object.freeze([
-    apiRoute("/api/v1/admin/accounts", "POST"),
+  const consoleApiRoutes = Object.freeze([
+    apiRoute("/api/v1/admin/monitoring", "GET"),
+    apiRoute("/api/v1/admin/stats", "GET"),
+    apiRoute("/api/v1/admin/accounts", "GET", "POST"),
     apiRoute("/api/v1/admin/accounts/{id}", "PATCH", "DELETE"),
-    apiRoute("/api/v1/admin/bans", "POST"),
-    apiRoute("/api/v1/admin/bans/{id}", "DELETE"),
+    apiRoute("/api/v1/admin/invitations", "GET", "POST"),
+    apiRoute("/api/v1/admin/invitations/{id}", "DELETE"),
+    apiRoute("/api/v1/admin/connections", "GET"),
+    apiRoute("/api/v1/admin/connections/{id}", "DELETE"),
+    apiRoute("/api/v1/admin/channels", "GET"),
     apiRoute("/api/v1/admin/channels/{name}", "DELETE"),
-    apiRoute("/api/v1/admin/configuration", "PATCH"),
+    apiRoute("/api/v1/admin/bans", "GET", "POST"),
+    apiRoute("/api/v1/admin/bans/{id}", "DELETE"),
+    apiRoute("/api/v1/admin/audit", "GET"),
+    apiRoute("/api/v1/admin/configuration", "GET", "PATCH"),
+    apiRoute("/api/v1/admin/networks", "GET"),
+    apiRoute("/api/v1/admin/networks/{owner}/{name}", "PATCH"),
+    apiRoute("/api/v1/me/profile", "GET", "PATCH"),
+    apiRoute("/api/v1/me/sessions", "GET", "DELETE"),
+    apiRoute("/api/v1/me/sessions/{id}", "DELETE"),
+    apiRoute("/api/v1/me/connections", "GET"),
+    apiRoute("/api/v1/me/connections/{id}", "DELETE"),
+    apiRoute("/api/v1/me/identities", "GET"),
+    apiRoute("/api/v1/me/identities/{id}", "DELETE"),
+    apiRoute("/api/v1/me/tokens", "GET", "POST"),
+    apiRoute("/api/v1/me/tokens/{id}", "DELETE"),
+    apiRoute("/api/v1/me/read-markers", "GET"),
+    apiRoute("/api/v1/me/credentials", "GET", "POST"),
+    apiRoute("/api/v1/me/credentials/{id}", "DELETE"),
+    apiRoute("/api/v1/me/networks", "GET", "POST"),
+    apiRoute("/api/v1/me/networks/preflight", "POST"),
+    apiRoute("/api/v1/me/networks/{name}", "GET", "PUT", "PATCH", "DELETE"),
+    apiRoute("/api/v1/me/networks/{name}/operations", "GET"),
+    apiRoute("/api/v1/me/channels", "GET", "POST"),
+    apiRoute("/api/v1/me/channels/{name}", "PATCH", "DELETE"),
+    apiRoute("/api/v1/me/channels/{name}/access/{account}", "PUT", "DELETE"),
     apiRoute("/api/v1/admin/configuration/networks", "POST"),
     apiRoute("/api/v1/admin/configuration/networks/{name}", "DELETE"),
     apiRoute("/api/v1/admin/configuration/oidc-providers", "POST"),
     apiRoute("/api/v1/admin/configuration/oidc-providers/{name}", "DELETE"),
     apiRoute("/api/v1/admin/configuration/opers", "POST"),
     apiRoute("/api/v1/admin/configuration/opers/{name}", "DELETE"),
-    apiRoute("/api/v1/admin/invitations", "POST"),
-    apiRoute("/api/v1/admin/invitations/{id}", "DELETE"),
-    apiRoute("/api/v1/admin/networks/{owner}/{name}", "PATCH"),
-    apiRoute("/api/v1/me/account", "DELETE"),
-    apiRoute("/api/v1/me/channels", "POST"),
-    apiRoute("/api/v1/me/channels/{name}", "PATCH", "DELETE"),
-    apiRoute("/api/v1/me/channels/{name}/access/{account}", "PUT", "DELETE"),
-    apiRoute("/api/v1/me/connections/{id}", "DELETE"),
-    apiRoute("/api/v1/me/credentials", "POST"),
-    apiRoute("/api/v1/me/credentials/{id}", "DELETE"),
-    apiRoute("/api/v1/me/identities/{id}", "DELETE"),
-    apiRoute("/api/v1/me/networks", "POST"),
-    apiRoute("/api/v1/me/networks/preflight", "POST"),
-    apiRoute("/api/v1/me/networks/{name}", "PUT", "PATCH", "DELETE"),
     apiRoute("/api/v1/me/password", "PUT"),
-    apiRoute("/api/v1/me/profile", "PATCH"),
-    apiRoute("/api/v1/me/sessions", "DELETE"),
-    apiRoute("/api/v1/me/sessions/{id}", "DELETE"),
-    apiRoute("/api/v1/me/tokens", "POST"),
-    apiRoute("/api/v1/me/tokens/{id}", "DELETE"),
+    apiRoute("/api/v1/me/account", "DELETE"),
   ]);
 
   const matchesRoute = (path, route) => {
@@ -284,13 +277,20 @@
     return actual.length === expected.length && actual.every((part, index) => expected[index].startsWith("{") || part === expected[index]);
   };
 
-  const apiMutation = (method, url) => {
+  const apiOperation = (method, url) => {
     const path = new URL(url, window.location.origin).pathname;
-    const route = consoleMutationRoutes.find((candidate) => matchesRoute(path, candidate));
+    const route = consoleApiRoutes.find((candidate) => matchesRoute(path, candidate));
     if (!route || !route.methods.includes(method)) {
       throw new Error("The console API operation is not declared. Reload and try again.");
     }
     return Object.freeze({ method, url });
+  };
+
+  const apiMutation = apiOperation;
+
+  const consoleApiContract = () => {
+    apiContract ??= loadApiContract(fetch);
+    return apiContract;
   };
 
   const apiRequest = async (form, operation, body) => {
@@ -311,43 +311,14 @@
   };
 
   const apiRead = async (url) => {
-    const response = await fetch(url, {
+    const operation = apiOperation("GET", url);
+    return getOperationJson(fetch, await consoleApiContract(), operation.method, operation.url, {
       cache: "no-store",
       credentials: "same-origin",
-      headers: { Accept: "application/json" },
     });
-    if (!response.ok) throw new Error(await apiProblem(response));
-    return apiObject(response);
   };
 
-  const optionalString = (value) => value === null || typeof value === "string";
-
-  const parseOwnerNetwork = (value) => {
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("The network response is invalid. Reload and try again.");
-    const network = value;
-    if (
-      typeof network.name !== "string"
-      || !["irc", "local", "matrix", "discord", "slack"].includes(network.kind)
-      || typeof network.addr !== "string"
-      || typeof network.nick !== "string"
-      || !Array.isArray(network.autojoin)
-      || !network.autojoin.every((channel) => typeof channel === "string")
-      || typeof network.tls !== "boolean"
-      || typeof network.enabled !== "boolean"
-      || !optionalString(network.realname)
-      || !optionalString(network.sasl_account)
-      || typeof network.has_sasl_account !== "boolean"
-      || typeof network.has_sasl_password !== "boolean"
-    ) throw new Error("The network response is invalid. Reload and try again.");
-    return network;
-  };
-
-  const apiCollection = (value, field, label) => {
-    if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(value[field])) {
-      throw new Error(`The ${label} response is invalid. Reload and try again.`);
-    }
-    return value[field];
-  };
+  const apiCollection = (value, field) => value[field];
 
   const serializeRefresh = (refresh, reportQueued) => {
     let running = false;
@@ -707,7 +678,7 @@
   };
 
   const formatBytes = (value) => {
-    const bytes = Number(value) || 0; const units = ["B", "KiB", "MiB", "GiB"];
+    const bytes = value; const units = ["B", "KiB", "MiB", "GiB"];
     let amount = bytes; let unit = 0; while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit += 1; }
     return `${amount >= 10 || unit === 0 ? Math.round(amount) : amount.toFixed(1)} ${units[unit]}`;
   };
@@ -1123,7 +1094,6 @@
   const renderConfiguration = (root, view) => {
     const settings = view.settings;
     const runtime = view.runtime;
-    if (!settings || !runtime || !Number.isSafeInteger(view.revision)) throw new Error("The configuration response is incomplete.");
     const form = root.querySelector("[data-api-configuration-patch]");
     if (!(form instanceof HTMLFormElement)) throw new Error("The configuration form is missing.");
     const revision = String(view.revision);
@@ -1490,7 +1460,7 @@
             const suffix = value ? `?reason=${encodeURIComponent(value)}` : "";
             void mutateSession(disconnect, `${apiPath}/${encodeURIComponent(row.id)}${suffix}`, "Disconnect request failed.", refreshAfterMutation);
           });
-          body.append(append(element("tr"), element("td", "meta", row.id), client, append(element("td"), element("span", "tag", row.transport)), element("td", "", account), append(element("td"), connected, element("div", "meta", `${row.idle_seconds} seconds idle`)), element("td", "", Array.isArray(row.channels) && row.channels.length ? element("code", "", row.channels.join(", ")) : element("span", "meta", "—")), append(element("td"), disconnect)));
+          body.append(append(element("tr"), element("td", "meta", row.id), client, append(element("td"), element("span", "tag", row.transport)), element("td", "", account), append(element("td"), connected, element("div", "meta", `${row.idle_seconds} seconds idle`)), element("td", "", row.channels.length ? element("code", "", row.channels.join(", ")) : element("span", "meta", "—")), append(element("td"), disconnect)));
         }
         const table = append(document.createElement("table"), append(document.createElement("thead"), append(document.createElement("tr"), element("th", "", "ID"), element("th", "", "Client"), element("th", "", "Transport"), element("th", "", "Account"), element("th", "", "Connected / idle"), element("th", "", "Channels"), element("th", "", "Actions"))), body);
         connections.append(scrollRegion("Live connections", table));
@@ -1752,7 +1722,7 @@
       try {
         const profile = await apiRead("/api/v1/me/profile");
         if (accountContactEmail.dataset.apiEdited !== "true") {
-          accountContactEmail.value = typeof profile.contact_email === "string" ? profile.contact_email : "";
+          accountContactEmail.value = profile.contact_email ?? "";
         }
       } catch (error) {
         accountLoadFailure(error, () => void refreshContactEmail());
@@ -1842,7 +1812,7 @@
         }
         for (const token of tokens) {
           const row = document.createElement("tr");
-          const scopes = Array.isArray(token.scopes) ? token.scopes.join(", ") : "";
+          const scopes = token.scopes.join(", ");
           [token.label, scopes, token.created_at, token.expires_at].forEach((value) => {
             const cell = document.createElement("td");
             cell.textContent = String(value || "");
@@ -2154,15 +2124,12 @@
       body.append(row);
     }
     for (const network of networks) {
-      if (!network || typeof network.name !== "string" || typeof network.kind !== "string") {
-        throw new Error("The network list response is invalid. Reload and try again.");
-      }
-      const runtime = network.runtime && typeof network.runtime === "object" ? network.runtime : null;
-      const enabled = network.enabled === true;
-      const connected = network.connected === true;
+      const runtime = network.runtime;
+      const enabled = network.enabled;
+      const connected = network.connected;
       const state = !enabled
         ? "disabled"
-        : typeof runtime?.state === "string" ? runtime.state.replaceAll("_", " ") : "not running";
+        : runtime === null ? "not running" : runtime.state.replaceAll("_", " ");
       const row = document.createElement("tr");
       const status = document.createElement("td");
       const dot = document.createElement("span");
@@ -2464,10 +2431,9 @@
     };
     if (form instanceof HTMLFormElement) preserveFormEdits(form);
     const render = (network) => {
-      network = parseOwnerNetwork(network);
       if (network.kind !== "irc") { window.location.replace("/console/networks"); return; }
       if (ownerNetworkResult instanceof HTMLElement) { ownerNetworkResult.replaceChildren(); ownerNetworkResult.className = ""; }
-      hydrateTextInput(form, "addr", network.addr); hydrateTextInput(form, "nick", network.nick); hydrateTextInput(form, "realname", typeof network.realname === "string" ? network.realname : ""); hydrateTextInput(form, "autojoin", network.autojoin.join(", ")); hydrateTextInput(form, "sasl_account", typeof network.sasl_account === "string" ? network.sasl_account : "");
+      hydrateTextInput(form, "addr", network.addr); hydrateTextInput(form, "nick", network.nick); hydrateTextInput(form, "realname", network.realname ?? ""); hydrateTextInput(form, "autojoin", network.autojoin.join(", ")); hydrateTextInput(form, "sasl_account", network.sasl_account ?? "");
       hydrateCheckbox(form, "tls", network.tls);
       form.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
       const title = ownerNetworkEditor.querySelector("[data-network-editor-title]"); if (title) title.textContent = `Edit ${network.name}`;
@@ -2492,7 +2458,6 @@
     if (!name || !(form instanceof HTMLFormElement)) setOwnerNetworkResult("This bridge editor has no resource ID. Return to integrations and try again.", false); else {
       preserveFormEdits(form);
       const render = (network) => {
-        network = parseOwnerNetwork(network);
         if (!["matrix", "discord", "slack"].includes(network.kind)) { window.location.replace("/console/integrations"); return; }
         hydrateTextInput(form, "addr", network.addr); hydrateTextInput(form, "nick", network.nick); hydrateTextInput(form, "autojoin", network.autojoin.join(", "));
         const nick = ownerBridgeEditor.querySelector("[data-bridge-nick]"); if (nick instanceof HTMLElement) nick.hidden = !network.nick;
@@ -2546,12 +2511,11 @@
       detailResult.className = "banner-error";
     };
     const render = (network) => {
-      network = parseOwnerNetwork(network);
       if (detailResult instanceof HTMLElement) { detailResult.replaceChildren(); detailResult.className = ""; }
       const title = ownerNetworkDetail.querySelector("[data-network-title]"); if (title) title.textContent = network.name;
       const kind = ownerNetworkDetail.querySelector("[data-network-kind]"); if (kind) kind.textContent = `${network.kind} network`;
       const provider = network.addr || "Provider API";
-      setField("kind", network.kind); setField("addr", provider); setField("transport", network.tls ? "TLS" : network.addr ? "Plaintext" : "Provider-managed"); setField("nick", network.nick || "Provider account"); setField("realname", typeof network.realname === "string" && network.realname ? network.realname : "Not set"); setField("autojoin", network.autojoin.length ? network.autojoin.join(", ") : "None"); setField("account-credential", network.has_sasl_account === true ? "Stored" : "Not set"); setField("secret-credential", network.has_sasl_password === true ? "Stored encrypted" : "Not set"); setField("enabled", network.enabled ? "Enabled" : "Disabled");
+      setField("kind", network.kind); setField("addr", provider); setField("transport", network.tls ? "TLS" : network.addr ? "Plaintext" : "Provider-managed"); setField("nick", network.nick || "Provider account"); setField("realname", network.realname || "Not set"); setField("autojoin", network.autojoin.length ? network.autojoin.join(", ") : "None"); setField("account-credential", network.has_sasl_account ? "Stored" : "Not set"); setField("secret-credential", network.has_sasl_password ? "Stored encrypted" : "Not set"); setField("enabled", network.enabled ? "Enabled" : "Disabled");
       const summary = ownerNetworkDetail.querySelector("[data-network-summary]"); if (summary instanceof HTMLElement) summary.hidden = false;
       const actions = ownerNetworkDetail.querySelector("[data-network-actions]"); if (actions instanceof HTMLElement) actions.hidden = false;
       const destructive = ownerNetworkDetail.querySelector("[data-network-destructive]"); if (destructive instanceof HTMLElement) destructive.hidden = false;
