@@ -295,7 +295,7 @@ try {
   await page.reload();
   const malformedTokenDirectoryFailure = page.locator("#account-token-rows [role=status]");
   await malformedTokenDirectoryFailure.waitFor();
-  assert.match(await malformedTokenDirectoryFailure.innerText(), /token directory response is invalid/i);
+  assert.match(await malformedTokenDirectoryFailure.innerText(), /invalid API response/i);
   await page.locator("#account-token-rows").getByRole("button", { name: "Retry", exact: true }).click();
   await page.getByText("No personal access tokens.", { exact: true }).waitFor();
   assert.equal(malformedTokenDirectoryReads, 2, "Retry made exactly one replacement malformed-token request");
