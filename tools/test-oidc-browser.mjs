@@ -496,31 +496,35 @@ try {
   const configurationFailureErrorStart = applicationErrors.length;
   await page.route(`${applicationOrigin}/api/v1/admin/configuration`, async (route) => {
     configurationReads += 1;
-    if (configurationReads === 1) {
-      await route.fulfill({
-        status: 503,
-        contentType: "application/problem+json",
-        body: JSON.stringify({ status: 503, title: "Configuration inventory unavailable" }),
-      });
-    } else {
-      await route.continue();
-    }
+    assert.equal(configurationReads, 1);
+    await route.fulfill({
+      status: 503,
+      contentType: "application/problem+json",
+      body: JSON.stringify({ status: 503, title: "Configuration inventory unavailable" }),
+    });
   });
   await page.goto(`${applicationOrigin}/console/configuration`);
   await page.getByRole("heading", { name: "Configuration", exact: true }).waitFor();
   const configurationFailure = page.locator("#configuration-api-result");
   await configurationFailure.getByRole("button", { name: "Retry", exact: true }).waitFor();
   assert.match(await configurationFailure.innerText(), /Configuration inventory unavailable/);
-  await configurationFailure.getByRole("button", { name: "Retry", exact: true }).click();
+  await page.unroute(`${applicationOrigin}/api/v1/admin/configuration`);
+  await Promise.all([
+    page.waitForResponse(
+      (response) => response.url() === `${applicationOrigin}/api/v1/admin/configuration`
+        && response.request().method() === "GET"
+        && response.status() === 200,
+    ),
+    configurationFailure.getByRole("button", { name: "Retry", exact: true }).click(),
+  ]);
   const settingsForm = page.locator("form.settings-form");
   await waitForConfigurationServerName(page, "irc.browser.example");
-  assert.equal(configurationReads, 2, "Retry made exactly one replacement configuration request");
+  assert.equal(configurationReads, 1, "the first configuration read was intercepted once");
   assert.deepEqual(
     applicationErrors.splice(configurationFailureErrorStart),
     [`503 GET ${applicationOrigin}/api/v1/admin/configuration`],
     "the deliberate configuration failure was the only browser diagnostic during recovery",
   );
-  await page.unroute(`${applicationOrigin}/api/v1/admin/configuration`);
   await settingsForm.getByLabel("Server hostname").fill("irc.browser-managed.example");
   await settingsForm.getByLabel("Network name").fill("ManagedBrowserNet");
   await settingsForm.getByLabel("Description").fill("Browser-managed server");
