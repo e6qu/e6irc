@@ -312,6 +312,13 @@
     };
   };
 
+  const refreshAfterMutation = async (refresh) => {
+    if (!refresh) throw new Error("The updated view is unavailable. Return to the directory and try again.");
+    if (await refresh() === false) {
+      throw new Error("The change was saved, but the updated data could not be loaded.");
+    }
+  };
+
   const element = (name, className, text) => {
     const node = document.createElement(name);
     if (className) node.className = className;
@@ -815,27 +822,16 @@
     configurationResult.className = success ? "banner-success" : "banner-error";
   };
 
-  try {
-    const message = window.sessionStorage.getItem("e6irc.configuration-result");
-    if (message) {
-      window.sessionStorage.removeItem("e6irc.configuration-result");
-      setConfigurationResult(message, true);
-    }
-  } catch (_) {
-    // A successful reload remains authoritative if the browser denies session storage.
-  }
+  let refreshConfiguration;
 
   const mutateConfiguration = async (form, url, method, body, success = "Configuration saved.") => {
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
       await apiRequest(form, url, method, body);
-      try {
-        window.sessionStorage.setItem("e6irc.configuration-result", success);
-      } catch (_) {
-        // A successful API response is still authoritative if the browser denies storage.
-      }
-      window.location.reload();
+      await refreshAfterMutation(refreshConfiguration);
+      setConfigurationResult(success, true);
+      if (submit) submit.disabled = false;
     } catch (error) {
       setConfigurationResult(error instanceof Error ? error.message : "Configuration request failed.", false);
       if (submit) submit.disabled = false;
@@ -1147,23 +1143,26 @@
 
   const configurationRoot = document.querySelector("[data-api-configuration-read]");
   if (configurationRoot instanceof HTMLElement) {
-    const refreshConfiguration = async () => {
+    refreshConfiguration = async () => {
       try {
         renderConfiguration(configurationRoot, await apiRead("/api/v1/admin/configuration"));
       } catch (error) {
         const result = document.getElementById("configuration-api-result");
-        if (!(result instanceof HTMLElement)) return;
+        if (!(result instanceof HTMLElement)) return false;
         result.replaceChildren(element("span", "", error instanceof Error ? error.message : "Configuration failed to load."), retryButton(() => void refreshConfiguration()));
         result.className = "banner-error";
+        return false;
       }
+      return true;
     };
     void refreshConfiguration();
   }
 
   const banResult = document.getElementById("ban-api-result");
   const adminBanRows = document.querySelector("[data-api-admin-ban-list]");
+  let refreshBanDirectory;
   if (adminBanRows instanceof HTMLElement) {
-    const refreshBanDirectory = async () => {
+    refreshBanDirectory = async () => {
       try {
         const result = await apiRead(`/api/v1/admin/bans${window.location.search}`);
         const bans = apiCollection(result, "bans", "server-ban directory");
@@ -1190,7 +1189,7 @@
           cell.textContent = "No server bans match this view.";
           row.append(cell);
           adminBanRows.append(row);
-          return;
+          return true;
         }
         for (const ban of bans) {
           const row = document.createElement("tr");
@@ -1224,7 +1223,9 @@
         }
       } catch (error) {
         tableLoadFailure(adminBanRows, 7, error, () => void refreshBanDirectory());
+        return false;
       }
+      return true;
     };
     void refreshBanDirectory();
   }
@@ -1239,7 +1240,9 @@
     if (submit) submit.disabled = true;
     try {
       await apiRequest(form, url, method, body);
-      window.location.reload();
+      await refreshAfterMutation(refreshBanDirectory);
+      setBanResult("Updated.", true);
+      if (submit) submit.disabled = false;
     } catch (error) {
       setBanResult(error instanceof Error ? error.message : "Server-ban request failed.", false);
       if (submit) submit.disabled = false;
@@ -1507,6 +1510,7 @@
     if (submit) submit.disabled = true;
     try {
       const result = await apiRequest(form, form.action, method, body);
+      if (submit) submit.disabled = false;
       return result === undefined ? true : result;
     } catch (error) {
       setAccountResult(error instanceof Error ? error.message : failure, false);
@@ -1515,7 +1519,9 @@
     }
   };
 
-  const reloadAccount = () => window.location.reload();
+  let refreshAccountAccess;
+  let refreshContactEmail;
+  let refreshTokens;
 
   const accountRoot = document.querySelector("[data-api-account-read]");
   if (accountRoot instanceof HTMLElement) {
@@ -1527,7 +1533,15 @@
     const bindDelete = (form) => form.addEventListener("submit", (event) => {
       event.preventDefault();
       void mutateAccount(form, "DELETE", undefined, "Account access change failed.")
-        .then((result) => { if (result !== false) reloadAccount(); });
+        .then(async (result) => {
+          if (result === undefined) return;
+          try {
+            await refreshAfterMutation(refreshAccountAccess);
+            setAccountResult("Updated.", true);
+          } catch (error) {
+            setAccountResult(error instanceof Error ? error.message : "Account data failed to load.", false);
+          }
+        });
     });
     const renderPassword = (hasLocalPassword) => {
       if (!(passwordPanel instanceof HTMLElement)) return;
@@ -1634,7 +1648,7 @@
         identityList.append(card);
       }
     };
-    const refreshAccountAccess = async () => {
+    refreshAccountAccess = async () => {
       try {
         const [credentialResult, identityResult] = await Promise.all([
           apiRead("/api/v1/me/credentials"),
@@ -1648,7 +1662,9 @@
         if (credentialRows instanceof HTMLElement) tableLoadFailure(credentialRows, 5, error, () => void refreshAccountAccess());
         if (identityList instanceof HTMLElement) listLoadFailure(identityList, error, () => void refreshAccountAccess());
         if (linkProviders instanceof HTMLElement) linkProviders.replaceChildren();
+        return false;
       }
+      return true;
     };
     void refreshAccountAccess();
   }
@@ -1658,7 +1674,15 @@
       event.preventDefault();
       const email = fieldValue(new FormData(form), "contact_email");
       void mutateAccount(form, "PATCH", { contact_email: email || null }, "Profile update failed.")
-        .then((result) => { if (result !== false) reloadAccount(); });
+        .then(async (result) => {
+          if (result === undefined) return;
+          try {
+            await refreshAfterMutation(refreshContactEmail);
+            setAccountResult("Profile updated.", true);
+          } catch (error) {
+            setAccountResult(error instanceof Error ? error.message : "Profile data failed to load.", false);
+          }
+        });
     });
   }
 
@@ -1666,7 +1690,7 @@
   if (accountContactEmail instanceof HTMLInputElement) {
     const form = accountContactEmail.form;
     if (form instanceof HTMLFormElement) preserveFormEdits(form);
-    const refreshContactEmail = async () => {
+    refreshContactEmail = async () => {
       try {
         const profile = await apiRead("/api/v1/me/profile");
         if (accountContactEmail.dataset.apiEdited !== "true") {
@@ -1674,7 +1698,9 @@
         }
       } catch (error) {
         accountLoadFailure(error, () => void refreshContactEmail());
+        return false;
       }
+      return true;
     };
     void refreshContactEmail();
   }
@@ -1691,7 +1717,7 @@
       }
       void mutateAccount(form, "PUT", { current_password: current || null, new_password: next }, "Password update failed.")
         .then((result) => {
-          if (result !== false) setAccountResult(current ? "Local password changed." : "Local password added.", true);
+          if (result !== undefined) setAccountResult(current ? "Local password changed." : "Local password added.", true);
         });
     });
   }
@@ -1709,6 +1735,7 @@
           if (!result || typeof result !== "object") return;
           showAccountSecret("App password", result.app_password);
           setAccountResult("App password created. Copy it now; it cannot be shown again.", true);
+          void refreshAccountAccess?.();
         });
     });
   }
@@ -1731,13 +1758,14 @@
         if (!result || typeof result !== "object") return;
         showAccountSecret("Personal access token", result.token);
         setAccountResult("Personal access token created. Copy it now; it cannot be shown again.", true);
+        void refreshTokens?.();
       });
     });
   }
 
   const accountTokenRows = document.querySelector("[data-api-account-token-list]");
   if (accountTokenRows instanceof HTMLElement) {
-    const refreshTokens = async () => {
+    refreshTokens = async () => {
       try {
         const result = await apiRead("/api/v1/me/tokens");
         const tokens = apiCollection(result, "tokens", "token directory");
@@ -1752,7 +1780,7 @@
           cell.textContent = "No personal access tokens.";
           row.append(cell);
           accountTokenRows.append(row);
-          return;
+          return true;
         }
         for (const token of tokens) {
           const row = document.createElement("tr");
@@ -1784,7 +1812,9 @@
         }
       } catch (error) {
         tableLoadFailure(accountTokenRows, 5, error, () => void refreshTokens());
+        return false;
       }
+      return true;
     };
     void refreshTokens();
   }
@@ -1793,7 +1823,15 @@
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       void mutateAccount(form, "DELETE", undefined, "Account access change failed.")
-        .then((result) => { if (result !== false) reloadAccount(); });
+        .then(async (result) => {
+          if (result === undefined) return;
+          try {
+            await refreshAfterMutation(refreshTokens);
+            setAccountResult("Token revoked.", true);
+          } catch (error) {
+            setAccountResult(error instanceof Error ? error.message : "Token directory failed to load.", false);
+          }
+        });
     });
   }
 
@@ -1802,7 +1840,7 @@
       event.preventDefault();
       const confirmation = fieldValue(new FormData(form), "confirmation");
       void mutateAccount(form, "DELETE", { confirmation }, "Account deletion failed.")
-        .then((result) => { if (result !== false) window.location.assign("/auth/signed-out"); });
+        .then((result) => { if (result !== undefined) window.location.assign("/auth/signed-out"); });
     });
   }
 
@@ -1877,6 +1915,7 @@
 
   const adminAccountResult = document.getElementById("admin-account-api-result");
   const adminAccountSecret = document.getElementById("admin-account-api-secret");
+  let refreshAdminAccounts;
   const setAdminAccountResult = (message, success) => {
     if (!adminAccountResult) return;
     adminAccountResult.textContent = message;
@@ -1886,7 +1925,9 @@
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      return (await apiRequest(form, form.action, method, body)) ?? {};
+      const result = (await apiRequest(form, form.action, method, body)) ?? {};
+      if (submit) submit.disabled = false;
+      return result;
     } catch (error) {
       setAdminAccountResult(error instanceof Error ? error.message : failure, false);
       if (submit) submit.disabled = false;
@@ -1910,9 +1951,18 @@
     section.append(title, code, copy);
     adminAccountSecret.append(section);
   };
-  for (const form of document.querySelectorAll("[data-api-admin-account-create]")) form.addEventListener("submit", (event) => { event.preventDefault(); const fields = new FormData(form); void mutateAdminAccount(form, "POST", { account: fieldValue(fields, "account"), password: String(fields.get("password") || ""), contact_email: optionalValue(String(fields.get("contact_email") || "")), administrator: fields.has("administrator") }, "Account creation failed.").then((result) => { if (result) window.location.reload(); }); });
-  for (const form of document.querySelectorAll("[data-api-admin-invitation-create]")) form.addEventListener("submit", (event) => { event.preventDefault(); const fields = new FormData(form); void mutateAdminAccount(form, "POST", { account: fieldValue(fields, "account"), contact_email: optionalValue(String(fields.get("contact_email") || "")), expires_in_days: Number(fields.get("expires_in_days")), administrator: fields.has("administrator") }, "Invitation creation failed.").then((result) => { if (!result) return; showInvitationSecret(result.invitation_url); setAdminAccountResult("Invitation issued. Copy the link now; it cannot be shown again.", true); }); });
-  document.addEventListener("submit", (event) => { const form = event.target; if (!(form instanceof HTMLFormElement)) return; if (form.matches("[data-api-admin-invitation-delete]")) { event.preventDefault(); void mutateAdminAccount(form, "DELETE", undefined, "Invitation revocation failed.").then((result) => { if (result) window.location.reload(); }); } else if (form.matches("[data-api-admin-account-state]")) { event.preventDefault(); const fields = new FormData(form); const key = form.dataset.apiAdminAccountState === "suspension" ? "suspended" : "administrator"; void mutateAdminAccount(form, "PATCH", { [key]: fieldValue(fields, key) === "true" }, "Account state change failed.").then((result) => { if (result) window.location.reload(); }); } else if (form.matches("[data-api-admin-account-delete]")) { event.preventDefault(); void mutateAdminAccount(form, "DELETE", { confirmation: fieldValue(new FormData(form), "confirmation") }, "Account deletion failed.").then((result) => { if (result) window.location.reload(); }); } });
+  const refreshAdminAccountDirectory = async (result, success) => {
+    if (result === undefined) return;
+    try {
+      await refreshAfterMutation(refreshAdminAccounts);
+      setAdminAccountResult(success, true);
+    } catch (error) {
+      setAdminAccountResult(error instanceof Error ? error.message : "Account directory failed to load.", false);
+    }
+  };
+  for (const form of document.querySelectorAll("[data-api-admin-account-create]")) form.addEventListener("submit", (event) => { event.preventDefault(); const fields = new FormData(form); void mutateAdminAccount(form, "POST", { account: fieldValue(fields, "account"), password: String(fields.get("password") || ""), contact_email: optionalValue(String(fields.get("contact_email") || "")), administrator: fields.has("administrator") }, "Account creation failed.").then((result) => refreshAdminAccountDirectory(result, "Account created.")); });
+  for (const form of document.querySelectorAll("[data-api-admin-invitation-create]")) form.addEventListener("submit", (event) => { event.preventDefault(); const fields = new FormData(form); void mutateAdminAccount(form, "POST", { account: fieldValue(fields, "account"), contact_email: optionalValue(String(fields.get("contact_email") || "")), expires_in_days: Number(fields.get("expires_in_days")), administrator: fields.has("administrator") }, "Invitation creation failed.").then(async (result) => { if (!result) return; showInvitationSecret(result.invitation_url); try { await refreshAfterMutation(refreshAdminAccounts); setAdminAccountResult("Invitation issued. Copy the link now; it cannot be shown again.", true); } catch (error) { setAdminAccountResult(error instanceof Error ? error.message : "Invitation directory failed to load.", false); } }); });
+  document.addEventListener("submit", (event) => { const form = event.target; if (!(form instanceof HTMLFormElement)) return; if (form.matches("[data-api-admin-invitation-delete]")) { event.preventDefault(); void mutateAdminAccount(form, "DELETE", undefined, "Invitation revocation failed.").then((result) => refreshAdminAccountDirectory(result, "Invitation revoked.")); } else if (form.matches("[data-api-admin-account-state]")) { event.preventDefault(); const fields = new FormData(form); const key = form.dataset.apiAdminAccountState === "suspension" ? "suspended" : "administrator"; void mutateAdminAccount(form, "PATCH", { [key]: fieldValue(fields, key) === "true" }, "Account state change failed.").then((result) => refreshAdminAccountDirectory(result, "Account state updated.")); } else if (form.matches("[data-api-admin-account-delete]")) { event.preventDefault(); void mutateAdminAccount(form, "DELETE", { confirmation: fieldValue(new FormData(form), "confirmation") }, "Account deletion failed.").then((result) => refreshAdminAccountDirectory(result, "Account deleted.")); } });
 
   const adminAccountsPage = document.querySelector("[data-api-admin-accounts-page]");
   if (adminAccountsPage instanceof HTMLElement) {
@@ -1933,13 +1983,14 @@
       const section = append(element("div", "panel-head"), append(element("div"), element("h2", "", "Accounts"), element("p", "", "Only active browser sessions and unexpired personal access tokens are counted.")), element("span", "count", rows.length)); accountHost.append(section);
       if (!rows.length) accountHost.append(element("p", "empty", "No account matches this exact name.")); else { const table = document.createElement("table"); table.append(element("caption", "sr-only", "Account directory")); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "ID"), element("th", "", "Account"), element("th", "", "Created (UTC)"), element("th", "", "Login methods"), element("th", "", "Status"), element("th", "", "Active access"), element("th", "", "Resources"), element("th"))); const body = document.createElement("tbody"); for (const account of rows) { const auth = account.authentication || {}; const resources = account.resources || {}; const sources = account.administrator_sources || {}; const actions = element("td"); if (account.current) actions.append(element("span", "meta", "Current account")); else { for (const [key, value, label, confirmation] of [["suspension", !account.suspended, account.suspended ? "Reactivate" : "Suspend", account.suspended ? `Reactivate ${account.name} and restart its enabled networks?` : `Suspend ${account.name}, revoke its sessions and tokens, disconnect its clients, and stop its networks?`], ["administrator", !sources.durable, sources.durable ? "Revoke durable admin" : "Grant durable admin", sources.durable ? `Remove durable administrator authority from ${account.name}?` : `Grant durable administrator authority to ${account.name}?`]]) { const form = document.createElement("form"); form.className = "cell-form"; form.dataset.apiAdminAccountState = key; form.dataset.confirm = confirmation; form.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const state = document.createElement("input"); state.type = "hidden"; state.name = key === "suspension" ? "suspended" : "administrator"; state.value = String(value); form.append(capability(), state, button(label, value ? "" : "danger")); actions.append(form); } const deletion = document.createElement("form"); deletion.className = "cell-form account-delete-form"; deletion.dataset.apiAdminAccountDelete = ""; deletion.dataset.confirm = `Permanently delete ${account.name}, revoke every credential and session, erase its private history, stop its networks, and retire the account name? This cannot be undone.`; deletion.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const confirmation = document.createElement("input"); confirmation.name = "confirmation"; confirmation.autocomplete = "off"; confirmation.required = true; const deletionLabel = append(element("label", "field"), element("span", "", `Type ${account.name} to delete`), confirmation); deletion.append(capability(), deletionLabel, button("Delete permanently", "danger")); actions.append(deletion); } const created = element("time", "", account.created_at); created.dateTime = account.created_at; const loginMethods = `${auth.local_password ? "local password · " : ""}${auth.oidc_identities} OIDC · ${auth.app_passwords} app passwords`; const status = `${account.suspended ? "suspended" : "active"}${account.administrator ? " · administrator" : ""}${sources.durable ? " · durable grant" : ""}${sources.configuration ? " · configuration grant" : ""}`; body.append(append(element("tr"), element("td", "meta", account.id), append(element("td"), append(element("strong"), element("code", "", account.name))), append(element("td", "meta"), created), element("td", "", loginMethods), element("td", "", status), element("td", "", `${auth.browser_sessions} browsers · ${auth.api_tokens} API tokens`), element("td", "", `${resources.networks} networks · ${resources.founded_channels} channels`), actions)); } table.append(head, body); accountHost.append(append(element("div", "scroll"), table)); } accountHost.append(pager("Older accounts", data.next_before_id, "before_id")); accountHost.append(element("p", "section-note", "An account that founded registered channels cannot be deleted. Transfer or drop those channels first. Deleted account names remain permanently retired so old credentials and identity links can never resolve to a different person."));
     };
-    const refresh = async () => { const params = query(); const invitations = new URLSearchParams(); invitations.set("limit", params.get("limit") || "50"); if (params.get("invitation_before_id")) invitations.set("before_id", params.get("invitation_before_id")); const [accounts, invitationData] = await Promise.all([apiRead(`/api/v1/admin/accounts?${params}`), apiRead(`/api/v1/admin/invitations?${invitations}`)]); renderAccounts(accounts); renderInvitations(invitationData); for (const region of adminAccountsPage.querySelectorAll(".scroll")) { region.tabIndex = 0; region.setAttribute("aria-label", "Account directory table"); } };
+    refreshAdminAccounts = async () => { const params = query(); const invitations = new URLSearchParams(); invitations.set("limit", params.get("limit") || "50"); if (params.get("invitation_before_id")) invitations.set("before_id", params.get("invitation_before_id")); const [accounts, invitationData] = await Promise.all([apiRead(`/api/v1/admin/accounts?${params}`), apiRead(`/api/v1/admin/invitations?${invitations}`)]); renderAccounts(accounts); renderInvitations(invitationData); for (const region of adminAccountsPage.querySelectorAll(".scroll")) { region.tabIndex = 0; region.setAttribute("aria-label", "Account directory table"); } };
     if (filters instanceof HTMLFormElement) for (const input of filters.elements) if ((input instanceof HTMLInputElement || input instanceof HTMLSelectElement) && input.name) input.value = new URLSearchParams(window.location.search).get(input.name) || (input.name === "limit" ? "50" : "");
-    void refresh().catch((error) => setAdminAccountResult(error instanceof Error ? error.message : "Account directory failed to load.", false));
+    void refreshAdminAccounts().catch((error) => setAdminAccountResult(error instanceof Error ? error.message : "Account directory failed to load.", false));
   }
 
   const adminNetworkResult = document.getElementById("admin-network-api-result");
   const adminNetworkRows = document.querySelector("[data-api-admin-network-list]");
+  let refreshAdminNetworks;
   const renderAdminNetworks = (networks) => {
     if (!(adminNetworkRows instanceof HTMLElement)) return;
     adminNetworkRows.replaceChildren();
@@ -1977,13 +2028,15 @@
     }
   };
   if (adminNetworkRows instanceof HTMLElement) {
-    const refreshAdminNetworks = async () => {
+    refreshAdminNetworks = async () => {
       try {
         const result = await apiRead("/api/v1/admin/networks");
         renderAdminNetworks(apiCollection(result, "networks", "network directory"));
       } catch (error) {
         tableLoadFailure(adminNetworkRows, 9, error, () => void refreshAdminNetworks());
+        return false;
       }
+      return true;
     };
     void refreshAdminNetworks();
   }
@@ -2000,7 +2053,12 @@
       return;
     }
     void apiRequest(form, form.action, "PATCH", { enabled: enabled === "true" })
-      .then(() => window.location.reload())
+      .then(() => refreshAfterMutation(refreshAdminNetworks))
+      .then(() => {
+        if (!adminNetworkResult) return;
+        adminNetworkResult.textContent = "Network state updated.";
+        adminNetworkResult.className = "banner-success";
+      })
       .catch((error) => {
         if (!adminNetworkResult) return;
         adminNetworkResult.textContent = error instanceof Error ? error.message : "Network lifecycle change failed.";
@@ -2135,12 +2193,14 @@
       const result = await apiRead("/api/v1/me/networks");
       renderOwnerNetworks(apiCollection(result, "networks", "network directory"));
       if (ownerNetworkRefreshStatus) ownerNetworkRefreshStatus.textContent = "Live data refreshed.";
+      return true;
     } catch (error) {
       renderOwnerNetworkFailure(error, () => { if (refreshOwnerNetworks) void refreshOwnerNetworks(true); });
       if (ownerNetworkRefreshStatus) {
         ownerNetworkRefreshStatus.textContent = "Live refresh failed. Retry is available in the network list.";
         ownerNetworkRefreshStatus.classList.add("refresh-error");
       }
+      return false;
     } finally {
       ownerNetworkRows.removeAttribute("aria-busy");
     }
@@ -2159,14 +2219,25 @@
     }
   }
 
-  const mutateOwnerNetwork = async (form, url, method, body, reload = true) => {
+  let refreshOwnerNetworkEditor;
+  let refreshOwnerBridgeEditor;
+  let refreshOwnerNetworkDetail;
+  let refreshIntegrations;
+  const ownerNetworkPreflight = Symbol("owner-network-preflight");
+  const ownerNetworkRefresher = (form) => {
+    if (form.closest("[data-api-owner-network-editor]")) return refreshOwnerNetworkEditor;
+    if (form.closest("[data-api-owner-bridge-editor]")) return refreshOwnerBridgeEditor;
+    if (form.closest("[data-api-owner-network-detail]")) return refreshOwnerNetworkDetail;
+    if (form.closest("[data-api-integrations]")) return refreshIntegrations;
+    return refreshOwnerNetworks;
+  };
+
+  const mutateOwnerNetwork = async (form, url, method, body, mode) => {
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
       const result = await apiRequest(form, url, method, body);
-      if (reload) {
-        window.location.reload();
-      } else {
+      if (mode === ownerNetworkPreflight) {
         const nick = result?.confirmed_nick;
         const timings = [result?.dns_ms, result?.connect_ms, result?.registration_ms];
         if (
@@ -2180,7 +2251,11 @@
           `Registered as ${nick}. Resolved ${result.resolved_addresses} address${result.resolved_addresses === 1 ? "" : "es"}; DNS ${result.dns_ms}ms, connection ${result.connect_ms}ms, registration ${result.registration_ms}ms. No network was created.`,
           true,
         );
+      } else {
+        await refreshAfterMutation(ownerNetworkRefresher(form));
+        setOwnerNetworkResult("Updated.", true);
       }
+      if (submit) submit.disabled = false;
     } catch (error) {
       setOwnerNetworkResult(error instanceof Error ? error.message : "Network request failed.", false);
       if (submit) submit.disabled = false;
@@ -2213,7 +2288,7 @@
         const { addr, tls, nick, realname, sasl_account, sasl_password } = connection;
         void mutateOwnerNetwork(form, "/api/v1/me/networks/preflight", "POST", {
           addr, tls, nick, realname, sasl_account, sasl_password,
-        }, false);
+        }, ownerNetworkPreflight);
         return;
       }
       void mutateOwnerNetwork(form, form.action, "POST", { kind: "irc", name, ...connection });
@@ -2305,7 +2380,7 @@
         table.append(body); target.append(table);
       }
     };
-    const refreshIntegrations = async () => {
+    refreshIntegrations = async () => {
       try {
         const result = await apiRead("/api/v1/admin/networks");
         render(apiCollection(result, "networks", "integration directory"));
@@ -2313,7 +2388,9 @@
         integrations.querySelectorAll("[data-integration-list]").forEach((target) => {
           if (target instanceof HTMLElement) listLoadFailure(target, error, () => void refreshIntegrations());
         });
+        return false;
       }
+      return true;
     };
     void refreshIntegrations();
   }
@@ -2338,12 +2415,14 @@
       const title = ownerNetworkEditor.querySelector("[data-network-editor-title]"); if (title) title.textContent = `Edit ${network.name}`;
       form.hidden = false;
     };
-    const refreshOwnerNetworkEditor = async () => {
+    refreshOwnerNetworkEditor = async () => {
       try {
         render(await apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`));
       } catch (error) {
         showFailure(error, () => void refreshOwnerNetworkEditor());
+        return false;
       }
+      return true;
     };
     if (!name || !(form instanceof HTMLFormElement)) setOwnerNetworkResult("This network editor has no resource ID. Return to the network directory and try again.", false); else void refreshOwnerNetworkEditor();
   }
@@ -2354,8 +2433,7 @@
     const form = ownerBridgeEditor.querySelector("[data-api-owner-bridge-update]");
     if (!name || !(form instanceof HTMLFormElement)) setOwnerNetworkResult("This bridge editor has no resource ID. Return to integrations and try again.", false); else {
       preserveFormEdits(form);
-      void apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`)
-      .then((network) => {
+      const render = (network) => {
         network = parseOwnerNetwork(network);
         if (!["matrix", "discord", "slack"].includes(network.kind)) { window.location.replace("/console/integrations"); return; }
         hydrateTextInput(form, "addr", network.addr); hydrateTextInput(form, "nick", network.nick); hydrateTextInput(form, "autojoin", network.autojoin.join(", "));
@@ -2366,8 +2444,17 @@
         const title = ownerBridgeEditor.querySelector("[data-bridge-editor-title]"); if (title) title.textContent = `Edit ${network.name}`;
         const credential = ownerBridgeEditor.querySelector("[data-bridge-credential]"); if (credential) credential.textContent = network.has_sasl_password === true ? "A credential is stored. Leave blank to keep it." : "No credential is stored; enter one before saving.";
         form.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; form.hidden = false;
-      })
-      .catch((error) => setOwnerNetworkResult(error instanceof Error ? error.message : "Bridge configuration failed to load.", false));
+      };
+      refreshOwnerBridgeEditor = async () => {
+        try {
+          render(await apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`));
+        } catch (error) {
+          setOwnerNetworkResult(error instanceof Error ? error.message : "Bridge configuration failed to load.", false);
+          return false;
+        }
+        return true;
+      };
+      void refreshOwnerBridgeEditor();
     }
   }
 
@@ -2416,20 +2503,23 @@
       const deleteForm = ownerNetworkDetail.querySelector("[data-api-owner-network-delete]"); if (deleteForm instanceof HTMLFormElement) { deleteForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; deleteForm.dataset.confirm = `Remove network ${network.name}? Its live connection and stored backlog will be deleted.`; }
       const edit = ownerNetworkDetail.querySelector("[data-network-edit]"); if (edit instanceof HTMLAnchorElement) { if (network.kind === "irc") { edit.href = `/console/networks/${encodeURIComponent(network.name)}/edit`; edit.hidden = false; } else if (ownerNetworkDetail.dataset.isAdmin === "true") { edit.href = `/console/integrations/${encodeURIComponent(network.name)}/edit`; edit.textContent = "Edit integration"; edit.hidden = false; } }
     };
-    const refreshOwnerNetworkDetail = async () => {
+    refreshOwnerNetworkDetail = async () => {
       try {
         render(await apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`));
       } catch (error) {
         showFailure(error, () => void refreshOwnerNetworkDetail());
+        return false;
       }
+      return true;
     };
     if (!name) showFailure(new Error("This network page has no resource ID. Return to the network directory and try again."), () => void refreshOwnerNetworkDetail()); else void refreshOwnerNetworkDetail();
   }
 
   const channelResult = document.getElementById("channel-api-result");
   const adminChannelRows = document.querySelector("[data-api-admin-channel-list]");
+  let refreshAdminChannelDirectory;
   if (adminChannelRows instanceof HTMLElement) {
-    const refreshChannelDirectory = async () => {
+    refreshAdminChannelDirectory = async () => {
       try {
         const result = await apiRead(`/api/v1/admin/channels${window.location.search}`);
         const channels = apiCollection(result, "channels", "channel directory");
@@ -2437,13 +2527,15 @@
         if (pager) { pager.replaceChildren(); if (result.next_before_id) { const link = document.createElement("a"); const query = new URLSearchParams(window.location.search); query.set("before_id", String(result.next_before_id)); link.href = `/console/admin/channels?${query}`; link.textContent = "Older registrations"; pager.append(link); } }
         adminChannelRows.replaceChildren();
         const count = document.getElementById("admin-channel-count"); if (count) count.textContent = String(channels.length);
-        if (!channels.length) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 7; cell.className = "empty"; cell.textContent = "No registered channels match this view."; row.append(cell); adminChannelRows.append(row); return; }
+        if (!channels.length) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 7; cell.className = "empty"; cell.textContent = "No registered channels match this view."; row.append(cell); adminChannelRows.append(row); return true; }
         for (const channel of channels) { const row = document.createElement("tr"); const policy = channel.policy || {}; const values = [channel.id, channel.name, channel.founder, channel.created_at, `KEEP ${policy.keeptopic ? "on" : "off"}${policy.topic_retained ? "; topic retained" : ""}${policy.mlock ? `; MLOCK ${policy.mlock}` : ""}`, `${policy.access_entries || 0} grants`]; values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = String(value); row.append(cell); }); const actions = document.createElement("td"); const form = document.createElement("form"); form.method = "post"; form.action = `/api/v1/admin/channels/${encodeURIComponent(channel.name)}`; form.dataset.apiAdminChannelDrop = ""; form.dataset.confirm = `Unregister ${channel.name} and delete its retained policy?`; const csrf = document.createElement("input"); csrf.type = "hidden"; csrf.name = "csrf"; csrf.value = adminChannelRows.dataset.csrf || ""; const button = document.createElement("button"); button.type = "submit"; button.className = "danger"; button.textContent = "Unregister"; form.append(csrf, button); actions.append(form); row.append(actions); adminChannelRows.append(row); }
       } catch (error) {
-        tableLoadFailure(adminChannelRows, 7, error, () => void refreshChannelDirectory());
+        tableLoadFailure(adminChannelRows, 7, error, () => void refreshAdminChannelDirectory());
+        return false;
       }
+      return true;
     };
-    void refreshChannelDirectory();
+    void refreshAdminChannelDirectory();
   }
 
   const adminAuditRows = document.querySelector("[data-api-admin-audit-list]");
@@ -2509,12 +2601,18 @@
     channelResult.className = success ? "banner-success" : "banner-error";
   };
 
+  let refreshOwnedChannels;
+  const channelRefresher = () => ownedChannelList instanceof HTMLElement
+    ? refreshOwnedChannels
+    : refreshAdminChannelDirectory;
   const mutateChannel = async (form, url, method, body) => {
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
       await apiRequest(form, url, method, body);
-      window.location.reload();
+      await refreshAfterMutation(channelRefresher());
+      setChannelResult("Updated.", true);
+      if (submit) submit.disabled = false;
     } catch (error) {
       setChannelResult(error instanceof Error ? error.message : "Channel request failed.", false);
       if (submit) submit.disabled = false;
@@ -2538,7 +2636,7 @@
       node.append(button);
       node.addEventListener("submit", (event) => { event.preventDefault(); void run(node); });
     };
-    void apiRead("/api/v1/me/channels").then((result) => {
+    const renderOwnedChannels = (result) => {
       const channels = apiCollection(result, "channels", "channel directory");
       ownedChannelList.replaceChildren();
       const count = document.getElementById("owned-channel-count"); if (count) count.textContent = `${channels.length} owned`;
@@ -2558,7 +2656,11 @@
         const transfer = form(url, "transfer", (node) => { node.append(input("account")); }); submit(transfer, "Transfer ownership", (node) => { const account = fieldValue(new FormData(node), "account"); if (!account) { setChannelResult("Enter the new founder account.", false); return Promise.resolve(); } return mutateChannel(node, url, "PATCH", { action: "transfer_founder", account }); }, `Transfer ${channel.name} to this account? You will lose founder control.`); card.append(transfer);
         const drop = form(url, "drop", () => {}); submit(drop, "Unregister", (node) => mutateChannel(node, url, "DELETE"), `Unregister ${channel.name} and delete its retained policy?`); card.append(drop); ownedChannelList.append(card);
       }
-    }).catch((error) => { ownedChannelList.textContent = error instanceof Error ? error.message : "Registered channels failed to load."; });
+    };
+    refreshOwnedChannels = async () => {
+      renderOwnedChannels(await apiRead("/api/v1/me/channels"));
+    };
+    void refreshOwnedChannels().catch((error) => { ownedChannelList.textContent = error instanceof Error ? error.message : "Registered channels failed to load."; });
   }
 
   for (const form of document.querySelectorAll("[data-api-channel-register]")) {

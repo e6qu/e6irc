@@ -10,21 +10,18 @@ Complete means: one API contract; usable browser chat and console; API and
 browser evidence for shipped workflows; and measured release, recovery, scale,
 and integration claims.
 
-## Current work
+## Current state
 
-### Stage F — Scale architecture and qualification
-
-- The daemon runs a configured nonzero number of core workers (default 1).
-  Runtime N=2/N=3 tests cover ownership, routing, delivery, and shutdown.
-- Controlled Linux campaigns record source, executable, host, workload,
-  configured worker count, budgets, and a closed passed/rejected/failed outcome.
-  Tuned-host campaigns remain required before scale claims.
+The console reads and writes only through `/api/v1`. Its mutation forms and
+client handlers are checked against that boundary, and successful mutations
+refresh their affected API-backed view without a document reload.
 
 ## Remaining qualification
 
-- Run the shipped credential-gated campaigns and retain passed evidence for
-  Discord, Slack, each required OIDC issuer, public IRC networks, and a tuned
-  host. Local oracle results do not qualify external services.
+- Run the shipped credential-gated campaigns for Discord, Slack, each required
+  OpenID Connect issuer, and public IRC networks.
+- Run the tuned-host scale campaign. It remains required for production scale
+  claims.
 
 ## Rules
 

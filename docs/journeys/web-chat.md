@@ -244,6 +244,8 @@ boundary at the handler, regardless of whether a link was hidden. Server
 errors render an error state rather than an empty collection. Expired sessions
 return to authentication, and sign-out ends at the reload-safe signed-out page.
 Delayed API reads do not overwrite a field edited before the response arrives.
+Successful mutations refresh the affected API-backed view in place; a failed
+mutation keeps the current document and its entered values.
 
 **Security and observability.** Navigation visibility is only presentation;
 each destination independently authenticates, authorizes, and applies CSRF to
@@ -255,9 +257,9 @@ database/provider text.
 level. The real Chromium journey crosses OpenID Connect and local
 authentication, visits account/network/channel and every administrator
 directory, proves narrow and high-zoom layouts plus forced-color focus and
-accessibility, preserves an in-progress profile edit across a delayed API
-read, edits every managed-configuration subsection and credential collection,
-adds and removes a server ban, verifies its audit trail, inspects live queue
+accessibility, preserves an in-progress profile edit across a delayed API read
+and a failed profile mutation, edits every managed-configuration subsection
+and credential collection, adds and removes a server ban, verifies its audit trail, inspects live queue
 monitoring, and completes the reload-safe sign-out/recovery flow.
 Focused HTTP journeys prove the remaining owner and administrator mutation
 families with their role and CSRF boundaries.
