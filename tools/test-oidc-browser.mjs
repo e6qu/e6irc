@@ -440,7 +440,7 @@ try {
   assert.equal(
     profileMutationRoutes,
     1,
-    `profile mutation requests: ${applicationRequests.slice(profileRequestStart).join(", ")}`,
+    `profile mutation requests: ${applicationRequests.slice(profileRequestStart).join(", ")}; browser errors: ${applicationErrors.slice(profileFailureErrorStart).join(", ")}`,
   );
   await profileFailure;
   await expectStatus(page, /Profile storage unavailable/);
