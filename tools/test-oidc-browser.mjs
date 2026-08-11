@@ -386,8 +386,9 @@ try {
     window.__e6ircProfileFailure = false;
     window.__e6ircProfileFailureRequests = 0;
     window.fetch = async (input, init) => {
-      const request = new Request(input, init);
-      if (window.__e6ircProfileFailure && request.url === url && request.method === "PATCH") {
+      const requestURL = input instanceof Request ? input.url : new URL(input, window.location.href).href;
+      const method = input instanceof Request ? input.method : init?.method ?? "GET";
+      if (window.__e6ircProfileFailure && requestURL === url && method === "PATCH") {
         window.__e6ircProfileFailureRequests += 1;
         return new Response(JSON.stringify({ status: 503, title: "Profile storage unavailable" }), {
           status: 503,
@@ -426,11 +427,7 @@ try {
   await page.evaluate(() => { window.__e6ircProfileFailure = true; });
   await contactEmail.fill("retry-contact@example.test");
   await page.getByRole("button", { name: "Save contact email", exact: true }).click();
-  const accountResult = page.locator("#account-api-result");
-  await page.waitForFunction(
-    () => document.getElementById("account-api-result")?.textContent?.trim().length,
-  );
-  assert.match(await accountResult.innerText(), /Profile storage unavailable/);
+  await expectStatus(page, /Profile storage unavailable/);
   assert.equal(await page.evaluate(() => performance.timeOrigin), accountDocument);
   assert.equal(await contactEmail.inputValue(), "retry-contact@example.test");
   assert.equal(await page.evaluate(() => window.__e6ircProfileFailureRequests), 1);
