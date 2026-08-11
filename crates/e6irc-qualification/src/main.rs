@@ -125,10 +125,6 @@ impl SafeText {
         }
         Ok(Self(value))
     }
-
-    fn validate(&self, flag: &str) -> Result<(), String> {
-        Self::parse(self.0.clone(), flag).map(|_| ())
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -143,7 +139,7 @@ impl CampaignTarget {
     }
 
     fn validate(&self, kind: TargetKind) -> Result<(), String> {
-        self.0.validate("target")?;
+        SafeText::parse(self.0.0.clone(), "target")?;
         match kind {
             TargetKind::Oidc => validate_external_oidc_issuer(&self.0.0),
             TargetKind::PublicIrc if !matches!(self.0.0.as_str(), "libera" | "oftc" | "ergo") => {
@@ -162,13 +158,7 @@ impl CampaignTarget {
 
 fn validate_external_oidc_issuer(value: &str) -> Result<(), String> {
     let url = Url::parse(value).map_err(|_| "OIDC target must be an HTTPS issuer URL")?;
-    let loopback = url.host_str().is_some_and(|host| {
-        host == "localhost"
-            || host
-                .trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-    });
+    let loopback = url.host_str().is_some_and(native::is_loopback_host);
     if url.scheme() != "https"
         || url.host_str().is_none()
         || !url.username().is_empty()
@@ -194,10 +184,6 @@ impl PositiveDecimal {
             return Err(format!("{flag} value must be a positive finite number"));
         }
         Ok(Self(value))
-    }
-
-    fn validate(&self, flag: &str) -> Result<(), String> {
-        Self::parse(self.0.clone(), flag).map(|_| ())
     }
 }
 
@@ -234,7 +220,7 @@ impl Measurements {
         }
         for (name, value) in &self.0 {
             validate_measurement_name(name, flag)?;
-            value.validate(flag)?;
+            PositiveDecimal::parse(value.0.clone(), flag)?;
         }
         Ok(())
     }
@@ -628,7 +614,7 @@ impl QualificationEvidence {
         self.target.validate(self.kind)?;
         self.source.validate("source")?;
         self.executable.validate()?;
-        self.host.validate("host")?;
+        SafeText::parse(self.host.0.clone(), "host")?;
         if self.started_at_unix_ms > self.finished_at_unix_ms {
             return Err("evidence finished before it started".into());
         }
