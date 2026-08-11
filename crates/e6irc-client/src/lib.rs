@@ -615,6 +615,12 @@ impl Connection {
             if let Some(err) = registration_refused(&msg.command) {
                 return Err(err);
             }
+            if msg.command == "ERROR" {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "server refused registration",
+                ));
+            }
             match msg.command.as_str() {
                 "001" => {
                     return Ok(msg
@@ -1018,6 +1024,29 @@ mod tests {
             "a SASL-reject numeric must surface as an error"
         );
         drop(conn); // closes the client side so the server task can end
+        server.await.expect("mock server task");
+    }
+
+    #[tokio::test]
+    async fn register_fails_loudly_on_error_before_welcome() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let (cr, cw) = tokio::io::split(client_io);
+        let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
+        let server = tokio::spawn(async move {
+            let (mut reader, mut writer) = tokio::io::split(server_io);
+            writer
+                .write_all(b"ERROR :Closing Link: client [network policy]\r\n")
+                .await
+                .unwrap();
+            let mut buffer = [0; 1024];
+            while reader.read(&mut buffer).await.unwrap_or(0) != 0 {}
+        });
+
+        let error = conn.register("nick", "real").await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        drop(conn);
         server.await.expect("mock server task");
     }
 

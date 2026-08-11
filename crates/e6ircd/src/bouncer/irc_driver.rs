@@ -265,7 +265,9 @@ fn classify_registration(
         Ok(Err(e))
             if matches!(
                 e.kind(),
-                std::io::ErrorKind::Other | std::io::ErrorKind::Unsupported
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::Other
+                    | std::io::ErrorKind::Unsupported
             ) =>
         {
             RegistrationResult::RegistrationRejected
@@ -754,6 +756,18 @@ mod tests {
             interleave_address_families(vec![v4a, v4b, v6a, v6b]),
             [v4a, v6a, v4b, v6b]
         );
+    }
+
+    #[test]
+    fn registration_error_line_is_a_terminal_rejection() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "server refused registration",
+        );
+        assert!(matches!(
+            classify_registration(Ok(Err(error))),
+            RegistrationResult::RegistrationRejected
+        ));
     }
 
     /// Exercises the actual always-on driver path (DNS vetting, pinned-IP TLS
