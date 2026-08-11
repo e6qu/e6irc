@@ -114,6 +114,21 @@ test("operation parser selects the exact documented path before parsing", () => 
   );
 });
 
+test("operation requests preserve an API problem detail", async () => {
+  await assert.rejects(
+    getOperationJson(
+      async () => new Response(JSON.stringify({ title: "Profile storage unavailable" }), {
+        status: 503,
+        headers: { "content-type": "application/problem+json" },
+      }),
+      { paths: {} },
+      "PATCH",
+      "/api/v1/me/profile",
+    ),
+    /Profile storage unavailable/,
+  );
+});
+
 test("contract loader rejects a failed response without preserving stale state", async () => {
   let attempts = 0;
   const load = apiContractLoader(async () => {
