@@ -29,7 +29,9 @@ message post, thread read-back, and deletion. OIDC verifies the discovered
 issuer, gets two client-credential tokens, introspects one, and revokes it.
 The optional
 `E6IRC_DISCORD_API_BASE` and `E6IRC_SLACK_API_BASE` values select a compatible
-test or provider endpoint; they must be credential-free HTTP(S) URLs.
+test or provider endpoint; they must be credential-free HTTPS URLs. HTTP is
+accepted only for a loopback test oracle. Evidence records every required
+environment-variable name, never its value.
 
 `public-irc` and `scale` need their supplied probe path. A probe writes this
 exact JSON, with the runner-provided challenge, to

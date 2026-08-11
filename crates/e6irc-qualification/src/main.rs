@@ -57,11 +57,15 @@ impl TargetKind {
         }
     }
 
-    fn required_credentials(self) -> &'static [&'static str] {
+    fn required_environment(self) -> &'static [&'static str] {
         match self {
-            Self::Discord => &["E6IRC_DISCORD_BOT_TOKEN"],
-            Self::Slack => &["E6IRC_SLACK_BOT_TOKEN", "E6IRC_SLACK_APP_TOKEN"],
-            Self::Oidc => &["E6IRC_OIDC_CLIENT_SECRET"],
+            Self::Discord => &["E6IRC_DISCORD_BOT_TOKEN", "E6IRC_DISCORD_CHANNEL_ID"],
+            Self::Slack => &[
+                "E6IRC_SLACK_BOT_TOKEN",
+                "E6IRC_SLACK_APP_TOKEN",
+                "E6IRC_SLACK_CHANNEL_ID",
+            ],
+            Self::Oidc => &["E6IRC_OIDC_CLIENT_ID", "E6IRC_OIDC_CLIENT_SECRET"],
             Self::PublicIrc | Self::Scale => &[],
         }
     }
@@ -315,7 +319,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Args, Str
         }
         Some(probe)
     };
-    for name in kind.required_credentials() {
+    for name in kind.required_environment() {
         let credential = CredentialEnv::parse((*name).to_string())?;
         if !credentials
             .iter()
@@ -673,16 +677,24 @@ mod tests {
     }
 
     #[test]
-    fn credential_requirements_are_bound_to_target_kind() {
+    fn required_environment_is_bound_to_target_kind() {
         assert_eq!(
-            TargetKind::Discord.required_credentials(),
-            ["E6IRC_DISCORD_BOT_TOKEN"]
+            TargetKind::Discord.required_environment(),
+            ["E6IRC_DISCORD_BOT_TOKEN", "E6IRC_DISCORD_CHANNEL_ID"]
         );
         assert_eq!(
-            TargetKind::Slack.required_credentials(),
-            ["E6IRC_SLACK_BOT_TOKEN", "E6IRC_SLACK_APP_TOKEN"]
+            TargetKind::Slack.required_environment(),
+            [
+                "E6IRC_SLACK_BOT_TOKEN",
+                "E6IRC_SLACK_APP_TOKEN",
+                "E6IRC_SLACK_CHANNEL_ID"
+            ]
         );
-        assert_eq!(TargetKind::PublicIrc.required_credentials(), &[] as &[&str]);
+        assert_eq!(
+            TargetKind::Oidc.required_environment(),
+            ["E6IRC_OIDC_CLIENT_ID", "E6IRC_OIDC_CLIENT_SECRET"]
+        );
+        assert_eq!(TargetKind::PublicIrc.required_environment(), &[] as &[&str]);
     }
 
     #[test]
