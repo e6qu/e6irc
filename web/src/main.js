@@ -22,6 +22,7 @@ import {
   networksFrom,
   saveSettings,
 } from "./client-state.js";
+import { parseUiEvent } from "./ui-event.js";
 import {
   MEMBER_RANKS,
   asMessage,
@@ -1063,47 +1064,42 @@ function connect() {
     if (socket !== liveSocket) return;
     let event;
     try {
-      event = JSON.parse(ev.data);
+      event = parseUiEvent(ev.data);
     } catch {
       showAlert(
         "protocol",
-        "The server sent a malformed live event. The event was rejected; other messages remain connected.",
+        "The server sent an invalid live event. The event was rejected; other messages remain connected.",
         "error",
       );
       return;
     }
-    if (event.t === "line" && typeof event.v === "string") {
-      if (snapshotComplete || !isInitialReplay(event.v)) handleLine(event.v);
+    if (event.type === "line") {
+      if (snapshotComplete || !isInitialReplay(event.value)) handleLine(event.value);
     }
-    else if (event.t === "sent" && typeof event.v === "string") {
-      if (!acceptPendingSend(event.v)) {
+    else if (event.type === "sent") {
+      if (!acceptPendingSend(event.value)) {
         showAlert("protocol", "The server acknowledged an unknown composer request.", "error");
       }
-    } else if (
-      event.t === "send-error"
-      && typeof event.v === "string"
-      && typeof event.message === "string"
-    ) {
-      if (!rejectPendingSend(event.v, event.message)) {
+    } else if (event.type === "send-error") {
+      if (!rejectPendingSend(event.value, event.message)) {
         showAlert("protocol", "The server rejected an unknown composer request.", "error");
       }
-    }
-    else if (event.t === "status" && event.v === "connected") {
+    } else if (event.type === "status" && event.value === "connected") {
       const becameConnected = !upstreamConnected;
       upstreamConnected = true;
       setStatus(`${network}: upstream connected`, "ok");
       if (becameConnected && snapshotComplete) resyncMemberships();
-    } else if (event.t === "status" && event.v === "disconnected") {
+    } else if (event.type === "status" && event.value === "disconnected") {
       upstreamConnected = false;
       // The server includes the classified failure summary when it knows why
       // the upstream dropped — say it, don't leave the user guessing.
-      const why = typeof event.reason === "string" && event.reason ? ` — ${event.reason}` : "";
+      const why = event.reason ? ` — ${event.reason}` : "";
       setStatus(`${network}: upstream reconnecting${why}`, "error");
-    } else if (event.t === "snapshot" && event.v === "complete") {
+    } else if (event.type === "snapshot") {
       snapshotComplete = true;
       initialReplay.clear();
       if (upstreamConnected) resyncMemberships();
-    } else if (event.t === "status" && event.v === "unavailable") {
+    } else if (event.type === "status" && event.value === "unavailable") {
       terminalSocket = true;
       upstreamConnected = false;
       setComposerAvailable(false);
