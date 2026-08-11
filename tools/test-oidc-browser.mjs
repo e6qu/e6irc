@@ -381,23 +381,6 @@ try {
   );
   await page.setViewportSize({ width: 1280, height: 720 });
   const profileURL = `${applicationOrigin}/api/v1/me/profile`;
-  await page.addInitScript((url) => {
-    const nativeFetch = window.fetch;
-    window.__e6ircProfileFailure = false;
-    window.__e6ircProfileFailureRequests = 0;
-    window.fetch = async (input, init) => {
-      const requestURL = input instanceof Request ? input.url : new URL(input, window.location.href).href;
-      const method = input instanceof Request ? input.method : init?.method ?? "GET";
-      if (window.__e6ircProfileFailure && requestURL === url && method === "PATCH") {
-        window.__e6ircProfileFailureRequests += 1;
-        return new Response(JSON.stringify({ status: 503, title: "Profile storage unavailable" }), {
-          status: 503,
-          headers: { "Content-Type": "application/problem+json" },
-        });
-      }
-      return nativeFetch(input, init);
-    };
-  }, profileURL);
   let releaseProfile;
   const profileReleased = new Promise((resolve) => {
     releaseProfile = resolve;
@@ -406,9 +389,25 @@ try {
   const profileRequest = new Promise((resolve) => {
     profileRequested = resolve;
   });
+  let rejectProfileMutation = false;
+  let profileFailureFulfilled;
+  const profileFailure = new Promise((resolve) => {
+    profileFailureFulfilled = resolve;
+  });
   await page.route(profileURL, async (route) => {
-    profileRequested();
-    await profileReleased;
+    if (route.request().method() === "PATCH" && rejectProfileMutation) {
+      profileFailureFulfilled();
+      await route.fulfill({
+        status: 503,
+        contentType: "application/problem+json",
+        body: JSON.stringify({ status: 503, title: "Profile storage unavailable" }),
+      });
+      return;
+    }
+    if (route.request().method() === "GET") {
+      profileRequested();
+      await profileReleased;
+    }
     await route.continue();
   });
   const profileResponse = page.waitForResponse(
@@ -421,21 +420,21 @@ try {
   releaseProfile();
   await profileResponse;
   assert.equal(await contactEmail.inputValue(), "draft-contact@example.test");
-  await page.unroute(profileURL);
   const accountDocument = await page.evaluate(() => performance.timeOrigin);
   const profileFailureErrorStart = applicationErrors.length;
-  await page.evaluate(() => { window.__e6ircProfileFailure = true; });
+  rejectProfileMutation = true;
   await contactEmail.fill("retry-contact@example.test");
   await page.getByRole("button", { name: "Save contact email", exact: true }).click();
+  await profileFailure;
   await expectStatus(page, /Profile storage unavailable/);
   assert.equal(await page.evaluate(() => performance.timeOrigin), accountDocument);
   assert.equal(await contactEmail.inputValue(), "retry-contact@example.test");
-  assert.equal(await page.evaluate(() => window.__e6ircProfileFailureRequests), 1);
   assert.deepEqual(
     applicationErrors.splice(profileFailureErrorStart),
     [],
     "a failed account mutation stayed in the current document",
   );
+  await page.unroute(profileURL);
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
   await page.getByLabel("New password", { exact: true }).fill("browser-local-password");
   await page.getByLabel("Confirm new password", { exact: true }).fill("browser-local-password");
