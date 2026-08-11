@@ -235,11 +235,62 @@
     return `Request failed with HTTP ${response.status}.`;
   };
 
-  const apiRequest = async (form, url, method, body) => {
+  const apiRoute = (path, ...methods) => Object.freeze({ path, methods: Object.freeze(methods) });
+  const consoleMutationRoutes = Object.freeze([
+    apiRoute("/api/v1/admin/accounts", "POST"),
+    apiRoute("/api/v1/admin/accounts/{id}", "PATCH", "DELETE"),
+    apiRoute("/api/v1/admin/bans", "POST"),
+    apiRoute("/api/v1/admin/bans/{id}", "DELETE"),
+    apiRoute("/api/v1/admin/channels/{name}", "DELETE"),
+    apiRoute("/api/v1/admin/configuration", "PATCH"),
+    apiRoute("/api/v1/admin/configuration/networks", "POST"),
+    apiRoute("/api/v1/admin/configuration/networks/{name}", "DELETE"),
+    apiRoute("/api/v1/admin/configuration/oidc-providers", "POST"),
+    apiRoute("/api/v1/admin/configuration/oidc-providers/{name}", "DELETE"),
+    apiRoute("/api/v1/admin/configuration/opers", "POST"),
+    apiRoute("/api/v1/admin/configuration/opers/{name}", "DELETE"),
+    apiRoute("/api/v1/admin/invitations", "POST"),
+    apiRoute("/api/v1/admin/invitations/{id}", "DELETE"),
+    apiRoute("/api/v1/admin/networks/{owner}/{name}", "PATCH"),
+    apiRoute("/api/v1/me/account", "DELETE"),
+    apiRoute("/api/v1/me/channels", "POST"),
+    apiRoute("/api/v1/me/channels/{name}", "PATCH", "DELETE"),
+    apiRoute("/api/v1/me/channels/{name}/access/{account}", "PUT", "DELETE"),
+    apiRoute("/api/v1/me/connections/{id}", "DELETE"),
+    apiRoute("/api/v1/me/credentials", "POST"),
+    apiRoute("/api/v1/me/credentials/{id}", "DELETE"),
+    apiRoute("/api/v1/me/identities/{id}", "DELETE"),
+    apiRoute("/api/v1/me/networks", "POST"),
+    apiRoute("/api/v1/me/networks/preflight", "POST"),
+    apiRoute("/api/v1/me/networks/{name}", "PUT", "PATCH", "DELETE"),
+    apiRoute("/api/v1/me/password", "PUT"),
+    apiRoute("/api/v1/me/profile", "PATCH"),
+    apiRoute("/api/v1/me/sessions", "DELETE"),
+    apiRoute("/api/v1/me/sessions/{id}", "DELETE"),
+    apiRoute("/api/v1/me/tokens", "POST"),
+    apiRoute("/api/v1/me/tokens/{id}", "DELETE"),
+  ]);
+
+  const matchesRoute = (path, route) => {
+    const actual = path.split("/");
+    const expected = route.path.split("/");
+    return actual.length === expected.length && actual.every((part, index) => expected[index].startsWith("{") || part === expected[index]);
+  };
+
+  const apiMutation = (method, url) => {
+    const path = new URL(url, window.location.origin).pathname;
+    const route = consoleMutationRoutes.find((candidate) => matchesRoute(path, candidate));
+    if (!route || !route.methods.includes(method)) {
+      throw new Error("The console API operation is not declared. Reload and try again.");
+    }
+    return Object.freeze({ method, url });
+  };
+
+  const apiRequest = async (form, operation, body) => {
     const csrf = form.querySelector('input[name="csrf"]')?.value;
     if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
-    const response = await fetch(url, {
-      method,
+    const response = await fetch(operation.url, {
+      method: operation.method,
       credentials: "same-origin",
       headers: {
         Accept: "application/json",
@@ -828,7 +879,7 @@
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      await apiRequest(form, url, method, body);
+      await apiRequest(form, apiMutation(method, url), body);
       await refreshAfterMutation(refreshConfiguration);
       setConfigurationResult(success, true);
       if (submit) submit.disabled = false;
@@ -1239,7 +1290,7 @@
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      await apiRequest(form, url, method, body);
+      await apiRequest(form, apiMutation(method, url), body);
       await refreshAfterMutation(refreshBanDirectory);
       setBanResult("Updated.", true);
       if (submit) submit.disabled = false;
@@ -1292,7 +1343,7 @@
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      await apiRequest(form, url, "DELETE");
+      await apiRequest(form, apiMutation("DELETE", url));
       await refresh();
     } catch (error) {
       setSessionResult(error instanceof Error ? error.message : message, false);
@@ -1509,7 +1560,7 @@
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      const result = await apiRequest(form, form.action, method, body);
+      const result = await apiRequest(form, apiMutation(method, form.action), body);
       if (submit) submit.disabled = false;
       return result === undefined ? true : result;
     } catch (error) {
@@ -1925,7 +1976,7 @@
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      const result = (await apiRequest(form, form.action, method, body)) ?? {};
+      const result = (await apiRequest(form, apiMutation(method, form.action), body)) ?? {};
       if (submit) submit.disabled = false;
       return result;
     } catch (error) {
@@ -2052,7 +2103,7 @@
       }
       return;
     }
-    void apiRequest(form, form.action, "PATCH", { enabled: enabled === "true" })
+    void apiRequest(form, apiMutation("PATCH", form.action), { enabled: enabled === "true" })
       .then(() => refreshAfterMutation(refreshAdminNetworks))
       .then(() => {
         if (!adminNetworkResult) return;
@@ -2236,7 +2287,7 @@
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      const result = await apiRequest(form, url, method, body);
+      const result = await apiRequest(form, apiMutation(method, url), body);
       if (mode === ownerNetworkPreflight) {
         const nick = result?.confirmed_nick;
         const timings = [result?.dns_ms, result?.connect_ms, result?.registration_ms];
@@ -2609,7 +2660,7 @@
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      await apiRequest(form, url, method, body);
+      await apiRequest(form, apiMutation(method, url), body);
       await refreshAfterMutation(channelRefresher());
       setChannelResult("Updated.", true);
       if (submit) submit.disabled = false;

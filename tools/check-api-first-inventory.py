@@ -37,6 +37,36 @@ def console_mutations(source: str) -> set[str]:
     }
 
 
+def documented_operations(source: str) -> set[tuple[str, str]]:
+    routes = re.findall(
+        r'^\s*"(?P<path>/api/v1[^\"]+)"\s*=>\s*\{(?P<body>.*?)(?=^\s*"/api/v1|^}\n\npub fn router)',
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    return {
+        (path, method.upper())
+        for path, body in routes
+        for method in re.findall(r"\b(get|post|put|patch|delete)\s*:", body)
+    }
+
+
+def console_operations(source: str) -> set[tuple[str, str]]:
+    routes = re.findall(r'apiRoute\((?P<args>[^)]*)\)', source)
+    operations: set[tuple[str, str]] = set()
+    for args in routes:
+        values = re.findall(r'"([^\"]+)"', args)
+        if not values:
+            continue
+        path, *methods = values
+        operations.update((path, method) for method in methods)
+    return operations
+
+
+def uses_only_declared_mutations(source: str) -> bool:
+    calls = re.findall(r"apiRequest\((?P<args>[^\n]*)", source)
+    return all("apiMutation(" in args for args in calls)
+
+
 def template_mutations() -> list[tuple[Path, dict[str, str]]]:
     forms: list[tuple[Path, dict[str, str]]] = []
     for template in TEMPLATES.glob("console*.html"):
@@ -61,6 +91,18 @@ def main() -> int:
     asset = ASSET.read_text(encoding="utf-8")
     if "window.location.reload" in asset:
         print("console mutation reload: use an API refresher instead", file=sys.stderr)
+        failures = True
+
+    if not uses_only_declared_mutations(asset):
+        print("console mutation bypasses the declared operation boundary", file=sys.stderr)
+        failures = True
+
+    documented = documented_operations(ROUTER.read_text(encoding="utf-8"))
+    for path, method in sorted(console_operations(asset) - documented):
+        print(
+            f"console mutation is absent from the public API contract: {method} {path}",
+            file=sys.stderr,
+        )
         failures = True
 
     for template, form in template_mutations():

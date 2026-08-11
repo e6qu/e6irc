@@ -12,4 +12,5 @@ parallel console handler.
 
 The console is a document shell. Authenticated reads and mutations use
 `/api/v1`; it has no mutation routes. `tools/check-api-first-inventory.py`
-fails CI if one is added.
+fails CI if one is added. Console mutations are immutable, declared
+method/path operations. The gate checks each operation against the router.

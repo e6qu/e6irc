@@ -12,9 +12,9 @@ and integration claims.
 
 ## Current state
 
-The console reads and writes only through `/api/v1`. Its mutation forms and
-client handlers are checked against that boundary, and successful mutations
-refresh their affected API-backed view without a document reload.
+The console reads and writes only through `/api/v1`. Its immutable mutation
+operations are checked against the router, and successful mutations refresh
+their API-backed view without a document reload.
 
 ## Remaining qualification
 
