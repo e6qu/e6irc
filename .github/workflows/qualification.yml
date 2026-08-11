@@ -38,13 +38,13 @@ jobs:
     runs-on: ${{ inputs.campaign == 'scale' && 'qualification-scale' || 'ubuntu-24.04' }}
     timeout-minutes: 45
     env:
-      E6IRC_DISCORD_BOT_TOKEN: ${{ secrets.E6IRC_DISCORD_BOT_TOKEN }}
-      E6IRC_DISCORD_CHANNEL_ID: ${{ secrets.E6IRC_DISCORD_CHANNEL_ID }}
-      E6IRC_SLACK_BOT_TOKEN: ${{ secrets.E6IRC_SLACK_BOT_TOKEN }}
-      E6IRC_SLACK_APP_TOKEN: ${{ secrets.E6IRC_SLACK_APP_TOKEN }}
-      E6IRC_SLACK_CHANNEL_ID: ${{ secrets.E6IRC_SLACK_CHANNEL_ID }}
-      E6IRC_OIDC_CLIENT_ID: ${{ secrets.E6IRC_OIDC_CLIENT_ID }}
-      E6IRC_OIDC_CLIENT_SECRET: ${{ secrets.E6IRC_OIDC_CLIENT_SECRET }}
+      E6IRC_DISCORD_BOT_TOKEN: ${{ inputs.campaign == 'discord' && secrets.E6IRC_DISCORD_BOT_TOKEN || '' }}
+      E6IRC_DISCORD_CHANNEL_ID: ${{ inputs.campaign == 'discord' && secrets.E6IRC_DISCORD_CHANNEL_ID || '' }}
+      E6IRC_SLACK_BOT_TOKEN: ${{ inputs.campaign == 'slack' && secrets.E6IRC_SLACK_BOT_TOKEN || '' }}
+      E6IRC_SLACK_APP_TOKEN: ${{ inputs.campaign == 'slack' && secrets.E6IRC_SLACK_APP_TOKEN || '' }}
+      E6IRC_SLACK_CHANNEL_ID: ${{ inputs.campaign == 'slack' && secrets.E6IRC_SLACK_CHANNEL_ID || '' }}
+      E6IRC_OIDC_CLIENT_ID: ${{ inputs.campaign == 'oidc' && secrets.E6IRC_OIDC_CLIENT_ID || '' }}
+      E6IRC_OIDC_CLIENT_SECRET: ${{ inputs.campaign == 'oidc' && secrets.E6IRC_OIDC_CLIENT_SECRET || '' }}
       QUALIFICATION_TARGET: ${{ inputs.target }}
       QUALIFICATION_HOST: ${{ inputs.host }}
       QUALIFICATION_WORKLOAD: ${{ inputs.workload }}
