@@ -14,3 +14,8 @@ The console is a document shell. Authenticated reads and mutations use
 `/api/v1`; it has no mutation routes. `tools/check-api-first-inventory.py`
 fails CI if one is added. Console mutations are immutable, declared
 method/path operations. The gate checks each operation against the router.
+
+Browser chat and console load `/api/v1/openapi.json` once and parse each
+documented success response into a closed immutable projection before rendering.
+The OpenAPI tests require a closed JSON schema for each browser read and console
+JSON mutation.

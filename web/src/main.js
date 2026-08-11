@@ -15,13 +15,13 @@ import {
   ApiError,
   backlogFrom,
   errorMessage,
-  getJson,
   identityFrom,
   loadSettings,
   networkStateLabel,
   networksFrom,
   saveSettings,
 } from "./client-state.js";
+import { apiContractLoader, getOperationJson } from "./api-contract.js";
 import { serializeComposerRequest } from "./composer-request.js";
 import { parseUiEvent } from "./ui-event.js";
 import {
@@ -40,6 +40,14 @@ import {
 
 const params = new URLSearchParams(window.location.search);
 const network = params.get("network");
+const currentApiContract = apiContractLoader(window.fetch.bind(window));
+const apiGet = async (url) => getOperationJson(
+  window.fetch.bind(window),
+  await currentApiContract(),
+  "GET",
+  url,
+  { cache: "no-store", credentials: "same-origin" },
+);
 
 const el = (id) => document.getElementById(id);
 const statusEl = el("status");
@@ -989,7 +997,7 @@ async function reconcileUnavailableNetwork() {
   setStatus(`${network}: checking availability…`, "connecting");
   try {
     const networks = networksFrom(
-      await getJson(window.fetch.bind(window), "/api/v1/me/networks"),
+      await apiGet("/api/v1/me/networks"),
     );
     populateNetworkSelector(networks);
     const replacement = networks.find((item) => fold(item.name) === fold(network));
@@ -1358,8 +1366,7 @@ async function loadEarlier() {
   let lines = [];
   try {
     lines = backlogFrom(
-      await getJson(
-        window.fetch.bind(window),
+      await apiGet(
         `/api/v1/me/networks/${encodeURIComponent(network)}/buffer?limit=1000`,
       ),
     );
@@ -1409,8 +1416,7 @@ async function loadEarlier() {
 async function loadInitialBacklog() {
   try {
     const lines = backlogFrom(
-      await getJson(
-        window.fetch.bind(window),
+      await apiGet(
         `/api/v1/me/networks/${encodeURIComponent(network)}/buffer?limit=1000`,
       ),
     );
@@ -1486,7 +1492,7 @@ async function boot() {
   setComposerAvailable(false);
 
   try {
-    const me = identityFrom(await getJson(window.fetch.bind(window), "/api/v1/me"));
+    const me = identityFrom(await apiGet("/api/v1/me"));
     el("account-name").textContent = me.account;
     el("account-link").dataset.shauthUser = me.account;
     el("account-name").title = me.email || "";
@@ -1509,7 +1515,7 @@ async function boot() {
   let networkFailure = null;
   try {
     networks = networksFrom(
-      await getJson(window.fetch.bind(window), "/api/v1/me/networks"),
+      await apiGet("/api/v1/me/networks"),
     );
     clearAlert("networks");
   } catch (error) {

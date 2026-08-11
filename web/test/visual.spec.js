@@ -4,13 +4,50 @@ import AxeBuilder from "@axe-core/playwright";
 const { expect, test } = playwrightTest;
 
 const identity = { account: "visual-test", email: "visual@example.test", role: "operator" };
+const response = (schema) => ({ content: { "application/json": { schema } } });
+const apiContract = {
+  paths: {
+    "/api/v1/me": {
+      get: { responses: { 200: response({
+        type: "object", additionalProperties: false, required: ["account"], properties: {
+          account: { type: "string", minLength: 1 }, email: { type: ["string", "null"] },
+          role: { type: ["string", "null"] }, logout_url: { type: "string" },
+        },
+      }) } },
+    },
+    "/api/v1/me/networks": {
+      get: { responses: { 200: response({
+        type: "object", additionalProperties: false, required: ["networks"], properties: {
+          networks: { type: "array", items: {
+            type: "object", additionalProperties: false,
+            required: ["name", "kind", "nick", "enabled", "connected", "runtime"],
+            properties: {
+              name: { type: "string", minLength: 1 }, kind: { type: "string" }, nick: { type: "string" },
+              enabled: { type: "boolean" }, connected: { type: ["boolean", "null"] }, runtime: { oneOf: [
+                { type: "null" },
+                { type: "object", additionalProperties: false, required: ["state"], properties: { state: { type: "string" } } },
+              ] },
+            },
+          } },
+        },
+      }) } },
+    },
+  },
+};
 
 async function expectAccessible(page) {
   const results = await new AxeBuilder({ page }).include("#app").analyze();
   expect(results.violations, results.violations.map(({ id, help }) => `${id}: ${help}`).join("\n")).toEqual([]);
 }
 
+async function mockApiContract(page) {
+  await page.route("/api/v1/openapi.json", (route) => route.fulfill({
+    contentType: "application/json", body: JSON.stringify(apiContract),
+  }));
+}
+
 async function mockSession(page, networks, failureStatus = 503, identityPayload = identity) {
+  await mockApiContract(page);
   await page.route(/\/api\/v1\/me$/, (route) =>
     route.fulfill({
       contentType: "application/json",
@@ -55,6 +92,7 @@ test("chat stays non-interactive while the network catalog loads", async ({ page
   const requested = new Promise((resolve) => {
     markRequested = resolve;
   });
+  await mockApiContract(page);
   await page.route(/\/api\/v1\/me$/, (route) =>
     route.fulfill({ contentType: "application/json", body: JSON.stringify(identity) }),
   );

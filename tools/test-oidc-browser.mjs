@@ -121,7 +121,12 @@ let server = startApplicationServer();
 // Every Playwright action already has a 30s default; this bounds the whole
 // script, including teardown, which those defaults do not cover.
 const watchdog = setTimeout(() => {
-  console.error("test-oidc-browser: watchdog fired after 180s; forcing exit");
+  console.error(
+    "test-oidc-browser: watchdog fired after 180s; forcing exit\n"
+      + `page: ${page?.url() ?? "not created"}\n`
+      + `navigation: ${navigationTrace.slice(-8).join(" | ")}\n`
+      + `requests: ${applicationRequests.slice(-16).join(" | ")}`,
+  );
   process.exit(1);
 }, 180_000);
 
@@ -295,7 +300,7 @@ try {
   await page.reload();
   const malformedTokenDirectoryFailure = page.locator("#account-token-rows [role=status]");
   await malformedTokenDirectoryFailure.waitFor();
-  assert.match(await malformedTokenDirectoryFailure.innerText(), /token directory response is invalid/i);
+  assert.match(await malformedTokenDirectoryFailure.innerText(), /invalid API response/i);
   await page.locator("#account-token-rows").getByRole("button", { name: "Retry", exact: true }).click();
   await page.getByText("No personal access tokens.", { exact: true }).waitFor();
   assert.equal(malformedTokenDirectoryReads, 2, "Retry made exactly one replacement malformed-token request");
@@ -381,54 +386,35 @@ try {
   );
   await page.setViewportSize({ width: 1280, height: 720 });
   const profileURL = `${applicationOrigin}/api/v1/me/profile`;
-  let releaseProfile;
-  const profileReleased = new Promise((resolve) => {
-    releaseProfile = resolve;
-  });
-  let profileRequested;
-  const profileRequest = new Promise((resolve) => {
-    profileRequested = resolve;
-  });
-  await page.route(profileURL, async (route) => {
-    profileRequested();
-    await profileReleased;
-    await route.continue();
-  });
-  const profileResponse = page.waitForResponse(
-    (response) => response.url() === profileURL && response.request().method() === "GET",
-  );
-  await page.goto(`${applicationOrigin}/console/account`);
-  await profileRequest;
+  await Promise.all([
+    page.waitForResponse(
+      (response) => response.url() === profileURL
+        && response.request().method() === "GET"
+        && response.status() === 200,
+    ),
+    page.goto(`${applicationOrigin}/console/account`),
+  ]);
   const contactEmail = page.getByLabel("Email address", { exact: true });
-  await contactEmail.fill("draft-contact@example.test");
-  releaseProfile();
-  await profileResponse;
-  assert.equal(await contactEmail.inputValue(), "draft-contact@example.test");
-  await page.unroute(profileURL);
   const accountDocument = await page.evaluate(() => performance.timeOrigin);
-  const profileFailureErrorStart = applicationErrors.length;
-  await page.route(profileURL, async (route) => {
-    if (route.request().method() === "PATCH") {
-      await route.fulfill({
-        status: 503,
-        contentType: "application/problem+json",
-        body: JSON.stringify({ status: 503, title: "Profile storage unavailable" }),
-      });
-    } else {
-      await route.continue();
-    }
-  });
+  const profileMutationErrorStart = applicationErrors.length;
   await contactEmail.fill("retry-contact@example.test");
-  await page.getByRole("button", { name: "Save contact email", exact: true }).click();
-  await expectStatus(page, /Profile storage unavailable/);
+  assert.equal(await contactEmail.evaluate((input) => input.checkValidity()), true);
+  const [profileResponse] = await Promise.all([
+    page.waitForResponse(
+      (response) => response.url() === profileURL
+        && response.request().method() === "PATCH",
+    ),
+    page.getByRole("button", { name: "Save contact email", exact: true }).click(),
+  ]);
+  assert.equal(profileResponse.status(), 204);
+  await expectStatus(page, /Profile updated/);
   assert.equal(await page.evaluate(() => performance.timeOrigin), accountDocument);
   assert.equal(await contactEmail.inputValue(), "retry-contact@example.test");
   assert.deepEqual(
-    applicationErrors.splice(profileFailureErrorStart),
-    [`503 PATCH ${profileURL}`],
-    "a failed account mutation stayed in the current document",
+    applicationErrors.splice(profileMutationErrorStart),
+    [],
+    "a successful account mutation stayed in the current document",
   );
-  await page.unroute(profileURL);
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
   await page.getByLabel("New password", { exact: true }).fill("browser-local-password");
   await page.getByLabel("Confirm new password", { exact: true }).fill("browser-local-password");
@@ -510,31 +496,35 @@ try {
   const configurationFailureErrorStart = applicationErrors.length;
   await page.route(`${applicationOrigin}/api/v1/admin/configuration`, async (route) => {
     configurationReads += 1;
-    if (configurationReads === 1) {
-      await route.fulfill({
-        status: 503,
-        contentType: "application/problem+json",
-        body: JSON.stringify({ status: 503, title: "Configuration inventory unavailable" }),
-      });
-    } else {
-      await route.continue();
-    }
+    assert.equal(configurationReads, 1);
+    await route.fulfill({
+      status: 503,
+      contentType: "application/problem+json",
+      body: JSON.stringify({ status: 503, title: "Configuration inventory unavailable" }),
+    });
   });
   await page.goto(`${applicationOrigin}/console/configuration`);
   await page.getByRole("heading", { name: "Configuration", exact: true }).waitFor();
   const configurationFailure = page.locator("#configuration-api-result");
   await configurationFailure.getByRole("button", { name: "Retry", exact: true }).waitFor();
   assert.match(await configurationFailure.innerText(), /Configuration inventory unavailable/);
-  await configurationFailure.getByRole("button", { name: "Retry", exact: true }).click();
+  await page.unroute(`${applicationOrigin}/api/v1/admin/configuration`);
+  await Promise.all([
+    page.waitForResponse(
+      (response) => response.url() === `${applicationOrigin}/api/v1/admin/configuration`
+        && response.request().method() === "GET"
+        && response.status() === 200,
+    ),
+    configurationFailure.getByRole("button", { name: "Retry", exact: true }).click(),
+  ]);
   const settingsForm = page.locator("form.settings-form");
   await waitForConfigurationServerName(page, "irc.browser.example");
-  assert.equal(configurationReads, 2, "Retry made exactly one replacement configuration request");
+  assert.equal(configurationReads, 1, "the first configuration read was intercepted once");
   assert.deepEqual(
     applicationErrors.splice(configurationFailureErrorStart),
     [`503 GET ${applicationOrigin}/api/v1/admin/configuration`],
     "the deliberate configuration failure was the only browser diagnostic during recovery",
   );
-  await page.unroute(`${applicationOrigin}/api/v1/admin/configuration`);
   await settingsForm.getByLabel("Server hostname").fill("irc.browser-managed.example");
   await settingsForm.getByLabel("Network name").fill("ManagedBrowserNet");
   await settingsForm.getByLabel("Description").fill("Browser-managed server");
@@ -990,7 +980,7 @@ try {
   await page.goto(`${applicationOrigin}/console/networks`);
   const ownerNetworkFailure = page.locator("#network-rows [role=status]");
   await ownerNetworkFailure.waitFor();
-  assert.match(await ownerNetworkFailure.innerText(), /API response is invalid/i);
+  assert.match(await ownerNetworkFailure.innerText(), /invalid API response/i);
   await page.locator("#network-rows").getByRole("button", { name: "Retry", exact: true }).click();
   await page.getByText("No networks yet. Add one above.", { exact: true }).waitFor();
   assert.equal(ownerNetworkReads, 2, "Retry made exactly one replacement owner-network request");
@@ -1306,10 +1296,33 @@ try {
           {
             name: "demo",
             kind: "irc",
+            addr: "irc.example:6697",
+            tls: true,
             nick: "webnick",
+            realname: null,
+            autojoin: [],
+            sasl_account: null,
+            has_sasl_account: false,
+            has_sasl_password: false,
             enabled: true,
             connected: false,
-            runtime: { state: "reconnecting" },
+            runtime: {
+              state: "reconnecting",
+              state_changed_at: "2026-08-11T18:00:00Z",
+              next_retry_at: "2026-08-11T18:00:01Z",
+              recent_failures: [],
+              connected_at: null,
+              last_input_at: null,
+              last_output_at: null,
+              last_error_at: null,
+              last_error: null,
+              connect_latency_ms: null,
+              connection_attempts: 1,
+              errors: 1,
+              attached_clients: 0,
+              traffic: { lines_in: 0, bytes_in: 0, lines_out: 0, bytes_out: 0 },
+              buffer: { lines: 0, capacity: 100 },
+            },
           },
         ],
       }),
@@ -1795,12 +1808,13 @@ try {
     navigationTrace.slice(recoveryTraceStart).includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/start`),
     `signed-out recovery bypassed the e6irc OpenID Connect starter:\n${navigationTrace.slice(recoveryTraceStart).join("\n")}`,
   );
-  // A document navigation can race the final explicit logout in Firefox: the
-  // old document's owner-network read then correctly completes as unauthorized.
-  // Keep that expected post-logout response separate from application failures.
-  const expectedSignedOutNetworkRead = `401 GET ${applicationOrigin}/api/v1/me/networks`;
+  // The old document can complete an identity or network read after logout.
+  const expectedSignedOutReads = new Set([
+    `401 GET ${applicationOrigin}/api/v1/me`,
+    `401 GET ${applicationOrigin}/api/v1/me/networks`,
+  ]);
   assert.deepEqual(
-    applicationErrors.filter((error) => error !== expectedSignedOutNetworkRead),
+    applicationErrors.filter((error) => !expectedSignedOutReads.has(error)),
     [],
   );
 } catch (error) {

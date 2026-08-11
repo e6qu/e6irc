@@ -1,3 +1,5 @@
+import { apiContractLoader, getOperationJson } from "/console-contract.js";
+
 (() => {
   "use strict";
 
@@ -203,151 +205,34 @@
 
   const configurationResult = document.getElementById("configuration-api-result");
 
-  const MAX_API_JSON_BYTES = 1024 * 1024;
-  const apiText = async (response) => {
-    const length = Number(response.headers.get("content-length"));
-    if (Number.isFinite(length) && length > MAX_API_JSON_BYTES) {
-      throw new Error("The API response is too large. Reload and try again.");
-    }
-    const text = await response.text();
-    if (new TextEncoder().encode(text).byteLength > MAX_API_JSON_BYTES) {
-      throw new Error("The API response is too large. Reload and try again.");
-    }
-    return text;
-  };
-  const apiJson = async (response) => {
-    const text = await apiText(response);
-    if (!text) return undefined;
-    try {
-      return JSON.parse(text);
-    } catch (_) {
-      throw new Error("The API response is invalid. Reload and try again.");
-    }
-  };
-  const apiObject = async (response) => {
-    const value = await apiJson(response);
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error("The API response is invalid. Reload and try again.");
-    }
-    return value;
-  };
-  const apiProblem = async (response) => {
-    try {
-      const problem = await apiJson(response);
-      if (problem && typeof problem === "object") {
-        if (typeof problem.detail === "string") return problem.detail;
-        if (typeof problem.title === "string") return problem.title;
-      }
-    } catch (_) {}
-    return `Request failed with HTTP ${response.status}.`;
-  };
+  const apiOperation = (method, url) => Object.freeze({ method, url });
 
-  const apiRoute = (path, ...methods) => Object.freeze({ path, methods: Object.freeze(methods) });
-  const consoleMutationRoutes = Object.freeze([
-    apiRoute("/api/v1/admin/accounts", "POST"),
-    apiRoute("/api/v1/admin/accounts/{id}", "PATCH", "DELETE"),
-    apiRoute("/api/v1/admin/bans", "POST"),
-    apiRoute("/api/v1/admin/bans/{id}", "DELETE"),
-    apiRoute("/api/v1/admin/channels/{name}", "DELETE"),
-    apiRoute("/api/v1/admin/configuration", "PATCH"),
-    apiRoute("/api/v1/admin/configuration/networks", "POST"),
-    apiRoute("/api/v1/admin/configuration/networks/{name}", "DELETE"),
-    apiRoute("/api/v1/admin/configuration/oidc-providers", "POST"),
-    apiRoute("/api/v1/admin/configuration/oidc-providers/{name}", "DELETE"),
-    apiRoute("/api/v1/admin/configuration/opers", "POST"),
-    apiRoute("/api/v1/admin/configuration/opers/{name}", "DELETE"),
-    apiRoute("/api/v1/admin/invitations", "POST"),
-    apiRoute("/api/v1/admin/invitations/{id}", "DELETE"),
-    apiRoute("/api/v1/admin/networks/{owner}/{name}", "PATCH"),
-    apiRoute("/api/v1/me/account", "DELETE"),
-    apiRoute("/api/v1/me/channels", "POST"),
-    apiRoute("/api/v1/me/channels/{name}", "PATCH", "DELETE"),
-    apiRoute("/api/v1/me/channels/{name}/access/{account}", "PUT", "DELETE"),
-    apiRoute("/api/v1/me/connections/{id}", "DELETE"),
-    apiRoute("/api/v1/me/credentials", "POST"),
-    apiRoute("/api/v1/me/credentials/{id}", "DELETE"),
-    apiRoute("/api/v1/me/identities/{id}", "DELETE"),
-    apiRoute("/api/v1/me/networks", "POST"),
-    apiRoute("/api/v1/me/networks/preflight", "POST"),
-    apiRoute("/api/v1/me/networks/{name}", "PUT", "PATCH", "DELETE"),
-    apiRoute("/api/v1/me/password", "PUT"),
-    apiRoute("/api/v1/me/profile", "PATCH"),
-    apiRoute("/api/v1/me/sessions", "DELETE"),
-    apiRoute("/api/v1/me/sessions/{id}", "DELETE"),
-    apiRoute("/api/v1/me/tokens", "POST"),
-    apiRoute("/api/v1/me/tokens/{id}", "DELETE"),
-  ]);
+  const apiMutation = apiOperation;
 
-  const matchesRoute = (path, route) => {
-    const actual = path.split("/");
-    const expected = route.path.split("/");
-    return actual.length === expected.length && actual.every((part, index) => expected[index].startsWith("{") || part === expected[index]);
-  };
-
-  const apiMutation = (method, url) => {
-    const path = new URL(url, window.location.origin).pathname;
-    const route = consoleMutationRoutes.find((candidate) => matchesRoute(path, candidate));
-    if (!route || !route.methods.includes(method)) {
-      throw new Error("The console API operation is not declared. Reload and try again.");
-    }
-    return Object.freeze({ method, url });
-  };
+  const consoleApiContract = apiContractLoader(fetch);
 
   const apiRequest = async (form, operation, body) => {
     const csrf = form.querySelector('input[name="csrf"]')?.value;
     if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
-    const response = await fetch(operation.url, {
-      method: operation.method,
+    return getOperationJson(fetch, await consoleApiContract(), operation.method, operation.url, {
       credentials: "same-origin",
       headers: {
-        Accept: "application/json",
         "Content-Type": "application/json",
         "X-E6IRC-CSRF": csrf,
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
-    if (!response.ok) throw new Error(await apiProblem(response));
-    return response.status === 204 ? undefined : apiObject(response);
   };
 
   const apiRead = async (url) => {
-    const response = await fetch(url, {
+    const operation = apiOperation("GET", url);
+    return getOperationJson(fetch, await consoleApiContract(), operation.method, operation.url, {
       cache: "no-store",
       credentials: "same-origin",
-      headers: { Accept: "application/json" },
     });
-    if (!response.ok) throw new Error(await apiProblem(response));
-    return apiObject(response);
   };
 
-  const optionalString = (value) => value === null || typeof value === "string";
-
-  const parseOwnerNetwork = (value) => {
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("The network response is invalid. Reload and try again.");
-    const network = value;
-    if (
-      typeof network.name !== "string"
-      || !["irc", "local", "matrix", "discord", "slack"].includes(network.kind)
-      || typeof network.addr !== "string"
-      || typeof network.nick !== "string"
-      || !Array.isArray(network.autojoin)
-      || !network.autojoin.every((channel) => typeof channel === "string")
-      || typeof network.tls !== "boolean"
-      || typeof network.enabled !== "boolean"
-      || !optionalString(network.realname)
-      || !optionalString(network.sasl_account)
-      || typeof network.has_sasl_account !== "boolean"
-      || typeof network.has_sasl_password !== "boolean"
-    ) throw new Error("The network response is invalid. Reload and try again.");
-    return network;
-  };
-
-  const apiCollection = (value, field, label) => {
-    if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(value[field])) {
-      throw new Error(`The ${label} response is invalid. Reload and try again.`);
-    }
-    return value[field];
-  };
+  const apiCollection = (value, field) => value[field];
 
   const serializeRefresh = (refresh, reportQueued) => {
     let running = false;
@@ -707,7 +592,7 @@
   };
 
   const formatBytes = (value) => {
-    const bytes = Number(value) || 0; const units = ["B", "KiB", "MiB", "GiB"];
+    const bytes = value; const units = ["B", "KiB", "MiB", "GiB"];
     let amount = bytes; let unit = 0; while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit += 1; }
     return `${amount >= 10 || unit === 0 ? Math.round(amount) : amount.toFixed(1)} ${units[unit]}`;
   };
@@ -1123,7 +1008,6 @@
   const renderConfiguration = (root, view) => {
     const settings = view.settings;
     const runtime = view.runtime;
-    if (!settings || !runtime || !Number.isSafeInteger(view.revision)) throw new Error("The configuration response is incomplete.");
     const form = root.querySelector("[data-api-configuration-patch]");
     if (!(form instanceof HTMLFormElement)) throw new Error("The configuration form is missing.");
     const revision = String(view.revision);
@@ -1490,7 +1374,7 @@
             const suffix = value ? `?reason=${encodeURIComponent(value)}` : "";
             void mutateSession(disconnect, `${apiPath}/${encodeURIComponent(row.id)}${suffix}`, "Disconnect request failed.", refreshAfterMutation);
           });
-          body.append(append(element("tr"), element("td", "meta", row.id), client, append(element("td"), element("span", "tag", row.transport)), element("td", "", account), append(element("td"), connected, element("div", "meta", `${row.idle_seconds} seconds idle`)), element("td", "", Array.isArray(row.channels) && row.channels.length ? element("code", "", row.channels.join(", ")) : element("span", "meta", "—")), append(element("td"), disconnect)));
+          body.append(append(element("tr"), element("td", "meta", row.id), client, append(element("td"), element("span", "tag", row.transport)), element("td", "", account), append(element("td"), connected, element("div", "meta", `${row.idle_seconds} seconds idle`)), element("td", "", row.channels.length ? element("code", "", row.channels.join(", ")) : element("span", "meta", "—")), append(element("td"), disconnect)));
         }
         const table = append(document.createElement("table"), append(document.createElement("thead"), append(document.createElement("tr"), element("th", "", "ID"), element("th", "", "Client"), element("th", "", "Transport"), element("th", "", "Account"), element("th", "", "Connected / idle"), element("th", "", "Channels"), element("th", "", "Actions"))), body);
         connections.append(scrollRegion("Live connections", table));
@@ -1580,6 +1464,7 @@
   let refreshAccountAccess;
   let refreshContactEmail;
   let refreshTokens;
+  let profileReadRevision = 0;
 
   const accountRoot = document.querySelector("[data-api-account-read]");
   if (accountRoot instanceof HTMLElement) {
@@ -1730,6 +1615,7 @@
   for (const form of document.querySelectorAll("[data-api-account-profile]")) {
     form.addEventListener("submit", (event) => {
       event.preventDefault();
+      profileReadRevision += 1;
       const email = fieldValue(new FormData(form), "contact_email");
       void mutateAccount(form, "PATCH", { contact_email: email || null }, "Profile update failed.")
         .then(async (result) => {
@@ -1749,12 +1635,15 @@
     const form = accountContactEmail.form;
     if (form instanceof HTMLFormElement) preserveFormEdits(form);
     refreshContactEmail = async () => {
+      const revision = ++profileReadRevision;
       try {
         const profile = await apiRead("/api/v1/me/profile");
+        if (revision !== profileReadRevision) return true;
         if (accountContactEmail.dataset.apiEdited !== "true") {
-          accountContactEmail.value = typeof profile.contact_email === "string" ? profile.contact_email : "";
+          accountContactEmail.value = profile.contact_email ?? "";
         }
       } catch (error) {
+        if (revision !== profileReadRevision) return true;
         accountLoadFailure(error, () => void refreshContactEmail());
         return false;
       }
@@ -1790,7 +1679,7 @@
       }
       void mutateAccount(form, "POST", { label }, "App-password creation failed.")
         .then((result) => {
-          if (!result || typeof result !== "object") return;
+          if (result === undefined) return;
           showAccountSecret("App password", result.app_password);
           setAccountResult("App password created. Copy it now; it cannot be shown again.", true);
           void refreshAccountAccess?.();
@@ -1813,7 +1702,7 @@
         scopes,
         expires_in_days: Number(fields.get("expires_in_days")),
       }, "Token creation failed.").then((result) => {
-        if (!result || typeof result !== "object") return;
+        if (result === undefined) return;
         showAccountSecret("Personal access token", result.token);
         setAccountResult("Personal access token created. Copy it now; it cannot be shown again.", true);
         void refreshTokens?.();
@@ -1842,7 +1731,7 @@
         }
         for (const token of tokens) {
           const row = document.createElement("tr");
-          const scopes = Array.isArray(token.scopes) ? token.scopes.join(", ") : "";
+          const scopes = token.scopes.join(", ");
           [token.label, scopes, token.created_at, token.expires_at].forEach((value) => {
             const cell = document.createElement("td");
             cell.textContent = String(value || "");
@@ -1983,7 +1872,7 @@
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      const result = (await apiRequest(form, apiMutation(method, form.action), body)) ?? {};
+      const result = await apiRequest(form, apiMutation(method, form.action), body);
       if (submit) submit.disabled = false;
       return result;
     } catch (error) {
@@ -2039,7 +1928,7 @@
     const renderAccounts = (data) => {
       if (!(accountHost instanceof HTMLElement)) return; accountHost.replaceChildren(); const rows = apiCollection(data, "accounts", "account directory");
       const section = append(element("div", "panel-head"), append(element("div"), element("h2", "", "Accounts"), element("p", "", "Only active browser sessions and unexpired personal access tokens are counted.")), element("span", "count", rows.length)); accountHost.append(section);
-      if (!rows.length) accountHost.append(element("p", "empty", "No account matches this exact name.")); else { const table = document.createElement("table"); table.append(element("caption", "sr-only", "Account directory")); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "ID"), element("th", "", "Account"), element("th", "", "Created (UTC)"), element("th", "", "Login methods"), element("th", "", "Status"), element("th", "", "Active access"), element("th", "", "Resources"), element("th"))); const body = document.createElement("tbody"); for (const account of rows) { const auth = account.authentication || {}; const resources = account.resources || {}; const sources = account.administrator_sources || {}; const actions = element("td"); if (account.current) actions.append(element("span", "meta", "Current account")); else { for (const [key, value, label, confirmation] of [["suspension", !account.suspended, account.suspended ? "Reactivate" : "Suspend", account.suspended ? `Reactivate ${account.name} and restart its enabled networks?` : `Suspend ${account.name}, revoke its sessions and tokens, disconnect its clients, and stop its networks?`], ["administrator", !sources.durable, sources.durable ? "Revoke durable admin" : "Grant durable admin", sources.durable ? `Remove durable administrator authority from ${account.name}?` : `Grant durable administrator authority to ${account.name}?`]]) { const form = document.createElement("form"); form.className = "cell-form"; form.dataset.apiAdminAccountState = key; form.dataset.confirm = confirmation; form.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const state = document.createElement("input"); state.type = "hidden"; state.name = key === "suspension" ? "suspended" : "administrator"; state.value = String(value); form.append(capability(), state, button(label, value ? "" : "danger")); actions.append(form); } const deletion = document.createElement("form"); deletion.className = "cell-form account-delete-form"; deletion.dataset.apiAdminAccountDelete = ""; deletion.dataset.confirm = `Permanently delete ${account.name}, revoke every credential and session, erase its private history, stop its networks, and retire the account name? This cannot be undone.`; deletion.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const confirmation = document.createElement("input"); confirmation.name = "confirmation"; confirmation.autocomplete = "off"; confirmation.required = true; const deletionLabel = append(element("label", "field"), element("span", "", `Type ${account.name} to delete`), confirmation); deletion.append(capability(), deletionLabel, button("Delete permanently", "danger")); actions.append(deletion); } const created = element("time", "", account.created_at); created.dateTime = account.created_at; const loginMethods = `${auth.local_password ? "local password · " : ""}${auth.oidc_identities} OIDC · ${auth.app_passwords} app passwords`; const status = `${account.suspended ? "suspended" : "active"}${account.administrator ? " · administrator" : ""}${sources.durable ? " · durable grant" : ""}${sources.configuration ? " · configuration grant" : ""}`; body.append(append(element("tr"), element("td", "meta", account.id), append(element("td"), append(element("strong"), element("code", "", account.name))), append(element("td", "meta"), created), element("td", "", loginMethods), element("td", "", status), element("td", "", `${auth.browser_sessions} browsers · ${auth.api_tokens} API tokens`), element("td", "", `${resources.networks} networks · ${resources.founded_channels} channels`), actions)); } table.append(head, body); accountHost.append(append(element("div", "scroll"), table)); } accountHost.append(pager("Older accounts", data.next_before_id, "before_id")); accountHost.append(element("p", "section-note", "An account that founded registered channels cannot be deleted. Transfer or drop those channels first. Deleted account names remain permanently retired so old credentials and identity links can never resolve to a different person."));
+      if (!rows.length) accountHost.append(element("p", "empty", "No account matches this exact name.")); else { const table = document.createElement("table"); table.append(element("caption", "sr-only", "Account directory")); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "ID"), element("th", "", "Account"), element("th", "", "Created (UTC)"), element("th", "", "Login methods"), element("th", "", "Status"), element("th", "", "Active access"), element("th", "", "Resources"), element("th"))); const body = document.createElement("tbody"); for (const account of rows) { const auth = account.authentication; const resources = account.resources; const sources = account.administrator_sources; const actions = element("td"); if (account.current) actions.append(element("span", "meta", "Current account")); else { for (const [key, value, label, confirmation] of [["suspension", !account.suspended, account.suspended ? "Reactivate" : "Suspend", account.suspended ? `Reactivate ${account.name} and restart its enabled networks?` : `Suspend ${account.name}, revoke its sessions and tokens, disconnect its clients, and stop its networks?`], ["administrator", !sources.durable, sources.durable ? "Revoke durable admin" : "Grant durable admin", sources.durable ? `Remove durable administrator authority from ${account.name}?` : `Grant durable administrator authority to ${account.name}?`]]) { const form = document.createElement("form"); form.className = "cell-form"; form.dataset.apiAdminAccountState = key; form.dataset.confirm = confirmation; form.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const state = document.createElement("input"); state.type = "hidden"; state.name = key === "suspension" ? "suspended" : "administrator"; state.value = String(value); form.append(capability(), state, button(label, value ? "" : "danger")); actions.append(form); } const deletion = document.createElement("form"); deletion.className = "cell-form account-delete-form"; deletion.dataset.apiAdminAccountDelete = ""; deletion.dataset.confirm = `Permanently delete ${account.name}, revoke every credential and session, erase its private history, stop its networks, and retire the account name? This cannot be undone.`; deletion.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const confirmation = document.createElement("input"); confirmation.name = "confirmation"; confirmation.autocomplete = "off"; confirmation.required = true; const deletionLabel = append(element("label", "field"), element("span", "", `Type ${account.name} to delete`), confirmation); deletion.append(capability(), deletionLabel, button("Delete permanently", "danger")); actions.append(deletion); } const created = element("time", "", account.created_at); created.dateTime = account.created_at; const loginMethods = `${auth.local_password ? "local password · " : ""}${auth.oidc_identities} OIDC · ${auth.app_passwords} app passwords`; const status = `${account.suspended ? "suspended" : "active"}${account.administrator ? " · administrator" : ""}${sources.durable ? " · durable grant" : ""}${sources.configuration ? " · configuration grant" : ""}`; body.append(append(element("tr"), element("td", "meta", account.id), append(element("td"), append(element("strong"), element("code", "", account.name))), append(element("td", "meta"), created), element("td", "", loginMethods), element("td", "", status), element("td", "", `${auth.browser_sessions} browsers · ${auth.api_tokens} API tokens`), element("td", "", `${resources.networks} networks · ${resources.founded_channels} channels`), actions)); } table.append(head, body); accountHost.append(append(element("div", "scroll"), table)); } accountHost.append(pager("Older accounts", data.next_before_id, "before_id")); accountHost.append(element("p", "section-note", "An account that founded registered channels cannot be deleted. Transfer or drop those channels first. Deleted account names remain permanently retired so old credentials and identity links can never resolve to a different person."));
     };
     refreshAdminAccounts = async () => { const params = query(); const invitations = new URLSearchParams(); invitations.set("limit", params.get("limit") || "50"); if (params.get("invitation_before_id")) invitations.set("before_id", params.get("invitation_before_id")); const [accounts, invitationData] = await Promise.all([apiRead(`/api/v1/admin/accounts?${params}`), apiRead(`/api/v1/admin/invitations?${invitations}`)]); renderAccounts(accounts); renderInvitations(invitationData); for (const region of adminAccountsPage.querySelectorAll(".scroll")) { region.tabIndex = 0; region.setAttribute("aria-label", "Account directory table"); } };
     if (filters instanceof HTMLFormElement) for (const input of filters.elements) if ((input instanceof HTMLInputElement || input instanceof HTMLSelectElement) && input.name) input.value = new URLSearchParams(window.location.search).get(input.name) || (input.name === "limit" ? "50" : "");
@@ -2066,8 +1955,8 @@
     }
     for (const network of networks) {
       const row = document.createElement("tr");
-      const runtime = network.runtime || {};
-      const cells = [runtime.state || (network.enabled ? "not running" : "disabled"), network.owner, network.name, network.kind, network.shared === true ? "Managed configuration" : network.addr, runtime.attached_clients || 0, runtime.errors || 0, runtime.last_error?.summary || "—"];
+      const runtime = network.runtime;
+      const cells = [runtime === null ? (network.enabled ? "not running" : "disabled") : runtime.state, network.owner, network.name, network.kind, network.shared === true ? "Managed configuration" : network.addr, runtime === null ? 0 : runtime.attached_clients, runtime === null ? 0 : runtime.errors, runtime?.last_error?.summary ?? "—"];
       cells.forEach((value, index) => { const cell = document.createElement("td"); cell.textContent = String(value); if (index === 0) { const dot = document.createElement("span"); dot.className = `dot ${network.connected ? "on" : "off"}`; cell.prepend(dot); } if (index === 4 && network.tls) { const tls = document.createElement("span"); tls.className = "tag"; tls.textContent = "TLS"; cell.append(" ", tls); } row.append(cell); });
       const actions = document.createElement("td");
       actions.className = "row-actions";
@@ -2154,15 +2043,12 @@
       body.append(row);
     }
     for (const network of networks) {
-      if (!network || typeof network.name !== "string" || typeof network.kind !== "string") {
-        throw new Error("The network list response is invalid. Reload and try again.");
-      }
-      const runtime = network.runtime && typeof network.runtime === "object" ? network.runtime : null;
-      const enabled = network.enabled === true;
-      const connected = network.connected === true;
+      const runtime = network.runtime;
+      const enabled = network.enabled;
+      const connected = network.connected;
       const state = !enabled
         ? "disabled"
-        : typeof runtime?.state === "string" ? runtime.state.replaceAll("_", " ") : "not running";
+        : runtime === null ? "not running" : runtime.state.replaceAll("_", " ");
       const row = document.createElement("tr");
       const status = document.createElement("td");
       const dot = document.createElement("span");
@@ -2177,7 +2063,7 @@
       const kind = networkCell(network.kind);
       const upstream = document.createElement("td");
       const address = document.createElement("code");
-      address.textContent = typeof network.addr === "string" ? network.addr : "";
+      address.textContent = network.shared === true ? "" : network.addr;
       upstream.append(address);
       if (network.tls === true) {
         const tls = document.createElement("span");
@@ -2185,8 +2071,8 @@
         tls.textContent = "TLS";
         upstream.append(document.createTextNode(" "), tls);
       }
-      const clients = networkCell(Number.isSafeInteger(runtime?.attached_clients) ? runtime.attached_clients : 0);
-      const errors = networkCell(Number.isSafeInteger(runtime?.errors) ? runtime.errors : 0);
+      const clients = networkCell(runtime === null ? 0 : runtime.attached_clients);
+      const errors = networkCell(runtime === null ? 0 : runtime.errors);
       const actions = document.createElement("td");
       actions.className = "row-actions";
       const inspect = document.createElement("a");
@@ -2296,17 +2182,8 @@
     try {
       const result = await apiRequest(form, apiMutation(method, url), body);
       if (mode === ownerNetworkPreflight) {
-        const nick = result?.confirmed_nick;
-        const timings = [result?.dns_ms, result?.connect_ms, result?.registration_ms];
-        if (
-          typeof nick !== "string" || !nick
-          || !Number.isSafeInteger(result?.resolved_addresses) || result.resolved_addresses < 1
-          || timings.some((value) => !Number.isSafeInteger(value) || value < 0)
-        ) {
-          throw new Error("The connection check returned an invalid response. Reload and try again.");
-        }
         setOwnerNetworkResult(
-          `Registered as ${nick}. Resolved ${result.resolved_addresses} address${result.resolved_addresses === 1 ? "" : "es"}; DNS ${result.dns_ms}ms, connection ${result.connect_ms}ms, registration ${result.registration_ms}ms. No network was created.`,
+          `Registered as ${result.confirmed_nick}. Resolved ${result.resolved_addresses} address${result.resolved_addresses === 1 ? "" : "es"}; DNS ${result.dns_ms}ms, connection ${result.connect_ms}ms, registration ${result.registration_ms}ms. No network was created.`,
           true,
         );
       } else {
@@ -2415,16 +2292,15 @@
         const target = integrations.querySelector(`[data-integration-list="${kind}"]`);
         const count = integrations.querySelector(`[data-integration-count="${kind}"]`);
         if (!(target instanceof HTMLElement)) continue;
-        const entries = networks.filter((network) => network && network.kind === kind);
+        const entries = networks.filter((network) => network.kind === kind);
         if (count) count.textContent = String(entries.length);
         target.replaceChildren();
         if (!entries.length) { const empty = document.createElement("p"); empty.className = "empty"; empty.textContent = `No ${kind} bridges configured.`; target.append(empty); continue; }
         const table = document.createElement("table"); table.innerHTML = "<thead><tr><th>Status</th><th>Network</th><th>Owner</th><th>Actions</th></tr></thead>";
         const body = document.createElement("tbody");
         for (const network of entries) {
-          if (typeof network.name !== "string" || typeof network.owner !== "string") continue;
-          const row = document.createElement("tr"); const runtime = network.runtime || {};
-          const status = document.createElement("td"); const dot = document.createElement("span"); dot.className = `dot ${network.connected ? "on" : "off"}`; status.append(dot, String(runtime.state || (network.enabled ? "not running" : "disabled")));
+          const row = document.createElement("tr"); const runtime = network.runtime;
+          const status = document.createElement("td"); const dot = document.createElement("span"); dot.className = `dot ${network.connected ? "on" : "off"}`; status.append(dot, String(runtime === null ? (network.enabled ? "not running" : "disabled") : runtime.state));
           const name = document.createElement("td"); const code = document.createElement("code"); code.textContent = network.name; name.append(code);
           const owner = document.createElement("td"); const ownerCode = document.createElement("code"); ownerCode.textContent = network.owner; owner.append(ownerCode);
           const actions = document.createElement("td"); actions.className = "row-actions";
@@ -2464,10 +2340,9 @@
     };
     if (form instanceof HTMLFormElement) preserveFormEdits(form);
     const render = (network) => {
-      network = parseOwnerNetwork(network);
       if (network.kind !== "irc") { window.location.replace("/console/networks"); return; }
       if (ownerNetworkResult instanceof HTMLElement) { ownerNetworkResult.replaceChildren(); ownerNetworkResult.className = ""; }
-      hydrateTextInput(form, "addr", network.addr); hydrateTextInput(form, "nick", network.nick); hydrateTextInput(form, "realname", typeof network.realname === "string" ? network.realname : ""); hydrateTextInput(form, "autojoin", network.autojoin.join(", ")); hydrateTextInput(form, "sasl_account", typeof network.sasl_account === "string" ? network.sasl_account : "");
+      hydrateTextInput(form, "addr", network.addr); hydrateTextInput(form, "nick", network.nick); hydrateTextInput(form, "realname", network.realname ?? ""); hydrateTextInput(form, "autojoin", network.autojoin.join(", ")); hydrateTextInput(form, "sasl_account", network.sasl_account ?? "");
       hydrateCheckbox(form, "tls", network.tls);
       form.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
       const title = ownerNetworkEditor.querySelector("[data-network-editor-title]"); if (title) title.textContent = `Edit ${network.name}`;
@@ -2492,7 +2367,6 @@
     if (!name || !(form instanceof HTMLFormElement)) setOwnerNetworkResult("This bridge editor has no resource ID. Return to integrations and try again.", false); else {
       preserveFormEdits(form);
       const render = (network) => {
-        network = parseOwnerNetwork(network);
         if (!["matrix", "discord", "slack"].includes(network.kind)) { window.location.replace("/console/integrations"); return; }
         hydrateTextInput(form, "addr", network.addr); hydrateTextInput(form, "nick", network.nick); hydrateTextInput(form, "autojoin", network.autojoin.join(", "));
         const nick = ownerBridgeEditor.querySelector("[data-bridge-nick]"); if (nick instanceof HTMLElement) nick.hidden = !network.nick;
@@ -2546,12 +2420,11 @@
       detailResult.className = "banner-error";
     };
     const render = (network) => {
-      network = parseOwnerNetwork(network);
       if (detailResult instanceof HTMLElement) { detailResult.replaceChildren(); detailResult.className = ""; }
       const title = ownerNetworkDetail.querySelector("[data-network-title]"); if (title) title.textContent = network.name;
       const kind = ownerNetworkDetail.querySelector("[data-network-kind]"); if (kind) kind.textContent = `${network.kind} network`;
       const provider = network.addr || "Provider API";
-      setField("kind", network.kind); setField("addr", provider); setField("transport", network.tls ? "TLS" : network.addr ? "Plaintext" : "Provider-managed"); setField("nick", network.nick || "Provider account"); setField("realname", typeof network.realname === "string" && network.realname ? network.realname : "Not set"); setField("autojoin", network.autojoin.length ? network.autojoin.join(", ") : "None"); setField("account-credential", network.has_sasl_account === true ? "Stored" : "Not set"); setField("secret-credential", network.has_sasl_password === true ? "Stored encrypted" : "Not set"); setField("enabled", network.enabled ? "Enabled" : "Disabled");
+      setField("kind", network.kind); setField("addr", provider); setField("transport", network.tls ? "TLS" : network.addr ? "Plaintext" : "Provider-managed"); setField("nick", network.nick || "Provider account"); setField("realname", network.realname || "Not set"); setField("autojoin", network.autojoin.length ? network.autojoin.join(", ") : "None"); setField("account-credential", network.has_sasl_account ? "Stored" : "Not set"); setField("secret-credential", network.has_sasl_password ? "Stored encrypted" : "Not set"); setField("enabled", network.enabled ? "Enabled" : "Disabled");
       const summary = ownerNetworkDetail.querySelector("[data-network-summary]"); if (summary instanceof HTMLElement) summary.hidden = false;
       const actions = ownerNetworkDetail.querySelector("[data-network-actions]"); if (actions instanceof HTMLElement) actions.hidden = false;
       const destructive = ownerNetworkDetail.querySelector("[data-network-destructive]"); if (destructive instanceof HTMLElement) destructive.hidden = false;
@@ -2586,7 +2459,7 @@
         adminChannelRows.replaceChildren();
         const count = document.getElementById("admin-channel-count"); if (count) count.textContent = String(channels.length);
         if (!channels.length) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 7; cell.className = "empty"; cell.textContent = "No registered channels match this view."; row.append(cell); adminChannelRows.append(row); return true; }
-        for (const channel of channels) { const row = document.createElement("tr"); const policy = channel.policy || {}; const values = [channel.id, channel.name, channel.founder, channel.created_at, `KEEP ${policy.keeptopic ? "on" : "off"}${policy.topic_retained ? "; topic retained" : ""}${policy.mlock ? `; MLOCK ${policy.mlock}` : ""}`, `${policy.access_entries || 0} grants`]; values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = String(value); row.append(cell); }); const actions = document.createElement("td"); const form = document.createElement("form"); form.method = "post"; form.action = `/api/v1/admin/channels/${encodeURIComponent(channel.name)}`; form.dataset.apiAdminChannelDrop = ""; form.dataset.confirm = `Unregister ${channel.name} and delete its retained policy?`; const csrf = document.createElement("input"); csrf.type = "hidden"; csrf.name = "csrf"; csrf.value = adminChannelRows.dataset.csrf || ""; const button = document.createElement("button"); button.type = "submit"; button.className = "danger"; button.textContent = "Unregister"; form.append(csrf, button); actions.append(form); row.append(actions); adminChannelRows.append(row); }
+        for (const channel of channels) { const row = document.createElement("tr"); const policy = channel.policy; const values = [channel.id, channel.name, channel.founder, channel.created_at, `KEEP ${policy.keeptopic ? "on" : "off"}${policy.topic_retained ? "; topic retained" : ""}${policy.mlock ? `; MLOCK ${policy.mlock}` : ""}`, `${policy.access_entries} grants`]; values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = String(value); row.append(cell); }); const actions = document.createElement("td"); const form = document.createElement("form"); form.method = "post"; form.action = `/api/v1/admin/channels/${encodeURIComponent(channel.name)}`; form.dataset.apiAdminChannelDrop = ""; form.dataset.confirm = `Unregister ${channel.name} and delete its retained policy?`; const csrf = document.createElement("input"); csrf.type = "hidden"; csrf.name = "csrf"; csrf.value = adminChannelRows.dataset.csrf || ""; const button = document.createElement("button"); button.type = "submit"; button.className = "danger"; button.textContent = "Unregister"; form.append(csrf, button); actions.append(form); row.append(actions); adminChannelRows.append(row); }
       } catch (error) {
         tableLoadFailure(adminChannelRows, 7, error, () => void refreshAdminChannelDirectory());
         return false;

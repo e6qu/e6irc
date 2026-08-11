@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { ApiError } from "./api-contract.js";
+
+export { ApiError };
+
 export const SETTINGS_KEY = "e6irc.settings";
 export const DEFAULT_SETTINGS = Object.freeze({
   theme: "auto",
@@ -7,26 +11,6 @@ export const DEFAULT_SETTINGS = Object.freeze({
 });
 
 const THEMES = new Set(["auto", "light", "dark"]);
-const NETWORK_STATES = new Set([
-  "connecting",
-  "connected",
-  "reconnecting",
-  "authentication_failed",
-  "registration_failed",
-]);
-const NETWORK_KINDS = new Set(["irc", "local", "matrix", "discord", "slack"]);
-const IDENTITY_KEYS = new Set([
-  "account",
-  "email",
-  "role",
-  "provider",
-  "release_revision",
-  "csrf_token",
-  "logout_url",
-]);
-const NETWORK_LIST_KEYS = new Set(["networks"]);
-const BACKLOG_KEYS = new Set(["lines"]);
-const MAX_API_JSON_BYTES = 1024 * 1024;
 
 function defaults() {
   return { ...DEFAULT_SETTINGS };
@@ -92,157 +76,32 @@ export function saveSettings(storage, settings) {
   }
 }
 
-export class ApiError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.name = "ApiError";
-    this.status = status;
-  }
-}
-
-async function apiJson(response) {
-  const length = Number(response.headers.get("content-length"));
-  if (Number.isFinite(length) && length > MAX_API_JSON_BYTES) {
-    throw new ApiError(response.status, "The API response is too large. Reload and try again.");
-  }
-  const text = await response.text();
-  if (new TextEncoder().encode(text).byteLength > MAX_API_JSON_BYTES) {
-    throw new ApiError(response.status, "The API response is too large. Reload and try again.");
-  }
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new ApiError(response.status, "The API response contains invalid JSON. Reload and try again.");
-  }
-}
-
-function apiObject(value, status) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new ApiError(status, "The API response is invalid. Reload and try again.");
-  }
-  return value;
-}
-
-export async function getJson(fetcher, url) {
-  const response = await fetcher(url, { headers: { Accept: "application/json" } });
-  if (!response.ok) {
-    let detail = "";
-    try {
-      const problem = await apiJson(response);
-      detail =
-        typeof problem.detail === "string"
-          ? problem.detail
-          : typeof problem.title === "string"
-            ? problem.title
-            : "";
-    } catch {}
-    throw new ApiError(response.status, detail || `Request failed with HTTP ${response.status}`);
-  }
-  return apiObject(await apiJson(response), response.status);
-}
-
-function optionalString(value) {
-  return value === undefined || value === null ? null : typeof value === "string" ? value : undefined;
-}
-
-function hasOnlyKeys(value, allowed) {
-  return Object.keys(value).every((key) => allowed.has(key));
-}
-
 export function identityFrom(payload) {
-  if (
-    payload === null ||
-    typeof payload !== "object" ||
-    Array.isArray(payload) ||
-    !hasOnlyKeys(payload, IDENTITY_KEYS)
-  ) {
-    throw new ApiError(200, "The server returned an invalid identity");
-  }
-  const { account } = payload;
-  const email = optionalString(payload.email);
-  const role = optionalString(payload.role);
-  const provider = optionalString(payload.provider);
-  const releaseRevision = optionalString(payload.release_revision);
-  const logoutURL = optionalString(payload.logout_url);
-  const csrfToken = payload.csrf_token;
-  if (
-    typeof account !== "string" ||
-    !account.trim() ||
-    email === undefined ||
-    role === undefined ||
-    provider === undefined ||
-    releaseRevision === undefined ||
-    (csrfToken !== undefined && typeof csrfToken !== "string") ||
-    logoutURL === undefined ||
-    (logoutURL !== null && (!logoutURL.startsWith("/") || logoutURL.startsWith("//")))
-  ) {
-    throw new ApiError(200, "The server returned an invalid identity");
-  }
-  return Object.freeze({ account, email, role, logoutURL });
+  return Object.freeze({
+    account: payload.account,
+    email: payload.email,
+    role: payload.role,
+    logoutURL: payload.logout_url,
+  });
 }
 
 function networkSummary(value) {
-  if (value === null || typeof value !== "object") return null;
-  const { name, kind, nick, enabled, connected, runtime } = value;
-  if (
-    typeof name !== "string" ||
-    !name.trim() ||
-    typeof kind !== "string" ||
-    !NETWORK_KINDS.has(kind) ||
-    typeof nick !== "string" ||
-    !nick.trim() ||
-    typeof enabled !== "boolean" ||
-    (connected !== null && typeof connected !== "boolean") ||
-    (runtime !== null && (typeof runtime !== "object" || Array.isArray(runtime)))
-  ) {
-    return null;
-  }
-  if (runtime === null) {
-    return connected === null
-      ? Object.freeze({ name, kind, nick, enabled, connected, state: null, runtime: null })
-      : null;
-  }
-  if (typeof runtime.state !== "string" || !NETWORK_STATES.has(runtime.state)) return null;
-  if (connected !== (runtime.state === "connected")) return null;
   return Object.freeze({
-    name,
-    kind,
-    nick,
-    enabled,
-    connected,
-    state: runtime.state,
-    runtime: Object.freeze({ state: runtime.state }),
+    name: value.name,
+    kind: value.kind,
+    nick: value.nick,
+    enabled: value.enabled,
+    connected: value.connected,
+    state: value.runtime?.state ?? null,
+    runtime: value.runtime === null ? null : Object.freeze({ state: value.runtime.state }),
   });
 }
 
 export function networksFrom(payload) {
-  if (
-    payload === null ||
-    typeof payload !== "object" ||
-    Array.isArray(payload) ||
-    !hasOnlyKeys(payload, NETWORK_LIST_KEYS) ||
-    !Array.isArray(payload.networks)
-  ) {
-    throw new ApiError(200, "The server returned an invalid network list");
-  }
-  const networks = payload.networks.map(networkSummary);
-  if (networks.some((network) => network === null)) {
-    throw new ApiError(200, "The server returned an invalid network list");
-  }
-  return Object.freeze(networks);
+  return Object.freeze(payload.networks.map(networkSummary));
 }
 
 export function backlogFrom(payload) {
-  if (
-    payload === null ||
-    typeof payload !== "object" ||
-    Array.isArray(payload) ||
-    !hasOnlyKeys(payload, BACKLOG_KEYS) ||
-    !Array.isArray(payload.lines) ||
-    payload.lines.some((line) => typeof line !== "string")
-  ) {
-    throw new ApiError(200, "The server returned an invalid backlog");
-  }
   return Object.freeze([...payload.lines]);
 }
 

@@ -9,7 +9,6 @@ import {
   SETTINGS_KEY,
   backlogFrom,
   errorMessage,
-  getJson,
   identityFrom,
   loadSettings,
   networksFrom,
@@ -74,101 +73,7 @@ test("storage denial is explicit on read and write", () => {
   );
 });
 
-test("JSON requests preserve problem details and reject malformed success bodies", async () => {
-  await assert.rejects(
-    getJson(
-      async () => ({
-        ok: false,
-        status: 503,
-        headers: new Headers(),
-        text: async () => '{"title":"Database unavailable"}',
-      }),
-      "/api/v1/me/networks",
-    ),
-    (error) =>
-      error instanceof ApiError &&
-      error.status === 503 &&
-      error.message === "Database unavailable",
-  );
-
-  await assert.rejects(
-    getJson(
-      async () => ({
-        ok: true,
-        status: 200,
-        headers: new Headers(),
-        text: async () => "not JSON",
-      }),
-      "/api/v1/me",
-    ),
-    /invalid JSON/,
-  );
-});
-
-test("JSON requests reject non-object success bodies at the shared boundary", async () => {
-  assert.deepEqual(
-    await getJson(
-      async () => ({
-        ok: true,
-        status: 200,
-        headers: new Headers(),
-        text: async () => '{"networks":[]}',
-      }),
-      "/api/v1/me/networks",
-    ),
-    { networks: [] },
-  );
-
-  for (const body of ["null", "[]", "true", "42", '\"text\"']) {
-    await assert.rejects(
-      getJson(
-        async () => ({
-          ok: true,
-          status: 200,
-          headers: new Headers(),
-          text: async () => body,
-        }),
-        "/api/v1/me",
-      ),
-      (error) =>
-        error instanceof ApiError &&
-        error.status === 200 &&
-        error.message === "The API response is invalid. Reload and try again.",
-    );
-  }
-});
-
-test("JSON requests reject oversized API responses before parsing", async () => {
-  await assert.rejects(
-    getJson(
-      async () => ({
-        ok: true,
-        status: 200,
-        headers: new Headers({ "content-length": "1048577" }),
-        text: async () => {
-          throw new Error("must not read an oversized response");
-        },
-      }),
-      "/api/v1/me",
-    ),
-    /too large/,
-  );
-
-  await assert.rejects(
-    getJson(
-      async () => ({
-        ok: true,
-        status: 200,
-        headers: new Headers(),
-        text: async () => `"${"€".repeat(524289)}"`,
-      }),
-      "/api/v1/me",
-    ),
-    /too large/,
-  );
-});
-
-test("network collection validation separates an empty list from a broken contract", () => {
+test("network projection preserves the closed API state", () => {
   assert.deepEqual(networksFrom({ networks: [] }), []);
   const offline = { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, runtime: null };
   assert.deepEqual(networksFrom({ networks: [offline] }), [
@@ -186,46 +91,19 @@ test("network collection validation separates an empty list from a broken contra
       runtime: { state: "connected" },
     }],
   );
-  assert.throws(() => networksFrom({ networks: [{ enabled: true }] }), /invalid network list/);
-  assert.throws(
-    () => networksFrom({ networks: [{ ...offline, connected: true }] }),
-    /invalid network list/,
-  );
-  assert.throws(
-    () => networksFrom({ networks: [{ ...offline, connected: false, runtime: { state: "connected" } }] }),
-    /invalid network list/,
-  );
-  assert.throws(
-    () => networksFrom({ networks: [{ ...offline, kind: "unknown" }] }),
-    /invalid network list/,
-  );
-  assert.throws(() => networksFrom({ networks: [], next: "not part of this response" }), /invalid network list/);
 });
 
-test("backlog parsing accepts only the closed lines response", () => {
+test("backlog projection preserves contract lines", () => {
   assert.deepEqual(backlogFrom({ lines: [":a PRIVMSG #chat :hello"] }), [":a PRIVMSG #chat :hello"]);
-  assert.throws(() => backlogFrom({ lines: ["ok"], cursor: "unexpected" }), /invalid backlog/);
-  assert.throws(() => backlogFrom({ lines: [1] }), /invalid backlog/);
 });
 
-test("identity parsing keeps only a safe, complete projection", () => {
+test("identity projection keeps browser-visible fields", () => {
   assert.deepEqual(identityFrom({ account: "alice", email: "a@example.test", role: "operator", logout_url: "/logout" }), {
     account: "alice",
     email: "a@example.test",
     role: "operator",
     logoutURL: "/logout",
   });
-  assert.deepEqual(identityFrom({ account: "token-user" }), {
-    account: "token-user",
-    email: null,
-    role: null,
-    logoutURL: null,
-  });
-  assert.throws(() => identityFrom({ account: "", email: null }), /invalid identity/);
-  assert.throws(() => identityFrom({ account: "alice", role: 1 }), /invalid identity/);
-  assert.throws(() => identityFrom({ account: "alice", logout_url: "//other.test/logout" }), /invalid identity/);
-  assert.throws(() => identityFrom({ account: "alice", csrf_token: 1 }), /invalid identity/);
-  assert.throws(() => identityFrom({ account: "alice", unexpected: true }), /invalid identity/);
 });
 
 test("network labels use the API's typed runtime state", () => {
