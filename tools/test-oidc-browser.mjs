@@ -413,12 +413,12 @@ try {
   });
   await page.route(profileURL, async (route) => {
     if (route.request().method() === "PATCH") {
+      profileFailureFulfilled();
       await route.fulfill({
         status: 503,
         contentType: "application/problem+json",
         body: JSON.stringify({ status: 503, title: "Profile storage unavailable" }),
       });
-      profileFailureFulfilled();
     } else {
       await route.continue();
     }
