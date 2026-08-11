@@ -38,11 +38,7 @@ async function expectAccessible(page, selector) {
   );
 }
 
-// A configuration form POST navigates to a re-rendered page, but the old
-// document — including its previous status banner — stays in the DOM until
-// the response arrives. Waiting for any role="status" therefore resolves
-// against the stale banner and reads the previous outcome on slower engines
-// (webkit). Wait for the banner that carries this action's outcome instead.
+// Wait for the banner that carries this action's outcome.
 async function expectStatus(page, pattern) {
   const banner = page.getByRole("status").filter({ hasText: pattern });
   await banner.waitFor();
@@ -408,6 +404,30 @@ try {
   releaseProfile();
   await profileResponse;
   assert.equal(await contactEmail.inputValue(), "draft-contact@example.test");
+  await page.unroute(profileURL);
+  const accountDocument = await page.evaluate(() => performance.timeOrigin);
+  const profileFailureErrorStart = applicationErrors.length;
+  await page.route(profileURL, async (route) => {
+    if (route.request().method() === "POST") {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/problem+json",
+        body: JSON.stringify({ status: 503, title: "Profile storage unavailable" }),
+      });
+    } else {
+      await route.continue();
+    }
+  });
+  await contactEmail.fill("retry-contact@example.test");
+  await page.getByRole("button", { name: "Save contact email", exact: true }).click();
+  await expectStatus(page, /Profile storage unavailable/);
+  assert.equal(await page.evaluate(() => performance.timeOrigin), accountDocument);
+  assert.equal(await contactEmail.inputValue(), "retry-contact@example.test");
+  assert.deepEqual(
+    applicationErrors.splice(profileFailureErrorStart),
+    [`503 POST ${profileURL}`],
+    "a failed account mutation stayed in the current document",
+  );
   await page.unroute(profileURL);
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
   await page.getByLabel("New password", { exact: true }).fill("browser-local-password");
@@ -1008,11 +1028,15 @@ try {
   assert.equal(page.url(), `${applicationOrigin}/console/networks`);
   assert.equal(await page.getByRole("link", { name: "journey", exact: true }).count(), 0);
   assert.equal(await page.locator('input[name="addr"]').inputValue(), upstream.address);
-  await clickAndWaitForURL(
-    page,
-    page.getByRole("button", { name: "Add network", exact: true }),
-    `${applicationOrigin}/console/networks`,
+  const networkDocument = await page.evaluate(() => performance.timeOrigin);
+  const refreshedNetworks = page.waitForResponse(
+    (response) => response.url() === `${applicationOrigin}/api/v1/me/networks`
+      && response.request().method() === "GET" && response.status() === 200,
   );
+  await page.getByRole("button", { name: "Add network", exact: true }).click();
+  await refreshedNetworks;
+  assert.equal(await page.evaluate(() => performance.timeOrigin), networkDocument);
+  assert.equal(page.url(), `${applicationOrigin}/console/networks`);
   await page.getByRole("link", { name: "journey", exact: true }).waitFor();
   await upstream.waitForJoin("#journey");
   await upstream.sendPeerMessage("#journey", "browser replays through the real stack");

@@ -27,7 +27,7 @@ by the selected control plane.
 **Visible failures and recovery.** Non-founders cannot mutate founder-only
 state. Transfer to an absent account, invalid channel/mode/access values,
 duplicate registration, and persistence failure return explicit errors. The
-console re-renders safely with escaped values; forms require CSRF.
+console refreshes the affected API-backed view safely; forms require CSRF.
 
 **Security and observability.** Founder/access checks are repeated in the core
 for console, REST, and services requests. Collections and inputs are bounded,
