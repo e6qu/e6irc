@@ -3609,31 +3609,6 @@ mod pages {
 
 #[cfg(test)]
 mod composer_tests {
-    use super::composer_to_irc;
-
-    #[test]
-    fn composer_json_form_becomes_privmsg() {
-        let frame = r##"{"target":"#rust","message":"hi there","HEADERS":{}}"##;
-        assert_eq!(composer_to_irc(frame), "PRIVMSG #rust :hi there");
-    }
-
-    #[test]
-    fn raw_prefix_sends_literally() {
-        let frame = r##"{"target":"#rust","message":"/raw WHOIS bob"}"##;
-        assert_eq!(composer_to_irc(frame), "WHOIS bob");
-    }
-
-    #[test]
-    fn message_without_target_is_sent_as_is() {
-        let frame = r#"{"message":"JOIN #x"}"#;
-        assert_eq!(composer_to_irc(frame), "JOIN #x");
-    }
-
-    #[test]
-    fn non_json_frame_is_relayed_unchanged() {
-        assert_eq!(composer_to_irc("PRIVMSG #c :raw"), "PRIVMSG #c :raw");
-    }
-
     #[test]
     fn slash_commands_map_to_irc() {
         use super::slash_to_irc;

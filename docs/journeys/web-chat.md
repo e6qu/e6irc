@@ -44,6 +44,8 @@ stacking duplicate handlers.
 **Security and observability.** Network inventory and attachment are
 cookie-authenticated and owner-scoped; the WebSocket enforces same-origin
 policy. Each inbound event is parsed into a closed shape before handling.
+Composer requests are parsed into a closed shape before the server derives an
+IRC line.
 Server-controlled text reaches the document only through text nodes, and
 connection/attachment/error state is counted without user text in metric
 labels.
@@ -125,8 +127,9 @@ current network and conversation selection.
 
 **Flow.**
 
-1. The composer sends `{id, target, message}`; `/raw ` deliberately requests
-   one complete IRC line instead.
+1. The interactive composer sends the closed `{id, target, message}` shape.
+   Internal commands use the same shape without `id`; `/raw ` deliberately
+   requests one complete IRC line instead.
 2. The server validates the whole derived line, admits it to the selected
    driver's bounded queue, and returns a correlated `sent` or `send-error`
    event.
@@ -148,17 +151,18 @@ visibly without truncating the message into different content. Removing the
 selected network detaches the WebSocket. Channel leave and direct-message
 close are different actions and remain different in both UI and wire behavior.
 
-**Security and observability.** Browser text is validated as a complete IRC
-line at the WebSocket boundary and again by the driver/core path. Pending
-sends, buffers, members, and sent-history are bounded; acceptance/refusal is
-correlated by opaque request identifier and message bodies stay out of metrics.
+**Security and observability.** The browser serializes and the server parses a
+closed composer shape before deriving the complete IRC line, then the driver
+and core validate it again. Pending sends, buffers, members, and sent-history
+are bounded; acceptance/refusal is correlated by opaque request identifier and
+message bodies stay out of metrics.
 
 **Evidence.** Browser state tests cover NAMES, direct-message close, channel
 leave, delayed acknowledgement, and refusal without false echo. A real local
 IRC peer observes the Chromium composer’s exact PRIVMSG after a correlated
 server acknowledgement and sends a peer message back through the driver and
-`/ws/ui`; protocol tests cover injection/length rejection, queue admission,
-and detachment on network removal.
+`/ws/ui`; protocol tests cover malformed-frame recovery, injection/length
+rejection, queue admission, and detachment on network removal.
 
 ## Personalize web chat and desktop notifications
 

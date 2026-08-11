@@ -411,7 +411,7 @@ pub(super) async fn ws_ui_conn(
                         Ok(request) => request,
                         Err(error) => {
                             let event = composer_result_event(ComposerResult::Rejected {
-                                request_id: error.request_id.as_deref(),
+                                request_id: error.request_id.as_ref().map(ComposerRequestId::as_str),
                                 message: error.message,
                             });
                             if socket.send(WsMessage::text(event)).await.is_err() {
@@ -425,7 +425,7 @@ pub(super) async fn ws_ui_conn(
                             if let Some(request_id) = request.request_id
                                 && socket
                                     .send(WsMessage::text(composer_result_event(
-                                        ComposerResult::Sent(&request_id),
+                                        ComposerResult::Sent(request_id.as_str()),
                                     )))
                                     .await
                                     .is_err()
@@ -435,7 +435,7 @@ pub(super) async fn ws_ui_conn(
                         }
                         crate::bouncer::SendOutcome::Full => {
                             let event = composer_result_event(ComposerResult::Rejected {
-                                request_id: request.request_id.as_deref(),
+                                request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
                                 message: "upstream busy; line not sent, try again",
                             });
                             if socket.send(WsMessage::text(event)).await.is_err() {
@@ -448,8 +448,22 @@ pub(super) async fn ws_ui_conn(
                         }
                     }
                 }
-                Some(Ok(_)) => {}
-                _ => break, // close or error
+                Some(Ok(WsMessage::Binary(_))) => {
+                    let event = composer_result_event(ComposerResult::Rejected {
+                        request_id: None,
+                        message: "composer requests must be text JSON",
+                    });
+                    if socket.send(WsMessage::text(event)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(WsMessage::Ping(payload))) => {
+                    if socket.send(WsMessage::Pong(payload)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(WsMessage::Pong(_))) => {}
+                Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
             },
         }
     }
@@ -466,50 +480,112 @@ async fn send_unavailable(socket: &mut WebSocket) {
 #[derive(Debug)]
 struct ComposerRequest {
     line: String,
-    request_id: Option<String>,
+    request_id: Option<ComposerRequestId>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComposerFrame {
+    #[serde(default, deserialize_with = "composer_request_id")]
+    id: Option<ComposerRequestId>,
+    target: String,
+    message: String,
+}
+
+#[derive(Debug)]
+struct ComposerRequestId(String);
+
+impl ComposerRequestId {
+    fn parse(value: String) -> Result<Self, ComposerRequestError> {
+        if !value.is_empty()
+            && value.len() <= 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Ok(Self(value));
+        }
+        Err(ComposerRequestError {
+            request_id: None,
+            message: "invalid composer request identifier",
+        })
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn composer_request_id<'de, D>(deserializer: D) -> Result<Option<ComposerRequestId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct RequestId;
+
+    impl<'de> serde::de::Visitor<'de> for RequestId {
+        type Value = Option<ComposerRequestId>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a composer request identifier")
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            let value = String::deserialize(deserializer)?;
+            ComposerRequestId::parse(value)
+                .map(Some)
+                .map_err(|error| serde::de::Error::custom(error.message))
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Err(E::custom("composer request identifier cannot be null"))
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_none()
+        }
+    }
+
+    deserializer.deserialize_option(RequestId)
 }
 
 #[derive(Debug)]
 struct ComposerRequestError {
-    request_id: Option<String>,
+    request_id: Option<ComposerRequestId>,
     message: &'static str,
 }
 
-/// Reject invalid or over-long composer lines.
+/// Parse and bound one browser composer frame.
 fn composer_request(frame: &str) -> Result<ComposerRequest, ComposerRequestError> {
-    let parsed = serde_json::from_str::<serde_json::Value>(frame).ok();
-    let request_id = match parsed.as_ref().and_then(|value| value.get("id")) {
-        None => None,
-        Some(serde_json::Value::String(id))
-            if !id.is_empty()
-                && id.len() <= 64
-                && id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') =>
-        {
-            Some(id.clone())
-        }
-        Some(_) => {
-            return Err(ComposerRequestError {
-                request_id: None,
-                message: "invalid composer request identifier",
-            });
-        }
-    };
-    let line = composer_to_irc(frame);
+    let frame = serde_json::from_str::<ComposerFrame>(frame).map_err(|_| ComposerRequestError {
+        request_id: None,
+        message: "invalid composer request",
+    })?;
+    let line = slash_to_irc(&frame.message, &frame.target);
     if line.contains(['\r', '\n', '\0']) {
         return Err(ComposerRequestError {
-            request_id,
+            request_id: frame.id,
             message: "message contains an invalid line delimiter; nothing was sent",
         });
     }
     if line.len() > e6irc_proto::message::MAX_LINE_LEN - 2 {
         return Err(ComposerRequestError {
-            request_id,
+            request_id: frame.id,
             message: "message exceeds the IRC wire limit; nothing was sent",
         });
     }
-    Ok(ComposerRequest { line, request_id })
+    Ok(ComposerRequest {
+        line,
+        request_id: frame.id,
+    })
 }
 
 enum ComposerResult<'a> {
@@ -558,18 +634,6 @@ fn composer_result_event(result: ComposerResult<'_>) -> String {
             message,
         } => line_event(&format!(":*bnc* NOTICE * :{message}")),
     }
-}
-
-/// Translate composer JSON; preserve raw frames.
-pub(super) fn composer_to_irc(frame: &str) -> String {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(frame) else {
-        return frame.to_string();
-    };
-    let Some(message) = v.get("message").and_then(|m| m.as_str()) else {
-        return frame.to_string();
-    };
-    let target = v.get("target").and_then(|t| t.as_str()).unwrap_or("");
-    slash_to_irc(message, target)
 }
 
 /// Map a composer message to IRC.
@@ -715,13 +779,19 @@ mod tests {
     fn composer_request_is_correlated_and_never_truncated() {
         let request =
             composer_request(r##"{"id":"send-1","target":"#rust","message":"hi"}"##).unwrap();
-        assert_eq!(request.request_id.as_deref(), Some("send-1"));
+        assert_eq!(
+            request.request_id.as_ref().map(ComposerRequestId::as_str),
+            Some("send-1")
+        );
         assert_eq!(request.line, "PRIVMSG #rust :hi");
 
         let injection =
             composer_request(r##"{"id":"send-2","target":"#rust","message":"hi\r\nJOIN #bad"}"##)
                 .expect_err("embedded delimiter must reject the whole request");
-        assert_eq!(injection.request_id.as_deref(), Some("send-2"));
+        assert_eq!(
+            injection.request_id.as_ref().map(ComposerRequestId::as_str),
+            Some("send-2")
+        );
         assert!(injection.message.contains("nothing was sent"));
 
         let frame = serde_json::json!({
@@ -731,8 +801,39 @@ mod tests {
         })
         .to_string();
         let overlong = composer_request(&frame).expect_err("over-long line must be refused");
-        assert_eq!(overlong.request_id.as_deref(), Some("send-3"));
+        assert_eq!(
+            overlong.request_id.as_ref().map(ComposerRequestId::as_str),
+            Some("send-3")
+        );
         assert!(overlong.message.contains("wire limit"));
+    }
+
+    #[test]
+    fn composer_request_is_a_closed_json_contract() {
+        let uncorrelated = composer_request(r##"{"target":"","message":"/join #rust"}"##)
+            .expect("uncorrelated command");
+        assert_eq!(uncorrelated.line, "JOIN #rust");
+        assert!(uncorrelated.request_id.is_none());
+
+        for frame in [
+            "not JSON",
+            "null",
+            "[]",
+            r##"{}"##,
+            r##"{"target":"#rust"}"##,
+            r##"{"message":"hello"}"##,
+            r##"{"target":1,"message":"hello"}"##,
+            r##"{"target":"#rust","message":1}"##,
+            r##"{"id":null,"target":"#rust","message":"hello"}"##,
+            r##"{"id":"bad_id","target":"#rust","message":"hello"}"##,
+            &format!(
+                r##"{{"id":"{}","target":"#rust","message":"hello"}}"##,
+                "x".repeat(65)
+            ),
+            r##"{"target":"#rust","message":"hello","extra":true}"##,
+        ] {
+            assert!(composer_request(frame).is_err(), "accepted {frame}");
+        }
     }
 
     #[test]
