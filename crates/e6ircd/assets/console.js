@@ -2223,6 +2223,7 @@
   let refreshOwnerBridgeEditor;
   let refreshOwnerNetworkDetail;
   let refreshIntegrations;
+  const ownerNetworkPreflight = Symbol("owner-network-preflight");
   const ownerNetworkRefresher = (form) => {
     if (form.closest("[data-api-owner-network-editor]")) return refreshOwnerNetworkEditor;
     if (form.closest("[data-api-owner-bridge-editor]")) return refreshOwnerBridgeEditor;
@@ -2231,12 +2232,12 @@
     return refreshOwnerNetworks;
   };
 
-  const mutateOwnerNetwork = async (form, url, method, body, preflight = false) => {
+  const mutateOwnerNetwork = async (form, url, method, body, mode) => {
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
       const result = await apiRequest(form, url, method, body);
-      if (preflight) {
+      if (mode === ownerNetworkPreflight) {
         const nick = result?.confirmed_nick;
         const timings = [result?.dns_ms, result?.connect_ms, result?.registration_ms];
         if (
@@ -2287,7 +2288,7 @@
         const { addr, tls, nick, realname, sasl_account, sasl_password } = connection;
         void mutateOwnerNetwork(form, "/api/v1/me/networks/preflight", "POST", {
           addr, tls, nick, realname, sasl_account, sasl_password,
-        }, true);
+        }, ownerNetworkPreflight);
         return;
       }
       void mutateOwnerNetwork(form, form.action, "POST", { kind: "irc", name, ...connection });
