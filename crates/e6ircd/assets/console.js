@@ -1934,7 +1934,7 @@ import { getOperationJson, loadApiContract } from "/console-contract.js";
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      const result = (await apiRequest(form, apiMutation(method, form.action), body)) ?? {};
+      const result = await apiRequest(form, apiMutation(method, form.action), body);
       if (submit) submit.disabled = false;
       return result;
     } catch (error) {
