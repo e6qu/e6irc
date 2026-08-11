@@ -271,7 +271,10 @@ import { getOperationJson, loadApiContract } from "/console-contract.js";
   const apiMutation = apiOperation;
 
   const consoleApiContract = () => {
-    apiContract ??= loadApiContract(fetch);
+    apiContract ??= loadApiContract(fetch).catch((error) => {
+      apiContract = undefined;
+      throw error;
+    });
     return apiContract;
   };
 

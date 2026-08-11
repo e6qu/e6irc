@@ -15,6 +15,7 @@ The console is a document shell. Authenticated reads and mutations use
 fails CI if one is added. Console mutations are immutable, declared
 method/path operations. The gate checks each operation against the router.
 
-Console loads `/api/v1/openapi.json` once and parses each documented success
-response into a closed immutable projection before rendering. The OpenAPI tests
-require a closed JSON schema for each console read and JSON mutation.
+Browser chat and console load `/api/v1/openapi.json` once and parse each
+documented success response into a closed immutable projection before rendering.
+The OpenAPI tests require a closed JSON schema for each browser read and console
+JSON mutation.

@@ -12,10 +12,10 @@ and integration claims.
 
 ## Current state
 
-The console reads and writes only through `/api/v1`. Browser chat parses its
-API payloads at the shared boundary. Console loads the served OpenAPI contract
-and parses each successful read or mutation into a closed immutable projection
-before a view uses it. Browser chat parses each UI WebSocket event into its closed
+The console reads and writes only through `/api/v1`. Browser chat and console
+load the served OpenAPI contract and parse each successful API response into a
+closed immutable projection before a view uses it. Browser chat parses each UI
+WebSocket event into its closed
 shape before handling it and serializes each composer request from its closed
 shape before sending it. Immutable console mutation operations are checked
 against the router. Successful mutations refresh their API-backed view without

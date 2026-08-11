@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { ApiError, getApiObject } from "./api-contract.js";
+import { ApiError } from "./api-contract.js";
 
 export { ApiError };
 
@@ -11,25 +11,6 @@ export const DEFAULT_SETTINGS = Object.freeze({
 });
 
 const THEMES = new Set(["auto", "light", "dark"]);
-const NETWORK_STATES = new Set([
-  "connecting",
-  "connected",
-  "reconnecting",
-  "authentication_failed",
-  "registration_failed",
-]);
-const NETWORK_KINDS = new Set(["irc", "local", "matrix", "discord", "slack"]);
-const IDENTITY_KEYS = new Set([
-  "account",
-  "email",
-  "role",
-  "provider",
-  "release_revision",
-  "csrf_token",
-  "logout_url",
-]);
-const NETWORK_LIST_KEYS = new Set(["networks"]);
-const BACKLOG_KEYS = new Set(["lines"]);
 
 function defaults() {
   return { ...DEFAULT_SETTINGS };
@@ -95,112 +76,32 @@ export function saveSettings(storage, settings) {
   }
 }
 
-export async function getJson(fetcher, url) {
-  return getApiObject(fetcher, url);
-}
-
-function optionalString(value) {
-  return value === undefined || value === null ? null : typeof value === "string" ? value : undefined;
-}
-
-function hasOnlyKeys(value, allowed) {
-  return Object.keys(value).every((key) => allowed.has(key));
-}
-
 export function identityFrom(payload) {
-  if (
-    payload === null ||
-    typeof payload !== "object" ||
-    Array.isArray(payload) ||
-    !hasOnlyKeys(payload, IDENTITY_KEYS)
-  ) {
-    throw new ApiError(200, "The server returned an invalid identity");
-  }
-  const { account } = payload;
-  const email = optionalString(payload.email);
-  const role = optionalString(payload.role);
-  const provider = optionalString(payload.provider);
-  const releaseRevision = optionalString(payload.release_revision);
-  const logoutURL = optionalString(payload.logout_url);
-  const csrfToken = payload.csrf_token;
-  if (
-    typeof account !== "string" ||
-    !account.trim() ||
-    email === undefined ||
-    role === undefined ||
-    provider === undefined ||
-    releaseRevision === undefined ||
-    (csrfToken !== undefined && typeof csrfToken !== "string") ||
-    logoutURL === undefined ||
-    (logoutURL !== null && (!logoutURL.startsWith("/") || logoutURL.startsWith("//")))
-  ) {
-    throw new ApiError(200, "The server returned an invalid identity");
-  }
-  return Object.freeze({ account, email, role, logoutURL });
+  return Object.freeze({
+    account: payload.account,
+    email: payload.email,
+    role: payload.role,
+    logoutURL: payload.logout_url,
+  });
 }
 
 function networkSummary(value) {
-  if (value === null || typeof value !== "object") return null;
-  const { name, kind, nick, enabled, connected, runtime } = value;
-  if (
-    typeof name !== "string" ||
-    !name.trim() ||
-    typeof kind !== "string" ||
-    !NETWORK_KINDS.has(kind) ||
-    typeof nick !== "string" ||
-    !nick.trim() ||
-    typeof enabled !== "boolean" ||
-    (connected !== null && typeof connected !== "boolean") ||
-    (runtime !== null && (typeof runtime !== "object" || Array.isArray(runtime)))
-  ) {
-    return null;
-  }
-  if (runtime === null) {
-    return connected === null
-      ? Object.freeze({ name, kind, nick, enabled, connected, state: null, runtime: null })
-      : null;
-  }
-  if (typeof runtime.state !== "string" || !NETWORK_STATES.has(runtime.state)) return null;
-  if (connected !== (runtime.state === "connected")) return null;
   return Object.freeze({
-    name,
-    kind,
-    nick,
-    enabled,
-    connected,
-    state: runtime.state,
-    runtime: Object.freeze({ state: runtime.state }),
+    name: value.name,
+    kind: value.kind,
+    nick: value.nick,
+    enabled: value.enabled,
+    connected: value.connected,
+    state: value.runtime?.state ?? null,
+    runtime: value.runtime === null ? null : Object.freeze({ state: value.runtime.state }),
   });
 }
 
 export function networksFrom(payload) {
-  if (
-    payload === null ||
-    typeof payload !== "object" ||
-    Array.isArray(payload) ||
-    !hasOnlyKeys(payload, NETWORK_LIST_KEYS) ||
-    !Array.isArray(payload.networks)
-  ) {
-    throw new ApiError(200, "The server returned an invalid network list");
-  }
-  const networks = payload.networks.map(networkSummary);
-  if (networks.some((network) => network === null)) {
-    throw new ApiError(200, "The server returned an invalid network list");
-  }
-  return Object.freeze(networks);
+  return Object.freeze(payload.networks.map(networkSummary));
 }
 
 export function backlogFrom(payload) {
-  if (
-    payload === null ||
-    typeof payload !== "object" ||
-    Array.isArray(payload) ||
-    !hasOnlyKeys(payload, BACKLOG_KEYS) ||
-    !Array.isArray(payload.lines) ||
-    payload.lines.some((line) => typeof line !== "string")
-  ) {
-    throw new ApiError(200, "The server returned an invalid backlog");
-  }
   return Object.freeze([...payload.lines]);
 }
 

@@ -1851,6 +1851,11 @@ mod tests {
         ("/api/v1/me/sessions", "delete", "200"),
         ("/api/v1/me/tokens", "post", "201"),
     ];
+    const CHAT_READ_OPERATIONS: &[(&str, &str)] = &[
+        ("/api/v1/me", "get"),
+        ("/api/v1/me/networks", "get"),
+        ("/api/v1/me/networks/{name}/buffer", "get"),
+    ];
 
     #[test]
     fn openapi_covers_every_documented_router_operation_exactly() {
@@ -1880,6 +1885,17 @@ mod tests {
                 assert_eq!(schema["type"], "object", "{method} {path}");
                 assert_eq!(schema["additionalProperties"], false, "{method} {path}");
             }
+        }
+    }
+
+    #[test]
+    fn browser_chat_reads_have_closed_json_response_schemas() {
+        let spec = super::document();
+        for (path, method) in CHAT_READ_OPERATIONS {
+            let schema = &spec["paths"][path][method]["responses"]["200"]["content"]["application/json"]
+                ["schema"];
+            assert_eq!(schema["type"], "object", "{method} {path}");
+            assert_eq!(schema["additionalProperties"], false, "{method} {path}");
         }
     }
 }
