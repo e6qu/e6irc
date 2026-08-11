@@ -1994,6 +1994,7 @@ async fn console_configuration_manages_every_credential_collection() {
     assert_eq!(api["settings"]["opers"][0]["password"], "");
     assert_eq!(api["settings"]["oidc_providers"][0]["client_secret"], "");
     assert!(api["settings"]["networks"][0]["sasl_password"].is_null());
+    assert!(api["settings"]["credentials_from_bootstrap"].is_boolean());
     let mut scalar_settings = api["settings"].clone();
     let scalar = scalar_settings.as_object_mut().expect("settings object");
     scalar.remove("oidc_providers");

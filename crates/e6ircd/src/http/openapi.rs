@@ -637,6 +637,12 @@ fn document() -> serde_json::Value {
             "required": ["name", "owner", "kind", "addr", "tls", "nick", "realname", "autojoin", "buffer_cap", "sasl_account", "sasl_password"],
             "properties": { "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "realname": { "type": ["string", "null"] }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] } } }
     }));
+    configuration_properties.insert(
+        "credentials_from_bootstrap".into(),
+        serde_json::json!({
+            "type": "boolean"
+        }),
+    );
     configuration_settings_schema["required"]
         .as_array_mut()
         .expect("configuration settings required fields are an array")
@@ -644,6 +650,7 @@ fn document() -> serde_json::Value {
             serde_json::json!("opers"),
             serde_json::json!("oidc_providers"),
             serde_json::json!("networks"),
+            serde_json::json!("credentials_from_bootstrap"),
         ]);
     let configuration_response = json_response(
         "redacted settings, revision, and runtime/bootstrap status",
