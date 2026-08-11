@@ -408,7 +408,7 @@ try {
   const accountDocument = await page.evaluate(() => performance.timeOrigin);
   const profileFailureErrorStart = applicationErrors.length;
   await page.route(profileURL, async (route) => {
-    if (route.request().method() === "POST") {
+    if (route.request().method() === "PATCH") {
       await route.fulfill({
         status: 503,
         contentType: "application/problem+json",
@@ -425,7 +425,7 @@ try {
   assert.equal(await contactEmail.inputValue(), "retry-contact@example.test");
   assert.deepEqual(
     applicationErrors.splice(profileFailureErrorStart),
-    [`503 POST ${profileURL}`],
+    [`503 PATCH ${profileURL}`],
     "a failed account mutation stayed in the current document",
   );
   await page.unroute(profileURL);
