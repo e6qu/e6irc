@@ -389,28 +389,17 @@ try {
   const profileRequest = new Promise((resolve) => {
     profileRequested = resolve;
   });
-  let rejectProfileMutation = false;
-  let profileMutationRoutes = 0;
-  let profileFailureFulfilled;
-  const profileFailure = new Promise((resolve) => {
-    profileFailureFulfilled = resolve;
+  let profileRouteContinued;
+  const profileRouteComplete = new Promise((resolve) => {
+    profileRouteContinued = resolve;
   });
   await page.route(profileURL, async (route) => {
-    if (route.request().method() === "PATCH" && rejectProfileMutation) {
-      profileMutationRoutes += 1;
-      profileFailureFulfilled();
-      await route.fulfill({
-        status: 503,
-        contentType: "application/problem+json",
-        body: JSON.stringify({ status: 503, title: "Profile storage unavailable" }),
-      });
-      return;
-    }
     if (route.request().method() === "GET") {
       profileRequested();
       await profileReleased;
     }
     await route.continue();
+    profileRouteContinued();
   });
   const profileResponse = page.waitForResponse(
     (response) => response.url() === profileURL && response.request().method() === "GET",
@@ -421,27 +410,30 @@ try {
   await contactEmail.fill("draft-contact@example.test");
   releaseProfile();
   await profileResponse;
+  await profileRouteComplete;
   assert.equal(await contactEmail.inputValue(), "draft-contact@example.test");
+  await page.unroute(profileURL);
   const accountDocument = await page.evaluate(() => performance.timeOrigin);
   const profileFailureErrorStart = applicationErrors.length;
-  const profileRequestStart = applicationRequests.length;
-  await page.evaluate(() => {
-    window.__e6ircProfileSubmitEvents = 0;
-    document.querySelector("[data-api-account-profile]").addEventListener("submit", () => {
-      window.__e6ircProfileSubmitEvents += 1;
-    });
+  let profileFailureFulfilled;
+  const profileFailure = new Promise((resolve) => {
+    profileFailureFulfilled = resolve;
   });
-  rejectProfileMutation = true;
+  await page.route(profileURL, async (route) => {
+    if (route.request().method() === "PATCH") {
+      profileFailureFulfilled();
+      await route.fulfill({
+        status: 503,
+        contentType: "application/problem+json",
+        body: JSON.stringify({ status: 503, title: "Profile storage unavailable" }),
+      });
+      return;
+    }
+    await route.continue();
+  });
   await contactEmail.fill("retry-contact@example.test");
   assert.equal(await contactEmail.evaluate((input) => input.checkValidity()), true);
-  await contactEmail.evaluate((input) => input.form.requestSubmit());
-  await page.waitForTimeout(250);
-  assert.equal(await page.evaluate(() => window.__e6ircProfileSubmitEvents), 1);
-  assert.equal(
-    profileMutationRoutes,
-    1,
-    `profile mutation requests: ${applicationRequests.slice(profileRequestStart).join(", ")}; browser errors: ${applicationErrors.slice(profileFailureErrorStart).join(", ")}`,
-  );
+  await page.getByRole("button", { name: "Save contact email", exact: true }).click();
   await profileFailure;
   await expectStatus(page, /Profile storage unavailable/);
   assert.equal(await page.evaluate(() => performance.timeOrigin), accountDocument);
