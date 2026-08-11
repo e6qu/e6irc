@@ -15,7 +15,8 @@ and integration claims.
 The console reads and writes only through `/api/v1`. Browser chat and console
 parse successful API payloads as objects at their shared boundaries before a
 view uses them. Browser chat parses each UI WebSocket event into its closed
-shape before handling it. Immutable console mutation operations are checked
+shape before handling it and serializes each composer request from its closed
+shape before sending it. Immutable console mutation operations are checked
 against the router. Successful mutations refresh their API-backed view without
 a document reload.
 

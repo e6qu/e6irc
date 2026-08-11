@@ -203,6 +203,75 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
     .await
     .expect("composer acknowledgement timed out");
     assert_eq!(accepted["v"], "integration-1");
+
+    // Unsupported input is rejected locally without closing a healthy socket.
+    ws.send(Tung::binary(b"not a composer frame".to_vec()))
+        .await
+        .unwrap();
+    let binary_rejected = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Tung::Text(text))) if text.contains("must be text JSON") => return text,
+                Some(Ok(_)) => {}
+                _ => panic!("ws/ui closed after a binary composer request"),
+            }
+        }
+    })
+    .await
+    .expect("binary composer rejection was not reported");
+    assert!(binary_rejected.contains("must be text JSON"));
+
+    ws.send(Tung::text(
+        serde_json::json!({
+            "target": "#lobby",
+            "message": "must not be sent",
+            "extra": true,
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let rejected = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Tung::Text(text))) if text.contains("invalid composer request") => {
+                    return text;
+                }
+                Some(Ok(_)) => {}
+                _ => panic!("ws/ui closed after an invalid composer request"),
+            }
+        }
+    })
+    .await
+    .expect("composer rejection was not reported");
+    assert!(rejected.contains("invalid composer request"));
+
+    ws.send(Tung::text(
+        serde_json::json!({
+            "id": "integration-2",
+            "target": "#lobby",
+            "message": "still connected",
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let message = peer.next_message().await.unwrap().unwrap();
+            if message.command == "PRIVMSG"
+                && message.params.get(1).map(String::as_str) == Some("still connected")
+            {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("valid composer frame after rejection never reached the peer");
+    assert!(
+        got.source.as_deref().unwrap_or("").starts_with("alicebnc!"),
+        "{got:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

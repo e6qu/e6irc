@@ -22,6 +22,7 @@ import {
   networksFrom,
   saveSettings,
 } from "./client-state.js";
+import { serializeComposerRequest } from "./composer-request.js";
 import { parseUiEvent } from "./ui-event.js";
 import {
   MEMBER_RANKS,
@@ -155,6 +156,12 @@ let memberTracking = true;
 let nextSendId = 0;
 const pendingSends = new Map();
 
+function sendComposer(target, message, requestId = undefined) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  socket.send(serializeComposerRequest({ id: requestId, target, message }));
+  return true;
+}
+
 function rememberSentText(text) {
   if (sentHistory[sentHistory.length - 1] !== text) sentHistory.push(text);
   if (sentHistory.length > 100) sentHistory.shift();
@@ -265,7 +272,15 @@ function requestNames(buffer) {
     return;
   }
   namesRequested.add(buffer.key);
-  socket.send(JSON.stringify({ target: "", message: `/raw NAMES ${buffer.display}` }));
+  try {
+    if (!sendComposer("", `/raw NAMES ${buffer.display}`)) {
+      namesRequested.delete(buffer.key);
+      addServer(`Could not refresh members for ${buffer.display}.`);
+    }
+  } catch {
+    namesRequested.delete(buffer.key);
+    addServer(`Could not refresh members for ${buffer.display}.`);
+  }
 }
 
 function resyncMemberships() {
@@ -576,7 +591,13 @@ bufferActionEl.addEventListener("click", () => {
     addServer(`Not connected — ${buffer.display} was not left.`);
     return;
   }
-  socket.send(JSON.stringify({ target: "", message: `/part ${buffer.display}` }));
+  try {
+    if (!sendComposer("", `/part ${buffer.display}`)) {
+      addServer(`Not connected — ${buffer.display} was not left.`);
+    }
+  } catch {
+    addServer(`The request to leave ${buffer.display} was not sent.`);
+  }
 });
 
 // ---- buffer mutation ----------------------------------------------------
@@ -1179,7 +1200,7 @@ composer.addEventListener("submit", (e) => {
   const requestId = nextSendId.toString(36);
   pendingSends.set(requestId, { buffer: b, text });
   try {
-    socket.send(JSON.stringify({ id: requestId, target, message: text }));
+    if (!sendComposer(target, text, requestId)) throw new Error("The live connection closed.");
   } catch (error) {
     pendingSends.delete(requestId);
     addServer("The message could not enter the live connection and was not sent.");
@@ -1201,7 +1222,15 @@ if (joinForm) {
     if (!chan) return;
     if (!isChannel(chan)) chan = "#" + chan;
     if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ target: "", message: `/join ${chan}` }));
+      try {
+        if (!sendComposer("", `/join ${chan}`)) {
+          addServer("Not connected — cannot join yet.");
+          return;
+        }
+      } catch {
+        addServer("The request to join was not sent.");
+        return;
+      }
     } else {
       addServer("Not connected — cannot join yet.");
     }
