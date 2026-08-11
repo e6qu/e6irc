@@ -406,12 +406,11 @@ try {
   const profileResponse = page.waitForResponse(
     (response) => response.url() === profileURL && response.request().method() === "GET",
   );
-  const accountNavigation = page.goto(`${applicationOrigin}/console/account`);
+  await page.goto(`${applicationOrigin}/console/account`, { waitUntil: "domcontentloaded" });
   await profileRequest;
   const contactEmail = page.getByLabel("Email address", { exact: true });
   await contactEmail.fill("draft-contact@example.test");
   releaseProfile();
-  await accountNavigation;
   await profileResponse;
   await profileRouteComplete;
   assert.equal(await contactEmail.inputValue(), "draft-contact@example.test");
