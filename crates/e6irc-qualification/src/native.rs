@@ -517,7 +517,10 @@ async fn oidc(target: &str) -> ProbeReport {
     ) else {
         return not_run(TargetKind::Oidc);
     };
-    let Some(discovery) = oidc_discovery_url(target) else {
+    let Some(issuer) = safe_url(target) else {
+        return not_run(TargetKind::Oidc);
+    };
+    let Some(discovery) = oidc_discovery_url(&issuer) else {
         return not_run(TargetKind::Oidc);
     };
     let Ok(http) = client() else {
@@ -536,6 +539,9 @@ async fn oidc(target: &str) -> ProbeReport {
             );
         }
     };
+    if !oidc_issuer_matches(&configuration, &issuer) {
+        return not_run(TargetKind::Oidc);
+    }
     let Some(token_endpoint) = configuration
         .get("token_endpoint")
         .and_then(serde_json::Value::as_str)
@@ -597,8 +603,15 @@ async fn oidc(target: &str) -> ProbeReport {
     )
 }
 
-fn oidc_discovery_url(target: &str) -> Option<Url> {
-    let mut issuer = safe_url(target)?;
+fn oidc_issuer_matches(configuration: &serde_json::Value, issuer: &Url) -> bool {
+    configuration
+        .get("issuer")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| value == issuer.as_str())
+}
+
+fn oidc_discovery_url(issuer: &Url) -> Option<Url> {
+    let mut issuer = issuer.clone();
     if !issuer.path().ends_with('/') {
         issuer.set_path(&format!("{}/", issuer.path()));
     }

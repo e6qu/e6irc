@@ -25,8 +25,9 @@ does not start a network request. Values are never included in output.
 
 Discord performs channel authentication, two gateway sessions, message post,
 read-back, and deletion. Slack performs `auth.test`, two Socket Mode sessions,
-message post, thread read-back, and deletion. OIDC discovers the issuer, gets
-two client-credential tokens, introspects one, and revokes it. The optional
+message post, thread read-back, and deletion. OIDC verifies the discovered
+issuer, gets two client-credential tokens, introspects one, and revokes it.
+The optional
 `E6IRC_DISCORD_API_BASE` and `E6IRC_SLACK_API_BASE` values select a compatible
 test or provider endpoint; they must be credential-free HTTP(S) URLs.
 

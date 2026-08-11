@@ -334,6 +334,7 @@ fn oidc_authorized(headers: &HeaderMap) -> bool {
 
 async fn oidc_discovery(State(state): State<OidcOracle>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
+        "issuer":state.issuer,
         "token_endpoint":state.token_endpoint,
         "introspection_endpoint":state.introspection_endpoint,
         "revocation_endpoint":state.revocation_endpoint,
@@ -396,12 +397,24 @@ fn endpoint_urls_cannot_carry_credentials_or_tokens() {
 
 #[test]
 fn oidc_discovery_keeps_the_issuer_path() {
+    let issuer = safe_url("https://issuer.example/realms/e6").expect("issuer");
     assert_eq!(
-        oidc_discovery_url("https://issuer.example/realms/e6")
-            .expect("discovery URL")
-            .as_str(),
+        oidc_discovery_url(&issuer).expect("discovery URL").as_str(),
         "https://issuer.example/realms/e6/.well-known/openid-configuration"
     );
+}
+
+#[test]
+fn oidc_discovery_metadata_must_name_the_requested_issuer() {
+    let issuer = safe_url("https://issuer.example/realms/e6").expect("issuer");
+    assert!(oidc_issuer_matches(
+        &serde_json::json!({"issuer":"https://issuer.example/realms/e6"}),
+        &issuer
+    ));
+    assert!(!oidc_issuer_matches(
+        &serde_json::json!({"issuer":"https://other.example/realms/e6"}),
+        &issuer
+    ));
 }
 
 #[test]
