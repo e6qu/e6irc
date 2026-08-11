@@ -1,8 +1,10 @@
 //! Run credential-gated external qualifications and write safe evidence.
 
+mod native;
+
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -11,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const USAGE: &str = "usage: e6irc-qualification KIND --target TARGET --source REVISION --host HOST --executable PATH --output PATH --workload NAME=VALUE --budget NAME=VALUE --probe PATH [--credential-env NAME]... [-- PROBE_ARGS...]";
+const USAGE: &str = "usage: e6irc-qualification KIND --target TARGET --source REVISION --host HOST --executable PATH --output PATH --workload NAME=VALUE --budget NAME=VALUE [--probe PATH [-- PROBE_ARGS...]]";
 
 fn main() -> ExitCode {
     match parse_args(std::env::args_os().skip(1)) {
@@ -188,7 +190,7 @@ struct Args {
     output: PathBuf,
     workload: Measurements,
     budgets: Measurements,
-    probe: PathBuf,
+    probe: Option<PathBuf>,
     credentials: Vec<CredentialEnv>,
     probe_args: Vec<OsString>,
 }
@@ -294,14 +296,25 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Args, Str
             executable.display()
         ));
     }
-    let probe = probe.ok_or_else(|| "--probe is required".to_string())?;
-    if !probe.is_file() {
+    let kind = TargetKind::parse(&kind)?;
+    if kind.uses_native_campaign() && probe.is_some() {
         return Err(format!(
-            "--probe is not a regular file: {}",
-            probe.display()
+            "{} uses its built-in adapter; --probe is invalid",
+            kind.name()
         ));
     }
-    let kind = TargetKind::parse(&kind)?;
+    let probe = if kind.uses_native_campaign() {
+        None
+    } else {
+        let probe = probe.ok_or_else(|| "--probe is required for this campaign".to_string())?;
+        if !probe.is_file() {
+            return Err(format!(
+                "--probe is not a regular file: {}",
+                probe.display()
+            ));
+        }
+        Some(probe)
+    };
     for name in kind.required_credentials() {
         let credential = CredentialEnv::parse((*name).to_string())?;
         if !credentials
@@ -333,6 +346,7 @@ enum PhaseOutcome {
     Rejected,
     Failed,
     NotApplicable,
+    NotRun,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -345,7 +359,32 @@ struct ProbeReport {
     persistence: PhaseOutcome,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeResult {
+    challenge: String,
+    #[serde(flatten)]
+    report: ProbeReport,
+}
+
 impl ProbeReport {
+    fn not_run(kind: TargetKind) -> Self {
+        let outcome = |index| {
+            if kind.requires_phase(index) {
+                PhaseOutcome::NotRun
+            } else {
+                PhaseOutcome::NotApplicable
+            }
+        };
+        Self {
+            authentication: outcome(0),
+            delivery: outcome(1),
+            reconnect: outcome(2),
+            cleanup: outcome(3),
+            persistence: outcome(4),
+        }
+    }
+
     fn uniform(outcome: PhaseOutcome) -> Self {
         Self {
             authentication: outcome,
@@ -368,6 +407,12 @@ impl ProbeReport {
         } else {
             ClosedOutcome::Rejected
         }
+    }
+
+    fn has_valid_applicability(&self, kind: TargetKind) -> bool {
+        self.outcomes().iter().enumerate().all(|(index, outcome)| {
+            (*outcome == PhaseOutcome::NotApplicable) != kind.requires_phase(index)
+        })
     }
 
     fn outcomes(&self) -> [PhaseOutcome; 5] {
@@ -402,7 +447,6 @@ enum ClosedOutcome {
 
 #[derive(Serialize)]
 struct ExecutableEvidence {
-    path: String,
     sha256: String,
 }
 
@@ -432,24 +476,43 @@ fn run(args: Args) -> ExitCode {
         }
     };
     let started_at_unix_ms = now_ms();
-    let probe_report_path = args.output.with_extension("probe.json");
+    let challenge = challenge(&args, &executable_sha256, started_at_unix_ms);
+    let probe_directory = match probe_directory(&args.output, &challenge) {
+        Ok(directory) => directory,
+        Err(error) => {
+            eprintln!("e6irc-qualification: cannot create isolated probe directory: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let probe_report_path = probe_directory.join("report.json");
     let missing_credential = args
         .credentials
         .iter()
         .any(|credential| !credential.is_present());
-    let report = if missing_credential {
-        ProbeReport::uniform(PhaseOutcome::Rejected)
+    let result = if missing_credential {
+        CampaignResult::Report(ProbeReport::not_run(args.kind))
+    } else if args.kind.uses_native_campaign() {
+        CampaignResult::Report(native::run(args.kind, &args.target.0))
+    } else if let Some(probe) = args.probe.as_deref() {
+        run_probe(&args, probe, &probe_report_path, &challenge)
     } else {
-        run_probe(&args, &probe_report_path)
+        CampaignResult::FailedBeforePhase
     };
-    let outcome = report.closed_outcome(args.kind);
+    let (report, outcome) = match result {
+        CampaignResult::Report(report) => {
+            let outcome = report.closed_outcome(args.kind);
+            (report, outcome)
+        }
+        CampaignResult::FailedBeforePhase => {
+            (ProbeReport::not_run(args.kind), ClosedOutcome::Failed)
+        }
+    };
     let evidence = QualificationEvidence {
         format_version: 1,
         kind: args.kind,
         target: args.target,
         source: args.source,
         executable: ExecutableEvidence {
-            path: args.executable.display().to_string(),
             sha256: executable_sha256,
         },
         host: args.host,
@@ -461,7 +524,7 @@ fn run(args: Args) -> ExitCode {
         probe: report,
         outcome,
     };
-    let _ = std::fs::remove_file(probe_report_path);
+    let _ = fs::remove_dir_all(probe_directory);
     if let Err(error) = write_evidence(&args.output, &evidence) {
         eprintln!("e6irc-qualification: could not write evidence: {error}");
         return ExitCode::FAILURE;
@@ -473,20 +536,55 @@ fn run(args: Args) -> ExitCode {
     }
 }
 
-fn run_probe(args: &Args, report_path: &Path) -> ProbeReport {
-    let status = Command::new(&args.probe)
+impl TargetKind {
+    fn uses_native_campaign(self) -> bool {
+        matches!(self, Self::Discord | Self::Slack | Self::Oidc)
+    }
+}
+
+enum CampaignResult {
+    Report(ProbeReport),
+    FailedBeforePhase,
+}
+
+fn run_probe(args: &Args, probe: &Path, report_path: &Path, challenge: &str) -> CampaignResult {
+    let status = Command::new(probe)
         .args(&args.probe_args)
         .env("E6IRC_QUALIFICATION_KIND", args.kind.name())
         .env("E6IRC_QUALIFICATION_TARGET", &args.target.0)
         .env("E6IRC_QUALIFICATION_PROBE_REPORT", report_path)
+        .env("E6IRC_QUALIFICATION_CHALLENGE", challenge)
         .status();
     if !matches!(status, Ok(status) if status.success()) {
-        return ProbeReport::uniform(PhaseOutcome::Failed);
+        return CampaignResult::FailedBeforePhase;
     }
     let Ok(bytes) = std::fs::read(report_path) else {
-        return ProbeReport::uniform(PhaseOutcome::Failed);
+        return CampaignResult::FailedBeforePhase;
     };
-    serde_json::from_slice(&bytes).unwrap_or_else(|_| ProbeReport::uniform(PhaseOutcome::Failed))
+    match serde_json::from_slice::<ProbeResult>(&bytes) {
+        Ok(result)
+            if result.challenge == challenge
+                && result.report.has_valid_applicability(args.kind) =>
+        {
+            CampaignResult::Report(result.report)
+        }
+        _ => CampaignResult::FailedBeforePhase,
+    }
+}
+
+fn challenge(args: &Args, executable_sha256: &str, started_at_unix_ms: u128) -> String {
+    let mut digest = Sha256::new();
+    digest.update(executable_sha256);
+    digest.update(args.output.as_os_str().as_encoded_bytes());
+    digest.update(started_at_unix_ms.to_le_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn probe_directory(output: &Path, challenge: &str) -> std::io::Result<PathBuf> {
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let directory = parent.join(format!(".e6irc-qualification-{challenge}"));
+    fs::create_dir(&directory)?;
+    Ok(directory)
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {
@@ -526,6 +624,10 @@ mod tests {
         assert_eq!(
             ProbeReport::uniform(PhaseOutcome::Failed).closed_outcome(TargetKind::Discord),
             ClosedOutcome::Failed
+        );
+        assert_eq!(
+            ProbeReport::not_run(TargetKind::Discord).closed_outcome(TargetKind::Discord),
+            ClosedOutcome::Rejected
         );
     }
 
@@ -600,5 +702,7 @@ mod tests {
             public_irc.closed_outcome(TargetKind::Discord),
             ClosedOutcome::Rejected
         );
+        assert!(public_irc.has_valid_applicability(TargetKind::PublicIrc));
+        assert!(!public_irc.has_valid_applicability(TargetKind::Discord));
     }
 }

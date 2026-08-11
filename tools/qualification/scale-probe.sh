@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${E6IRC_QUALIFICATION_PROBE_REPORT:?}"
+source "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/report.sh"
 
 if [[ $# -lt 2 ]]; then
   echo 'usage: scale-probe.sh LOAD_BIN RESULT_JSON [LOAD_ARGS...]' >&2
@@ -17,10 +17,11 @@ set +e
 set -e
 
 if [[ -f "$result" ]] && jq -e '.status == "completed" and .report.outcome == "passed"' "$result" >/dev/null; then
-  report='{"authentication":"passed","delivery":"passed","reconnect":"not_applicable","cleanup":"passed","persistence":"not_applicable"}'
+  report='passed passed not_applicable passed not_applicable'
 elif [[ -f "$result" ]] && jq -e '.status == "completed" and .report.outcome == "rejected"' "$result" >/dev/null; then
-  report='{"authentication":"rejected","delivery":"rejected","reconnect":"not_applicable","cleanup":"rejected","persistence":"not_applicable"}'
+  report='rejected rejected not_applicable rejected not_applicable'
 else
-  report='{"authentication":"failed","delivery":"failed","reconnect":"not_applicable","cleanup":"failed","persistence":"not_applicable"}'
+  exit 1
 fi
-printf '%s\n' "$report" >"$E6IRC_QUALIFICATION_PROBE_REPORT"
+read -r -a phases <<<"$report"
+write_probe_report "${phases[@]}"

@@ -6,13 +6,20 @@ bin="$root/target/debug/e6irc-qualification"
 temporary="$(mktemp -d)"
 trap 'rm -rf "$temporary"' EXIT
 
-cargo build --quiet -p e6irc-qualification
+cargo build -p e6irc-qualification
 
 probe() {
   local name="$1" report="$2"
   shift 2
   local path="$temporary/$name"
-  printf '#!/usr/bin/env bash\nset -euo pipefail\nprintf %%s %q > "$E6IRC_QUALIFICATION_PROBE_REPORT"\n' "$report" >"$path"
+  local report_tail="${report#\{}"
+  {
+    printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
+    printf '%s\n' 'printf %s '\''{"challenge":"'\'' > "$E6IRC_QUALIFICATION_PROBE_REPORT"'
+    printf '%s\n' 'printf %s "$E6IRC_QUALIFICATION_CHALLENGE" >> "$E6IRC_QUALIFICATION_PROBE_REPORT"'
+    printf '%s\n' 'printf %s '\''",'\'' >> "$E6IRC_QUALIFICATION_PROBE_REPORT"'
+    printf 'printf %%s %q >> "$E6IRC_QUALIFICATION_PROBE_REPORT"\n' "$report_tail"
+  } >"$path"
   chmod +x "$path"
   printf '%s\n' "$path"
 }
@@ -30,17 +37,49 @@ run() {
     "$@"
 }
 
-passed='{"authentication":"passed","delivery":"passed","reconnect":"passed","cleanup":"passed","persistence":"passed"}'
-rejected='{"authentication":"passed","delivery":"rejected","reconnect":"passed","cleanup":"passed","persistence":"passed"}'
+public_passed='{"authentication":"passed","delivery":"not_applicable","reconnect":"passed","cleanup":"passed","persistence":"not_applicable"}'
+scale_rejected='{"authentication":"passed","delivery":"rejected","reconnect":"not_applicable","cleanup":"passed","persistence":"not_applicable"}'
 
-pass_probe="$(probe pass "$passed")"
+pass_probe="$(probe pass "$public_passed")"
 run public-irc --output "$temporary/passed.json" --probe "$pass_probe"
 jq -e '
   .kind == "public_irc" and .outcome == "passed" and
-  (.probe | .authentication == "passed" and .delivery == "passed" and .reconnect == "passed" and .cleanup == "passed" and .persistence == "passed") and
-  (.executable.sha256 | test("^[0-9a-f]{64}$"))
+  (.probe | .authentication == "passed" and .delivery == "not_applicable" and .reconnect == "passed" and .cleanup == "passed" and .persistence == "not_applicable") and
+  (.executable.sha256 | test("^[0-9a-f]{64}$")) and
+  (.executable | has("path") | not)
 ' "$temporary/passed.json" >/dev/null
 ! find "$temporary" -name '*.probe.json' -print -quit | grep -q .
+
+occupied="$temporary/occupied.json"
+printf '%s' retained >"$occupied"
+if run public-irc --output "$occupied" --probe "$pass_probe"; then
+  echo 'existing evidence was overwritten' >&2
+  exit 1
+else
+  [[ $? -eq 2 ]]
+fi
+[[ "$(<"$occupied")" == retained ]]
+
+stale_probe="$temporary/stale"
+printf '%s\n' '#!/usr/bin/env bash' 'printf %s '\''{"challenge":"stale","authentication":"passed","delivery":"passed","reconnect":"passed","cleanup":"passed","persistence":"passed"}'\'' > "$E6IRC_QUALIFICATION_PROBE_REPORT"' >"$stale_probe"
+chmod +x "$stale_probe"
+if run public-irc --output "$temporary/stale.json" --probe "$stale_probe"; then
+  echo 'stale report unexpectedly passed' >&2
+  exit 1
+else
+  [[ $? -eq 1 ]]
+fi
+jq -e '.outcome == "failed" and .probe.authentication == "not_run" and .probe.delivery == "not_applicable" and .probe.reconnect == "not_run" and .probe.cleanup == "not_run" and .probe.persistence == "not_applicable"' "$temporary/stale.json" >/dev/null
+
+invalid_applicability='{"authentication":"not_applicable","delivery":"not_applicable","reconnect":"passed","cleanup":"passed","persistence":"not_applicable"}'
+invalid_applicability_probe="$(probe invalid-applicability "$invalid_applicability")"
+if run public-irc --output "$temporary/invalid-applicability.json" --probe "$invalid_applicability_probe"; then
+  echo 'invalid phase applicability unexpectedly passed' >&2
+  exit 1
+else
+  [[ $? -eq 1 ]]
+fi
+jq -e '.outcome == "failed" and .probe.authentication == "not_run"' "$temporary/invalid-applicability.json" >/dev/null
 
 if run public-irc --output "$temporary/public-rejected.json" --probe "$root/tools/qualification/public-irc-probe.sh"; then
   echo 'unknown public IRC target unexpectedly passed' >&2
@@ -50,30 +89,24 @@ else
 fi
 jq -e '.kind == "public_irc" and .outcome == "rejected" and .probe.delivery == "not_applicable"' "$temporary/public-rejected.json" >/dev/null
 
-reject_probe="$(probe reject "$passed")"
-if E6IRC_DISCORD_BOT_TOKEN='' run discord --output "$temporary/rejected.json" --probe "$reject_probe"; then
+if E6IRC_DISCORD_BOT_TOKEN='' run discord --output "$temporary/rejected.json"; then
   echo 'missing credential unexpectedly passed' >&2
   exit 1
 else
   [[ $? -eq 3 ]]
 fi
-jq -e '.kind == "discord" and .outcome == "rejected" and ([.probe[]] | all(. == "rejected"))' "$temporary/rejected.json" >/dev/null
+jq -e '.kind == "discord" and .outcome == "rejected" and ([.probe[]] | all(. == "not_run"))' "$temporary/rejected.json" >/dev/null
 
-failure_probe="$(probe failure '{not-json')"
-if E6IRC_DISCORD_BOT_TOKEN='literal-secret-token' run discord --output "$temporary/failed.json" --probe "$failure_probe"; then
-  echo 'malformed probe report unexpectedly passed' >&2
+if E6IRC_DISCORD_BOT_TOKEN='literal-secret-token' E6IRC_DISCORD_CHANNEL_ID='42' \
+  run discord --output "$temporary/invalid-probe.json" --probe "$pass_probe"; then
+  echo 'native Discord campaign accepted an external probe' >&2
   exit 1
+else
+  [[ $? -eq 2 ]]
 fi
-jq -e '.kind == "discord" and .outcome == "failed" and ([.probe[]] | all(. == "failed"))' "$temporary/failed.json" >/dev/null
-! rg -F 'literal-secret-token' "$temporary/failed.json"
+[[ ! -e "$temporary/invalid-probe.json" ]]
 
-slack_probe="$(probe slack "$passed")"
-E6IRC_SLACK_BOT_TOKEN='literal-slack-bot' E6IRC_SLACK_APP_TOKEN='literal-slack-app' E6IRC_SLACK_PROBE="$slack_probe" \
-  run slack --output "$temporary/slack-passed.json" --probe "$root/tools/qualification/external-probe.sh"
-jq -e '.kind == "slack" and .outcome == "passed"' "$temporary/slack-passed.json" >/dev/null
-! rg -F 'literal-slack-' "$temporary/slack-passed.json"
-
-partial_probe="$(probe partial "$rejected")"
+partial_probe="$(probe partial "$scale_rejected")"
 if run scale --output "$temporary/partial.json" --probe "$partial_probe"; then
   echo 'partial qualification unexpectedly passed' >&2
   exit 1
@@ -101,16 +134,10 @@ chmod +x "$load_pass"
 run scale --output "$temporary/scale-passed.json" --probe "$root/tools/qualification/scale-probe.sh" -- "$load_pass" "$temporary/load-pass.json"
 jq -e '.kind == "scale" and .outcome == "passed" and .probe.persistence == "not_applicable"' "$temporary/scale-passed.json" >/dev/null
 
-if run oidc --output "$temporary/oidc-rejected.json" --probe "$root/tools/qualification/external-probe.sh"; then
+if run oidc --output "$temporary/oidc-rejected.json"; then
   echo 'missing OIDC credential unexpectedly passed' >&2
   exit 1
 else
   [[ $? -eq 3 ]]
 fi
 jq -e '.kind == "oidc" and .outcome == "rejected"' "$temporary/oidc-rejected.json" >/dev/null
-
-oidc_probe="$(probe oidc '{"authentication":"passed","delivery":"not_applicable","reconnect":"passed","cleanup":"passed","persistence":"passed"}')"
-E6IRC_OIDC_CLIENT_SECRET='literal-oidc-secret' E6IRC_OIDC_PROBE="$oidc_probe" \
-  run oidc --output "$temporary/oidc-passed.json" --probe "$root/tools/qualification/external-probe.sh"
-jq -e '.kind == "oidc" and .outcome == "passed" and .probe.delivery == "not_applicable"' "$temporary/oidc-passed.json" >/dev/null
-! rg -F 'literal-oidc-secret' "$temporary/oidc-passed.json"
