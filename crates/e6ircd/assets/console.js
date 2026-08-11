@@ -2287,7 +2287,7 @@
         const { addr, tls, nick, realname, sasl_account, sasl_password } = connection;
         void mutateOwnerNetwork(form, "/api/v1/me/networks/preflight", "POST", {
           addr, tls, nick, realname, sasl_account, sasl_password,
-        }, false);
+        }, true);
         return;
       }
       void mutateOwnerNetwork(form, form.action, "POST", { kind: "irc", name, ...connection });
