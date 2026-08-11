@@ -1431,6 +1431,22 @@ try {
     expectedTaggedTime,
   );
 
+  const invalidEventErrorStart = applicationErrors.length;
+  mockSocket.send("null");
+  await page
+    .getByText("The server sent an invalid live event. The event was rejected; other messages remain connected.", { exact: true })
+    .waitFor();
+  mockSocket.send(JSON.stringify({
+    t: "line",
+    v: ":alice!u@h PRIVMSG #room :valid event after rejected event",
+  }));
+  await page.getByText("valid event after rejected event", { exact: true }).waitFor();
+  assert.deepEqual(
+    applicationErrors.splice(invalidEventErrorStart),
+    [],
+    "a rejected live event stayed in the document and did not break the socket handler",
+  );
+
   // Reading older content must not make new live traffic disappear below the
   // viewport. The explicit control stays keyboard-accessible and returns to
   // the newest line without changing conversations.

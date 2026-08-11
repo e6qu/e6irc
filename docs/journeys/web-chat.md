@@ -43,8 +43,9 @@ stacking duplicate handlers.
 
 **Security and observability.** Network inventory and attachment are
 cookie-authenticated and owner-scoped; the WebSocket enforces same-origin
-policy. Server-controlled text reaches the document only through text nodes,
-and connection/attachment/error state is counted without user text in metric
+policy. Each inbound event is parsed into a closed shape before handling.
+Server-controlled text reaches the document only through text nodes, and
+connection/attachment/error state is counted without user text in metric
 labels.
 
 **Evidence.** The embedded-shell, authentication, zero-network, deliberate

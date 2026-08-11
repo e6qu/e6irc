@@ -520,20 +520,39 @@ enum ComposerResult<'a> {
     },
 }
 
+#[derive(serde::Serialize)]
+#[serde(tag = "t")]
+enum UiEvent<'a> {
+    #[serde(rename = "line")]
+    Line { v: &'a str },
+    #[serde(rename = "sent")]
+    Sent { v: &'a str },
+    #[serde(rename = "send-error")]
+    SendError { v: &'a str, message: &'a str },
+    #[serde(rename = "snapshot")]
+    Snapshot { v: &'static str },
+    #[serde(rename = "status")]
+    Status {
+        v: ConnStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<&'a str>,
+    },
+}
+
+fn ui_event(event: UiEvent<'_>) -> String {
+    serde_json::to_string(&event).expect("UI event serialization is infallible")
+}
+
 fn composer_result_event(result: ComposerResult<'_>) -> String {
     match result {
-        ComposerResult::Sent(request_id) => {
-            serde_json::json!({ "t": "sent", "v": request_id }).to_string()
-        }
+        ComposerResult::Sent(request_id) => ui_event(UiEvent::Sent { v: request_id }),
         ComposerResult::Rejected {
             request_id: Some(request_id),
             message,
-        } => serde_json::json!({
-            "t": "send-error",
-            "v": request_id,
-            "message": message,
-        })
-        .to_string(),
+        } => ui_event(UiEvent::SendError {
+            v: request_id,
+            message,
+        }),
         ComposerResult::Rejected {
             request_id: None,
             message,
@@ -590,31 +609,22 @@ pub(super) fn slash_to_irc(message: &str, target: &str) -> String {
 /// gives the live and persisted timelines the same clock, while `msgid` gives
 /// their overlap a stable identity. `serde_json` handles all escaping.
 pub(super) fn line_event(line: &str) -> String {
-    serde_json::json!({ "t": "line", "v": line }).to_string()
+    ui_event(UiEvent::Line { v: line })
 }
 
 /// Marks the point after detached-buffer replay and before live traffic.
 pub(super) fn snapshot_event() -> String {
-    serde_json::json!({ "t": "snapshot", "v": "complete" }).to_string()
+    ui_event(UiEvent::Snapshot { v: "complete" })
 }
 
 /// Connection state sent to the web client. An enum (not a free `&str`) so the
 /// emitted value is closed and can never carry untrusted text.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(super) enum ConnStatus {
     Connected,
     Disconnected,
     Unavailable,
-}
-
-impl ConnStatus {
-    fn label(self) -> &'static str {
-        match self {
-            ConnStatus::Connected => "connected",
-            ConnStatus::Disconnected => "disconnected",
-            ConnStatus::Unavailable => "unavailable",
-        }
-    }
 }
 
 /// The operator-safe summary of the driver's classified last failure, when
@@ -638,12 +648,7 @@ fn disconnect_reason(
 /// the classified failure summary, so the chat UI can say *why* the upstream
 /// is reconnecting instead of leaving the user to guess.
 pub(super) fn status_event(status: ConnStatus, reason: Option<&str>) -> String {
-    match reason {
-        Some(reason) => {
-            serde_json::json!({ "t": "status", "v": status.label(), "reason": reason }).to_string()
-        }
-        None => serde_json::json!({ "t": "status", "v": status.label() }).to_string(),
-    }
+    ui_event(UiEvent::Status { v: status, reason })
 }
 
 #[cfg(test)]
@@ -667,6 +672,43 @@ mod tests {
             event,
             serde_json::json!({ "t": "snapshot", "v": "complete" })
         );
+    }
+
+    #[test]
+    fn ui_events_have_exact_shapes() {
+        let cases = [
+            (
+                line_event("PING :server"),
+                serde_json::json!({ "t": "line", "v": "PING :server" }),
+            ),
+            (
+                composer_result_event(ComposerResult::Sent("a1")),
+                serde_json::json!({ "t": "sent", "v": "a1" }),
+            ),
+            (
+                composer_result_event(ComposerResult::Rejected {
+                    request_id: Some("a1"),
+                    message: "not sent",
+                }),
+                serde_json::json!({ "t": "send-error", "v": "a1", "message": "not sent" }),
+            ),
+            (
+                status_event(ConnStatus::Connected, None),
+                serde_json::json!({ "t": "status", "v": "connected" }),
+            ),
+            (
+                status_event(ConnStatus::Disconnected, Some("connection lost")),
+                serde_json::json!({ "t": "status", "v": "disconnected", "reason": "connection lost" }),
+            ),
+            (
+                status_event(ConnStatus::Unavailable, None),
+                serde_json::json!({ "t": "status", "v": "unavailable" }),
+            ),
+        ];
+        for (wire, expected) in cases {
+            let event: serde_json::Value = serde_json::from_str(&wire).expect("UI event JSON");
+            assert_eq!(event, expected, "{wire}");
+        }
     }
 
     #[test]
