@@ -82,6 +82,7 @@ network, or tuned host. Publish a passed claim only with retained evidence.
 
 Run **External qualification** from the Actions page. It is manual only. Pick
 one campaign and supply non-secret target, host, workload, and budget values.
+The scale campaign measures its host itself and does not use `host`.
 The workflow sets provider credentials only from these repository secrets:
 
 - `E6IRC_DISCORD_BOT_TOKEN`, `E6IRC_DISCORD_CHANNEL_ID`

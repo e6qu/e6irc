@@ -13,8 +13,8 @@ on:
         required: true
         type: string
       host:
-        description: Non-secret name of the qualification host
-        required: true
+        description: Non-secret host name; required except for scale
+        required: false
         type: string
       workload:
         description: One NAME=VALUE workload measurement; not used by scale
@@ -68,8 +68,8 @@ jobs:
           status=2
           case '${{ inputs.campaign }}' in
             discord|slack|oidc)
-              if [[ -z "$QUALIFICATION_WORKLOAD" || -z "$QUALIFICATION_BUDGET" ]]; then
-                echo 'workload and budget are required' >&2
+              if [[ -z "$QUALIFICATION_HOST" || -z "$QUALIFICATION_WORKLOAD" || -z "$QUALIFICATION_BUDGET" ]]; then
+                echo 'host, workload, and budget are required' >&2
               else
                 target/release/e6irc-qualification '${{ inputs.campaign }}' \
                   --target "$QUALIFICATION_TARGET" \
@@ -83,8 +83,8 @@ jobs:
               fi
               ;;
             public-irc)
-              if [[ -z "$QUALIFICATION_WORKLOAD" || -z "$QUALIFICATION_BUDGET" ]]; then
-                echo 'workload and budget are required' >&2
+              if [[ -z "$QUALIFICATION_HOST" || -z "$QUALIFICATION_WORKLOAD" || -z "$QUALIFICATION_BUDGET" ]]; then
+                echo 'host, workload, and budget are required' >&2
               else
                 target/release/e6irc-qualification public-irc \
                   --target "$QUALIFICATION_TARGET" \
