@@ -21,7 +21,7 @@ if [[ -f "$result" ]] && jq -e '.status == "completed" and .report.outcome == "p
 elif [[ -f "$result" ]] && jq -e '.status == "completed" and .report.outcome == "rejected"' "$result" >/dev/null; then
   report='rejected rejected not_applicable rejected not_applicable'
 else
-  report='failed failed not_applicable failed not_applicable'
+  exit 1
 fi
 read -r -a phases <<<"$report"
 write_probe_report "${phases[@]}"

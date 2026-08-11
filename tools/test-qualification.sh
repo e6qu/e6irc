@@ -69,7 +69,17 @@ if run public-irc --output "$temporary/stale.json" --probe "$stale_probe"; then
 else
   [[ $? -eq 1 ]]
 fi
-jq -e '.outcome == "failed" and ([.probe[]] | all(. == "failed"))' "$temporary/stale.json" >/dev/null
+jq -e '.outcome == "failed" and .probe.authentication == "not_run" and .probe.delivery == "not_applicable" and .probe.reconnect == "not_run" and .probe.cleanup == "not_run" and .probe.persistence == "not_applicable"' "$temporary/stale.json" >/dev/null
+
+invalid_applicability='{"authentication":"not_applicable","delivery":"not_applicable","reconnect":"passed","cleanup":"passed","persistence":"not_applicable"}'
+invalid_applicability_probe="$(probe invalid-applicability "$invalid_applicability")"
+if run public-irc --output "$temporary/invalid-applicability.json" --probe "$invalid_applicability_probe"; then
+  echo 'invalid phase applicability unexpectedly passed' >&2
+  exit 1
+else
+  [[ $? -eq 1 ]]
+fi
+jq -e '.outcome == "failed" and .probe.authentication == "not_run"' "$temporary/invalid-applicability.json" >/dev/null
 
 if run public-irc --output "$temporary/public-rejected.json" --probe "$root/tools/qualification/public-irc-probe.sh"; then
   echo 'unknown public IRC target unexpectedly passed' >&2
@@ -85,7 +95,7 @@ if E6IRC_DISCORD_BOT_TOKEN='' run discord --output "$temporary/rejected.json"; t
 else
   [[ $? -eq 3 ]]
 fi
-jq -e '.kind == "discord" and .outcome == "rejected" and ([.probe[]] | all(. == "rejected"))' "$temporary/rejected.json" >/dev/null
+jq -e '.kind == "discord" and .outcome == "rejected" and ([.probe[]] | all(. == "not_run"))' "$temporary/rejected.json" >/dev/null
 
 if E6IRC_DISCORD_BOT_TOKEN='literal-secret-token' E6IRC_DISCORD_CHANNEL_ID='42' \
   run discord --output "$temporary/invalid-probe.json" --probe "$pass_probe"; then

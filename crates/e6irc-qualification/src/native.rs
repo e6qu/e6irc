@@ -26,12 +26,19 @@ pub(super) fn run(kind: TargetKind, target: &str) -> ProbeReport {
 }
 
 fn report(
+    kind: TargetKind,
     authentication: PhaseOutcome,
     delivery: PhaseOutcome,
     reconnect: PhaseOutcome,
     cleanup: PhaseOutcome,
     persistence: PhaseOutcome,
 ) -> ProbeReport {
+    let outcomes = [authentication, delivery, reconnect, cleanup, persistence];
+    if outcomes.iter().enumerate().any(|(index, outcome)| {
+        (*outcome == PhaseOutcome::NotApplicable) == kind.requires_phase(index)
+    }) {
+        return ProbeReport::not_run(kind);
+    }
     ProbeReport {
         authentication,
         delivery,
@@ -41,12 +48,19 @@ fn report(
     }
 }
 
-fn rejected() -> ProbeReport {
-    ProbeReport::uniform(PhaseOutcome::Rejected)
+fn not_run(kind: TargetKind) -> ProbeReport {
+    ProbeReport::not_run(kind)
 }
 
-fn failed() -> ProbeReport {
-    ProbeReport::uniform(PhaseOutcome::Failed)
+fn failed(kind: TargetKind) -> ProbeReport {
+    report(
+        kind,
+        PhaseOutcome::Failed,
+        PhaseOutcome::NotRun,
+        PhaseOutcome::NotRun,
+        PhaseOutcome::NotRun,
+        PhaseOutcome::NotRun,
+    )
 }
 
 fn setting(name: &str) -> Option<String> {
@@ -123,26 +137,28 @@ fn marker(kind: &str) -> String {
 
 async fn discord(_target: &str) -> ProbeReport {
     let Some(token) = setting("E6IRC_DISCORD_BOT_TOKEN") else {
-        return rejected();
+        return not_run(TargetKind::Discord);
     };
     let Some(channel) = setting("E6IRC_DISCORD_CHANNEL_ID") else {
-        return rejected();
+        return not_run(TargetKind::Discord);
     };
     if SafeText::parse(channel.clone(), "E6IRC_DISCORD_CHANNEL_ID").is_err() {
-        return rejected();
+        return not_run(TargetKind::Discord);
     }
     let base =
         setting("E6IRC_DISCORD_API_BASE").unwrap_or_else(|| "https://discord.com/api/v10".into());
     let Some(base) = safe_url(&base) else {
-        return rejected();
+        return not_run(TargetKind::Discord);
     };
     let Some(gateway) = endpoint(&base, "gateway") else {
-        return rejected();
+        return not_run(TargetKind::Discord);
     };
-    let Ok(http) = client() else { return failed() };
+    let Ok(http) = client() else {
+        return failed(TargetKind::Discord);
+    };
     let authorization = format!("Bot {token}");
     let Some(channel_url) = endpoint(&base, &format!("channels/{channel}")) else {
-        return rejected();
+        return not_run(TargetKind::Discord);
     };
     let auth = request_outcome(
         http.get(channel_url.clone())
@@ -150,7 +166,14 @@ async fn discord(_target: &str) -> ProbeReport {
     )
     .await;
     if auth != PhaseOutcome::Passed {
-        return report(auth, auth, auth, auth, auth);
+        return report(
+            TargetKind::Discord,
+            auth,
+            PhaseOutcome::NotRun,
+            PhaseOutcome::NotRun,
+            PhaseOutcome::NotRun,
+            PhaseOutcome::NotRun,
+        );
     }
     let gateway_url = match success_json(http.get(gateway)).await {
         Ok(json) => json
@@ -159,16 +182,24 @@ async fn discord(_target: &str) -> ProbeReport {
             .map(str::to_owned),
         Err(outcome) => {
             return report(
+                TargetKind::Discord,
                 PhaseOutcome::Passed,
+                PhaseOutcome::NotRun,
                 outcome,
-                PhaseOutcome::Failed,
-                PhaseOutcome::Failed,
-                PhaseOutcome::Failed,
+                PhaseOutcome::NotRun,
+                PhaseOutcome::NotRun,
             );
         }
     };
     let Some(gateway_url) = gateway_url else {
-        return failed();
+        return report(
+            TargetKind::Discord,
+            PhaseOutcome::Passed,
+            PhaseOutcome::NotRun,
+            PhaseOutcome::Failed,
+            PhaseOutcome::NotRun,
+            PhaseOutcome::NotRun,
+        );
     };
     let reconnect = match discord_connect(&gateway_url, &token).await {
         PhaseOutcome::Passed => discord_connect(&gateway_url, &token).await,
@@ -176,17 +207,18 @@ async fn discord(_target: &str) -> ProbeReport {
     };
     if reconnect != PhaseOutcome::Passed {
         return report(
+            TargetKind::Discord,
             PhaseOutcome::Passed,
+            PhaseOutcome::NotRun,
             reconnect,
-            reconnect,
-            reconnect,
-            reconnect,
+            PhaseOutcome::NotRun,
+            PhaseOutcome::NotRun,
         );
     }
     let message = marker("discord");
     let message_collection = match endpoint(&base, &format!("channels/{channel}/messages")) {
         Some(url) => url,
-        None => return rejected(),
+        None => return not_run(TargetKind::Discord),
     };
     let posted = match success_json(
         http.post(message_collection)
@@ -198,19 +230,34 @@ async fn discord(_target: &str) -> ProbeReport {
         Ok(json) => Some(json),
         Err(outcome) => {
             return report(
+                TargetKind::Discord,
                 PhaseOutcome::Passed,
                 outcome,
                 reconnect,
-                PhaseOutcome::Failed,
-                PhaseOutcome::Failed,
+                PhaseOutcome::NotRun,
+                PhaseOutcome::NotRun,
             );
         }
     };
     let Some(id) = posted.and_then(|json| json.get("id")?.as_str().map(str::to_owned)) else {
-        return failed();
+        return report(
+            TargetKind::Discord,
+            PhaseOutcome::Passed,
+            PhaseOutcome::Failed,
+            reconnect,
+            PhaseOutcome::NotRun,
+            PhaseOutcome::NotRun,
+        );
     };
     let Some(message_url) = endpoint(&base, &format!("channels/{channel}/messages/{id}")) else {
-        return failed();
+        return report(
+            TargetKind::Discord,
+            PhaseOutcome::Passed,
+            PhaseOutcome::Failed,
+            reconnect,
+            PhaseOutcome::NotRun,
+            PhaseOutcome::NotRun,
+        );
     };
     let persistence = request_outcome(
         http.get(message_url.clone())
@@ -223,6 +270,7 @@ async fn discord(_target: &str) -> ProbeReport {
     )
     .await;
     report(
+        TargetKind::Discord,
         PhaseOutcome::Passed,
         PhaseOutcome::Passed,
         reconnect,
@@ -288,19 +336,21 @@ async fn slack(_target: &str) -> ProbeReport {
         setting("E6IRC_SLACK_APP_TOKEN"),
         setting("E6IRC_SLACK_CHANNEL_ID"),
     ) else {
-        return rejected();
+        return not_run(TargetKind::Slack);
     };
     if SafeText::parse(channel.clone(), "E6IRC_SLACK_CHANNEL_ID").is_err() {
-        return rejected();
+        return not_run(TargetKind::Slack);
     }
     let base = setting("E6IRC_SLACK_API_BASE").unwrap_or_else(|| "https://slack.com/api/".into());
     let Some(base) = safe_url(&base) else {
-        return rejected();
+        return not_run(TargetKind::Slack);
     };
-    let Ok(http) = client() else { return failed() };
+    let Ok(http) = client() else {
+        return failed(TargetKind::Slack);
+    };
     let authorization = format!("Bearer {bot}");
     let Some(auth_url) = endpoint(&base, "auth.test") else {
-        return rejected();
+        return not_run(TargetKind::Slack);
     };
     let auth = json_outcome(
         http.post(auth_url).header("Authorization", &authorization),
@@ -308,21 +358,44 @@ async fn slack(_target: &str) -> ProbeReport {
     )
     .await;
     if auth != PhaseOutcome::Passed {
-        return report(auth, auth, auth, auth, auth);
+        return report(
+            TargetKind::Slack,
+            auth,
+            PhaseOutcome::NotRun,
+            PhaseOutcome::NotRun,
+            PhaseOutcome::NotRun,
+            PhaseOutcome::NotRun,
+        );
     }
     let socket = match slack_socket(&http, &base, &app).await {
         Ok(url) => url,
-        Err(outcome) => return report(auth, outcome, outcome, outcome, outcome),
+        Err(outcome) => {
+            return report(
+                TargetKind::Slack,
+                auth,
+                PhaseOutcome::NotRun,
+                outcome,
+                PhaseOutcome::NotRun,
+                PhaseOutcome::NotRun,
+            );
+        }
     };
     let reconnect = match slack_connect(&socket).await {
         PhaseOutcome::Passed => slack_connect(&socket).await,
         outcome => outcome,
     };
     if reconnect != PhaseOutcome::Passed {
-        return report(auth, reconnect, reconnect, reconnect, reconnect);
+        return report(
+            TargetKind::Slack,
+            auth,
+            PhaseOutcome::NotRun,
+            reconnect,
+            PhaseOutcome::NotRun,
+            PhaseOutcome::NotRun,
+        );
     }
     let Some(post_url) = endpoint(&base, "chat.postMessage") else {
-        return rejected();
+        return not_run(TargetKind::Slack);
     };
     let message = marker("slack");
     let posted = match success_json(
@@ -335,11 +408,12 @@ async fn slack(_target: &str) -> ProbeReport {
         Ok(json) => Some(json),
         Err(outcome) => {
             return report(
+                TargetKind::Slack,
                 auth,
                 outcome,
                 reconnect,
-                PhaseOutcome::Failed,
-                PhaseOutcome::Failed,
+                PhaseOutcome::NotRun,
+                PhaseOutcome::NotRun,
             );
         }
     };
@@ -354,15 +428,16 @@ async fn slack(_target: &str) -> ProbeReport {
             })
     }) else {
         return report(
+            TargetKind::Slack,
             auth,
             PhaseOutcome::Rejected,
             reconnect,
-            PhaseOutcome::Failed,
-            PhaseOutcome::Failed,
+            PhaseOutcome::NotRun,
+            PhaseOutcome::NotRun,
         );
     };
     let Some(replies_url) = endpoint(&base, "conversations.replies") else {
-        return rejected();
+        return not_run(TargetKind::Slack);
     };
     let persistence = json_outcome(
         http.get(replies_url)
@@ -372,7 +447,7 @@ async fn slack(_target: &str) -> ProbeReport {
     )
     .await;
     let Some(delete_url) = endpoint(&base, "chat.delete") else {
-        return rejected();
+        return not_run(TargetKind::Slack);
     };
     let cleanup = json_outcome(
         http.post(delete_url)
@@ -381,7 +456,14 @@ async fn slack(_target: &str) -> ProbeReport {
         slack_ok,
     )
     .await;
-    report(auth, PhaseOutcome::Passed, reconnect, cleanup, persistence)
+    report(
+        TargetKind::Slack,
+        auth,
+        PhaseOutcome::Passed,
+        reconnect,
+        cleanup,
+        persistence,
+    )
 }
 
 fn slack_readback_contains(json: &serde_json::Value, timestamp: &str) -> bool {
@@ -433,21 +515,24 @@ async fn oidc(target: &str) -> ProbeReport {
         setting("E6IRC_OIDC_CLIENT_ID"),
         setting("E6IRC_OIDC_CLIENT_SECRET"),
     ) else {
-        return rejected();
+        return not_run(TargetKind::Oidc);
     };
     let Some(discovery) = oidc_discovery_url(target) else {
-        return rejected();
+        return not_run(TargetKind::Oidc);
     };
-    let Ok(http) = client() else { return failed() };
+    let Ok(http) = client() else {
+        return failed(TargetKind::Oidc);
+    };
     let configuration = match success_json(http.get(discovery)).await {
         Ok(json) => json,
         Err(outcome) => {
             return report(
+                TargetKind::Oidc,
                 outcome,
                 PhaseOutcome::NotApplicable,
-                outcome,
-                outcome,
-                outcome,
+                PhaseOutcome::NotRun,
+                PhaseOutcome::NotRun,
+                PhaseOutcome::NotRun,
             );
         }
     };
@@ -456,31 +541,32 @@ async fn oidc(target: &str) -> ProbeReport {
         .and_then(serde_json::Value::as_str)
         .and_then(safe_url)
     else {
-        return rejected();
+        return not_run(TargetKind::Oidc);
     };
     let Some(introspection_endpoint) = configuration
         .get("introspection_endpoint")
         .and_then(serde_json::Value::as_str)
         .and_then(safe_url)
     else {
-        return rejected();
+        return not_run(TargetKind::Oidc);
     };
     let Some(revocation_endpoint) = configuration
         .get("revocation_endpoint")
         .and_then(serde_json::Value::as_str)
         .and_then(safe_url)
     else {
-        return rejected();
+        return not_run(TargetKind::Oidc);
     };
     let token = match oidc_token(&http, &token_endpoint, &client_id, &secret).await {
         Ok(token) => token,
         Err(outcome) => {
             return report(
+                TargetKind::Oidc,
                 outcome,
                 PhaseOutcome::NotApplicable,
-                outcome,
-                outcome,
-                outcome,
+                PhaseOutcome::NotRun,
+                PhaseOutcome::NotRun,
+                PhaseOutcome::NotRun,
             );
         }
     };
@@ -502,6 +588,7 @@ async fn oidc(target: &str) -> ProbeReport {
     )
     .await;
     report(
+        TargetKind::Oidc,
         PhaseOutcome::Passed,
         PhaseOutcome::NotApplicable,
         reconnect,

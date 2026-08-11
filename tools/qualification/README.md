@@ -38,10 +38,12 @@ exact JSON, with the runner-provided challenge, to
 {"challenge":"...","authentication":"passed","delivery":"passed","reconnect":"passed","cleanup":"passed","persistence":"passed"}
 ```
 
-Each value is `passed`, `rejected`, `failed`, or `not_applicable`. The runner
-permits `not_applicable` only for phases that do not apply to that kind. A
-probe exit failure, missing report, or malformed report becomes a failed
-record. Use a new output path for every run.
+Each value is `passed`, `rejected`, `failed`, `not_applicable`, or `not_run`.
+The runner accepts `not_applicable` only for phases that do not apply to that
+kind. `not_run` records a required phase that the campaign did not reach; it
+can never pass. A probe exit failure, missing report, or malformed report
+writes `not_run` for every applicable phase and a failed record. Use a new
+output path for every run.
 
 `public-irc-probe.sh` runs the ignored Libera, OFTC, or Ergo interoperability
 probe for targets `libera`, `oftc`, or `ergo`. It makes two sequential TLS

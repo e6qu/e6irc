@@ -533,9 +533,16 @@ async fn native_campaigns_reject_secret_bearing_configuration() {
         ("E6IRC_OIDC_CLIENT_ID", "client"),
         ("E6IRC_OIDC_CLIENT_SECRET", "secret"),
     ]);
+    let discord = discord("oracle").await;
     assert_eq!(
-        discord("oracle").await.closed_outcome(TargetKind::Discord),
+        discord.closed_outcome(TargetKind::Discord),
         super::super::ClosedOutcome::Rejected
+    );
+    assert!(
+        discord
+            .outcomes()
+            .iter()
+            .all(|outcome| *outcome == PhaseOutcome::NotRun)
     );
     assert_eq!(
         slack("oracle").await.closed_outcome(TargetKind::Slack),

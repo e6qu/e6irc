@@ -346,6 +346,7 @@ enum PhaseOutcome {
     Rejected,
     Failed,
     NotApplicable,
+    NotRun,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -367,6 +368,23 @@ struct ProbeResult {
 }
 
 impl ProbeReport {
+    fn not_run(kind: TargetKind) -> Self {
+        let outcome = |index| {
+            if kind.requires_phase(index) {
+                PhaseOutcome::NotRun
+            } else {
+                PhaseOutcome::NotApplicable
+            }
+        };
+        Self {
+            authentication: outcome(0),
+            delivery: outcome(1),
+            reconnect: outcome(2),
+            cleanup: outcome(3),
+            persistence: outcome(4),
+        }
+    }
+
     fn uniform(outcome: PhaseOutcome) -> Self {
         Self {
             authentication: outcome,
@@ -389,6 +407,12 @@ impl ProbeReport {
         } else {
             ClosedOutcome::Rejected
         }
+    }
+
+    fn has_valid_applicability(&self, kind: TargetKind) -> bool {
+        self.outcomes().iter().enumerate().all(|(index, outcome)| {
+            (*outcome == PhaseOutcome::NotApplicable) != kind.requires_phase(index)
+        })
     }
 
     fn outcomes(&self) -> [PhaseOutcome; 5] {
@@ -465,16 +489,24 @@ fn run(args: Args) -> ExitCode {
         .credentials
         .iter()
         .any(|credential| !credential.is_present());
-    let report = if missing_credential {
-        ProbeReport::uniform(PhaseOutcome::Rejected)
+    let result = if missing_credential {
+        CampaignResult::Report(ProbeReport::not_run(args.kind))
     } else if args.kind.uses_native_campaign() {
-        native::run(args.kind, &args.target.0)
+        CampaignResult::Report(native::run(args.kind, &args.target.0))
     } else if let Some(probe) = args.probe.as_deref() {
         run_probe(&args, probe, &probe_report_path, &challenge)
     } else {
-        ProbeReport::uniform(PhaseOutcome::Failed)
+        CampaignResult::FailedBeforePhase
     };
-    let outcome = report.closed_outcome(args.kind);
+    let (report, outcome) = match result {
+        CampaignResult::Report(report) => {
+            let outcome = report.closed_outcome(args.kind);
+            (report, outcome)
+        }
+        CampaignResult::FailedBeforePhase => {
+            (ProbeReport::not_run(args.kind), ClosedOutcome::Failed)
+        }
+    };
     let evidence = QualificationEvidence {
         format_version: 1,
         kind: args.kind,
@@ -510,7 +542,12 @@ impl TargetKind {
     }
 }
 
-fn run_probe(args: &Args, probe: &Path, report_path: &Path, challenge: &str) -> ProbeReport {
+enum CampaignResult {
+    Report(ProbeReport),
+    FailedBeforePhase,
+}
+
+fn run_probe(args: &Args, probe: &Path, report_path: &Path, challenge: &str) -> CampaignResult {
     let status = Command::new(probe)
         .args(&args.probe_args)
         .env("E6IRC_QUALIFICATION_KIND", args.kind.name())
@@ -519,14 +556,19 @@ fn run_probe(args: &Args, probe: &Path, report_path: &Path, challenge: &str) -> 
         .env("E6IRC_QUALIFICATION_CHALLENGE", challenge)
         .status();
     if !matches!(status, Ok(status) if status.success()) {
-        return ProbeReport::uniform(PhaseOutcome::Failed);
+        return CampaignResult::FailedBeforePhase;
     }
     let Ok(bytes) = std::fs::read(report_path) else {
-        return ProbeReport::uniform(PhaseOutcome::Failed);
+        return CampaignResult::FailedBeforePhase;
     };
     match serde_json::from_slice::<ProbeResult>(&bytes) {
-        Ok(result) if result.challenge == challenge => result.report,
-        _ => ProbeReport::uniform(PhaseOutcome::Failed),
+        Ok(result)
+            if result.challenge == challenge
+                && result.report.has_valid_applicability(args.kind) =>
+        {
+            CampaignResult::Report(result.report)
+        }
+        _ => CampaignResult::FailedBeforePhase,
     }
 }
 
@@ -582,6 +624,10 @@ mod tests {
         assert_eq!(
             ProbeReport::uniform(PhaseOutcome::Failed).closed_outcome(TargetKind::Discord),
             ClosedOutcome::Failed
+        );
+        assert_eq!(
+            ProbeReport::not_run(TargetKind::Discord).closed_outcome(TargetKind::Discord),
+            ClosedOutcome::Rejected
         );
     }
 
@@ -656,5 +702,7 @@ mod tests {
             public_irc.closed_outcome(TargetKind::Discord),
             ClosedOutcome::Rejected
         );
+        assert!(public_irc.has_valid_applicability(TargetKind::PublicIrc));
+        assert!(!public_irc.has_valid_applicability(TargetKind::Discord));
     }
 }
