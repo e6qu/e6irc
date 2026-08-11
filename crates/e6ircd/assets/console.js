@@ -1,4 +1,4 @@
-import { getOperationJson, loadApiContract, readApiJson, requireApiObject } from "/console-contract.js";
+import { getOperationJson, loadApiContract } from "/console-contract.js";
 
 (() => {
   "use strict";
@@ -206,24 +206,6 @@ import { getOperationJson, loadApiContract, readApiJson, requireApiObject } from
   const configurationResult = document.getElementById("configuration-api-result");
   let apiContract;
 
-  const apiJson = async (response) => {
-    if (response.status === 204) return undefined;
-    return readApiJson(response);
-  };
-  const apiObject = async (response) => {
-    return requireApiObject(await apiJson(response), response.status);
-  };
-  const apiProblem = async (response) => {
-    const problem = requireApiObject(
-      await readApiJson(response),
-      response.status,
-      "The server returned an invalid error response. Reload and try again.",
-    );
-    if (typeof problem.detail === "string") return problem.detail;
-    if (typeof problem.title === "string") return problem.title;
-    throw new Error("The server returned an invalid error response. Reload and try again.");
-  };
-
   const apiRoute = (path, ...methods) => Object.freeze({ path, methods: Object.freeze(methods) });
   const consoleApiRoutes = Object.freeze([
     apiRoute("/api/v1/admin/monitoring", "GET"),
@@ -296,18 +278,14 @@ import { getOperationJson, loadApiContract, readApiJson, requireApiObject } from
   const apiRequest = async (form, operation, body) => {
     const csrf = form.querySelector('input[name="csrf"]')?.value;
     if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
-    const response = await fetch(operation.url, {
-      method: operation.method,
+    return getOperationJson(fetch, await consoleApiContract(), operation.method, operation.url, {
       credentials: "same-origin",
       headers: {
-        Accept: "application/json",
         "Content-Type": "application/json",
         "X-E6IRC-CSRF": csrf,
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
-    if (!response.ok) throw new Error(await apiProblem(response));
-    return response.status === 204 ? undefined : apiObject(response);
   };
 
   const apiRead = async (url) => {
@@ -1760,7 +1738,7 @@ import { getOperationJson, loadApiContract, readApiJson, requireApiObject } from
       }
       void mutateAccount(form, "POST", { label }, "App-password creation failed.")
         .then((result) => {
-          if (!result || typeof result !== "object") return;
+          if (result === undefined) return;
           showAccountSecret("App password", result.app_password);
           setAccountResult("App password created. Copy it now; it cannot be shown again.", true);
           void refreshAccountAccess?.();
@@ -1783,7 +1761,7 @@ import { getOperationJson, loadApiContract, readApiJson, requireApiObject } from
         scopes,
         expires_in_days: Number(fields.get("expires_in_days")),
       }, "Token creation failed.").then((result) => {
-        if (!result || typeof result !== "object") return;
+        if (result === undefined) return;
         showAccountSecret("Personal access token", result.token);
         setAccountResult("Personal access token created. Copy it now; it cannot be shown again.", true);
         void refreshTokens?.();
@@ -2263,17 +2241,8 @@ import { getOperationJson, loadApiContract, readApiJson, requireApiObject } from
     try {
       const result = await apiRequest(form, apiMutation(method, url), body);
       if (mode === ownerNetworkPreflight) {
-        const nick = result?.confirmed_nick;
-        const timings = [result?.dns_ms, result?.connect_ms, result?.registration_ms];
-        if (
-          typeof nick !== "string" || !nick
-          || !Number.isSafeInteger(result?.resolved_addresses) || result.resolved_addresses < 1
-          || timings.some((value) => !Number.isSafeInteger(value) || value < 0)
-        ) {
-          throw new Error("The connection check returned an invalid response. Reload and try again.");
-        }
         setOwnerNetworkResult(
-          `Registered as ${nick}. Resolved ${result.resolved_addresses} address${result.resolved_addresses === 1 ? "" : "es"}; DNS ${result.dns_ms}ms, connection ${result.connect_ms}ms, registration ${result.registration_ms}ms. No network was created.`,
+          `Registered as ${result.confirmed_nick}. Resolved ${result.resolved_addresses} address${result.resolved_addresses === 1 ? "" : "es"}; DNS ${result.dns_ms}ms, connection ${result.connect_ms}ms, registration ${result.registration_ms}ms. No network was created.`,
           true,
         );
       } else {

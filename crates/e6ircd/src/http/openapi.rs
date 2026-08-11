@@ -86,6 +86,38 @@ fn document() -> serde_json::Value {
             "properties": { "owner": { "type": "string", "minLength": 1 }, "name": { "type": "string", "minLength": 1 }, "enabled": { "type": "boolean" } }
         }),
     );
+    let account_created_response = json_response_status(
+        201,
+        "account created",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["id", "account", "administrator"],
+            "properties": { "id": { "type": "integer", "minimum": 1 }, "account": { "type": "string", "minLength": 1 }, "administrator": { "type": "boolean" } }
+        }),
+    );
+    let account_state_response = json_response(
+        "account state and live runtime reconciled",
+        serde_json::json!({
+            "oneOf": [
+                { "type": "object", "additionalProperties": false, "required": ["account_id", "suspended", "message"], "properties": { "account_id": { "type": "integer", "minimum": 1 }, "suspended": { "type": "boolean" }, "message": { "type": "string" } } },
+                { "type": "object", "additionalProperties": false, "required": ["account_id", "administrator", "message"], "properties": { "account_id": { "type": "integer", "minimum": 1 }, "administrator": { "type": "boolean" }, "message": { "type": "string" } } }
+            ]
+        }),
+    );
+    let invitation_created_response = json_response_status(
+        201,
+        "invitation link shown once",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["account", "administrator", "expires_in_days", "invitation_url", "note"],
+            "properties": { "account": { "type": "string", "minLength": 1 }, "administrator": { "type": "boolean" }, "expires_in_days": { "type": "integer", "minimum": 1, "maximum": 30 }, "invitation_url": { "type": "string", "minLength": 1 }, "note": { "type": "string" } }
+        }),
+    );
+    let revoked_sessions_response = json_response(
+        "other browser sessions revoked",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["revoked"],
+            "properties": { "revoked": { "type": "integer", "minimum": 0 } }
+        }),
+    );
     let identity_response = serde_json::json!({
         "200": { "description": "authenticated identity", "content": { "application/json": {
             "schema": { "type": "object", "required": ["account"], "additionalProperties": false,
@@ -815,7 +847,7 @@ fn document() -> serde_json::Value {
                     "parameters": [{ "name": "except", "in": "query", "required": true,
                         "schema": { "type": "string", "enum": ["current"] } }],
                     "responses": {
-                        "200": { "description": "other browser sessions revoked" },
+                        "200": revoked_sessions_response["200"],
                         "400": { "description": "missing or invalid selector" },
                         "401": { "description": "browser cookie session required" },
                         "503": { "description": "database unavailable" }
@@ -1395,7 +1427,7 @@ fn document() -> serde_json::Value {
                         }
                     } } },
                     "responses": {
-                        "201": { "description": "account created" },
+                        "201": account_created_response["201"],
                         "400": { "description": "invalid account, password, or contact email" },
                         "409": { "description": "account name exists or is retired" },
                         "503": { "description": "database unavailable" }
@@ -1442,7 +1474,7 @@ fn document() -> serde_json::Value {
                         }
                     },
                     "responses": {
-                        "200": { "description": "account state and live runtime reconciled" },
+                        "200": account_state_response["200"],
                         "400": { "description": "invalid account ID or request body" },
                         "403": { "description": "not an admin account" },
                         "404": { "description": "no such account" },
@@ -1460,7 +1492,7 @@ fn document() -> serde_json::Value {
                     }],
                     "requestBody": confirmation_body,
                     "responses": {
-                        "200": { "description": "account deleted and live resources stopped" },
+                        "200": json_response("account deleted and live resources stopped", message_schema.clone())["200"],
                         "400": { "description": "confirmation does not match" },
                         "404": { "description": "no such account" },
                         "409": { "description": "self target, founded channels, or final effective administrator" },
@@ -1497,7 +1529,7 @@ fn document() -> serde_json::Value {
                         }
                     } } },
                     "responses": {
-                        "201": { "description": "invitation link shown once" },
+                        "201": invitation_created_response["201"],
                         "400": { "description": "invalid account, email, or lifetime" },
                         "409": { "description": "name unavailable or administrator invitation cap reached" },
                         "503": { "description": "database unavailable" }
@@ -1781,6 +1813,44 @@ mod tests {
         ("/api/v1/me/networks/{name}/operations", "get"),
         ("/api/v1/me/channels", "get"),
     ];
+    const CONSOLE_JSON_MUTATIONS: &[(&str, &str, &str)] = &[
+        ("/api/v1/admin/accounts", "post", "201"),
+        ("/api/v1/admin/accounts/{id}", "patch", "200"),
+        ("/api/v1/admin/accounts/{id}", "delete", "200"),
+        ("/api/v1/admin/bans", "post", "201"),
+        ("/api/v1/admin/configuration", "patch", "200"),
+        ("/api/v1/admin/configuration/networks", "post", "200"),
+        (
+            "/api/v1/admin/configuration/networks/{name}",
+            "delete",
+            "200",
+        ),
+        ("/api/v1/admin/configuration/oidc-providers", "post", "200"),
+        (
+            "/api/v1/admin/configuration/oidc-providers/{name}",
+            "delete",
+            "200",
+        ),
+        ("/api/v1/admin/configuration/opers", "post", "200"),
+        ("/api/v1/admin/configuration/opers/{name}", "delete", "200"),
+        ("/api/v1/admin/invitations", "post", "201"),
+        ("/api/v1/admin/networks/{owner}/{name}", "patch", "200"),
+        ("/api/v1/me/channels", "post", "201"),
+        ("/api/v1/me/channels/{name}", "patch", "200"),
+        ("/api/v1/me/channels/{name}", "delete", "200"),
+        ("/api/v1/me/channels/{name}/access/{account}", "put", "200"),
+        (
+            "/api/v1/me/channels/{name}/access/{account}",
+            "delete",
+            "200",
+        ),
+        ("/api/v1/me/credentials", "post", "201"),
+        ("/api/v1/me/networks", "post", "201"),
+        ("/api/v1/me/networks/preflight", "post", "200"),
+        ("/api/v1/me/networks/{name}", "patch", "200"),
+        ("/api/v1/me/sessions", "delete", "200"),
+        ("/api/v1/me/tokens", "post", "201"),
+    ];
 
     #[test]
     fn openapi_covers_every_documented_router_operation_exactly() {
@@ -1796,6 +1866,20 @@ mod tests {
                 ["schema"];
             assert_eq!(schema["type"], "object", "{method} {path}");
             assert_eq!(schema["additionalProperties"], false, "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn console_json_mutations_have_closed_response_schemas() {
+        let spec = super::document();
+        for (path, method, status) in CONSOLE_JSON_MUTATIONS {
+            let schema = &spec["paths"][path][method]["responses"][status]["content"]["application/json"]
+                ["schema"];
+            assert!(schema.is_object(), "{method} {path}");
+            if schema.get("oneOf").is_none() {
+                assert_eq!(schema["type"], "object", "{method} {path}");
+                assert_eq!(schema["additionalProperties"], false, "{method} {path}");
+            }
         }
     }
 }
