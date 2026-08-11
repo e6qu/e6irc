@@ -6,7 +6,7 @@ use reqwest::{Client, RequestBuilder, StatusCode, Url};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{PhaseOutcome, ProbeReport, SafeText, TargetKind};
+use super::{PhaseOutcome, ProbeReport, QualificationPhase, SafeText, TargetKind};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -34,9 +34,13 @@ fn report(
     persistence: PhaseOutcome,
 ) -> ProbeReport {
     let outcomes = [authentication, delivery, reconnect, cleanup, persistence];
-    if outcomes.iter().enumerate().any(|(index, outcome)| {
-        (*outcome == PhaseOutcome::NotApplicable) == kind.requires_phase(index)
-    }) {
+    if outcomes
+        .into_iter()
+        .zip(QualificationPhase::ALL)
+        .any(|(outcome, phase)| {
+            (outcome == PhaseOutcome::NotApplicable) == kind.requires_phase(phase)
+        })
+    {
         return ProbeReport::not_run(kind);
     }
     ProbeReport {
@@ -67,24 +71,53 @@ fn setting(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-fn safe_url(value: &str) -> Option<Url> {
+/// A credential-free campaign endpoint. HTTP is safe only for a loopback oracle.
+#[derive(Clone, Debug)]
+struct CampaignUrl(Url);
+
+impl CampaignUrl {
+    fn as_url(&self) -> &Url {
+        &self.0
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    fn into_url(self) -> Url {
+        self.0
+    }
+}
+
+fn safe_url(value: &str) -> Option<CampaignUrl> {
     let url = Url::parse(value).ok()?;
-    (matches!(url.scheme(), "http" | "https")
+    let loopback = url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    ((url.scheme() == "https" || (url.scheme() == "http" && loopback))
         && url.host_str().is_some()
         && url.username().is_empty()
         && url.password().is_none()
         && url.query().is_none()
         && url.fragment().is_none())
-    .then_some(url)
+    .then_some(CampaignUrl(url))
 }
 
-fn endpoint(base: &Url, path: &str) -> Option<Url> {
-    base.join(path).ok().filter(|url| {
-        url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none()
-    })
+fn endpoint(base: &CampaignUrl, path: &str) -> Option<CampaignUrl> {
+    base.as_url()
+        .join(path)
+        .ok()
+        .filter(|url| {
+            url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+        })
+        .map(CampaignUrl)
 }
 
 fn client() -> Result<Client, ()> {
@@ -161,7 +194,7 @@ async fn discord(_target: &str) -> ProbeReport {
         return not_run(TargetKind::Discord);
     };
     let auth = request_outcome(
-        http.get(channel_url.clone())
+        http.get(channel_url.clone().into_url())
             .header("Authorization", &authorization),
     )
     .await;
@@ -175,7 +208,7 @@ async fn discord(_target: &str) -> ProbeReport {
             PhaseOutcome::NotRun,
         );
     }
-    let gateway_url = match success_json(http.get(gateway)).await {
+    let gateway_url = match success_json(http.get(gateway.into_url())).await {
         Ok(json) => json
             .get("url")
             .and_then(serde_json::Value::as_str)
@@ -221,7 +254,7 @@ async fn discord(_target: &str) -> ProbeReport {
         None => return not_run(TargetKind::Discord),
     };
     let posted = match success_json(
-        http.post(message_collection)
+        http.post(message_collection.into_url())
             .header("Authorization", &authorization)
             .json(&serde_json::json!({"content": message})),
     )
@@ -260,12 +293,12 @@ async fn discord(_target: &str) -> ProbeReport {
         );
     };
     let persistence = request_outcome(
-        http.get(message_url.clone())
+        http.get(message_url.clone().into_url())
             .header("Authorization", &authorization),
     )
     .await;
     let cleanup = request_outcome(
-        http.delete(message_url)
+        http.delete(message_url.into_url())
             .header("Authorization", &authorization),
     )
     .await;
@@ -353,7 +386,8 @@ async fn slack(_target: &str) -> ProbeReport {
         return not_run(TargetKind::Slack);
     };
     let auth = json_outcome(
-        http.post(auth_url).header("Authorization", &authorization),
+        http.post(auth_url.into_url())
+            .header("Authorization", &authorization),
         slack_ok,
     )
     .await;
@@ -399,7 +433,7 @@ async fn slack(_target: &str) -> ProbeReport {
     };
     let message = marker("slack");
     let posted = match success_json(
-        http.post(post_url)
+        http.post(post_url.into_url())
             .header("Authorization", &authorization)
             .json(&serde_json::json!({"channel":channel,"text":message})),
     )
@@ -440,7 +474,7 @@ async fn slack(_target: &str) -> ProbeReport {
         return not_run(TargetKind::Slack);
     };
     let persistence = json_outcome(
-        http.get(replies_url)
+        http.get(replies_url.into_url())
             .header("Authorization", &authorization)
             .query(&[("channel", &channel), ("ts", &timestamp)]),
         |json| slack_readback_contains(json, &timestamp),
@@ -450,7 +484,7 @@ async fn slack(_target: &str) -> ProbeReport {
         return not_run(TargetKind::Slack);
     };
     let cleanup = json_outcome(
-        http.post(delete_url)
+        http.post(delete_url.into_url())
             .header("Authorization", &authorization)
             .json(&serde_json::json!({"channel":channel,"ts":timestamp})),
         slack_ok,
@@ -482,12 +516,16 @@ fn slack_ok(json: &serde_json::Value) -> bool {
     json.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
 }
 
-async fn slack_socket(http: &Client, base: &Url, app: &str) -> Result<String, PhaseOutcome> {
+async fn slack_socket(
+    http: &Client,
+    base: &CampaignUrl,
+    app: &str,
+) -> Result<String, PhaseOutcome> {
     let Some(url) = endpoint(base, "apps.connections.open") else {
         return Err(PhaseOutcome::Rejected);
     };
     let json = success_json(
-        http.post(url)
+        http.post(url.into_url())
             .header("Authorization", format!("Bearer {app}")),
     )
     .await?;
@@ -526,7 +564,7 @@ async fn oidc(target: &str) -> ProbeReport {
     let Ok(http) = client() else {
         return failed(TargetKind::Oidc);
     };
-    let configuration = match success_json(http.get(discovery)).await {
+    let configuration = match success_json(http.get(discovery.into_url())).await {
         Ok(json) => json,
         Err(outcome) => {
             return report(
@@ -581,14 +619,14 @@ async fn oidc(target: &str) -> ProbeReport {
         Err(outcome) => outcome,
     };
     let persistence = json_outcome(
-        http.post(introspection_endpoint)
+        http.post(introspection_endpoint.into_url())
             .basic_auth(&client_id, Some(&secret))
             .form(&[("token", token.as_str())]),
         |json| json.get("active").and_then(serde_json::Value::as_bool) == Some(true),
     )
     .await;
     let cleanup = request_outcome(
-        http.post(revocation_endpoint)
+        http.post(revocation_endpoint.into_url())
             .basic_auth(&client_id, Some(&secret))
             .form(&[("token", token.as_str())]),
     )
@@ -603,29 +641,32 @@ async fn oidc(target: &str) -> ProbeReport {
     )
 }
 
-fn oidc_issuer_matches(configuration: &serde_json::Value, issuer: &Url) -> bool {
+fn oidc_issuer_matches(configuration: &serde_json::Value, issuer: &CampaignUrl) -> bool {
     configuration
         .get("issuer")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|value| value == issuer.as_str())
 }
 
-fn oidc_discovery_url(issuer: &Url) -> Option<Url> {
-    let mut issuer = issuer.clone();
+fn oidc_discovery_url(issuer: &CampaignUrl) -> Option<CampaignUrl> {
+    let mut issuer = issuer.as_url().clone();
     if !issuer.path().ends_with('/') {
         issuer.set_path(&format!("{}/", issuer.path()));
     }
-    issuer.join(".well-known/openid-configuration").ok()
+    issuer
+        .join(".well-known/openid-configuration")
+        .ok()
+        .map(CampaignUrl)
 }
 
 async fn oidc_token(
     http: &Client,
-    endpoint: &Url,
+    endpoint: &CampaignUrl,
     client_id: &str,
     secret: &str,
 ) -> Result<String, PhaseOutcome> {
     success_json(
-        http.post(endpoint.clone())
+        http.post(endpoint.clone().into_url())
             .basic_auth(client_id, Some(secret))
             .form(&[("grant_type", "client_credentials")]),
     )

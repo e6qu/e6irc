@@ -97,6 +97,19 @@ else
 fi
 jq -e '.kind == "discord" and .outcome == "rejected" and ([.probe[]] | all(. == "not_run"))' "$temporary/rejected.json" >/dev/null
 
+if E6IRC_DISCORD_BOT_TOKEN='literal-secret-token' E6IRC_DISCORD_CHANNEL_ID='' \
+  run discord --output "$temporary/missing-channel.json"; then
+  echo 'missing Discord channel unexpectedly passed' >&2
+  exit 1
+else
+  [[ $? -eq 3 ]]
+fi
+jq -e '
+  .kind == "discord" and .outcome == "rejected" and
+  (.credential_environment | sort == ["E6IRC_DISCORD_BOT_TOKEN", "E6IRC_DISCORD_CHANNEL_ID"]) and
+  ([.probe[]] | all(. == "not_run"))
+' "$temporary/missing-channel.json" >/dev/null
+
 if E6IRC_DISCORD_BOT_TOKEN='literal-secret-token' E6IRC_DISCORD_CHANNEL_ID='42' \
   run discord --output "$temporary/invalid-probe.json" --probe "$pass_probe"; then
   echo 'native Discord campaign accepted an external probe' >&2

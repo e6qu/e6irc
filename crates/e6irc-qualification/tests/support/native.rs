@@ -390,6 +390,9 @@ async fn oidc_revoke(
 #[test]
 fn endpoint_urls_cannot_carry_credentials_or_tokens() {
     assert!(safe_url("https://issuer.example/api").is_some());
+    assert!(safe_url("http://127.0.0.1/api").is_some());
+    assert!(safe_url("http://[::1]/api").is_some());
+    assert!(safe_url("http://issuer.example/api").is_none());
     assert!(safe_url("https://user:secret@issuer.example/api").is_none());
     assert!(safe_url("https://issuer.example/api?token=secret").is_none());
     assert!(safe_url("https://issuer.example/api#secret").is_none());
@@ -454,7 +457,11 @@ async fn discord_oracle_proves_all_required_phases_and_cleanup() {
     let base = safe_url(&setting("E6IRC_DISCORD_API_BASE").expect("base")).expect("safe base");
     let status = client()
         .expect("client")
-        .get(endpoint(&base, "channels/42").expect("channel endpoint"))
+        .get(
+            endpoint(&base, "channels/42")
+                .expect("channel endpoint")
+                .into_url(),
+        )
         .header("Authorization", "Bot token")
         .send()
         .await
@@ -553,9 +560,9 @@ async fn native_campaigns_reject_secret_bearing_configuration() {
     );
     assert!(
         discord
-            .outcomes()
+            .phase_outcomes()
             .iter()
-            .all(|outcome| *outcome == PhaseOutcome::NotRun)
+            .all(|(_, outcome)| *outcome == PhaseOutcome::NotRun)
     );
     assert_eq!(
         slack("oracle").await.closed_outcome(TargetKind::Slack),
