@@ -95,6 +95,19 @@ export function parseApiSchema(schema, value, label = "API response", path = "$"
   return Object.freeze(parsed);
 }
 
+function declaredOperation(document, method, url) {
+  if (!objectValue(document) || !objectValue(document.paths)) {
+    throw new ApiSchemaError("The API contract document is invalid.");
+  }
+  const pathname = new URL(url, "https://e6irc.invalid").pathname;
+  const match = matchingPath(document.paths, pathname);
+  const operation = match?.[1]?.[method.toLowerCase()];
+  if (!objectValue(operation)) {
+    throw new ApiSchemaError(`The API contract does not describe ${method.toUpperCase()} ${pathname}.`);
+  }
+  return { pathname, operation };
+}
+
 function matchingPath(paths, pathname) {
   const actual = pathname.split("/");
   return Object.entries(paths).find(([candidate]) => {
@@ -105,12 +118,7 @@ function matchingPath(paths, pathname) {
 }
 
 export function operationResponseSchema(document, method, url, status = 200) {
-  if (!objectValue(document) || !objectValue(document.paths)) {
-    throw new ApiSchemaError("The API contract document is invalid.");
-  }
-  const pathname = new URL(url, "https://e6irc.invalid").pathname;
-  const match = matchingPath(document.paths, pathname);
-  const operation = match?.[1]?.[method.toLowerCase()];
+  const { pathname, operation } = declaredOperation(document, method, url);
   const schema = operation?.responses?.[String(status)]?.content?.["application/json"]?.schema;
   if (!objectValue(schema)) {
     throw new ApiSchemaError(`The API contract does not describe ${method.toUpperCase()} ${pathname}.`);
@@ -190,6 +198,7 @@ export function apiContractLoader(fetcher) {
 }
 
 export async function getOperationJson(fetcher, document, method, url, options = {}) {
+  declaredOperation(document, method, url);
   const response = await fetcher(url, {
     ...options,
     method,

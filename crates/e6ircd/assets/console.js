@@ -205,67 +205,7 @@ import { apiContractLoader, getOperationJson } from "/console-contract.js";
 
   const configurationResult = document.getElementById("configuration-api-result");
 
-  const apiRoute = (path, ...methods) => Object.freeze({ path, methods: Object.freeze(methods) });
-  const consoleApiRoutes = Object.freeze([
-    apiRoute("/api/v1/admin/monitoring", "GET"),
-    apiRoute("/api/v1/admin/stats", "GET"),
-    apiRoute("/api/v1/admin/accounts", "GET", "POST"),
-    apiRoute("/api/v1/admin/accounts/{id}", "PATCH", "DELETE"),
-    apiRoute("/api/v1/admin/invitations", "GET", "POST"),
-    apiRoute("/api/v1/admin/invitations/{id}", "DELETE"),
-    apiRoute("/api/v1/admin/connections", "GET"),
-    apiRoute("/api/v1/admin/connections/{id}", "DELETE"),
-    apiRoute("/api/v1/admin/channels", "GET"),
-    apiRoute("/api/v1/admin/channels/{name}", "DELETE"),
-    apiRoute("/api/v1/admin/bans", "GET", "POST"),
-    apiRoute("/api/v1/admin/bans/{id}", "DELETE"),
-    apiRoute("/api/v1/admin/audit", "GET"),
-    apiRoute("/api/v1/admin/configuration", "GET", "PATCH"),
-    apiRoute("/api/v1/admin/networks", "GET"),
-    apiRoute("/api/v1/admin/networks/{owner}/{name}", "PATCH"),
-    apiRoute("/api/v1/me/profile", "GET", "PATCH"),
-    apiRoute("/api/v1/me/sessions", "GET", "DELETE"),
-    apiRoute("/api/v1/me/sessions/{id}", "DELETE"),
-    apiRoute("/api/v1/me/connections", "GET"),
-    apiRoute("/api/v1/me/connections/{id}", "DELETE"),
-    apiRoute("/api/v1/me/identities", "GET"),
-    apiRoute("/api/v1/me/identities/{id}", "DELETE"),
-    apiRoute("/api/v1/me/tokens", "GET", "POST"),
-    apiRoute("/api/v1/me/tokens/{id}", "DELETE"),
-    apiRoute("/api/v1/me/read-markers", "GET"),
-    apiRoute("/api/v1/me/credentials", "GET", "POST"),
-    apiRoute("/api/v1/me/credentials/{id}", "DELETE"),
-    apiRoute("/api/v1/me/networks", "GET", "POST"),
-    apiRoute("/api/v1/me/networks/preflight", "POST"),
-    apiRoute("/api/v1/me/networks/{name}", "GET", "PUT", "PATCH", "DELETE"),
-    apiRoute("/api/v1/me/networks/{name}/operations", "GET"),
-    apiRoute("/api/v1/me/channels", "GET", "POST"),
-    apiRoute("/api/v1/me/channels/{name}", "PATCH", "DELETE"),
-    apiRoute("/api/v1/me/channels/{name}/access/{account}", "PUT", "DELETE"),
-    apiRoute("/api/v1/admin/configuration/networks", "POST"),
-    apiRoute("/api/v1/admin/configuration/networks/{name}", "DELETE"),
-    apiRoute("/api/v1/admin/configuration/oidc-providers", "POST"),
-    apiRoute("/api/v1/admin/configuration/oidc-providers/{name}", "DELETE"),
-    apiRoute("/api/v1/admin/configuration/opers", "POST"),
-    apiRoute("/api/v1/admin/configuration/opers/{name}", "DELETE"),
-    apiRoute("/api/v1/me/password", "PUT"),
-    apiRoute("/api/v1/me/account", "DELETE"),
-  ]);
-
-  const matchesRoute = (path, route) => {
-    const actual = path.split("/");
-    const expected = route.path.split("/");
-    return actual.length === expected.length && actual.every((part, index) => expected[index].startsWith("{") || part === expected[index]);
-  };
-
-  const apiOperation = (method, url) => {
-    const path = new URL(url, window.location.origin).pathname;
-    const route = consoleApiRoutes.find((candidate) => matchesRoute(path, candidate));
-    if (!route || !route.methods.includes(method)) {
-      throw new Error("The console API operation is not declared. Reload and try again.");
-    }
-    return Object.freeze({ method, url });
-  };
+  const apiOperation = (method, url) => Object.freeze({ method, url });
 
   const apiMutation = apiOperation;
 

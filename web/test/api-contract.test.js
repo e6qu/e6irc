@@ -129,12 +129,29 @@ test("operation requests preserve an API problem detail", async () => {
         status: 503,
         headers: { "content-type": "application/problem+json" },
       }),
-      { paths: {} },
+      { paths: { "/api/v1/me/profile": { patch: { responses: {} } } } },
       "PATCH",
       "/api/v1/me/profile",
     ),
     /Profile storage unavailable/,
   );
+});
+
+test("undeclared operations fail before a request leaves the browser", async () => {
+  let requested = false;
+  await assert.rejects(
+    getOperationJson(
+      async () => {
+        requested = true;
+        return new Response();
+      },
+      { paths: {} },
+      "GET",
+      "/api/v1/me/security-activity",
+    ),
+    ApiSchemaError,
+  );
+  assert.equal(requested, false);
 });
 
 test("contract loader rejects a failed response without preserving stale state", async () => {
