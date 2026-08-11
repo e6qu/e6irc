@@ -6,7 +6,7 @@ bin="$root/target/debug/e6irc-qualification"
 temporary="$(mktemp -d)"
 trap 'rm -rf "$temporary"' EXIT
 
-cargo build --quiet -p e6irc-qualification
+cargo build -p e6irc-qualification
 
 probe() {
   local name="$1" report="$2"
@@ -37,14 +37,14 @@ run() {
     "$@"
 }
 
-passed='{"authentication":"passed","delivery":"passed","reconnect":"passed","cleanup":"passed","persistence":"passed"}'
-rejected='{"authentication":"passed","delivery":"rejected","reconnect":"passed","cleanup":"passed","persistence":"passed"}'
+public_passed='{"authentication":"passed","delivery":"not_applicable","reconnect":"passed","cleanup":"passed","persistence":"not_applicable"}'
+scale_rejected='{"authentication":"passed","delivery":"rejected","reconnect":"not_applicable","cleanup":"passed","persistence":"not_applicable"}'
 
-pass_probe="$(probe pass "$passed")"
+pass_probe="$(probe pass "$public_passed")"
 run public-irc --output "$temporary/passed.json" --probe "$pass_probe"
 jq -e '
   .kind == "public_irc" and .outcome == "passed" and
-  (.probe | .authentication == "passed" and .delivery == "passed" and .reconnect == "passed" and .cleanup == "passed" and .persistence == "passed") and
+  (.probe | .authentication == "passed" and .delivery == "not_applicable" and .reconnect == "passed" and .cleanup == "passed" and .persistence == "not_applicable") and
   (.executable.sha256 | test("^[0-9a-f]{64}$")) and
   (.executable | has("path") | not)
 ' "$temporary/passed.json" >/dev/null
@@ -106,7 +106,7 @@ else
 fi
 [[ ! -e "$temporary/invalid-probe.json" ]]
 
-partial_probe="$(probe partial "$rejected")"
+partial_probe="$(probe partial "$scale_rejected")"
 if run scale --output "$temporary/partial.json" --probe "$partial_probe"; then
   echo 'partial qualification unexpectedly passed' >&2
   exit 1
