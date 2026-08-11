@@ -407,6 +407,10 @@ try {
   await page.unroute(profileURL);
   const accountDocument = await page.evaluate(() => performance.timeOrigin);
   const profileFailureErrorStart = applicationErrors.length;
+  let profileFailureFulfilled;
+  const profileFailure = new Promise((resolve) => {
+    profileFailureFulfilled = resolve;
+  });
   await page.route(profileURL, async (route) => {
     if (route.request().method() === "PATCH") {
       await route.fulfill({
@@ -414,25 +418,15 @@ try {
         contentType: "application/problem+json",
         body: JSON.stringify({ status: 503, title: "Profile storage unavailable" }),
       });
+      profileFailureFulfilled();
     } else {
       await route.continue();
     }
   });
   await contactEmail.fill("retry-contact@example.test");
-  const profileFailureResponse = page.waitForResponse(
-    (response) => response.url() === profileURL
-      && response.request().method() === "PATCH"
-      && response.status() === 503,
-  );
   await page.getByRole("button", { name: "Save contact email", exact: true }).click();
-  await profileFailureResponse;
-  await page.waitForFunction(
-    () => document.getElementById("account-api-result")?.textContent?.trim(),
-  );
-  assert.match(
-    await page.locator("#account-api-result").innerText(),
-    /Profile storage unavailable/,
-  );
+  await profileFailure;
+  await expectStatus(page, /Profile storage unavailable/);
   assert.equal(await page.evaluate(() => performance.timeOrigin), accountDocument);
   assert.equal(await contactEmail.inputValue(), "retry-contact@example.test");
   assert.deepEqual(
