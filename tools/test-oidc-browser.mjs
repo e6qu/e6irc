@@ -390,12 +390,14 @@ try {
     profileRequested = resolve;
   });
   let rejectProfileMutation = false;
+  let profileMutationRoutes = 0;
   let profileFailureFulfilled;
   const profileFailure = new Promise((resolve) => {
     profileFailureFulfilled = resolve;
   });
   await page.route(profileURL, async (route) => {
     if (route.request().method() === "PATCH" && rejectProfileMutation) {
+      profileMutationRoutes += 1;
       profileFailureFulfilled();
       await route.fulfill({
         status: 503,
@@ -422,10 +424,24 @@ try {
   assert.equal(await contactEmail.inputValue(), "draft-contact@example.test");
   const accountDocument = await page.evaluate(() => performance.timeOrigin);
   const profileFailureErrorStart = applicationErrors.length;
+  const profileRequestStart = applicationRequests.length;
+  await page.evaluate(() => {
+    window.__e6ircProfileSubmitEvents = 0;
+    document.querySelector("[data-api-account-profile]").addEventListener("submit", () => {
+      window.__e6ircProfileSubmitEvents += 1;
+    });
+  });
   rejectProfileMutation = true;
   await contactEmail.fill("retry-contact@example.test");
   assert.equal(await contactEmail.evaluate((input) => input.checkValidity()), true);
   await contactEmail.evaluate((input) => input.form.requestSubmit());
+  await page.waitForTimeout(250);
+  assert.equal(await page.evaluate(() => window.__e6ircProfileSubmitEvents), 1);
+  assert.equal(
+    profileMutationRoutes,
+    1,
+    `profile mutation requests: ${applicationRequests.slice(profileRequestStart).join(", ")}`,
+  );
   await profileFailure;
   await expectStatus(page, /Profile storage unavailable/);
   assert.equal(await page.evaluate(() => performance.timeOrigin), accountDocument);
