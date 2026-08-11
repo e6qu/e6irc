@@ -20,6 +20,9 @@ shape before handling it and serializes each composer request from its closed
 shape before sending it. Immutable console mutation operations are checked
 against the router. Successful mutations refresh their API-backed view without
 a document reload.
+External qualification has one manual GitHub workflow. It selects one closed
+campaign, refuses local provider oracles, and uploads only evidence accepted by
+the runner verifier.
 
 ## Remaining qualification
 

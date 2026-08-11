@@ -27,8 +27,13 @@ probe() {
 run() {
   local kind="$1"
   shift
+  local target=example.test
+  case "$kind" in
+    oidc) target=https://issuer.example.test ;;
+    public-irc) target=libera ;;
+  esac
   "$bin" "$kind" \
-    --target example.test \
+    --target "$target" \
     --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     --host qualification-host \
     --executable "$bin" \
@@ -48,6 +53,26 @@ jq -e '
   (.executable.sha256 | test("^[0-9a-f]{64}$")) and
   (.executable | has("path") | not)
 ' "$temporary/passed.json" >/dev/null
+"$bin" verify "$temporary/passed.json"
+
+jq '.outcome = "passed" | .probe.authentication = "rejected"' \
+  "$temporary/passed.json" >"$temporary/inconsistent.json"
+if "$bin" verify "$temporary/inconsistent.json"; then
+  echo 'inconsistent evidence unexpectedly verified' >&2
+  exit 1
+fi
+
+jq '.unexpected = true' "$temporary/passed.json" >"$temporary/unknown-field.json"
+if "$bin" verify "$temporary/unknown-field.json"; then
+  echo 'evidence with an unknown field unexpectedly verified' >&2
+  exit 1
+fi
+
+jq '.source |= ascii_upcase' "$temporary/passed.json" >"$temporary/noncanonical-source.json"
+if "$bin" verify "$temporary/noncanonical-source.json"; then
+  echo 'noncanonical source revision unexpectedly verified' >&2
+  exit 1
+fi
 ! find "$temporary" -name '*.probe.json' -print -quit | grep -q .
 
 occupied="$temporary/occupied.json"
@@ -81,13 +106,45 @@ else
 fi
 jq -e '.outcome == "failed" and .probe.authentication == "not_run"' "$temporary/invalid-applicability.json" >/dev/null
 
-if run public-irc --output "$temporary/public-rejected.json" --probe "$root/tools/qualification/public-irc-probe.sh"; then
-  echo 'unknown public IRC target unexpectedly passed' >&2
+if "$bin" public-irc \
+  --target unknown \
+  --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --host qualification-host \
+  --executable "$bin" \
+  --output "$temporary/unknown-public-irc.json" \
+  --workload sessions=1 \
+  --budget timeout_seconds=1 \
+  --probe "$root/tools/qualification/public-irc-probe.sh"; then
+  echo 'unknown public IRC target unexpectedly parsed' >&2
   exit 1
 else
-  [[ $? -eq 3 ]]
+  [[ $? -eq 2 ]]
 fi
-jq -e '.kind == "public_irc" and .outcome == "rejected" and .probe.delivery == "not_applicable"' "$temporary/public-rejected.json" >/dev/null
+[[ ! -e "$temporary/unknown-public-irc.json" ]]
+
+if E6IRC_DISCORD_API_BASE=http://127.0.0.1:1 \
+  run discord --output "$temporary/oracle-discord.json"; then
+  echo 'external Discord campaign accepted a local oracle' >&2
+  exit 1
+else
+  [[ $? -eq 2 ]]
+fi
+[[ ! -e "$temporary/oracle-discord.json" ]]
+
+if "$bin" oidc \
+  --target http://127.0.0.1:1 \
+  --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --host qualification-host \
+  --executable "$bin" \
+  --output "$temporary/oracle-oidc.json" \
+  --workload sessions=1 \
+  --budget timeout_seconds=1; then
+  echo 'external OIDC campaign accepted a local oracle' >&2
+  exit 1
+else
+  [[ $? -eq 2 ]]
+fi
+[[ ! -e "$temporary/oracle-oidc.json" ]]
 
 if E6IRC_DISCORD_BOT_TOKEN='' run discord --output "$temporary/rejected.json"; then
   echo 'missing credential unexpectedly passed' >&2

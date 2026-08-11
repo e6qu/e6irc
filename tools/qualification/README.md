@@ -6,6 +6,10 @@ digest, host, target, workload, budgets, start/end times, phase results, and a
 closed `passed`, `rejected`, or `failed` outcome. Only every required phase
 passed can produce `passed`.
 
+Use `e6irc-qualification verify EVIDENCE` before retaining or publishing a
+file. It accepts only the current closed schema, valid non-secret metadata,
+valid phase applicability, and an outcome that matches the recorded phases.
+
 Build it with `cargo build --release -p e6irc-qualification`. Every command
 needs a non-secret target identifier, source revision, host, executable, new
 output path, workload, and budget values:
@@ -27,10 +31,9 @@ Discord performs channel authentication, two gateway sessions, message post,
 read-back, and deletion. Slack performs `auth.test`, two Socket Mode sessions,
 message post, thread read-back, and deletion. OIDC verifies the discovered
 issuer, gets two client-credential tokens, introspects one, and revokes it.
-The optional
-`E6IRC_DISCORD_API_BASE` and `E6IRC_SLACK_API_BASE` values select a compatible
-test or provider endpoint; they must be credential-free HTTPS URLs. HTTP is
-accepted only for a loopback test oracle. Evidence records every required
+The adapter tests can select credential-free loopback or provider endpoints.
+The external command rejects custom Discord and Slack endpoints. It always
+uses the public provider endpoint. Evidence records every required
 environment-variable name, never its value.
 
 `public-irc` and `scale` need their supplied probe path. A probe writes this
@@ -74,3 +77,26 @@ The runner creates an isolated report directory and accepts only its fresh
 challenge. It records an executable digest, never a local path. Local oracles
 prove the adapter contract. They do not qualify a commercial provider, public
 network, or tuned host. Publish a passed claim only with retained evidence.
+
+## GitHub dispatch
+
+Run **External qualification** from the Actions page. It is manual only. Pick
+one campaign and supply non-secret target, host, workload, and budget values.
+The workflow sets provider credentials only from these repository secrets:
+
+- `E6IRC_DISCORD_BOT_TOKEN`, `E6IRC_DISCORD_CHANNEL_ID`
+- `E6IRC_SLACK_BOT_TOKEN`, `E6IRC_SLACK_APP_TOKEN`, `E6IRC_SLACK_CHANNEL_ID`
+- `E6IRC_OIDC_CLIENT_ID`, `E6IRC_OIDC_CLIENT_SECRET`
+
+The workflow never sets a Discord or Slack test endpoint. These campaigns use
+the public provider endpoints. Missing credentials or required inputs fail the
+run and do not create a passed record. A verified evidence file is the only
+uploaded artifact. Rejected and failed campaigns retain verified evidence too.
+
+The `scale` campaign runs only on a self-hosted runner with the
+`qualification-scale` label. Start the target `e6ircd` there first. Set
+`target` to its listener address and provide `scale_arguments` in this order:
+`ADDR SERVER_PID CORE_WORKERS CLIENTS CHANNELS BURST MIN_CONNECT_RATE
+MIN_FANOUT_RATE MAX_P99_MS MAX_RSS_BYTES_PER_CONNECTION`. The first value must
+equal `target`. The host checks in `qualify-linux.sh` reject an untuned or
+wrong-process run.
