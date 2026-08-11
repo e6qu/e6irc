@@ -419,8 +419,20 @@ try {
     }
   });
   await contactEmail.fill("retry-contact@example.test");
+  const profileFailureResponse = page.waitForResponse(
+    (response) => response.url() === profileURL
+      && response.request().method() === "PATCH"
+      && response.status() === 503,
+  );
   await page.getByRole("button", { name: "Save contact email", exact: true }).click();
-  await expectStatus(page, /Profile storage unavailable/);
+  await profileFailureResponse;
+  await page.waitForFunction(
+    () => document.getElementById("account-api-result")?.textContent?.trim(),
+  );
+  assert.match(
+    await page.locator("#account-api-result").innerText(),
+    /Profile storage unavailable/,
+  );
   assert.equal(await page.evaluate(() => performance.timeOrigin), accountDocument);
   assert.equal(await contactEmail.inputValue(), "retry-contact@example.test");
   assert.deepEqual(
