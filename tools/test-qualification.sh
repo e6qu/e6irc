@@ -50,6 +50,16 @@ jq -e '
 ' "$temporary/passed.json" >/dev/null
 ! find "$temporary" -name '*.probe.json' -print -quit | grep -q .
 
+occupied="$temporary/occupied.json"
+printf '%s' retained >"$occupied"
+if run public-irc --output "$occupied" --probe "$pass_probe"; then
+  echo 'existing evidence was overwritten' >&2
+  exit 1
+else
+  [[ $? -eq 2 ]]
+fi
+[[ "$(<"$occupied")" == retained ]]
+
 stale_probe="$temporary/stale"
 printf '%s\n' '#!/usr/bin/env bash' 'printf %s '\''{"challenge":"stale","authentication":"passed","delivery":"passed","reconnect":"passed","cleanup":"passed","persistence":"passed"}'\'' > "$E6IRC_QUALIFICATION_PROBE_REPORT"' >"$stale_probe"
 chmod +x "$stale_probe"

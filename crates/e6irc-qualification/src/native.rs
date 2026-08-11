@@ -375,7 +375,18 @@ async fn slack(_target: &str) -> ProbeReport {
     {
         Ok(response) if response.status().is_success() => {
             match response.json::<serde_json::Value>().await {
-                Ok(json) if json.get("ok").and_then(serde_json::Value::as_bool) == Some(true) => {
+                Ok(json)
+                    if json.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+                        && json
+                            .get("messages")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|messages| {
+                                messages.iter().any(|message| {
+                                    message.get("ts").and_then(serde_json::Value::as_str)
+                                        == Some(&timestamp)
+                                })
+                            }) =>
+                {
                     PhaseOutcome::Passed
                 }
                 Ok(_) => PhaseOutcome::Rejected,
@@ -601,17 +612,47 @@ async fn oidc_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock};
 
     use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
-    use axum::extract::{Path, State};
+    use axum::extract::{Form, Path, Query, State};
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
     use axum::routing::{get, post};
     use axum::{Json, Router};
 
     static ENVIRONMENT: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    struct EnvironmentGuard(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvironmentGuard {
+        fn set(values: &[(&'static str, &str)]) -> Self {
+            let mut previous = Vec::with_capacity(values.len());
+            unsafe {
+                for (name, value) in values {
+                    previous.push((*name, std::env::var_os(name)));
+                    std::env::set_var(name, value);
+                }
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for EnvironmentGuard {
+        fn drop(&mut self) {
+            unsafe {
+                for (name, value) in self.0.drain(..).rev() {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
 
     #[derive(Clone)]
     struct DiscordOracle {
@@ -726,6 +767,238 @@ mod tests {
             .expect("ready");
     }
 
+    #[derive(Clone)]
+    struct SlackOracle {
+        websocket: String,
+        posts: Arc<AtomicUsize>,
+        reads: Arc<AtomicUsize>,
+        deletes: Arc<AtomicUsize>,
+    }
+
+    async fn start_slack_oracle() -> SlackOracle {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind oracle");
+        let state = SlackOracle {
+            websocket: format!("ws://{}/socket", listener.local_addr().expect("address")),
+            posts: Arc::new(AtomicUsize::new(0)),
+            reads: Arc::new(AtomicUsize::new(0)),
+            deletes: Arc::new(AtomicUsize::new(0)),
+        };
+        let router = Router::new()
+            .route("/auth.test", post(slack_auth))
+            .route("/apps.connections.open", post(slack_open))
+            .route("/chat.postMessage", post(slack_post))
+            .route("/conversations.replies", get(slack_replies))
+            .route("/chat.delete", post(slack_delete))
+            .route("/socket", get(slack_socket))
+            .with_state(state.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await.expect("serve oracle") });
+        state
+    }
+
+    fn slack_authorized(headers: &HeaderMap, token: &str) -> bool {
+        let authorization = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        authorization == Some(token)
+    }
+
+    async fn slack_auth(headers: HeaderMap) -> impl IntoResponse {
+        if slack_authorized(&headers, "bot") {
+            (StatusCode::OK, Json(serde_json::json!({"ok":true})))
+        } else {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"ok":false})),
+            )
+        }
+    }
+
+    async fn slack_open(State(state): State<SlackOracle>, headers: HeaderMap) -> impl IntoResponse {
+        if slack_authorized(&headers, "app") {
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok":true,"url":state.websocket})),
+            )
+        } else {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"ok":false})),
+            )
+        }
+    }
+
+    async fn slack_post(
+        State(state): State<SlackOracle>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        if slack_authorized(&headers, "bot")
+            && body.get("channel").and_then(serde_json::Value::as_str) == Some("C42")
+            && body
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        {
+            state.posts.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok":true,"ts":"1"})),
+            )
+        } else {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"ok":false})),
+            )
+        }
+    }
+
+    async fn slack_replies(
+        State(state): State<SlackOracle>,
+        headers: HeaderMap,
+        Query(query): Query<BTreeMap<String, String>>,
+    ) -> impl IntoResponse {
+        if slack_authorized(&headers, "bot")
+            && query.get("channel").is_some_and(|channel| channel == "C42")
+            && query.get("ts").is_some_and(|timestamp| timestamp == "1")
+        {
+            state.reads.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok":true,"messages":[{"ts":"1"}]})),
+            )
+        } else {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"ok":false})),
+            )
+        }
+    }
+
+    async fn slack_delete(
+        State(state): State<SlackOracle>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        if slack_authorized(&headers, "bot")
+            && body.get("channel").and_then(serde_json::Value::as_str) == Some("C42")
+            && body.get("ts").and_then(serde_json::Value::as_str) == Some("1")
+        {
+            state.deletes.fetch_add(1, Ordering::SeqCst);
+            (StatusCode::OK, Json(serde_json::json!({"ok":true})))
+        } else {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"ok":false})),
+            )
+        }
+    }
+
+    async fn slack_socket(websocket: WebSocketUpgrade) -> impl IntoResponse {
+        websocket.on_upgrade(|mut socket| async move { while socket.recv().await.is_some() {} })
+    }
+
+    #[derive(Clone)]
+    struct OidcOracle {
+        issuer: String,
+        token_endpoint: String,
+        introspection_endpoint: String,
+        revocation_endpoint: String,
+        tokens: Arc<AtomicUsize>,
+        introspections: Arc<AtomicUsize>,
+        revocations: Arc<AtomicUsize>,
+    }
+
+    async fn start_oidc_oracle() -> OidcOracle {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind oracle");
+        let base = format!("http://{}", listener.local_addr().expect("address"));
+        let state = OidcOracle {
+            issuer: format!("{base}/issuer"),
+            token_endpoint: format!("{base}/token"),
+            introspection_endpoint: format!("{base}/introspect"),
+            revocation_endpoint: format!("{base}/revoke"),
+            tokens: Arc::new(AtomicUsize::new(0)),
+            introspections: Arc::new(AtomicUsize::new(0)),
+            revocations: Arc::new(AtomicUsize::new(0)),
+        };
+        let router = Router::new()
+            .route(
+                "/issuer/.well-known/openid-configuration",
+                get(oidc_discovery),
+            )
+            .route("/token", post(oidc_token_response))
+            .route("/introspect", post(oidc_introspect))
+            .route("/revoke", post(oidc_revoke))
+            .with_state(state.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await.expect("serve oracle") });
+        state
+    }
+
+    fn oidc_authorized(headers: &HeaderMap) -> bool {
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            == Some("Basic Y2xpZW50OnNlY3JldA==")
+    }
+
+    async fn oidc_discovery(State(state): State<OidcOracle>) -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "token_endpoint":state.token_endpoint,
+            "introspection_endpoint":state.introspection_endpoint,
+            "revocation_endpoint":state.revocation_endpoint,
+        }))
+    }
+
+    async fn oidc_token_response(
+        State(state): State<OidcOracle>,
+        headers: HeaderMap,
+        Form(form): Form<BTreeMap<String, String>>,
+    ) -> impl IntoResponse {
+        if oidc_authorized(&headers)
+            && form
+                .get("grant_type")
+                .is_some_and(|grant_type| grant_type == "client_credentials")
+        {
+            state.tokens.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"access_token":"opaque"})),
+            )
+        } else {
+            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})))
+        }
+    }
+
+    async fn oidc_introspect(
+        State(state): State<OidcOracle>,
+        headers: HeaderMap,
+        Form(form): Form<BTreeMap<String, String>>,
+    ) -> impl IntoResponse {
+        if oidc_authorized(&headers) && form.get("token").is_some_and(|token| token == "opaque") {
+            state.introspections.fetch_add(1, Ordering::SeqCst);
+            (StatusCode::OK, Json(serde_json::json!({"active":true})))
+        } else {
+            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})))
+        }
+    }
+
+    async fn oidc_revoke(
+        State(state): State<OidcOracle>,
+        headers: HeaderMap,
+        Form(form): Form<BTreeMap<String, String>>,
+    ) -> StatusCode {
+        if oidc_authorized(&headers) && form.get("token").is_some_and(|token| token == "opaque") {
+            state.revocations.fetch_add(1, Ordering::SeqCst);
+            StatusCode::OK
+        } else {
+            StatusCode::UNAUTHORIZED
+        }
+    }
+
     #[test]
     fn endpoint_urls_cannot_carry_credentials_or_tokens() {
         assert!(safe_url("https://issuer.example/api").is_some());
@@ -751,20 +1024,18 @@ mod tests {
             .lock()
             .await;
         let oracle = start_discord_oracle().await;
-        unsafe {
-            std::env::set_var("E6IRC_DISCORD_BOT_TOKEN", "token");
-            std::env::set_var("E6IRC_DISCORD_CHANNEL_ID", "42");
-            std::env::set_var(
-                "E6IRC_DISCORD_API_BASE",
-                format!(
-                    "http://{}/",
-                    oracle
-                        .websocket
-                        .trim_start_matches("ws://")
-                        .trim_end_matches("/socket")
-                ),
-            );
-        }
+        let base = format!(
+            "http://{}/",
+            oracle
+                .websocket
+                .trim_start_matches("ws://")
+                .trim_end_matches("/socket")
+        );
+        let _settings = EnvironmentGuard::set(&[
+            ("E6IRC_DISCORD_BOT_TOKEN", "token"),
+            ("E6IRC_DISCORD_CHANNEL_ID", "42"),
+            ("E6IRC_DISCORD_API_BASE", &base),
+        ]);
         assert_eq!(setting("E6IRC_DISCORD_BOT_TOKEN").as_deref(), Some("token"));
         assert_eq!(setting("E6IRC_DISCORD_CHANNEL_ID").as_deref(), Some("42"));
         assert!(safe_url(&setting("E6IRC_DISCORD_API_BASE").expect("base")).is_some());
@@ -779,16 +1050,141 @@ mod tests {
             .status();
         assert_eq!(status, StatusCode::OK);
         let result = discord("oracle").await;
-        unsafe {
-            std::env::remove_var("E6IRC_DISCORD_BOT_TOKEN");
-            std::env::remove_var("E6IRC_DISCORD_CHANNEL_ID");
-            std::env::remove_var("E6IRC_DISCORD_API_BASE");
-        }
         assert_eq!(
             result.closed_outcome(TargetKind::Discord),
             super::super::ClosedOutcome::Passed,
             "{result:?}"
         );
         assert_eq!(oracle.deletes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn slack_oracle_proves_all_required_phases_and_cleanup() {
+        let _environment = ENVIRONMENT
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let oracle = start_slack_oracle().await;
+        let base = format!(
+            "http://{}/",
+            oracle
+                .websocket
+                .trim_start_matches("ws://")
+                .trim_end_matches("/socket")
+        );
+        let _settings = EnvironmentGuard::set(&[
+            ("E6IRC_SLACK_BOT_TOKEN", "bot"),
+            ("E6IRC_SLACK_APP_TOKEN", "app"),
+            ("E6IRC_SLACK_CHANNEL_ID", "C42"),
+            ("E6IRC_SLACK_API_BASE", &base),
+        ]);
+        let result = slack("oracle").await;
+        assert_eq!(
+            result.closed_outcome(TargetKind::Slack),
+            super::super::ClosedOutcome::Passed,
+            "{result:?}"
+        );
+        assert_eq!(oracle.posts.load(Ordering::SeqCst), 1);
+        assert_eq!(oracle.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(oracle.deletes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn oidc_oracle_proves_all_required_phases_and_cleanup() {
+        let _environment = ENVIRONMENT
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let oracle = start_oidc_oracle().await;
+        let _settings = EnvironmentGuard::set(&[
+            ("E6IRC_OIDC_CLIENT_ID", "client"),
+            ("E6IRC_OIDC_CLIENT_SECRET", "secret"),
+        ]);
+        let result = oidc(&oracle.issuer).await;
+        assert_eq!(
+            result.closed_outcome(TargetKind::Oidc),
+            super::super::ClosedOutcome::Passed,
+            "{result:?}"
+        );
+        assert_eq!(oracle.tokens.load(Ordering::SeqCst), 2);
+        assert_eq!(oracle.introspections.load(Ordering::SeqCst), 1);
+        assert_eq!(oracle.revocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn native_campaigns_reject_secret_bearing_configuration() {
+        let _environment = ENVIRONMENT
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let _settings = EnvironmentGuard::set(&[
+            ("E6IRC_DISCORD_BOT_TOKEN", "token"),
+            ("E6IRC_DISCORD_CHANNEL_ID", "42"),
+            (
+                "E6IRC_DISCORD_API_BASE",
+                "https://oracle.example/?token=secret",
+            ),
+            ("E6IRC_SLACK_BOT_TOKEN", "bot"),
+            ("E6IRC_SLACK_APP_TOKEN", "app"),
+            ("E6IRC_SLACK_CHANNEL_ID", "C42"),
+            (
+                "E6IRC_SLACK_API_BASE",
+                "https://oracle.example/?token=secret",
+            ),
+            ("E6IRC_OIDC_CLIENT_ID", "client"),
+            ("E6IRC_OIDC_CLIENT_SECRET", "secret"),
+        ]);
+        assert_eq!(
+            discord("oracle").await.closed_outcome(TargetKind::Discord),
+            super::super::ClosedOutcome::Rejected
+        );
+        assert_eq!(
+            slack("oracle").await.closed_outcome(TargetKind::Slack),
+            super::super::ClosedOutcome::Rejected
+        );
+        assert_eq!(
+            oidc("https://client:secret@oracle.example")
+                .await
+                .closed_outcome(TargetKind::Oidc),
+            super::super::ClosedOutcome::Rejected
+        );
+    }
+
+    #[tokio::test]
+    async fn native_campaigns_fail_closed_on_unreachable_transport() {
+        let _environment = ENVIRONMENT
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve port");
+        let base = format!("http://{}", listener.local_addr().expect("address"));
+        drop(listener);
+        let _settings = EnvironmentGuard::set(&[
+            ("E6IRC_DISCORD_BOT_TOKEN", "token"),
+            ("E6IRC_DISCORD_CHANNEL_ID", "42"),
+            ("E6IRC_DISCORD_API_BASE", &base),
+            ("E6IRC_SLACK_BOT_TOKEN", "bot"),
+            ("E6IRC_SLACK_APP_TOKEN", "app"),
+            ("E6IRC_SLACK_CHANNEL_ID", "C42"),
+            ("E6IRC_SLACK_API_BASE", &base),
+            ("E6IRC_OIDC_CLIENT_ID", "client"),
+            ("E6IRC_OIDC_CLIENT_SECRET", "secret"),
+        ]);
+        assert_eq!(
+            discord("oracle").await.closed_outcome(TargetKind::Discord),
+            super::super::ClosedOutcome::Failed
+        );
+        assert_eq!(
+            slack("oracle").await.closed_outcome(TargetKind::Slack),
+            super::super::ClosedOutcome::Failed
+        );
+        assert_eq!(
+            oidc(&format!("{base}/issuer"))
+                .await
+                .closed_outcome(TargetKind::Oidc),
+            super::super::ClosedOutcome::Failed
+        );
     }
 }
