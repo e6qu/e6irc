@@ -116,6 +116,13 @@ async function apiJson(response) {
   }
 }
 
+function apiObject(value, status) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new ApiError(status, "The API response is invalid. Reload and try again.");
+  }
+  return value;
+}
+
 export async function getJson(fetcher, url) {
   const response = await fetcher(url, { headers: { Accept: "application/json" } });
   if (!response.ok) {
@@ -131,7 +138,7 @@ export async function getJson(fetcher, url) {
     } catch {}
     throw new ApiError(response.status, detail || `Request failed with HTTP ${response.status}`);
   }
-  return apiJson(response);
+  return apiObject(await apiJson(response), response.status);
 }
 
 function optionalString(value) {

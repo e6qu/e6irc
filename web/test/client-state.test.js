@@ -105,6 +105,39 @@ test("JSON requests preserve problem details and reject malformed success bodies
   );
 });
 
+test("JSON requests reject non-object success bodies at the shared boundary", async () => {
+  assert.deepEqual(
+    await getJson(
+      async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        text: async () => '{"networks":[]}',
+      }),
+      "/api/v1/me/networks",
+    ),
+    { networks: [] },
+  );
+
+  for (const body of ["null", "[]", "true", "42", '\"text\"']) {
+    await assert.rejects(
+      getJson(
+        async () => ({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          text: async () => body,
+        }),
+        "/api/v1/me",
+      ),
+      (error) =>
+        error instanceof ApiError &&
+        error.status === 200 &&
+        error.message === "The API response is invalid. Reload and try again.",
+    );
+  }
+});
+
 test("JSON requests reject oversized API responses before parsing", async () => {
   await assert.rejects(
     getJson(

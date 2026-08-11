@@ -12,10 +12,11 @@ and integration claims.
 
 ## Current state
 
-The console reads and writes only through `/api/v1`. Immutable mutation
-operations are checked against the router, and JSON response objects are parsed
-at the boundary before a view uses them. Successful mutations refresh their
-API-backed view without a document reload.
+The console reads and writes only through `/api/v1`. Browser chat and console
+parse successful API payloads as objects at their shared boundaries before a
+view uses them. Immutable console mutation operations are checked against the
+router. Successful mutations refresh their API-backed view without a document
+reload.
 
 ## Remaining qualification
 
