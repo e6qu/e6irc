@@ -34,6 +34,7 @@ jobs:
       # the frontend first. Node is preinstalled on the runners.
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web test && pnpm -C web build
       - run: cargo fmt --all --check
+      - run: rustfmt --edition 2024 --check crates/e6irc-qualification/tests/support/native.rs
       - run: cargo clippy --workspace --all-targets --all-features
       # `--all-features` is the union, so it never compiles a bridge on its
       # own. Code behind `cfg(feature = "discord")` that happens to depend on
