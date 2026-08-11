@@ -426,7 +426,11 @@ try {
   await page.evaluate(() => { window.__e6ircProfileFailure = true; });
   await contactEmail.fill("retry-contact@example.test");
   await page.getByRole("button", { name: "Save contact email", exact: true }).click();
-  await expectStatus(page, /Profile storage unavailable/);
+  const accountResult = page.locator("#account-api-result");
+  await page.waitForFunction(
+    () => document.getElementById("account-api-result")?.textContent?.trim().length,
+  );
+  assert.match(await accountResult.innerText(), /Profile storage unavailable/);
   assert.equal(await page.evaluate(() => performance.timeOrigin), accountDocument);
   assert.equal(await contactEmail.inputValue(), "retry-contact@example.test");
   assert.equal(await page.evaluate(() => window.__e6ircProfileFailureRequests), 1);
