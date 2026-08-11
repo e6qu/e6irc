@@ -121,7 +121,12 @@ let server = startApplicationServer();
 // Every Playwright action already has a 30s default; this bounds the whole
 // script, including teardown, which those defaults do not cover.
 const watchdog = setTimeout(() => {
-  console.error("test-oidc-browser: watchdog fired after 180s; forcing exit");
+  console.error(
+    "test-oidc-browser: watchdog fired after 180s; forcing exit\n"
+      + `page: ${page?.url() ?? "not created"}\n`
+      + `navigation: ${navigationTrace.slice(-8).join(" | ")}\n`
+      + `requests: ${applicationRequests.slice(-16).join(" | ")}`,
+  );
   process.exit(1);
 }, 180_000);
 
@@ -385,13 +390,8 @@ try {
   const contactEmail = page.getByLabel("Email address", { exact: true });
   const accountDocument = await page.evaluate(() => performance.timeOrigin);
   const profileFailureErrorStart = applicationErrors.length;
-  let profileFailureFulfilled;
-  const profileFailure = new Promise((resolve) => {
-    profileFailureFulfilled = resolve;
-  });
   await page.route(profileURL, async (route) => {
     if (route.request().method() === "PATCH") {
-      profileFailureFulfilled();
       await route.fulfill({
         status: 503,
         contentType: "application/problem+json",
@@ -401,6 +401,11 @@ try {
     }
     await route.continue();
   });
+  const profileFailure = page.waitForResponse(
+    (response) => response.url() === profileURL
+      && response.request().method() === "PATCH"
+      && response.status() === 503,
+  );
   await contactEmail.fill("retry-contact@example.test");
   assert.equal(await contactEmail.evaluate((input) => input.checkValidity()), true);
   await page.getByRole("button", { name: "Save contact email", exact: true }).click();
