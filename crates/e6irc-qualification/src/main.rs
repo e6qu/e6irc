@@ -353,6 +353,25 @@ enum PhaseOutcome {
     NotRun,
 }
 
+#[derive(Clone, Copy)]
+enum QualificationPhase {
+    Authentication,
+    Delivery,
+    Reconnect,
+    Cleanup,
+    Persistence,
+}
+
+impl QualificationPhase {
+    const ALL: [Self; 5] = [
+        Self::Authentication,
+        Self::Delivery,
+        Self::Reconnect,
+        Self::Cleanup,
+        Self::Persistence,
+    ];
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ProbeReport {
@@ -373,19 +392,19 @@ struct ProbeResult {
 
 impl ProbeReport {
     fn not_run(kind: TargetKind) -> Self {
-        let outcome = |index| {
-            if kind.requires_phase(index) {
+        let outcome = |phase| {
+            if kind.requires_phase(phase) {
                 PhaseOutcome::NotRun
             } else {
                 PhaseOutcome::NotApplicable
             }
         };
         Self {
-            authentication: outcome(0),
-            delivery: outcome(1),
-            reconnect: outcome(2),
-            cleanup: outcome(3),
-            persistence: outcome(4),
+            authentication: outcome(QualificationPhase::Authentication),
+            delivery: outcome(QualificationPhase::Delivery),
+            reconnect: outcome(QualificationPhase::Reconnect),
+            cleanup: outcome(QualificationPhase::Cleanup),
+            persistence: outcome(QualificationPhase::Persistence),
         }
     }
 
@@ -400,12 +419,15 @@ impl ProbeReport {
     }
 
     fn closed_outcome(&self, kind: TargetKind) -> ClosedOutcome {
-        let outcomes = self.outcomes();
-        if outcomes.contains(&PhaseOutcome::Failed) {
+        let outcomes = self.phase_outcomes();
+        if outcomes
+            .iter()
+            .any(|(_, outcome)| *outcome == PhaseOutcome::Failed)
+        {
             ClosedOutcome::Failed
-        } else if outcomes.iter().enumerate().all(|(index, outcome)| {
+        } else if outcomes.iter().all(|(phase, outcome)| {
             *outcome == PhaseOutcome::Passed
-                || (*outcome == PhaseOutcome::NotApplicable && !kind.requires_phase(index))
+                || (*outcome == PhaseOutcome::NotApplicable && !kind.requires_phase(*phase))
         }) {
             ClosedOutcome::Passed
         } else {
@@ -414,29 +436,39 @@ impl ProbeReport {
     }
 
     fn has_valid_applicability(&self, kind: TargetKind) -> bool {
-        self.outcomes().iter().enumerate().all(|(index, outcome)| {
-            (*outcome == PhaseOutcome::NotApplicable) != kind.requires_phase(index)
+        self.phase_outcomes().iter().all(|(phase, outcome)| {
+            (*outcome == PhaseOutcome::NotApplicable) != kind.requires_phase(*phase)
         })
     }
 
-    fn outcomes(&self) -> [PhaseOutcome; 5] {
+    fn phase_outcomes(&self) -> [(QualificationPhase, PhaseOutcome); 5] {
         [
-            self.authentication,
-            self.delivery,
-            self.reconnect,
-            self.cleanup,
-            self.persistence,
+            (QualificationPhase::Authentication, self.authentication),
+            (QualificationPhase::Delivery, self.delivery),
+            (QualificationPhase::Reconnect, self.reconnect),
+            (QualificationPhase::Cleanup, self.cleanup),
+            (QualificationPhase::Persistence, self.persistence),
         ]
     }
 }
 
 impl TargetKind {
-    fn requires_phase(self, index: usize) -> bool {
+    fn requires_phase(self, phase: QualificationPhase) -> bool {
         match self {
             Self::Discord | Self::Slack => true,
-            Self::Oidc => matches!(index, 0 | 2 | 3 | 4),
-            Self::PublicIrc => matches!(index, 0 | 2 | 3),
-            Self::Scale => matches!(index, 0 | 1 | 3),
+            Self::Oidc => !matches!(phase, QualificationPhase::Delivery),
+            Self::PublicIrc => matches!(
+                phase,
+                QualificationPhase::Authentication
+                    | QualificationPhase::Reconnect
+                    | QualificationPhase::Cleanup
+            ),
+            Self::Scale => matches!(
+                phase,
+                QualificationPhase::Authentication
+                    | QualificationPhase::Delivery
+                    | QualificationPhase::Cleanup
+            ),
         }
     }
 }

@@ -6,7 +6,7 @@ use reqwest::{Client, RequestBuilder, StatusCode, Url};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{PhaseOutcome, ProbeReport, SafeText, TargetKind};
+use super::{PhaseOutcome, ProbeReport, QualificationPhase, SafeText, TargetKind};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -34,9 +34,13 @@ fn report(
     persistence: PhaseOutcome,
 ) -> ProbeReport {
     let outcomes = [authentication, delivery, reconnect, cleanup, persistence];
-    if outcomes.iter().enumerate().any(|(index, outcome)| {
-        (*outcome == PhaseOutcome::NotApplicable) == kind.requires_phase(index)
-    }) {
+    if outcomes
+        .into_iter()
+        .zip(QualificationPhase::ALL)
+        .any(|(outcome, phase)| {
+            (outcome == PhaseOutcome::NotApplicable) == kind.requires_phase(phase)
+        })
+    {
         return ProbeReport::not_run(kind);
     }
     ProbeReport {

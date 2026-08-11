@@ -560,9 +560,9 @@ async fn native_campaigns_reject_secret_bearing_configuration() {
     );
     assert!(
         discord
-            .outcomes()
+            .phase_outcomes()
             .iter()
-            .all(|outcome| *outcome == PhaseOutcome::NotRun)
+            .all(|(_, outcome)| *outcome == PhaseOutcome::NotRun)
     );
     assert_eq!(
         slack("oracle").await.closed_outcome(TargetKind::Slack),
