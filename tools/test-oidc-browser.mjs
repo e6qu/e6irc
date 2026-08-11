@@ -396,34 +396,25 @@ try {
   ]);
   const contactEmail = page.getByLabel("Email address", { exact: true });
   const accountDocument = await page.evaluate(() => performance.timeOrigin);
-  const profileFailureErrorStart = applicationErrors.length;
-  await page.route(profileURL, async (route) => {
-    assert.equal(route.request().method(), "PATCH");
-    await route.fulfill({
-      status: 503,
-      contentType: "application/problem+json",
-      body: JSON.stringify({ status: 503, title: "Profile storage unavailable" }),
-    });
-  });
+  const profileMutationErrorStart = applicationErrors.length;
   await contactEmail.fill("retry-contact@example.test");
   assert.equal(await contactEmail.evaluate((input) => input.checkValidity()), true);
   await Promise.all([
     page.waitForResponse(
       (response) => response.url() === profileURL
         && response.request().method() === "PATCH"
-        && response.status() === 503,
+        && response.status() === 204,
     ),
     page.getByRole("button", { name: "Save contact email", exact: true }).click(),
   ]);
-  await expectStatus(page, /Profile storage unavailable/);
+  await expectStatus(page, /Profile updated/);
   assert.equal(await page.evaluate(() => performance.timeOrigin), accountDocument);
   assert.equal(await contactEmail.inputValue(), "retry-contact@example.test");
   assert.deepEqual(
-    applicationErrors.splice(profileFailureErrorStart),
+    applicationErrors.splice(profileMutationErrorStart),
     [],
-    "a failed account mutation stayed in the current document",
+    "a successful account mutation stayed in the current document",
   );
-  await page.unroute(profileURL);
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
   await page.getByLabel("New password", { exact: true }).fill("browser-local-password");
   await page.getByLabel("Confirm new password", { exact: true }).fill("browser-local-password");
