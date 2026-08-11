@@ -375,20 +375,7 @@ async fn slack(_target: &str) -> ProbeReport {
     {
         Ok(response) if response.status().is_success() => {
             match response.json::<serde_json::Value>().await {
-                Ok(json)
-                    if json.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
-                        && json
-                            .get("messages")
-                            .and_then(serde_json::Value::as_array)
-                            .is_some_and(|messages| {
-                                messages.iter().any(|message| {
-                                    message.get("ts").and_then(serde_json::Value::as_str)
-                                        == Some(&timestamp)
-                                })
-                            }) =>
-                {
-                    PhaseOutcome::Passed
-                }
+                Ok(json) if slack_readback_contains(&json, &timestamp) => PhaseOutcome::Passed,
                 Ok(_) => PhaseOutcome::Rejected,
                 Err(_) => PhaseOutcome::Failed,
             }
@@ -419,6 +406,18 @@ async fn slack(_target: &str) -> ProbeReport {
         Err(_) => PhaseOutcome::Failed,
     };
     report(auth, PhaseOutcome::Passed, reconnect, cleanup, persistence)
+}
+
+fn slack_readback_contains(json: &serde_json::Value, timestamp: &str) -> bool {
+    json.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+        && json
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message.get("ts").and_then(serde_json::Value::as_str) == Some(timestamp)
+                })
+            })
 }
 
 async fn slack_socket(http: &Client, base: &Url, app: &str) -> Result<String, PhaseOutcome> {
@@ -1015,6 +1014,18 @@ mod tests {
                 .as_str(),
             "https://issuer.example/realms/e6/.well-known/openid-configuration"
         );
+    }
+
+    #[test]
+    fn slack_readback_requires_the_posted_message() {
+        assert!(slack_readback_contains(
+            &serde_json::json!({"ok":true,"messages":[{"ts":"1"}]}),
+            "1"
+        ));
+        assert!(!slack_readback_contains(
+            &serde_json::json!({"ok":true,"messages":[{"ts":"other"}]}),
+            "1"
+        ));
     }
 
     #[tokio::test]
