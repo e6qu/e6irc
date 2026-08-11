@@ -138,7 +138,7 @@ fn document() -> serde_json::Value {
         "required": ["name", "kind", "addr", "tls", "nick", "realname", "autojoin", "sasl_account", "has_sasl_account", "has_sasl_password", "enabled", "connected", "runtime"],
         "properties": {
             "name": { "type": "string", "minLength": 1 },
-            "kind": { "type": "string", "enum": ["irc", "matrix", "discord", "slack"] },
+            "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] },
             "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" },
             "realname": { "type": ["string", "null"] },
             "autojoin": { "type": "array", "items": { "type": "string" } },
@@ -1904,5 +1904,17 @@ mod tests {
             assert_eq!(schema["type"], "object", "{method} {path}");
             assert_eq!(schema["additionalProperties"], false, "{method} {path}");
         }
+    }
+
+    #[test]
+    fn network_response_accepts_the_local_driver() {
+        let spec = super::document();
+        let kinds = &spec["paths"]["/api/v1/me/networks"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["properties"]["networks"]["items"]["properties"]["kind"]["enum"];
+        assert!(
+            kinds
+                .as_array()
+                .is_some_and(|values| values.contains(&serde_json::json!("local")))
+        );
     }
 }
