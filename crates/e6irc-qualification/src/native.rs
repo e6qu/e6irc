@@ -2,7 +2,7 @@ use std::env;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use reqwest::{Client, StatusCode, Url};
+use reqwest::{Client, RequestBuilder, StatusCode, Url};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -91,6 +91,32 @@ fn classified(status: StatusCode) -> PhaseOutcome {
     }
 }
 
+async fn request_outcome(request: RequestBuilder) -> PhaseOutcome {
+    match request.send().await {
+        Ok(response) => classified(response.status()),
+        Err(_) => PhaseOutcome::Failed,
+    }
+}
+
+async fn success_json(request: RequestBuilder) -> Result<serde_json::Value, PhaseOutcome> {
+    let response = request.send().await.map_err(|_| PhaseOutcome::Failed)?;
+    if !response.status().is_success() {
+        return Err(classified(response.status()));
+    }
+    response.json().await.map_err(|_| PhaseOutcome::Failed)
+}
+
+async fn json_outcome(
+    request: RequestBuilder,
+    accepted: impl FnOnce(&serde_json::Value) -> bool,
+) -> PhaseOutcome {
+    match success_json(request).await {
+        Ok(json) if accepted(&json) => PhaseOutcome::Passed,
+        Ok(_) => PhaseOutcome::Rejected,
+        Err(outcome) => outcome,
+    }
+}
+
 fn marker(kind: &str) -> String {
     format!("e6irc-qualification-{kind}-{}", super::now_ms())
 }
@@ -118,34 +144,28 @@ async fn discord(_target: &str) -> ProbeReport {
     let Some(channel_url) = endpoint(&base, &format!("channels/{channel}")) else {
         return rejected();
     };
-    let auth = match http
-        .get(channel_url.clone())
-        .header("Authorization", &authorization)
-        .send()
-        .await
-    {
-        Ok(response) => classified(response.status()),
-        Err(_) => PhaseOutcome::Failed,
-    };
+    let auth = request_outcome(
+        http.get(channel_url.clone())
+            .header("Authorization", &authorization),
+    )
+    .await;
     if auth != PhaseOutcome::Passed {
         return report(auth, auth, auth, auth, auth);
     }
-    let gateway_url = match http.get(gateway).send().await {
-        Ok(response) if response.status().is_success() => response
-            .json::<serde_json::Value>()
-            .await
-            .ok()
-            .and_then(|json| json.get("url")?.as_str().map(str::to_owned)),
-        Ok(response) => {
+    let gateway_url = match success_json(http.get(gateway)).await {
+        Ok(json) => json
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        Err(outcome) => {
             return report(
                 PhaseOutcome::Passed,
-                classified(response.status()),
+                outcome,
                 PhaseOutcome::Failed,
                 PhaseOutcome::Failed,
                 PhaseOutcome::Failed,
             );
         }
-        Err(_) => return failed(),
     };
     let Some(gateway_url) = gateway_url else {
         return failed();
@@ -168,26 +188,23 @@ async fn discord(_target: &str) -> ProbeReport {
         Some(url) => url,
         None => return rejected(),
     };
-    let posted = match http
-        .post(message_collection)
-        .header("Authorization", &authorization)
-        .json(&serde_json::json!({"content": message}))
-        .send()
-        .await
+    let posted = match success_json(
+        http.post(message_collection)
+            .header("Authorization", &authorization)
+            .json(&serde_json::json!({"content": message})),
+    )
+    .await
     {
-        Ok(response) if response.status().is_success() => {
-            response.json::<serde_json::Value>().await.ok()
-        }
-        Ok(response) => {
+        Ok(json) => Some(json),
+        Err(outcome) => {
             return report(
                 PhaseOutcome::Passed,
-                classified(response.status()),
+                outcome,
                 reconnect,
                 PhaseOutcome::Failed,
                 PhaseOutcome::Failed,
             );
         }
-        Err(_) => return failed(),
     };
     let Some(id) = posted.and_then(|json| json.get("id")?.as_str().map(str::to_owned)) else {
         return failed();
@@ -195,25 +212,16 @@ async fn discord(_target: &str) -> ProbeReport {
     let Some(message_url) = endpoint(&base, &format!("channels/{channel}/messages/{id}")) else {
         return failed();
     };
-    let persistence = match http
-        .get(message_url.clone())
-        .header("Authorization", &authorization)
-        .send()
-        .await
-    {
-        Ok(response) if response.status().is_success() => PhaseOutcome::Passed,
-        Ok(response) => classified(response.status()),
-        Err(_) => PhaseOutcome::Failed,
-    };
-    let cleanup = match http
-        .delete(message_url)
-        .header("Authorization", &authorization)
-        .send()
-        .await
-    {
-        Ok(response) => classified(response.status()),
-        Err(_) => PhaseOutcome::Failed,
-    };
+    let persistence = request_outcome(
+        http.get(message_url.clone())
+            .header("Authorization", &authorization),
+    )
+    .await;
+    let cleanup = request_outcome(
+        http.delete(message_url)
+            .header("Authorization", &authorization),
+    )
+    .await;
     report(
         PhaseOutcome::Passed,
         PhaseOutcome::Passed,
@@ -294,18 +302,11 @@ async fn slack(_target: &str) -> ProbeReport {
     let Some(auth_url) = endpoint(&base, "auth.test") else {
         return rejected();
     };
-    let auth = match slack_json(
-        http.post(auth_url)
-            .header("Authorization", &authorization)
-            .send()
-            .await,
+    let auth = json_outcome(
+        http.post(auth_url).header("Authorization", &authorization),
+        slack_ok,
     )
-    .await
-    {
-        Ok(true) => PhaseOutcome::Passed,
-        Ok(false) => PhaseOutcome::Rejected,
-        Err(()) => PhaseOutcome::Failed,
-    };
+    .await;
     if auth != PhaseOutcome::Passed {
         return report(auth, auth, auth, auth, auth);
     }
@@ -324,26 +325,23 @@ async fn slack(_target: &str) -> ProbeReport {
         return rejected();
     };
     let message = marker("slack");
-    let posted = match http
-        .post(post_url)
-        .header("Authorization", &authorization)
-        .json(&serde_json::json!({"channel":channel,"text":message}))
-        .send()
-        .await
+    let posted = match success_json(
+        http.post(post_url)
+            .header("Authorization", &authorization)
+            .json(&serde_json::json!({"channel":channel,"text":message})),
+    )
+    .await
     {
-        Ok(response) if response.status().is_success() => {
-            response.json::<serde_json::Value>().await.ok()
-        }
-        Ok(response) => {
+        Ok(json) => Some(json),
+        Err(outcome) => {
             return report(
                 auth,
-                classified(response.status()),
+                outcome,
                 reconnect,
                 PhaseOutcome::Failed,
                 PhaseOutcome::Failed,
             );
         }
-        Err(_) => return failed(),
     };
     let Some(timestamp) = posted.and_then(|json| {
         (json.get("ok").and_then(serde_json::Value::as_bool) == Some(true))
@@ -366,45 +364,23 @@ async fn slack(_target: &str) -> ProbeReport {
     let Some(replies_url) = endpoint(&base, "conversations.replies") else {
         return rejected();
     };
-    let persistence = match http
-        .get(replies_url)
-        .header("Authorization", &authorization)
-        .query(&[("channel", &channel), ("ts", &timestamp)])
-        .send()
-        .await
-    {
-        Ok(response) if response.status().is_success() => {
-            match response.json::<serde_json::Value>().await {
-                Ok(json) if slack_readback_contains(&json, &timestamp) => PhaseOutcome::Passed,
-                Ok(_) => PhaseOutcome::Rejected,
-                Err(_) => PhaseOutcome::Failed,
-            }
-        }
-        Ok(response) => classified(response.status()),
-        Err(_) => PhaseOutcome::Failed,
-    };
+    let persistence = json_outcome(
+        http.get(replies_url)
+            .header("Authorization", &authorization)
+            .query(&[("channel", &channel), ("ts", &timestamp)]),
+        |json| slack_readback_contains(json, &timestamp),
+    )
+    .await;
     let Some(delete_url) = endpoint(&base, "chat.delete") else {
         return rejected();
     };
-    let cleanup = match http
-        .post(delete_url)
-        .header("Authorization", &authorization)
-        .json(&serde_json::json!({"channel":channel,"ts":timestamp}))
-        .send()
-        .await
-    {
-        Ok(response) if response.status().is_success() => {
-            match response.json::<serde_json::Value>().await {
-                Ok(json) if json.get("ok").and_then(serde_json::Value::as_bool) == Some(true) => {
-                    PhaseOutcome::Passed
-                }
-                Ok(_) => PhaseOutcome::Rejected,
-                Err(_) => PhaseOutcome::Failed,
-            }
-        }
-        Ok(response) => classified(response.status()),
-        Err(_) => PhaseOutcome::Failed,
-    };
+    let cleanup = json_outcome(
+        http.post(delete_url)
+            .header("Authorization", &authorization)
+            .json(&serde_json::json!({"channel":channel,"ts":timestamp})),
+        slack_ok,
+    )
+    .await;
     report(auth, PhaseOutcome::Passed, reconnect, cleanup, persistence)
 }
 
@@ -420,24 +396,20 @@ fn slack_readback_contains(json: &serde_json::Value, timestamp: &str) -> bool {
             })
 }
 
+fn slack_ok(json: &serde_json::Value) -> bool {
+    json.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
 async fn slack_socket(http: &Client, base: &Url, app: &str) -> Result<String, PhaseOutcome> {
     let Some(url) = endpoint(base, "apps.connections.open") else {
         return Err(PhaseOutcome::Rejected);
     };
-    let response = http
-        .post(url)
-        .header("Authorization", format!("Bearer {app}"))
-        .send()
-        .await
-        .map_err(|_| PhaseOutcome::Failed)?;
-    if !response.status().is_success() {
-        return Err(classified(response.status()));
-    }
-    let json = response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|_| PhaseOutcome::Failed)?;
-    if json.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+    let json = success_json(
+        http.post(url)
+            .header("Authorization", format!("Bearer {app}")),
+    )
+    .await?;
+    if !slack_ok(&json) {
         return Err(PhaseOutcome::Rejected);
     }
     json.get("url")
@@ -456,18 +428,6 @@ async fn slack_connect(url: &str) -> PhaseOutcome {
     }
 }
 
-async fn slack_json(response: Result<reqwest::Response, reqwest::Error>) -> Result<bool, ()> {
-    let response = response.map_err(|_| ())?;
-    if !response.status().is_success() {
-        return Ok(false);
-    }
-    response
-        .json::<serde_json::Value>()
-        .await
-        .map(|json| json.get("ok").and_then(serde_json::Value::as_bool) == Some(true))
-        .map_err(|_| ())
-}
-
 async fn oidc(target: &str) -> ProbeReport {
     let (Some(client_id), Some(secret)) = (
         setting("E6IRC_OIDC_CLIENT_ID"),
@@ -479,23 +439,17 @@ async fn oidc(target: &str) -> ProbeReport {
         return rejected();
     };
     let Ok(http) = client() else { return failed() };
-    let configuration = match http.get(discovery).send().await {
-        Ok(response) if response.status().is_success() => {
-            response.json::<serde_json::Value>().await.ok()
-        }
-        Ok(response) => {
+    let configuration = match success_json(http.get(discovery)).await {
+        Ok(json) => json,
+        Err(outcome) => {
             return report(
-                classified(response.status()),
+                outcome,
                 PhaseOutcome::NotApplicable,
-                classified(response.status()),
-                classified(response.status()),
-                classified(response.status()),
+                outcome,
+                outcome,
+                outcome,
             );
         }
-        Err(_) => return failed(),
-    };
-    let Some(configuration) = configuration else {
-        return failed();
     };
     let Some(token_endpoint) = configuration
         .get("token_endpoint")
@@ -534,36 +488,19 @@ async fn oidc(target: &str) -> ProbeReport {
         Ok(_) => PhaseOutcome::Passed,
         Err(outcome) => outcome,
     };
-    let persistence = match http
-        .post(introspection_endpoint)
-        .basic_auth(&client_id, Some(&secret))
-        .form(&[("token", token.as_str())])
-        .send()
-        .await
-    {
-        Ok(response) if response.status().is_success() => match response
-            .json::<serde_json::Value>()
-            .await
-        {
-            Ok(json) if json.get("active").and_then(serde_json::Value::as_bool) == Some(true) => {
-                PhaseOutcome::Passed
-            }
-            Ok(_) => PhaseOutcome::Rejected,
-            Err(_) => PhaseOutcome::Failed,
-        },
-        Ok(response) => classified(response.status()),
-        Err(_) => PhaseOutcome::Failed,
-    };
-    let cleanup = match http
-        .post(revocation_endpoint)
-        .basic_auth(&client_id, Some(&secret))
-        .form(&[("token", token.as_str())])
-        .send()
-        .await
-    {
-        Ok(response) => classified(response.status()),
-        Err(_) => PhaseOutcome::Failed,
-    };
+    let persistence = json_outcome(
+        http.post(introspection_endpoint)
+            .basic_auth(&client_id, Some(&secret))
+            .form(&[("token", token.as_str())]),
+        |json| json.get("active").and_then(serde_json::Value::as_bool) == Some(true),
+    )
+    .await;
+    let cleanup = request_outcome(
+        http.post(revocation_endpoint)
+            .basic_auth(&client_id, Some(&secret))
+            .form(&[("token", token.as_str())]),
+    )
+    .await;
     report(
         PhaseOutcome::Passed,
         PhaseOutcome::NotApplicable,
@@ -587,25 +524,17 @@ async fn oidc_token(
     client_id: &str,
     secret: &str,
 ) -> Result<String, PhaseOutcome> {
-    let response = http
-        .post(endpoint.clone())
-        .basic_auth(client_id, Some(secret))
-        .form(&[("grant_type", "client_credentials")])
-        .send()
-        .await
-        .map_err(|_| PhaseOutcome::Failed)?;
-    if !response.status().is_success() {
-        return Err(classified(response.status()));
-    }
-    response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|_| PhaseOutcome::Failed)?
-        .get("access_token")
-        .and_then(serde_json::Value::as_str)
-        .filter(|token| !token.is_empty())
-        .map(str::to_owned)
-        .ok_or(PhaseOutcome::Rejected)
+    success_json(
+        http.post(endpoint.clone())
+            .basic_auth(client_id, Some(secret))
+            .form(&[("grant_type", "client_credentials")]),
+    )
+    .await?
+    .get("access_token")
+    .and_then(serde_json::Value::as_str)
+    .filter(|token| !token.is_empty())
+    .map(str::to_owned)
+    .ok_or(PhaseOutcome::Rejected)
 }
 
 #[cfg(test)]
