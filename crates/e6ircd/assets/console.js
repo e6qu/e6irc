@@ -224,6 +224,13 @@
       throw new Error("The API response is invalid. Reload and try again.");
     }
   };
+  const apiObject = async (response) => {
+    const value = await apiJson(response);
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("The API response is invalid. Reload and try again.");
+    }
+    return value;
+  };
   const apiProblem = async (response) => {
     try {
       const problem = await apiJson(response);
@@ -300,7 +307,7 @@
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     if (!response.ok) throw new Error(await apiProblem(response));
-    return response.status === 204 ? undefined : apiJson(response);
+    return response.status === 204 ? undefined : apiObject(response);
   };
 
   const apiRead = async (url) => {
@@ -310,7 +317,7 @@
       headers: { Accept: "application/json" },
     });
     if (!response.ok) throw new Error(await apiProblem(response));
-    return apiJson(response);
+    return apiObject(response);
   };
 
   const optionalString = (value) => value === null || typeof value === "string";
