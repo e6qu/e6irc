@@ -981,7 +981,7 @@ try {
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: "{",
+        body: "[]",
       });
     } else {
       await route.continue();
