@@ -1,4 +1,4 @@
-import { getOperationJson, loadApiContract } from "/console-contract.js";
+import { apiContractLoader, getOperationJson } from "/console-contract.js";
 
 (() => {
   "use strict";
@@ -204,7 +204,6 @@ import { getOperationJson, loadApiContract } from "/console-contract.js";
   }
 
   const configurationResult = document.getElementById("configuration-api-result");
-  let apiContract;
 
   const apiRoute = (path, ...methods) => Object.freeze({ path, methods: Object.freeze(methods) });
   const consoleApiRoutes = Object.freeze([
@@ -270,13 +269,7 @@ import { getOperationJson, loadApiContract } from "/console-contract.js";
 
   const apiMutation = apiOperation;
 
-  const consoleApiContract = () => {
-    apiContract ??= loadApiContract(fetch).catch((error) => {
-      apiContract = undefined;
-      throw error;
-    });
-    return apiContract;
-  };
+  const consoleApiContract = apiContractLoader(fetch);
 
   const apiRequest = async (form, operation, body) => {
     const csrf = form.querySelector('input[name="csrf"]')?.value;
@@ -1990,7 +1983,7 @@ import { getOperationJson, loadApiContract } from "/console-contract.js";
     const renderAccounts = (data) => {
       if (!(accountHost instanceof HTMLElement)) return; accountHost.replaceChildren(); const rows = apiCollection(data, "accounts", "account directory");
       const section = append(element("div", "panel-head"), append(element("div"), element("h2", "", "Accounts"), element("p", "", "Only active browser sessions and unexpired personal access tokens are counted.")), element("span", "count", rows.length)); accountHost.append(section);
-      if (!rows.length) accountHost.append(element("p", "empty", "No account matches this exact name.")); else { const table = document.createElement("table"); table.append(element("caption", "sr-only", "Account directory")); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "ID"), element("th", "", "Account"), element("th", "", "Created (UTC)"), element("th", "", "Login methods"), element("th", "", "Status"), element("th", "", "Active access"), element("th", "", "Resources"), element("th"))); const body = document.createElement("tbody"); for (const account of rows) { const auth = account.authentication || {}; const resources = account.resources || {}; const sources = account.administrator_sources || {}; const actions = element("td"); if (account.current) actions.append(element("span", "meta", "Current account")); else { for (const [key, value, label, confirmation] of [["suspension", !account.suspended, account.suspended ? "Reactivate" : "Suspend", account.suspended ? `Reactivate ${account.name} and restart its enabled networks?` : `Suspend ${account.name}, revoke its sessions and tokens, disconnect its clients, and stop its networks?`], ["administrator", !sources.durable, sources.durable ? "Revoke durable admin" : "Grant durable admin", sources.durable ? `Remove durable administrator authority from ${account.name}?` : `Grant durable administrator authority to ${account.name}?`]]) { const form = document.createElement("form"); form.className = "cell-form"; form.dataset.apiAdminAccountState = key; form.dataset.confirm = confirmation; form.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const state = document.createElement("input"); state.type = "hidden"; state.name = key === "suspension" ? "suspended" : "administrator"; state.value = String(value); form.append(capability(), state, button(label, value ? "" : "danger")); actions.append(form); } const deletion = document.createElement("form"); deletion.className = "cell-form account-delete-form"; deletion.dataset.apiAdminAccountDelete = ""; deletion.dataset.confirm = `Permanently delete ${account.name}, revoke every credential and session, erase its private history, stop its networks, and retire the account name? This cannot be undone.`; deletion.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const confirmation = document.createElement("input"); confirmation.name = "confirmation"; confirmation.autocomplete = "off"; confirmation.required = true; const deletionLabel = append(element("label", "field"), element("span", "", `Type ${account.name} to delete`), confirmation); deletion.append(capability(), deletionLabel, button("Delete permanently", "danger")); actions.append(deletion); } const created = element("time", "", account.created_at); created.dateTime = account.created_at; const loginMethods = `${auth.local_password ? "local password · " : ""}${auth.oidc_identities} OIDC · ${auth.app_passwords} app passwords`; const status = `${account.suspended ? "suspended" : "active"}${account.administrator ? " · administrator" : ""}${sources.durable ? " · durable grant" : ""}${sources.configuration ? " · configuration grant" : ""}`; body.append(append(element("tr"), element("td", "meta", account.id), append(element("td"), append(element("strong"), element("code", "", account.name))), append(element("td", "meta"), created), element("td", "", loginMethods), element("td", "", status), element("td", "", `${auth.browser_sessions} browsers · ${auth.api_tokens} API tokens`), element("td", "", `${resources.networks} networks · ${resources.founded_channels} channels`), actions)); } table.append(head, body); accountHost.append(append(element("div", "scroll"), table)); } accountHost.append(pager("Older accounts", data.next_before_id, "before_id")); accountHost.append(element("p", "section-note", "An account that founded registered channels cannot be deleted. Transfer or drop those channels first. Deleted account names remain permanently retired so old credentials and identity links can never resolve to a different person."));
+      if (!rows.length) accountHost.append(element("p", "empty", "No account matches this exact name.")); else { const table = document.createElement("table"); table.append(element("caption", "sr-only", "Account directory")); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "ID"), element("th", "", "Account"), element("th", "", "Created (UTC)"), element("th", "", "Login methods"), element("th", "", "Status"), element("th", "", "Active access"), element("th", "", "Resources"), element("th"))); const body = document.createElement("tbody"); for (const account of rows) { const auth = account.authentication; const resources = account.resources; const sources = account.administrator_sources; const actions = element("td"); if (account.current) actions.append(element("span", "meta", "Current account")); else { for (const [key, value, label, confirmation] of [["suspension", !account.suspended, account.suspended ? "Reactivate" : "Suspend", account.suspended ? `Reactivate ${account.name} and restart its enabled networks?` : `Suspend ${account.name}, revoke its sessions and tokens, disconnect its clients, and stop its networks?`], ["administrator", !sources.durable, sources.durable ? "Revoke durable admin" : "Grant durable admin", sources.durable ? `Remove durable administrator authority from ${account.name}?` : `Grant durable administrator authority to ${account.name}?`]]) { const form = document.createElement("form"); form.className = "cell-form"; form.dataset.apiAdminAccountState = key; form.dataset.confirm = confirmation; form.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const state = document.createElement("input"); state.type = "hidden"; state.name = key === "suspension" ? "suspended" : "administrator"; state.value = String(value); form.append(capability(), state, button(label, value ? "" : "danger")); actions.append(form); } const deletion = document.createElement("form"); deletion.className = "cell-form account-delete-form"; deletion.dataset.apiAdminAccountDelete = ""; deletion.dataset.confirm = `Permanently delete ${account.name}, revoke every credential and session, erase its private history, stop its networks, and retire the account name? This cannot be undone.`; deletion.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const confirmation = document.createElement("input"); confirmation.name = "confirmation"; confirmation.autocomplete = "off"; confirmation.required = true; const deletionLabel = append(element("label", "field"), element("span", "", `Type ${account.name} to delete`), confirmation); deletion.append(capability(), deletionLabel, button("Delete permanently", "danger")); actions.append(deletion); } const created = element("time", "", account.created_at); created.dateTime = account.created_at; const loginMethods = `${auth.local_password ? "local password · " : ""}${auth.oidc_identities} OIDC · ${auth.app_passwords} app passwords`; const status = `${account.suspended ? "suspended" : "active"}${account.administrator ? " · administrator" : ""}${sources.durable ? " · durable grant" : ""}${sources.configuration ? " · configuration grant" : ""}`; body.append(append(element("tr"), element("td", "meta", account.id), append(element("td"), append(element("strong"), element("code", "", account.name))), append(element("td", "meta"), created), element("td", "", loginMethods), element("td", "", status), element("td", "", `${auth.browser_sessions} browsers · ${auth.api_tokens} API tokens`), element("td", "", `${resources.networks} networks · ${resources.founded_channels} channels`), actions)); } table.append(head, body); accountHost.append(append(element("div", "scroll"), table)); } accountHost.append(pager("Older accounts", data.next_before_id, "before_id")); accountHost.append(element("p", "section-note", "An account that founded registered channels cannot be deleted. Transfer or drop those channels first. Deleted account names remain permanently retired so old credentials and identity links can never resolve to a different person."));
     };
     refreshAdminAccounts = async () => { const params = query(); const invitations = new URLSearchParams(); invitations.set("limit", params.get("limit") || "50"); if (params.get("invitation_before_id")) invitations.set("before_id", params.get("invitation_before_id")); const [accounts, invitationData] = await Promise.all([apiRead(`/api/v1/admin/accounts?${params}`), apiRead(`/api/v1/admin/invitations?${invitations}`)]); renderAccounts(accounts); renderInvitations(invitationData); for (const region of adminAccountsPage.querySelectorAll(".scroll")) { region.tabIndex = 0; region.setAttribute("aria-label", "Account directory table"); } };
     if (filters instanceof HTMLFormElement) for (const input of filters.elements) if ((input instanceof HTMLInputElement || input instanceof HTMLSelectElement) && input.name) input.value = new URLSearchParams(window.location.search).get(input.name) || (input.name === "limit" ? "50" : "");
@@ -2017,8 +2010,8 @@ import { getOperationJson, loadApiContract } from "/console-contract.js";
     }
     for (const network of networks) {
       const row = document.createElement("tr");
-      const runtime = network.runtime || {};
-      const cells = [runtime.state || (network.enabled ? "not running" : "disabled"), network.owner, network.name, network.kind, network.shared === true ? "Managed configuration" : network.addr, runtime.attached_clients || 0, runtime.errors || 0, runtime.last_error?.summary || "—"];
+      const runtime = network.runtime;
+      const cells = [runtime === null ? (network.enabled ? "not running" : "disabled") : runtime.state, network.owner, network.name, network.kind, network.shared === true ? "Managed configuration" : network.addr, runtime === null ? 0 : runtime.attached_clients, runtime === null ? 0 : runtime.errors, runtime?.last_error?.summary ?? "—"];
       cells.forEach((value, index) => { const cell = document.createElement("td"); cell.textContent = String(value); if (index === 0) { const dot = document.createElement("span"); dot.className = `dot ${network.connected ? "on" : "off"}`; cell.prepend(dot); } if (index === 4 && network.tls) { const tls = document.createElement("span"); tls.className = "tag"; tls.textContent = "TLS"; cell.append(" ", tls); } row.append(cell); });
       const actions = document.createElement("td");
       actions.className = "row-actions";
@@ -2125,7 +2118,7 @@ import { getOperationJson, loadApiContract } from "/console-contract.js";
       const kind = networkCell(network.kind);
       const upstream = document.createElement("td");
       const address = document.createElement("code");
-      address.textContent = typeof network.addr === "string" ? network.addr : "";
+      address.textContent = network.shared === true ? "" : network.addr;
       upstream.append(address);
       if (network.tls === true) {
         const tls = document.createElement("span");
@@ -2133,8 +2126,8 @@ import { getOperationJson, loadApiContract } from "/console-contract.js";
         tls.textContent = "TLS";
         upstream.append(document.createTextNode(" "), tls);
       }
-      const clients = networkCell(Number.isSafeInteger(runtime?.attached_clients) ? runtime.attached_clients : 0);
-      const errors = networkCell(Number.isSafeInteger(runtime?.errors) ? runtime.errors : 0);
+      const clients = networkCell(runtime === null ? 0 : runtime.attached_clients);
+      const errors = networkCell(runtime === null ? 0 : runtime.errors);
       const actions = document.createElement("td");
       actions.className = "row-actions";
       const inspect = document.createElement("a");
@@ -2354,16 +2347,15 @@ import { getOperationJson, loadApiContract } from "/console-contract.js";
         const target = integrations.querySelector(`[data-integration-list="${kind}"]`);
         const count = integrations.querySelector(`[data-integration-count="${kind}"]`);
         if (!(target instanceof HTMLElement)) continue;
-        const entries = networks.filter((network) => network && network.kind === kind);
+        const entries = networks.filter((network) => network.kind === kind);
         if (count) count.textContent = String(entries.length);
         target.replaceChildren();
         if (!entries.length) { const empty = document.createElement("p"); empty.className = "empty"; empty.textContent = `No ${kind} bridges configured.`; target.append(empty); continue; }
         const table = document.createElement("table"); table.innerHTML = "<thead><tr><th>Status</th><th>Network</th><th>Owner</th><th>Actions</th></tr></thead>";
         const body = document.createElement("tbody");
         for (const network of entries) {
-          if (typeof network.name !== "string" || typeof network.owner !== "string") continue;
-          const row = document.createElement("tr"); const runtime = network.runtime || {};
-          const status = document.createElement("td"); const dot = document.createElement("span"); dot.className = `dot ${network.connected ? "on" : "off"}`; status.append(dot, String(runtime.state || (network.enabled ? "not running" : "disabled")));
+          const row = document.createElement("tr"); const runtime = network.runtime;
+          const status = document.createElement("td"); const dot = document.createElement("span"); dot.className = `dot ${network.connected ? "on" : "off"}`; status.append(dot, String(runtime === null ? (network.enabled ? "not running" : "disabled") : runtime.state));
           const name = document.createElement("td"); const code = document.createElement("code"); code.textContent = network.name; name.append(code);
           const owner = document.createElement("td"); const ownerCode = document.createElement("code"); ownerCode.textContent = network.owner; owner.append(ownerCode);
           const actions = document.createElement("td"); actions.className = "row-actions";
@@ -2522,7 +2514,7 @@ import { getOperationJson, loadApiContract } from "/console-contract.js";
         adminChannelRows.replaceChildren();
         const count = document.getElementById("admin-channel-count"); if (count) count.textContent = String(channels.length);
         if (!channels.length) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 7; cell.className = "empty"; cell.textContent = "No registered channels match this view."; row.append(cell); adminChannelRows.append(row); return true; }
-        for (const channel of channels) { const row = document.createElement("tr"); const policy = channel.policy || {}; const values = [channel.id, channel.name, channel.founder, channel.created_at, `KEEP ${policy.keeptopic ? "on" : "off"}${policy.topic_retained ? "; topic retained" : ""}${policy.mlock ? `; MLOCK ${policy.mlock}` : ""}`, `${policy.access_entries || 0} grants`]; values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = String(value); row.append(cell); }); const actions = document.createElement("td"); const form = document.createElement("form"); form.method = "post"; form.action = `/api/v1/admin/channels/${encodeURIComponent(channel.name)}`; form.dataset.apiAdminChannelDrop = ""; form.dataset.confirm = `Unregister ${channel.name} and delete its retained policy?`; const csrf = document.createElement("input"); csrf.type = "hidden"; csrf.name = "csrf"; csrf.value = adminChannelRows.dataset.csrf || ""; const button = document.createElement("button"); button.type = "submit"; button.className = "danger"; button.textContent = "Unregister"; form.append(csrf, button); actions.append(form); row.append(actions); adminChannelRows.append(row); }
+        for (const channel of channels) { const row = document.createElement("tr"); const policy = channel.policy; const values = [channel.id, channel.name, channel.founder, channel.created_at, `KEEP ${policy.keeptopic ? "on" : "off"}${policy.topic_retained ? "; topic retained" : ""}${policy.mlock ? `; MLOCK ${policy.mlock}` : ""}`, `${policy.access_entries} grants`]; values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = String(value); row.append(cell); }); const actions = document.createElement("td"); const form = document.createElement("form"); form.method = "post"; form.action = `/api/v1/admin/channels/${encodeURIComponent(channel.name)}`; form.dataset.apiAdminChannelDrop = ""; form.dataset.confirm = `Unregister ${channel.name} and delete its retained policy?`; const csrf = document.createElement("input"); csrf.type = "hidden"; csrf.name = "csrf"; csrf.value = adminChannelRows.dataset.csrf || ""; const button = document.createElement("button"); button.type = "submit"; button.className = "danger"; button.textContent = "Unregister"; form.append(csrf, button); actions.append(form); row.append(actions); adminChannelRows.append(row); }
       } catch (error) {
         tableLoadFailure(adminChannelRows, 7, error, () => void refreshAdminChannelDirectory());
         return false;

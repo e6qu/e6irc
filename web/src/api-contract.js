@@ -178,6 +178,17 @@ export async function loadApiContract(fetcher) {
   return getApiObject(fetcher, "/api/v1/openapi.json", { cache: "no-store", credentials: "same-origin" });
 }
 
+export function apiContractLoader(fetcher) {
+  let contract;
+  return async () => {
+    contract ??= loadApiContract(fetcher).catch((error) => {
+      contract = undefined;
+      throw error;
+    });
+    return contract;
+  };
+}
+
 export async function getOperationJson(fetcher, document, method, url, options = {}) {
   const response = await fetcher(url, {
     ...options,

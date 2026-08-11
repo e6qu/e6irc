@@ -21,7 +21,7 @@ import {
   networksFrom,
   saveSettings,
 } from "./client-state.js";
-import { getOperationJson, loadApiContract } from "./api-contract.js";
+import { apiContractLoader, getOperationJson } from "./api-contract.js";
 import { serializeComposerRequest } from "./composer-request.js";
 import { parseUiEvent } from "./ui-event.js";
 import {
@@ -40,14 +40,7 @@ import {
 
 const params = new URLSearchParams(window.location.search);
 const network = params.get("network");
-let apiContract;
-const currentApiContract = () => {
-  apiContract ??= loadApiContract(window.fetch.bind(window)).catch((error) => {
-    apiContract = undefined;
-    throw error;
-  });
-  return apiContract;
-};
+const currentApiContract = apiContractLoader(window.fetch.bind(window));
 const apiGet = async (url) => getOperationJson(
   window.fetch.bind(window),
   await currentApiContract(),

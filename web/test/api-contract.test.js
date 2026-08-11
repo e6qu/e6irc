@@ -5,6 +5,7 @@ import test from "node:test";
 
 import {
   ApiSchemaError,
+  apiContractLoader,
   getOperationJson,
   operationResponseSchema,
   parseApiSchema,
@@ -111,4 +112,16 @@ test("operation parser selects the exact documented path before parsing", () => 
     () => operationResponseSchema(document, "GET", "/api/v1/me/networks"),
     ApiSchemaError,
   );
+});
+
+test("contract loader rejects a failed response without preserving stale state", async () => {
+  let attempts = 0;
+  const load = apiContractLoader(async () => {
+    attempts += 1;
+    if (attempts === 1) return new Response("not JSON", { status: 200 });
+    return new Response(JSON.stringify({ paths: {} }), { status: 200 });
+  });
+  await assert.rejects(load());
+  assert.deepEqual(await load(), { paths: {} });
+  assert.equal(attempts, 2);
 });
