@@ -334,12 +334,12 @@ try {
   );
   assert.equal(
     await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()),
-    "#f5f7fa",
+    "#f5f8fa",
   );
   await page.emulateMedia({ colorScheme: "dark" });
   assert.equal(
     await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()),
-    "#0d1015",
+    "#0b1218",
   );
   await consoleTheme.selectOption("dark");
   await page.waitForFunction(() => document.documentElement.dataset.theme === "dark");
