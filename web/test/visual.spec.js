@@ -76,11 +76,26 @@ test("network picker renders the empty account state", async ({ page }) => {
   await page.goto("/");
 
   await expect(page.getByText("No networks are configured for this account.")).toBeVisible();
+  await expect(page.locator("ol#messages[aria-live=polite]")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Join channel" })).toBeDisabled();
   await expectAccessible(page);
   await expect(page).toHaveScreenshot("network-picker-empty-light.png", {
     animations: "disabled",
     fullPage: true,
   });
+});
+
+test("chat preferences are keyboard-dismissible and retain their trigger focus", async ({ page }) => {
+  await mockSession(page, []);
+  await page.goto("/");
+
+  const preferences = page.getByText("Preferences", { exact: true });
+  await preferences.focus();
+  await preferences.press("Enter");
+  await expect(page.getByLabel("Chat preferences")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByLabel("Chat preferences")).toBeHidden();
+  await expect(preferences).toBeFocused();
 });
 
 test("chat stays non-interactive while the network catalog loads", async ({ page }) => {

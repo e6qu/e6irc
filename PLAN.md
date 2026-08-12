@@ -20,6 +20,9 @@ shape before handling it and serializes each composer request from its closed
 shape before sending it. Immutable console mutation operations are checked
 against the router. Successful mutations refresh their API-backed view without
 a document reload.
+Chat, console, and identity pages share accessible light and dark palettes.
+Browser tests cover WCAG AA contrast, keyboard focus, Escape dismissal,
+reduced motion, forced colors, and responsive chat controls.
 External qualification has one manual GitHub workflow. It selects one closed
 campaign, refuses local provider oracles, and uploads only evidence accepted by
 the runner verifier.

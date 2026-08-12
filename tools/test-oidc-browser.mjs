@@ -334,12 +334,12 @@ try {
   );
   assert.equal(
     await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()),
-    "#f5f7fa",
+    "#f5f8fa",
   );
   await page.emulateMedia({ colorScheme: "dark" });
   assert.equal(
     await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()),
-    "#0d1015",
+    "#0b1218",
   );
   await consoleTheme.selectOption("dark");
   await page.waitForFunction(() => document.documentElement.dataset.theme === "dark");
@@ -1467,6 +1467,7 @@ try {
     const messages = document.getElementById("messages");
     messages.style.flex = "none";
     messages.style.height = "5rem";
+    messages.style.overflowY = "scroll";
   });
   for (let index = 0; index < 12; index += 1) {
     mockSocket.send(
@@ -1478,6 +1479,10 @@ try {
   }
   await page.getByText("scrollback filler 11", { exact: true }).waitFor();
   await page.locator("#messages").evaluate((node) => { node.scrollTop = 0; });
+  await page.waitForFunction(() => {
+    const messages = document.getElementById("messages");
+    return messages.scrollTop === 0 && messages.scrollHeight - messages.clientHeight >= 40;
+  });
   mockSocket.send(
     JSON.stringify({
       t: "line",
