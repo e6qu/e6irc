@@ -93,7 +93,7 @@ body {
 }
 #brand { color: var(--fg); font: 750 0.92rem/1 ui-monospace, SFMono-Regular, monospace; letter-spacing: 0.08em; text-decoration: none; text-transform: uppercase; }
 #user-nav { margin-left: auto; display: flex; gap: 0.9rem; align-items: center; }
-#user-nav a { color: var(--accent); text-decoration: none; white-space: nowrap; }
+#user-nav a { color: var(--accent); text-decoration: underline; text-underline-offset: 0.16em; white-space: nowrap; }
 .user-role { color: var(--muted); font-size: 0.8rem; margin-left: 0.3rem; }
 .status {
   font-size: 0.78rem;

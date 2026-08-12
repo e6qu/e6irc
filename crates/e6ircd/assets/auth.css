@@ -178,6 +178,8 @@ h1 {
 .section-note a {
   color: var(--accent);
   font-weight: 750;
+  text-decoration: underline;
+  text-underline-offset: 0.16em;
 }
 
 .auth-divider {
