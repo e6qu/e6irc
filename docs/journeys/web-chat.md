@@ -25,9 +25,9 @@ available; at least one owned/shared network is enabled for chat.
    state; it never invents “connected” from stored configuration alone.
 5. The initial snapshot/replay establishes buffers before live events are
    applied.
-6. A skip link reaches the chat region, and conversation/member activation uses
-   native buttons so keyboard and assistive-technology behavior follows the
-   browser's standard interaction model.
+6. A skip link reaches the chat log. Conversation and member activation use
+   native buttons. The selected conversation is exposed as the current item,
+   not as a document page.
 7. Each conversation control names its target, unread count, and any unread
    direct mentions. Decorative numeric and mention badges are not announced a
    second time; opening that conversation clears its own counters.

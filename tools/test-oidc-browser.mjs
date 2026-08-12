@@ -1042,12 +1042,13 @@ try {
   assert.equal(await replayedMessage.count(), 1);
   const journeyBuffer = page.getByRole("button", { name: "Open #journey", exact: true });
   assert.equal(await journeyBuffer.evaluate((button) => button.tagName), "BUTTON");
-  assert.equal(await journeyBuffer.getAttribute("aria-pressed"), "true");
+  assert.equal(await journeyBuffer.getAttribute("aria-current"), "true");
+  assert.equal(await journeyBuffer.getAttribute("aria-pressed"), null);
   const skipToChat = page.getByRole("link", { name: "Skip to chat", exact: true });
   await skipToChat.focus();
   await skipToChat.press("Enter");
   assert.equal(await page.evaluate(() => document.activeElement?.id), "chatpane");
-  const peerMember = page.getByRole("button", { name: "peer", exact: true });
+  const peerMember = page.getByRole("button", { name: "Open conversation with peer", exact: true });
   await peerMember.waitFor();
   assert.equal(await peerMember.evaluate((button) => button.tagName), "BUTTON");
   await upstream.sendPeerMessage("#journey", "browser receives through the real stack");

@@ -98,6 +98,16 @@ test("chat preferences are keyboard-dismissible and retain their trigger focus",
   await expect(preferences).toBeFocused();
 });
 
+test("the selected conversation exposes current navigation state", async ({ page }) => {
+  await mockSession(page, []);
+  await page.goto("/");
+
+  const server = page.getByRole("button", { name: "Open server" });
+  await expect(server).toHaveAttribute("aria-current", "true");
+  await expect(server).not.toHaveAttribute("aria-pressed");
+  await expectAccessible(page);
+});
+
 test("chat stays non-interactive while the network catalog loads", async ({ page }) => {
   let releaseRequest;
   const release = new Promise((resolve) => {

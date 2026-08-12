@@ -25,6 +25,7 @@ test("shared signal-room palette keeps text and actions above WCAG AA contrast",
     assert.match(stylesheet, /#075985/);
     assert.match(stylesheet, /#17212b/);
   }
+  assert.doesNotMatch(identity, /rgb\(113 39 232/);
   for (const [foreground, background] of [
     ["#17212b", "#ffffff"],
     ["#475569", "#ffffff"],
