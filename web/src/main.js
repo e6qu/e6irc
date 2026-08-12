@@ -376,7 +376,7 @@ function renderBufferList() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "buf" + (b.key === active ? " active" : "");
-    if (b.key === active) button.setAttribute("aria-current", "page");
+    if (b.key === active) button.setAttribute("aria-current", "true");
     const bufferName = b.key === SERVER ? "server" : b.display;
     const inactive = b.key !== active;
     const unreadLabel = b.unread > 0 && inactive

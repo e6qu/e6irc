@@ -1042,7 +1042,7 @@ try {
   assert.equal(await replayedMessage.count(), 1);
   const journeyBuffer = page.getByRole("button", { name: "Open #journey", exact: true });
   assert.equal(await journeyBuffer.evaluate((button) => button.tagName), "BUTTON");
-  assert.equal(await journeyBuffer.getAttribute("aria-current"), "page");
+  assert.equal(await journeyBuffer.getAttribute("aria-current"), "true");
   assert.equal(await journeyBuffer.getAttribute("aria-pressed"), null);
   const skipToChat = page.getByRole("link", { name: "Skip to chat", exact: true });
   await skipToChat.focus();

@@ -103,7 +103,7 @@ test("the selected conversation exposes current navigation state", async ({ page
   await page.goto("/");
 
   const server = page.getByRole("button", { name: "Open server" });
-  await expect(server).toHaveAttribute("aria-current", "page");
+  await expect(server).toHaveAttribute("aria-current", "true");
   await expect(server).not.toHaveAttribute("aria-pressed");
   await expectAccessible(page);
 });
