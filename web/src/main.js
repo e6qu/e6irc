@@ -376,7 +376,7 @@ function renderBufferList() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "buf" + (b.key === active ? " active" : "");
-    button.setAttribute("aria-pressed", String(b.key === active));
+    if (b.key === active) button.setAttribute("aria-current", "page");
     const bufferName = b.key === SERVER ? "server" : b.display;
     const inactive = b.key !== active;
     const unreadLabel = b.unread > 0 && inactive
@@ -564,7 +564,9 @@ function renderNickList() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "nick";
-    button.title = `Message ${m.name}`;
+    const action = `Open conversation with ${m.name}`;
+    button.title = action;
+    button.setAttribute("aria-label", action);
     button.textContent = nickPrefix(m.modes) + m.name;
     // Native button semantics make click, Enter, and Space equivalent.
     const open = () => setActive(ensureBuffer(m.name, "dm").display);
