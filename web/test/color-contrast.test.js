@@ -32,6 +32,8 @@ test("shared signal-room palette keeps text and actions above WCAG AA contrast",
     ["#eef6fa", "#111d26"],
     ["#b7c6d2", "#111d26"],
     ["#082f49", "#7dd3fc"],
+    ["#ffffff", "#a64b00"],
+    ["#17212b", "#fdba74"],
   ]) {
     assert.ok(ratio(foreground, background) >= 4.5, `${foreground} on ${background} is below 4.5:1`);
   }

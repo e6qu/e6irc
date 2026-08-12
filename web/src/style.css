@@ -12,9 +12,9 @@
   --ok: #0f766e;
   --off: #b42318;
   --warn: #a64b00;
+  --warn-text: #ffffff;
   --info: #075985;
   --focus: #075985;
-  --focus-ring: color-mix(in srgb, var(--focus) 32%, transparent);
   --shadow: 0 12px 30px rgb(23 33 43 / 0.1);
 }
 @media (prefers-color-scheme: dark) {
@@ -31,9 +31,9 @@
     --ok: #5eead4;
     --off: #fda4af;
     --warn: #fdba74;
+    --warn-text: #17212b;
     --info: #7dd3fc;
     --focus: #fef08a;
-    --focus-ring: color-mix(in srgb, var(--focus) 42%, transparent);
     --shadow: 0 16px 34px rgb(0 0 0 / 0.35);
   }
 }
@@ -50,9 +50,9 @@
   --ok: #5eead4;
   --off: #fda4af;
   --warn: #fdba74;
+  --warn-text: #17212b;
   --info: #7dd3fc;
   --focus: #fef08a;
-  --focus-ring: color-mix(in srgb, var(--focus) 42%, transparent);
   --shadow: 0 16px 34px rgb(0 0 0 / 0.35);
 }
 
@@ -202,7 +202,6 @@ body {
   align-items: center;
   gap: 0.4rem;
   padding: 0.35rem 0.5rem;
-  border-radius: 0.4rem;
   cursor: pointer;
 }
 .buf:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
@@ -220,7 +219,7 @@ body {
   flex: 0 0 auto;
   font-size: 0.68rem;
   background: var(--warn);
-  color: var(--fg);
+  color: var(--warn-text);
   border-radius: 0.7rem;
   padding: 0 0.4rem;
   font-weight: 700;
