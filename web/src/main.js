@@ -68,6 +68,7 @@ const sidebarEl = el("sidebar");
 const settingsEl = el("settings");
 const jumpLatestButton = el("jump-latest");
 const sendButton = composer.querySelector("button[type=submit]");
+const joinInput = el("join-input");
 const joinButton = el("join-form")?.querySelector("button[type=submit]");
 
 const MAX_LINES = 500;
@@ -244,6 +245,7 @@ function setStatus(text, cls) {
 function setComposerAvailable(available) {
   messageInput.disabled = !available;
   sendButton.disabled = !available;
+  if (joinInput) joinInput.disabled = !available;
   if (joinButton) joinButton.disabled = !available;
 }
 
@@ -451,10 +453,12 @@ function messageRow(line) {
   const time = document.createElement("span");
   time.className = "ts";
   time.textContent = line.time;
+  if (line.time) time.setAttribute("aria-label", `At ${line.time}`);
   if (line.title) time.title = line.title; // full date+time on hover
   const from = document.createElement("span");
   from.className = "from";
   from.textContent = line.from ? line.from : "";
+  if (line.from) from.setAttribute("aria-label", `From ${line.from}`);
   const text = document.createElement("span");
   text.className = "text";
   renderText(text, line.text);

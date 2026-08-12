@@ -132,6 +132,7 @@ test("chat stays non-interactive while the network catalog loads", async ({ page
   await expect(page.locator("#status")).toHaveText("starting…");
   await expect(page.locator("#message")).toBeDisabled();
   await expect(page.locator("#composer button")).toBeDisabled();
+  await expect(page.getByLabel("Join a channel")).toBeDisabled();
   await expectAccessible(page);
 
   releaseRequest();
@@ -236,5 +237,22 @@ test("network picker keeps recovery controls usable in forced colors", async ({ 
   await expect(retry).toBeVisible();
   await retry.focus();
   await expect(retry).toBeFocused();
+  await expectAccessible(page);
+});
+
+test("phone conversation rail returns focus after Escape", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mockSession(page, []);
+  await page.goto("/");
+
+  const conversations = page.getByRole("button", { name: "Conversations" });
+  await conversations.click();
+  const server = page.getByRole("button", { name: "Open server" });
+  await expect(server).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(conversations).toBeFocused();
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth))
+    .toBe(true);
   await expectAccessible(page);
 });
