@@ -65,6 +65,7 @@ const alertsEl = el("alerts");
 const networkSelect = el("network-select");
 const sidebarToggle = el("sidebar-toggle");
 const sidebarEl = el("sidebar");
+const settingsEl = el("settings");
 const jumpLatestButton = el("jump-latest");
 const sendButton = composer.querySelector("button[type=submit]");
 const joinButton = el("join-form")?.querySelector("button[type=submit]");
@@ -264,6 +265,12 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && document.body.classList.contains("sidebar-open")) {
     event.preventDefault();
     closeMobileSidebar({ restoreFocus: true });
+    return;
+  }
+  if (event.key === "Escape" && settingsEl?.open) {
+    event.preventDefault();
+    settingsEl.open = false;
+    settingsEl.querySelector("summary")?.focus();
   }
 });
 
@@ -464,8 +471,9 @@ function renderActive({ atLatest = true } = {}) {
   } else {
     bufferActionEl.hidden = false;
     bufferActionEl.textContent = b.kind === "channel" ? "Leave" : "Close";
-    bufferActionEl.title =
-      b.kind === "channel" ? `Leave ${b.display}` : `Close conversation with ${b.display}`;
+    const action = b.kind === "channel" ? `Leave ${b.display}` : `Close conversation with ${b.display}`;
+    bufferActionEl.title = action;
+    bufferActionEl.setAttribute("aria-label", action);
   }
   // "Load earlier" is offered for a real conversation buffer (channel/DM) whose
   // persisted backlog hasn't been pulled yet, and only when attached (network set).
