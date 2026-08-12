@@ -1,0 +1,147 @@
+name: External qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      campaign:
+        description: Campaign to run
+        required: true
+        type: choice
+        options: [discord, slack, oidc, public-irc, scale]
+      target:
+        description: Non-secret provider, issuer, network, or host identifier
+        required: true
+        type: string
+      host:
+        description: Non-secret host name; required except for scale
+        required: false
+        type: string
+      workload:
+        description: One NAME=VALUE workload measurement; not used by scale
+        required: false
+        type: string
+      budget:
+        description: One NAME=VALUE budget measurement; not used by scale
+        required: false
+        type: string
+      scale_arguments:
+        description: ADDR SERVER_PID CORE_WORKERS CLIENTS CHANNELS BURST MIN_CONNECT_RATE MIN_FANOUT_RATE MAX_P99_MS MAX_RSS_BYTES_PER_CONNECTION
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    name: ${{ inputs.campaign }} qualification
+    runs-on: ${{ inputs.campaign == 'scale' && 'qualification-scale' || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    env:
+      E6IRC_DISCORD_BOT_TOKEN: ${{ inputs.campaign == 'discord' && secrets.E6IRC_DISCORD_BOT_TOKEN || '' }}
+      E6IRC_DISCORD_CHANNEL_ID: ${{ inputs.campaign == 'discord' && secrets.E6IRC_DISCORD_CHANNEL_ID || '' }}
+      E6IRC_SLACK_BOT_TOKEN: ${{ inputs.campaign == 'slack' && secrets.E6IRC_SLACK_BOT_TOKEN || '' }}
+      E6IRC_SLACK_APP_TOKEN: ${{ inputs.campaign == 'slack' && secrets.E6IRC_SLACK_APP_TOKEN || '' }}
+      E6IRC_SLACK_CHANNEL_ID: ${{ inputs.campaign == 'slack' && secrets.E6IRC_SLACK_CHANNEL_ID || '' }}
+      E6IRC_OIDC_CLIENT_ID: ${{ inputs.campaign == 'oidc' && secrets.E6IRC_OIDC_CLIENT_ID || '' }}
+      E6IRC_OIDC_CLIENT_SECRET: ${{ inputs.campaign == 'oidc' && secrets.E6IRC_OIDC_CLIENT_SECRET || '' }}
+      QUALIFICATION_TARGET: ${{ inputs.target }}
+      QUALIFICATION_HOST: ${{ inputs.host }}
+      QUALIFICATION_WORKLOAD: ${{ inputs.workload }}
+      QUALIFICATION_BUDGET: ${{ inputs.budget }}
+      QUALIFICATION_SCALE_ARGUMENTS: ${{ inputs.scale_arguments }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build qualification executables
+        run: cargo build --release -p e6ircd -p e6irc-qualification
+
+      - id: campaign
+        name: Run external campaign
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p qualification
+          evidence='qualification/evidence.json'
+          status=2
+          case '${{ inputs.campaign }}' in
+            discord|slack|oidc)
+              if [[ -z "$QUALIFICATION_HOST" || -z "$QUALIFICATION_WORKLOAD" || -z "$QUALIFICATION_BUDGET" ]]; then
+                echo 'host, workload, and budget are required' >&2
+              else
+                target/release/e6irc-qualification '${{ inputs.campaign }}' \
+                  --target "$QUALIFICATION_TARGET" \
+                  --source "$GITHUB_SHA" \
+                  --host "$QUALIFICATION_HOST" \
+                  --executable target/release/e6ircd \
+                  --output "$evidence" \
+                  --workload "$QUALIFICATION_WORKLOAD" \
+                  --budget "$QUALIFICATION_BUDGET"
+                status=$?
+              fi
+              ;;
+            public-irc)
+              if [[ -z "$QUALIFICATION_HOST" || -z "$QUALIFICATION_WORKLOAD" || -z "$QUALIFICATION_BUDGET" ]]; then
+                echo 'host, workload, and budget are required' >&2
+              else
+                target/release/e6irc-qualification public-irc \
+                  --target "$QUALIFICATION_TARGET" \
+                  --source "$GITHUB_SHA" \
+                  --host "$QUALIFICATION_HOST" \
+                  --executable target/release/e6ircd \
+                  --output "$evidence" \
+                  --workload "$QUALIFICATION_WORKLOAD" \
+                  --budget "$QUALIFICATION_BUDGET" \
+                  --probe tools/qualification/public-irc-probe.sh
+                status=$?
+              fi
+              ;;
+            scale)
+              evidence='qualification/scale/qualification.json'
+              read -r addr server_pid core_workers clients channels burst minimum_connect_rate minimum_fanout_rate maximum_p99_ms maximum_rss_bytes extra <<< "$QUALIFICATION_SCALE_ARGUMENTS"
+              if [[ "$QUALIFICATION_TARGET" != "$addr" || -n "${extra:-}" || -z "${maximum_rss_bytes:-}" ]]; then
+                echo 'scale_arguments needs exactly ten values' >&2
+              else
+                tools/load/qualify-linux.sh \
+                  "$addr" "$server_pid" "$core_workers" "$clients" "$channels" "$burst" \
+                  qualification/scale "$minimum_connect_rate" "$minimum_fanout_rate" \
+                  "$maximum_p99_ms" "$maximum_rss_bytes"
+                status=$?
+              fi
+              ;;
+            *) echo 'unsupported campaign' >&2 ;;
+          esac
+          printf 'evidence=%s\nstatus=%s\n' "$evidence" "$status" >> "$GITHUB_OUTPUT"
+
+      - id: verify
+        if: always()
+        name: Verify safe evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence='${{ steps.campaign.outputs.evidence }}'
+          [[ -n "$evidence" && -f "$evidence" ]]
+          target/release/e6irc-qualification verify "$evidence"
+
+      - if: ${{ always() && steps.verify.outcome == 'success' }}
+        name: Retain verified evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification-${{ inputs.campaign }}-${{ github.run_id }}
+          path: ${{ steps.campaign.outputs.evidence }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - if: always()
+        name: Set campaign result
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ '${{ steps.verify.outcome }}' == success ]]
+          case '${{ steps.campaign.outputs.status }}' in
+            0) exit 0 ;;
+            3) exit 3 ;;
+            *) exit 1 ;;
+          esac

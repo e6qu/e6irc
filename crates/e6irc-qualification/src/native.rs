@@ -91,13 +91,7 @@ impl CampaignUrl {
 
 fn safe_url(value: &str) -> Option<CampaignUrl> {
     let url = Url::parse(value).ok()?;
-    let loopback = url.host_str().is_some_and(|host| {
-        host == "localhost"
-            || host
-                .trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-    });
+    let loopback = url.host_str().is_some_and(is_loopback_host);
     ((url.scheme() == "https" || (url.scheme() == "http" && loopback))
         && url.host_str().is_some()
         && url.username().is_empty()
@@ -105,6 +99,14 @@ fn safe_url(value: &str) -> Option<CampaignUrl> {
         && url.query().is_none()
         && url.fragment().is_none())
     .then_some(CampaignUrl(url))
+}
+
+pub(super) fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn endpoint(base: &CampaignUrl, path: &str) -> Option<CampaignUrl> {

@@ -2,7 +2,7 @@
 
 mod native;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -12,11 +12,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use url::Url;
 
-const USAGE: &str = "usage: e6irc-qualification KIND --target TARGET --source REVISION --host HOST --executable PATH --output PATH --workload NAME=VALUE --budget NAME=VALUE [--probe PATH [-- PROBE_ARGS...]]";
+const USAGE: &str = "usage: e6irc-qualification KIND --target TARGET --source REVISION --host HOST --executable PATH --output PATH --workload NAME=VALUE --budget NAME=VALUE [--probe PATH [-- PROBE_ARGS...]]\n       e6irc-qualification verify EVIDENCE";
 
 fn main() -> ExitCode {
-    match parse_args(std::env::args_os().skip(1)) {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "verify")
+    {
+        return verify(arguments.into_iter().skip(1));
+    }
+    match parse_args(arguments) {
         Ok(args) => run(args),
         Err(error) => {
             eprintln!("e6irc-qualification: {error}\n{USAGE}");
@@ -69,9 +77,17 @@ impl TargetKind {
             Self::PublicIrc | Self::Scale => &[],
         }
     }
+
+    fn rejects_oracle_endpoint(self) -> bool {
+        match self {
+            Self::Discord => std::env::var_os("E6IRC_DISCORD_API_BASE").is_some(),
+            Self::Slack => std::env::var_os("E6IRC_SLACK_API_BASE").is_some(),
+            Self::Oidc | Self::PublicIrc | Self::Scale => false,
+        }
+    }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct SourceRevision(String);
 
 impl SourceRevision {
@@ -83,9 +99,17 @@ impl SourceRevision {
         }
         Ok(Self(value.to_ascii_lowercase()))
     }
+
+    fn validate(&self, flag: &str) -> Result<(), String> {
+        let parsed = Self::parse(self.0.clone())
+            .map_err(|_| format!("{flag} needs a 40- or 64-character hexadecimal revision"))?;
+        (parsed.0 == self.0)
+            .then_some(())
+            .ok_or_else(|| format!("{flag} must use lowercase hexadecimal"))
+    }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct SafeText(String);
 
 impl SafeText {
@@ -103,7 +127,52 @@ impl SafeText {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(transparent)]
+struct CampaignTarget(SafeText);
+
+impl CampaignTarget {
+    fn parse(kind: TargetKind, value: String) -> Result<Self, String> {
+        let target = Self(SafeText::parse(value, "--target")?);
+        target.validate(kind)?;
+        Ok(target)
+    }
+
+    fn validate(&self, kind: TargetKind) -> Result<(), String> {
+        SafeText::parse(self.0.0.clone(), "target")?;
+        match kind {
+            TargetKind::Oidc => validate_external_oidc_issuer(&self.0.0),
+            TargetKind::PublicIrc if !matches!(self.0.0.as_str(), "libera" | "oftc" | "ergo") => {
+                Err("public-irc target must be libera, oftc, or ergo".into())
+            }
+            TargetKind::Discord | TargetKind::Slack | TargetKind::PublicIrc | TargetKind::Scale => {
+                Ok(())
+            }
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0.0
+    }
+}
+
+fn validate_external_oidc_issuer(value: &str) -> Result<(), String> {
+    let url = Url::parse(value).map_err(|_| "OIDC target must be an HTTPS issuer URL")?;
+    let loopback = url.host_str().is_some_and(native::is_loopback_host);
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || loopback
+    {
+        return Err("OIDC target must be a non-loopback HTTPS issuer URL".into());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct PositiveDecimal(String);
 
 impl PositiveDecimal {
@@ -118,7 +187,7 @@ impl PositiveDecimal {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct Measurements(BTreeMap<String, PositiveDecimal>);
 
 impl Measurements {
@@ -144,6 +213,17 @@ impl Measurements {
         }
         Ok(Self(parsed))
     }
+
+    fn validate(&self, flag: &str) -> Result<(), String> {
+        if self.0.is_empty() {
+            return Err(format!("{flag} is required at least once"));
+        }
+        for (name, value) in &self.0 {
+            validate_measurement_name(name, flag)?;
+            PositiveDecimal::parse(value.0.clone(), flag)?;
+        }
+        Ok(())
+    }
 }
 
 fn validate_measurement_name(value: &str, flag: &str) -> Result<(), String> {
@@ -159,7 +239,7 @@ fn validate_measurement_name(value: &str, flag: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct CredentialEnv(String);
 
 impl CredentialEnv {
@@ -182,12 +262,16 @@ impl CredentialEnv {
     fn is_present(&self) -> bool {
         std::env::var_os(&self.0).is_some_and(|value| !value.is_empty())
     }
+
+    fn validate(&self) -> Result<(), String> {
+        Self::parse(self.0.clone()).map(|_| ())
+    }
 }
 
 #[derive(Debug)]
-struct Args {
+struct Campaign {
     kind: TargetKind,
-    target: SafeText,
+    target: CampaignTarget,
     source: SourceRevision,
     host: SafeText,
     executable: PathBuf,
@@ -199,7 +283,7 @@ struct Args {
     probe_args: Vec<OsString>,
 }
 
-fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
+fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Campaign, String> {
     let mut arguments = arguments.into_iter().collect::<Vec<_>>().into_iter();
     let kind = arguments
         .next()
@@ -236,10 +320,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Args, Str
                 if target.is_some() {
                     return Err("--target must occur once".into());
                 }
-                target = Some(SafeText::parse(
-                    value(&mut arguments, "--target")?,
-                    "--target",
-                )?)
+                target = Some(value(&mut arguments, "--target")?)
             }
             "--source" => {
                 if source.is_some() {
@@ -301,6 +382,9 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Args, Str
         ));
     }
     let kind = TargetKind::parse(&kind)?;
+    if kind.rejects_oracle_endpoint() {
+        return Err("external campaigns cannot set a local oracle endpoint".into());
+    }
     if kind.uses_native_campaign() && probe.is_some() {
         return Err(format!(
             "{} uses its built-in adapter; --probe is invalid",
@@ -328,9 +412,12 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Args, Str
             credentials.push(credential);
         }
     }
-    Ok(Args {
+    Ok(Campaign {
         kind,
-        target: target.ok_or_else(|| "--target is required".to_string())?,
+        target: CampaignTarget::parse(
+            kind,
+            target.ok_or_else(|| "--target is required".to_string())?,
+        )?,
         source: source.ok_or_else(|| "--source is required".to_string())?,
         host: host.ok_or_else(|| "--host is required".to_string())?,
         executable,
@@ -473,7 +560,7 @@ impl TargetKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ClosedOutcome {
     Passed,
@@ -481,16 +568,32 @@ enum ClosedOutcome {
     Failed,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ExecutableEvidence {
     sha256: String,
 }
 
-#[derive(Serialize)]
+impl ExecutableEvidence {
+    fn validate(&self) -> Result<(), String> {
+        if self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
+        {
+            return Err("executable.sha256 needs a 64-character hexadecimal digest".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct QualificationEvidence {
     format_version: u8,
     kind: TargetKind,
-    target: SafeText,
+    target: CampaignTarget,
     source: SourceRevision,
     executable: ExecutableEvidence,
     host: SafeText,
@@ -503,7 +606,72 @@ struct QualificationEvidence {
     outcome: ClosedOutcome,
 }
 
-fn run(args: Args) -> ExitCode {
+impl QualificationEvidence {
+    fn validate(&self) -> Result<(), String> {
+        if self.format_version != 1 {
+            return Err("unsupported evidence format version".into());
+        }
+        self.target.validate(self.kind)?;
+        self.source.validate("source")?;
+        self.executable.validate()?;
+        SafeText::parse(self.host.0.clone(), "host")?;
+        if self.started_at_unix_ms > self.finished_at_unix_ms {
+            return Err("evidence finished before it started".into());
+        }
+        self.workload.validate("workload")?;
+        self.budgets.validate("budget")?;
+        let mut credentials = BTreeSet::new();
+        for credential in &self.credential_environment {
+            credential.validate()?;
+            if !credentials.insert(credential.0.as_str()) {
+                return Err(format!("credential_environment repeats {}", credential.0));
+            }
+        }
+        for required in self.kind.required_environment() {
+            if !credentials.contains(required) {
+                return Err(format!("credential_environment omits {required}"));
+            }
+        }
+        if !self.probe.has_valid_applicability(self.kind) {
+            return Err("probe has invalid phase applicability".into());
+        }
+        if self.probe.closed_outcome(self.kind) != self.outcome {
+            return Err("outcome does not match probe phases".into());
+        }
+        Ok(())
+    }
+}
+
+fn verify(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    let [path] = arguments.as_slice() else {
+        eprintln!("e6irc-qualification: verify needs one evidence path\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    let path = PathBuf::from(path);
+    let result = fs::read(&path)
+        .map_err(|error| format!("cannot read evidence: {error}"))
+        .and_then(|bytes| {
+            serde_json::from_slice::<QualificationEvidence>(&bytes)
+                .map_err(|error| format!("cannot parse evidence: {error}"))
+        })
+        .and_then(|evidence| {
+            evidence.validate()?;
+            Ok((evidence.kind.name(), evidence.outcome))
+        });
+    match result {
+        Ok((kind, outcome)) => {
+            println!("e6irc-qualification: verified {kind} evidence with {outcome:?} outcome");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("e6irc-qualification: invalid evidence: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run(args: Campaign) -> ExitCode {
     let executable_sha256 = match sha256_file(&args.executable) {
         Ok(digest) => digest,
         Err(error) => {
@@ -528,7 +696,7 @@ fn run(args: Args) -> ExitCode {
     let result = if missing_credential {
         CampaignResult::Report(ProbeReport::not_run(args.kind))
     } else if args.kind.uses_native_campaign() {
-        CampaignResult::Report(native::run(args.kind, &args.target.0))
+        CampaignResult::Report(native::run(args.kind, args.target.as_str()))
     } else if let Some(probe) = args.probe.as_deref() {
         run_probe(&args, probe, &probe_report_path, &challenge)
     } else {
@@ -583,11 +751,11 @@ enum CampaignResult {
     FailedBeforePhase,
 }
 
-fn run_probe(args: &Args, probe: &Path, report_path: &Path, challenge: &str) -> CampaignResult {
+fn run_probe(args: &Campaign, probe: &Path, report_path: &Path, challenge: &str) -> CampaignResult {
     let status = Command::new(probe)
         .args(&args.probe_args)
         .env("E6IRC_QUALIFICATION_KIND", args.kind.name())
-        .env("E6IRC_QUALIFICATION_TARGET", &args.target.0)
+        .env("E6IRC_QUALIFICATION_TARGET", args.target.as_str())
         .env("E6IRC_QUALIFICATION_PROBE_REPORT", report_path)
         .env("E6IRC_QUALIFICATION_CHALLENGE", challenge)
         .status();
@@ -608,7 +776,7 @@ fn run_probe(args: &Args, probe: &Path, report_path: &Path, challenge: &str) -> 
     }
 }
 
-fn challenge(args: &Args, executable_sha256: &str, started_at_unix_ms: u128) -> String {
+fn challenge(args: &Campaign, executable_sha256: &str, started_at_unix_ms: u128) -> String {
     let mut digest = Sha256::new();
     digest.update(executable_sha256);
     digest.update(args.output.as_os_str().as_encoded_bytes());

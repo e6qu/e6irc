@@ -20,11 +20,16 @@ shape before handling it and serializes each composer request from its closed
 shape before sending it. Immutable console mutation operations are checked
 against the router. Successful mutations refresh their API-backed view without
 a document reload.
+External qualification has one manual GitHub workflow. It selects one closed
+campaign, refuses local provider oracles, and uploads only evidence accepted by
+the runner verifier.
+The current qualification runner passed live public IRC campaigns for
+Libera.Chat, OFTC, and Ergo on 2026-08-12.
 
 ## Remaining qualification
 
-- Run the shipped credential-gated campaigns for Discord, Slack, each required
-  OpenID Connect issuer, and public IRC networks.
+- Run the shipped credential-gated campaigns for Discord, Slack, and each
+  required OpenID Connect issuer.
 - Run the tuned-host scale campaign. It remains required for production scale
   claims.
 
