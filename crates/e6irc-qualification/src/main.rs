@@ -141,6 +141,12 @@ impl CampaignTarget {
     fn validate(&self, kind: TargetKind) -> Result<(), String> {
         SafeText::parse(self.0.0.clone(), "target")?;
         match kind {
+            TargetKind::Discord if self.0.0 != "discord.com" => {
+                Err("Discord target must be discord.com".into())
+            }
+            TargetKind::Slack if self.0.0 != "slack.com" => {
+                Err("Slack target must be slack.com".into())
+            }
             TargetKind::Oidc => validate_external_oidc_issuer(&self.0.0),
             TargetKind::PublicIrc if !matches!(self.0.0.as_str(), "libera" | "oftc" | "ergo") => {
                 Err("public-irc target must be libera, oftc, or ergo".into())
@@ -874,6 +880,14 @@ mod tests {
     fn credential_environment_names_are_not_values() {
         assert!(CredentialEnv::parse("E6IRC_DISCORD_TOKEN".into()).is_ok());
         assert!(CredentialEnv::parse("token".into()).is_err());
+    }
+
+    #[test]
+    fn provider_campaign_targets_are_canonical() {
+        assert!(CampaignTarget::parse(TargetKind::Discord, "discord.com".into()).is_ok());
+        assert!(CampaignTarget::parse(TargetKind::Slack, "slack.com".into()).is_ok());
+        assert!(CampaignTarget::parse(TargetKind::Discord, "example.test".into()).is_err());
+        assert!(CampaignTarget::parse(TargetKind::Slack, "example.test".into()).is_err());
     }
 
     #[test]

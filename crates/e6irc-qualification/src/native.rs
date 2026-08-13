@@ -329,9 +329,10 @@ async fn discord(_target: &str) -> ProbeReport {
             PhaseOutcome::NotRun,
         );
     };
-    let persistence = request_outcome(
+    let persistence = json_outcome(
         http.get(message_url.clone().into_url())
             .header("Authorization", &authorization),
+        |json| discord_readback_matches(json, &id, &message),
     )
     .await;
     let cleanup = request_outcome(
@@ -347,6 +348,11 @@ async fn discord(_target: &str) -> ProbeReport {
         cleanup,
         persistence,
     )
+}
+
+fn discord_readback_matches(json: &serde_json::Value, id: &str, content: &str) -> bool {
+    json.get("id").and_then(serde_json::Value::as_str) == Some(id)
+        && json.get("content").and_then(serde_json::Value::as_str) == Some(content)
 }
 
 async fn discord_connect(url: &CampaignSocketUrl, token: &str) -> PhaseOutcome {
@@ -655,18 +661,29 @@ async fn oidc(target: &str) -> ProbeReport {
         Err(outcome) => outcome,
     };
     let persistence = json_outcome(
-        http.post(introspection_endpoint.into_url())
+        http.post(introspection_endpoint.clone().into_url())
             .basic_auth(&client_id, Some(&secret))
             .form(&[("token", token.as_str())]),
         |json| json.get("active").and_then(serde_json::Value::as_bool) == Some(true),
     )
     .await;
-    let cleanup = request_outcome(
+    let revoked = request_outcome(
         http.post(revocation_endpoint.into_url())
             .basic_auth(&client_id, Some(&secret))
             .form(&[("token", token.as_str())]),
     )
     .await;
+    let cleanup = if revoked == PhaseOutcome::Passed {
+        json_outcome(
+            http.post(introspection_endpoint.into_url())
+                .basic_auth(&client_id, Some(&secret))
+                .form(&[("token", token.as_str())]),
+            |json| json.get("active").and_then(serde_json::Value::as_bool) == Some(false),
+        )
+        .await
+    } else {
+        revoked
+    };
     report(
         TargetKind::Oidc,
         PhaseOutcome::Passed,

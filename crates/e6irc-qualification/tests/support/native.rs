@@ -1,8 +1,8 @@
 use super::*;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Form, Path, Query, State};
@@ -44,6 +44,7 @@ impl Drop for EnvironmentGuard {
 #[derive(Clone)]
 struct DiscordOracle {
     websocket: String,
+    content: Arc<Mutex<Option<String>>>,
     deletes: Arc<AtomicUsize>,
 }
 
@@ -54,6 +55,7 @@ async fn start_discord_oracle() -> DiscordOracle {
     let websocket = format!("ws://{}/socket", listener.local_addr().expect("address"));
     let state = DiscordOracle {
         websocket,
+        content: Arc::new(Mutex::new(None)),
         deletes: Arc::new(AtomicUsize::new(0)),
     };
     let router = Router::new()
@@ -95,11 +97,16 @@ async fn discord_gateway(State(state): State<DiscordOracle>) -> Json<serde_json:
 }
 
 async fn discord_post(
+    State(state): State<DiscordOracle>,
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    if id == "42" && discord_authorized(&headers) && body.get("content").is_some() {
+    if id == "42"
+        && discord_authorized(&headers)
+        && let Some(content) = body.get("content").and_then(serde_json::Value::as_str)
+    {
+        *state.content.lock().expect("content lock") = Some(content.to_owned());
         (StatusCode::OK, Json(serde_json::json!({"id":"m1"})))
     } else {
         (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})))
@@ -107,11 +114,18 @@ async fn discord_post(
 }
 
 async fn discord_message(
+    State(state): State<DiscordOracle>,
     Path((_id, message)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if message == "m1" && discord_authorized(&headers) {
-        (StatusCode::OK, Json(serde_json::json!({"id":"m1"})))
+    if message == "m1"
+        && discord_authorized(&headers)
+        && let Some(content) = state.content.lock().expect("content lock").clone()
+    {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"id":"m1","content":content})),
+        )
     } else {
         (StatusCode::NOT_FOUND, Json(serde_json::json!({})))
     }
@@ -296,6 +310,7 @@ struct OidcOracle {
     tokens: Arc<AtomicUsize>,
     introspections: Arc<AtomicUsize>,
     revocations: Arc<AtomicUsize>,
+    revoked: Arc<AtomicBool>,
 }
 
 async fn start_oidc_oracle() -> OidcOracle {
@@ -311,6 +326,7 @@ async fn start_oidc_oracle() -> OidcOracle {
         tokens: Arc::new(AtomicUsize::new(0)),
         introspections: Arc::new(AtomicUsize::new(0)),
         revocations: Arc::new(AtomicUsize::new(0)),
+        revoked: Arc::new(AtomicBool::new(false)),
     };
     let router = Router::new()
         .route(
@@ -368,7 +384,10 @@ async fn oidc_introspect(
 ) -> impl IntoResponse {
     if oidc_authorized(&headers) && form.get("token").is_some_and(|token| token == "opaque") {
         state.introspections.fetch_add(1, Ordering::SeqCst);
-        (StatusCode::OK, Json(serde_json::json!({"active":true})))
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"active":!state.revoked.load(Ordering::SeqCst)})),
+        )
     } else {
         (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})))
     }
@@ -381,6 +400,7 @@ async fn oidc_revoke(
 ) -> StatusCode {
     if oidc_authorized(&headers) && form.get("token").is_some_and(|token| token == "opaque") {
         state.revocations.fetch_add(1, Ordering::SeqCst);
+        state.revoked.store(true, Ordering::SeqCst);
         StatusCode::OK
     } else {
         StatusCode::UNAUTHORIZED
@@ -449,6 +469,25 @@ fn slack_readback_requires_the_posted_message() {
     assert!(!slack_readback_contains(
         &serde_json::json!({"ok":true,"messages":[{"ts":"other"}]}),
         "1"
+    ));
+}
+
+#[test]
+fn discord_readback_requires_the_posted_message() {
+    assert!(discord_readback_matches(
+        &serde_json::json!({"id":"m1","content":"marker"}),
+        "m1",
+        "marker"
+    ));
+    assert!(!discord_readback_matches(
+        &serde_json::json!({"id":"other","content":"marker"}),
+        "m1",
+        "marker"
+    ));
+    assert!(!discord_readback_matches(
+        &serde_json::json!({"id":"m1","content":"other"}),
+        "m1",
+        "marker"
     ));
 }
 
@@ -546,7 +585,7 @@ async fn oidc_oracle_proves_all_required_phases_and_cleanup() {
         "{result:?}"
     );
     assert_eq!(oracle.tokens.load(Ordering::SeqCst), 2);
-    assert_eq!(oracle.introspections.load(Ordering::SeqCst), 1);
+    assert_eq!(oracle.introspections.load(Ordering::SeqCst), 2);
     assert_eq!(oracle.revocations.load(Ordering::SeqCst), 1);
 }
 

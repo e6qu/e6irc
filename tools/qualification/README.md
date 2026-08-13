@@ -20,7 +20,8 @@ e6irc-qualification KIND --target TARGET --source REVISION --host HOST \
   --budget NAME=VALUE
 ```
 
-Kinds are `discord`, `slack`, `oidc`, `public-irc`, and `scale`. Discord
+Kinds are `discord`, `slack`, `oidc`, `public-irc`, and `scale`. Discord uses
+`discord.com` as `--target`; Slack uses `slack.com`. Discord
 requires `E6IRC_DISCORD_BOT_TOKEN` and `E6IRC_DISCORD_CHANNEL_ID`; Slack
 requires `E6IRC_SLACK_BOT_TOKEN`, `E6IRC_SLACK_APP_TOKEN`, and
 `E6IRC_SLACK_CHANNEL_ID`; OIDC requires `E6IRC_OIDC_CLIENT_ID` and
@@ -30,7 +31,8 @@ does not start a network request. Values are never included in output.
 Discord performs channel authentication, two gateway sessions, message post,
 read-back, and deletion. Slack performs `auth.test`, two Socket Mode sessions,
 message post, thread read-back, and deletion. OIDC verifies the discovered
-issuer, gets two client-credential tokens, introspects one, and revokes it.
+issuer, gets two client-credential tokens, introspects one, revokes it, and
+proves that introspection marks it inactive.
 Provider HTTP endpoints use HTTPS and provider WebSocket endpoints use WSS.
 Loopback oracles may use HTTP and WS. OIDC metadata cannot cross between those
 trust domains. Provider-signed WebSocket query parameters stay in memory.
@@ -85,6 +87,7 @@ network, or tuned host. Publish a passed claim only with retained evidence.
 
 Run **External qualification** from the Actions page. It is manual only. Pick
 one campaign and supply non-secret target, host, workload, and budget values.
+Use `discord.com` or `slack.com` for those provider campaigns.
 The scale campaign measures its host itself and does not use `host`.
 The workflow sets provider credentials only from these repository secrets:
 
