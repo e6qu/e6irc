@@ -1524,6 +1524,24 @@ async fn console_networks_page_lists_the_callers_networks() {
     assert!(editor.contains("data-api-owner-network-editor"), "{editor}");
     assert!(editor.contains("Loading network…"), "{editor}");
     assert!(!editor.contains("irc.libera.chat:6697"), "{editor}");
+    let log_req = format!(
+        "GET /console/networks/libera/logs HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, log) = request(http, &log_req).await;
+    assert_eq!(status, 200, "{log}");
+    for needle in [
+        "data-api-network-log",
+        "data-network-name=\"libera\"",
+        "Component log",
+        "Loading component log…",
+        "/api/v1/me/networks",
+    ] {
+        assert!(
+            log.contains(needle),
+            "network log missing {needle:?}: {log}"
+        );
+    }
+    assert!(!log.contains("irc.libera.chat:6697"), "{log}");
     let operations_req = format!(
         "GET /api/v1/me/networks/libera/operations HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );

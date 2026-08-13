@@ -124,12 +124,20 @@ async fn attach_relays_over_the_loopback_driver() {
         status.contains("*bnc*") && status.contains("upstream"),
         "attach sends an initial status line: {status}"
     );
-    // Then playback of the buffered line.
-    let replayed = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
-        .await
-        .expect("timeout")
-        .expect("io")
-        .expect("line");
+    // Then playback includes lifecycle notices and the buffered line.
+    let replayed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let line = lines.next_line().await?.ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "attach closed")
+            })?;
+            if line == "earlier" {
+                return Ok::<_, std::io::Error>(line);
+            }
+        }
+    })
+    .await
+    .expect("timeout")
+    .expect("io");
     assert_eq!(replayed, "earlier");
 
     // Live: a client line is echoed by the loopback driver back to us.

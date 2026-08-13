@@ -1113,6 +1113,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(pages::console_edit_network),
         )
         .route(
+            "/console/networks/{name}/logs",
+            get(pages::console_network_logs),
+        )
+        .route(
             "/console/networks/{name}",
             get(pages::console_network_detail),
         )
@@ -3046,6 +3050,13 @@ mod pages {
         name: String,
     }
 
+    #[derive(Template)]
+    #[template(path = "console_network_logs.html")]
+    struct ConsoleNetworkLogs {
+        shell: ConsoleShell,
+        name: String,
+    }
+
     /// Admin console: server-wide read views (accounts, registered channels,
     /// server bans, audit log) rendered server-side. Cookie-authenticated and
     /// admin-gated the same way the `/api/v1/admin/*` JSON endpoints are — an
@@ -3219,6 +3230,23 @@ mod pages {
             Err(response) => return response,
         };
         render_private(ConsoleNetworkDetail {
+            shell: console_shell(&state, account, csrf, "networks"),
+            name,
+        })
+    }
+
+    /// Console → network component log. The browser reads the owner-scoped
+    /// buffer API; every BNC driver uses the same persisted stream.
+    pub async fn console_network_logs(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Path(name): Path<String>,
+    ) -> Response {
+        let (account, csrf) = match page_actor(&state, &headers, false).await {
+            Ok(result) => result,
+            Err(response) => return response,
+        };
+        render_private(ConsoleNetworkLogs {
             shell: console_shell(&state, account, csrf, "networks"),
             name,
         })

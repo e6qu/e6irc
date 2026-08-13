@@ -549,6 +549,63 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     }
   }
 
+  const renderNetworkLog = (panel, lines) => {
+    const log = element("div", "backlog");
+    log.setAttribute("role", "log");
+    log.setAttribute("aria-label", "Component log");
+    if (lines.length === 0) {
+      log.append(element("p", "empty", "No component lines have been stored yet."));
+    } else {
+      for (const line of lines) log.append(element("code", "", line));
+    }
+    panel.replaceChildren(log);
+  };
+
+  const refreshNetworkLogNow = async (root) => {
+    const panel = root.querySelector("#network-log-panel");
+    const status = document.getElementById(root.dataset.refreshStatus);
+    if (!(panel instanceof HTMLElement)) return;
+    panel.setAttribute("aria-busy", "true");
+    if (status) {
+      status.textContent = "Refreshing…";
+      status.classList.remove("refresh-error");
+    }
+    try {
+      const name = root.dataset.networkName;
+      if (!name) throw new Error("This component has no resource ID. Return to networks and try again.");
+      const network = await apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`);
+      const title = root.querySelector("[data-network-log-title]");
+      if (title) title.textContent = `${network.name} log`;
+      const detail = root.querySelector("[data-network-log-detail]");
+      if (detail instanceof HTMLAnchorElement) detail.href = `/console/networks/${encodeURIComponent(network.name)}`;
+      const result = await apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}/buffer?limit=1000`);
+      renderNetworkLog(panel, apiCollection(result, "lines", "component log"));
+      if (status) status.textContent = "Live log refreshed.";
+    } catch (error) {
+      panel.replaceChildren(monitoringEmpty(`Component log failed (${error.message}). Use Refresh to retry.`));
+      if (status) {
+        status.textContent = `Live log refresh failed (${error.message}). Use Refresh to retry.`;
+        status.classList.add("refresh-error");
+      }
+    } finally {
+      panel.removeAttribute("aria-busy");
+    }
+  };
+
+  for (const root of document.querySelectorAll("[data-api-network-log]")) {
+    const refresh = serializeRefresh(
+      () => refreshNetworkLogNow(root),
+      () => {
+        const status = document.getElementById(root.dataset.refreshStatus);
+        if (status) status.textContent = "Refresh queued.";
+      },
+    );
+    panelRefreshers.set(root, refresh);
+    void refresh();
+    const seconds = Number(root.dataset.refreshSeconds);
+    if (Number.isFinite(seconds) && seconds >= 5) window.setInterval(() => void refresh(), seconds * 1000);
+  }
+
   const overviewSection = (target, title, href, headings, rows) => {
     target.replaceChildren();
     const head = element("div", "panel-head list-head");
@@ -2412,6 +2469,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       const toggleForm = ownerNetworkDetail.querySelector("[data-api-owner-network-toggle]"); if (toggleForm instanceof HTMLFormElement) toggleForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
       const deleteForm = ownerNetworkDetail.querySelector("[data-api-owner-network-delete]"); if (deleteForm instanceof HTMLFormElement) { deleteForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; deleteForm.dataset.confirm = `Remove network ${network.name}? Its live connection and stored backlog will be deleted.`; }
       const edit = ownerNetworkDetail.querySelector("[data-network-edit]"); if (edit instanceof HTMLAnchorElement) { if (network.kind === "irc") { edit.href = `/console/networks/${encodeURIComponent(network.name)}/edit`; edit.hidden = false; } else if (ownerNetworkDetail.dataset.isAdmin === "true") { edit.href = `/console/integrations/${encodeURIComponent(network.name)}/edit`; edit.textContent = "Edit integration"; edit.hidden = false; } }
+      const logs = ownerNetworkDetail.querySelector("[data-network-logs]"); if (logs instanceof HTMLAnchorElement) logs.href = `/console/networks/${encodeURIComponent(network.name)}/logs`;
     };
     refreshOwnerNetworkDetail = async () => {
       try {

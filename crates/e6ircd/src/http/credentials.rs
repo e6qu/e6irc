@@ -159,6 +159,27 @@ fn owner_scoped_delete_response(
     }
 }
 
+enum OwnerItem {
+    Token,
+    Credential,
+}
+
+async fn delete_owner_item(
+    state: &AppState,
+    account: &str,
+    id: i64,
+    item: OwnerItem,
+    not_found_title: &'static str,
+    operation: &'static str,
+) -> Response {
+    let pool = pool_of(state);
+    let result = match item {
+        OwnerItem::Token => crate::db::delete_api_token(pool, account, id).await,
+        OwnerItem::Credential => crate::db::revoke_credential(pool, account, id).await,
+    };
+    owner_scoped_delete_response(result, not_found_title, operation)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AppPasswordRequest {
@@ -505,12 +526,15 @@ pub(super) async fn me_tokens_revoke(
     Authenticated(account): Authenticated,
     Path(id): Path<i64>,
 ) -> Response {
-    let pool = pool_of(&state);
-    owner_scoped_delete_response(
-        crate::db::delete_api_token(pool, &account, id).await,
+    delete_owner_item(
+        &state,
+        &account,
+        id,
+        OwnerItem::Token,
         "No such token",
         "token revoke",
     )
+    .await
 }
 
 /// Revoke one of the authenticated account's app passwords by id.
@@ -519,12 +543,15 @@ pub(super) async fn revoke_credential(
     Authenticated(account): Authenticated,
     Path(id): Path<i64>,
 ) -> Response {
-    let pool = pool_of(&state);
-    owner_scoped_delete_response(
-        crate::db::revoke_credential(pool, &account, id).await,
+    delete_owner_item(
+        &state,
+        &account,
+        id,
+        OwnerItem::Credential,
         "No such credential",
         "credential revoke",
     )
+    .await
 }
 
 #[derive(Deserialize)]

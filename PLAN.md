@@ -28,7 +28,9 @@ External qualification has one manual GitHub workflow. It selects one closed
 campaign, refuses local provider oracles, and uploads only evidence accepted by
 the runner verifier.
 The current qualification runner passed live public IRC campaigns for
-Libera.Chat, OFTC, and Ergo on 2026-08-12.
+Libera.Chat, OFTC, and Ergo on 2026-08-13. The console has a bounded,
+owner-scoped component-log view backed by the same API buffer for IRC and every
+bridge driver.
 
 ## Remaining qualification
 

@@ -1394,7 +1394,8 @@ fn document() -> serde_json::Value {
                         "404": { "description": "no such network" } } }
             },
             "/api/v1/me/networks/{name}/buffer": {
-                "get": { "summary": "Recent buffered upstream lines for a network (oldest-first)",
+                "get": { "summary": "Read the bounded owner-scoped component log (oldest-first)",
+                    "description": "Returns the persisted line stream used by IRC and every bridge component. It includes safe lifecycle notices and never includes credentials.",
                     "security": authenticated,
                     "parameters": [
                         { "name": "name", "in": "path", "required": true,

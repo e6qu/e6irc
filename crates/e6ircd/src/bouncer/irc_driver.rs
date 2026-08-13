@@ -96,6 +96,10 @@ pub enum IrcPreflightFailure {
     ConnectionTimedOut,
     AuthenticationRejected,
     RegistrationRejected,
+    InvalidNickname,
+    NicknameInUse,
+    ServerPasswordRejected,
+    NetworkBanned,
     RegistrationFailed,
     RegistrationTimedOut,
 }
@@ -111,6 +115,10 @@ impl IrcPreflightFailure {
             Self::ConnectionTimedOut => "connection_timed_out",
             Self::AuthenticationRejected => "authentication_rejected",
             Self::RegistrationRejected => "registration_rejected",
+            Self::InvalidNickname => "invalid_nickname",
+            Self::NicknameInUse => "nickname_in_use",
+            Self::ServerPasswordRejected => "server_password_rejected",
+            Self::NetworkBanned => "network_banned",
             Self::RegistrationFailed => "registration_failed",
             Self::RegistrationTimedOut => "registration_timed_out",
         }
@@ -130,6 +138,10 @@ impl IrcPreflightFailure {
             Self::ConnectionTimedOut => "Connecting to the upstream timed out.",
             Self::AuthenticationRejected => "The upstream rejected the SASL credentials.",
             Self::RegistrationRejected => "The upstream rejected IRC registration.",
+            Self::InvalidNickname => "The upstream rejected the configured nickname.",
+            Self::NicknameInUse => "The configured nickname is already in use.",
+            Self::ServerPasswordRejected => "The upstream rejected the configured server password.",
+            Self::NetworkBanned => "The upstream network banned this connection.",
             Self::RegistrationFailed => "IRC registration failed before a welcome was received.",
             Self::RegistrationTimedOut => "IRC registration timed out.",
         }
@@ -185,6 +197,11 @@ pub async fn preflight_irc(config: &NetworkConfig) -> Result<IrcPreflight, IrcPr
     };
     let confirmed_nick = match tokio::time::timeout(Duration::from_secs(30), registration).await {
         Ok(Ok(confirmed_nick)) => confirmed_nick,
+        Ok(Err(error))
+            if let Some(refusal) = e6irc_client::RegistrationRefusal::from_error(&error) =>
+        {
+            return Err(preflight_refusal(refusal));
+        }
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
             return Err(IrcPreflightFailure::AuthenticationRejected);
         }
@@ -243,10 +260,8 @@ struct SharedDriver {
 enum RegistrationResult {
     Ok(String),
     AuthRejected,
-    /// 433 — nickname in use. Earns one replacement-nick retry without SASL.
     NickInUse,
-    /// 432 / unsupported capability / etc.
-    RegistrationRejected,
+    Rejected(e6irc_client::RegistrationRefusal),
     Failed,
     TimedOut,
 }
@@ -256,11 +271,14 @@ fn classify_registration(
 ) -> RegistrationResult {
     match result {
         Ok(Ok(nick)) => RegistrationResult::Ok(nick),
+        Ok(Err(e)) if let Some(refusal) = e6irc_client::RegistrationRefusal::from_error(&e) => {
+            match refusal {
+                e6irc_client::RegistrationRefusal::NicknameInUse => RegistrationResult::NickInUse,
+                refusal => RegistrationResult::Rejected(refusal),
+            }
+        }
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             RegistrationResult::AuthRejected
-        }
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            RegistrationResult::NickInUse
         }
         Ok(Err(e))
             if matches!(
@@ -270,7 +288,7 @@ fn classify_registration(
                     | std::io::ErrorKind::Unsupported
             ) =>
         {
-            RegistrationResult::RegistrationRejected
+            RegistrationResult::Rejected(e6irc_client::RegistrationRefusal::NotRegistered)
         }
         Ok(Err(_)) => RegistrationResult::Failed,
         Err(_) => RegistrationResult::TimedOut,
@@ -283,11 +301,28 @@ fn into_outcome(result: RegistrationResult) -> Result<String, super::SessionOutc
     match result {
         RegistrationResult::Ok(nick) => Ok(nick),
         RegistrationResult::AuthRejected => Err(super::SessionOutcome::AuthRejected),
-        RegistrationResult::NickInUse | RegistrationResult::RegistrationRejected => {
-            Err(super::SessionOutcome::RegistrationRejected)
+        RegistrationResult::NickInUse => Err(super::SessionOutcome::RegistrationRejected(
+            e6irc_client::RegistrationRefusal::NicknameInUse,
+        )),
+        RegistrationResult::Rejected(rejection) => {
+            Err(super::SessionOutcome::RegistrationRejected(rejection))
         }
         RegistrationResult::Failed => Err(dropped(super::NetworkFailure::RegistrationFailed)),
         RegistrationResult::TimedOut => Err(dropped(super::NetworkFailure::RegistrationTimedOut)),
+    }
+}
+
+fn preflight_refusal(refusal: e6irc_client::RegistrationRefusal) -> IrcPreflightFailure {
+    match refusal {
+        e6irc_client::RegistrationRefusal::InvalidNickname => IrcPreflightFailure::InvalidNickname,
+        e6irc_client::RegistrationRefusal::NicknameInUse => IrcPreflightFailure::NicknameInUse,
+        e6irc_client::RegistrationRefusal::ServerPasswordRejected => {
+            IrcPreflightFailure::ServerPasswordRejected
+        }
+        e6irc_client::RegistrationRefusal::NetworkBanned => IrcPreflightFailure::NetworkBanned,
+        e6irc_client::RegistrationRefusal::NotRegistered => {
+            IrcPreflightFailure::RegistrationRejected
+        }
     }
 }
 
@@ -766,7 +801,7 @@ mod tests {
         );
         assert!(matches!(
             classify_registration(Ok(Err(error))),
-            RegistrationResult::RegistrationRejected
+            RegistrationResult::Rejected(e6irc_client::RegistrationRefusal::NotRegistered)
         ));
     }
 

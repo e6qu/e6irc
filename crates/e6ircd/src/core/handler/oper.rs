@@ -637,11 +637,7 @@ pub(crate) fn apply_committed_server_ban(
             kind,
             ..
         } => {
-            let Some(kind) = BanKind::from_token(&kind) else {
-                panic!("validated server-ban mutation has invalid kind");
-            };
-            let mask = crate::core::state::MaskKey::new(&mask_display, state.casemap);
-            let label = kind.label();
+            let (kind, mask, label) = committed_ban_parts(state, &kind, &mask_display);
             apply_server_ban_hot(state, mask.clone(), kind, &reason, &set_by, label);
             notify_opers(
                 state,
@@ -655,11 +651,7 @@ pub(crate) fn apply_committed_server_ban(
             kind,
             ..
         } => {
-            let Some(kind) = BanKind::from_token(&kind) else {
-                panic!("validated server-ban mutation has invalid kind");
-            };
-            let mask = crate::core::state::MaskKey::new(&mask_display, state.casemap);
-            let label = kind.label();
+            let (kind, mask, label) = committed_ban_parts(state, &kind, &mask_display);
             remove_server_ban_hot(state, &mask, kind);
             notify_opers(
                 state,
@@ -668,6 +660,18 @@ pub(crate) fn apply_committed_server_ban(
             );
         }
     }
+}
+
+fn committed_ban_parts(
+    state: &ServerState,
+    kind: &str,
+    mask_display: &str,
+) -> (BanKind, crate::core::state::MaskKey, &'static str) {
+    let Some(kind) = BanKind::from_token(kind) else {
+        panic!("validated server-ban mutation has invalid kind");
+    };
+    let mask = crate::core::state::MaskKey::new(mask_display, state.casemap);
+    (kind, mask, kind.label())
 }
 
 fn finish_server_ban_unavailable(

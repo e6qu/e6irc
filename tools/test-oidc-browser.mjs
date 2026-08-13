@@ -1039,6 +1039,16 @@ try {
   await upstream.sendPeerMessage("#journey", "browser replays through the real stack");
   await waitForBufferedLine(context.request, "journey", "browser replays through the real stack");
 
+  const componentLogBuffer = page.waitForResponse(
+    (response) => response.url() === `${applicationOrigin}/api/v1/me/networks/journey/buffer?limit=1000`
+      && response.request().method() === "GET",
+  );
+  const componentLogPage = await page.goto(`${applicationOrigin}/console/networks/journey/logs`);
+  assert.equal(componentLogPage.status(), 200);
+  assert.equal((await componentLogBuffer).status(), 200);
+  await page.getByText("browser replays through the real stack", { exact: true }).waitFor();
+  await page.getByRole("heading", { name: "journey log", exact: true }).waitFor();
+
   const initialBuffer = page.waitForResponse(
     (response) => response.url() === `${applicationOrigin}/api/v1/me/networks/journey/buffer?limit=1000`,
   );
