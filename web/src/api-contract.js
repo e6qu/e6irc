@@ -141,9 +141,17 @@ function parameterSchema(parameter, label) {
   return parameter.schema;
 }
 
+function operationParameters(operation, label) {
+  if (operation.parameters === undefined) return [];
+  if (!Array.isArray(operation.parameters)) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  return operation.parameters;
+}
+
 export function parseOperationQuery(document, method, url, label = "API query") {
   const { operation } = declaredOperation(document, method, url);
-  const parameters = Array.isArray(operation.parameters) ? operation.parameters : [];
+  const parameters = operationParameters(operation, label);
   const schemas = new Map();
   for (const parameter of parameters) {
     if (!objectValue(parameter) || parameter.in !== "query" || typeof parameter.name !== "string" || parameter.name === "") {
@@ -166,7 +174,7 @@ export function parseOperationQuery(document, method, url, label = "API query") 
 
 export function parseOperationPath(document, method, url, label = "API path") {
   const { pathname, path, operation } = declaredOperation(document, method, url);
-  const parameters = Array.isArray(operation.parameters) ? operation.parameters : [];
+  const parameters = operationParameters(operation, label);
   const schemas = new Map();
   for (const parameter of parameters) {
     if (!objectValue(parameter) || parameter.in !== "path" || typeof parameter.name !== "string" || parameter.name === "" || parameter.required !== true) {

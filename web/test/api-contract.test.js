@@ -254,6 +254,20 @@ test("operation parser requires documented path parameters", () => {
   assert.throws(() => parseOperationPath(document, "GET", "/api/v1/me/widgets/1"), ApiSchemaError);
 });
 
+test("operation parser rejects malformed parameter collections", () => {
+  const document = {
+    paths: {
+      "/api/v1/me/widgets": {
+        get: {
+          parameters: {},
+          responses: { 200: { content: { "application/json": { schema: { type: "object" } } } } },
+        },
+      },
+    },
+  };
+  assert.throws(() => parseOperationQuery(document, "GET", "/api/v1/me/widgets"), ApiSchemaError);
+});
+
 test("operation request serializer closes and validates documented JSON", () => {
   const document = {
     paths: {

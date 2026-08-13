@@ -1804,6 +1804,14 @@ fn validate_documented_operations(spec: &serde_json::Value) -> Result<(), String
     }
 
     for (path, item) in paths {
+        let item = item
+            .as_object()
+            .ok_or_else(|| format!("OpenAPI path {path} is not an object"))?;
+        if item.contains_key("parameters") {
+            return Err(format!(
+                "OpenAPI path {path} has unsupported path-item parameters"
+            ));
+        }
         let path_parameters: std::collections::BTreeSet<&str> = path
             .split('/')
             .filter_map(|segment| segment.strip_prefix('{')?.strip_suffix('}'))
@@ -1993,6 +2001,17 @@ mod tests {
             super::validate_documented_operations(&spec)
                 .expect_err("missing path parameter must reject the contract")
                 .contains("/api/v1/me/tokens/{id} path parameters differ")
+        );
+    }
+
+    #[test]
+    fn openapi_rejects_path_item_parameters() {
+        let mut spec = super::document();
+        spec["paths"]["/api/v1/me/tokens/{id}"]["parameters"] = serde_json::json!([]);
+        assert!(
+            super::validate_documented_operations(&spec)
+                .expect_err("unsupported path-item parameters must reject the contract")
+                .contains("unsupported path-item parameters")
         );
     }
 
