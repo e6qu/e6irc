@@ -828,7 +828,7 @@ async fn console_runtime_is_served_in_every_build() {
     assert!(body.contains("data-api-session-page"), "{body}");
     assert!(body.contains("data-api-account-app-password"), "{body}");
     assert!(body.contains("data-api-channel-register"), "{body}");
-    assert!(body.contains("SETTINGS_KEY = \"e6irc.settings\""), "{body}");
+    assert!(body.contains("/console-settings.js"), "{body}");
     assert!(body.contains("data-api-owner-network-create"), "{body}");
     assert!(body.contains("data-api-admin-account-create"), "{body}");
     assert!(body.contains("X-E6IRC-CSRF"), "{body}");
@@ -841,6 +841,10 @@ async fn console_runtime_is_served_in_every_build() {
     let (status, headers, body) = request(http, &get("/console-contract.js")).await;
     assert_eq!(status, 200, "{headers}");
     assert!(body.contains("readApiJson"), "{body}");
+
+    let (status, headers, body) = request(http, &get("/console-settings.js")).await;
+    assert_eq!(status, 200, "{headers}");
+    assert!(body.contains("loadSettings"), "{body}");
 }
 
 #[tokio::test]

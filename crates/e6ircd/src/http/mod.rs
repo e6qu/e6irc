@@ -1089,6 +1089,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/auth/shauth/logout/complete", get(shauth_logout_complete))
         .route("/auth.css", get(pages::auth_styles))
         .route("/console-contract.js", get(pages::console_contract_script))
+        .route("/console-settings.js", get(pages::console_settings_script))
         .route("/console.js", get(pages::console_script))
         .route("/account", get(pages::account_redirect))
         .route("/console", get(pages::console))
@@ -2049,6 +2050,18 @@ mod pages {
                 (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             ],
             include_str!("../../../../web/src/api-contract.js"),
+        )
+            .into_response()
+    }
+
+    pub async fn console_settings_script() -> Response {
+        (
+            [
+                (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+                (header::CACHE_CONTROL, "public, max-age=3600"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            include_str!("../../../../web/src/settings.js"),
         )
             .into_response()
     }
