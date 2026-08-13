@@ -2885,10 +2885,19 @@ mod tests {
                 .any(|l| l.contains("no bridged") && l.contains("#c")),
             "the unmapped target is surfaced: {lines:#?}"
         );
+        let delivery_notices = lines
+            .iter()
+            .filter(|line| line.contains("not delivered") || line.contains("no bridged"))
+            .count();
         assert_eq!(
-            lines.len(),
-            2,
-            "exactly one notice per problem target — earlier problems not dropped: {lines:#?}"
+            delivery_notices, 2,
+            "exactly one delivery notice per problem target: {lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == &failure_notice(NetworkFailure::UpstreamWriteFailed)),
+            "the component diagnostic is retained: {lines:#?}"
         );
     }
 
