@@ -1297,6 +1297,16 @@ fn failure_notice(failure: NetworkFailure) -> String {
     )
 }
 
+fn emit_failure_notice(
+    buffer: &std::sync::Mutex<Buffer>,
+    events: &tokio::sync::broadcast::Sender<DriverEvent>,
+    failure: NetworkFailure,
+) {
+    let line = crate::sanitize::upstream_line(failure_notice(failure));
+    buffer.lock().expect("buffer poisoned").push(line.clone());
+    drop(events.send(DriverEvent::Line(line)));
+}
+
 /// One classified failure with when it happened — the unit of the bounded
 /// per-network failure history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1695,13 +1705,7 @@ pub enum SendOutcome {
 
 impl NetworkHandle {
     fn emit_notice(&self, failure: NetworkFailure) {
-        let line = failure_notice(failure);
-        let line = crate::sanitize::upstream_line(line);
-        self.buffer
-            .lock()
-            .expect("buffer poisoned")
-            .push(line.clone());
-        drop(self.events.send(DriverEvent::Line(line)));
+        emit_failure_notice(&self.buffer, &self.events, failure);
     }
 
     /// Try to hand a raw line to the upstream network **without blocking**.
@@ -2063,7 +2067,7 @@ impl DriverEnds {
 
     #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
     fn emit_failure_notice(&self, failure: NetworkFailure) {
-        self.emit_notice(failure_notice(failure));
+        emit_failure_notice(&self.buffer, &self.events, failure);
     }
 
     /// Record a synthesized self-echo: a copy of a line an attached client
