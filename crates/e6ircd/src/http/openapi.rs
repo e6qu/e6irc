@@ -1488,15 +1488,23 @@ fn document() -> serde_json::Value {
                         "content": {
                             "application/json": {
                                 "schema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "suspended": { "type": "boolean" },
-                                        "administrator": { "type": "boolean" }
-                                    },
-                                    "additionalProperties": false,
                                     "oneOf": [
-                                        { "required": ["suspended"] },
-                                        { "required": ["administrator"] }
+                                        {
+                                            "type": "object",
+                                            "additionalProperties": false,
+                                            "required": ["suspended"],
+                                            "properties": {
+                                                "suspended": { "type": "boolean" }
+                                            }
+                                        },
+                                        {
+                                            "type": "object",
+                                            "additionalProperties": false,
+                                            "required": ["administrator"],
+                                            "properties": {
+                                                "administrator": { "type": "boolean" }
+                                            }
+                                        }
                                     ]
                                 }
                             }
@@ -1938,6 +1946,7 @@ mod tests {
         ("/api/v1/me/networks", "get"),
         ("/api/v1/me/networks/{name}", "get"),
         ("/api/v1/me/networks/{name}/operations", "get"),
+        ("/api/v1/me/networks/{name}/buffer", "get"),
         ("/api/v1/me/channels", "get"),
     ];
     const CONSOLE_JSON_MUTATIONS: &[(&str, &str, &str)] = &[
@@ -1977,6 +1986,36 @@ mod tests {
         ("/api/v1/me/networks/{name}", "patch", "200"),
         ("/api/v1/me/sessions", "delete", "200"),
         ("/api/v1/me/tokens", "post", "201"),
+    ];
+    const CONSOLE_JSON_REQUESTS: &[(&str, &str)] = &[
+        ("/api/v1/admin/accounts", "post"),
+        ("/api/v1/admin/accounts/{id}", "patch"),
+        ("/api/v1/admin/accounts/{id}", "delete"),
+        ("/api/v1/admin/bans", "post"),
+        ("/api/v1/admin/configuration", "patch"),
+        ("/api/v1/admin/configuration/networks", "post"),
+        ("/api/v1/admin/configuration/networks/{name}", "delete"),
+        ("/api/v1/admin/configuration/oidc-providers", "post"),
+        (
+            "/api/v1/admin/configuration/oidc-providers/{name}",
+            "delete",
+        ),
+        ("/api/v1/admin/configuration/opers", "post"),
+        ("/api/v1/admin/configuration/opers/{name}", "delete"),
+        ("/api/v1/admin/invitations", "post"),
+        ("/api/v1/admin/networks/{owner}/{name}", "patch"),
+        ("/api/v1/me/profile", "patch"),
+        ("/api/v1/me/account", "delete"),
+        ("/api/v1/me/password", "put"),
+        ("/api/v1/me/channels", "post"),
+        ("/api/v1/me/channels/{name}", "patch"),
+        ("/api/v1/me/channels/{name}/access/{account}", "put"),
+        ("/api/v1/me/credentials", "post"),
+        ("/api/v1/me/networks", "post"),
+        ("/api/v1/me/networks/preflight", "post"),
+        ("/api/v1/me/networks/{name}", "put"),
+        ("/api/v1/me/networks/{name}", "patch"),
+        ("/api/v1/me/tokens", "post"),
     ];
     const CHAT_READ_OPERATIONS: &[(&str, &str)] = &[
         ("/api/v1/me", "get"),
@@ -2055,6 +2094,28 @@ mod tests {
                 assert_eq!(schema["type"], "object", "{method} {path}");
                 assert_eq!(schema["additionalProperties"], false, "{method} {path}");
             }
+        }
+    }
+
+    #[test]
+    fn console_json_requests_have_closed_object_branches() {
+        fn assert_closed_object_branch(schema: &serde_json::Value, path: &str, method: &str) {
+            if let Some(branches) = schema.get("oneOf").and_then(serde_json::Value::as_array) {
+                assert!(!branches.is_empty(), "{method} {path}");
+                for branch in branches {
+                    assert_closed_object_branch(branch, path, method);
+                }
+                return;
+            }
+            assert_eq!(schema["type"], "object", "{method} {path}");
+            assert_eq!(schema["additionalProperties"], false, "{method} {path}");
+        }
+
+        let spec = super::document();
+        for (path, method) in CONSOLE_JSON_REQUESTS {
+            let schema = &spec["paths"][path][method]["requestBody"]["content"]["application/json"]
+                ["schema"];
+            assert_closed_object_branch(schema, path, method);
         }
     }
 

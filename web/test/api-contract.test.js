@@ -326,6 +326,38 @@ test("operation request serializer closes and validates documented JSON", () => 
   );
 });
 
+test("operation request serializer accepts exactly one complete union branch", () => {
+  const document = {
+    paths: {
+      "/api/v1/admin/accounts/{id}": {
+        patch: {
+          requestBody: { required: true, content: { "application/json": { schema: {
+            oneOf: [
+              { type: "object", additionalProperties: false, required: ["suspended"], properties: { suspended: { type: "boolean" } } },
+              { type: "object", additionalProperties: false, required: ["administrator"], properties: { administrator: { type: "boolean" } } },
+            ],
+          } } } },
+          responses: {},
+        },
+      },
+    },
+  };
+  assert.equal(
+    serializeOperationRequest(document, "PATCH", "/api/v1/admin/accounts/1", { suspended: true }),
+    '{"suspended":true}',
+  );
+  assert.equal(
+    serializeOperationRequest(document, "PATCH", "/api/v1/admin/accounts/1", { administrator: false }),
+    '{"administrator":false}',
+  );
+  for (const value of [{}, { suspended: true, administrator: false }]) {
+    assert.throws(
+      () => serializeOperationRequest(document, "PATCH", "/api/v1/admin/accounts/1", value),
+      ApiSchemaError,
+    );
+  }
+});
+
 test("operation requests serialize only contract-checked JSON", async () => {
   const document = {
     paths: {
