@@ -1070,6 +1070,22 @@ async fn openapi_spec_is_served() {
     assert!(v["paths"]["/healthz"]["get"].is_object());
     assert!(v["paths"]["/readyz"]["get"].is_object());
     assert!(v["paths"]["/api/v1/admin/observability"]["get"].is_object());
+    let buffer = &v["paths"]["/api/v1/me/networks/{name}/buffer"]["get"]["responses"]["200"]["content"]
+        ["application/json"]["schema"]["properties"]["lines"];
+    assert_eq!(buffer["maxItems"], 1_000);
+    assert_eq!(buffer["items"]["maxLength"], 510);
+    let runtime_failures = &v["paths"]["/api/v1/me/networks/{name}"]["get"]["responses"]["200"]["content"]
+        ["application/json"]["schema"]["properties"]["runtime"]["oneOf"][1]["properties"]["recent_failures"];
+    assert_eq!(
+        runtime_failures["maxItems"],
+        e6ircd::bouncer::NETWORK_FAILURE_HISTORY_LIMIT
+    );
+    let operation_failures = &v["paths"]["/api/v1/me/networks/{name}/operations"]["get"]["responses"]
+        ["200"]["content"]["application/json"]["schema"]["properties"]["recent_failures"];
+    assert_eq!(
+        operation_failures["maxItems"],
+        e6ircd::bouncer::NETWORK_FAILURE_HISTORY_LIMIT
+    );
     assert!(v["paths"]["/api/v1/admin/monitoring"]["get"].is_object());
     assert!(v["paths"]["/api/v1/admin/metrics"]["get"].is_object());
     let account_parameters = v["paths"]["/api/v1/admin/accounts"]["get"]["parameters"]

@@ -152,7 +152,7 @@ fn document() -> serde_json::Value {
                     "properties": {
                         "state": { "type": "string", "enum": ["connecting", "connected", "reconnecting", "authentication_failed", "registration_failed"] },
                         "state_changed_at": { "type": "string" }, "next_retry_at": { "type": ["string", "null"] },
-                        "recent_failures": { "type": "array", "items": {
+                        "recent_failures": { "type": "array", "maxItems": crate::bouncer::NETWORK_FAILURE_HISTORY_LIMIT, "items": {
                             "type": "object", "additionalProperties": false, "required": ["at", "code", "summary"],
                             "properties": { "at": { "type": "string" }, "code": { "type": "string" }, "summary": { "type": "string" } }
                         } },
@@ -208,7 +208,8 @@ fn document() -> serde_json::Value {
     let buffer_response = serde_json::json!({
         "200": { "description": "buffered lines", "content": { "application/json": {
             "schema": { "type": "object", "required": ["lines"], "additionalProperties": false,
-                "properties": { "lines": { "type": "array", "items": { "type": "string" } } }
+                "properties": { "lines": { "type": "array", "maxItems": 1000,
+                    "items": { "type": "string", "maxLength": 510 } } }
             }
         } } }
     });
@@ -239,14 +240,16 @@ fn document() -> serde_json::Value {
             "required": ["state", "connected", "state_changed", "next_retry", "recent_failures", "connected_since", "last_input", "last_output", "last_error", "last_error_reason", "connect_latency", "connection_attempts", "errors", "attached_clients", "traffic_in", "traffic_out", "lines_in", "lines_out", "memory_buffer", "stored_lines", "stored_oldest", "stored_newest", "recent_lines"],
             "properties": {
                 "state": { "type": "string" }, "connected": { "type": "boolean" }, "state_changed": { "type": "string" }, "next_retry": { "type": "string" },
-                "recent_failures": { "type": "array", "items": { "type": "string" } }, "connected_since": { "type": "string" },
+                "recent_failures": { "type": "array", "maxItems": crate::bouncer::NETWORK_FAILURE_HISTORY_LIMIT, "items": { "type": "string" } }, "connected_since": { "type": "string" },
                 "last_input": { "type": "string" }, "last_output": { "type": "string" }, "last_error": { "type": "string" },
                 "last_error_reason": { "type": "string" }, "connect_latency": { "type": "string" },
                 "connection_attempts": { "type": "integer", "minimum": 0 }, "errors": { "type": "integer", "minimum": 0 },
                 "attached_clients": { "type": "integer", "minimum": 0 }, "traffic_in": { "type": "string" }, "traffic_out": { "type": "string" },
                 "lines_in": { "type": "integer", "minimum": 0 }, "lines_out": { "type": "integer", "minimum": 0 },
                 "memory_buffer": { "type": "string" }, "stored_lines": { "type": "integer", "minimum": 0 },
-                "stored_oldest": { "type": "string" }, "stored_newest": { "type": "string" }, "recent_lines": { "type": "array", "items": { "type": "string" } }
+                "stored_oldest": { "type": "string" }, "stored_newest": { "type": "string" },
+                "recent_lines": { "type": "array", "maxItems": 100,
+                    "items": { "type": "string", "maxLength": 510 } }
             }
         }),
     );

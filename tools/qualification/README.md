@@ -31,6 +31,9 @@ Discord performs channel authentication, two gateway sessions, message post,
 read-back, and deletion. Slack performs `auth.test`, two Socket Mode sessions,
 message post, thread read-back, and deletion. OIDC verifies the discovered
 issuer, gets two client-credential tokens, introspects one, and revokes it.
+Provider HTTP endpoints use HTTPS and provider WebSocket endpoints use WSS.
+Loopback oracles may use HTTP and WS. OIDC metadata cannot cross between those
+trust domains. Provider-signed WebSocket query parameters stay in memory.
 The adapter tests can select credential-free loopback or provider endpoints.
 The external command rejects custom Discord and Slack endpoints. It always
 uses the public provider endpoint. Evidence records every required

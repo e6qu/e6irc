@@ -87,6 +87,10 @@ impl CampaignUrl {
     fn into_url(self) -> Url {
         self.0
     }
+
+    fn is_loopback(&self) -> bool {
+        self.0.host_str().is_some_and(is_loopback_host)
+    }
 }
 
 fn safe_url(value: &str) -> Option<CampaignUrl> {
@@ -99,6 +103,37 @@ fn safe_url(value: &str) -> Option<CampaignUrl> {
         && url.query().is_none()
         && url.fragment().is_none())
     .then_some(CampaignUrl(url))
+}
+
+#[derive(Clone, Debug)]
+struct CampaignSocketUrl(Url);
+
+impl CampaignSocketUrl {
+    fn parse(value: &str) -> Option<Self> {
+        let url = Url::parse(value).ok()?;
+        let loopback = url.host_str().is_some_and(is_loopback_host);
+        ((url.scheme() == "wss" || (url.scheme() == "ws" && loopback))
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none())
+        .then_some(Self(url))
+    }
+
+    fn with_query(&self, values: &[(&str, &str)]) -> String {
+        let mut url = self.0.clone();
+        url.query_pairs_mut().extend_pairs(values);
+        url.into()
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+fn oidc_endpoint(issuer: &CampaignUrl, value: &str) -> Option<CampaignUrl> {
+    let endpoint = safe_url(value)?;
+    (issuer.is_loopback() == endpoint.is_loopback()).then_some(endpoint)
 }
 
 pub(super) fn is_loopback_host(host: &str) -> bool {
@@ -226,7 +261,7 @@ async fn discord(_target: &str) -> ProbeReport {
             );
         }
     };
-    let Some(gateway_url) = gateway_url else {
+    let Some(gateway_url) = gateway_url.and_then(|url| CampaignSocketUrl::parse(&url)) else {
         return report(
             TargetKind::Discord,
             PhaseOutcome::Passed,
@@ -314,11 +349,10 @@ async fn discord(_target: &str) -> ProbeReport {
     )
 }
 
-async fn discord_connect(url: &str, token: &str) -> PhaseOutcome {
-    let Ok(mut socket) =
-        connect_async(format!("{}/?v=10&encoding=json", url.trim_end_matches('/')))
-            .await
-            .map(|(socket, _)| socket)
+async fn discord_connect(url: &CampaignSocketUrl, token: &str) -> PhaseOutcome {
+    let Ok(mut socket) = connect_async(url.with_query(&[("v", "10"), ("encoding", "json")]))
+        .await
+        .map(|(socket, _)| socket)
     else {
         return PhaseOutcome::Failed;
     };
@@ -522,7 +556,7 @@ async fn slack_socket(
     http: &Client,
     base: &CampaignUrl,
     app: &str,
-) -> Result<String, PhaseOutcome> {
+) -> Result<CampaignSocketUrl, PhaseOutcome> {
     let Some(url) = endpoint(base, "apps.connections.open") else {
         return Err(PhaseOutcome::Rejected);
     };
@@ -536,12 +570,12 @@ async fn slack_socket(
     }
     json.get("url")
         .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .ok_or(PhaseOutcome::Failed)
+        .and_then(CampaignSocketUrl::parse)
+        .ok_or(PhaseOutcome::Rejected)
 }
 
-async fn slack_connect(url: &str) -> PhaseOutcome {
-    match connect_async(url).await {
+async fn slack_connect(url: &CampaignSocketUrl) -> PhaseOutcome {
+    match connect_async(url.as_str()).await {
         Ok((mut socket, _)) => {
             let _ = socket.close(None).await;
             PhaseOutcome::Passed
@@ -585,21 +619,21 @@ async fn oidc(target: &str) -> ProbeReport {
     let Some(token_endpoint) = configuration
         .get("token_endpoint")
         .and_then(serde_json::Value::as_str)
-        .and_then(safe_url)
+        .and_then(|value| oidc_endpoint(&issuer, value))
     else {
         return not_run(TargetKind::Oidc);
     };
     let Some(introspection_endpoint) = configuration
         .get("introspection_endpoint")
         .and_then(serde_json::Value::as_str)
-        .and_then(safe_url)
+        .and_then(|value| oidc_endpoint(&issuer, value))
     else {
         return not_run(TargetKind::Oidc);
     };
     let Some(revocation_endpoint) = configuration
         .get("revocation_endpoint")
         .and_then(serde_json::Value::as_str)
-        .and_then(safe_url)
+        .and_then(|value| oidc_endpoint(&issuer, value))
     else {
         return not_run(TargetKind::Oidc);
     };
