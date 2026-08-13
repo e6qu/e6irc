@@ -2298,11 +2298,13 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   });
 
   for (const form of document.querySelectorAll("[data-api-owner-network-create]")) {
-    form.addEventListener("click", (event) => {
-      if (event.target instanceof Element && event.target.closest("[data-api-network-preflight]")) {
+    const preflightButton = form.querySelector("[data-api-network-preflight]");
+    if (preflightButton instanceof HTMLButtonElement) {
+      preflightButton.addEventListener("click", () => {
         requestedNetworkPreflight.add(form);
-      }
-    });
+        form.requestSubmit();
+      });
+    }
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       const fields = new FormData(form);
