@@ -140,6 +140,14 @@ function matchesType(value, type) {
   return false;
 }
 
+function jsonIdentity(value) {
+  if (Array.isArray(value)) return `[${value.map(jsonIdentity).join(",")}]`;
+  if (objectValue(value)) {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${jsonIdentity(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 export function parseApiSchema(schema, value, label = "API response", path = "$") {
   const types = validateApiSchema(schema, label);
   if ("const" in schema && !Object.is(schema.const, value)) schemaError(label, path);
@@ -173,7 +181,7 @@ export function parseApiSchema(schema, value, label = "API response", path = "$"
   if (Array.isArray(value)) {
     if (Number.isInteger(schema.minItems) && value.length < schema.minItems) schemaError(label, path);
     if (Number.isInteger(schema.maxItems) && value.length > schema.maxItems) schemaError(label, path);
-    if (schema.uniqueItems === true && new Set(value.map((item) => JSON.stringify(item))).size !== value.length) {
+    if (schema.uniqueItems === true && new Set(value.map(jsonIdentity)).size !== value.length) {
       schemaError(label, path);
     }
     if (!objectValue(schema.items)) schemaError(label, path);

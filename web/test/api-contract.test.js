@@ -140,6 +140,26 @@ test("schema parser enforces response status, constants, and array bounds", asyn
   );
 });
 
+test("schema parser compares unique JSON objects structurally", () => {
+  const schema = {
+    type: "array",
+    uniqueItems: true,
+    items: {
+      type: "object",
+      additionalProperties: false,
+      required: ["name", "enabled"],
+      properties: { name: { type: "string" }, enabled: { type: "boolean" } },
+    },
+  };
+  assert.throws(
+    () => parseApiSchema(schema, [
+      { name: "Libera", enabled: true },
+      { enabled: true, name: "Libera" },
+    ]),
+    ApiSchemaError,
+  );
+});
+
 test("operation parser selects the exact documented path before parsing", () => {
   const document = {
     paths: {
