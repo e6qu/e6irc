@@ -1018,8 +1018,15 @@ try {
   await page.locator('input[name="nick"]').fill("webjourney");
   await page.locator('input[name="autojoin"]').fill("#journey");
   await page.locator('input[name="tls"]').uncheck();
+  const preflightResponse = page.waitForResponse(
+    (response) => response.url() === `${applicationOrigin}/api/v1/me/networks/preflight`
+      && response.request().method() === "POST",
+    { timeout: 45_000 },
+  );
   await page.getByRole("button", { name: "Test connection", exact: true }).click();
-  await page.getByRole("status").filter({ hasText: /Registered as webjourney/ }).waitFor();
+  const preflight = await preflightResponse;
+  assert.equal(preflight.status(), 200, await preflight.text());
+  await page.getByRole("status").filter({ hasText: /Registered as webjourney/ }).waitFor({ timeout: 45_000 });
   assert.match(await page.getByRole("status").innerText(), /DNS \d+ms, connection \d+ms, registration \d+ms/);
   assert.match(await page.getByRole("status").innerText(), /No network was created/);
   assert.equal(page.url(), `${applicationOrigin}/console/networks`);
