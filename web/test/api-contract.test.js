@@ -84,6 +84,7 @@ test("schema parser rejects malformed constraints instead of weakening a project
     ApiSchemaError,
   );
   for (const schema of [
+    {},
     { type: "array", items: { type: "record" } },
     { type: "array" },
     { type: "object", additionalProperties: false, properties: { nested: { type: "record" } } },

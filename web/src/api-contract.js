@@ -71,6 +71,9 @@ function closedObjectSchema(schema, label) {
 function validateApiSchema(schema, label) {
   if (!objectValue(schema)) throw new ApiSchemaError(`The ${label} schema is invalid.`);
   const types = schemaTypes(schema, label);
+  if (types.length === 0 && !("oneOf" in schema) && !("const" in schema) && !("enum" in schema)) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
   if ("enum" in schema && (!Array.isArray(schema.enum) || schema.enum.length === 0)) {
     throw new ApiSchemaError(`The ${label} schema is invalid.`);
   }
