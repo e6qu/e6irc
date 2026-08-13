@@ -186,13 +186,14 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   const apiRequest = async (form, operation, body) => {
     const csrf = form.querySelector('input[name="csrf"]')?.value;
     if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
-    return getOperationJson(fetch, await consoleApiContract(), operation.method, operation.url, {
+    const contract = await consoleApiContract();
+    return getOperationJson(fetch, contract, operation.method, operation.url, {
       credentials: "same-origin",
       headers: {
         "Content-Type": "application/json",
         "X-E6IRC-CSRF": csrf,
       },
-      body: body === undefined ? undefined : JSON.stringify(body),
+      json: body,
     });
   };
 
@@ -548,6 +549,116 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     }
   }
 
+  const renderNetworkLog = (panel, lines) => {
+    const log = element("div", "backlog");
+    log.setAttribute("role", "log");
+    log.setAttribute("aria-label", "Component log");
+    if (lines.length === 0) {
+      log.append(element("p", "empty", "No component lines have been stored yet."));
+    } else {
+      for (const line of lines) log.append(element("code", "", line));
+    }
+    panel.replaceChildren(log);
+  };
+
+  const refreshNetworkLogNow = async (root) => {
+    const panel = root.querySelector("#network-log-panel");
+    const status = document.getElementById(root.dataset.refreshStatus);
+    if (!(panel instanceof HTMLElement)) return;
+    panel.setAttribute("aria-busy", "true");
+    if (status) {
+      status.textContent = "Refreshing…";
+      status.classList.remove("refresh-error");
+    }
+    try {
+      const name = root.dataset.networkName;
+      if (!name) throw new Error("This component has no resource ID. Return to networks and try again.");
+      const network = await apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`);
+      const title = root.querySelector("[data-network-log-title]");
+      if (title) title.textContent = `${network.name} log`;
+      const detail = root.querySelector("[data-network-log-detail]");
+      if (detail instanceof HTMLAnchorElement) detail.href = `/console/networks/${encodeURIComponent(network.name)}`;
+      const result = await apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}/buffer?limit=1000`);
+      renderNetworkLog(panel, apiCollection(result, "lines", "component log"));
+      if (status) status.textContent = "Live log refreshed.";
+    } catch (error) {
+      panel.replaceChildren(monitoringEmpty(`Component log failed (${error.message}). Use Refresh to retry.`));
+      if (status) {
+        status.textContent = `Live log refresh failed (${error.message}). Use Refresh to retry.`;
+        status.classList.add("refresh-error");
+      }
+    } finally {
+      panel.removeAttribute("aria-busy");
+    }
+  };
+
+  for (const root of document.querySelectorAll("[data-api-network-log]")) {
+    const refresh = serializeRefresh(
+      () => refreshNetworkLogNow(root),
+      () => {
+        const status = document.getElementById(root.dataset.refreshStatus);
+        if (status) status.textContent = "Refresh queued.";
+      },
+    );
+    panelRefreshers.set(root, refresh);
+    void refresh();
+    const seconds = Number(root.dataset.refreshSeconds);
+    if (Number.isFinite(seconds) && seconds >= 5) window.setInterval(() => void refresh(), seconds * 1000);
+  }
+
+  const renderServerLog = (panel, entries) => {
+    const log = element("div", "backlog");
+    log.setAttribute("role", "log");
+    log.setAttribute("aria-label", "Live server logs");
+    if (entries.length === 0) {
+      log.append(element("p", "empty", "No operational events have been recorded yet."));
+    } else {
+      for (const entry of entries) {
+        const at = new Date(entry.at_ms).toISOString();
+        log.append(element("code", "", `${at} — ${entry.component} — ${entry.severity}: ${entry.message}`));
+      }
+    }
+    panel.replaceChildren(log);
+  };
+
+  const refreshServerLogNow = async (root) => {
+    const panel = root.querySelector("#server-log-panel");
+    const status = document.getElementById(root.dataset.refreshStatus);
+    if (!(panel instanceof HTMLElement)) return;
+    panel.setAttribute("aria-busy", "true");
+    if (status) {
+      status.textContent = "Refreshing…";
+      status.classList.remove("refresh-error");
+    }
+    try {
+      const result = await apiRead("/api/v1/admin/logs");
+      renderServerLog(panel, apiCollection(result, "entries", "live logs"));
+      if (status) status.textContent = "Live logs refreshed.";
+    } catch (error) {
+      panel.replaceChildren(monitoringEmpty(`Live logs failed (${error.message}). Use Refresh to retry.`));
+      if (status) {
+        status.textContent = `Live log refresh failed (${error.message}). Use Refresh to retry.`;
+        status.classList.add("refresh-error");
+      }
+    } finally {
+      panel.removeAttribute("aria-busy");
+    }
+  };
+
+  for (const root of document.querySelectorAll("[data-api-server-log]")) {
+    const refresh = serializeRefresh(
+      () => refreshServerLogNow(root),
+      () => {
+        const status = document.getElementById(root.dataset.refreshStatus);
+        if (status) status.textContent = "Refresh queued.";
+      },
+    );
+    panelRefreshers.set(root, refresh);
+    void refresh();
+    const seconds = Number(root.dataset.refreshSeconds);
+    if (Number.isFinite(seconds) && seconds >= 5) window.setInterval(() => void refresh(), seconds * 1000);
+  }
+
   const overviewSection = (target, title, href, headings, rows) => {
     target.replaceChildren();
     const head = element("div", "panel-head list-head");
@@ -715,19 +826,23 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     if (!Number.isSafeInteger(revision) || revision < 0) {
       throw new Error("The configuration revision is invalid. Reload and try again.");
     }
+    const optional = (name) => {
+      const value = String(fields.get(name) || "").trim();
+      return value ? { [name]: value } : {};
+    };
     return {
       revision,
       name: String(fields.get("name") || "").trim(),
-      owner: optionalValue(String(fields.get("owner") || "")),
       kind: String(fields.get("kind") || ""),
       addr: String(fields.get("addr") || "").trim(),
       tls: fields.has("tls"),
       nick: String(fields.get("nick") || "").trim(),
-      realname: optionalValue(String(fields.get("realname") || "")),
       autojoin: splitValues(String(fields.get("autojoin") || ""), ","),
       buffer_cap: number,
-      sasl_account: optionalValue(String(fields.get("sasl_account") || "")),
-      sasl_password: optionalValue(String(fields.get("sasl_password") || "")),
+      ...optional("owner"),
+      ...optional("realname"),
+      ...optional("sasl_account"),
+      ...optional("sasl_password"),
     };
   };
 
@@ -1192,7 +1307,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       setBanResult("The server-ban ID is invalid. Reload and try again.", false);
       return;
     }
-    void mutateBan(form, `/api/v1/admin/bans/${id}`, "DELETE", {});
+    void mutateBan(form, `/api/v1/admin/bans/${id}`, "DELETE");
   });
 
   const sessionResult = document.getElementById("session-api-result");
@@ -1492,9 +1607,11 @@ import { loadSettings, saveSettings } from "/console-settings.js";
           setAccountResult("The new password and confirmation do not match.", false);
           return;
         }
-        void mutateAccount(form, "PUT", { current_password: current || null, new_password: next }, "Password update failed.")
+        const body = { new_password: next };
+        if (current) body.current_password = current;
+        void mutateAccount(form, "PUT", body, "Password update failed.")
           .then((result) => {
-            if (result === false) return;
+            if (result === undefined) return;
             setAccountResult(current ? "Local password changed." : "Local password added.", true);
             void apiRead("/api/v1/me/credentials").then((updated) => {
               const credentials = apiCollection(updated, "credentials", "credential directory");
@@ -2180,6 +2297,22 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   });
 
   for (const form of document.querySelectorAll("[data-api-owner-network-create]")) {
+    const preflightButton = form.querySelector("[data-api-network-preflight]");
+    if (preflightButton) {
+      preflightButton.addEventListener("click", () => {
+        const fields = new FormData(form);
+        const name = fieldValue(fields, "name");
+        const connection = ownerNetworkConnection(fields);
+        if (!name || !connection.addr || !connection.nick) {
+          setOwnerNetworkResult("Enter a network ID, server, and nickname.", false);
+          return;
+        }
+        const { addr, tls, nick, realname, sasl_account, sasl_password } = connection;
+        void mutateOwnerNetwork(form, "/api/v1/me/networks/preflight", "POST", {
+          addr, tls, nick, realname, sasl_account, sasl_password,
+        }, ownerNetworkPreflight);
+      });
+    }
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       const fields = new FormData(form);
@@ -2187,15 +2320,6 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       const connection = ownerNetworkConnection(fields);
       if (!name || !connection.addr || !connection.nick) {
         setOwnerNetworkResult("Enter a network ID, server, and nickname.", false);
-        return;
-      }
-      const preflight = event.submitter instanceof HTMLElement
-        && event.submitter.matches("[data-api-network-preflight]");
-      if (preflight) {
-        const { addr, tls, nick, realname, sasl_account, sasl_password } = connection;
-        void mutateOwnerNetwork(form, "/api/v1/me/networks/preflight", "POST", {
-          addr, tls, nick, realname, sasl_account, sasl_password,
-        }, ownerNetworkPreflight);
         return;
       }
       void mutateOwnerNetwork(form, form.action, "POST", { kind: "irc", name, ...connection });
@@ -2405,6 +2529,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       const toggleForm = ownerNetworkDetail.querySelector("[data-api-owner-network-toggle]"); if (toggleForm instanceof HTMLFormElement) toggleForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
       const deleteForm = ownerNetworkDetail.querySelector("[data-api-owner-network-delete]"); if (deleteForm instanceof HTMLFormElement) { deleteForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; deleteForm.dataset.confirm = `Remove network ${network.name}? Its live connection and stored backlog will be deleted.`; }
       const edit = ownerNetworkDetail.querySelector("[data-network-edit]"); if (edit instanceof HTMLAnchorElement) { if (network.kind === "irc") { edit.href = `/console/networks/${encodeURIComponent(network.name)}/edit`; edit.hidden = false; } else if (ownerNetworkDetail.dataset.isAdmin === "true") { edit.href = `/console/integrations/${encodeURIComponent(network.name)}/edit`; edit.textContent = "Edit integration"; edit.hidden = false; } }
+      const logs = ownerNetworkDetail.querySelector("[data-network-logs]"); if (logs instanceof HTMLAnchorElement) logs.href = `/console/networks/${encodeURIComponent(network.name)}/logs`;
     };
     refreshOwnerNetworkDetail = async () => {
       try {

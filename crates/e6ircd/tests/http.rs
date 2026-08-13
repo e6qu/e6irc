@@ -1524,6 +1524,23 @@ async fn console_networks_page_lists_the_callers_networks() {
     assert!(editor.contains("data-api-owner-network-editor"), "{editor}");
     assert!(editor.contains("Loading network…"), "{editor}");
     assert!(!editor.contains("irc.libera.chat:6697"), "{editor}");
+    let log_req = format!(
+        "GET /console/networks/libera/logs HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, log) = request(http, &log_req).await;
+    assert_eq!(status, 200, "{log}");
+    for needle in [
+        "data-api-network-log",
+        "data-network-name=\"libera\"",
+        "Component log",
+        "Loading component log…",
+    ] {
+        assert!(
+            log.contains(needle),
+            "network log missing {needle:?}: {log}"
+        );
+    }
+    assert!(!log.contains("irc.libera.chat:6697"), "{log}");
     let operations_req = format!(
         "GET /api/v1/me/networks/libera/operations HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
@@ -1639,6 +1656,36 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
         !monitoring_page.contains("/console/monitoring/panel"),
         "{monitoring_page}"
     );
+
+    let logs = format!(
+        "GET /console/logs HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, logs_page) = request(http, &logs).await;
+    assert_eq!(status, 200, "{logs_page}");
+    for needle in [
+        "data-api-server-log",
+        "data-refresh-seconds=\"5\"",
+        "Loading live logs…",
+        "Live logs",
+    ] {
+        assert!(
+            logs_page.contains(needle),
+            "live logs console missing {needle:?}: {logs_page}"
+        );
+    }
+
+    let logs_api = format!(
+        "GET /api/v1/admin/logs HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, logs_headers, body) = request(http, &logs_api).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        logs_headers
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store")
+    );
+    let logs: serde_json::Value = serde_json::from_str(&body).expect("logs JSON");
+    assert!(logs["entries"].is_array(), "{logs}");
 
     let invalid_monitoring = format!(
         "GET /console/monitoring?minutes=17 HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"

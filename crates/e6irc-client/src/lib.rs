@@ -899,17 +899,56 @@ pub fn is_join_refusal(command: &str) -> bool {
 /// are the replies a server sends when it will not complete registration for
 /// the requested nick/credentials; a client that keeps waiting for `001` after
 /// one of them hangs forever.
-fn registration_refused(command: &str) -> Option<io::Error> {
-    match command {
-        "433" => Some(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "nickname in use",
-        )),
-        "432" | "451" | "464" | "465" => Some(io::Error::other(format!(
-            "registration refused ({command})"
-        ))),
-        _ => None,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationRefusal {
+    InvalidNickname,
+    NicknameInUse,
+    ServerPasswordRejected,
+    NetworkBanned,
+    NotRegistered,
+}
+
+#[derive(Debug)]
+struct RegistrationRefusalError(RegistrationRefusal);
+
+impl std::fmt::Display for RegistrationRefusalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IRC registration refusal: {:?}", self.0)
     }
+}
+
+impl std::error::Error for RegistrationRefusalError {}
+
+impl RegistrationRefusal {
+    pub fn from_error(error: &io::Error) -> Option<Self> {
+        error
+            .get_ref()?
+            .downcast_ref::<RegistrationRefusalError>()
+            .map(|error| error.0)
+    }
+
+    fn error(self) -> io::Error {
+        let kind = match self {
+            Self::NicknameInUse => io::ErrorKind::AlreadyExists,
+            Self::InvalidNickname => io::ErrorKind::InvalidInput,
+            Self::ServerPasswordRejected => io::ErrorKind::PermissionDenied,
+            Self::NetworkBanned => io::ErrorKind::ConnectionAborted,
+            Self::NotRegistered => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, RegistrationRefusalError(self))
+    }
+}
+
+fn registration_refused(command: &str) -> Option<io::Error> {
+    let refusal = match command {
+        "432" => RegistrationRefusal::InvalidNickname,
+        "433" => RegistrationRefusal::NicknameInUse,
+        "464" => RegistrationRefusal::ServerPasswordRejected,
+        "465" => RegistrationRefusal::NetworkBanned,
+        "451" => RegistrationRefusal::NotRegistered,
+        _ => return None,
+    };
+    Some(refusal.error())
 }
 
 /// Install aws-lc-rs as the process rustls provider, once.
@@ -932,6 +971,20 @@ pub fn webpki_root_store() -> rustls::RootCertStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_refusals_keep_the_server_cause() {
+        for (numeric, expected) in [
+            ("432", RegistrationRefusal::InvalidNickname),
+            ("433", RegistrationRefusal::NicknameInUse),
+            ("464", RegistrationRefusal::ServerPasswordRejected),
+            ("465", RegistrationRefusal::NetworkBanned),
+            ("451", RegistrationRefusal::NotRegistered),
+        ] {
+            let error = registration_refused(numeric).expect("known refusal numeric");
+            assert_eq!(RegistrationRefusal::from_error(&error), Some(expected));
+        }
+    }
 
     #[test]
     fn terminal_safe_neutralizes_control_bytes() {

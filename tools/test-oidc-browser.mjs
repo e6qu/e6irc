@@ -22,10 +22,10 @@ const browserType = playwright[browserName];
 const requireNativeNotificationPermission = browserName === "chromium";
 
 async function clickAndWaitForURL(page, locator, expectedURL) {
-  const navigation = page.waitForEvent("framenavigated", (frame) =>
-    frame === page.mainFrame() && frame.url() === expectedURL
-  );
-  await Promise.all([navigation, locator.click()]);
+  await locator.click({ noWaitAfter: true });
+  for (let attempt = 0; attempt < 300 && page.url() !== expectedURL; attempt += 1) {
+    await page.waitForTimeout(100);
+  }
   assert.equal(page.url(), expectedURL);
 }
 
@@ -130,7 +130,9 @@ const watchdog = setTimeout(() => {
   process.exit(1);
 }, 180_000);
 
-const artifactDirectory = process.env.E6IRC_BROWSER_ARTIFACTS_DIR;
+const artifactDirectory = process.env.E6IRC_BROWSER_ARTIFACTS_DIR
+  ? resolve(repositoryRoot, process.env.E6IRC_BROWSER_ARTIFACTS_DIR)
+  : undefined;
 const applicationErrors = [];
 const applicationRequests = [];
 const navigationTrace = [];
@@ -418,7 +420,14 @@ try {
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
   await page.getByLabel("New password", { exact: true }).fill("browser-local-password");
   await page.getByLabel("Confirm new password", { exact: true }).fill("browser-local-password");
-  await page.getByRole("button", { name: "Add password", exact: true }).click();
+  const [passwordResponse] = await Promise.all([
+    page.waitForResponse(
+      (response) => response.url() === `${applicationOrigin}/api/v1/me/password`
+        && response.request().method() === "PUT",
+    ),
+    page.getByRole("button", { name: "Add password", exact: true }).click(),
+  ]);
+  assert.equal(passwordResponse.status(), 204);
   await expectStatus(page, /Local password added/);
   assert.equal((await context.request.post(`${applicationOrigin}/api/v1/auth/logout`)).status(), 204);
   await page.goto(`${applicationOrigin}/login`);
@@ -1011,8 +1020,15 @@ try {
   await page.locator('input[name="nick"]').fill("webjourney");
   await page.locator('input[name="autojoin"]').fill("#journey");
   await page.locator('input[name="tls"]').uncheck();
+  const preflightResponse = page.waitForResponse(
+    (response) => response.url() === `${applicationOrigin}/api/v1/me/networks/preflight`
+      && response.request().method() === "POST",
+    { timeout: 45_000 },
+  );
   await page.getByRole("button", { name: "Test connection", exact: true }).click();
-  await page.getByRole("status").filter({ hasText: /Registered as webjourney/ }).waitFor();
+  const preflight = await preflightResponse;
+  assert.equal(preflight.status(), 200, await preflight.text());
+  await page.getByRole("status").filter({ hasText: /Registered as webjourney/ }).waitFor({ timeout: 45_000 });
   assert.match(await page.getByRole("status").innerText(), /DNS \d+ms, connection \d+ms, registration \d+ms/);
   assert.match(await page.getByRole("status").innerText(), /No network was created/);
   assert.equal(page.url(), `${applicationOrigin}/console/networks`);
@@ -1031,6 +1047,28 @@ try {
   await upstream.waitForJoin("#journey");
   await upstream.sendPeerMessage("#journey", "browser replays through the real stack");
   await waitForBufferedLine(context.request, "journey", "browser replays through the real stack");
+
+  const componentLogBuffer = page.waitForResponse(
+    (response) => response.url() === `${applicationOrigin}/api/v1/me/networks/journey/buffer?limit=1000`
+      && response.request().method() === "GET",
+  );
+  const componentLogPage = await page.goto(`${applicationOrigin}/console/networks/journey/logs`);
+  assert.equal(componentLogPage.status(), 200);
+  assert.equal((await componentLogBuffer).status(), 200);
+  await page.getByRole("log", { name: "Component log", exact: true })
+    .getByText("browser replays through the real stack", { exact: false })
+    .waitFor();
+  await page.getByRole("heading", { name: "journey log", exact: true }).waitFor();
+
+  const serverLogRead = page.waitForResponse(
+    (response) => response.url() === `${applicationOrigin}/api/v1/admin/logs`
+      && response.request().method() === "GET",
+  );
+  const serverLogPage = await page.goto(`${applicationOrigin}/console/logs`);
+  assert.equal(serverLogPage.status(), 200);
+  assert.equal((await serverLogRead).status(), 200);
+  await page.getByRole("heading", { name: "Live logs", exact: true }).waitFor();
+  await page.getByText("This feed never includes request data, IRC traffic, or secrets.", { exact: false }).waitFor();
 
   const initialBuffer = page.waitForResponse(
     (response) => response.url() === `${applicationOrigin}/api/v1/me/networks/journey/buffer?limit=1000`,

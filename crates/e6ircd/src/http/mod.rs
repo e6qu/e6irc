@@ -1070,6 +1070,7 @@ documented_routes! {
     "/api/v1/admin/configuration/networks/{name}" => { delete: admin_delete_network },
     "/api/v1/admin/observability" => { get: admin_observability },
     "/api/v1/admin/monitoring" => { get: pages::admin_monitoring },
+    "/api/v1/admin/logs" => { get: pages::admin_logs },
     "/api/v1/admin/metrics" => { get: admin_metrics },
 }
 
@@ -1106,11 +1107,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/console/account", get(pages::console_account))
         .route("/console/channels", get(pages::console_channels))
         .route("/console/monitoring", get(pages::console_monitoring))
+        .route("/console/logs", get(pages::console_logs))
         .route("/console/configuration", get(pages::console_configuration))
         .route("/console/networks", get(pages::console_networks))
         .route(
             "/console/networks/{name}/edit",
             get(pages::console_edit_network),
+        )
+        .route(
+            "/console/networks/{name}/logs",
+            get(pages::console_network_logs),
         )
         .route(
             "/console/networks/{name}",
@@ -2429,6 +2435,12 @@ mod pages {
         window_links: Vec<MonitoringWindowLink>,
     }
 
+    #[derive(Template)]
+    #[template(path = "console_logs.html")]
+    struct ConsoleLogs {
+        shell: ConsoleShell,
+    }
+
     fn format_bytes(bytes: u64) -> String {
         const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
         let mut value = bytes as f64;
@@ -2854,6 +2866,23 @@ mod pages {
         super::json_no_store(monitoring_view(&state, window).await)
     }
 
+    /// A bounded, redacted event feed for the server components. It is live
+    /// process state, not a substitute for the durable privileged audit log.
+    pub async fn admin_logs(State(state): State<Arc<AppState>>, _admin: AdminAccount) -> Response {
+        super::json_no_store(serde_json::json!({
+            "entries": state.telemetry.operational_log(1_000),
+        }))
+    }
+
+    pub async fn console_logs(
+        State(state): State<Arc<AppState>>,
+        AdminPageActor { account, csrf }: AdminPageActor,
+    ) -> Response {
+        render_private(ConsoleLogs {
+            shell: console_shell(&state, account, csrf, "logs"),
+        })
+    }
+
     pub async fn console_accounts(
         State(state): State<Arc<AppState>>,
         AdminPageActor { account, csrf }: AdminPageActor,
@@ -3046,6 +3075,13 @@ mod pages {
         name: String,
     }
 
+    #[derive(Template)]
+    #[template(path = "console_network_logs.html")]
+    struct ConsoleNetworkLogs {
+        shell: ConsoleShell,
+        name: String,
+    }
+
     /// Admin console: server-wide read views (accounts, registered channels,
     /// server bans, audit log) rendered server-side. Cookie-authenticated and
     /// admin-gated the same way the `/api/v1/admin/*` JSON endpoints are — an
@@ -3219,6 +3255,23 @@ mod pages {
             Err(response) => return response,
         };
         render_private(ConsoleNetworkDetail {
+            shell: console_shell(&state, account, csrf, "networks"),
+            name,
+        })
+    }
+
+    /// Console → network component log. The browser reads the owner-scoped
+    /// buffer API; every BNC driver uses the same persisted stream.
+    pub async fn console_network_logs(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Path(name): Path<String>,
+    ) -> Response {
+        let (account, csrf) = match page_actor(&state, &headers, false).await {
+            Ok(result) => result,
+            Err(response) => return response,
+        };
+        render_private(ConsoleNetworkLogs {
             shell: console_shell(&state, account, csrf, "networks"),
             name,
         })

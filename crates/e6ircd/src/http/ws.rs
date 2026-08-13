@@ -346,9 +346,10 @@ pub(super) async fn ws_ui_conn(
                 }
             }
             ev = events.recv() => match ev {
-                Ok(DriverEvent::Line(line)) => {
+                Ok(event @ (DriverEvent::Line(_) | DriverEvent::Notice(_))) => {
+                    let line = event.display_line().expect("display event carries a line");
                     if socket
-                        .send(WsMessage::text(line_event(&line)))
+                        .send(WsMessage::text(line_event(line)))
                         .await
                         .is_err()
                     {

@@ -112,6 +112,13 @@ pub async fn verify_round_trip(
             .expect("connected event"),
         super::DriverEvent::Connected
     );
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), driver_events.recv())
+            .await
+            .expect("component-log timeout")
+            .expect("component-log event"),
+        super::DriverEvent::Line(line) if line == ":*bnc* NOTICE * :component connected: unregistered network"
+    ));
 
     if matches!(provider, Provider::Slack) {
         let ack = recv_oracle(oracle, "ACK").await;

@@ -433,11 +433,7 @@ pub(crate) enum SessionOutcome {
     /// in a row, so a mistyped or revoked upstream password can't hammer the
     /// upstream forever every ~30s.
     AuthRejected,
-    /// The upstream rejected IRC registration itself (for example, an invalid
-    /// or occupied nickname or a network ban). Retrying unchanged settings has
-    /// the same hammering problem as bad credentials, but it must not be
-    /// mislabeled as an authentication failure in owner diagnostics.
-    RegistrationRejected,
+    RegistrationRejected(e6irc_client::RegistrationRefusal),
 }
 
 /// Consecutive upstream credential or registration rejections before a driver
@@ -568,15 +564,15 @@ pub(crate) async fn run_with_backoff<C>(
         let started = tokio::time::Instant::now();
         match session(&config, ends).await {
             SessionOutcome::Stopped => return,
-            outcome @ (SessionOutcome::AuthRejected | SessionOutcome::RegistrationRejected) => {
+            outcome @ (SessionOutcome::AuthRejected | SessionOutcome::RegistrationRejected(_)) => {
                 let (failure, event) = match outcome {
                     SessionOutcome::AuthRejected => (
                         NetworkFailure::AuthenticationRejected,
                         ConnectionEvent::AuthenticationFailed,
                     ),
-                    SessionOutcome::RegistrationRejected => (
-                        NetworkFailure::RegistrationRejected,
-                        ConnectionEvent::RegistrationFailed,
+                    SessionOutcome::RegistrationRejected(refusal) => (
+                        registration_failure(refusal),
+                        ConnectionEvent::RegistrationFailed(refusal),
                     ),
                     _ => unreachable!("matched only terminal rejections"),
                 };
@@ -1095,6 +1091,10 @@ pub enum DriverEvent {
     Connected,
     /// One line received from upstream (CRLF stripped).
     Line(String),
+    /// A safe component notice for attached clients. It intentionally does not
+    /// enter the persistence stream: a failed backlog writer cannot retry its
+    /// own failure notice forever.
+    Notice(String),
     /// A synthesized copy of a line an attached client sent. IRC servers do
     /// not echo a sender's own messages unless echo-message was negotiated —
     /// and the driver never negotiates it — so without this the detached
@@ -1105,6 +1105,15 @@ pub enum DriverEvent {
     Echo { line: String, origin: u64 },
     /// The upstream connection dropped; the driver will retry.
     Disconnected,
+}
+
+impl DriverEvent {
+    pub(crate) fn display_line(&self) -> Option<&str> {
+        match self {
+            Self::Line(line) | Self::Notice(line) => Some(line),
+            Self::Connected | Self::Echo { .. } | Self::Disconnected => None,
+        }
+    }
 }
 
 /// A downstream line queued for the upstream, tagged with the attachment
@@ -1134,7 +1143,7 @@ pub enum ConnectionEvent {
     /// Repeated credential rejection parked the driver until it is reconfigured.
     AuthenticationFailed,
     /// Repeated IRC registration rejection parked the driver until reconfigured.
-    RegistrationFailed,
+    RegistrationFailed(e6irc_client::RegistrationRefusal),
 }
 
 /// A handle to a running, always-on network driver. Events are
@@ -1209,6 +1218,10 @@ pub enum NetworkFailure {
     RegistrationTimedOut,
     RegistrationFailed,
     RegistrationRejected,
+    InvalidNickname,
+    NicknameInUse,
+    ServerPasswordRejected,
+    NetworkBanned,
     AuthenticationRejected,
     AutojoinFailed,
     ConnectionLost,
@@ -1232,6 +1245,10 @@ impl NetworkFailure {
             Self::RegistrationTimedOut => "registration_timed_out",
             Self::RegistrationFailed => "registration_failed",
             Self::RegistrationRejected => "registration_rejected",
+            Self::InvalidNickname => "invalid_nickname",
+            Self::NicknameInUse => "nickname_in_use",
+            Self::ServerPasswordRejected => "server_password_rejected",
+            Self::NetworkBanned => "network_banned",
             Self::AuthenticationRejected => "authentication_rejected",
             Self::AutojoinFailed => "autojoin_failed",
             Self::ConnectionLost => "connection_lost",
@@ -1259,6 +1276,10 @@ impl NetworkFailure {
             Self::RegistrationRejected => {
                 "The upstream rejected IRC registration; check the nickname and network policy."
             }
+            Self::InvalidNickname => "The upstream rejected the configured nickname.",
+            Self::NicknameInUse => "The configured nickname is already in use.",
+            Self::ServerPasswordRejected => "The upstream rejected the configured server password.",
+            Self::NetworkBanned => "The upstream network banned this connection.",
             Self::AuthenticationRejected => "The upstream rejected the configured credentials.",
             Self::AutojoinFailed => "A configured JOIN could not be sent during startup.",
             Self::ConnectionLost => "The established upstream connection was lost.",
@@ -1279,6 +1300,32 @@ impl NetworkFailure {
             Self::DriverStopped => "The network driver is no longer accepting commands.",
         }
     }
+}
+
+fn failure_notice(failure: NetworkFailure) -> String {
+    format!(
+        ":*bnc* NOTICE * :component error: {} ({})",
+        failure.summary(),
+        failure.code()
+    )
+}
+
+fn emit_failure_notice(
+    buffer: &std::sync::Mutex<Buffer>,
+    events: &tokio::sync::broadcast::Sender<DriverEvent>,
+    failure: NetworkFailure,
+) {
+    let line = crate::sanitize::upstream_line(failure_notice(failure));
+    buffer.lock().expect("buffer poisoned").push(line.clone());
+    let event = if matches!(
+        failure,
+        NetworkFailure::BacklogStorageFailed | NetworkFailure::BacklogStorageLagged
+    ) {
+        DriverEvent::Notice(line)
+    } else {
+        DriverEvent::Line(line)
+    };
+    drop(events.send(event));
 }
 
 /// One classified failure with when it happened — the unit of the bounded
@@ -1678,6 +1725,10 @@ pub enum SendOutcome {
 }
 
 impl NetworkHandle {
+    fn emit_notice(&self, failure: NetworkFailure) {
+        emit_failure_notice(&self.buffer, &self.events, failure);
+    }
+
     /// Try to hand a raw line to the upstream network **without blocking**.
     ///
     /// The command queue is bounded and *shared by every client attached to the
@@ -1966,6 +2017,7 @@ impl NetworkHandle {
 
     pub(crate) fn record_error(&self, failure: NetworkFailure) {
         record_network_error(&self.runtime, &self.telemetry, failure);
+        self.emit_notice(failure);
     }
 }
 
@@ -1997,6 +2049,7 @@ impl DriverEnds {
     #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
     pub(crate) fn record_error(&self, failure: NetworkFailure) {
         record_network_error(&self.runtime, &self.telemetry, failure);
+        self.emit_failure_notice(failure);
     }
 
     /// Record a line to the detached buffer and broadcast it live. The line
@@ -2004,15 +2057,25 @@ impl DriverEnds {
     /// builds it from free-form remote text cannot inject a second IRC line
     /// into an attached client's stream.
     pub fn emit_line(&self, line: String) {
+        self.emit_buffered_line(line, true);
+    }
+
+    fn emit_notice(&self, line: String) {
+        self.emit_buffered_line(line, false);
+    }
+
+    fn emit_buffered_line(&self, line: String, count_as_input: bool) {
         let line = crate::sanitize::upstream_line(line);
-        self.runtime.record_input(line.len());
-        if let Some(telemetry) = self
-            .telemetry
-            .lock()
-            .expect("telemetry hook poisoned")
-            .as_ref()
-        {
-            telemetry.record_bnc_input(line.len());
+        if count_as_input {
+            self.runtime.record_input(line.len());
+            if let Some(telemetry) = self
+                .telemetry
+                .lock()
+                .expect("telemetry hook poisoned")
+                .as_ref()
+            {
+                telemetry.record_bnc_input(line.len());
+            }
         }
         self.buffer
             .lock()
@@ -2021,6 +2084,11 @@ impl DriverEnds {
         // A detached network legitimately has no live subscribers; the line is
         // still retained in the buffer above.
         drop(self.events.send(DriverEvent::Line(line)));
+    }
+
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    fn emit_failure_notice(&self, failure: NetworkFailure) {
+        emit_failure_notice(&self.buffer, &self.events, failure);
     }
 
     /// Record a synthesized self-echo: a copy of a line an attached client
@@ -2043,14 +2111,17 @@ impl DriverEnds {
     /// ([`DriverEnds::emit_line`]) because they need sanitizing and buffering;
     /// see [`ConnectionEvent`].
     pub fn emit(&self, event: ConnectionEvent) {
-        let broadcast = match event {
+        let (broadcast, notice) = match event {
             ConnectionEvent::Connected => {
                 self.runtime.connected();
-                // One line per transition, labeled: an upstream flap on an
-                // IRC network must be as visible in the log as a bridge's
-                // (bridges already log their own connect failures).
                 eprintln!("bnc: {} connected", self.runtime.label());
-                DriverEvent::Connected
+                (
+                    DriverEvent::Connected,
+                    format!(
+                        ":*bnc* NOTICE * :component connected: {}",
+                        self.runtime.label()
+                    ),
+                )
             }
             failure_event => {
                 let (terminal, failure) = match failure_event {
@@ -2059,9 +2130,9 @@ impl DriverEnds {
                         Some(NetworkLifecycle::AuthenticationFailed),
                         NetworkFailure::AuthenticationRejected,
                     ),
-                    ConnectionEvent::RegistrationFailed => (
+                    ConnectionEvent::RegistrationFailed(refusal) => (
                         Some(NetworkLifecycle::RegistrationFailed),
-                        NetworkFailure::RegistrationRejected,
+                        registration_failure(refusal),
                     ),
                     ConnectionEvent::Connected => {
                         unreachable!("connected handled before failure transition")
@@ -2089,12 +2160,21 @@ impl DriverEnds {
                         failure.code(),
                     ),
                 }
-                DriverEvent::Disconnected
+                let state = terminal.map_or("reconnecting", NetworkLifecycle::as_str);
+                (
+                    DriverEvent::Disconnected,
+                    format!(
+                        ":*bnc* NOTICE * :component {state}: {} ({})",
+                        failure.summary(),
+                        failure.code(),
+                    ),
+                )
             }
         };
         // Connection state is sticky in `connected`; zero live subscribers is
         // therefore not a delivery failure.
         drop(self.events.send(broadcast));
+        self.emit_notice(notice);
     }
 
     fn begin_attempt(&self) {
@@ -2144,6 +2224,18 @@ impl DriverEnds {
                 return;
             }
         }
+    }
+}
+
+const fn registration_failure(refusal: e6irc_client::RegistrationRefusal) -> NetworkFailure {
+    match refusal {
+        e6irc_client::RegistrationRefusal::InvalidNickname => NetworkFailure::InvalidNickname,
+        e6irc_client::RegistrationRefusal::NicknameInUse => NetworkFailure::NicknameInUse,
+        e6irc_client::RegistrationRefusal::ServerPasswordRejected => {
+            NetworkFailure::ServerPasswordRejected
+        }
+        e6irc_client::RegistrationRefusal::NetworkBanned => NetworkFailure::NetworkBanned,
+        e6irc_client::RegistrationRefusal::NotRegistered => NetworkFailure::RegistrationRejected,
     }
 }
 
@@ -2300,8 +2392,9 @@ where
             }
             // Upstream -> client.
             ev = events.recv() => match ev {
-                Ok(DriverEvent::Line(line)) => {
-                    write.write_all(filter_tags(&line, caps).as_bytes()).await?;
+                Ok(event @ (DriverEvent::Line(_) | DriverEvent::Notice(_))) => {
+                    let line = event.display_line().expect("display event carries a line");
+                    write.write_all(filter_tags(line, caps).as_bytes()).await?;
                     write.write_all(b"\r\n").await?;
                     write.flush().await?;
                 }
@@ -2573,7 +2666,7 @@ mod tests {
         assert_eq!(connected.lines_in, 1);
         assert_eq!(connected.lines_out, 1);
         assert!(connected.bytes_in > connected.bytes_out);
-        assert_eq!(connected.buffer_lines, 1);
+        assert_eq!(connected.buffer_lines, 2);
         assert_eq!(connected.buffer_capacity, 16);
         assert_eq!(connected.attached_clients, 1);
         assert!(connected.last_input_at.is_some());
@@ -2603,14 +2696,24 @@ mod tests {
             Some(NetworkFailure::AuthenticationRejected)
         );
 
-        ends.emit(ConnectionEvent::RegistrationFailed);
+        ends.emit(ConnectionEvent::RegistrationFailed(
+            e6irc_client::RegistrationRefusal::InvalidNickname,
+        ));
         let rejected = handle.runtime_snapshot();
         assert_eq!(rejected.lifecycle, NetworkLifecycle::RegistrationFailed);
-        assert_eq!(
-            rejected.last_error,
-            Some(NetworkFailure::RegistrationRejected)
-        );
+        assert_eq!(rejected.last_error, Some(NetworkFailure::InvalidNickname));
         assert_eq!(failed.errors, 2);
+        assert_eq!(rejected.buffer_lines, 5);
+        assert_eq!(
+            handle.buffer_snapshot(),
+            vec![
+                ":*bnc* NOTICE * :component connected: unregistered network".to_string(),
+                ":upstream PRIVMSG #room :hello".to_string(),
+                ":*bnc* NOTICE * :component reconnecting: The established upstream connection was lost. (connection_lost)".to_string(),
+                ":*bnc* NOTICE * :component authentication_failed: The upstream rejected the configured credentials. (authentication_rejected)".to_string(),
+                ":*bnc* NOTICE * :component registration_failed: The upstream rejected the configured nickname. (invalid_nickname)".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -2630,6 +2733,22 @@ mod tests {
             "{runtime:?}"
         );
         assert_eq!(telemetry.snapshot(0, 0).errors["bouncer"], 1);
+        assert_eq!(
+            handle.buffer_snapshot(),
+            vec![failure_notice(NetworkFailure::BacklogStorageFailed)]
+        );
+    }
+
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    #[test]
+    fn bridge_error_is_a_component_log_notice() {
+        let (handle, ends) = NetworkHandle::channels(8);
+        ends.record_error(NetworkFailure::UpstreamRequestFailed);
+
+        assert_eq!(
+            handle.buffer_snapshot(),
+            vec![failure_notice(NetworkFailure::UpstreamRequestFailed)]
+        );
     }
 
     #[tokio::test]
@@ -2771,10 +2890,19 @@ mod tests {
                 .any(|l| l.contains("no bridged") && l.contains("#c")),
             "the unmapped target is surfaced: {lines:#?}"
         );
+        let delivery_notices = lines
+            .iter()
+            .filter(|line| line.contains("not delivered") || line.contains("no bridged"))
+            .count();
         assert_eq!(
-            lines.len(),
-            2,
-            "exactly one notice per problem target — earlier problems not dropped: {lines:#?}"
+            delivery_notices, 2,
+            "exactly one delivery notice per problem target: {lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == &failure_notice(NetworkFailure::UpstreamWriteFailed)),
+            "the component diagnostic is retained: {lines:#?}"
         );
     }
 

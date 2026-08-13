@@ -13,8 +13,9 @@ and integration claims.
 ## Current state
 
 The console reads and writes only through `/api/v1`. Browser chat and console
-load the served OpenAPI contract and parse each successful API response into a
-closed immutable projection before a view uses it. Browser chat parses each UI
+load the served OpenAPI contract, parse each successful API response into a
+closed immutable projection, and serialize each JSON mutation from its closed
+request shape before a view uses or sends it. Browser chat parses each UI
 WebSocket event into its closed
 shape before handling it and serializes each composer request from its closed
 shape before sending it. Immutable console mutation operations are checked
@@ -27,7 +28,13 @@ External qualification has one manual GitHub workflow. It selects one closed
 campaign, refuses local provider oracles, and uploads only evidence accepted by
 the runner verifier.
 The current qualification runner passed live public IRC campaigns for
-Libera.Chat, OFTC, and Ergo on 2026-08-12.
+Libera.Chat, OFTC, and Ergo on 2026-08-13. The console has a bounded,
+owner-scoped component-log view for IRC and every bridge driver. Its API reads
+the live buffer while active and persisted history after stop; typed lifecycle
+and operational failures are safe notices, and storage-failure notices cannot
+retry through the failed writer. Administrators also have a bounded live server
+log for fixed operational error classes. It excludes request data, IRC traffic,
+and secrets; the durable audit log remains the source for privileged actions.
 
 ## Remaining qualification
 

@@ -212,6 +212,22 @@ fn document() -> serde_json::Value {
             }
         } } }
     });
+    let logs_response = json_response(
+        "bounded redacted operational events",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["entries"],
+            "properties": { "entries": { "type": "array", "maxItems": 1000, "items": {
+                "type": "object", "additionalProperties": false,
+                "required": ["at_ms", "component", "severity", "message"],
+                "properties": {
+                    "at_ms": { "type": "integer", "minimum": 0 },
+                    "component": { "type": "string", "enum": ["accept", "connection_setup", "tls_handshake", "read", "write", "send_queue", "database", "bouncer", "http"] },
+                    "severity": { "const": "error" },
+                    "message": { "const": "An operational error was recorded." }
+                }
+            } } }
+        }),
+    );
     let network_response = json_response(
         "stored network configuration and runtime",
         network_response_schema,
@@ -1292,10 +1308,10 @@ fn document() -> serde_json::Value {
                                 "addr": { "type": "string" },
                                 "tls": { "type": "boolean" },
                                 "nick": { "type": "string" },
-                                "realname": { "type": "string" },
+                                "realname": { "type": ["string", "null"] },
                                 "autojoin": { "type": "array", "items": { "type": "string" } },
-                                "sasl_account": { "type": "string" },
-                                "sasl_password": { "type": "string" } } } } } },
+                                "sasl_account": { "type": ["string", "null"] },
+                                "sasl_password": { "type": ["string", "null"] } } } } } },
                     "responses": { "201": network_created_response["201"],
                         "409": { "description": "duplicate name, or upstream secret with no master key" } } }
             },
@@ -1311,9 +1327,9 @@ fn document() -> serde_json::Value {
                                 "addr": { "type": "string", "minLength": 1, "maxLength": 255 },
                                 "tls": { "type": "boolean" },
                                 "nick": { "type": "string", "minLength": 1, "maxLength": 64 },
-                                "realname": { "type": "string", "maxLength": 128 },
-                                "sasl_account": { "type": "string", "minLength": 1, "maxLength": 255, "writeOnly": true },
-                                "sasl_password": { "type": "string", "minLength": 1, "maxLength": 512, "writeOnly": true }
+                                "realname": { "type": ["string", "null"], "maxLength": 128 },
+                                "sasl_account": { "type": ["string", "null"], "minLength": 1, "maxLength": 255, "writeOnly": true },
+                                "sasl_password": { "type": ["string", "null"], "minLength": 1, "maxLength": 512, "writeOnly": true }
                             } } } } },
                     "responses": {
                         "200": {
@@ -1394,7 +1410,8 @@ fn document() -> serde_json::Value {
                         "404": { "description": "no such network" } } }
             },
             "/api/v1/me/networks/{name}/buffer": {
-                "get": { "summary": "Recent buffered upstream lines for a network (oldest-first)",
+                "get": { "summary": "Read the bounded owner-scoped component log (oldest-first)",
+                    "description": "Returns the active component's bounded live stream, or persisted history after it stops. It includes safe lifecycle notices and never includes credentials.",
                     "security": authenticated,
                     "parameters": [
                         { "name": "name", "in": "path", "required": true,
@@ -1727,6 +1744,13 @@ fn document() -> serde_json::Value {
                     "responses": { "200": monitoring_response["200"], "400": { "description": "unsupported monitoring window" }, "403": { "description": "not an admin account" } }
                 }
             },
+            "/api/v1/admin/logs": {
+                "get": { "summary": "Read recent redacted operational events (admin only)",
+                    "description": "Returns at most 1,000 in-memory events from fixed server components. Event details never include request data, IRC traffic, or secrets.",
+                    "security": authenticated,
+                    "responses": { "200": logs_response["200"], "403": { "description": "not an admin account" } }
+                }
+            },
             "/api/v1/admin/metrics": {
                 "get": { "summary": "Prometheus exposition (admin only)",
                     "security": authenticated,
@@ -1799,6 +1823,7 @@ pub(super) async fn openapi() -> Response {
 mod tests {
     const CONSOLE_READ_OPERATIONS: &[(&str, &str)] = &[
         ("/api/v1/admin/monitoring", "get"),
+        ("/api/v1/admin/logs", "get"),
         ("/api/v1/admin/stats", "get"),
         ("/api/v1/admin/accounts", "get"),
         ("/api/v1/admin/invitations", "get"),
@@ -1891,6 +1916,21 @@ mod tests {
             if schema.get("oneOf").is_none() {
                 assert_eq!(schema["type"], "object", "{method} {path}");
                 assert_eq!(schema["additionalProperties"], false, "{method} {path}");
+            }
+        }
+    }
+
+    #[test]
+    fn optional_network_request_fields_accept_null() {
+        let spec = super::document();
+        for path in ["/api/v1/me/networks", "/api/v1/me/networks/preflight"] {
+            for field in ["realname", "sasl_account", "sasl_password"] {
+                assert_eq!(
+                    spec["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]
+                        ["properties"][field]["type"],
+                    serde_json::json!(["string", "null"]),
+                    "{path} {field}",
+                );
             }
         }
     }

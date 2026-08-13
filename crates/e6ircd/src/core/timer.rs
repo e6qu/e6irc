@@ -38,36 +38,29 @@ impl<T> TimerWheel<T> {
         if target.saturating_sub(self.tick) >= self.buckets.len() as u64 {
             self.tick = target;
             for bucket in &mut self.buckets {
-                let timers = std::mem::take(bucket);
-                let (ready, pending): (Vec<_>, Vec<_>) = timers
-                    .into_iter()
-                    .partition(|timer| timer.tick <= self.tick);
-                due.extend(ready.into_iter().map(|timer| timer.payload));
-                *bucket = pending;
+                Self::drain_bucket(bucket, self.tick, &mut due);
             }
             return due;
         }
         while self.tick < target {
             self.tick += 1;
             let slot = self.tick as usize % self.buckets.len();
-            let bucket = std::mem::take(&mut self.buckets[slot]);
-            let (ready, pending): (Vec<_>, Vec<_>) = bucket
-                .into_iter()
-                .partition(|timer| timer.tick <= self.tick);
-            due.extend(ready.into_iter().map(|timer| timer.payload));
-            self.buckets[slot] = pending;
+            Self::drain_bucket(&mut self.buckets[slot], self.tick, &mut due);
         }
         due
     }
 
     fn drain_current(&mut self, due: &mut Vec<T>) {
         let slot = self.tick as usize % self.buckets.len();
-        let bucket = std::mem::take(&mut self.buckets[slot]);
-        let (ready, pending): (Vec<_>, Vec<_>) = bucket
-            .into_iter()
-            .partition(|timer| timer.tick <= self.tick);
+        Self::drain_bucket(&mut self.buckets[slot], self.tick, due);
+    }
+
+    fn drain_bucket(bucket: &mut Vec<Timed<T>>, tick: u64, due: &mut Vec<T>) {
+        let timers = std::mem::take(bucket);
+        let (ready, pending): (Vec<_>, Vec<_>) =
+            timers.into_iter().partition(|timer| timer.tick <= tick);
         due.extend(ready.into_iter().map(|timer| timer.payload));
-        self.buckets[slot] = pending;
+        *bucket = pending;
     }
 }
 
@@ -79,13 +72,17 @@ mod tests {
         MonoMillis::from_millis(ms)
     }
 
-    #[test]
-    fn retains_wrapped_timers_until_their_real_deadline() {
-        let mut wheel = TimerWheel::new(
-            at(0),
+    fn wheel(now: u64) -> TimerWheel<&'static str> {
+        TimerWheel::new(
+            at(now),
             NonZeroU64::new(10).expect("nonzero resolution"),
             NonZeroUsize::new(2).expect("nonzero slots"),
-        );
+        )
+    }
+
+    #[test]
+    fn retains_wrapped_timers_until_their_real_deadline() {
+        let mut wheel = wheel(0);
         wheel.schedule(at(10), "first");
         wheel.schedule(at(30), "later");
 
@@ -96,22 +93,14 @@ mod tests {
 
     #[test]
     fn emits_a_timer_due_now() {
-        let mut wheel = TimerWheel::new(
-            at(10),
-            NonZeroU64::new(10).expect("nonzero resolution"),
-            NonZeroUsize::new(2).expect("nonzero slots"),
-        );
+        let mut wheel = wheel(10);
         wheel.schedule(at(10), "now");
         assert_eq!(wheel.advance(at(10)), vec!["now"]);
     }
 
     #[test]
     fn large_clock_jump_scans_each_slot_once() {
-        let mut wheel = TimerWheel::new(
-            at(0),
-            NonZeroU64::new(10).expect("nonzero resolution"),
-            NonZeroUsize::new(2).expect("nonzero slots"),
-        );
+        let mut wheel = wheel(0);
         wheel.schedule(at(10), "due");
         wheel.schedule(at(1_000_010), "future");
 

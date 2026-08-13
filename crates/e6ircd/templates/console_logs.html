@@ -1,0 +1,21 @@
+{% extends "console_base.html" %}
+{% block main %}
+  <div data-api-server-log data-refresh-seconds="5" data-refresh-status="server-log-refresh-status">
+    <div class="page-head">
+      <div>
+        <p class="eyebrow">Operations</p>
+        <h1>Live logs</h1>
+        <p class="lede">The newest 1,000 safe events from server components. This feed never includes request data, IRC traffic, or secrets.</p>
+      </div>
+      <div class="page-actions">
+        <button type="button" data-refresh-target="#server-log-panel">Refresh</button>
+        <a class="button-link secondary-link" href="/console/audit">Audit log</a>
+      </div>
+    </div>
+    <noscript><div class="banner-error">JavaScript is required because this page reads the administrator API.</div></noscript>
+    <section id="server-log-panel" class="panel" aria-live="polite">
+      <div class="chart-empty">Loading live logs…</div>
+    </section>
+    <p id="server-log-refresh-status" class="refresh-status" aria-live="polite">Refreshes every five seconds.</p>
+  </div>
+{% endblock %}
