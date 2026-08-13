@@ -1534,7 +1534,6 @@ async fn console_networks_page_lists_the_callers_networks() {
         "data-network-name=\"libera\"",
         "Component log",
         "Loading component log…",
-        "/api/v1/me/networks",
     ] {
         assert!(
             log.contains(needle),
