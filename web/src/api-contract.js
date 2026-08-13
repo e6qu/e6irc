@@ -99,7 +99,12 @@ function declaredOperation(document, method, url) {
   if (!objectValue(document) || !objectValue(document.paths)) {
     throw new ApiSchemaError("The API contract document is invalid.");
   }
-  const pathname = new URL(url, "https://e6irc.invalid").pathname;
+  const base = "https://e6irc.invalid";
+  const parsed = new URL(url, base);
+  if (parsed.origin !== base || !parsed.pathname.startsWith("/api/v1/")) {
+    throw new ApiSchemaError("The API request URL is invalid.");
+  }
+  const pathname = parsed.pathname;
   const match = matchingPath(document.paths, pathname);
   const operation = match?.[1]?.[method.toLowerCase()];
   if (!objectValue(operation)) {

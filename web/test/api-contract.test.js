@@ -184,6 +184,25 @@ test("operation parser rejects invalid queries before a request leaves the brows
   assert.equal(requested, false);
 });
 
+test("operation parser rejects URLs outside the origin-relative API", async () => {
+  const document = {
+    paths: {
+      "/api/v1/me/widgets": {
+        get: { responses: { 200: { content: { "application/json": { schema: { type: "object" } } } } } },
+      },
+    },
+  };
+  for (const url of ["widgets", "/console", "https://example.test/api/v1/me/widgets", "//example.test/api/v1/me/widgets"]) {
+    assert.throws(() => parseOperationQuery(document, "GET", url), ApiSchemaError);
+  }
+  let requested = false;
+  await assert.rejects(getOperationJson(async () => {
+    requested = true;
+    return new Response();
+  }, document, "GET", "https://example.test/api/v1/me/widgets"), ApiSchemaError);
+  assert.equal(requested, false);
+});
+
 test("operation parser rejects invalid path parameters before a request leaves the browser", async () => {
   const document = {
     paths: {
