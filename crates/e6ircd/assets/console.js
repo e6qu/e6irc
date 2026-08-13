@@ -186,13 +186,14 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   const apiRequest = async (form, operation, body) => {
     const csrf = form.querySelector('input[name="csrf"]')?.value;
     if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
-    return getOperationJson(fetch, await consoleApiContract(), operation.method, operation.url, {
+    const contract = await consoleApiContract();
+    return getOperationJson(fetch, contract, operation.method, operation.url, {
       credentials: "same-origin",
       headers: {
         "Content-Type": "application/json",
         "X-E6IRC-CSRF": csrf,
       },
-      body: body === undefined ? undefined : JSON.stringify(body),
+      json: body,
     });
   };
 
@@ -1192,7 +1193,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       setBanResult("The server-ban ID is invalid. Reload and try again.", false);
       return;
     }
-    void mutateBan(form, `/api/v1/admin/bans/${id}`, "DELETE", {});
+    void mutateBan(form, `/api/v1/admin/bans/${id}`, "DELETE");
   });
 
   const sessionResult = document.getElementById("session-api-result");

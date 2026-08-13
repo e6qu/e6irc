@@ -7,9 +7,11 @@ import {
   ApiSchemaError,
   apiContractLoader,
   getOperationJson,
+  operationRequestSchema,
   operationResponseSchema,
   parseApiSchema,
   parseOperationResponse,
+  serializeOperationRequest,
 } from "../src/api-contract.js";
 
 const responseSchema = {
@@ -118,6 +120,84 @@ test("operation parser selects the exact documented path before parsing", () => 
   }), { name: "Libera", enabled: true, state: "connected" });
   assert.throws(
     () => operationResponseSchema(document, "GET", "/api/v1/me/networks"),
+    ApiSchemaError,
+  );
+});
+
+test("operation request serializer closes and validates documented JSON", () => {
+  const document = {
+    paths: {
+      "/api/v1/me/widgets/{name}": {
+        patch: {
+          requestBody: { required: true, content: { "application/json": { schema: {
+            type: "object", additionalProperties: false, required: ["enabled"], properties: {
+              enabled: { type: "boolean" }, label: { type: "string", minLength: 1 },
+            },
+          } } } },
+          responses: {},
+        },
+      },
+    },
+  };
+  assert.deepEqual(operationRequestSchema(document, "PATCH", "/api/v1/me/widgets/libera"), {
+    type: "object", additionalProperties: false, required: ["enabled"], properties: {
+      enabled: { type: "boolean" }, label: { type: "string", minLength: 1 },
+    },
+  });
+  assert.equal(
+    serializeOperationRequest(document, "PATCH", "/api/v1/me/widgets/libera", { enabled: true }),
+    '{"enabled":true}',
+  );
+  for (const value of [{}, { enabled: "true" }, { enabled: true, extra: true }]) {
+    assert.throws(
+      () => serializeOperationRequest(document, "PATCH", "/api/v1/me/widgets/libera", value),
+      ApiSchemaError,
+    );
+  }
+  assert.throws(
+    () => operationRequestSchema(document, "DELETE", "/api/v1/me/widgets/libera"),
+    ApiSchemaError,
+  );
+});
+
+test("operation requests serialize only contract-checked JSON", async () => {
+  const document = {
+    paths: {
+      "/api/v1/me/widgets": {
+        post: {
+          requestBody: { required: true, content: { "application/json": { schema: {
+            type: "object", additionalProperties: false, required: ["enabled"], properties: {
+              enabled: { type: "boolean" },
+            },
+          } } } },
+          responses: { 204: { description: "updated" } },
+        },
+      },
+    },
+  };
+  let request;
+  assert.equal(await getOperationJson(async (url, options) => {
+    request = { url, options };
+    return new Response(null, { status: 204 });
+  }, document, "POST", "/api/v1/me/widgets", { json: { enabled: true } }), undefined);
+  assert.deepEqual(request, {
+    url: "/api/v1/me/widgets",
+    options: {
+      method: "POST",
+      headers: { Accept: "application/json" },
+      body: '{"enabled":true}',
+    },
+  });
+  await assert.rejects(
+    getOperationJson(async () => new Response(), document, "POST", "/api/v1/me/widgets", { json: {} }),
+    ApiSchemaError,
+  );
+  await assert.rejects(
+    getOperationJson(async () => new Response(), document, "POST", "/api/v1/me/widgets", { body: "{}" }),
+    ApiSchemaError,
+  );
+  await assert.rejects(
+    getOperationJson(async () => new Response(), document, "POST", "/api/v1/me/widgets"),
     ApiSchemaError,
   );
 });

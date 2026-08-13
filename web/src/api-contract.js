@@ -126,6 +126,19 @@ export function operationResponseSchema(document, method, url, status = 200) {
   return schema;
 }
 
+export function operationRequestSchema(document, method, url) {
+  const { pathname, operation } = declaredOperation(document, method, url);
+  const schema = operation.requestBody?.content?.["application/json"]?.schema;
+  if (!objectValue(schema)) {
+    throw new ApiSchemaError(`The API contract does not describe a JSON request body for ${method.toUpperCase()} ${pathname}.`);
+  }
+  return schema;
+}
+
+export function serializeOperationRequest(document, method, url, value, label = "API request") {
+  return JSON.stringify(parseApiSchema(operationRequestSchema(document, method, url), value, label));
+}
+
 export function parseOperationResponse(document, method, url, value, label = "API response", status = 200) {
   return parseApiSchema(operationResponseSchema(document, method, url, status), value, label);
 }
@@ -198,11 +211,21 @@ export function apiContractLoader(fetcher) {
 }
 
 export async function getOperationJson(fetcher, document, method, url, options = {}) {
-  declaredOperation(document, method, url);
+  const { operation } = declaredOperation(document, method, url);
+  const { json, body: ignoredBody, ...request } = options;
+  if (ignoredBody !== undefined) {
+    throw new ApiSchemaError("JSON API requests must use the json option.");
+  }
+  if (json === undefined && operation.requestBody?.required === true) {
+    throw new ApiSchemaError(`The API contract requires a JSON request body for ${method.toUpperCase()} ${new URL(url, "https://e6irc.invalid").pathname}.`);
+  }
+  if (json !== undefined) {
+    request.body = serializeOperationRequest(document, method, url, json);
+  }
   const response = await fetcher(url, {
-    ...options,
+    ...request,
     method,
-    headers: { Accept: "application/json", ...options.headers },
+    headers: { Accept: "application/json", ...request.headers },
   });
   if (!response.ok) await apiFailure(response);
   if (response.status === 204) return undefined;
