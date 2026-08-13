@@ -431,7 +431,14 @@ fn gateway_connection_url(gateway: &str) -> Result<String, String> {
     {
         return Err("must be absolute ws(s), without credentials or fragment".into());
     }
+    let preserved: Vec<_> = url
+        .query_pairs()
+        .filter(|(key, _)| key != "v" && key != "encoding")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    url.set_query(None);
     url.query_pairs_mut()
+        .extend_pairs(preserved)
         .append_pair("v", "10")
         .append_pair("encoding", "json");
     Ok(url.to_string())
@@ -591,8 +598,9 @@ mod tests {
 
     #[test]
     fn gateway_connection_url_preserves_existing_queries() {
-        let url = gateway_connection_url("wss://gateway.example/socket?compress=zlib")
-            .expect("valid gateway URL");
+        let url =
+            gateway_connection_url("wss://gateway.example/socket?compress=zlib&v=1&encoding=etf")
+                .expect("valid gateway URL");
         let parsed = openidconnect::url::Url::parse(&url).expect("output URL");
         let query: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
         assert_eq!(query.get("compress"), Some(&"zlib".into()));
