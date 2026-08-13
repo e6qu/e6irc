@@ -415,7 +415,14 @@ try {
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
   await page.getByLabel("New password", { exact: true }).fill("browser-local-password");
   await page.getByLabel("Confirm new password", { exact: true }).fill("browser-local-password");
-  await page.getByRole("button", { name: "Add password", exact: true }).click();
+  const [passwordResponse] = await Promise.all([
+    page.waitForResponse(
+      (response) => response.url() === `${applicationOrigin}/api/v1/me/password`
+        && response.request().method() === "PUT",
+    ),
+    page.getByRole("button", { name: "Add password", exact: true }).click(),
+  ]);
+  assert.equal(passwordResponse.status(), 204);
   await expectStatus(page, /Local password added/);
   assert.equal((await context.request.post(`${applicationOrigin}/api/v1/auth/logout`)).status(), 204);
   await page.goto(`${applicationOrigin}/login`);

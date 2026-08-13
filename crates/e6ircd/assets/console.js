@@ -1493,9 +1493,11 @@ import { loadSettings, saveSettings } from "/console-settings.js";
           setAccountResult("The new password and confirmation do not match.", false);
           return;
         }
-        void mutateAccount(form, "PUT", { current_password: current || null, new_password: next }, "Password update failed.")
+        const body = { new_password: next };
+        if (current) body.current_password = current;
+        void mutateAccount(form, "PUT", body, "Password update failed.")
           .then((result) => {
-            if (result === false) return;
+            if (result === undefined) return;
             setAccountResult(current ? "Local password changed." : "Local password added.", true);
             void apiRead("/api/v1/me/credentials").then((updated) => {
               const credentials = apiCollection(updated, "credentials", "credential directory");
