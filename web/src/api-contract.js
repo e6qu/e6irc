@@ -25,6 +25,110 @@ function objectValue(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function validSchemaType(type) {
+  return ["null", "array", "object", "string", "boolean", "integer", "number"].includes(type);
+}
+
+function schemaTypes(schema, label) {
+  if (!("type" in schema)) return [];
+  const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+  if (types.length === 0 || types.some((type) => !validSchemaType(type)) || new Set(types).size !== types.length) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  return types;
+}
+
+function nonNegativeInteger(schema, key, label) {
+  if (key in schema && (!Number.isSafeInteger(schema[key]) || schema[key] < 0)) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+}
+
+function finiteNumber(schema, key, label) {
+  if (key in schema && (typeof schema[key] !== "number" || !Number.isFinite(schema[key]))) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+}
+
+function closedObjectSchema(schema, label) {
+  if (schema.additionalProperties !== false) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  if ("properties" in schema && !objectValue(schema.properties)) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  if ("required" in schema && !Array.isArray(schema.required)) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  const properties = schema.properties ?? {};
+  const required = schema.required ?? [];
+  if (required.some((field) => typeof field !== "string" || !(field in properties)) || new Set(required).size !== required.length) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  return { properties, required };
+}
+
+function validateApiSchema(schema, label) {
+  if (!objectValue(schema)) throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  const types = schemaTypes(schema, label);
+  if (types.length === 0 && !("oneOf" in schema) && !("const" in schema) && !("enum" in schema)) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  if ("enum" in schema && (!Array.isArray(schema.enum) || schema.enum.length === 0)) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  const requiresType = (keys, allowed) => {
+    if (keys.some((key) => key in schema) && !types.some((type) => allowed.includes(type))) {
+      throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    }
+  };
+  requiresType(["minLength", "maxLength", "pattern"], ["string"]);
+  requiresType(["minimum", "maximum"], ["integer", "number"]);
+  requiresType(["items", "minItems", "maxItems", "uniqueItems"], ["array"]);
+  requiresType(["properties", "required", "additionalProperties"], ["object"]);
+  if ("oneOf" in schema) {
+    if (!Array.isArray(schema.oneOf) || schema.oneOf.length === 0) {
+      throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    }
+    for (const branch of schema.oneOf) validateApiSchema(branch, label);
+  }
+  nonNegativeInteger(schema, "minLength", label);
+  nonNegativeInteger(schema, "maxLength", label);
+  nonNegativeInteger(schema, "minItems", label);
+  nonNegativeInteger(schema, "maxItems", label);
+  finiteNumber(schema, "minimum", label);
+  finiteNumber(schema, "maximum", label);
+  if (Number.isSafeInteger(schema.minLength) && Number.isSafeInteger(schema.maxLength) && schema.minLength > schema.maxLength) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  if (Number.isSafeInteger(schema.minItems) && Number.isSafeInteger(schema.maxItems) && schema.minItems > schema.maxItems) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  if (typeof schema.minimum === "number" && typeof schema.maximum === "number" && schema.minimum > schema.maximum) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  if ("pattern" in schema) {
+    if (typeof schema.pattern !== "string") throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    try {
+      new RegExp(schema.pattern);
+    } catch {
+      throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    }
+  }
+  if ("uniqueItems" in schema && typeof schema.uniqueItems !== "boolean") {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  if (types.includes("array")) {
+    if (!objectValue(schema.items)) throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    validateApiSchema(schema.items, label);
+  }
+  if (types.includes("object")) {
+    const { properties } = closedObjectSchema(schema, label);
+    for (const property of Object.values(properties)) validateApiSchema(property, label);
+  }
+  return types;
+}
+
 function matchesType(value, type) {
   if (type === "null") return value === null;
   if (type === "array") return Array.isArray(value);
@@ -36,8 +140,16 @@ function matchesType(value, type) {
   return false;
 }
 
+function jsonIdentity(value) {
+  if (Array.isArray(value)) return `[${value.map(jsonIdentity).join(",")}]`;
+  if (objectValue(value)) {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${jsonIdentity(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 export function parseApiSchema(schema, value, label = "API response", path = "$") {
-  if (!objectValue(schema)) throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  const types = validateApiSchema(schema, label);
   if ("const" in schema && !Object.is(schema.const, value)) schemaError(label, path);
   if (Array.isArray(schema.oneOf)) {
     const matches = schema.oneOf.flatMap((candidate) => {
@@ -51,10 +163,7 @@ export function parseApiSchema(schema, value, label = "API response", path = "$"
     if (matches.length !== 1) schemaError(label, path);
     return matches[0];
   }
-  if (schema.type !== undefined) {
-    const types = Array.isArray(schema.type) ? schema.type : [schema.type];
-    if (!types.some((type) => matchesType(value, type))) schemaError(label, path);
-  }
+  if (types.length > 0 && !types.some((type) => matchesType(value, type))) schemaError(label, path);
   if (Array.isArray(schema.enum) && !schema.enum.some((entry) => Object.is(entry, value))) {
     schemaError(label, path);
   }
@@ -72,7 +181,7 @@ export function parseApiSchema(schema, value, label = "API response", path = "$"
   if (Array.isArray(value)) {
     if (Number.isInteger(schema.minItems) && value.length < schema.minItems) schemaError(label, path);
     if (Number.isInteger(schema.maxItems) && value.length > schema.maxItems) schemaError(label, path);
-    if (schema.uniqueItems === true && new Set(value.map((item) => JSON.stringify(item))).size !== value.length) {
+    if (schema.uniqueItems === true && new Set(value.map(jsonIdentity)).size !== value.length) {
       schemaError(label, path);
     }
     if (!objectValue(schema.items)) schemaError(label, path);
@@ -80,8 +189,8 @@ export function parseApiSchema(schema, value, label = "API response", path = "$"
   }
   if (!objectValue(value)) return value;
 
-  const properties = objectValue(schema.properties) ? schema.properties : {};
-  const required = Array.isArray(schema.required) ? new Set(schema.required) : new Set();
+  const { properties, required: requiredFields } = closedObjectSchema(schema, label);
+  const required = new Set(requiredFields);
   for (const field of required) {
     if (!(field in value)) schemaError(label, `${path}.${field}`);
   }
@@ -99,13 +208,125 @@ function declaredOperation(document, method, url) {
   if (!objectValue(document) || !objectValue(document.paths)) {
     throw new ApiSchemaError("The API contract document is invalid.");
   }
-  const pathname = new URL(url, "https://e6irc.invalid").pathname;
+  const base = "https://e6irc.invalid";
+  const parsed = new URL(url, base);
+  if (parsed.origin !== base || parsed.hash !== "" || !parsed.pathname.startsWith("/api/v1/")) {
+    throw new ApiSchemaError("The API request URL is invalid.");
+  }
+  const pathname = parsed.pathname;
   const match = matchingPath(document.paths, pathname);
   const operation = match?.[1]?.[method.toLowerCase()];
   if (!objectValue(operation)) {
     throw new ApiSchemaError(`The API contract does not describe ${method.toUpperCase()} ${pathname}.`);
   }
-  return { pathname, operation };
+  operationParameters(operation, "API operation");
+  return { pathname, path: match[0], operation };
+}
+
+function queryValue(schema, value, label, path) {
+  if (schema.type === "boolean") {
+    if (value === "true") return true;
+    if (value === "false") return false;
+    schemaError(label, path);
+  }
+  if (schema.type === "integer") {
+    if (!/^-?(?:0|[1-9][0-9]*)$/.test(value)) schemaError(label, path);
+    const parsed = Number(value);
+    if (!Number.isSafeInteger(parsed)) schemaError(label, path);
+    return parsed;
+  }
+  if (schema.type === "number") {
+    if (!/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$/.test(value)) schemaError(label, path);
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) schemaError(label, path);
+    return parsed;
+  }
+  return value;
+}
+
+function parameterSchema(parameter, label) {
+  if (!objectValue(parameter.schema) || !["string", "boolean", "integer", "number"].includes(parameter.schema.type)) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  return parameter.schema;
+}
+
+function operationParameters(operation, label) {
+  if (operation.parameters === undefined) return [];
+  if (!Array.isArray(operation.parameters)) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  const names = new Set();
+  return operation.parameters.map((parameter) => {
+    if (!objectValue(parameter)
+      || !["path", "query"].includes(parameter.in)
+      || typeof parameter.name !== "string"
+      || parameter.name === ""
+      || (parameter.required !== undefined && typeof parameter.required !== "boolean")
+      || (parameter.in === "path" && parameter.required !== true)
+      || (parameter.style !== undefined && parameter.style !== (parameter.in === "path" ? "simple" : "form"))
+      || (parameter.explode !== undefined && parameter.explode !== (parameter.in === "query"))
+      || (parameter.allowReserved !== undefined && parameter.allowReserved !== false)
+      || parameter.allowEmptyValue !== undefined
+      || parameter.content !== undefined) {
+      throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    }
+    const name = `${parameter.in}:${parameter.name}`;
+    if (names.has(name)) throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    names.add(name);
+    parameterSchema(parameter, label);
+    validateApiSchema(parameter.schema, label);
+    return parameter;
+  });
+}
+
+export function parseOperationQuery(document, method, url, label = "API query") {
+  const { operation } = declaredOperation(document, method, url);
+  const parameters = operationParameters(operation, label);
+  const schemas = new Map();
+  for (const parameter of parameters) {
+    if (parameter.in !== "query") continue;
+    if (schemas.has(parameter.name)) throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    schemas.set(parameter.name, { ...parameter, schema: parameterSchema(parameter, label) });
+  }
+  const query = new URL(url, "https://e6irc.invalid").searchParams;
+  for (const name of new Set(query.keys())) {
+    const parameter = schemas.get(name);
+    if (!parameter || query.getAll(name).length !== 1) schemaError(label, `$.${name}`);
+    parseApiSchema(parameter.schema, queryValue(parameter.schema, query.get(name), label, `$.${name}`), label, `$.${name}`);
+  }
+  for (const [name, parameter] of schemas) {
+    if (parameter.required === true && !query.has(name)) schemaError(label, `$.${name}`);
+  }
+}
+
+export function parseOperationPath(document, method, url, label = "API path") {
+  const { pathname, path, operation } = declaredOperation(document, method, url);
+  const parameters = operationParameters(operation, label);
+  const schemas = new Map();
+  for (const parameter of parameters) {
+    if (parameter.in !== "path") continue;
+    if (schemas.has(parameter.name)) throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    schemas.set(parameter.name, parameterSchema(parameter, label));
+  }
+  const actual = pathname.split("/");
+  const expected = path.split("/");
+  for (let index = 0; index < expected.length; index += 1) {
+    const match = /^\{([^}]+)\}$/.exec(expected[index]);
+    if (!match) continue;
+    const schema = schemas.get(match[1]);
+    if (!schema) throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    let value;
+    try {
+      value = decodeURIComponent(actual[index]);
+    } catch {
+      schemaError(label, `$.${match[1]}`);
+    }
+    parseApiSchema(schema, queryValue(schema, value, label, `$.${match[1]}`), label, `$.${match[1]}`);
+  }
+  for (const [name] of schemas) {
+    if (!path.includes(`{${name}}`)) throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
 }
 
 function matchingPath(paths, pathname) {
@@ -218,6 +439,8 @@ export function apiContractLoader(fetcher) {
 
 export async function getOperationJson(fetcher, document, method, url, options = {}) {
   const { operation } = declaredOperation(document, method, url);
+  parseOperationPath(document, method, url);
+  parseOperationQuery(document, method, url);
   const { json, body: ignoredBody, ...request } = options;
   if (ignoredBody !== undefined) {
     throw new ApiSchemaError("JSON API requests must use the json option.");

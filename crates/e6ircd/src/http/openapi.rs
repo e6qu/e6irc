@@ -886,7 +886,7 @@ fn document() -> serde_json::Value {
                     "description": "The session ID is scoped to the authenticated account in the deletion query. Revoking the current cookie session also clears its browser cookie.",
                     "security": authenticated,
                     "parameters": [{ "name": "id", "in": "path", "required": true,
-                        "schema": { "type": "integer", "format": "int64" } }],
+                        "schema": { "type": "integer", "format": "int64", "minimum": 1 } }],
                     "responses": {
                         "204": { "description": "session revoked" },
                         "404": { "description": "session does not exist or belongs to another account" },
@@ -1009,7 +1009,7 @@ fn document() -> serde_json::Value {
                     "summary": "Unlink one of your OIDC identities and revoke its browser sessions",
                     "security": authenticated,
                     "parameters": [{ "name": "id", "in": "path", "required": true,
-                        "schema": { "type": "integer" } }],
+                        "schema": { "type": "integer", "minimum": 1 } }],
                     "responses": {
                         "204": { "description": "identity unlinked and its sessions revoked" },
                         "404": { "description": "identity is not linked to this account" },
@@ -1090,6 +1090,8 @@ fn document() -> serde_json::Value {
             "/api/v1/me/tokens/{id}": {
                 "delete": { "summary": "Revoke one of your personal access tokens",
                     "security": authenticated,
+                    "parameters": [{ "name": "id", "in": "path", "required": true,
+                        "schema": { "type": "integer", "minimum": 1 } }],
                     "responses": { "204": { "description": "revoked" },
                         "404": { "description": "no such token" } } }
             },
@@ -1291,7 +1293,7 @@ fn document() -> serde_json::Value {
             "/api/v1/me/credentials/{id}": {
                 "delete": { "summary": "Revoke an app password", "security": authenticated,
                     "parameters": [{ "name": "id", "in": "path", "required": true,
-                        "schema": { "type": "integer" } }],
+                        "schema": { "type": "integer", "minimum": 1 } }],
                     "responses": { "204": { "description": "revoked" },
                         "404": { "description": "no such credential" } } }
             },
@@ -1486,15 +1488,23 @@ fn document() -> serde_json::Value {
                         "content": {
                             "application/json": {
                                 "schema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "suspended": { "type": "boolean" },
-                                        "administrator": { "type": "boolean" }
-                                    },
-                                    "additionalProperties": false,
                                     "oneOf": [
-                                        { "required": ["suspended"] },
-                                        { "required": ["administrator"] }
+                                        {
+                                            "type": "object",
+                                            "additionalProperties": false,
+                                            "required": ["suspended"],
+                                            "properties": {
+                                                "suspended": { "type": "boolean" }
+                                            }
+                                        },
+                                        {
+                                            "type": "object",
+                                            "additionalProperties": false,
+                                            "required": ["administrator"],
+                                            "properties": {
+                                                "administrator": { "type": "boolean" }
+                                            }
+                                        }
                                     ]
                                 }
                             }
@@ -1653,7 +1663,7 @@ fn document() -> serde_json::Value {
                 "delete": { "summary": "Delete one immutable server-ban resource (admin only)",
                     "description": "Resolves the stable directory ID before submitting the matching policy removal through the core. A stale ID cannot delete a recreated visible mask.",
                     "security": authenticated,
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64", "minimum": 1 } }],
                     "responses": { "204": { "description": "server ban removed" }, "400": { "description": "invalid ID" }, "403": { "description": "not an admin account" }, "404": { "description": "server ban no longer exists" }, "409": { "description": "conflicting policy mutation" }, "503": { "description": "server-ban control unavailable" } } }
             },
             "/api/v1/admin/audit": {
@@ -1785,22 +1795,112 @@ fn validate_documented_operations(spec: &serde_json::Value) -> Result<(), String
         .collect();
     let expected: std::collections::BTreeSet<(&str, &str)> =
         super::DOCUMENTED_ROUTE_OPERATIONS.iter().copied().collect();
-    if actual == expected {
-        return Ok(());
+    if actual != expected {
+        let missing: Vec<String> = expected
+            .difference(&actual)
+            .map(|(path, method)| format!("{} {}", method.to_ascii_uppercase(), path))
+            .collect();
+        let extra: Vec<String> = actual
+            .difference(&expected)
+            .map(|(path, method)| format!("{} {}", method.to_ascii_uppercase(), path))
+            .collect();
+        return Err(format!(
+            "OpenAPI/router operation mismatch; missing from spec: [{}]; absent from router: [{}]",
+            missing.join(", "),
+            extra.join(", ")
+        ));
     }
-    let missing: Vec<String> = expected
-        .difference(&actual)
-        .map(|(path, method)| format!("{} {}", method.to_ascii_uppercase(), path))
-        .collect();
-    let extra: Vec<String> = actual
-        .difference(&expected)
-        .map(|(path, method)| format!("{} {}", method.to_ascii_uppercase(), path))
-        .collect();
-    Err(format!(
-        "OpenAPI/router operation mismatch; missing from spec: [{}]; absent from router: [{}]",
-        missing.join(", "),
-        extra.join(", ")
-    ))
+
+    for (path, item) in paths {
+        let item = item
+            .as_object()
+            .ok_or_else(|| format!("OpenAPI path {path} is not an object"))?;
+        if item.contains_key("parameters") {
+            return Err(format!(
+                "OpenAPI path {path} has unsupported path-item parameters"
+            ));
+        }
+        let path_parameters: std::collections::BTreeSet<&str> = path
+            .split('/')
+            .filter_map(|segment| segment.strip_prefix('{')?.strip_suffix('}'))
+            .collect();
+        for method in methods {
+            let Some(operation) = item.get(method) else {
+                continue;
+            };
+            let parameters: &[serde_json::Value] = match operation.get("parameters") {
+                Some(parameters) => parameters
+                    .as_array()
+                    .ok_or_else(|| format!("OpenAPI {method} {path} parameters is not an array"))?,
+                None => &[],
+            };
+            let mut documented_path_parameters = std::collections::BTreeSet::new();
+            let mut documented_query_parameters = std::collections::BTreeSet::new();
+            for parameter in parameters {
+                let Some(parameter) = parameter.as_object() else {
+                    return Err(format!(
+                        "OpenAPI {method} {path} has a non-object parameter"
+                    ));
+                };
+                let name = parameter
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| format!("OpenAPI {method} {path} has an unnamed parameter"))?;
+                let location = parameter.get("in").and_then(serde_json::Value::as_str);
+                if !matches!(location, Some("path" | "query")) {
+                    return Err(format!(
+                        "OpenAPI {method} {path} parameter {name} has an unsupported location"
+                    ));
+                }
+                let schema = parameter
+                    .get("schema")
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| {
+                        format!("OpenAPI {method} {path} parameter {name} has no schema")
+                    })?;
+                if !matches!(
+                    schema.get("type").and_then(serde_json::Value::as_str),
+                    Some("string" | "boolean" | "integer" | "number")
+                ) {
+                    return Err(format!(
+                        "OpenAPI {method} {path} parameter {name} has an unsupported schema"
+                    ));
+                }
+                if location == Some("path") {
+                    if parameter
+                        .get("required")
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(true)
+                    {
+                        return Err(format!(
+                            "OpenAPI {method} {path} path parameter {name} is not required"
+                        ));
+                    }
+                    if !documented_path_parameters.insert(name) {
+                        return Err(format!(
+                            "OpenAPI {method} {path} duplicates path parameter {name}"
+                        ));
+                    }
+                } else if !documented_query_parameters.insert(name) {
+                    return Err(format!(
+                        "OpenAPI {method} {path} duplicates query parameter {name}"
+                    ));
+                }
+            }
+            if documented_path_parameters != path_parameters {
+                return Err(format!(
+                    "OpenAPI {method} {path} path parameters differ; documented: [{}], template: [{}]",
+                    documented_path_parameters
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    path_parameters.into_iter().collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Serve the validated contract. A drifted build does not hand automation a
@@ -1846,6 +1946,7 @@ mod tests {
         ("/api/v1/me/networks", "get"),
         ("/api/v1/me/networks/{name}", "get"),
         ("/api/v1/me/networks/{name}/operations", "get"),
+        ("/api/v1/me/networks/{name}/buffer", "get"),
         ("/api/v1/me/channels", "get"),
     ];
     const CONSOLE_JSON_MUTATIONS: &[(&str, &str, &str)] = &[
@@ -1886,6 +1987,36 @@ mod tests {
         ("/api/v1/me/sessions", "delete", "200"),
         ("/api/v1/me/tokens", "post", "201"),
     ];
+    const CONSOLE_JSON_REQUESTS: &[(&str, &str)] = &[
+        ("/api/v1/admin/accounts", "post"),
+        ("/api/v1/admin/accounts/{id}", "patch"),
+        ("/api/v1/admin/accounts/{id}", "delete"),
+        ("/api/v1/admin/bans", "post"),
+        ("/api/v1/admin/configuration", "patch"),
+        ("/api/v1/admin/configuration/networks", "post"),
+        ("/api/v1/admin/configuration/networks/{name}", "delete"),
+        ("/api/v1/admin/configuration/oidc-providers", "post"),
+        (
+            "/api/v1/admin/configuration/oidc-providers/{name}",
+            "delete",
+        ),
+        ("/api/v1/admin/configuration/opers", "post"),
+        ("/api/v1/admin/configuration/opers/{name}", "delete"),
+        ("/api/v1/admin/invitations", "post"),
+        ("/api/v1/admin/networks/{owner}/{name}", "patch"),
+        ("/api/v1/me/profile", "patch"),
+        ("/api/v1/me/account", "delete"),
+        ("/api/v1/me/password", "put"),
+        ("/api/v1/me/channels", "post"),
+        ("/api/v1/me/channels/{name}", "patch"),
+        ("/api/v1/me/channels/{name}/access/{account}", "put"),
+        ("/api/v1/me/credentials", "post"),
+        ("/api/v1/me/networks", "post"),
+        ("/api/v1/me/networks/preflight", "post"),
+        ("/api/v1/me/networks/{name}", "put"),
+        ("/api/v1/me/networks/{name}", "patch"),
+        ("/api/v1/me/tokens", "post"),
+    ];
     const CHAT_READ_OPERATIONS: &[(&str, &str)] = &[
         ("/api/v1/me", "get"),
         ("/api/v1/me/networks", "get"),
@@ -1896,6 +2027,49 @@ mod tests {
     fn openapi_covers_every_documented_router_operation_exactly() {
         let spec = super::document();
         assert_eq!(super::validate_documented_operations(&spec), Ok(()));
+    }
+
+    #[test]
+    fn openapi_rejects_a_route_path_parameter_missing_from_an_operation() {
+        let mut spec = super::document();
+        spec["paths"]["/api/v1/me/tokens/{id}"]["delete"]
+            .as_object_mut()
+            .expect("token deletion operation")
+            .remove("parameters");
+        assert!(
+            super::validate_documented_operations(&spec)
+                .expect_err("missing path parameter must reject the contract")
+                .contains("/api/v1/me/tokens/{id} path parameters differ")
+        );
+    }
+
+    #[test]
+    fn openapi_rejects_path_item_parameters() {
+        let mut spec = super::document();
+        spec["paths"]["/api/v1/me/tokens/{id}"]["parameters"] = serde_json::json!([]);
+        assert!(
+            super::validate_documented_operations(&spec)
+                .expect_err("unsupported path-item parameters must reject the contract")
+                .contains("unsupported path-item parameters")
+        );
+    }
+
+    #[test]
+    fn database_identifier_path_parameters_are_positive() {
+        let spec = super::document();
+        for path in [
+            "/api/v1/me/sessions/{id}",
+            "/api/v1/me/identities/{id}",
+            "/api/v1/me/tokens/{id}",
+            "/api/v1/me/credentials/{id}",
+            "/api/v1/admin/accounts/{id}",
+            "/api/v1/admin/invitations/{id}",
+            "/api/v1/admin/bans/{id}",
+        ] {
+            for (_, operation) in spec["paths"][path].as_object().expect("documented path") {
+                assert_eq!(operation["parameters"][0]["schema"]["minimum"], 1, "{path}");
+            }
+        }
     }
 
     #[test]
@@ -1920,6 +2094,28 @@ mod tests {
                 assert_eq!(schema["type"], "object", "{method} {path}");
                 assert_eq!(schema["additionalProperties"], false, "{method} {path}");
             }
+        }
+    }
+
+    #[test]
+    fn console_json_requests_have_closed_object_branches() {
+        fn assert_closed_object_branch(schema: &serde_json::Value, path: &str, method: &str) {
+            if let Some(branches) = schema.get("oneOf").and_then(serde_json::Value::as_array) {
+                assert!(!branches.is_empty(), "{method} {path}");
+                for branch in branches {
+                    assert_closed_object_branch(branch, path, method);
+                }
+                return;
+            }
+            assert_eq!(schema["type"], "object", "{method} {path}");
+            assert_eq!(schema["additionalProperties"], false, "{method} {path}");
+        }
+
+        let spec = super::document();
+        for (path, method) in CONSOLE_JSON_REQUESTS {
+            let schema = &spec["paths"][path][method]["requestBody"]["content"]["application/json"]
+                ["schema"];
+            assert_closed_object_branch(schema, path, method);
         }
     }
 

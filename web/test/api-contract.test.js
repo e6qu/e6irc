@@ -10,6 +10,8 @@ import {
   operationRequestSchema,
   operationResponseSchema,
   parseApiSchema,
+  parseOperationPath,
+  parseOperationQuery,
   parseOperationResponse,
   serializeOperationRequest,
 } from "../src/api-contract.js";
@@ -61,6 +63,40 @@ test("schema parser rejects incompatible and drifted JSON before a view uses it"
   }
 });
 
+test("schema parser rejects malformed constraints instead of weakening a projection", () => {
+  const valid = { name: "Libera", enabled: true, state: "connected" };
+  for (const schema of [
+    { ...responseSchema, type: "record" },
+    { ...responseSchema, type: [] },
+    { ...responseSchema, enum: "connected" },
+    { ...responseSchema, oneOf: [] },
+    { ...responseSchema, minLength: -1 },
+    { ...responseSchema, minimum: Number.NaN },
+    { ...responseSchema, pattern: 42 },
+    { ...responseSchema, properties: [] },
+    { ...responseSchema, required: ["missing"] },
+    { ...responseSchema, additionalProperties: true },
+    { type: "boolean", minLength: 1 },
+    { type: "string", minimum: 1 },
+    { type: "object", items: { type: "string" } },
+    { type: "array", uniqueItems: "true", items: { type: "string" } },
+  ]) {
+    assert.throws(() => parseApiSchema(schema, valid, "network response"), ApiSchemaError);
+  }
+  assert.throws(
+    () => parseApiSchema({ type: "string", pattern: "[" }, "Libera", "network response"),
+    ApiSchemaError,
+  );
+  for (const schema of [
+    {},
+    { type: "array", items: { type: "record" } },
+    { type: "array" },
+    { type: "object", additionalProperties: false, properties: { nested: { type: "record" } } },
+  ]) {
+    assert.throws(() => parseApiSchema(schema, schema.type === "array" ? [] : {}, "network response"), ApiSchemaError);
+  }
+});
+
 test("schema parser enforces response status, constants, and array bounds", async () => {
   const document = {
     paths: {
@@ -100,6 +136,26 @@ test("schema parser enforces response status, constants, and array bounds", asyn
   }
   assert.throws(
     () => operationResponseSchema(document, "POST", "/api/v1/me/widgets"),
+    ApiSchemaError,
+  );
+});
+
+test("schema parser compares unique JSON objects structurally", () => {
+  const schema = {
+    type: "array",
+    uniqueItems: true,
+    items: {
+      type: "object",
+      additionalProperties: false,
+      required: ["name", "enabled"],
+      properties: { name: { type: "string" }, enabled: { type: "boolean" } },
+    },
+  };
+  assert.throws(
+    () => parseApiSchema(schema, [
+      { name: "Libera", enabled: true },
+      { enabled: true, name: "Libera" },
+    ]),
     ApiSchemaError,
   );
 });
@@ -156,6 +212,140 @@ test("operation parser rejects ambiguous templates", () => {
   );
 });
 
+test("operation parser rejects invalid queries before a request leaves the browser", async () => {
+  const document = {
+    paths: {
+      "/api/v1/me/widgets": {
+        get: {
+          parameters: [
+            { name: "limit", in: "query", schema: { type: "integer", minimum: 1, maximum: 100 } },
+            { name: "active", in: "query", required: true, schema: { type: "boolean" } },
+          ],
+          responses: { 200: { content: { "application/json": { schema: { type: "object" } } } } },
+        },
+      },
+    },
+  };
+  parseOperationQuery(document, "GET", "/api/v1/me/widgets?limit=10&active=true");
+  for (const query of ["?limit=0&active=true", "?limit=1.5&active=true", "?limit=10&active=yes", "?limit=10", "?limit=10&active=true&extra=x", "?limit=10&active=true&limit=11"]) {
+    assert.throws(() => parseOperationQuery(document, "GET", `/api/v1/me/widgets${query}`), ApiSchemaError);
+  }
+  let requested = false;
+  await assert.rejects(getOperationJson(async () => {
+    requested = true;
+    return new Response();
+  }, document, "GET", "/api/v1/me/widgets?limit=0&active=true"), ApiSchemaError);
+  assert.equal(requested, false);
+});
+
+test("operation parser rejects URLs outside the origin-relative API", async () => {
+  const document = {
+    paths: {
+      "/api/v1/me/widgets": {
+        get: { responses: { 200: { content: { "application/json": { schema: { type: "object" } } } } } },
+      },
+    },
+  };
+  for (const url of ["widgets", "/console", "/api/v1/me/widgets#stale", "https://example.test/api/v1/me/widgets", "//example.test/api/v1/me/widgets"]) {
+    assert.throws(() => parseOperationQuery(document, "GET", url), ApiSchemaError);
+  }
+  let requested = false;
+  await assert.rejects(getOperationJson(async () => {
+    requested = true;
+    return new Response();
+  }, document, "GET", "https://example.test/api/v1/me/widgets"), ApiSchemaError);
+  assert.equal(requested, false);
+});
+
+test("operation parser rejects invalid path parameters before a request leaves the browser", async () => {
+  const document = {
+    paths: {
+      "/api/v1/me/widgets/{id}": {
+        get: {
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } }],
+          responses: { 200: { content: { "application/json": { schema: { type: "object" } } } } },
+        },
+      },
+    },
+  };
+  parseOperationPath(document, "GET", "/api/v1/me/widgets/42");
+  for (const path of ["/api/v1/me/widgets/0", "/api/v1/me/widgets/1.5", "/api/v1/me/widgets/nope"]) {
+    assert.throws(() => parseOperationPath(document, "GET", path), ApiSchemaError);
+  }
+  let requested = false;
+  await assert.rejects(getOperationJson(async () => {
+    requested = true;
+    return new Response();
+  }, document, "GET", "/api/v1/me/widgets/nope"), ApiSchemaError);
+  assert.equal(requested, false);
+});
+
+test("operation parser rejects parameters with unsupported wire types", () => {
+  const document = {
+    paths: {
+      "/api/v1/me/widgets": {
+        get: {
+          parameters: [{ name: "ids", in: "query", schema: { type: "array", items: { type: "integer" } } }],
+          responses: { 200: { content: { "application/json": { schema: { type: "object" } } } } },
+        },
+      },
+    },
+  };
+  assert.throws(() => parseOperationQuery(document, "GET", "/api/v1/me/widgets?ids=1"), ApiSchemaError);
+});
+
+test("operation parser requires documented path parameters", () => {
+  const document = {
+    paths: {
+      "/api/v1/me/widgets/{id}": {
+        get: {
+          parameters: [{ name: "id", in: "path", schema: { type: "integer" } }],
+          responses: { 200: { content: { "application/json": { schema: { type: "object" } } } } },
+        },
+      },
+    },
+  };
+  assert.throws(() => parseOperationPath(document, "GET", "/api/v1/me/widgets/1"), ApiSchemaError);
+});
+
+test("operation parser rejects malformed parameter collections", () => {
+  const document = {
+    paths: {
+      "/api/v1/me/widgets": {
+        get: {
+          parameters: {},
+          responses: { 200: { content: { "application/json": { schema: { type: "object" } } } } },
+        },
+      },
+    },
+  };
+  assert.throws(() => parseOperationQuery(document, "GET", "/api/v1/me/widgets"), ApiSchemaError);
+});
+
+test("operation parser rejects parameters the browser cannot enforce", () => {
+  for (const parameter of [
+    { name: "authorization", in: "header", schema: { type: "string" } },
+    { name: "session", in: "cookie", schema: { type: "string" } },
+    { name: "limit", in: "query", schema: { type: "array" } },
+    { name: "limit", in: "query", schema: { type: "string" } },
+    { name: "limit", in: "query", style: "spaceDelimited", schema: { type: "integer" } },
+    { name: "limit", in: "query", allowReserved: "false", schema: { type: "integer" } },
+    { name: "id", in: "path", explode: true, required: true, schema: { type: "integer" } },
+  ]) {
+    const document = {
+      paths: {
+        "/api/v1/me/widgets": {
+          get: {
+            parameters: [parameter, ...(parameter.in === "query" ? [parameter] : [])],
+            responses: { 200: { content: { "application/json": { schema: { type: "object", additionalProperties: false } } } } },
+          },
+        },
+      },
+    };
+    assert.throws(() => operationResponseSchema(document, "GET", "/api/v1/me/widgets"), ApiSchemaError);
+  }
+});
+
 test("operation request serializer closes and validates documented JSON", () => {
   const document = {
     paths: {
@@ -190,6 +380,38 @@ test("operation request serializer closes and validates documented JSON", () => 
     () => operationRequestSchema(document, "DELETE", "/api/v1/me/widgets/libera"),
     ApiSchemaError,
   );
+});
+
+test("operation request serializer accepts exactly one complete union branch", () => {
+  const document = {
+    paths: {
+      "/api/v1/admin/accounts/{id}": {
+        patch: {
+          requestBody: { required: true, content: { "application/json": { schema: {
+            oneOf: [
+              { type: "object", additionalProperties: false, required: ["suspended"], properties: { suspended: { type: "boolean" } } },
+              { type: "object", additionalProperties: false, required: ["administrator"], properties: { administrator: { type: "boolean" } } },
+            ],
+          } } } },
+          responses: {},
+        },
+      },
+    },
+  };
+  assert.equal(
+    serializeOperationRequest(document, "PATCH", "/api/v1/admin/accounts/1", { suspended: true }),
+    '{"suspended":true}',
+  );
+  assert.equal(
+    serializeOperationRequest(document, "PATCH", "/api/v1/admin/accounts/1", { administrator: false }),
+    '{"administrator":false}',
+  );
+  for (const value of [{}, { suspended: true, administrator: false }]) {
+    assert.throws(
+      () => serializeOperationRequest(document, "PATCH", "/api/v1/admin/accounts/1", value),
+      ApiSchemaError,
+    );
+  }
 });
 
 test("operation requests serialize only contract-checked JSON", async () => {
