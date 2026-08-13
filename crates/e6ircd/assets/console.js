@@ -2257,7 +2257,6 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   let refreshOwnerNetworkDetail;
   let refreshIntegrations;
   const ownerNetworkPreflight = Symbol("owner-network-preflight");
-  const requestedNetworkPreflight = new WeakSet();
   const ownerNetworkRefresher = (form) => {
     if (form.closest("[data-api-owner-network-editor]")) return refreshOwnerNetworkEditor;
     if (form.closest("[data-api-owner-bridge-editor]")) return refreshOwnerBridgeEditor;
@@ -2301,8 +2300,17 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     const preflightButton = form.querySelector("[data-api-network-preflight]");
     if (preflightButton instanceof HTMLButtonElement) {
       preflightButton.addEventListener("click", () => {
-        requestedNetworkPreflight.add(form);
-        form.requestSubmit();
+        const fields = new FormData(form);
+        const name = fieldValue(fields, "name");
+        const connection = ownerNetworkConnection(fields);
+        if (!name || !connection.addr || !connection.nick) {
+          setOwnerNetworkResult("Enter a network ID, server, and nickname.", false);
+          return;
+        }
+        const { addr, tls, nick, realname, sasl_account, sasl_password } = connection;
+        void mutateOwnerNetwork(form, "/api/v1/me/networks/preflight", "POST", {
+          addr, tls, nick, realname, sasl_account, sasl_password,
+        }, ownerNetworkPreflight);
       });
     }
     form.addEventListener("submit", (event) => {
@@ -2312,20 +2320,6 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       const connection = ownerNetworkConnection(fields);
       if (!name || !connection.addr || !connection.nick) {
         setOwnerNetworkResult("Enter a network ID, server, and nickname.", false);
-        return;
-      }
-      const submitter = event.submitter instanceof HTMLElement
-        ? event.submitter
-        : document.activeElement instanceof HTMLElement
-          ? document.activeElement
-          : null;
-      const preflight = requestedNetworkPreflight.delete(form)
-        || submitter?.matches("[data-api-network-preflight]") === true;
-      if (preflight) {
-        const { addr, tls, nick, realname, sasl_account, sasl_password } = connection;
-        void mutateOwnerNetwork(form, "/api/v1/me/networks/preflight", "POST", {
-          addr, tls, nick, realname, sasl_account, sasl_password,
-        }, ownerNetworkPreflight);
         return;
       }
       void mutateOwnerNetwork(form, form.action, "POST", { kind: "irc", name, ...connection });
