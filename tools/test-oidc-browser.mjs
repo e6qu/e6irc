@@ -1055,7 +1055,9 @@ try {
   const componentLogPage = await page.goto(`${applicationOrigin}/console/networks/journey/logs`);
   assert.equal(componentLogPage.status(), 200);
   assert.equal((await componentLogBuffer).status(), 200);
-  await page.getByText("browser replays through the real stack", { exact: true }).waitFor();
+  await page.getByRole("log", { name: "Component log", exact: true })
+    .getByText("browser replays through the real stack", { exact: false })
+    .waitFor();
   await page.getByRole("heading", { name: "journey log", exact: true }).waitFor();
 
   const serverLogRead = page.waitForResponse(
