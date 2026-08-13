@@ -2298,7 +2298,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
 
   for (const form of document.querySelectorAll("[data-api-owner-network-create]")) {
     const preflightButton = form.querySelector("[data-api-network-preflight]");
-    if (preflightButton instanceof HTMLButtonElement) {
+    if (preflightButton) {
       preflightButton.addEventListener("click", () => {
         const fields = new FormData(form);
         const name = fieldValue(fields, "name");

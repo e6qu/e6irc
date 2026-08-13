@@ -130,7 +130,9 @@ const watchdog = setTimeout(() => {
   process.exit(1);
 }, 180_000);
 
-const artifactDirectory = process.env.E6IRC_BROWSER_ARTIFACTS_DIR;
+const artifactDirectory = process.env.E6IRC_BROWSER_ARTIFACTS_DIR
+  ? resolve(repositoryRoot, process.env.E6IRC_BROWSER_ARTIFACTS_DIR)
+  : undefined;
 const applicationErrors = [];
 const applicationRequests = [];
 const navigationTrace = [];
