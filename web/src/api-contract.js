@@ -235,7 +235,23 @@ function operationParameters(operation, label) {
   if (!Array.isArray(operation.parameters)) {
     throw new ApiSchemaError(`The ${label} schema is invalid.`);
   }
-  return operation.parameters;
+  const names = new Set();
+  return operation.parameters.map((parameter) => {
+    if (!objectValue(parameter)
+      || !["path", "query"].includes(parameter.in)
+      || typeof parameter.name !== "string"
+      || parameter.name === ""
+      || (parameter.required !== undefined && typeof parameter.required !== "boolean")
+      || (parameter.in === "path" && parameter.required !== true)) {
+      throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    }
+    const name = `${parameter.in}:${parameter.name}`;
+    if (names.has(name)) throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    names.add(name);
+    parameterSchema(parameter, label);
+    validateApiSchema(parameter.schema, label);
+    return parameter;
+  });
 }
 
 export function parseOperationQuery(document, method, url, label = "API query") {
@@ -243,10 +259,7 @@ export function parseOperationQuery(document, method, url, label = "API query") 
   const parameters = operationParameters(operation, label);
   const schemas = new Map();
   for (const parameter of parameters) {
-    if (!objectValue(parameter) || parameter.in !== "query" || typeof parameter.name !== "string" || parameter.name === "") {
-      if (objectValue(parameter) && parameter.in !== "query") continue;
-      throw new ApiSchemaError(`The ${label} schema is invalid.`);
-    }
+    if (parameter.in !== "query") continue;
     if (schemas.has(parameter.name)) throw new ApiSchemaError(`The ${label} schema is invalid.`);
     schemas.set(parameter.name, { ...parameter, schema: parameterSchema(parameter, label) });
   }
@@ -266,10 +279,7 @@ export function parseOperationPath(document, method, url, label = "API path") {
   const parameters = operationParameters(operation, label);
   const schemas = new Map();
   for (const parameter of parameters) {
-    if (!objectValue(parameter) || parameter.in !== "path" || typeof parameter.name !== "string" || parameter.name === "" || parameter.required !== true) {
-      if (objectValue(parameter) && parameter.in !== "path") continue;
-      throw new ApiSchemaError(`The ${label} schema is invalid.`);
-    }
+    if (parameter.in !== "path") continue;
     if (schemas.has(parameter.name)) throw new ApiSchemaError(`The ${label} schema is invalid.`);
     schemas.set(parameter.name, parameterSchema(parameter, label));
   }

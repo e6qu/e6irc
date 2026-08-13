@@ -298,6 +298,27 @@ test("operation parser rejects malformed parameter collections", () => {
   assert.throws(() => parseOperationQuery(document, "GET", "/api/v1/me/widgets"), ApiSchemaError);
 });
 
+test("operation parser rejects parameters the browser cannot enforce", () => {
+  for (const parameter of [
+    { name: "authorization", in: "header", schema: { type: "string" } },
+    { name: "session", in: "cookie", schema: { type: "string" } },
+    { name: "limit", in: "query", schema: { type: "array" } },
+    { name: "limit", in: "query", schema: { type: "string" } },
+  ]) {
+    const document = {
+      paths: {
+        "/api/v1/me/widgets": {
+          get: {
+            parameters: [parameter, ...(parameter.in === "query" ? [parameter] : [])],
+            responses: { 200: { content: { "application/json": { schema: { type: "object", additionalProperties: false } } } } },
+          },
+        },
+      },
+    };
+    assert.throws(() => parseOperationQuery(document, "GET", "/api/v1/me/widgets"), ApiSchemaError);
+  }
+});
+
 test("operation request serializer closes and validates documented JSON", () => {
   const document = {
     paths: {
