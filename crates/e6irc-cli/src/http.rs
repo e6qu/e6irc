@@ -34,6 +34,20 @@ struct DeviceError {
     error: String,
 }
 
+fn verification_uri(value: &str) -> io::Result<&str> {
+    let parsed = reqwest::Url::parse(value).map_err(invalid_input)?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || parsed.fragment().is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "device authorization response has an invalid verification URI",
+        ));
+    }
+    Ok(value)
+}
+
 fn normalized_base(base: &str) -> io::Result<String> {
     let base = base.trim_end_matches('/');
     let parsed = reqwest::Url::parse(base).map_err(invalid_input)?;
@@ -125,7 +139,6 @@ pub async fn login(base: &str, cache_path: &Path) -> io::Result<()> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if start.device_code.is_empty()
         || start.user_code.is_empty()
-        || start.verification_uri.is_empty()
         || !(1..=MAX_DEVICE_INTERVAL_SECONDS).contains(&start.interval)
         || !(1..=MAX_DEVICE_EXPIRY_SECONDS).contains(&start.expires_in)
     {
@@ -134,10 +147,11 @@ pub async fn login(base: &str, cache_path: &Path) -> io::Result<()> {
             "device authorization response contains invalid bounds or empty fields",
         ));
     }
+    let verification_uri = verification_uri(&start.verification_uri)?;
 
     eprintln!(
         "Open {} and enter {}",
-        TerminalSafe::from_untrusted(&start.verification_uri),
+        TerminalSafe::from_untrusted(verification_uri),
         TerminalSafe::from_untrusted(&start.user_code)
     );
     eprintln!("Waiting for authorization…");
@@ -320,6 +334,18 @@ mod tests {
         assert!(endpoint("https://irc.example", "/api/v1/me").is_ok());
         assert!(endpoint("https://irc.example", "//attacker.example").is_err());
         assert!(endpoint("https://irc.example", "api/v1/me").is_err());
+        assert_eq!(
+            verification_uri("https://verify.example/device").unwrap(),
+            "https://verify.example/device"
+        );
+        for invalid in [
+            "/device",
+            "device",
+            "ftp://verify.example/device",
+            "https://verify.example/device#fragment",
+        ] {
+            assert!(verification_uri(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[tokio::test]

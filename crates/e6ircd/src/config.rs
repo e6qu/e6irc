@@ -1168,19 +1168,22 @@ impl Config {
                     .into(),
             ));
         }
-        // A configured `public_url` seeds the OIDC redirect_uri *and* the device
-        // flow's user-facing verification URL (`http/device.rs`), so an
-        // unparseable or non-http(s) value would silently propagate a broken base
-        // URL — and the https guard above only fires on a value that *parses*, so
-        // outright garbage would slip through when `[[oidc]]` is absent. Validate
-        // it as an http/https URL with a host whenever it is set (DESIGN §2).
+        // A configured `public_url` seeds every browser-facing absolute URL.
+        // Credentials leak into those links; queries and fragments corrupt an
+        // appended path. Keep a valid scheme, host, and optional deployment path.
         if let Some(h) = &self.http
             && let Some(value) = h.public_url.as_deref()
-            && !openidconnect::url::Url::parse(value)
-                .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+            && !openidconnect::url::Url::parse(value).is_ok_and(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.has_host()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+            })
         {
             return Err(ConfigError::Invalid(
-                "http.public_url must be an http(s) URL with a host".into(),
+                "http.public_url must be an http(s) URL with a host, without credentials, query, or fragment".into(),
             ));
         }
         // Configured networks need an authenticated management/attach surface.
@@ -1558,10 +1561,21 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("public_url"), "{err}");
-        // A well-formed http(s) URL is accepted.
-        with_public_url("https://irc.example")
-            .validate()
-            .expect("a valid public_url is accepted");
+        for value in ["https://irc.example", "https://irc.example/e6irc"] {
+            with_public_url(value)
+                .validate()
+                .expect("a valid public_url is accepted");
+        }
+        for value in [
+            "https://user:secret@irc.example",
+            "https://irc.example?stale=true",
+            "https://irc.example#stale",
+        ] {
+            let error = with_public_url(value)
+                .validate()
+                .expect_err("unsafe public URL");
+            assert!(error.to_string().contains("public_url"), "{error}");
+        }
     }
 
     #[test]

@@ -18,30 +18,27 @@ macro_rules! json_or_response {
 /// minutes — `RateLimited` caps the per-IP rate so an anonymous flood can't
 /// accumulate rows unboundedly.
 pub(super) async fn device_start(State(state): State<Arc<AppState>>, _rl: RateLimited) -> Response {
+    let Some(verification_uri) = device_verification_uri(state.public_url.as_deref()) else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Device authorization unavailable",
+            Some("http.public_url must be configured to advertise an absolute verification URI"),
+        );
+    };
     let pool = require_pool!(state);
     match crate::db::create_device_grant(pool).await {
-        Ok((device_code, user_code)) => {
-            let verification_uri = format!(
-                "{}/device",
-                state
-                    .public_url
-                    .as_deref()
-                    .unwrap_or("")
-                    .trim_end_matches('/')
-            );
-            (
-                [(header::CONTENT_TYPE, "application/json")],
-                serde_json::json!({
-                    "device_code": device_code,
-                    "user_code": user_code,
-                    "verification_uri": verification_uri,
-                    "interval": 5,
-                    "expires_in": 600,
-                })
-                .to_string(),
-            )
-                .into_response()
-        }
+        Ok((device_code, user_code)) => (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "device_code": device_code,
+                "user_code": user_code,
+                "verification_uri": verification_uri,
+                "interval": 5,
+                "expires_in": 600,
+            })
+            .to_string(),
+        )
+            .into_response(),
         Err(e) => {
             eprintln!("http: device start failed: {e}");
             problem(
@@ -51,6 +48,10 @@ pub(super) async fn device_start(State(state): State<Arc<AppState>>, _rl: RateLi
             )
         }
     }
+}
+
+fn device_verification_uri(public_url: Option<&str>) -> Option<String> {
+    public_url.map(|url| format!("{}/device", url.trim_end_matches('/')))
 }
 
 #[derive(Deserialize)]
@@ -120,6 +121,20 @@ pub(super) async fn approve_user_code(
         .map(|c| c.to_ascii_uppercase())
         .collect();
     crate::db::approve_device_grant(pool, &code, account).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::device_verification_uri;
+
+    #[test]
+    fn device_verification_uri_requires_a_public_origin() {
+        assert_eq!(device_verification_uri(None), None);
+        assert_eq!(
+            device_verification_uri(Some("https://chat.example/e6irc/")),
+            Some("https://chat.example/e6irc/device".into())
+        );
+    }
 }
 
 /// Approve a device grant as the signed-in user (cookie-authenticated).

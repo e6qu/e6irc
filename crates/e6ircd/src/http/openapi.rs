@@ -1020,7 +1020,8 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/auth/device/start": {
                 "post": { "summary": "Begin an RFC 8628 device authorization grant",
-                    "responses": { "200": { "description": "device_code, user_code, verification_uri" } } }
+                    "responses": { "200": { "description": "device_code, user_code, verification_uri" },
+                        "503": { "description": "database or absolute public URL unavailable" } } }
             },
             "/api/v1/auth/device/token": {
                 "post": { "summary": "Poll for the device grant's token",
