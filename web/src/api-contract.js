@@ -25,6 +25,49 @@ function objectValue(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function validSchemaType(type) {
+  return ["null", "array", "object", "string", "boolean", "integer", "number"].includes(type);
+}
+
+function schemaTypes(schema, label) {
+  if (!("type" in schema)) return [];
+  const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+  if (types.length === 0 || types.some((type) => !validSchemaType(type)) || new Set(types).size !== types.length) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  return types;
+}
+
+function nonNegativeInteger(schema, key, label) {
+  if (key in schema && (!Number.isSafeInteger(schema[key]) || schema[key] < 0)) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+}
+
+function finiteNumber(schema, key, label) {
+  if (key in schema && (typeof schema[key] !== "number" || !Number.isFinite(schema[key]))) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+}
+
+function closedObjectSchema(schema, label) {
+  if (schema.additionalProperties !== false) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  if ("properties" in schema && !objectValue(schema.properties)) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  if ("required" in schema && !Array.isArray(schema.required)) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  const properties = schema.properties ?? {};
+  const required = schema.required ?? [];
+  if (required.some((field) => typeof field !== "string" || !(field in properties)) || new Set(required).size !== required.length) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  return { properties, required };
+}
+
 function matchesType(value, type) {
   if (type === "null") return value === null;
   if (type === "array") return Array.isArray(value);
@@ -38,6 +81,31 @@ function matchesType(value, type) {
 
 export function parseApiSchema(schema, value, label = "API response", path = "$") {
   if (!objectValue(schema)) throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  const types = schemaTypes(schema, label);
+  if ("enum" in schema && (!Array.isArray(schema.enum) || schema.enum.length === 0)) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  if ("oneOf" in schema && (!Array.isArray(schema.oneOf) || schema.oneOf.length === 0)) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  nonNegativeInteger(schema, "minLength", label);
+  nonNegativeInteger(schema, "maxLength", label);
+  nonNegativeInteger(schema, "minItems", label);
+  nonNegativeInteger(schema, "maxItems", label);
+  finiteNumber(schema, "minimum", label);
+  finiteNumber(schema, "maximum", label);
+  if (Number.isSafeInteger(schema.minLength) && Number.isSafeInteger(schema.maxLength) && schema.minLength > schema.maxLength) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  if (Number.isSafeInteger(schema.minItems) && Number.isSafeInteger(schema.maxItems) && schema.minItems > schema.maxItems) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  if (typeof schema.minimum === "number" && typeof schema.maximum === "number" && schema.minimum > schema.maximum) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  if ("pattern" in schema && typeof schema.pattern !== "string") {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
   if ("const" in schema && !Object.is(schema.const, value)) schemaError(label, path);
   if (Array.isArray(schema.oneOf)) {
     const matches = schema.oneOf.flatMap((candidate) => {
@@ -51,17 +119,22 @@ export function parseApiSchema(schema, value, label = "API response", path = "$"
     if (matches.length !== 1) schemaError(label, path);
     return matches[0];
   }
-  if (schema.type !== undefined) {
-    const types = Array.isArray(schema.type) ? schema.type : [schema.type];
-    if (!types.some((type) => matchesType(value, type))) schemaError(label, path);
-  }
+  if (types.length > 0 && !types.some((type) => matchesType(value, type))) schemaError(label, path);
   if (Array.isArray(schema.enum) && !schema.enum.some((entry) => Object.is(entry, value))) {
     schemaError(label, path);
   }
   if (typeof value === "string") {
     if (Number.isInteger(schema.minLength) && value.length < schema.minLength) schemaError(label, path);
     if (Number.isInteger(schema.maxLength) && value.length > schema.maxLength) schemaError(label, path);
-    if (typeof schema.pattern === "string" && !(new RegExp(schema.pattern).test(value))) schemaError(label, path);
+    if (typeof schema.pattern === "string") {
+      let pattern;
+      try {
+        pattern = new RegExp(schema.pattern);
+      } catch {
+        throw new ApiSchemaError(`The ${label} schema is invalid.`);
+      }
+      if (!pattern.test(value)) schemaError(label, path);
+    }
     return value;
   }
   if (typeof value === "number") {
@@ -80,8 +153,8 @@ export function parseApiSchema(schema, value, label = "API response", path = "$"
   }
   if (!objectValue(value)) return value;
 
-  const properties = objectValue(schema.properties) ? schema.properties : {};
-  const required = Array.isArray(schema.required) ? new Set(schema.required) : new Set();
+  const { properties, required: requiredFields } = closedObjectSchema(schema, label);
+  const required = new Set(requiredFields);
   for (const field of required) {
     if (!(field in value)) schemaError(label, `${path}.${field}`);
   }

@@ -63,6 +63,28 @@ test("schema parser rejects incompatible and drifted JSON before a view uses it"
   }
 });
 
+test("schema parser rejects malformed constraints instead of weakening a projection", () => {
+  const valid = { name: "Libera", enabled: true, state: "connected" };
+  for (const schema of [
+    { ...responseSchema, type: "record" },
+    { ...responseSchema, type: [] },
+    { ...responseSchema, enum: "connected" },
+    { ...responseSchema, oneOf: [] },
+    { ...responseSchema, minLength: -1 },
+    { ...responseSchema, minimum: Number.NaN },
+    { ...responseSchema, pattern: 42 },
+    { ...responseSchema, properties: [] },
+    { ...responseSchema, required: ["missing"] },
+    { ...responseSchema, additionalProperties: true },
+  ]) {
+    assert.throws(() => parseApiSchema(schema, valid, "network response"), ApiSchemaError);
+  }
+  assert.throws(
+    () => parseApiSchema({ type: "string", pattern: "[" }, "Libera", "network response"),
+    ApiSchemaError,
+  );
+});
+
 test("schema parser enforces response status, constants, and array bounds", async () => {
   const document = {
     paths: {
