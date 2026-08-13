@@ -1236,6 +1236,8 @@ pub enum NetworkFailure {
     DriverStopped,
 }
 
+pub const NETWORK_FAILURE_HISTORY_LIMIT: usize = 8;
+
 impl NetworkFailure {
     pub const fn code(self) -> &'static str {
         match self {
@@ -1503,9 +1505,6 @@ impl NetworkRuntime {
         Self::set_error(&mut state, now, failure);
     }
 
-    /// How many classified failures the per-network history retains.
-    const FAILURE_HISTORY: usize = 8;
-
     fn set_error(
         state: &mut NetworkRuntimeState,
         now: e6irc_proto::time::Millis,
@@ -1517,7 +1516,7 @@ impl NetworkRuntime {
         state
             .recent_failures
             .push_back(FailureRecord { at: now, failure });
-        while state.recent_failures.len() > Self::FAILURE_HISTORY {
+        while state.recent_failures.len() > NETWORK_FAILURE_HISTORY_LIMIT {
             state.recent_failures.pop_front();
         }
     }
