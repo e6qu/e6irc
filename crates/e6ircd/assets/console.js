@@ -177,7 +177,13 @@ import { loadSettings, saveSettings } from "/console-settings.js";
 
   const configurationResult = document.getElementById("configuration-api-result");
 
-  const apiOperation = (method, url) => Object.freeze({ method, url });
+  const apiOperation = (method, url) => {
+    const parsed = new URL(url, window.location.origin);
+    if (parsed.origin !== window.location.origin || !parsed.pathname.startsWith("/api/v1/")) {
+      throw new Error("The API request URL is invalid. Reload and try again.");
+    }
+    return Object.freeze({ method, url: `${parsed.pathname}${parsed.search}` });
+  };
 
   const apiMutation = apiOperation;
 

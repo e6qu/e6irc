@@ -37,6 +37,30 @@ random_secret() {
   openssl rand -base64 48 | tr -d '\n'
 }
 
+start_shauth_stack() {
+  local attempt=1
+  local output
+  local status
+  while (( attempt <= 3 )); do
+    output="$temporary/compose-up-$attempt.log"
+    if "${compose[@]}" up --build --detach >"$output" 2>&1; then
+      cat "$output"
+      return
+    fi
+    status=$?
+    cat "$output" >&2
+    if ! grep -Fq 'failed to solve: Unavailable: error reading from server: EOF' "$output"; then
+      return "$status"
+    fi
+    if (( attempt == 3 )); then
+      return "$status"
+    fi
+    "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
+    sleep "$attempt"
+    ((attempt += 1))
+  done
+}
+
 cleanup() {
   status=$?
   for pid in "$primary_pid" "$secondary_pid"; do
@@ -68,12 +92,7 @@ export POSTGRES_PASSWORD
 HYDRA_SYSTEM_SECRET="$(random_secret)"
 export HYDRA_SYSTEM_SECRET
 export HYDRA_DSN="postgres://shauth:${POSTGRES_PASSWORD}@postgres:5432/hydra?sslmode=disable"
-# Shauth reverse-proxies /.well-known, /oauth2 and /userinfo to Ory Hydra, so
-# Hydra's issuer must be the origin relying parties actually reach. Advertising
-# Hydra's own container port here would serve a discovery document whose issuer
-# disagrees with the URL it was fetched from, which a conforming relying party
-# rejects. This mirrors the deployed topology, where one public origin fronts
-# both.
+# Shauth proxies Hydra on this public origin; the issuer must match discovery.
 export HYDRA_PUBLIC_URL="http://localhost:8080"
 export SHAUTH_PUBLIC_URL="http://localhost:8080"
 export SHAUTH_DATABASE_URL="postgres://shauth:${POSTGRES_PASSWORD}@postgres:5432/shauth?sslmode=disable"
@@ -133,7 +152,7 @@ SHAUTH_BOOTSTRAP_APPS_JSON="$(jq -cn \
   ]')"
 
 "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
-"${compose[@]}" up --build --detach
+start_shauth_stack
 
 for _ in $(seq 1 180); do
   if curl --fail --silent http://localhost:8080/healthz >/dev/null 2>&1 &&
