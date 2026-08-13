@@ -68,25 +68,17 @@ function closedObjectSchema(schema, label) {
   return { properties, required };
 }
 
-function matchesType(value, type) {
-  if (type === "null") return value === null;
-  if (type === "array") return Array.isArray(value);
-  if (type === "object") return objectValue(value);
-  if (type === "string") return typeof value === "string";
-  if (type === "boolean") return typeof value === "boolean";
-  if (type === "integer") return Number.isSafeInteger(value);
-  if (type === "number") return typeof value === "number" && Number.isFinite(value);
-  return false;
-}
-
-export function parseApiSchema(schema, value, label = "API response", path = "$") {
+function validateApiSchema(schema, label) {
   if (!objectValue(schema)) throw new ApiSchemaError(`The ${label} schema is invalid.`);
   const types = schemaTypes(schema, label);
   if ("enum" in schema && (!Array.isArray(schema.enum) || schema.enum.length === 0)) {
     throw new ApiSchemaError(`The ${label} schema is invalid.`);
   }
-  if ("oneOf" in schema && (!Array.isArray(schema.oneOf) || schema.oneOf.length === 0)) {
-    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  if ("oneOf" in schema) {
+    if (!Array.isArray(schema.oneOf) || schema.oneOf.length === 0) {
+      throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    }
+    for (const branch of schema.oneOf) validateApiSchema(branch, label);
   }
   nonNegativeInteger(schema, "minLength", label);
   nonNegativeInteger(schema, "maxLength", label);
@@ -103,9 +95,38 @@ export function parseApiSchema(schema, value, label = "API response", path = "$"
   if (typeof schema.minimum === "number" && typeof schema.maximum === "number" && schema.minimum > schema.maximum) {
     throw new ApiSchemaError(`The ${label} schema is invalid.`);
   }
-  if ("pattern" in schema && typeof schema.pattern !== "string") {
-    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  if ("pattern" in schema) {
+    if (typeof schema.pattern !== "string") throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    try {
+      new RegExp(schema.pattern);
+    } catch {
+      throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    }
   }
+  if (types.includes("array")) {
+    if (!objectValue(schema.items)) throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    validateApiSchema(schema.items, label);
+  }
+  if (types.includes("object")) {
+    const { properties } = closedObjectSchema(schema, label);
+    for (const property of Object.values(properties)) validateApiSchema(property, label);
+  }
+  return types;
+}
+
+function matchesType(value, type) {
+  if (type === "null") return value === null;
+  if (type === "array") return Array.isArray(value);
+  if (type === "object") return objectValue(value);
+  if (type === "string") return typeof value === "string";
+  if (type === "boolean") return typeof value === "boolean";
+  if (type === "integer") return Number.isSafeInteger(value);
+  if (type === "number") return typeof value === "number" && Number.isFinite(value);
+  return false;
+}
+
+export function parseApiSchema(schema, value, label = "API response", path = "$") {
+  const types = validateApiSchema(schema, label);
   if ("const" in schema && !Object.is(schema.const, value)) schemaError(label, path);
   if (Array.isArray(schema.oneOf)) {
     const matches = schema.oneOf.flatMap((candidate) => {
@@ -126,15 +147,7 @@ export function parseApiSchema(schema, value, label = "API response", path = "$"
   if (typeof value === "string") {
     if (Number.isInteger(schema.minLength) && value.length < schema.minLength) schemaError(label, path);
     if (Number.isInteger(schema.maxLength) && value.length > schema.maxLength) schemaError(label, path);
-    if (typeof schema.pattern === "string") {
-      let pattern;
-      try {
-        pattern = new RegExp(schema.pattern);
-      } catch {
-        throw new ApiSchemaError(`The ${label} schema is invalid.`);
-      }
-      if (!pattern.test(value)) schemaError(label, path);
-    }
+    if (typeof schema.pattern === "string" && !(new RegExp(schema.pattern).test(value))) schemaError(label, path);
     return value;
   }
   if (typeof value === "number") {

@@ -83,6 +83,13 @@ test("schema parser rejects malformed constraints instead of weakening a project
     () => parseApiSchema({ type: "string", pattern: "[" }, "Libera", "network response"),
     ApiSchemaError,
   );
+  for (const schema of [
+    { type: "array", items: { type: "record" } },
+    { type: "array" },
+    { type: "object", additionalProperties: false, properties: { nested: { type: "record" } } },
+  ]) {
+    assert.throws(() => parseApiSchema(schema, schema.type === "array" ? [] : {}, "network response"), ApiSchemaError);
+  }
 });
 
 test("schema parser enforces response status, constants, and array bounds", async () => {
