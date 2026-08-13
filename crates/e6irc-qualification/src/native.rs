@@ -329,9 +329,10 @@ async fn discord(_target: &str) -> ProbeReport {
             PhaseOutcome::NotRun,
         );
     };
-    let persistence = request_outcome(
+    let persistence = json_outcome(
         http.get(message_url.clone().into_url())
             .header("Authorization", &authorization),
+        |json| discord_readback_matches(json, &id),
     )
     .await;
     let cleanup = request_outcome(
@@ -347,6 +348,10 @@ async fn discord(_target: &str) -> ProbeReport {
         cleanup,
         persistence,
     )
+}
+
+fn discord_readback_matches(json: &serde_json::Value, id: &str) -> bool {
+    json.get("id").and_then(serde_json::Value::as_str) == Some(id)
 }
 
 async fn discord_connect(url: &CampaignSocketUrl, token: &str) -> PhaseOutcome {

@@ -452,6 +452,19 @@ fn slack_readback_requires_the_posted_message() {
     ));
 }
 
+#[test]
+fn discord_readback_requires_the_posted_message() {
+    assert!(discord_readback_matches(
+        &serde_json::json!({"id":"m1"}),
+        "m1"
+    ));
+    assert!(!discord_readback_matches(
+        &serde_json::json!({"id":"other"}),
+        "m1"
+    ));
+    assert!(!discord_readback_matches(&serde_json::json!({}), "m1"));
+}
+
 #[tokio::test]
 async fn discord_oracle_proves_all_required_phases_and_cleanup() {
     let _environment = ENVIRONMENT

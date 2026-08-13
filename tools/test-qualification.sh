@@ -29,6 +29,8 @@ run() {
   shift
   local target=example.test
   case "$kind" in
+    discord) target=discord.com ;;
+    slack) target=slack.com ;;
     oidc) target=https://issuer.example.test ;;
     public-irc) target=libera ;;
   esac
@@ -130,6 +132,36 @@ else
   [[ $? -eq 2 ]]
 fi
 [[ ! -e "$temporary/oracle-discord.json" ]]
+
+if "$bin" discord \
+  --target example.test \
+  --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --host qualification-host \
+  --executable "$bin" \
+  --output "$temporary/mislabeled-discord.json" \
+  --workload sessions=1 \
+  --budget timeout_seconds=1; then
+  echo 'mislabeled Discord campaign unexpectedly parsed' >&2
+  exit 1
+else
+  [[ $? -eq 2 ]]
+fi
+[[ ! -e "$temporary/mislabeled-discord.json" ]]
+
+if "$bin" slack \
+  --target example.test \
+  --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --host qualification-host \
+  --executable "$bin" \
+  --output "$temporary/mislabeled-slack.json" \
+  --workload sessions=1 \
+  --budget timeout_seconds=1; then
+  echo 'mislabeled Slack campaign unexpectedly parsed' >&2
+  exit 1
+else
+  [[ $? -eq 2 ]]
+fi
+[[ ! -e "$temporary/mislabeled-slack.json" ]]
 
 if "$bin" oidc \
   --target http://127.0.0.1:1 \

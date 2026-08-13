@@ -9,7 +9,7 @@ on:
         type: choice
         options: [discord, slack, oidc, public-irc, scale]
       target:
-        description: Non-secret provider, issuer, network, or host identifier
+        description: discord.com, slack.com, OIDC issuer URL, public network, or scale listener
         required: true
         type: string
       host:
