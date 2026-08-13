@@ -31,7 +31,8 @@ does not start a network request. Values are never included in output.
 Discord performs channel authentication, two gateway sessions, message post,
 read-back, and deletion. Slack performs `auth.test`, two Socket Mode sessions,
 message post, thread read-back, and deletion. OIDC verifies the discovered
-issuer, gets two client-credential tokens, introspects one, and revokes it.
+issuer, gets two client-credential tokens, introspects one, revokes it, and
+proves that introspection marks it inactive.
 Provider HTTP endpoints use HTTPS and provider WebSocket endpoints use WSS.
 Loopback oracles may use HTTP and WS. OIDC metadata cannot cross between those
 trust domains. Provider-signed WebSocket query parameters stay in memory.
