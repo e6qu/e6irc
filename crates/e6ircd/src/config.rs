@@ -523,8 +523,8 @@ pub struct OperConfig {
 #[serde(deny_unknown_fields)]
 pub struct HttpConfig {
     pub addr: SocketAddr,
-    /// Externally reachable base URL (scheme://host[:port]), used to
-    /// build OIDC redirect URIs. Required when [[oidc]] is configured.
+    /// Externally reachable base URL for browser and device links.
+    /// Required for OIDC, device login, and account invitations.
     #[serde(default)]
     pub public_url: Option<String>,
     /// Mark session cookies Secure (default true; disable only for
