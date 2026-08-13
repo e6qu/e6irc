@@ -304,6 +304,9 @@ test("operation parser rejects parameters the browser cannot enforce", () => {
     { name: "session", in: "cookie", schema: { type: "string" } },
     { name: "limit", in: "query", schema: { type: "array" } },
     { name: "limit", in: "query", schema: { type: "string" } },
+    { name: "limit", in: "query", style: "spaceDelimited", schema: { type: "integer" } },
+    { name: "limit", in: "query", allowReserved: "false", schema: { type: "integer" } },
+    { name: "id", in: "path", explode: true, required: true, schema: { type: "integer" } },
   ]) {
     const document = {
       paths: {
@@ -315,7 +318,7 @@ test("operation parser rejects parameters the browser cannot enforce", () => {
         },
       },
     };
-    assert.throws(() => parseOperationQuery(document, "GET", "/api/v1/me/widgets"), ApiSchemaError);
+    assert.throws(() => operationResponseSchema(document, "GET", "/api/v1/me/widgets"), ApiSchemaError);
   }
 });
 

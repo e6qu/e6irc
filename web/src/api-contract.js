@@ -199,6 +199,7 @@ function declaredOperation(document, method, url) {
   if (!objectValue(operation)) {
     throw new ApiSchemaError(`The API contract does not describe ${method.toUpperCase()} ${pathname}.`);
   }
+  operationParameters(operation, "API operation");
   return { pathname, path: match[0], operation };
 }
 
@@ -242,7 +243,12 @@ function operationParameters(operation, label) {
       || typeof parameter.name !== "string"
       || parameter.name === ""
       || (parameter.required !== undefined && typeof parameter.required !== "boolean")
-      || (parameter.in === "path" && parameter.required !== true)) {
+      || (parameter.in === "path" && parameter.required !== true)
+      || (parameter.style !== undefined && parameter.style !== (parameter.in === "path" ? "simple" : "form"))
+      || (parameter.explode !== undefined && parameter.explode !== (parameter.in === "query"))
+      || (parameter.allowReserved !== undefined && parameter.allowReserved !== false)
+      || parameter.allowEmptyValue !== undefined
+      || parameter.content !== undefined) {
       throw new ApiSchemaError(`The ${label} schema is invalid.`);
     }
     const name = `${parameter.in}:${parameter.name}`;
