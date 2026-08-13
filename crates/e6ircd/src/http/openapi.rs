@@ -1308,10 +1308,10 @@ fn document() -> serde_json::Value {
                                 "addr": { "type": "string" },
                                 "tls": { "type": "boolean" },
                                 "nick": { "type": "string" },
-                                "realname": { "type": "string" },
+                                "realname": { "type": ["string", "null"] },
                                 "autojoin": { "type": "array", "items": { "type": "string" } },
-                                "sasl_account": { "type": "string" },
-                                "sasl_password": { "type": "string" } } } } } },
+                                "sasl_account": { "type": ["string", "null"] },
+                                "sasl_password": { "type": ["string", "null"] } } } } } },
                     "responses": { "201": network_created_response["201"],
                         "409": { "description": "duplicate name, or upstream secret with no master key" } } }
             },
@@ -1327,9 +1327,9 @@ fn document() -> serde_json::Value {
                                 "addr": { "type": "string", "minLength": 1, "maxLength": 255 },
                                 "tls": { "type": "boolean" },
                                 "nick": { "type": "string", "minLength": 1, "maxLength": 64 },
-                                "realname": { "type": "string", "maxLength": 128 },
-                                "sasl_account": { "type": "string", "minLength": 1, "maxLength": 255, "writeOnly": true },
-                                "sasl_password": { "type": "string", "minLength": 1, "maxLength": 512, "writeOnly": true }
+                                "realname": { "type": ["string", "null"], "maxLength": 128 },
+                                "sasl_account": { "type": ["string", "null"], "minLength": 1, "maxLength": 255, "writeOnly": true },
+                                "sasl_password": { "type": ["string", "null"], "minLength": 1, "maxLength": 512, "writeOnly": true }
                             } } } } },
                     "responses": {
                         "200": {
@@ -1916,6 +1916,21 @@ mod tests {
             if schema.get("oneOf").is_none() {
                 assert_eq!(schema["type"], "object", "{method} {path}");
                 assert_eq!(schema["additionalProperties"], false, "{method} {path}");
+            }
+        }
+    }
+
+    #[test]
+    fn optional_network_request_fields_accept_null() {
+        let spec = super::document();
+        for path in ["/api/v1/me/networks", "/api/v1/me/networks/preflight"] {
+            for field in ["realname", "sasl_account", "sasl_password"] {
+                assert_eq!(
+                    spec["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]
+                        ["properties"][field]["type"],
+                    serde_json::json!(["string", "null"]),
+                    "{path} {field}",
+                );
             }
         }
     }
