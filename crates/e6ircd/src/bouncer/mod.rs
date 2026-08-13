@@ -1289,6 +1289,14 @@ impl NetworkFailure {
     }
 }
 
+fn failure_notice(failure: NetworkFailure) -> String {
+    format!(
+        ":*bnc* NOTICE * :component error: {} ({})",
+        failure.summary(),
+        failure.code()
+    )
+}
+
 /// One classified failure with when it happened — the unit of the bounded
 /// per-network failure history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1686,6 +1694,16 @@ pub enum SendOutcome {
 }
 
 impl NetworkHandle {
+    fn emit_notice(&self, failure: NetworkFailure) {
+        let line = failure_notice(failure);
+        let line = crate::sanitize::upstream_line(line);
+        self.buffer
+            .lock()
+            .expect("buffer poisoned")
+            .push(line.clone());
+        drop(self.events.send(DriverEvent::Line(line)));
+    }
+
     /// Try to hand a raw line to the upstream network **without blocking**.
     ///
     /// The command queue is bounded and *shared by every client attached to the
@@ -1974,6 +1992,7 @@ impl NetworkHandle {
 
     pub(crate) fn record_error(&self, failure: NetworkFailure) {
         record_network_error(&self.runtime, &self.telemetry, failure);
+        self.emit_notice(failure);
     }
 }
 
@@ -2005,6 +2024,7 @@ impl DriverEnds {
     #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
     pub(crate) fn record_error(&self, failure: NetworkFailure) {
         record_network_error(&self.runtime, &self.telemetry, failure);
+        self.emit_failure_notice(failure);
     }
 
     /// Record a line to the detached buffer and broadcast it live. The line
@@ -2039,6 +2059,11 @@ impl DriverEnds {
         // A detached network legitimately has no live subscribers; the line is
         // still retained in the buffer above.
         drop(self.events.send(DriverEvent::Line(line)));
+    }
+
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    fn emit_failure_notice(&self, failure: NetworkFailure) {
+        self.emit_notice(failure_notice(failure));
     }
 
     /// Record a synthesized self-echo: a copy of a line an attached client
@@ -2682,6 +2707,22 @@ mod tests {
             "{runtime:?}"
         );
         assert_eq!(telemetry.snapshot(0, 0).errors["bouncer"], 1);
+        assert_eq!(
+            handle.buffer_snapshot(),
+            vec![failure_notice(NetworkFailure::BacklogStorageFailed)]
+        );
+    }
+
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    #[test]
+    fn bridge_error_is_a_component_log_notice() {
+        let (handle, ends) = NetworkHandle::channels(8);
+        ends.record_error(NetworkFailure::UpstreamRequestFailed);
+
+        assert_eq!(
+            handle.buffer_snapshot(),
+            vec![failure_notice(NetworkFailure::UpstreamRequestFailed)]
+        );
     }
 
     #[tokio::test]
