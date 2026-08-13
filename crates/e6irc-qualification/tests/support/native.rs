@@ -399,6 +399,26 @@ fn endpoint_urls_cannot_carry_credentials_or_tokens() {
 }
 
 #[test]
+fn provider_socket_urls_require_secure_or_loopback_transport() {
+    assert!(CampaignSocketUrl::parse("wss://gateway.example/socket").is_some());
+    assert!(CampaignSocketUrl::parse("wss://gateway.example/socket?ticket=secret").is_some());
+    assert!(CampaignSocketUrl::parse("ws://127.0.0.1/socket").is_some());
+    assert!(CampaignSocketUrl::parse("ws://gateway.example/socket").is_none());
+    assert!(CampaignSocketUrl::parse("wss://user:secret@gateway.example/socket").is_none());
+    assert!(CampaignSocketUrl::parse("wss://gateway.example/socket#fragment").is_none());
+}
+
+#[test]
+fn oidc_metadata_endpoints_cannot_cross_the_loopback_boundary() {
+    let external = safe_url("https://issuer.example").expect("issuer");
+    let loopback = safe_url("http://127.0.0.1/issuer").expect("issuer");
+    assert!(oidc_endpoint(&external, "https://tokens.example/token").is_some());
+    assert!(oidc_endpoint(&external, "http://127.0.0.1/token").is_none());
+    assert!(oidc_endpoint(&loopback, "http://127.0.0.1/token").is_some());
+    assert!(oidc_endpoint(&loopback, "https://tokens.example/token").is_none());
+}
+
+#[test]
 fn oidc_discovery_keeps_the_issuer_path() {
     let issuer = safe_url("https://issuer.example/realms/e6").expect("issuer");
     assert_eq!(

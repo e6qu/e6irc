@@ -1410,6 +1410,13 @@ HTTP/WebSocket contract oracles. Shipped credential-gated campaigns perform
 provider authentication, two sessions, delivery, read-back, and cleanup; a
 commercial-provider claim still requires retained passed evidence.
 
+External qualification parses provider-discovered HTTP and WebSocket endpoints
+before it sends credentials. HTTP endpoints use HTTPS unless the issuer is a
+loopback test oracle; WebSockets use WSS under the same rule. OIDC metadata
+cannot cross between the external and loopback trust domains. Signed provider
+WebSocket query parameters stay inside the typed endpoint and never enter
+evidence.
+
 Design constraints recorded now:
 
 - Per-user ("personal bouncer", Bitlbee-style) mode is the primary mode and
