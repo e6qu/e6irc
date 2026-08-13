@@ -208,7 +208,8 @@ fn document() -> serde_json::Value {
     let buffer_response = serde_json::json!({
         "200": { "description": "buffered lines", "content": { "application/json": {
             "schema": { "type": "object", "required": ["lines"], "additionalProperties": false,
-                "properties": { "lines": { "type": "array", "items": { "type": "string" } } }
+                "properties": { "lines": { "type": "array", "maxItems": 1000,
+                    "items": { "type": "string", "maxLength": 510 } } }
             }
         } } }
     });
@@ -246,7 +247,9 @@ fn document() -> serde_json::Value {
                 "attached_clients": { "type": "integer", "minimum": 0 }, "traffic_in": { "type": "string" }, "traffic_out": { "type": "string" },
                 "lines_in": { "type": "integer", "minimum": 0 }, "lines_out": { "type": "integer", "minimum": 0 },
                 "memory_buffer": { "type": "string" }, "stored_lines": { "type": "integer", "minimum": 0 },
-                "stored_oldest": { "type": "string" }, "stored_newest": { "type": "string" }, "recent_lines": { "type": "array", "items": { "type": "string" } }
+                "stored_oldest": { "type": "string" }, "stored_newest": { "type": "string" },
+                "recent_lines": { "type": "array", "maxItems": 100,
+                    "items": { "type": "string", "maxLength": 510 } }
             }
         }),
     );
