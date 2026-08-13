@@ -1527,9 +1527,9 @@ Surface (initial):
 
 The OpenAPI 3.1 document at `/api/v1/openapi.json` is hand-authored for
 request/response semantics and always served (no feature gate, no utoipa
-dependency). Its method/path inventory and the Axum API router are generated
-from one route catalog; a mismatch is a unit-test failure and the endpoint
-refuses to serve a plausible but incomplete contract.
+dependency). Its method/path inventory and path/query parameter declarations
+are checked against the Axum API router; a mismatch is a unit-test failure and
+the endpoint refuses to serve a plausible but incomplete contract.
 
 ---
 
@@ -1544,7 +1544,8 @@ reads and mutations use `/api/v1`; no `/console` mutation route exists. The
 always-served, same-origin `/console.js` hydrates those API-backed controls,
 including explicit confirmation, retry, and failure states. The console works
 in the default build and `embed-web`; its private pages permit only that
-same-origin script.
+same-origin script. The shared browser contract parser validates each path,
+query, JSON request, and JSON response before a request or view uses it.
 `/console/channels` lets an identified live channel operator register it, then
 manage the retained topic, KEEPTOPIC, canonical mode lock,
 auto-op/auto-voice grants, ownership transfer, and unregister lifecycle

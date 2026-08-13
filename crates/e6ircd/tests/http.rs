@@ -856,6 +856,13 @@ async fn openapi_spec_is_served() {
     assert!(head.to_lowercase().contains("application/json"), "{head}");
     let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON spec");
     assert_eq!(v["openapi"], "3.1.0");
+    assert_eq!(
+        v["paths"]["/api/v1/me/tokens/{id}"]["delete"]["parameters"],
+        serde_json::json!([{
+            "name": "id", "in": "path", "required": true,
+            "schema": { "type": "integer" }
+        }])
+    );
     let identity_schema = &v["paths"]["/api/v1/me"]["get"]["responses"]["200"]["content"]["application/json"]
         ["schema"];
     assert_eq!(identity_schema["additionalProperties"], false);

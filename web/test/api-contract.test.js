@@ -10,6 +10,8 @@ import {
   operationRequestSchema,
   operationResponseSchema,
   parseApiSchema,
+  parseOperationPath,
+  parseOperationQuery,
   parseOperationResponse,
   serializeOperationRequest,
 } from "../src/api-contract.js";
@@ -154,6 +156,83 @@ test("operation parser rejects ambiguous templates", () => {
     () => operationResponseSchema(document, "GET", "/api/v1/me/widgets/current"),
     /ambiguous paths/,
   );
+});
+
+test("operation parser rejects invalid queries before a request leaves the browser", async () => {
+  const document = {
+    paths: {
+      "/api/v1/me/widgets": {
+        get: {
+          parameters: [
+            { name: "limit", in: "query", schema: { type: "integer", minimum: 1, maximum: 100 } },
+            { name: "active", in: "query", required: true, schema: { type: "boolean" } },
+          ],
+          responses: { 200: { content: { "application/json": { schema: { type: "object" } } } } },
+        },
+      },
+    },
+  };
+  parseOperationQuery(document, "GET", "/api/v1/me/widgets?limit=10&active=true");
+  for (const query of ["?limit=0&active=true", "?limit=1.5&active=true", "?limit=10&active=yes", "?limit=10", "?limit=10&active=true&extra=x", "?limit=10&active=true&limit=11"]) {
+    assert.throws(() => parseOperationQuery(document, "GET", `/api/v1/me/widgets${query}`), ApiSchemaError);
+  }
+  let requested = false;
+  await assert.rejects(getOperationJson(async () => {
+    requested = true;
+    return new Response();
+  }, document, "GET", "/api/v1/me/widgets?limit=0&active=true"), ApiSchemaError);
+  assert.equal(requested, false);
+});
+
+test("operation parser rejects invalid path parameters before a request leaves the browser", async () => {
+  const document = {
+    paths: {
+      "/api/v1/me/widgets/{id}": {
+        get: {
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } }],
+          responses: { 200: { content: { "application/json": { schema: { type: "object" } } } } },
+        },
+      },
+    },
+  };
+  parseOperationPath(document, "GET", "/api/v1/me/widgets/42");
+  for (const path of ["/api/v1/me/widgets/0", "/api/v1/me/widgets/1.5", "/api/v1/me/widgets/nope"]) {
+    assert.throws(() => parseOperationPath(document, "GET", path), ApiSchemaError);
+  }
+  let requested = false;
+  await assert.rejects(getOperationJson(async () => {
+    requested = true;
+    return new Response();
+  }, document, "GET", "/api/v1/me/widgets/nope"), ApiSchemaError);
+  assert.equal(requested, false);
+});
+
+test("operation parser rejects parameters with unsupported wire types", () => {
+  const document = {
+    paths: {
+      "/api/v1/me/widgets": {
+        get: {
+          parameters: [{ name: "ids", in: "query", schema: { type: "array", items: { type: "integer" } } }],
+          responses: { 200: { content: { "application/json": { schema: { type: "object" } } } } },
+        },
+      },
+    },
+  };
+  assert.throws(() => parseOperationQuery(document, "GET", "/api/v1/me/widgets?ids=1"), ApiSchemaError);
+});
+
+test("operation parser requires documented path parameters", () => {
+  const document = {
+    paths: {
+      "/api/v1/me/widgets/{id}": {
+        get: {
+          parameters: [{ name: "id", in: "path", schema: { type: "integer" } }],
+          responses: { 200: { content: { "application/json": { schema: { type: "object" } } } } },
+        },
+      },
+    },
+  };
+  assert.throws(() => parseOperationPath(document, "GET", "/api/v1/me/widgets/1"), ApiSchemaError);
 });
 
 test("operation request serializer closes and validates documented JSON", () => {

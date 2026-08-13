@@ -105,7 +105,90 @@ function declaredOperation(document, method, url) {
   if (!objectValue(operation)) {
     throw new ApiSchemaError(`The API contract does not describe ${method.toUpperCase()} ${pathname}.`);
   }
-  return { pathname, operation };
+  return { pathname, path: match[0], operation };
+}
+
+function queryValue(schema, value, label, path) {
+  if (schema.type === "boolean") {
+    if (value === "true") return true;
+    if (value === "false") return false;
+    schemaError(label, path);
+  }
+  if (schema.type === "integer") {
+    if (!/^-?(?:0|[1-9][0-9]*)$/.test(value)) schemaError(label, path);
+    const parsed = Number(value);
+    if (!Number.isSafeInteger(parsed)) schemaError(label, path);
+    return parsed;
+  }
+  if (schema.type === "number") {
+    if (!/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$/.test(value)) schemaError(label, path);
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) schemaError(label, path);
+    return parsed;
+  }
+  return value;
+}
+
+function parameterSchema(parameter, label) {
+  if (!objectValue(parameter.schema) || !["string", "boolean", "integer", "number"].includes(parameter.schema.type)) {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
+  return parameter.schema;
+}
+
+export function parseOperationQuery(document, method, url, label = "API query") {
+  const { operation } = declaredOperation(document, method, url);
+  const parameters = Array.isArray(operation.parameters) ? operation.parameters : [];
+  const schemas = new Map();
+  for (const parameter of parameters) {
+    if (!objectValue(parameter) || parameter.in !== "query" || typeof parameter.name !== "string" || parameter.name === "") {
+      if (objectValue(parameter) && parameter.in !== "query") continue;
+      throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    }
+    if (schemas.has(parameter.name)) throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    schemas.set(parameter.name, { ...parameter, schema: parameterSchema(parameter, label) });
+  }
+  const query = new URL(url, "https://e6irc.invalid").searchParams;
+  for (const name of new Set(query.keys())) {
+    const parameter = schemas.get(name);
+    if (!parameter || query.getAll(name).length !== 1) schemaError(label, `$.${name}`);
+    parseApiSchema(parameter.schema, queryValue(parameter.schema, query.get(name), label, `$.${name}`), label, `$.${name}`);
+  }
+  for (const [name, parameter] of schemas) {
+    if (parameter.required === true && !query.has(name)) schemaError(label, `$.${name}`);
+  }
+}
+
+export function parseOperationPath(document, method, url, label = "API path") {
+  const { pathname, path, operation } = declaredOperation(document, method, url);
+  const parameters = Array.isArray(operation.parameters) ? operation.parameters : [];
+  const schemas = new Map();
+  for (const parameter of parameters) {
+    if (!objectValue(parameter) || parameter.in !== "path" || typeof parameter.name !== "string" || parameter.name === "" || parameter.required !== true) {
+      if (objectValue(parameter) && parameter.in !== "path") continue;
+      throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    }
+    if (schemas.has(parameter.name)) throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    schemas.set(parameter.name, parameterSchema(parameter, label));
+  }
+  const actual = pathname.split("/");
+  const expected = path.split("/");
+  for (let index = 0; index < expected.length; index += 1) {
+    const match = /^\{([^}]+)\}$/.exec(expected[index]);
+    if (!match) continue;
+    const schema = schemas.get(match[1]);
+    if (!schema) throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    let value;
+    try {
+      value = decodeURIComponent(actual[index]);
+    } catch {
+      schemaError(label, `$.${match[1]}`);
+    }
+    parseApiSchema(schema, queryValue(schema, value, label, `$.${match[1]}`), label, `$.${match[1]}`);
+  }
+  for (const [name] of schemas) {
+    if (!path.includes(`{${name}}`)) throw new ApiSchemaError(`The ${label} schema is invalid.`);
+  }
 }
 
 function matchingPath(paths, pathname) {
@@ -218,6 +301,8 @@ export function apiContractLoader(fetcher) {
 
 export async function getOperationJson(fetcher, document, method, url, options = {}) {
   const { operation } = declaredOperation(document, method, url);
+  parseOperationPath(document, method, url);
+  parseOperationQuery(document, method, url);
   const { json, body: ignoredBody, ...request } = options;
   if (ignoredBody !== undefined) {
     throw new ApiSchemaError("JSON API requests must use the json option.");

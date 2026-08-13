@@ -1090,6 +1090,8 @@ fn document() -> serde_json::Value {
             "/api/v1/me/tokens/{id}": {
                 "delete": { "summary": "Revoke one of your personal access tokens",
                     "security": authenticated,
+                    "parameters": [{ "name": "id", "in": "path", "required": true,
+                        "schema": { "type": "integer" } }],
                     "responses": { "204": { "description": "revoked" },
                         "404": { "description": "no such token" } } }
             },
@@ -1785,22 +1787,104 @@ fn validate_documented_operations(spec: &serde_json::Value) -> Result<(), String
         .collect();
     let expected: std::collections::BTreeSet<(&str, &str)> =
         super::DOCUMENTED_ROUTE_OPERATIONS.iter().copied().collect();
-    if actual == expected {
-        return Ok(());
+    if actual != expected {
+        let missing: Vec<String> = expected
+            .difference(&actual)
+            .map(|(path, method)| format!("{} {}", method.to_ascii_uppercase(), path))
+            .collect();
+        let extra: Vec<String> = actual
+            .difference(&expected)
+            .map(|(path, method)| format!("{} {}", method.to_ascii_uppercase(), path))
+            .collect();
+        return Err(format!(
+            "OpenAPI/router operation mismatch; missing from spec: [{}]; absent from router: [{}]",
+            missing.join(", "),
+            extra.join(", ")
+        ));
     }
-    let missing: Vec<String> = expected
-        .difference(&actual)
-        .map(|(path, method)| format!("{} {}", method.to_ascii_uppercase(), path))
-        .collect();
-    let extra: Vec<String> = actual
-        .difference(&expected)
-        .map(|(path, method)| format!("{} {}", method.to_ascii_uppercase(), path))
-        .collect();
-    Err(format!(
-        "OpenAPI/router operation mismatch; missing from spec: [{}]; absent from router: [{}]",
-        missing.join(", "),
-        extra.join(", ")
-    ))
+
+    for (path, item) in paths {
+        let path_parameters: std::collections::BTreeSet<&str> = path
+            .split('/')
+            .filter_map(|segment| segment.strip_prefix('{')?.strip_suffix('}'))
+            .collect();
+        for method in methods {
+            let Some(operation) = item.get(method) else {
+                continue;
+            };
+            let parameters: &[serde_json::Value] = match operation.get("parameters") {
+                Some(parameters) => parameters
+                    .as_array()
+                    .ok_or_else(|| format!("OpenAPI {method} {path} parameters is not an array"))?,
+                None => &[],
+            };
+            let mut documented_path_parameters = std::collections::BTreeSet::new();
+            let mut documented_query_parameters = std::collections::BTreeSet::new();
+            for parameter in parameters {
+                let Some(parameter) = parameter.as_object() else {
+                    return Err(format!(
+                        "OpenAPI {method} {path} has a non-object parameter"
+                    ));
+                };
+                let name = parameter
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| format!("OpenAPI {method} {path} has an unnamed parameter"))?;
+                let location = parameter.get("in").and_then(serde_json::Value::as_str);
+                if !matches!(location, Some("path" | "query")) {
+                    return Err(format!(
+                        "OpenAPI {method} {path} parameter {name} has an unsupported location"
+                    ));
+                }
+                let schema = parameter
+                    .get("schema")
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| {
+                        format!("OpenAPI {method} {path} parameter {name} has no schema")
+                    })?;
+                if !matches!(
+                    schema.get("type").and_then(serde_json::Value::as_str),
+                    Some("string" | "boolean" | "integer" | "number")
+                ) {
+                    return Err(format!(
+                        "OpenAPI {method} {path} parameter {name} has an unsupported schema"
+                    ));
+                }
+                if location == Some("path") {
+                    if parameter
+                        .get("required")
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(true)
+                    {
+                        return Err(format!(
+                            "OpenAPI {method} {path} path parameter {name} is not required"
+                        ));
+                    }
+                    if !documented_path_parameters.insert(name) {
+                        return Err(format!(
+                            "OpenAPI {method} {path} duplicates path parameter {name}"
+                        ));
+                    }
+                } else if !documented_query_parameters.insert(name) {
+                    return Err(format!(
+                        "OpenAPI {method} {path} duplicates query parameter {name}"
+                    ));
+                }
+            }
+            if documented_path_parameters != path_parameters {
+                return Err(format!(
+                    "OpenAPI {method} {path} path parameters differ; documented: [{}], template: [{}]",
+                    documented_path_parameters
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    path_parameters.into_iter().collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Serve the validated contract. A drifted build does not hand automation a
@@ -1896,6 +1980,20 @@ mod tests {
     fn openapi_covers_every_documented_router_operation_exactly() {
         let spec = super::document();
         assert_eq!(super::validate_documented_operations(&spec), Ok(()));
+    }
+
+    #[test]
+    fn openapi_rejects_a_route_path_parameter_missing_from_an_operation() {
+        let mut spec = super::document();
+        spec["paths"]["/api/v1/me/tokens/{id}"]["delete"]
+            .as_object_mut()
+            .expect("token deletion operation")
+            .remove("parameters");
+        assert!(
+            super::validate_documented_operations(&spec)
+                .expect_err("missing path parameter must reject the contract")
+                .contains("/api/v1/me/tokens/{id} path parameters differ")
+        );
     }
 
     #[test]
