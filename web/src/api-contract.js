@@ -77,6 +77,15 @@ function validateApiSchema(schema, label) {
   if ("enum" in schema && (!Array.isArray(schema.enum) || schema.enum.length === 0)) {
     throw new ApiSchemaError(`The ${label} schema is invalid.`);
   }
+  const requiresType = (keys, allowed) => {
+    if (keys.some((key) => key in schema) && !types.some((type) => allowed.includes(type))) {
+      throw new ApiSchemaError(`The ${label} schema is invalid.`);
+    }
+  };
+  requiresType(["minLength", "maxLength", "pattern"], ["string"]);
+  requiresType(["minimum", "maximum"], ["integer", "number"]);
+  requiresType(["items", "minItems", "maxItems", "uniqueItems"], ["array"]);
+  requiresType(["properties", "required", "additionalProperties"], ["object"]);
   if ("oneOf" in schema) {
     if (!Array.isArray(schema.oneOf) || schema.oneOf.length === 0) {
       throw new ApiSchemaError(`The ${label} schema is invalid.`);
@@ -105,6 +114,9 @@ function validateApiSchema(schema, label) {
     } catch {
       throw new ApiSchemaError(`The ${label} schema is invalid.`);
     }
+  }
+  if ("uniqueItems" in schema && typeof schema.uniqueItems !== "boolean") {
+    throw new ApiSchemaError(`The ${label} schema is invalid.`);
   }
   if (types.includes("array")) {
     if (!objectValue(schema.items)) throw new ApiSchemaError(`The ${label} schema is invalid.`);

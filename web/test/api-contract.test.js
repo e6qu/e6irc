@@ -76,6 +76,10 @@ test("schema parser rejects malformed constraints instead of weakening a project
     { ...responseSchema, properties: [] },
     { ...responseSchema, required: ["missing"] },
     { ...responseSchema, additionalProperties: true },
+    { type: "boolean", minLength: 1 },
+    { type: "string", minimum: 1 },
+    { type: "object", items: { type: "string" } },
+    { type: "array", uniqueItems: "true", items: { type: "string" } },
   ]) {
     assert.throws(() => parseApiSchema(schema, valid, "network response"), ApiSchemaError);
   }
