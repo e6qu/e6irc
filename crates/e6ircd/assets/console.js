@@ -606,6 +606,59 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     if (Number.isFinite(seconds) && seconds >= 5) window.setInterval(() => void refresh(), seconds * 1000);
   }
 
+  const renderServerLog = (panel, entries) => {
+    const log = element("div", "backlog");
+    log.setAttribute("role", "log");
+    log.setAttribute("aria-label", "Live server logs");
+    if (entries.length === 0) {
+      log.append(element("p", "empty", "No operational events have been recorded yet."));
+    } else {
+      for (const entry of entries) {
+        const at = new Date(entry.at_ms).toISOString();
+        log.append(element("code", "", `${at} — ${entry.component} — ${entry.severity}: ${entry.message}`));
+      }
+    }
+    panel.replaceChildren(log);
+  };
+
+  const refreshServerLogNow = async (root) => {
+    const panel = root.querySelector("#server-log-panel");
+    const status = document.getElementById(root.dataset.refreshStatus);
+    if (!(panel instanceof HTMLElement)) return;
+    panel.setAttribute("aria-busy", "true");
+    if (status) {
+      status.textContent = "Refreshing…";
+      status.classList.remove("refresh-error");
+    }
+    try {
+      const result = await apiRead("/api/v1/admin/logs");
+      renderServerLog(panel, apiCollection(result, "entries", "live logs"));
+      if (status) status.textContent = "Live logs refreshed.";
+    } catch (error) {
+      panel.replaceChildren(monitoringEmpty(`Live logs failed (${error.message}). Use Refresh to retry.`));
+      if (status) {
+        status.textContent = `Live log refresh failed (${error.message}). Use Refresh to retry.`;
+        status.classList.add("refresh-error");
+      }
+    } finally {
+      panel.removeAttribute("aria-busy");
+    }
+  };
+
+  for (const root of document.querySelectorAll("[data-api-server-log]")) {
+    const refresh = serializeRefresh(
+      () => refreshServerLogNow(root),
+      () => {
+        const status = document.getElementById(root.dataset.refreshStatus);
+        if (status) status.textContent = "Refresh queued.";
+      },
+    );
+    panelRefreshers.set(root, refresh);
+    void refresh();
+    const seconds = Number(root.dataset.refreshSeconds);
+    if (Number.isFinite(seconds) && seconds >= 5) window.setInterval(() => void refresh(), seconds * 1000);
+  }
+
   const overviewSection = (target, title, href, headings, rows) => {
     target.replaceChildren();
     const head = element("div", "panel-head list-head");

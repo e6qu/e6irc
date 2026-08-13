@@ -5,7 +5,7 @@
 //! taxonomy are recorded. Untrusted input and secrets therefore cannot become
 //! metric labels or enter persisted monitoring history.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -60,7 +60,8 @@ impl LatencyKind {
 }
 
 /// A closed error taxonomy prevents untrusted details from becoming labels.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ErrorKind {
     Accept,
     ConnectionSetup,
@@ -113,6 +114,56 @@ impl ErrorKind {
             Self::Bouncer => "bouncer",
             Self::Http => "http",
         }
+    }
+}
+
+/// One safe, bounded event from a server component. The event carries no
+/// external error text, so an operator view cannot disclose a secret by
+/// replaying a diagnostic.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct OperationalLogEntry {
+    pub at_ms: u64,
+    pub component: ErrorKind,
+    pub severity: OperationalSeverity,
+    pub message: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OperationalSeverity {
+    Error,
+}
+
+const OPERATIONAL_LOG_CAPACITY: usize = 1_000;
+
+struct OperationalLog {
+    entries: std::sync::Mutex<VecDeque<OperationalLogEntry>>,
+}
+
+impl OperationalLog {
+    fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(VecDeque::with_capacity(OPERATIONAL_LOG_CAPACITY)),
+        }
+    }
+
+    fn record_error(&self, kind: ErrorKind) {
+        let mut entries = self.entries.lock().expect("operational log poisoned");
+        if entries.len() == OPERATIONAL_LOG_CAPACITY {
+            entries.pop_front();
+        }
+        entries.push_back(OperationalLogEntry {
+            at_ms: epoch_millis(),
+            component: kind,
+            severity: OperationalSeverity::Error,
+            message: "An operational error was recorded.",
+        });
+    }
+
+    fn snapshot(&self, limit: usize) -> Vec<OperationalLogEntry> {
+        let entries = self.entries.lock().expect("operational log poisoned");
+        let skip = entries.len().saturating_sub(limit);
+        entries.iter().skip(skip).cloned().collect()
     }
 }
 
@@ -283,6 +334,7 @@ pub(crate) struct Telemetry {
     errors: [AtomicU64; ErrorKind::COUNT],
     error_last_seen_ms: [AtomicU64; ErrorKind::COUNT],
     latency: [LatencyHistogram; LatencyKind::COUNT],
+    operational_log: OperationalLog,
 }
 
 pub(crate) struct BncClientConnection {
@@ -328,6 +380,7 @@ impl Telemetry {
             errors: std::array::from_fn(|_| AtomicU64::new(0)),
             error_last_seen_ms: std::array::from_fn(|_| AtomicU64::new(0)),
             latency: std::array::from_fn(|_| LatencyHistogram::new()),
+            operational_log: OperationalLog::new(),
         }
     }
 
@@ -416,6 +469,12 @@ impl Telemetry {
     pub(crate) fn record_error(&self, kind: ErrorKind) {
         self.errors[kind.index()].fetch_add(1, Ordering::Relaxed);
         self.error_last_seen_ms[kind.index()].store(epoch_millis(), Ordering::Relaxed);
+        self.operational_log.record_error(kind);
+    }
+
+    pub(crate) fn operational_log(&self, limit: usize) -> Vec<OperationalLogEntry> {
+        self.operational_log
+            .snapshot(limit.min(OPERATIONAL_LOG_CAPACITY))
     }
 
     pub(crate) fn adjust_core_gauges(
@@ -902,6 +961,27 @@ mod tests {
         assert_eq!(snapshot.core_latency.count, 2);
         assert_eq!(snapshot.core_latency.p50_us, 1_000);
         assert_eq!(snapshot.core_latency.p95_us, 5_000);
+        let entries = telemetry.operational_log(1);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].component, ErrorKind::Read);
+        assert_eq!(entries[0].severity, OperationalSeverity::Error);
+        assert_eq!(entries[0].message, "An operational error was recorded.");
+    }
+
+    #[test]
+    fn operational_log_is_bounded_and_has_no_free_form_error_text() {
+        let telemetry = Telemetry::new();
+        for _ in 0..=OPERATIONAL_LOG_CAPACITY {
+            telemetry.record_error(ErrorKind::Database);
+        }
+
+        let entries = telemetry.operational_log(usize::MAX);
+        assert_eq!(entries.len(), OPERATIONAL_LOG_CAPACITY);
+        assert!(entries.iter().all(|entry| {
+            matches!(entry.component, ErrorKind::Database)
+                && matches!(entry.severity, OperationalSeverity::Error)
+                && entry.message == "An operational error was recorded."
+        }));
     }
 
     #[test]

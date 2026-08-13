@@ -212,6 +212,22 @@ fn document() -> serde_json::Value {
             }
         } } }
     });
+    let logs_response = json_response(
+        "bounded redacted operational events",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["entries"],
+            "properties": { "entries": { "type": "array", "maxItems": 1000, "items": {
+                "type": "object", "additionalProperties": false,
+                "required": ["at_ms", "component", "severity", "message"],
+                "properties": {
+                    "at_ms": { "type": "integer", "minimum": 0 },
+                    "component": { "type": "string", "enum": ["accept", "connection_setup", "tls_handshake", "read", "write", "send_queue", "database", "bouncer", "http"] },
+                    "severity": { "const": "error" },
+                    "message": { "const": "An operational error was recorded." }
+                }
+            } } }
+        }),
+    );
     let network_response = json_response(
         "stored network configuration and runtime",
         network_response_schema,
@@ -1728,6 +1744,13 @@ fn document() -> serde_json::Value {
                     "responses": { "200": monitoring_response["200"], "400": { "description": "unsupported monitoring window" }, "403": { "description": "not an admin account" } }
                 }
             },
+            "/api/v1/admin/logs": {
+                "get": { "summary": "Read recent redacted operational events (admin only)",
+                    "description": "Returns at most 1,000 in-memory events from fixed server components. Event details never include request data, IRC traffic, or secrets.",
+                    "security": authenticated,
+                    "responses": { "200": logs_response["200"], "403": { "description": "not an admin account" } }
+                }
+            },
             "/api/v1/admin/metrics": {
                 "get": { "summary": "Prometheus exposition (admin only)",
                     "security": authenticated,
@@ -1800,6 +1823,7 @@ pub(super) async fn openapi() -> Response {
 mod tests {
     const CONSOLE_READ_OPERATIONS: &[(&str, &str)] = &[
         ("/api/v1/admin/monitoring", "get"),
+        ("/api/v1/admin/logs", "get"),
         ("/api/v1/admin/stats", "get"),
         ("/api/v1/admin/accounts", "get"),
         ("/api/v1/admin/invitations", "get"),

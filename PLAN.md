@@ -32,7 +32,9 @@ Libera.Chat, OFTC, and Ergo on 2026-08-13. The console has a bounded,
 owner-scoped component-log view for IRC and every bridge driver. Its API reads
 the live buffer while active and persisted history after stop; typed lifecycle
 and operational failures are safe notices, and storage-failure notices cannot
-retry through the failed writer.
+retry through the failed writer. Administrators also have a bounded live server
+log for fixed operational error classes. It excludes request data, IRC traffic,
+and secrets; the durable audit log remains the source for privileged actions.
 
 ## Remaining qualification
 

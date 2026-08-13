@@ -230,7 +230,8 @@ console views require an administrator session.
    capacity pressure, current queue state, cumulative latency histograms, and
    an error ledger by reading its administrator JSON projection.
 7. `/api/v1/admin/observability` returns raw JSON history;
-   `/api/v1/admin/monitoring` returns the render-ready console projection; and
+   `/api/v1/admin/monitoring` returns the render-ready console projection;
+   `/api/v1/admin/logs` returns bounded redacted operational events; and
    `/api/v1/admin/metrics` returns Prometheus text.
 8. Network **Operations** provides owner-scoped per-network detail that global
    aggregates intentionally omit.

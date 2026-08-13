@@ -1779,6 +1779,9 @@ Each running BNC handle additionally keeps owner-scoped per-network counters
 and lifecycle timing. Those values are deliberately not process-wide metric
 labels: account and network names are unbounded label cardinality. They are
 served only through the authenticated network API and console operations page.
+A separate bounded server event feed records only fixed error component and
+severity values with a fixed safe message. It cannot contain request data, IRC
+traffic, external error text, or secrets.
 
 The snapshot is the sole source for:
 
@@ -1794,6 +1797,9 @@ The snapshot is the sole source for:
   7-day range; invalid ranges fail with HTTP 400 rather than being clamped;
 - `/api/v1/admin/metrics`, authenticated Prometheus text exposition with only
   fixed `state`/`kind`/`queue`/`mode` labels;
+- `/console/logs` and `/api/v1/admin/logs`, administrator-only live views of
+  at most 1,000 redacted server events; the durable audit log remains the
+  source for privileged actions; and
 - `/readyz`, which fails when a core heartbeat is stale or
   configured PostgreSQL cannot answer `SELECT 1` within a separate two-second
   query deadline.

@@ -1056,6 +1056,16 @@ try {
   await page.getByText("browser replays through the real stack", { exact: true }).waitFor();
   await page.getByRole("heading", { name: "journey log", exact: true }).waitFor();
 
+  const serverLogRead = page.waitForResponse(
+    (response) => response.url() === `${applicationOrigin}/api/v1/admin/logs`
+      && response.request().method() === "GET",
+  );
+  const serverLogPage = await page.goto(`${applicationOrigin}/console/logs`);
+  assert.equal(serverLogPage.status(), 200);
+  assert.equal((await serverLogRead).status(), 200);
+  await page.getByRole("heading", { name: "Live logs", exact: true }).waitFor();
+  await page.getByText("This feed never includes request data, IRC traffic, or secrets.", { exact: true }).waitFor();
+
   const initialBuffer = page.waitForResponse(
     (response) => response.url() === `${applicationOrigin}/api/v1/me/networks/journey/buffer?limit=1000`,
   );
