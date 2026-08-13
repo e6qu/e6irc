@@ -22,7 +22,10 @@ const browserType = playwright[browserName];
 const requireNativeNotificationPermission = browserName === "chromium";
 
 async function clickAndWaitForURL(page, locator, expectedURL) {
-  await Promise.all([page.waitForURL(expectedURL), locator.click()]);
+  await locator.click({ noWaitAfter: true });
+  for (let attempt = 0; attempt < 300 && page.url() !== expectedURL; attempt += 1) {
+    await page.waitForTimeout(100);
+  }
   assert.equal(page.url(), expectedURL);
 }
 
