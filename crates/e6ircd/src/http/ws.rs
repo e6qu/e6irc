@@ -355,6 +355,15 @@ pub(super) async fn ws_ui_conn(
                         break;
                     }
                 }
+                Ok(DriverEvent::Notice(line)) => {
+                    if socket
+                        .send(WsMessage::text(line_event(&line)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 Ok(DriverEvent::Echo { line, origin }) => {
                     // This socket already rendered its own line optimistically
                     // with the correlated `sent` acknowledgement; an echo of it

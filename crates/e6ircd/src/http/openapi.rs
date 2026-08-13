@@ -1395,7 +1395,7 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/me/networks/{name}/buffer": {
                 "get": { "summary": "Read the bounded owner-scoped component log (oldest-first)",
-                    "description": "Returns the persisted line stream used by IRC and every bridge component. It includes safe lifecycle notices and never includes credentials.",
+                    "description": "Returns the active component's bounded live stream, or persisted history after it stops. It includes safe lifecycle notices and never includes credentials.",
                     "security": authenticated,
                     "parameters": [
                         { "name": "name", "in": "path", "required": true,

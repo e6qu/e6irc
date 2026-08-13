@@ -1134,10 +1134,9 @@ pub(super) struct BufferQuery {
     pub(super) limit: Option<usize>,
 }
 
-/// Recent upstream lines the bouncer buffered for one of the caller's
-/// networks, oldest-first — the same backlog attach playback replays.
-/// Served from the persisted buffer, so it works whether or not the
-/// network's driver is currently running.
+/// Recent bouncer lines for one caller-owned network, oldest-first — the same
+/// stream attach playback replays. A running driver provides its live bounded
+/// buffer; a stopped driver falls back to persisted history.
 pub(super) async fn network_buffer(
     State(state): State<Arc<AppState>>,
     Authenticated(account): Authenticated,
@@ -1165,6 +1164,19 @@ pub(super) async fn network_buffer(
         Ok(limit) => limit,
         Err(response) => return response,
     };
+    if let Some(handle) = state
+        .bnc_registry
+        .as_ref()
+        .and_then(|registry| registry.get_owned(&account, &name))
+    {
+        let lines = handle.buffer_snapshot();
+        let skip = lines.len().saturating_sub(limit as usize);
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "lines": &lines[skip..] }).to_string(),
+        )
+            .into_response();
+    }
     // The DB buffer API canonicalizes the owner/network composite key, matching
     // the live registry even when this URL uses a different case.
     match crate::db::recent_bnc_lines(pool, &account, &name, limit).await {

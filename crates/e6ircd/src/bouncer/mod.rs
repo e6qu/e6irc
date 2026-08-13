@@ -1091,6 +1091,10 @@ pub enum DriverEvent {
     Connected,
     /// One line received from upstream (CRLF stripped).
     Line(String),
+    /// A safe component notice for attached clients. It intentionally does not
+    /// enter the persistence stream: a failed backlog writer cannot retry its
+    /// own failure notice forever.
+    Notice(String),
     /// A synthesized copy of a line an attached client sent. IRC servers do
     /// not echo a sender's own messages unless echo-message was negotiated —
     /// and the driver never negotiates it — so without this the detached
@@ -1304,7 +1308,15 @@ fn emit_failure_notice(
 ) {
     let line = crate::sanitize::upstream_line(failure_notice(failure));
     buffer.lock().expect("buffer poisoned").push(line.clone());
-    drop(events.send(DriverEvent::Line(line)));
+    let event = if matches!(
+        failure,
+        NetworkFailure::BacklogStorageFailed | NetworkFailure::BacklogStorageLagged
+    ) {
+        DriverEvent::Notice(line)
+    } else {
+        DriverEvent::Line(line)
+    };
+    drop(events.send(event));
 }
 
 /// One classified failure with when it happened — the unit of the bounded
@@ -2372,6 +2384,11 @@ where
             // Upstream -> client.
             ev = events.recv() => match ev {
                 Ok(DriverEvent::Line(line)) => {
+                    write.write_all(filter_tags(&line, caps).as_bytes()).await?;
+                    write.write_all(b"\r\n").await?;
+                    write.flush().await?;
+                }
+                Ok(DriverEvent::Notice(line)) => {
                     write.write_all(filter_tags(&line, caps).as_bytes()).await?;
                     write.write_all(b"\r\n").await?;
                     write.flush().await?;
