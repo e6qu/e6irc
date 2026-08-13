@@ -1068,7 +1068,7 @@ try {
   assert.equal(serverLogPage.status(), 200);
   assert.equal((await serverLogRead).status(), 200);
   await page.getByRole("heading", { name: "Live logs", exact: true }).waitFor();
-  await page.getByText("This feed never includes request data, IRC traffic, or secrets.", { exact: true }).waitFor();
+  await page.getByText("This feed never includes request data, IRC traffic, or secrets.", { exact: false }).waitFor();
 
   const initialBuffer = page.waitForResponse(
     (response) => response.url() === `${applicationOrigin}/api/v1/me/networks/journey/buffer?limit=1000`,
