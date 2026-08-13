@@ -2306,8 +2306,13 @@ import { loadSettings, saveSettings } from "/console-settings.js";
         setOwnerNetworkResult("Enter a network ID, server, and nickname.", false);
         return;
       }
-      const preflight = event.submitter instanceof HTMLElement
-        && event.submitter.matches("[data-api-network-preflight]");
+      // Some engines omit `submitter` for synthetic submissions.
+      const submitter = event.submitter instanceof HTMLElement
+        ? event.submitter
+        : document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : null;
+      const preflight = submitter?.matches("[data-api-network-preflight]") === true;
       if (preflight) {
         const { addr, tls, nick, realname, sasl_account, sasl_password } = connection;
         void mutateOwnerNetwork(form, "/api/v1/me/networks/preflight", "POST", {
