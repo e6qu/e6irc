@@ -461,6 +461,13 @@ pub(super) async fn admin_create_account_invitation(
     >,
 ) -> Response {
     let body = json_or_response!(body);
+    let Some(public_url) = state.public_url.as_deref() else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Account invitations unavailable",
+            Some("http.public_url must be configured to issue a shareable invitation link"),
+        );
+    };
     if !crate::sanitize::valid_nick(&body.account, MAX_ACCOUNT_LEN) {
         return problem(
             StatusCode::BAD_REQUEST,
@@ -491,7 +498,7 @@ pub(super) async fn admin_create_account_invitation(
     .await
     {
         Ok(token) => {
-            let invitation_url = super::account_invitation_url(&state, &token);
+            let invitation_url = super::account_invitation_url(public_url, &token);
             let mut response = admin_json(serde_json::json!({
                 "account": body.account,
                 "administrator": body.administrator,
