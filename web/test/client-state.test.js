@@ -15,6 +15,7 @@ import {
   networkStateLabel,
   saveSettings,
 } from "../src/client-state.js";
+import { loadSettings as loadSharedSettings, saveSettings as saveSharedSettings } from "../src/settings.js";
 
 function storage(value, failure = null) {
   return {
@@ -54,6 +55,22 @@ test("settings corruption and unsupported values are surfaced and repaired", () 
   const unknown = loadSettings(storage('{"theme":"light","surprise":true}'));
   assert.deepEqual(unknown.settings, { theme: "light", notifications: false });
   assert.match(unknown.warning, /unsupported/);
+});
+
+test("console and chat share the same preference boundary", () => {
+  const malformed = storage('{"theme":"neon"}');
+  assert.deepEqual(loadSharedSettings(malformed), loadSettings(malformed));
+
+  let stored = null;
+  const sharedStorage = {
+    getItem() { return stored; },
+    setItem(_key, value) { stored = value; },
+  };
+  assert.equal(saveSharedSettings(sharedStorage, { theme: "dark", notifications: true }), null);
+  assert.deepEqual(loadSettings(sharedStorage), {
+    settings: { theme: "dark", notifications: true },
+    warning: null,
+  });
 });
 
 test("storage denial is explicit on read and write", () => {
