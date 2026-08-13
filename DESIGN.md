@@ -194,8 +194,8 @@ These are project-wide rules, enforced in review and (where possible) CI:
     rows and constrains future storage. A corrupt/non-canonical preload is a
     startup error, never a silently missing lock.
   - `ConnectionEvent` — the bouncer SPI's connection-state event *cannot
-    carry a line*, so a driver can't route text past the CR/LF sanitizer and
-    the detached-buffer append; the bypass is a compile error, not a lint.
+    carry a line*, so a driver can't route text past the line sanitizer and
+    detached-buffer append; the bypass is a compile error, not a lint.
   - `AttachCapability` — BNC attach capability names, state changes, `CAP LS`,
     and `CAP LIST` derive from one closed set. An attach cannot use SASL without
     negotiating it, and a new capability cannot be accepted but omitted from
@@ -209,7 +209,7 @@ These are project-wide rules, enforced in review and (where possible) CI:
     method, not a byte compared against `0`.
   - `crate::sanitize` — one module holds every "turn untrusted text into a
     field safe for its wire position" function (username, account name, bridge
-    nick token, upstream CR/LF/NUL neutralization, client-tag-key validation,
+    nick token, upstream line sanitizing and bounding, client-tag-key validation,
     nick/channel validators), each documented with the position it protects
     (prefix / middle / tag / trailing). A new field gets the right rule by
     reaching for the module rather than re-deriving a one-off filter.
@@ -901,12 +901,9 @@ Principal tables (columns abridged):
   (the `time=` tag verbatim, else bouncer arrival time) — the three columns
   the attach listener's CHATHISTORY paging and TARGETS scan over.
   Both ways into a network's buffer — a live line
-  from a driver and restored backlog from this table — neutralize embedded
-  CR/LF/NUL, so a line replayed to an attaching client cannot become two
-  regardless of which path it arrived through or which build wrote it, and a
-  bridge-synthesized line is split to fit `MAX_LINE_LEN` — an over-long line is
-  discarded whole by the receiving client's framing, so emitting one loses the
-  message silently.
+  from a driver and restored backlog from this table — remove CR/LF/NUL and
+  cap one entry to the IRC wire limit. A replay cannot inject a second line or
+  make the bounded buffer retain an unbounded entry.
   Retention is per (owner, network): the persistence task counts its own
   appends and trims to the newest `BNC_BUFFER_CAP` at every
   `BNC_TRIM_INTERVAL`. The count belongs to that task, not to the table's `id`

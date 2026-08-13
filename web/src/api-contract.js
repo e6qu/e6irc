@@ -109,12 +109,18 @@ function declaredOperation(document, method, url) {
 }
 
 function matchingPath(paths, pathname) {
+  const exact = paths[pathname];
+  if (objectValue(exact)) return [pathname, exact];
   const actual = pathname.split("/");
-  return Object.entries(paths).find(([candidate]) => {
+  const matches = Object.entries(paths).filter(([candidate]) => {
     const expected = candidate.split("/");
     return expected.length === actual.length
       && expected.every((segment, index) => /^\{[^}]+\}$/.test(segment) || segment === actual[index]);
   });
+  if (matches.length > 1) {
+    throw new ApiSchemaError(`The API contract has ambiguous paths for ${pathname}.`);
+  }
+  return matches[0];
 }
 
 export function operationResponseSchema(document, method, url, status = 200) {
