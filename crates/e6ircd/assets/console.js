@@ -2257,6 +2257,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   let refreshOwnerNetworkDetail;
   let refreshIntegrations;
   const ownerNetworkPreflight = Symbol("owner-network-preflight");
+  const requestedNetworkPreflight = new WeakSet();
   const ownerNetworkRefresher = (form) => {
     if (form.closest("[data-api-owner-network-editor]")) return refreshOwnerNetworkEditor;
     if (form.closest("[data-api-owner-bridge-editor]")) return refreshOwnerBridgeEditor;
@@ -2297,6 +2298,11 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   });
 
   for (const form of document.querySelectorAll("[data-api-owner-network-create]")) {
+    form.addEventListener("click", (event) => {
+      if (event.target instanceof Element && event.target.closest("[data-api-network-preflight]")) {
+        requestedNetworkPreflight.add(form);
+      }
+    });
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       const fields = new FormData(form);
@@ -2306,13 +2312,13 @@ import { loadSettings, saveSettings } from "/console-settings.js";
         setOwnerNetworkResult("Enter a network ID, server, and nickname.", false);
         return;
       }
-      // Some engines omit `submitter` for synthetic submissions.
       const submitter = event.submitter instanceof HTMLElement
         ? event.submitter
         : document.activeElement instanceof HTMLElement
           ? document.activeElement
           : null;
-      const preflight = submitter?.matches("[data-api-network-preflight]") === true;
+      const preflight = requestedNetworkPreflight.delete(form)
+        || submitter?.matches("[data-api-network-preflight]") === true;
       if (preflight) {
         const { addr, tls, nick, realname, sasl_account, sasl_password } = connection;
         void mutateOwnerNetwork(form, "/api/v1/me/networks/preflight", "POST", {
