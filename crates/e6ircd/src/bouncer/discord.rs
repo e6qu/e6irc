@@ -106,7 +106,13 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
             return Dropped(NetworkFailure::UpstreamRequestFailed);
         }
     };
-    let url = format!("{}/?v=10&encoding=json", gateway.trim_end_matches('/'));
+    let url = match gateway_connection_url(&gateway) {
+        Ok(url) => url,
+        Err(error) => {
+            eprintln!("discord: invalid gateway URL: {error}");
+            return Dropped(NetworkFailure::UpstreamProtocolFailed);
+        }
+    };
     // Bound the WS handshake so a black-holed gateway (accepts the connection
     // then goes silent) can't wedge the driver — the same guard irc_driver and
     // matrix already have.
@@ -414,6 +420,23 @@ async fn gateway_url(http: &reqwest::Client, base: &str) -> Result<String, Strin
         .ok_or_else(|| "gateway response had no url".to_string())
 }
 
+fn gateway_connection_url(gateway: &str) -> Result<String, String> {
+    let mut url = openidconnect::url::Url::parse(gateway)
+        .map_err(|_| "must be an absolute ws(s) URL".to_string())?;
+    if !matches!(url.scheme(), "ws" | "wss")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("must be absolute ws(s), without credentials or fragment".into());
+    }
+    url.query_pairs_mut()
+        .append_pair("v", "10")
+        .append_pair("encoding", "json");
+    Ok(url.to_string())
+}
+
 async fn fetch_channel_name(
     http: &reqwest::Client,
     base: &str,
@@ -564,6 +587,25 @@ mod tests {
             route_privmsg("JOIN #general", &map),
             vec![RouteResult::Ignore]
         );
+    }
+
+    #[test]
+    fn gateway_connection_url_preserves_existing_queries() {
+        let url = gateway_connection_url("wss://gateway.example/socket?compress=zlib")
+            .expect("valid gateway URL");
+        let parsed = openidconnect::url::Url::parse(&url).expect("output URL");
+        let query: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
+        assert_eq!(query.get("compress"), Some(&"zlib".into()));
+        assert_eq!(query.get("v"), Some(&"10".into()));
+        assert_eq!(query.get("encoding"), Some(&"json".into()));
+        for url in [
+            "https://gateway.example/socket",
+            "wss://user:secret@gateway.example/socket",
+            "wss://gateway.example/socket#fragment",
+            "/socket",
+        ] {
+            assert!(gateway_connection_url(url).is_err(), "accepted {url}");
+        }
     }
 
     #[test]
