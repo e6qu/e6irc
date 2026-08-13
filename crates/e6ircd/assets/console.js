@@ -716,19 +716,23 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     if (!Number.isSafeInteger(revision) || revision < 0) {
       throw new Error("The configuration revision is invalid. Reload and try again.");
     }
+    const optional = (name) => {
+      const value = String(fields.get(name) || "").trim();
+      return value ? { [name]: value } : {};
+    };
     return {
       revision,
       name: String(fields.get("name") || "").trim(),
-      owner: optionalValue(String(fields.get("owner") || "")),
       kind: String(fields.get("kind") || ""),
       addr: String(fields.get("addr") || "").trim(),
       tls: fields.has("tls"),
       nick: String(fields.get("nick") || "").trim(),
-      realname: optionalValue(String(fields.get("realname") || "")),
       autojoin: splitValues(String(fields.get("autojoin") || ""), ","),
       buffer_cap: number,
-      sasl_account: optionalValue(String(fields.get("sasl_account") || "")),
-      sasl_password: optionalValue(String(fields.get("sasl_password") || "")),
+      ...optional("owner"),
+      ...optional("realname"),
+      ...optional("sasl_account"),
+      ...optional("sasl_password"),
     };
   };
 
