@@ -222,7 +222,7 @@ test("operation parser rejects URLs outside the origin-relative API", async () =
       },
     },
   };
-  for (const url of ["widgets", "/console", "https://example.test/api/v1/me/widgets", "//example.test/api/v1/me/widgets"]) {
+  for (const url of ["widgets", "/console", "/api/v1/me/widgets#stale", "https://example.test/api/v1/me/widgets", "//example.test/api/v1/me/widgets"]) {
     assert.throws(() => parseOperationQuery(document, "GET", url), ApiSchemaError);
   }
   let requested = false;

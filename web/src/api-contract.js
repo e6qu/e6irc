@@ -190,7 +190,7 @@ function declaredOperation(document, method, url) {
   }
   const base = "https://e6irc.invalid";
   const parsed = new URL(url, base);
-  if (parsed.origin !== base || !parsed.pathname.startsWith("/api/v1/")) {
+  if (parsed.origin !== base || parsed.hash !== "" || !parsed.pathname.startsWith("/api/v1/")) {
     throw new ApiSchemaError("The API request URL is invalid.");
   }
   const pathname = parsed.pathname;
