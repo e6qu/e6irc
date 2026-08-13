@@ -124,6 +124,38 @@ test("operation parser selects the exact documented path before parsing", () => 
   );
 });
 
+test("operation parser gives a literal path precedence over a template", () => {
+  const literalSchema = {
+    type: "object", additionalProperties: false, required: ["preflight"],
+    properties: { preflight: { const: true } },
+  };
+  const templateSchema = {
+    type: "object", additionalProperties: false, required: ["name"],
+    properties: { name: { type: "string" } },
+  };
+  const document = {
+    paths: {
+      "/api/v1/me/networks/{name}": { get: { responses: { 200: { content: { "application/json": { schema: templateSchema } } } } } },
+      "/api/v1/me/networks/preflight": { get: { responses: { 200: { content: { "application/json": { schema: literalSchema } } } } } },
+    },
+  };
+  assert.deepEqual(parseOperationResponse(document, "GET", "/api/v1/me/networks/preflight", { preflight: true }), { preflight: true });
+});
+
+test("operation parser rejects ambiguous templates", () => {
+  const schema = { type: "object", additionalProperties: false };
+  const document = {
+    paths: {
+      "/api/v1/me/widgets/{name}": { get: { responses: { 200: { content: { "application/json": { schema } } } } } },
+      "/api/v1/me/widgets/{id}": { get: { responses: { 200: { content: { "application/json": { schema } } } } } },
+    },
+  };
+  assert.throws(
+    () => operationResponseSchema(document, "GET", "/api/v1/me/widgets/current"),
+    /ambiguous paths/,
+  );
+});
+
 test("operation request serializer closes and validates documented JSON", () => {
   const document = {
     paths: {

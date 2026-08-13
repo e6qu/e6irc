@@ -85,14 +85,9 @@ pub(crate) fn nick_token(raw: &str) -> String {
     out
 }
 
-/// Neutralize embedded CR/LF/NUL in a synthesized upstream line before it is
-/// buffered or broadcast to attached clients. A bridge builds lines from
-/// free-form remote text; an embedded newline would otherwise let that text
-/// inject a second, forged IRC line into the client's stream. Real IRC-upstream
-/// lines never carry these bytes (framing splits on them), so this is a no-op
-/// fast path for them.
+/// Make one upstream line safe to buffer or broadcast.
 pub(crate) fn upstream_line(line: String) -> String {
-    if line.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+    let line = if line.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
         line.chars()
             .map(|c| {
                 if matches!(c, '\r' | '\n' | '\0') {
@@ -104,7 +99,9 @@ pub(crate) fn upstream_line(line: String) -> String {
             .collect()
     } else {
         line
-    }
+    };
+    e6irc_proto::message::truncate_on_char_boundary(&line, e6irc_proto::message::MAX_LINE_LEN - 2)
+        .to_string()
 }
 
 /// Longest client-only tag key relayed. The whole tag section is bounded, but
@@ -325,6 +322,13 @@ mod tests {
         assert_eq!(upstream_line("a\rb\nc\0d".into()), "a b c d");
         let clean = "x y z".to_string();
         assert_eq!(upstream_line(clean.clone()), clean);
+    }
+
+    #[test]
+    fn upstream_line_fits_one_irc_frame_on_a_character_boundary() {
+        let safe = upstream_line("𝄞".repeat(200));
+        assert!(safe.len() <= e6irc_proto::message::MAX_LINE_LEN - 2);
+        assert!(std::str::from_utf8(safe.as_bytes()).is_ok());
     }
 
     #[test]
