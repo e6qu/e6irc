@@ -1107,6 +1107,15 @@ pub enum DriverEvent {
     Disconnected,
 }
 
+impl DriverEvent {
+    pub(crate) fn display_line(&self) -> Option<&str> {
+        match self {
+            Self::Line(line) | Self::Notice(line) => Some(line),
+            Self::Connected | Self::Echo { .. } | Self::Disconnected => None,
+        }
+    }
+}
+
 /// A downstream line queued for the upstream, tagged with the attachment
 /// that sent it so a synthesized [`DriverEvent::Echo`] can exclude its
 /// originator. Origin 0 is the untracked/internal sender (no exclusion).
@@ -2383,13 +2392,9 @@ where
             }
             // Upstream -> client.
             ev = events.recv() => match ev {
-                Ok(DriverEvent::Line(line)) => {
-                    write.write_all(filter_tags(&line, caps).as_bytes()).await?;
-                    write.write_all(b"\r\n").await?;
-                    write.flush().await?;
-                }
-                Ok(DriverEvent::Notice(line)) => {
-                    write.write_all(filter_tags(&line, caps).as_bytes()).await?;
+                Ok(event @ (DriverEvent::Line(_) | DriverEvent::Notice(_))) => {
+                    let line = event.display_line().expect("display event carries a line");
+                    write.write_all(filter_tags(line, caps).as_bytes()).await?;
                     write.write_all(b"\r\n").await?;
                     write.flush().await?;
                 }
