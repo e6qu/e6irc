@@ -860,7 +860,7 @@ async fn openapi_spec_is_served() {
         v["paths"]["/api/v1/me/tokens/{id}"]["delete"]["parameters"],
         serde_json::json!([{
             "name": "id", "in": "path", "required": true,
-            "schema": { "type": "integer" }
+            "schema": { "type": "integer", "minimum": 1 }
         }])
     );
     let identity_schema = &v["paths"]["/api/v1/me"]["get"]["responses"]["200"]["content"]["application/json"]

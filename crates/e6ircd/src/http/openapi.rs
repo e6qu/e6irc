@@ -886,7 +886,7 @@ fn document() -> serde_json::Value {
                     "description": "The session ID is scoped to the authenticated account in the deletion query. Revoking the current cookie session also clears its browser cookie.",
                     "security": authenticated,
                     "parameters": [{ "name": "id", "in": "path", "required": true,
-                        "schema": { "type": "integer", "format": "int64" } }],
+                        "schema": { "type": "integer", "format": "int64", "minimum": 1 } }],
                     "responses": {
                         "204": { "description": "session revoked" },
                         "404": { "description": "session does not exist or belongs to another account" },
@@ -1009,7 +1009,7 @@ fn document() -> serde_json::Value {
                     "summary": "Unlink one of your OIDC identities and revoke its browser sessions",
                     "security": authenticated,
                     "parameters": [{ "name": "id", "in": "path", "required": true,
-                        "schema": { "type": "integer" } }],
+                        "schema": { "type": "integer", "minimum": 1 } }],
                     "responses": {
                         "204": { "description": "identity unlinked and its sessions revoked" },
                         "404": { "description": "identity is not linked to this account" },
@@ -1091,7 +1091,7 @@ fn document() -> serde_json::Value {
                 "delete": { "summary": "Revoke one of your personal access tokens",
                     "security": authenticated,
                     "parameters": [{ "name": "id", "in": "path", "required": true,
-                        "schema": { "type": "integer" } }],
+                        "schema": { "type": "integer", "minimum": 1 } }],
                     "responses": { "204": { "description": "revoked" },
                         "404": { "description": "no such token" } } }
             },
@@ -1293,7 +1293,7 @@ fn document() -> serde_json::Value {
             "/api/v1/me/credentials/{id}": {
                 "delete": { "summary": "Revoke an app password", "security": authenticated,
                     "parameters": [{ "name": "id", "in": "path", "required": true,
-                        "schema": { "type": "integer" } }],
+                        "schema": { "type": "integer", "minimum": 1 } }],
                     "responses": { "204": { "description": "revoked" },
                         "404": { "description": "no such credential" } } }
             },
@@ -1655,7 +1655,7 @@ fn document() -> serde_json::Value {
                 "delete": { "summary": "Delete one immutable server-ban resource (admin only)",
                     "description": "Resolves the stable directory ID before submitting the matching policy removal through the core. A stale ID cannot delete a recreated visible mask.",
                     "security": authenticated,
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64", "minimum": 1 } }],
                     "responses": { "204": { "description": "server ban removed" }, "400": { "description": "invalid ID" }, "403": { "description": "not an admin account" }, "404": { "description": "server ban no longer exists" }, "409": { "description": "conflicting policy mutation" }, "503": { "description": "server-ban control unavailable" } } }
             },
             "/api/v1/admin/audit": {
@@ -1994,6 +1994,24 @@ mod tests {
                 .expect_err("missing path parameter must reject the contract")
                 .contains("/api/v1/me/tokens/{id} path parameters differ")
         );
+    }
+
+    #[test]
+    fn database_identifier_path_parameters_are_positive() {
+        let spec = super::document();
+        for path in [
+            "/api/v1/me/sessions/{id}",
+            "/api/v1/me/identities/{id}",
+            "/api/v1/me/tokens/{id}",
+            "/api/v1/me/credentials/{id}",
+            "/api/v1/admin/accounts/{id}",
+            "/api/v1/admin/invitations/{id}",
+            "/api/v1/admin/bans/{id}",
+        ] {
+            for (_, operation) in spec["paths"][path].as_object().expect("documented path") {
+                assert_eq!(operation["parameters"][0]["schema"]["minimum"], 1, "{path}");
+            }
+        }
     }
 
     #[test]
