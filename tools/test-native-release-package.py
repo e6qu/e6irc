@@ -60,6 +60,25 @@ def package(
     return pathlib.Path(result.stdout.strip())
 
 
+def rejects_unknown_target(target_directory: pathlib.Path, output_directory: pathlib.Path) -> None:
+    result = subprocess.run(
+        [
+            str(PACKAGER),
+            "--target",
+            "x86_64-unknown-windows-gnu",
+            "--target-directory",
+            str(target_directory),
+            "--output-directory",
+            str(output_directory),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "argument --target" in result.stderr
+
+
 def expected_names(prefix: str, suffix: str) -> set[str]:
     return {
         f"{prefix}/e6ircd{suffix}",
@@ -94,6 +113,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="e6irc-native-package-") as temporary:
         root = pathlib.Path(temporary)
         target_directory = root / "target"
+        rejects_unknown_target(target_directory, root / "invalid")
         for target, assertion in (
             ("x86_64-unknown-linux-gnu", assert_tar),
             ("x86_64-pc-windows-msvc", assert_zip),

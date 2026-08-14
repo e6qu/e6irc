@@ -14,6 +14,16 @@ import zipfile
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+RELEASE_TARGETS = frozenset(
+    {
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+        "aarch64-pc-windows-msvc",
+    }
+)
 DOCUMENTS = (
     ("README.md", ROOT / "README.md"),
     ("LICENSE", ROOT / "LICENSE"),
@@ -26,6 +36,12 @@ def workspace_version() -> str:
         value = tomllib.load(manifest)["workspace"]["package"]["version"]
     if not isinstance(value, str) or not value:
         raise ValueError("workspace.package.version must be a non-empty string")
+    return value
+
+
+def release_target(value: str) -> str:
+    if value not in RELEASE_TARGETS:
+        raise ValueError(f"unsupported release target: {value}")
     return value
 
 
@@ -97,7 +113,7 @@ def write_zip(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target", required=True)
+    parser.add_argument("--target", required=True, type=release_target)
     parser.add_argument("--target-directory", type=pathlib.Path, default=ROOT / "target")
     parser.add_argument("--output-directory", type=pathlib.Path, default=ROOT / "dist")
     arguments = parser.parse_args()
