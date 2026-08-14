@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use e6irc_client::TerminalSafe;
 use e6irc_client::token_cache::{CachedToken, default_token_path, load_token, store_token};
 use reqwest::{Client, Method, Response, StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const MAX_API_RESPONSE: usize = 16 * 1024 * 1024;
 const MAX_DEVICE_RESPONSE: usize = 1024 * 1024;
@@ -32,6 +32,11 @@ struct DeviceToken {
 #[derive(Deserialize)]
 struct DeviceError {
     error: String,
+}
+
+#[derive(Serialize)]
+struct DeviceTokenRequest<'a> {
+    device_code: &'a str,
 }
 
 fn verification_uri(value: &str) -> io::Result<&str> {
@@ -169,7 +174,12 @@ pub async fn login(base: &str, cache_path: &Path) -> io::Result<()> {
             .post(endpoint(&base, "/api/v1/auth/device/token")?)
             .header(reqwest::header::ACCEPT, "application/json")
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(serde_json::json!({ "device_code": start.device_code }).to_string())
+            .body(
+                serde_json::to_vec(&DeviceTokenRequest {
+                    device_code: &start.device_code,
+                })
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            )
             .send()
             .await
             .map_err(transport_error)?;
@@ -391,5 +401,14 @@ mod tests {
         assert_eq!(cached.base_url(), format!("http://{address}"));
         assert_eq!(cached.access_token(), "issued-secret");
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn device_token_request_uses_the_closed_wire_shape() {
+        let request = serde_json::to_string(&DeviceTokenRequest {
+            device_code: "device",
+        })
+        .unwrap();
+        assert_eq!(request, r#"{"device_code":"device"}"#);
     }
 }
