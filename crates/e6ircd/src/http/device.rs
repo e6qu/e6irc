@@ -11,6 +11,288 @@ macro_rules! json_or_response {
     };
 }
 
+fn json_response<T: serde::Serialize>(body: T) -> Response {
+    axum::Json(body).into_response()
+}
+
+fn no_store_json<T: serde::Serialize>(body: T) -> Response {
+    let mut response = json_response(body);
+    no_store(response.headers_mut());
+    response
+}
+
+#[derive(serde::Serialize)]
+struct DeviceStartResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    interval: u16,
+    expires_in: u16,
+}
+
+#[derive(serde::Serialize)]
+struct DeviceTokenResponse {
+    access_token: String,
+    token_type: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct DeviceErrorResponse<'a> {
+    error: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct MessageResponse {
+    message: String,
+}
+
+#[derive(serde::Serialize)]
+struct RevisionMessageResponse {
+    revision: i64,
+    message: String,
+}
+
+#[derive(serde::Serialize)]
+struct ConfigurationPatchResponse {
+    revision: i64,
+    restart_required: bool,
+}
+
+#[derive(serde::Serialize)]
+struct AccountCreatedResponse {
+    id: i64,
+    account: String,
+    administrator: bool,
+}
+
+#[derive(serde::Serialize)]
+struct AccountSuspensionResponse {
+    account_id: i64,
+    suspended: bool,
+    message: String,
+}
+
+#[derive(serde::Serialize)]
+struct AccountAdministratorResponse {
+    account_id: i64,
+    administrator: bool,
+    message: String,
+}
+
+enum AccountStateResponse {
+    Suspension(AccountSuspensionResponse),
+    Administrator(AccountAdministratorResponse),
+}
+
+impl From<AccountSuspensionResponse> for AccountStateResponse {
+    fn from(response: AccountSuspensionResponse) -> Self {
+        Self::Suspension(response)
+    }
+}
+
+impl From<AccountAdministratorResponse> for AccountStateResponse {
+    fn from(response: AccountAdministratorResponse) -> Self {
+        Self::Administrator(response)
+    }
+}
+
+#[derive(serde::Serialize)]
+struct AccountInvitationCreatedResponse {
+    account: String,
+    administrator: bool,
+    expires_in_days: u16,
+    invitation_url: String,
+    note: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct AdminNetworksResponse {
+    networks: Vec<super::networks::AdminNetworkResponse>,
+}
+
+#[derive(serde::Serialize)]
+struct AccountDirectoryResponse {
+    accounts: Vec<AccountDirectoryResponseEntry>,
+    next_before_id: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+struct AccountDirectoryResponseEntry {
+    id: i64,
+    name: String,
+    created_at: String,
+    authentication: AccountAuthenticationResponse,
+    resources: AccountResourcesResponse,
+    administrator: bool,
+    administrator_sources: AccountAdministratorSourcesResponse,
+    suspended: bool,
+    current: bool,
+}
+
+#[derive(serde::Serialize)]
+struct AccountAuthenticationResponse {
+    local_password: bool,
+    app_passwords: i64,
+    api_tokens: i64,
+    oidc_identities: i64,
+    browser_sessions: i64,
+}
+
+#[derive(serde::Serialize)]
+struct AccountResourcesResponse {
+    networks: i64,
+    founded_channels: i64,
+}
+
+#[derive(serde::Serialize)]
+struct AccountAdministratorSourcesResponse {
+    durable: bool,
+    configuration: bool,
+}
+
+#[derive(serde::Serialize)]
+struct AccountInvitationsResponse {
+    invitations: Vec<AccountInvitationResponse>,
+    next_before_id: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+struct AccountInvitationResponse {
+    id: i64,
+    account: String,
+    contact_email: Option<String>,
+    administrator: bool,
+    created_by: String,
+    created_at: String,
+    expires_at: String,
+}
+
+#[derive(serde::Serialize)]
+struct ServerStatsResponse {
+    server: String,
+    network: String,
+    accounts: i64,
+    registered_channels: i64,
+    server_bans: i64,
+    version: &'static str,
+    live: ServerStatsLiveResponse,
+}
+
+#[derive(serde::Serialize)]
+struct ServerStatsLiveResponse {
+    connections: u64,
+    connected_upstreams: u64,
+    upstreams: u64,
+    traffic: u64,
+    errors: u64,
+}
+
+#[derive(serde::Serialize)]
+struct RegisteredChannelsResponse {
+    channels: Vec<RegisteredChannelResponse>,
+    next_before_id: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+struct RegisteredChannelResponse {
+    id: i64,
+    name: String,
+    founder: String,
+    created_at: String,
+    policy: RegisteredChannelPolicyResponse,
+}
+
+#[derive(serde::Serialize)]
+struct RegisteredChannelPolicyResponse {
+    keeptopic: bool,
+    topic_retained: bool,
+    mlock: Option<String>,
+    access_entries: i64,
+}
+
+#[derive(serde::Serialize)]
+struct ServerBansResponse {
+    bans: Vec<ServerBanResponse>,
+    next_before_id: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+struct ServerBanResponse {
+    id: i64,
+    mask: String,
+    reason: String,
+    set_by: String,
+    kind: String,
+    created_at: String,
+}
+
+#[derive(serde::Serialize)]
+struct AuditResponse {
+    audit: Vec<AuditEntryResponse>,
+    next_before_id: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+struct AuditEntryResponse {
+    id: i64,
+    actor: String,
+    action: String,
+    target: String,
+    detail: String,
+    at: String,
+}
+
+#[derive(serde::Serialize)]
+struct ConfigurationResponse {
+    revision: i64,
+    updated_by: String,
+    updated_at: String,
+    settings: crate::config::ManagedConfig,
+    runtime: ConfigurationRuntimeResponse,
+}
+
+#[derive(serde::Serialize)]
+struct ConfigurationRuntimeResponse {
+    bound_bnc_addr: Option<std::net::SocketAddr>,
+    http_bind: Option<std::net::SocketAddr>,
+    has_master_key: bool,
+    master_key_count: usize,
+    release_revision: Option<String>,
+    network_drivers: Vec<&'static str>,
+}
+
+#[derive(serde::Serialize)]
+struct SessionIdentityResponse {
+    account: String,
+    email: Option<String>,
+    role: Option<String>,
+    provider: Option<String>,
+    release_revision: Option<String>,
+    csrf_token: String,
+    logout_url: String,
+}
+
+#[derive(serde::Serialize)]
+struct AccountResponse {
+    account: String,
+}
+
+#[derive(serde::Serialize)]
+struct ApiTokenCreatedResponse {
+    token: String,
+    label: String,
+    scopes: Vec<crate::identity::ApiTokenScope>,
+    expires_in_days: u16,
+    note: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct ServerInfoResponse {
+    server_name: String,
+    network_name: String,
+    version: &'static str,
+}
+
 // ---- device authorization grant (RFC 8628) ------------------------------
 
 /// Start a device grant. No auth: the client is not yet a principal, but each
@@ -27,18 +309,13 @@ pub(super) async fn device_start(State(state): State<Arc<AppState>>, _rl: RateLi
     };
     let pool = require_pool!(state);
     match crate::db::create_device_grant(pool).await {
-        Ok((device_code, user_code)) => (
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({
-                "device_code": device_code,
-                "user_code": user_code,
-                "verification_uri": verification_uri,
-                "interval": 5,
-                "expires_in": 600,
-            })
-            .to_string(),
-        )
-            .into_response(),
+        Ok((device_code, user_code)) => json_response(DeviceStartResponse {
+            device_code,
+            user_code,
+            verification_uri,
+            interval: 5,
+            expires_in: 600,
+        }),
         Err(e) => {
             eprintln!("http: device start failed: {e}");
             problem(
@@ -73,19 +350,17 @@ pub(super) async fn device_token(
     let oauth_err = |code: &str| {
         (
             StatusCode::BAD_REQUEST,
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({ "error": code }).to_string(),
+            axum::Json(DeviceErrorResponse { error: code }),
         )
             .into_response()
     };
     // The grant is consumed and the token minted in one transaction inside
     // `poll_device_grant`, so a mint failure can't destroy an approved grant.
     match crate::db::poll_device_grant(pool, &req.device_code, "device").await {
-        Ok(crate::db::DeviceStatus::Approved(token)) => (
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({ "access_token": token, "token_type": "bearer" }).to_string(),
-        )
-            .into_response(),
+        Ok(crate::db::DeviceStatus::Approved(token)) => json_response(DeviceTokenResponse {
+            access_token: token,
+            token_type: "bearer",
+        }),
         Ok(crate::db::DeviceStatus::Pending) => oauth_err("authorization_pending"),
         Ok(crate::db::DeviceStatus::Expired) => oauth_err("expired_token"),
         Ok(crate::db::DeviceStatus::Unknown) => oauth_err("invalid_grant"),
@@ -275,40 +550,41 @@ pub(super) async fn admin_accounts(
         Err(response) => return response,
     };
     match crate::db::query_account_directory(pool, query.database_filter()).await {
-        Ok(page) => admin_json(serde_json::json!({
-            "accounts": page.entries
+        Ok(page) => admin_json(AccountDirectoryResponse {
+            accounts: page
+                .entries
                 .into_iter()
                 .map(|entry| {
-                    let folded =
-                        e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&entry.name);
-                    let configured =
-                        state.configured_admin_accounts.contains(&folded);
-                    serde_json::json!({
-                    "id": entry.id,
-                    "name": entry.name,
-                    "created_at": entry.created_at,
-                    "authentication": {
-                        "local_password": entry.has_local_password,
-                        "app_passwords": entry.app_passwords,
-                        "api_tokens": entry.api_tokens,
-                        "oidc_identities": entry.oidc_identities,
-                        "browser_sessions": entry.browser_sessions,
-                    },
-                    "resources": {
-                        "networks": entry.networks,
-                        "founded_channels": entry.founded_channels,
-                    },
-                    "administrator": entry.administrator || configured,
-                    "administrator_sources": {
-                        "durable": entry.administrator,
-                        "configuration": configured,
-                    },
-                    "suspended": entry.suspended,
-                    "current": folded == e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&actor),
-                })})
-                .collect::<Vec<_>>(),
-            "next_before_id": page.next_before_id,
-        })),
+                    let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&entry.name);
+                    let configured = state.configured_admin_accounts.contains(&folded);
+                    AccountDirectoryResponseEntry {
+                        id: entry.id,
+                        name: entry.name,
+                        created_at: entry.created_at,
+                        authentication: AccountAuthenticationResponse {
+                            local_password: entry.has_local_password,
+                            app_passwords: entry.app_passwords,
+                            api_tokens: entry.api_tokens,
+                            oidc_identities: entry.oidc_identities,
+                            browser_sessions: entry.browser_sessions,
+                        },
+                        resources: AccountResourcesResponse {
+                            networks: entry.networks,
+                            founded_channels: entry.founded_channels,
+                        },
+                        administrator: entry.administrator || configured,
+                        administrator_sources: AccountAdministratorSourcesResponse {
+                            durable: entry.administrator,
+                            configuration: configured,
+                        },
+                        suspended: entry.suspended,
+                        current: folded
+                            == e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&actor),
+                    }
+                })
+                .collect(),
+            next_before_id: page.next_before_id,
+        }),
         Err(e) => admin_db_error("account directory", e),
     }
 }
@@ -331,20 +607,31 @@ pub(super) async fn admin_account_state(
         AccountStateBody::Suspension { suspended } => {
             super::mutate_account_suspension(&state, &actor, account_id, suspended)
                 .await
-                .map(|message| ("suspended", suspended, message))
+                .map(|message| {
+                    AccountSuspensionResponse {
+                        account_id,
+                        suspended,
+                        message,
+                    }
+                    .into()
+                })
         }
         AccountStateBody::Administrator { administrator } => {
             super::mutate_account_administrator(&state, &actor, account_id, administrator)
                 .await
-                .map(|message| ("administrator", administrator, message))
+                .map(|message| {
+                    AccountAdministratorResponse {
+                        account_id,
+                        administrator,
+                        message,
+                    }
+                    .into()
+                })
         }
     };
     match mutation {
-        Ok((field, value, message)) => admin_json(serde_json::json!({
-            "account_id": account_id,
-            (field): value,
-            "message": message,
-        })),
+        Ok(AccountStateResponse::Suspension(response)) => admin_json(response),
+        Ok(AccountStateResponse::Administrator(response)) => admin_json(response),
         Err((status, detail)) => problem(status, "Account state change failed", Some(&detail)),
     }
 }
@@ -380,11 +667,11 @@ pub(super) async fn admin_create_account(
             return problem(status, "Account creation failed", Some(&detail));
         }
     };
-    let mut response = admin_json(serde_json::json!({
-        "id": account_id,
-        "account": body.account,
-        "administrator": body.administrator,
-    }));
+    let mut response = admin_json(AccountCreatedResponse {
+        id: account_id,
+        account: body.account,
+        administrator: body.administrator,
+    });
     *response.status_mut() = StatusCode::CREATED;
     response
 }
@@ -436,20 +723,22 @@ pub(super) async fn admin_account_invitations(
         Err(response) => return response,
     };
     match crate::db::list_account_invitations(pool_of(&state), before_id, page_size).await {
-        Ok(page) => admin_json(serde_json::json!({
-            "invitations": page.entries.into_iter().map(|invitation| {
-                serde_json::json!({
-                    "id": invitation.id,
-                    "account": invitation.account_name,
-                    "contact_email": invitation.contact_email,
-                    "administrator": invitation.administrator,
-                    "created_by": invitation.created_by,
-                    "created_at": invitation.created_at,
-                    "expires_at": invitation.expires_at,
+        Ok(page) => admin_json(AccountInvitationsResponse {
+            invitations: page
+                .entries
+                .into_iter()
+                .map(|invitation| AccountInvitationResponse {
+                    id: invitation.id,
+                    account: invitation.account_name,
+                    contact_email: invitation.contact_email,
+                    administrator: invitation.administrator,
+                    created_by: invitation.created_by,
+                    created_at: invitation.created_at,
+                    expires_at: invitation.expires_at,
                 })
-            }).collect::<Vec<_>>(),
-            "next_before_id": page.next_before_id,
-        })),
+                .collect(),
+            next_before_id: page.next_before_id,
+        }),
         Err(error) => admin_db_error("account invitation directory", error),
     }
 }
@@ -501,13 +790,13 @@ pub(super) async fn admin_create_account_invitation(
     {
         Ok(token) => {
             let invitation_url = super::account_invitation_url(public_url, &token);
-            let mut response = admin_json(serde_json::json!({
-                "account": body.account,
-                "administrator": body.administrator,
-                "expires_in_days": body.expires_in_days,
-                "invitation_url": invitation_url,
-                "note": "This bearer link is shown once and cannot be retrieved later.",
-            }));
+            let mut response = admin_json(AccountInvitationCreatedResponse {
+                account: body.account,
+                administrator: body.administrator,
+                expires_in_days: body.expires_in_days,
+                invitation_url,
+                note: "This bearer link is shown once and cannot be retrieved later.",
+            });
             *response.status_mut() = StatusCode::CREATED;
             response
         }
@@ -563,19 +852,13 @@ pub(super) async fn admin_delete_account(
         );
     }
     match super::delete_account_lifecycle(&state, &actor, account_id, false).await {
-        Ok(message) => admin_json(serde_json::json!({ "message": message })),
+        Ok(message) => admin_json(MessageResponse { message }),
         Err((status, detail)) => problem(status, "Account deletion failed", Some(&detail)),
     }
 }
 
-pub(super) fn admin_json(body: serde_json::Value) -> Response {
-    let mut response = (
-        [(header::CONTENT_TYPE, "application/json")],
-        body.to_string(),
-    )
-        .into_response();
-    no_store(response.headers_mut());
-    response
+pub(super) fn admin_json<T: serde::Serialize>(body: T) -> Response {
+    no_store_json(body)
 }
 
 pub(super) fn admin_db_error(what: &str, e: impl std::fmt::Display) -> Response {
@@ -625,7 +908,7 @@ pub(super) async fn admin_networks(
             networks.sort_by(|left, right| {
                 (left.owner(), left.name()).cmp(&(right.owner(), right.name()))
             });
-            admin_json(serde_json::json!({ "networks": networks }))
+            admin_json(AdminNetworksResponse { networks })
         }
         Err(e) => admin_db_error("network inventory", e),
     }
@@ -639,21 +922,25 @@ pub(super) async fn admin_stats(
     let (networks, connected) = crate::http::bnc_counts(&state);
     let live = state.telemetry.snapshot(networks, connected);
     match crate::db::server_stats(pool).await {
-        Ok((accounts, channels, server_bans)) => admin_json(serde_json::json!({
-            "server": state.server_name,
-            "network": state.network_name,
-            "accounts": accounts,
-            "registered_channels": channels,
-            "server_bans": server_bans,
-            "version": env!("CARGO_PKG_VERSION"),
-            "live": {
-                "connections": live.active_connections,
-                "connected_upstreams": live.bnc_connected,
-                "upstreams": live.bnc_networks,
-                "traffic": live.irc_bytes_in_total.saturating_add(live.irc_bytes_out_total).saturating_add(live.bnc_bytes_in_total).saturating_add(live.bnc_bytes_out_total),
-                "errors": live.errors.values().sum::<u64>(),
+        Ok((accounts, channels, server_bans)) => admin_json(ServerStatsResponse {
+            server: state.server_name.clone(),
+            network: state.network_name.clone(),
+            accounts,
+            registered_channels: channels,
+            server_bans,
+            version: env!("CARGO_PKG_VERSION"),
+            live: ServerStatsLiveResponse {
+                connections: live.active_connections,
+                connected_upstreams: live.bnc_connected,
+                upstreams: live.bnc_networks,
+                traffic: live
+                    .irc_bytes_in_total
+                    .saturating_add(live.irc_bytes_out_total)
+                    .saturating_add(live.bnc_bytes_in_total)
+                    .saturating_add(live.bnc_bytes_out_total),
+                errors: live.errors.values().sum(),
             },
-        })),
+        }),
         Err(e) => admin_db_error("server stats", e),
     }
 }
@@ -700,20 +987,20 @@ pub(super) async fn admin_configuration(
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
-    admin_json(serde_json::json!({
-        "revision": snapshot.revision,
-        "updated_by": snapshot.updated_by,
-        "updated_at": snapshot.updated_at,
-        "settings": settings,
-        "runtime": {
-            "bound_bnc_addr": bound_bnc_addr,
-            "http_bind": state.http_bind,
-            "has_master_key": state.secret_key.is_some(),
-            "master_key_count": state.secret_key.as_ref().map_or(0, |keys| keys.key_count()),
-            "release_revision": state.application_release_revision,
-            "network_drivers": network_drivers,
+    admin_json(ConfigurationResponse {
+        revision: snapshot.revision,
+        updated_by: snapshot.updated_by,
+        updated_at: snapshot.updated_at,
+        settings,
+        runtime: ConfigurationRuntimeResponse {
+            bound_bnc_addr,
+            http_bind: state.http_bind,
+            has_master_key: state.secret_key.is_some(),
+            master_key_count: state.secret_key.as_ref().map_or(0, |keys| keys.key_count()),
+            release_revision: state.application_release_revision.clone(),
+            network_drivers,
         },
-    }))
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -934,9 +1221,10 @@ pub(super) async fn admin_patch_configuration(
     {
         Ok(snapshot) => {
             *current = snapshot.clone();
-            admin_json(
-                serde_json::json!({ "revision": snapshot.revision, "restart_required": restart_required }),
-            )
+            admin_json(ConfigurationPatchResponse {
+                revision: snapshot.revision,
+                restart_required,
+            })
         }
         Err(error) => {
             if bnc_changed && let Some(listener) = &state.bnc_listener {
@@ -1262,7 +1550,10 @@ async fn mutate_managed_configuration(
     {
         Ok(snapshot) => {
             *current = snapshot.clone();
-            admin_json(serde_json::json!({ "revision": snapshot.revision, "message": detail }))
+            admin_json(RevisionMessageResponse {
+                revision: snapshot.revision,
+                message: detail,
+            })
         }
         Err(crate::db::DbError::StaleServerSettings) => problem(
             StatusCode::CONFLICT,
@@ -1349,24 +1640,25 @@ pub(super) async fn admin_channels(
         Err(response) => return response,
     };
     match crate::db::query_registered_channel_directory(pool, query.database_filter()).await {
-        Ok(page) => admin_json(serde_json::json!({
-            "channels": page.entries
+        Ok(page) => admin_json(RegisteredChannelsResponse {
+            channels: page
+                .entries
                 .into_iter()
-                .map(|entry| serde_json::json!({
-                    "id": entry.id,
-                    "name": entry.name,
-                    "founder": entry.founder,
-                    "created_at": entry.created_at,
-                    "policy": {
-                        "keeptopic": entry.keeptopic,
-                        "topic_retained": entry.topic_retained,
-                        "mlock": entry.mlock,
-                        "access_entries": entry.access_entries,
+                .map(|entry| RegisteredChannelResponse {
+                    id: entry.id,
+                    name: entry.name,
+                    founder: entry.founder,
+                    created_at: entry.created_at,
+                    policy: RegisteredChannelPolicyResponse {
+                        keeptopic: entry.keeptopic,
+                        topic_retained: entry.topic_retained,
+                        mlock: entry.mlock,
+                        access_entries: entry.access_entries,
                     },
-                }))
-                .collect::<Vec<_>>(),
-            "next_before_id": page.next_before_id,
-        })),
+                })
+                .collect(),
+            next_before_id: page.next_before_id,
+        }),
         Err(e) => admin_db_error("registered-channel directory", e),
     }
 }
@@ -1452,22 +1744,21 @@ pub(super) async fn admin_server_bans(
         Err(response) => return response,
     };
     match crate::db::query_server_ban_directory(pool, query.database_filter()).await {
-        Ok(page) => admin_json(serde_json::json!({
-            "bans": page.entries
+        Ok(page) => admin_json(ServerBansResponse {
+            bans: page
+                .entries
                 .into_iter()
-                .map(|entry| {
-                    serde_json::json!({
-                        "id": entry.id,
-                        "mask": entry.mask,
-                        "reason": entry.reason,
-                        "set_by": entry.set_by,
-                        "kind": entry.kind,
-                        "created_at": entry.created_at,
-                    })
+                .map(|entry| ServerBanResponse {
+                    id: entry.id,
+                    mask: entry.mask,
+                    reason: entry.reason,
+                    set_by: entry.set_by,
+                    kind: entry.kind,
+                    created_at: entry.created_at,
                 })
-                .collect::<Vec<_>>(),
-            "next_before_id": page.next_before_id,
-        })),
+                .collect(),
+            next_before_id: page.next_before_id,
+        }),
         Err(e) => admin_db_error("server-ban directory", e),
     }
 }
@@ -1541,11 +1832,7 @@ async fn server_ban_response(
             response
         }
         Ok(crate::core::AdminReply::Ok(message)) => {
-            let mut response = (
-                success,
-                axum::Json(serde_json::json!({ "message": message })),
-            )
-                .into_response();
+            let mut response = (success, axum::Json(MessageResponse { message })).into_response();
             no_store(response.headers_mut());
             response
         }
@@ -1668,19 +1955,21 @@ pub(super) async fn admin_audit(
         Err(response) => return response,
     };
     match crate::db::query_audit_log(pool, query.database_filter()).await {
-        Ok(page) => admin_json(serde_json::json!({
-            "audit": page.entries
+        Ok(page) => admin_json(AuditResponse {
+            audit: page
+                .entries
                 .into_iter()
-                .map(|entry| {
-                    serde_json::json!({
-                        "id": entry.id, "actor": entry.actor, "action": entry.action,
-                        "target": entry.target, "detail": entry.detail,
-                        "at": entry.created_at,
-                    })
+                .map(|entry| AuditEntryResponse {
+                    id: entry.id,
+                    actor: entry.actor,
+                    action: entry.action,
+                    target: entry.target,
+                    detail: entry.detail,
+                    at: entry.created_at,
                 })
-                .collect::<Vec<_>>(),
-            "next_before_id": page.next_before_id,
-        })),
+                .collect(),
+            next_before_id: page.next_before_id,
+        }),
         Err(e) => admin_db_error("audit log", e),
     }
 }
@@ -1942,23 +2231,16 @@ pub(super) async fn me(
     {
         match crate::db::session_identity(pool, &token).await {
             Ok(Some(identity)) => {
-                let mut response = (
-                    [(header::CONTENT_TYPE, "application/json")],
-                    serde_json::json!({
-                        "account": identity.account,
-                        "email": identity.email,
-                        "role": identity.role,
-                        "provider": identity.provider,
-                        "release_revision": state.application_release_revision,
-                        "csrf_token": state.csrf_token(&token),
-                        "logout_url": format!(
-                            "/api/v1/auth/logout?csrf={}",
-                            state.csrf_token(&token)
-                        ),
-                    })
-                    .to_string(),
-                )
-                    .into_response();
+                let csrf_token = state.csrf_token(&token);
+                let mut response = json_response(SessionIdentityResponse {
+                    account: identity.account,
+                    email: identity.email,
+                    role: identity.role,
+                    provider: identity.provider,
+                    release_revision: state.application_release_revision.clone(),
+                    logout_url: format!("/api/v1/auth/logout?csrf={csrf_token}"),
+                    csrf_token,
+                });
                 // This body carries the session-bound CSRF token; keep it out of
                 // any shared/proxy cache.
                 no_store(response.headers_mut());
@@ -1975,11 +2257,7 @@ pub(super) async fn me(
             }
         }
     }
-    (
-        [(header::CONTENT_TYPE, "application/json")],
-        serde_json::json!({ "account": account }).to_string(),
-    )
-        .into_response()
+    json_response(AccountResponse { account })
 }
 
 #[derive(Deserialize)]
@@ -2028,6 +2306,29 @@ mod token_request_tests {
     }
 
     #[test]
+    fn device_response_models_preserve_the_wire_contract() {
+        let start = serde_json::to_string(&DeviceStartResponse {
+            device_code: "device".into(),
+            user_code: "ABCD-EFGH".into(),
+            verification_uri: "https://example.test/device".into(),
+            interval: 5,
+            expires_in: 600,
+        })
+        .unwrap();
+        assert_eq!(
+            start,
+            r#"{"device_code":"device","user_code":"ABCD-EFGH","verification_uri":"https://example.test/device","interval":5,"expires_in":600}"#
+        );
+
+        let token = serde_json::to_string(&DeviceTokenResponse {
+            access_token: "secret".into(),
+            token_type: "bearer",
+        })
+        .unwrap();
+        assert_eq!(token, r#"{"access_token":"secret","token_type":"bearer"}"#);
+    }
+
+    #[test]
     fn logout_query_rejects_unknown_fields() {
         let uri = "/?extra=1".parse().expect("query URI");
         assert!(axum::extract::Query::<LogoutQuery>::try_from_uri(&uri).is_err());
@@ -2068,15 +2369,13 @@ pub(super) async fn create_api_token(
     match crate::db::issue_scoped_api_token(pool, &account, &req.label, scopes, lifetime).await {
         Ok(token) => (
             StatusCode::CREATED,
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({
-                "token": token,
-                "label": req.label,
-                "scopes": scopes.iter().collect::<Vec<_>>(),
-                "expires_in_days": lifetime.value(),
-                "note": "Store this now; it is not retrievable later.",
-            })
-            .to_string(),
+            axum::Json(ApiTokenCreatedResponse {
+                token,
+                label: req.label,
+                scopes: scopes.iter().collect(),
+                expires_in_days: lifetime.value(),
+                note: "Store this now; it is not retrievable later.",
+            }),
         )
             .into_response(),
         Err(crate::db::DbError::TooManyCredentials) => problem(
@@ -2281,14 +2580,9 @@ pub(super) async fn shauth_logout_complete(State(state): State<Arc<AppState>>) -
 }
 
 pub(super) async fn server_info(State(state): State<Arc<AppState>>) -> Response {
-    (
-        [(header::CONTENT_TYPE, "application/json")],
-        serde_json::json!({
-            "server_name": state.server_name,
-            "network_name": state.network_name,
-            "version": env!("CARGO_PKG_VERSION"),
-        })
-        .to_string(),
-    )
-        .into_response()
+    json_response(ServerInfoResponse {
+        server_name: state.server_name.clone(),
+        network_name: state.network_name.clone(),
+        version: env!("CARGO_PKG_VERSION"),
+    })
 }
