@@ -6,6 +6,156 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct Empty {}
+
+#[derive(Serialize)]
+struct DiscordChannel {
+    name: &'static str,
+}
+
+#[derive(Serialize)]
+struct DiscordGateway {
+    url: String,
+}
+
+#[derive(Serialize)]
+struct SlackError {
+    ok: bool,
+    error: &'static str,
+}
+
+#[derive(Serialize)]
+struct SlackChannel {
+    ok: bool,
+    channel: SlackChannelData,
+}
+
+#[derive(Serialize)]
+struct SlackChannelData {
+    name: &'static str,
+}
+
+#[derive(Serialize)]
+struct SlackUser {
+    ok: bool,
+    user: SlackUserData,
+}
+
+#[derive(Serialize)]
+struct SlackUserData {
+    name: &'static str,
+    profile: SlackProfile,
+}
+
+#[derive(Serialize)]
+struct SlackProfile {
+    display_name: &'static str,
+    real_name: &'static str,
+}
+
+#[derive(Serialize)]
+struct SlackSocketOpen {
+    ok: bool,
+    url: String,
+}
+
+#[derive(Serialize)]
+struct SlackSuccess {
+    ok: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct SlackChannelQuery {
+    channel: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SlackUserQuery {
+    user: String,
+}
+
+#[derive(Serialize)]
+struct DiscordHello {
+    op: u8,
+    d: DiscordHelloData,
+}
+
+#[derive(Serialize)]
+struct DiscordHelloData {
+    heartbeat_interval: u64,
+}
+
+#[derive(Serialize)]
+struct DiscordReady {
+    op: u8,
+    s: u8,
+    t: &'static str,
+    d: DiscordReadyData,
+}
+
+#[derive(Serialize)]
+struct DiscordReadyData {
+    user: DiscordUserId,
+}
+
+#[derive(Serialize)]
+struct DiscordUserId {
+    id: &'static str,
+}
+
+#[derive(Serialize)]
+struct DiscordMessageCreate {
+    op: u8,
+    s: u8,
+    t: &'static str,
+    d: DiscordMessageData,
+}
+
+#[derive(Serialize)]
+struct DiscordMessageData {
+    channel_id: &'static str,
+    content: &'static str,
+    author: DiscordAuthor,
+}
+
+#[derive(Serialize)]
+struct DiscordAuthor {
+    id: &'static str,
+    username: &'static str,
+}
+
+#[derive(Serialize)]
+struct SlackEventEnvelope {
+    envelope_id: &'static str,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    payload: SlackEventPayload,
+}
+
+#[derive(Serialize)]
+struct SlackEventPayload {
+    event: SlackMessageEvent,
+}
+
+#[derive(Serialize)]
+struct SlackMessageEvent {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    channel: &'static str,
+    user: &'static str,
+    text: &'static str,
+}
+
+fn json_message(value: &impl Serialize) -> Message {
+    Message::Text(
+        serde_json::to_string(value)
+            .expect("oracle response serializes")
+            .into(),
+    )
+}
 
 #[derive(Clone, Copy)]
 pub enum Provider {
@@ -219,12 +369,10 @@ async fn recv_oracle(oracle: &mut Oracle, label: &str) -> OracleEvent {
         .unwrap_or_else(|| panic!("{label} event channel closed"))
 }
 
-fn bearer(headers: &HeaderMap) -> String {
+fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string()
 }
 
 async fn discord_channel(
@@ -234,20 +382,23 @@ async fn discord_channel(
 ) -> impl IntoResponse {
     if !matches!(state.provider, Provider::Discord)
         || id != "42"
-        || bearer(&headers) != "Bot discord-token"
+        || bearer(&headers) != Some("Bot discord-token")
     {
-        return (StatusCode::UNAUTHORIZED, axum::Json(serde_json::json!({})));
+        return (StatusCode::UNAUTHORIZED, axum::Json(Empty {})).into_response();
     }
     (
         StatusCode::OK,
-        axum::Json(serde_json::json!({ "name": "general" })),
+        axum::Json(DiscordChannel { name: "general" }),
     )
+        .into_response()
 }
 
 async fn discord_gateway(State(state): State<OracleState>) -> impl IntoResponse {
     (
         StatusCode::OK,
-        axum::Json(serde_json::json!({ "url": state.websocket_url })),
+        axum::Json(DiscordGateway {
+            url: state.websocket_url,
+        }),
     )
 }
 
@@ -257,76 +408,85 @@ async fn discord_post(
     headers: HeaderMap,
     axum::Json(body): axum::Json<DiscordPost>,
 ) -> impl IntoResponse {
-    if !matches!(state.provider, Provider::Discord) || id != "42" {
+    if !matches!(state.provider, Provider::Discord)
+        || id != "42"
+        || bearer(&headers) != Some("Bot discord-token")
+    {
         return StatusCode::NOT_FOUND;
     }
     state
         .events
         .send(OracleEvent::DiscordPost {
-            authorization: bearer(&headers),
+            authorization: bearer(&headers)
+                .expect("validated Discord authorization")
+                .into(),
             body,
         })
         .expect("discord oracle event receiver");
     StatusCode::NO_CONTENT
 }
 
-fn slack_gate(
-    state: &OracleState,
-    headers: &HeaderMap,
-    query: &std::collections::HashMap<String, String>,
-    param: &str,
-    want: &str,
-) -> Option<axum::Json<serde_json::Value>> {
-    if !matches!(state.provider, Provider::Slack)
-        || query.get(param).map(String::as_str) != Some(want)
-        || bearer(headers) != "Bearer xoxb-token"
-    {
-        return Some(axum::Json(
-            serde_json::json!({ "ok": false, "error": "invalid_auth" }),
-        ));
-    }
-    None
+fn slack_authorized(state: &OracleState, headers: &HeaderMap) -> bool {
+    matches!(state.provider, Provider::Slack) && bearer(headers) == Some("Bearer xoxb-token")
 }
 
 async fn slack_channel(
     State(state): State<OracleState>,
     headers: HeaderMap,
-    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::Query(query): axum::extract::Query<SlackChannelQuery>,
 ) -> impl IntoResponse {
-    if let Some(fail) = slack_gate(&state, &headers, &query, "channel", "C1") {
-        return fail;
+    if !slack_authorized(&state, &headers) || query.channel != "C1" {
+        return axum::Json(SlackError {
+            ok: false,
+            error: "invalid_auth",
+        })
+        .into_response();
     }
-    axum::Json(serde_json::json!({
-        "ok": true,
-        "channel": { "name": "general" }
-    }))
+    axum::Json(SlackChannel {
+        ok: true,
+        channel: SlackChannelData { name: "general" },
+    })
+    .into_response()
 }
 
 async fn slack_user(
     State(state): State<OracleState>,
     headers: HeaderMap,
-    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::Query(query): axum::extract::Query<SlackUserQuery>,
 ) -> impl IntoResponse {
-    if let Some(fail) = slack_gate(&state, &headers, &query, "user", "U1") {
-        return fail;
+    if !slack_authorized(&state, &headers) || query.user != "U1" {
+        return axum::Json(SlackError {
+            ok: false,
+            error: "invalid_auth",
+        })
+        .into_response();
     }
-    axum::Json(serde_json::json!({
-        "ok": true,
-        "user": {
-            "name": "alice",
-            "profile": { "display_name": "Alice", "real_name": "Alice Example" }
-        }
-    }))
+    axum::Json(SlackUser {
+        ok: true,
+        user: SlackUserData {
+            name: "alice",
+            profile: SlackProfile {
+                display_name: "Alice",
+                real_name: "Alice Example",
+            },
+        },
+    })
+    .into_response()
 }
 
 async fn slack_open(State(state): State<OracleState>, headers: HeaderMap) -> impl IntoResponse {
-    if !matches!(state.provider, Provider::Slack) || bearer(&headers) != "Bearer xapp-token" {
-        return axum::Json(serde_json::json!({ "ok": false, "error": "invalid_auth" }));
+    if !matches!(state.provider, Provider::Slack) || bearer(&headers) != Some("Bearer xapp-token") {
+        return axum::Json(SlackError {
+            ok: false,
+            error: "invalid_auth",
+        })
+        .into_response();
     }
-    axum::Json(serde_json::json!({
-        "ok": true,
-        "url": state.websocket_url
-    }))
+    axum::Json(SlackSocketOpen {
+        ok: true,
+        url: state.websocket_url,
+    })
+    .into_response()
 }
 
 async fn slack_post(
@@ -334,17 +494,23 @@ async fn slack_post(
     headers: HeaderMap,
     axum::Json(body): axum::Json<SlackPost>,
 ) -> impl IntoResponse {
-    if !matches!(state.provider, Provider::Slack) {
-        return axum::Json(serde_json::json!({ "ok": false, "error": "wrong_provider" }));
+    if !slack_authorized(&state, &headers) {
+        return axum::Json(SlackError {
+            ok: false,
+            error: "invalid_auth",
+        })
+        .into_response();
     }
     state
         .events
         .send(OracleEvent::SlackPost {
-            authorization: bearer(&headers),
+            authorization: bearer(&headers)
+                .expect("validated Slack authorization")
+                .into(),
             body,
         })
         .expect("slack oracle event receiver");
-    axum::Json(serde_json::json!({ "ok": true }))
+    axum::Json(SlackSuccess { ok: true }).into_response()
 }
 
 async fn websocket(
@@ -358,9 +524,12 @@ async fn drive_websocket(state: OracleState, mut socket: WebSocket) {
     match state.provider {
         Provider::Discord => {
             socket
-                .send(Message::Text(
-                    r#"{"op":10,"d":{"heartbeat_interval":60000}}"#.into(),
-                ))
+                .send(json_message(&DiscordHello {
+                    op: 10,
+                    d: DiscordHelloData {
+                        heartbeat_interval: 60_000,
+                    },
+                }))
                 .await
                 .expect("discord HELLO");
             loop {
@@ -377,23 +546,47 @@ async fn drive_websocket(state: OracleState, mut socket: WebSocket) {
                 }
             }
             socket
-                .send(Message::Text(
-                    r#"{"op":0,"s":1,"t":"READY","d":{"user":{"id":"bot"}}}"#.into(),
-                ))
+                .send(json_message(&DiscordReady {
+                    op: 0,
+                    s: 1,
+                    t: "READY",
+                    d: DiscordReadyData {
+                        user: DiscordUserId { id: "bot" },
+                    },
+                }))
                 .await
                 .expect("discord READY");
             socket
-                .send(Message::Text(
-                    r#"{"op":0,"s":2,"t":"MESSAGE_CREATE","d":{"channel_id":"42","content":"hello from Discord","author":{"id":"user","username":"alice"}}}"#.into(),
-                ))
+                .send(json_message(&DiscordMessageCreate {
+                    op: 0,
+                    s: 2,
+                    t: "MESSAGE_CREATE",
+                    d: DiscordMessageData {
+                        channel_id: "42",
+                        content: "hello from Discord",
+                        author: DiscordAuthor {
+                            id: "user",
+                            username: "alice",
+                        },
+                    },
+                }))
                 .await
                 .expect("discord message");
         }
         Provider::Slack => {
             socket
-                .send(Message::Text(
-                    r#"{"envelope_id":"env-1","type":"events_api","payload":{"event":{"type":"message","channel":"C1","user":"U1","text":"hello from Slack"}}}"#.into(),
-                ))
+                .send(json_message(&SlackEventEnvelope {
+                    envelope_id: "env-1",
+                    kind: "events_api",
+                    payload: SlackEventPayload {
+                        event: SlackMessageEvent {
+                            kind: "message",
+                            channel: "C1",
+                            user: "U1",
+                            text: "hello from Slack",
+                        },
+                    },
+                }))
                 .await
                 .expect("slack event");
             let Some(Ok(Message::Text(text))) = socket.recv().await else {

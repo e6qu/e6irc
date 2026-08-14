@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, RequestBuilder, StatusCode, Url};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -196,7 +198,7 @@ async fn request_outcome(request: RequestBuilder) -> PhaseOutcome {
     }
 }
 
-async fn success_json(request: RequestBuilder) -> Result<serde_json::Value, PhaseOutcome> {
+async fn success_json<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, PhaseOutcome> {
     let response = request.send().await.map_err(|_| PhaseOutcome::Failed)?;
     if !response.status().is_success() {
         return Err(classified(response.status()));
@@ -204,15 +206,137 @@ async fn success_json(request: RequestBuilder) -> Result<serde_json::Value, Phas
     response.json().await.map_err(|_| PhaseOutcome::Failed)
 }
 
-async fn json_outcome(
+async fn json_outcome<T: DeserializeOwned>(
     request: RequestBuilder,
-    accepted: impl FnOnce(&serde_json::Value) -> bool,
+    accepted: impl FnOnce(&T) -> bool,
 ) -> PhaseOutcome {
     match success_json(request).await {
         Ok(json) if accepted(&json) => PhaseOutcome::Passed,
         Ok(_) => PhaseOutcome::Rejected,
         Err(outcome) => outcome,
     }
+}
+
+#[derive(Deserialize, Serialize)]
+struct DiscordGateway {
+    url: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct DiscordMessage {
+    id: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct DiscordMessageCreated {
+    id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct DiscordMessageCreate<'a> {
+    content: &'a str,
+}
+
+#[derive(Deserialize, Serialize)]
+struct DiscordHello {
+    op: u8,
+}
+
+#[derive(Serialize)]
+struct DiscordIdentify<'a> {
+    op: u8,
+    d: DiscordIdentifyData<'a>,
+}
+
+#[derive(Serialize)]
+struct DiscordIdentifyData<'a> {
+    token: &'a str,
+    intents: u8,
+    properties: DiscordIdentifyProperties,
+}
+
+#[derive(Serialize)]
+struct DiscordIdentifyProperties {
+    os: &'static str,
+    browser: &'static str,
+    device: &'static str,
+}
+
+#[derive(Deserialize)]
+struct DiscordReady {
+    #[serde(rename = "t")]
+    event: DiscordReadyEvent,
+}
+
+#[derive(Deserialize)]
+enum DiscordReadyEvent {
+    #[serde(rename = "READY")]
+    Ready,
+}
+
+#[derive(Serialize)]
+struct SlackMessageCreate<'a> {
+    channel: &'a str,
+    text: &'a str,
+}
+
+#[derive(Serialize)]
+struct SlackMessageDelete<'a> {
+    channel: &'a str,
+    ts: &'a str,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SlackResult {
+    ok: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SlackSocketOpen {
+    ok: bool,
+    url: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SlackMessagePost {
+    ok: bool,
+    ts: Option<String>,
+    message: Option<SlackMessageTimestamp>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SlackMessageTimestamp {
+    ts: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SlackReplies {
+    ok: bool,
+    messages: Vec<SlackReply>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SlackReply {
+    ts: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct OidcDiscovery {
+    issuer: String,
+    token_endpoint: String,
+    introspection_endpoint: String,
+    revocation_endpoint: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct OidcToken {
+    access_token: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct OidcIntrospection {
+    active: bool,
 }
 
 fn marker(kind: &str) -> String {
@@ -257,11 +381,8 @@ async fn discord(_target: &str) -> ProbeReport {
             PhaseOutcome::NotRun,
         );
     }
-    let gateway_url = match success_json(http.get(gateway.into_url())).await {
-        Ok(json) => json
-            .get("url")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
+    let gateway_url = match success_json::<DiscordGateway>(http.get(gateway.into_url())).await {
+        Ok(json) => Some(json.url),
         Err(outcome) => {
             return report(
                 TargetKind::Discord,
@@ -303,10 +424,10 @@ async fn discord(_target: &str) -> ProbeReport {
             Some(url) => url,
             None => return not_run(TargetKind::Discord),
         };
-    let posted = match success_json(
+    let posted = match success_json::<DiscordMessageCreated>(
         http.post(message_collection.into_url())
             .header("Authorization", &authorization)
-            .json(&serde_json::json!({"content": message})),
+            .json(&DiscordMessageCreate { content: &message }),
     )
     .await
     {
@@ -322,7 +443,7 @@ async fn discord(_target: &str) -> ProbeReport {
             );
         }
     };
-    let Some(id) = posted.and_then(|json| json.get("id")?.as_str().map(str::to_owned)) else {
+    let Some(DiscordMessageCreated { id }) = posted else {
         return report(
             TargetKind::Discord,
             PhaseOutcome::Passed,
@@ -348,7 +469,7 @@ async fn discord(_target: &str) -> ProbeReport {
     let persistence = json_outcome(
         http.get(message_url.clone().into_url())
             .header("Authorization", &authorization),
-        |json| discord_readback_matches(json, &id, &message),
+        |json: &DiscordMessage| discord_readback_matches(json, &id, &message),
     )
     .await;
     let cleanup = request_outcome(
@@ -366,9 +487,8 @@ async fn discord(_target: &str) -> ProbeReport {
     )
 }
 
-fn discord_readback_matches(json: &serde_json::Value, id: &str, content: &str) -> bool {
-    json.get("id").and_then(serde_json::Value::as_str) == Some(id)
-        && json.get("content").and_then(serde_json::Value::as_str) == Some(content)
+fn discord_readback_matches(message: &DiscordMessage, id: &str, content: &str) -> bool {
+    message.id == id && message.content == content
 }
 
 async fn discord_connect(url: &CampaignSocketUrl, token: &str) -> PhaseOutcome {
@@ -385,19 +505,25 @@ async fn discord_connect(url: &CampaignSocketUrl, token: &str) -> PhaseOutcome {
     let Some(Ok(Message::Text(frame))) = hello else {
         return PhaseOutcome::Failed;
     };
-    if serde_json::from_str::<serde_json::Value>(&frame)
-        .ok()
-        .and_then(|json| json.get("op").and_then(serde_json::Value::as_i64))
-        != Some(10)
-    {
+    if !matches!(serde_json::from_str(&frame), Ok(DiscordHello { op: 10 })) {
         return PhaseOutcome::Rejected;
     }
-    let identify = serde_json::json!({"op": 2, "d": {"token": token, "intents": 0, "properties": {"os":"linux", "browser":"e6irc", "device":"e6irc"}}});
-    if socket
-        .send(Message::Text(identify.to_string().into()))
-        .await
-        .is_err()
-    {
+    let identify = DiscordIdentify {
+        op: 2,
+        d: DiscordIdentifyData {
+            token,
+            intents: 0,
+            properties: DiscordIdentifyProperties {
+                os: "linux",
+                browser: "e6irc",
+                device: "e6irc",
+            },
+        },
+    };
+    let Ok(identify) = serde_json::to_string(&identify) else {
+        return PhaseOutcome::Failed;
+    };
+    if socket.send(Message::Text(identify.into())).await.is_err() {
         return PhaseOutcome::Failed;
     }
     let ready = tokio::time::timeout(TIMEOUT, socket.next())
@@ -406,11 +532,12 @@ async fn discord_connect(url: &CampaignSocketUrl, token: &str) -> PhaseOutcome {
         .flatten();
     let outcome = match ready {
         Some(Ok(Message::Text(frame)))
-            if serde_json::from_str::<serde_json::Value>(&frame)
-                .ok()
-                .is_some_and(|json| {
-                    json.get("t").and_then(serde_json::Value::as_str) == Some("READY")
-                }) =>
+            if matches!(
+                serde_json::from_str(&frame),
+                Ok(DiscordReady {
+                    event: DiscordReadyEvent::Ready
+                })
+            ) =>
         {
             PhaseOutcome::Passed
         }
@@ -443,7 +570,7 @@ async fn slack(_target: &str) -> ProbeReport {
     let auth = json_outcome(
         http.post(auth_url.into_url())
             .header("Authorization", &authorization),
-        slack_ok,
+        |response: &SlackResult| response.ok,
     )
     .await;
     if auth != PhaseOutcome::Passed {
@@ -474,10 +601,13 @@ async fn slack(_target: &str) -> ProbeReport {
         return not_run(TargetKind::Slack);
     };
     let message = marker("slack");
-    let posted = match success_json(
+    let posted = match success_json::<SlackMessagePost>(
         http.post(post_url.into_url())
             .header("Authorization", &authorization)
-            .json(&serde_json::json!({"channel":channel.as_str(),"text":message})),
+            .json(&SlackMessageCreate {
+                channel: channel.as_str(),
+                text: &message,
+            }),
     )
     .await
     {
@@ -494,14 +624,9 @@ async fn slack(_target: &str) -> ProbeReport {
         }
     };
     let Some(timestamp) = posted.and_then(|json| {
-        (json.get("ok").and_then(serde_json::Value::as_bool) == Some(true))
-            .then_some(json)
-            .and_then(|json| {
-                json.get("ts")
-                    .or_else(|| json.get("message")?.get("ts"))?
-                    .as_str()
-                    .map(str::to_owned)
-            })
+        json.ok
+            .then(|| json.ts.or_else(|| json.message.map(|message| message.ts)))
+            .flatten()
     }) else {
         return report(
             TargetKind::Slack,
@@ -519,7 +644,7 @@ async fn slack(_target: &str) -> ProbeReport {
         http.get(replies_url.into_url())
             .header("Authorization", &authorization)
             .query(&[("channel", channel.as_str()), ("ts", &timestamp)]),
-        |json| slack_readback_contains(json, &timestamp),
+        |json: &SlackReplies| slack_readback_contains(json, &timestamp),
     )
     .await;
     let Some(delete_url) = endpoint(&base, "chat.delete") else {
@@ -528,8 +653,11 @@ async fn slack(_target: &str) -> ProbeReport {
     let cleanup = json_outcome(
         http.post(delete_url.into_url())
             .header("Authorization", &authorization)
-            .json(&serde_json::json!({"channel":channel.as_str(),"ts":timestamp})),
-        slack_ok,
+            .json(&SlackMessageDelete {
+                channel: channel.as_str(),
+                ts: &timestamp,
+            }),
+        |response: &SlackResult| response.ok,
     )
     .await;
     report(
@@ -542,20 +670,12 @@ async fn slack(_target: &str) -> ProbeReport {
     )
 }
 
-fn slack_readback_contains(json: &serde_json::Value, timestamp: &str) -> bool {
-    json.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
-        && json
-            .get("messages")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|messages| {
-                messages.iter().any(|message| {
-                    message.get("ts").and_then(serde_json::Value::as_str) == Some(timestamp)
-                })
-            })
-}
-
-fn slack_ok(json: &serde_json::Value) -> bool {
-    json.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+fn slack_readback_contains(response: &SlackReplies, timestamp: &str) -> bool {
+    response.ok
+        && response
+            .messages
+            .iter()
+            .any(|message| message.ts == timestamp)
 }
 
 async fn slack_socket(
@@ -566,16 +686,17 @@ async fn slack_socket(
     let Some(url) = endpoint(base, "apps.connections.open") else {
         return Err(PhaseOutcome::Rejected);
     };
-    let json = success_json(
+    let response = success_json::<SlackSocketOpen>(
         http.post(url.into_url())
             .header("Authorization", format!("Bearer {app}")),
     )
     .await?;
-    if !slack_ok(&json) {
+    if !response.ok {
         return Err(PhaseOutcome::Rejected);
     }
-    json.get("url")
-        .and_then(serde_json::Value::as_str)
+    response
+        .url
+        .as_deref()
         .and_then(CampaignSocketUrl::parse)
         .ok_or(PhaseOutcome::Rejected)
 }
@@ -606,13 +727,13 @@ async fn slack_connect(http: &Client, base: &CampaignUrl, app: &str) -> PhaseOut
     }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Serialize)]
 struct SlackHello {
     #[serde(rename = "type")]
     kind: SlackSocketFrame,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum SlackSocketFrame {
     Hello,
@@ -643,7 +764,7 @@ async fn oidc(target: &str) -> ProbeReport {
     let Ok(http) = client() else {
         return failed(TargetKind::Oidc);
     };
-    let configuration = match success_json(http.get(discovery.into_url())).await {
+    let configuration = match success_json::<OidcDiscovery>(http.get(discovery.into_url())).await {
         Ok(json) => json,
         Err(outcome) => {
             return report(
@@ -659,24 +780,15 @@ async fn oidc(target: &str) -> ProbeReport {
     if !oidc_issuer_matches(&configuration, &issuer) {
         return not_run(TargetKind::Oidc);
     }
-    let Some(token_endpoint) = configuration
-        .get("token_endpoint")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| oidc_endpoint(&issuer, value))
+    let Some(token_endpoint) = oidc_endpoint(&issuer, &configuration.token_endpoint) else {
+        return not_run(TargetKind::Oidc);
+    };
+    let Some(introspection_endpoint) =
+        oidc_endpoint(&issuer, &configuration.introspection_endpoint)
     else {
         return not_run(TargetKind::Oidc);
     };
-    let Some(introspection_endpoint) = configuration
-        .get("introspection_endpoint")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| oidc_endpoint(&issuer, value))
-    else {
-        return not_run(TargetKind::Oidc);
-    };
-    let Some(revocation_endpoint) = configuration
-        .get("revocation_endpoint")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| oidc_endpoint(&issuer, value))
+    let Some(revocation_endpoint) = oidc_endpoint(&issuer, &configuration.revocation_endpoint)
     else {
         return not_run(TargetKind::Oidc);
     };
@@ -701,7 +813,7 @@ async fn oidc(target: &str) -> ProbeReport {
         http.post(introspection_endpoint.clone().into_url())
             .basic_auth(&client_id, Some(&secret))
             .form(&[("token", token.as_str())]),
-        |json| json.get("active").and_then(serde_json::Value::as_bool) == Some(true),
+        |response: &OidcIntrospection| response.active,
     )
     .await;
     let revoked = request_outcome(
@@ -715,7 +827,7 @@ async fn oidc(target: &str) -> ProbeReport {
             http.post(introspection_endpoint.into_url())
                 .basic_auth(&client_id, Some(&secret))
                 .form(&[("token", token.as_str())]),
-            |json| json.get("active").and_then(serde_json::Value::as_bool) == Some(false),
+            |response: &OidcIntrospection| !response.active,
         )
         .await
     } else {
@@ -731,11 +843,8 @@ async fn oidc(target: &str) -> ProbeReport {
     )
 }
 
-fn oidc_issuer_matches(configuration: &serde_json::Value, issuer: &CampaignUrl) -> bool {
-    configuration
-        .get("issuer")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| value == issuer.as_str())
+fn oidc_issuer_matches(configuration: &OidcDiscovery, issuer: &CampaignUrl) -> bool {
+    configuration.issuer == issuer.as_str()
 }
 
 fn oidc_discovery_url(issuer: &CampaignUrl) -> Option<CampaignUrl> {
@@ -755,17 +864,15 @@ async fn oidc_token(
     client_id: &str,
     secret: &str,
 ) -> Result<String, PhaseOutcome> {
-    success_json(
+    let response = success_json::<OidcToken>(
         http.post(endpoint.clone().into_url())
             .basic_auth(client_id, Some(secret))
             .form(&[("grant_type", "client_credentials")]),
     )
-    .await?
-    .get("access_token")
-    .and_then(serde_json::Value::as_str)
-    .filter(|token| !token.is_empty())
-    .map(str::to_owned)
-    .ok_or(PhaseOutcome::Rejected)
+    .await?;
+    (!response.access_token.is_empty())
+        .then_some(response.access_token)
+        .ok_or(PhaseOutcome::Rejected)
 }
 
 #[cfg(test)]
