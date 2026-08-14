@@ -597,7 +597,7 @@ pub(super) async fn admin_networks(
     let pool = pool_of(&state);
     match crate::db::list_bnc_network_inventory(pool).await {
         Ok(rows) => {
-            let mut networks: Vec<serde_json::Value> = rows
+            let mut networks: Vec<super::networks::AdminNetworkResponse> = rows
                 .into_iter()
                 .map(|row| {
                     let runtime = state
@@ -605,9 +605,10 @@ pub(super) async fn admin_networks(
                         .as_ref()
                         .and_then(|r| r.get_owned(&row.owner, &row.network.name))
                         .map(|h| h.runtime_snapshot());
-                    let mut value = super::networks::network_json(row.network, runtime.as_ref());
-                    value["owner"] = serde_json::json!(row.owner);
-                    value
+                    super::networks::owned_admin_network_response(
+                        row.owner,
+                        super::networks::network_response(row.network, runtime.as_ref()),
+                    )
                 })
                 .collect();
             if let Some(registry) = &state.bnc_registry {
@@ -616,22 +617,11 @@ pub(super) async fn admin_networks(
                         .list()
                         .into_iter()
                         .filter(|status| status.owner.is_none())
-                        .map(|status| {
-                            serde_json::json!({
-                                "owner": "shared",
-                                "name": status.name,
-                                "kind": status.kind,
-                                "enabled": true,
-                                "connected": status.connected,
-                                "runtime": super::networks::runtime_json(&status.runtime),
-                                "shared": true,
-                            })
-                        }),
+                        .map(super::networks::shared_admin_network_response),
                 );
             }
             networks.sort_by(|left, right| {
-                (left["owner"].as_str(), left["name"].as_str())
-                    .cmp(&(right["owner"].as_str(), right["name"].as_str()))
+                (left.owner(), left.name()).cmp(&(right.owner(), right.name()))
             });
             admin_json(serde_json::json!({ "networks": networks }))
         }
