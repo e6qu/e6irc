@@ -229,12 +229,7 @@ pub(super) async fn oidc_authorize(
         .set_pkce_challenge(pkce_challenge);
     // `openid` is implied by the flow; add the provider's other scopes
     // (defaulting to profile + email).
-    let scopes = if provider.scopes.is_empty() {
-        vec!["profile".to_string(), "email".to_string()]
-    } else {
-        provider.scopes.clone()
-    };
-    for scope in scopes {
+    for scope in requested_scopes(&provider) {
         request = request.add_scope(Scope::new(scope));
     }
     if silent {
@@ -287,11 +282,34 @@ pub(super) async fn oidc_authorize(
         .into_response()
 }
 
+fn requested_scopes(provider: &OidcProviderConfig) -> Vec<String> {
+    if provider.scopes.is_empty() {
+        vec!["profile".into(), "email".into()]
+    } else {
+        provider.scopes.clone()
+    }
+}
+
+fn callback_scope_matches(provider: &OidcProviderConfig, scope: &str) -> bool {
+    let returned = scope
+        .split_ascii_whitespace()
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = requested_scopes(provider)
+        .into_iter()
+        .chain(std::iter::once("openid".into()))
+        .collect::<std::collections::BTreeSet<_>>();
+    returned == expected.iter().map(String::as_str).collect()
+}
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct CallbackQuery {
     pub(super) code: Option<String>,
     pub(super) state: Option<String>,
     pub(super) error: Option<String>,
+    pub(super) scope: Option<String>,
+    #[serde(rename = "iss")]
+    pub(super) issuer: Option<String>,
 }
 
 pub(super) async fn oidc_callback(
@@ -301,7 +319,24 @@ pub(super) async fn oidc_callback(
     Query(query): Query<CallbackQuery>,
 ) -> Response {
     use openidconnect::{AuthorizationCode, PkceCodeVerifier, TokenResponse};
-    if let Some(err) = query.error {
+    if query.issuer.as_deref().is_some_and(|issuer| {
+        !state
+            .oidc_providers
+            .iter()
+            .any(|provider| provider.name == provider_name && provider.issuer_url == issuer)
+    }) {
+        return problem(StatusCode::UNAUTHORIZED, "OIDC issuer mismatch", None);
+    }
+    if query.scope.as_deref().is_some_and(|scope| {
+        !state
+            .oidc_providers
+            .iter()
+            .find(|provider| provider.name == provider_name)
+            .is_some_and(|provider| callback_scope_matches(provider, scope))
+    }) {
+        return problem(StatusCode::UNAUTHORIZED, "OIDC scope mismatch", None);
+    }
+    if let Some(err) = query.error.as_deref() {
         // Consuming the pending entry requires the browser to present the
         // binding cookie, constant-time-equal to the returned `state` — the
         // same guard the success path applies below, and for the same reason:
@@ -337,7 +372,7 @@ pub(super) async fn oidc_callback(
             }
             return Redirect::to("/?sso=none").into_response();
         }
-        return problem(StatusCode::UNAUTHORIZED, "OIDC login refused", Some(&err));
+        return problem(StatusCode::UNAUTHORIZED, "OIDC login refused", Some(err));
     }
     let (Some(code), Some(csrf_state)) = (query.code, query.state) else {
         return problem(StatusCode::BAD_REQUEST, "Missing code or state", None);
@@ -589,11 +624,13 @@ pub(super) const BACKCHANNEL_LOGOUT_EVENT: &str =
     "http://schemas.openid.net/event/backchannel-logout";
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct BackchannelLogoutForm {
     pub(super) logout_token: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct FrontchannelLogoutQuery {
     pub(super) iss: String,
     pub(super) sid: String,
@@ -1583,6 +1620,30 @@ mod domain_policy_tests {
             Some("not-an-email"),
             true
         ));
+    }
+
+    #[test]
+    fn logout_and_callback_queries_reject_unknown_fields() {
+        let uri = "/?extra=1".parse().expect("query URI");
+        assert!(axum::extract::Query::<CallbackQuery>::try_from_uri(&uri).is_err());
+        assert!(axum::extract::Query::<FrontchannelLogoutQuery>::try_from_uri(&uri).is_err());
+    }
+
+    #[test]
+    fn callback_query_accepts_the_standard_issuer_parameter() {
+        let uri = "/?iss=https%3A%2F%2Fidentity.example"
+            .parse()
+            .expect("query URI");
+        let query = axum::extract::Query::<CallbackQuery>::try_from_uri(&uri)
+            .expect("standard issuer parameter");
+        assert_eq!(query.issuer.as_deref(), Some("https://identity.example"));
+    }
+
+    #[test]
+    fn callback_scope_must_match_the_requested_scopes() {
+        let provider = provider(&[]);
+        assert!(callback_scope_matches(&provider, "openid profile email"));
+        assert!(!callback_scope_matches(&provider, "openid profile"));
     }
 
     #[test]

@@ -20,8 +20,8 @@ WebSocket events and composer requests. Immutable console mutation operations
 are checked against the router. Successful mutations refresh their API-backed
 view without a document reload. Bridge provider frames and REST bodies cross
 typed contracts. Server routes emit closed response models for owner, operator,
-and live-connection projections. History accepts one typed cursor window and a
-bounded page size.
+and live-connection projections; URL queries and forms reject unknown fields.
+History accepts one typed cursor window and a bounded page size.
 Chat, console, and identity pages share accessible light and dark palettes.
 Browser tests cover WCAG AA contrast, keyboard focus, Escape dismissal,
 reduced motion, forced colors, and responsive chat controls.

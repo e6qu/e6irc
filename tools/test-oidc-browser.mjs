@@ -1520,7 +1520,10 @@ try {
     );
   }
   await page.getByText("scrollback filler 11", { exact: true }).waitFor();
-  await page.locator("#messages").evaluate((node) => { node.scrollTop = 0; });
+  await page.locator("#messages").evaluate((node) => {
+    node.scrollTop = 0;
+    node.dispatchEvent(new Event("scroll"));
+  });
   await page.waitForFunction(() => {
     const messages = document.getElementById("messages");
     return messages.scrollTop === 0 && messages.scrollHeight - messages.clientHeight >= 40;

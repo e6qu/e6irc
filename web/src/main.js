@@ -157,6 +157,7 @@ const buffers = new Map();
 const namesSnapshots = new Set();
 const namesRequested = new Set();
 let active = null;
+let followingLatest = true;
 let myNick = null;
 let socket = null;
 let upstreamConnected = false;
@@ -494,6 +495,7 @@ function renderActive({ atLatest = true } = {}) {
   messagesEl.replaceChildren();
   if (b) for (const line of b.lines) messagesEl.appendChild(messageRow(line));
   messagesEl.scrollTop = atLatest ? messagesEl.scrollHeight : 0;
+  followingLatest = atLatest;
   if (b) b.pendingVisibleMessages = 0;
   renderJumpLatest();
   requestAnimationFrame(() => {
@@ -518,7 +520,8 @@ function renderJumpLatest() {
 }
 
 messagesEl.addEventListener("scroll", () => {
-  if (!isNearLatest()) return;
+  followingLatest = isNearLatest();
+  if (!followingLatest) return;
   const b = buffers.get(active);
   if (!b || b.pendingVisibleMessages === 0) return;
   b.pendingVisibleMessages = 0;
@@ -528,6 +531,7 @@ messagesEl.addEventListener("scroll", () => {
 if (jumpLatestButton) {
   jumpLatestButton.addEventListener("click", () => {
     messagesEl.scrollTop = messagesEl.scrollHeight;
+    followingLatest = true;
     const b = buffers.get(active);
     if (b) b.pendingVisibleMessages = 0;
     renderJumpLatest();
@@ -661,7 +665,7 @@ function addLine(bufName, kind, bufKind, from, text, tags = null) {
   b.lines.push(line);
   if (b.lines.length > MAX_LINES) b.lines.shift();
   if (b.key === active) {
-    const nearBottom = isNearLatest();
+    const nearBottom = followingLatest || isNearLatest();
     messagesEl.appendChild(messageRow(line));
     // Trim on the actual DOM node count — the model was already clamped above,
     // so a guard on `b.lines.length` would never fire and the DOM would grow
@@ -671,8 +675,10 @@ function addLine(bufName, kind, bufKind, from, text, tags = null) {
     }
     if (nearBottom) {
       messagesEl.scrollTop = messagesEl.scrollHeight;
+      followingLatest = true;
       b.pendingVisibleMessages = 0;
     } else {
+      followingLatest = false;
       b.pendingVisibleMessages += 1;
     }
     renderJumpLatest();

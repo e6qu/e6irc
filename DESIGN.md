@@ -1504,6 +1504,9 @@ Design constraints recorded now:
 ## 12. REST API (`/api/v1`)
 
 Versioned under `/api/v1`; JSON; errors use RFC 9457 problem+json shape.
+Every URL query and form is closed: unknown fields are rejected before a
+handler runs. OIDC callback issuers, when returned, must exactly match the
+configured provider.
 Surface (initial):
 
 - `auth`: OIDC start/callback, device-flow bootstrap, logout
