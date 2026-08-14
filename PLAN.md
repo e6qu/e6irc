@@ -27,7 +27,8 @@ Browser tests cover WCAG AA contrast, keyboard focus, Escape dismissal,
 reduced motion, forced colors, and responsive chat controls.
 External qualification has one manual GitHub workflow. It selects one closed
 campaign, refuses local provider oracles, and uploads only evidence accepted by
-the runner verifier.
+the runner verifier. Its Discord, Slack, and OpenID Connect boundaries use
+closed request, response, and WebSocket-frame contracts.
 The current qualification runner passed live public IRC campaigns for
 Libera.Chat, OFTC, and Ergo on 2026-08-13. The console has a bounded,
 owner-scoped component-log view for IRC and every bridge driver. Its API reads

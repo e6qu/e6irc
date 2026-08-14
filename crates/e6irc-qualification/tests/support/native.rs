@@ -10,6 +10,37 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize)]
+struct Empty {}
+
+#[derive(Serialize)]
+struct Channel {
+    name: &'static str,
+}
+
+#[derive(Serialize)]
+struct DiscordCreated {
+    id: &'static str,
+}
+
+#[derive(Deserialize)]
+struct DiscordPostRequest {
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct SlackPostRequest {
+    channel: String,
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct SlackDeleteRequest {
+    channel: String,
+    ts: String,
+}
 
 static ENVIRONMENT: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -86,30 +117,29 @@ async fn discord_channel(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if id == "42" && discord_authorized(&headers) {
-        (StatusCode::OK, Json(serde_json::json!({"name":"general"})))
+        (StatusCode::OK, Json(Channel { name: "general" })).into_response()
     } else {
-        (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})))
+        (StatusCode::UNAUTHORIZED, Json(Empty {})).into_response()
     }
 }
 
-async fn discord_gateway(State(state): State<DiscordOracle>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({"url":state.websocket}))
+async fn discord_gateway(State(state): State<DiscordOracle>) -> Json<DiscordGateway> {
+    Json(DiscordGateway {
+        url: state.websocket,
+    })
 }
 
 async fn discord_post(
     State(state): State<DiscordOracle>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    Json(body): Json<DiscordPostRequest>,
 ) -> impl IntoResponse {
-    if id == "42"
-        && discord_authorized(&headers)
-        && let Some(content) = body.get("content").and_then(serde_json::Value::as_str)
-    {
-        *state.content.lock().expect("content lock") = Some(content.to_owned());
-        (StatusCode::OK, Json(serde_json::json!({"id":"m1"})))
+    if id == "42" && discord_authorized(&headers) && !body.content.is_empty() {
+        *state.content.lock().expect("content lock") = Some(body.content);
+        (StatusCode::OK, Json(DiscordCreated { id: "m1" })).into_response()
     } else {
-        (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})))
+        (StatusCode::UNAUTHORIZED, Json(Empty {})).into_response()
     }
 }
 
@@ -124,10 +154,14 @@ async fn discord_message(
     {
         (
             StatusCode::OK,
-            Json(serde_json::json!({"id":"m1","content":content})),
+            Json(DiscordMessage {
+                id: "m1".into(),
+                content,
+            }),
         )
+            .into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({})))
+        (StatusCode::NOT_FOUND, Json(Empty {})).into_response()
     }
 }
 
@@ -157,9 +191,9 @@ async fn discord_session(mut socket: WebSocket) {
         return;
     };
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&identify)
+        serde_json::from_str::<DiscordHello>(&identify)
             .ok()
-            .and_then(|json| json.get("op").and_then(serde_json::Value::as_i64)),
+            .map(|frame| frame.op),
         Some(2)
     );
     socket
@@ -216,12 +250,9 @@ fn slack_authorized(headers: &HeaderMap, token: &str) -> bool {
 
 async fn slack_auth(headers: HeaderMap) -> impl IntoResponse {
     if slack_authorized(&headers, "bot") {
-        (StatusCode::OK, Json(serde_json::json!({"ok":true})))
+        (StatusCode::OK, Json(SlackResult { ok: true })).into_response()
     } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"ok":false})),
-        )
+        (StatusCode::UNAUTHORIZED, Json(SlackResult { ok: false })).into_response()
     }
 }
 
@@ -230,38 +261,50 @@ async fn slack_open(State(state): State<SlackOracle>, headers: HeaderMap) -> imp
         state.opens.fetch_add(1, Ordering::SeqCst);
         (
             StatusCode::OK,
-            Json(serde_json::json!({"ok":true,"url":state.websocket})),
+            Json(SlackSocketOpen {
+                ok: true,
+                url: Some(state.websocket),
+            }),
         )
+            .into_response()
     } else {
         (
             StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"ok":false})),
+            Json(SlackSocketOpen {
+                ok: false,
+                url: None,
+            }),
         )
+            .into_response()
     }
 }
 
 async fn slack_post(
     State(state): State<SlackOracle>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    Json(body): Json<SlackPostRequest>,
 ) -> impl IntoResponse {
-    if slack_authorized(&headers, "bot")
-        && body.get("channel").and_then(serde_json::Value::as_str) == Some("C42")
-        && body
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .is_some()
-    {
+    if slack_authorized(&headers, "bot") && body.channel == "C42" && !body.text.is_empty() {
         state.posts.fetch_add(1, Ordering::SeqCst);
         (
             StatusCode::OK,
-            Json(serde_json::json!({"ok":true,"ts":"1"})),
+            Json(SlackMessagePost {
+                ok: true,
+                ts: Some("1".into()),
+                message: None,
+            }),
         )
+            .into_response()
     } else {
         (
             StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"ok":false})),
+            Json(SlackMessagePost {
+                ok: false,
+                ts: None,
+                message: None,
+            }),
         )
+            .into_response()
     }
 }
 
@@ -277,32 +320,34 @@ async fn slack_replies(
         state.reads.fetch_add(1, Ordering::SeqCst);
         (
             StatusCode::OK,
-            Json(serde_json::json!({"ok":true,"messages":[{"ts":"1"}]})),
+            Json(SlackReplies {
+                ok: true,
+                messages: vec![SlackReply { ts: "1".into() }],
+            }),
         )
+            .into_response()
     } else {
         (
             StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"ok":false})),
+            Json(SlackReplies {
+                ok: false,
+                messages: Vec::new(),
+            }),
         )
+            .into_response()
     }
 }
 
 async fn slack_delete(
     State(state): State<SlackOracle>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    Json(body): Json<SlackDeleteRequest>,
 ) -> impl IntoResponse {
-    if slack_authorized(&headers, "bot")
-        && body.get("channel").and_then(serde_json::Value::as_str) == Some("C42")
-        && body.get("ts").and_then(serde_json::Value::as_str) == Some("1")
-    {
+    if slack_authorized(&headers, "bot") && body.channel == "C42" && body.ts == "1" {
         state.deletes.fetch_add(1, Ordering::SeqCst);
-        (StatusCode::OK, Json(serde_json::json!({"ok":true})))
+        (StatusCode::OK, Json(SlackResult { ok: true })).into_response()
     } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"ok":false})),
-        )
+        (StatusCode::UNAUTHORIZED, Json(SlackResult { ok: false })).into_response()
     }
 }
 
@@ -315,7 +360,13 @@ async fn slack_socket(
             return;
         }
         socket
-            .send(AxumMessage::Text(r#"{"type":"hello"}"#.into()))
+            .send(AxumMessage::Text(
+                serde_json::to_string(&SlackHello {
+                    kind: SlackSocketFrame::Hello,
+                })
+                .expect("Slack hello serializes")
+                .into(),
+            ))
             .await
             .expect("send hello");
         while socket.recv().await.is_some() {}
@@ -369,20 +420,20 @@ fn oidc_authorized(headers: &HeaderMap) -> bool {
         == Some("Basic Y2xpZW50OnNlY3JldA==")
 }
 
-async fn oidc_discovery(State(state): State<OidcOracle>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "issuer":state.issuer,
-        "token_endpoint":state.token_endpoint,
-        "introspection_endpoint":state.introspection_endpoint,
-        "revocation_endpoint":state.revocation_endpoint,
-    }))
+async fn oidc_discovery(State(state): State<OidcOracle>) -> Json<OidcDiscovery> {
+    Json(OidcDiscovery {
+        issuer: state.issuer,
+        token_endpoint: state.token_endpoint,
+        introspection_endpoint: state.introspection_endpoint,
+        revocation_endpoint: state.revocation_endpoint,
+    })
 }
 
 async fn oidc_token_response(
     State(state): State<OidcOracle>,
     headers: HeaderMap,
     Form(form): Form<BTreeMap<String, String>>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     if oidc_authorized(&headers)
         && form
             .get("grant_type")
@@ -391,10 +442,13 @@ async fn oidc_token_response(
         state.tokens.fetch_add(1, Ordering::SeqCst);
         (
             StatusCode::OK,
-            Json(serde_json::json!({"access_token":"opaque"})),
+            Json(OidcToken {
+                access_token: "opaque".into(),
+            }),
         )
+            .into_response()
     } else {
-        (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})))
+        (StatusCode::UNAUTHORIZED, Json(Empty {})).into_response()
     }
 }
 
@@ -402,15 +456,18 @@ async fn oidc_introspect(
     State(state): State<OidcOracle>,
     headers: HeaderMap,
     Form(form): Form<BTreeMap<String, String>>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     if oidc_authorized(&headers) && form.get("token").is_some_and(|token| token == "opaque") {
         state.introspections.fetch_add(1, Ordering::SeqCst);
         (
             StatusCode::OK,
-            Json(serde_json::json!({"active":!state.revoked.load(Ordering::SeqCst)})),
+            Json(OidcIntrospection {
+                active: !state.revoked.load(Ordering::SeqCst),
+            }),
         )
+            .into_response()
     } else {
-        (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})))
+        (StatusCode::UNAUTHORIZED, Json(Empty {})).into_response()
     }
 }
 
@@ -480,11 +537,21 @@ fn oidc_discovery_keeps_the_issuer_path() {
 fn oidc_discovery_metadata_must_name_the_requested_issuer() {
     let issuer = safe_url("https://issuer.example/realms/e6").expect("issuer");
     assert!(oidc_issuer_matches(
-        &serde_json::json!({"issuer":"https://issuer.example/realms/e6"}),
+        &OidcDiscovery {
+            issuer: "https://issuer.example/realms/e6".into(),
+            token_endpoint: "https://issuer.example/token".into(),
+            introspection_endpoint: "https://issuer.example/introspect".into(),
+            revocation_endpoint: "https://issuer.example/revoke".into(),
+        },
         &issuer
     ));
     assert!(!oidc_issuer_matches(
-        &serde_json::json!({"issuer":"https://other.example/realms/e6"}),
+        &OidcDiscovery {
+            issuer: "https://other.example/realms/e6".into(),
+            token_endpoint: "https://issuer.example/token".into(),
+            introspection_endpoint: "https://issuer.example/introspect".into(),
+            revocation_endpoint: "https://issuer.example/revoke".into(),
+        },
         &issuer
     ));
 }
@@ -492,11 +559,17 @@ fn oidc_discovery_metadata_must_name_the_requested_issuer() {
 #[test]
 fn slack_readback_requires_the_posted_message() {
     assert!(slack_readback_contains(
-        &serde_json::json!({"ok":true,"messages":[{"ts":"1"}]}),
+        &SlackReplies {
+            ok: true,
+            messages: vec![SlackReply { ts: "1".into() }],
+        },
         "1"
     ));
     assert!(!slack_readback_contains(
-        &serde_json::json!({"ok":true,"messages":[{"ts":"other"}]}),
+        &SlackReplies {
+            ok: true,
+            messages: vec![SlackReply { ts: "other".into() }],
+        },
         "1"
     ));
 }
@@ -504,20 +577,40 @@ fn slack_readback_requires_the_posted_message() {
 #[test]
 fn discord_readback_requires_the_posted_message() {
     assert!(discord_readback_matches(
-        &serde_json::json!({"id":"m1","content":"marker"}),
+        &DiscordMessage {
+            id: "m1".into(),
+            content: "marker".into(),
+        },
         "m1",
         "marker"
     ));
     assert!(!discord_readback_matches(
-        &serde_json::json!({"id":"other","content":"marker"}),
+        &DiscordMessage {
+            id: "other".into(),
+            content: "marker".into(),
+        },
         "m1",
         "marker"
     ));
     assert!(!discord_readback_matches(
-        &serde_json::json!({"id":"m1","content":"other"}),
+        &DiscordMessage {
+            id: "m1".into(),
+            content: "other".into(),
+        },
         "m1",
         "marker"
     ));
+}
+
+#[test]
+fn provider_contracts_reject_missing_or_mistyped_required_fields() {
+    assert!(serde_json::from_str::<DiscordGateway>(r#"{}"#).is_err());
+    assert!(serde_json::from_str::<DiscordMessage>(r#"{"id":"m1"}"#).is_err());
+    assert!(serde_json::from_str::<SlackReplies>(r#"{"ok":true}"#).is_err());
+    assert!(
+        serde_json::from_str::<OidcDiscovery>(r#"{"issuer":"https://issuer.example"}"#).is_err()
+    );
+    assert!(serde_json::from_str::<OidcIntrospection>(r#"{"active":"yes"}"#).is_err());
 }
 
 #[tokio::test]
