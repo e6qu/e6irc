@@ -762,6 +762,18 @@ mod query_limit_tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
     }
+
+    #[test]
+    fn observability_query_rejects_unknown_fields() {
+        let uri = "/?extra=1".parse().expect("query URI");
+        assert!(Query::<ObservabilityQuery>::try_from_uri(&uri).is_err());
+    }
+
+    #[test]
+    fn console_monitoring_query_rejects_unknown_fields() {
+        let uri = "/?extra=1".parse().expect("query URI");
+        assert!(Query::<pages::ConsoleMonitoringQuery>::try_from_uri(&uri).is_err());
+    }
 }
 
 pub(crate) fn bnc_counts(state: &AppState) -> (u64, u64) {
@@ -863,6 +875,7 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ObservabilityQuery {
     #[serde(default = "default_observability_minutes")]
     minutes: u64,
@@ -1552,6 +1565,7 @@ mod pages {
     }
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct BootstrapForm {
         bootstrap_state: String,
         token: String,
@@ -1747,6 +1761,7 @@ mod pages {
     }
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct AccountInvitationAcceptanceForm {
         invitation_state: String,
         password: String,
@@ -1858,6 +1873,7 @@ mod pages {
     }
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct LocalLoginForm {
         login_state: String,
         account: String,
@@ -2353,6 +2369,7 @@ mod pages {
     }
 
     #[derive(Deserialize, Default)]
+    #[serde(deny_unknown_fields)]
     pub struct ConsoleMonitoringQuery {
         minutes: Option<u64>,
     }
@@ -3511,6 +3528,7 @@ mod pages {
 
     /// The `/device` form (urlencoded): code + CSRF token as form fields.
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct DeviceFormFields {
         user_code: String,
         csrf: String,

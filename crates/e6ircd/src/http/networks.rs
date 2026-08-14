@@ -320,6 +320,30 @@ struct NetworkListResponse {
 }
 
 #[derive(serde::Serialize)]
+struct NetworkCreatedResponse {
+    name: String,
+    attach: String,
+}
+
+#[derive(serde::Serialize)]
+struct NetworkBufferLinesResponse {
+    lines: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct NetworkEnabledResponse {
+    name: String,
+    enabled: bool,
+}
+
+#[derive(serde::Serialize)]
+struct AdminNetworkEnabledResponse {
+    owner: String,
+    name: String,
+    enabled: bool,
+}
+
+#[derive(serde::Serialize)]
 pub(super) struct AdminNetworkResponse {
     #[serde(flatten)]
     kind: AdminNetworkKind,
@@ -493,9 +517,10 @@ pub(super) async fn create_network(
     match create_network_core(&state, registry, &account, &req).await {
         Ok(()) => (
             StatusCode::CREATED,
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({ "name": req.name, "attach": format!("{}/{}", account, req.name) })
-                .to_string(),
+            axum::Json(NetworkCreatedResponse {
+                attach: format!("{account}/{}", req.name),
+                name: req.name,
+            }),
         )
             .into_response(),
         Err(error) => error.into_response(),
@@ -1254,6 +1279,7 @@ pub(super) fn kind_feature_available(kind: crate::config::NetworkKind) -> bool {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct BufferQuery {
     pub(super) limit: Option<usize>,
 }
@@ -1295,20 +1321,14 @@ pub(super) async fn network_buffer(
     {
         let lines = handle.buffer_snapshot();
         let skip = lines.len().saturating_sub(limit as usize);
-        return (
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({ "lines": &lines[skip..] }).to_string(),
-        )
-            .into_response();
+        return json_no_store(NetworkBufferLinesResponse {
+            lines: lines[skip..].to_vec(),
+        });
     }
     // The DB buffer API canonicalizes the owner/network composite key, matching
     // the live registry even when this URL uses a different case.
     match crate::db::recent_bnc_lines(pool, &account, &name, limit).await {
-        Ok(lines) => (
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({ "lines": lines }).to_string(),
-        )
-            .into_response(),
+        Ok(lines) => json_no_store(NetworkBufferLinesResponse { lines }),
         Err(e) => {
             eprintln!("http: network buffer read failed: {e}");
             problem(
@@ -1489,11 +1509,11 @@ pub(super) async fn patch_network(
     {
         return error.into_response();
     }
-    (
-        [(header::CONTENT_TYPE, "application/json")],
-        serde_json::json!({ "name": name, "enabled": req.enabled }).to_string(),
-    )
-        .into_response()
+    axum::Json(NetworkEnabledResponse {
+        name,
+        enabled: req.enabled,
+    })
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -1518,7 +1538,11 @@ pub(super) async fn patch_admin_network(
     {
         return error.into_response();
     }
-    json_no_store(serde_json::json!({ "owner": owner, "name": name, "enabled": req.enabled }))
+    json_no_store(AdminNetworkEnabledResponse {
+        owner,
+        name,
+        enabled: req.enabled,
+    })
 }
 
 /// Delete one of the caller's networks and stop its driver.
@@ -1539,8 +1563,8 @@ pub(super) async fn delete_network(
 #[cfg(test)]
 mod tests {
     use super::{
-        IRC_NETWORK_PRESETS, network_name_ok, runtime_response, upstream_addr_is_internal,
-        validate_irc_upstream,
+        BufferQuery, IRC_NETWORK_PRESETS, network_name_ok, runtime_response,
+        upstream_addr_is_internal, validate_irc_upstream,
     };
 
     #[test]
@@ -1583,6 +1607,12 @@ mod tests {
                 "preset must include its secure IRC port: {preset:?}"
             );
         }
+    }
+
+    #[test]
+    fn buffer_query_rejects_unknown_fields() {
+        let uri = "/?extra=1".parse().expect("query URI");
+        assert!(axum::extract::Query::<BufferQuery>::try_from_uri(&uri).is_err());
     }
 
     #[test]

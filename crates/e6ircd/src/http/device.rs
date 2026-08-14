@@ -210,6 +210,7 @@ pub(super) fn printable_exact_filter(
 }
 
 #[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct AccountDirectoryQuery {
     pub(super) limit: Option<usize>,
     pub(super) before_id: Option<i64>,
@@ -399,6 +400,7 @@ pub(super) struct AdminCreateAccountInvitationBody {
 }
 
 #[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct AccountInvitationDirectoryQuery {
     limit: Option<usize>,
     before_id: Option<i64>,
@@ -1272,6 +1274,7 @@ async fn mutate_managed_configuration(
 }
 
 #[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RegisteredChannelDirectoryQuery {
     pub(super) limit: Option<usize>,
     pub(super) before_id: Option<i64>,
@@ -1369,6 +1372,7 @@ pub(super) async fn admin_channels(
 }
 
 #[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ServerBanDirectoryQuery {
     pub(super) limit: Option<usize>,
     pub(super) before_id: Option<i64>,
@@ -1572,6 +1576,7 @@ async fn server_ban_response(
 }
 
 #[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct AuditQuery {
     pub(super) limit: Option<usize>,
     pub(super) before_id: Option<i64>,
@@ -1706,6 +1711,20 @@ mod admin_query_tests {
                 "{body}"
             );
         }
+    }
+
+    #[test]
+    fn administrator_queries_reject_unknown_fields() {
+        let uri = "/?extra=1".parse().expect("query URI");
+        assert!(axum::extract::Query::<AccountDirectoryQuery>::try_from_uri(&uri).is_err());
+        assert!(
+            axum::extract::Query::<AccountInvitationDirectoryQuery>::try_from_uri(&uri).is_err()
+        );
+        assert!(
+            axum::extract::Query::<RegisteredChannelDirectoryQuery>::try_from_uri(&uri).is_err()
+        );
+        assert!(axum::extract::Query::<ServerBanDirectoryQuery>::try_from_uri(&uri).is_err());
+        assert!(axum::extract::Query::<AuditQuery>::try_from_uri(&uri).is_err());
     }
 
     #[test]
@@ -2007,6 +2026,12 @@ mod token_request_tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn logout_query_rejects_unknown_fields() {
+        let uri = "/?extra=1".parse().expect("query URI");
+        assert!(axum::extract::Query::<LogoutQuery>::try_from_uri(&uri).is_err());
+    }
 }
 
 /// Mint a PAT for the authenticated account (shown once).
@@ -2104,6 +2129,7 @@ pub(super) async fn logout(
 /// not configured for coordinated logout fails loudly instead of leaving the
 /// upstream SSO session active.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct LogoutQuery {
     #[serde(default)]
     pub(super) csrf: Option<String>,

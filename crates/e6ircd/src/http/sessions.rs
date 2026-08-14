@@ -94,6 +94,7 @@ pub(super) async fn revoke_browser_session(
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct BrowserSessionBulkDeleteQuery {
     except: Option<String>,
 }
@@ -135,6 +136,7 @@ pub(super) async fn revoke_other_browser_sessions(
 }
 
 #[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct LiveConnectionQueryParams {
     pub(super) limit: Option<usize>,
     pub(super) before_id: Option<i64>,
@@ -147,6 +149,7 @@ pub(super) struct LiveConnectionQueryParams {
 /// Owner connection queries deliberately cannot carry an account filter:
 /// ownership comes only from the authenticated request.
 #[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct OwnLiveConnectionQueryParams {
     pub(super) limit: Option<usize>,
     pub(super) before_id: Option<i64>,
@@ -363,6 +366,7 @@ pub(super) async fn me_connections(
 }
 
 #[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct DisconnectConnectionQuery {
     reason: Option<String>,
 }
@@ -555,5 +559,14 @@ mod tests {
             let response = validate_disconnect_reason(reason).expect_err("invalid reason");
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
+    }
+
+    #[test]
+    fn url_queries_reject_unknown_fields() {
+        let uri = "/?extra=1".parse().expect("query URI");
+        assert!(Query::<BrowserSessionBulkDeleteQuery>::try_from_uri(&uri).is_err());
+        assert!(Query::<LiveConnectionQueryParams>::try_from_uri(&uri).is_err());
+        assert!(Query::<OwnLiveConnectionQueryParams>::try_from_uri(&uri).is_err());
+        assert!(Query::<DisconnectConnectionQuery>::try_from_uri(&uri).is_err());
     }
 }

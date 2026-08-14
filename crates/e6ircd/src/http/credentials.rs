@@ -136,6 +136,7 @@ pub(super) async fn export_me(
 }
 
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct SecurityActivityQuery {
     limit: Option<usize>,
     before_id: Option<i64>,
@@ -276,6 +277,12 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn security_activity_query_rejects_unknown_fields() {
+        let uri = "/?extra=1".parse().expect("query URI");
+        assert!(axum::extract::Query::<SecurityActivityQuery>::try_from_uri(&uri).is_err());
     }
 }
 

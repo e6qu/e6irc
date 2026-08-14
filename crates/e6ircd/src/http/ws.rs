@@ -210,6 +210,7 @@ pub(super) async fn ws_irc_conn(
 // ---- live web UI socket (DESIGN §13.2) ----------------------------------
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct UiParams {
     /// Which of the caller's networks to attach this UI socket to.
     pub(super) network: String,
@@ -774,6 +775,12 @@ mod tests {
             let event: serde_json::Value = serde_json::from_str(&wire).expect("UI event JSON");
             assert_eq!(event, expected, "{wire}");
         }
+    }
+
+    #[test]
+    fn ui_query_rejects_unknown_fields() {
+        let uri = "/?network=libera&extra=1".parse().expect("query URI");
+        assert!(Query::<UiParams>::try_from_uri(&uri).is_err());
     }
 
     #[test]
