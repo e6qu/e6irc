@@ -718,7 +718,7 @@ fn run(args: Campaign) -> ExitCode {
         }
     };
     let started_at_unix_ms = now_ms();
-    let challenge = challenge(&args, &subject_sha256(&subject), started_at_unix_ms);
+    let challenge = challenge(&args, subject_sha256(&subject), started_at_unix_ms);
     let probe_directory = match probe_directory(&args.output, &challenge) {
         Ok(directory) => directory,
         Err(error) => {
