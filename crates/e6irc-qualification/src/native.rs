@@ -456,21 +456,8 @@ async fn slack(_target: &str) -> ProbeReport {
             PhaseOutcome::NotRun,
         );
     }
-    let socket = match slack_socket(&http, &base, &app).await {
-        Ok(url) => url,
-        Err(outcome) => {
-            return report(
-                TargetKind::Slack,
-                auth,
-                PhaseOutcome::NotRun,
-                outcome,
-                PhaseOutcome::NotRun,
-                PhaseOutcome::NotRun,
-            );
-        }
-    };
-    let reconnect = match slack_connect(&socket).await {
-        PhaseOutcome::Passed => slack_connect(&socket).await,
+    let reconnect = match slack_connect(&http, &base, &app).await {
+        PhaseOutcome::Passed => slack_connect(&http, &base, &app).await,
         outcome => outcome,
     };
     if reconnect != PhaseOutcome::Passed {
@@ -593,11 +580,32 @@ async fn slack_socket(
         .ok_or(PhaseOutcome::Rejected)
 }
 
-async fn slack_connect(url: &CampaignSocketUrl) -> PhaseOutcome {
+async fn slack_connect(http: &Client, base: &CampaignUrl, app: &str) -> PhaseOutcome {
+    let url = match slack_socket(http, base, app).await {
+        Ok(url) => url,
+        Err(outcome) => return outcome,
+    };
     match connect_async(url.as_str()).await {
         Ok((mut socket, _)) => {
+            let hello = tokio::time::timeout(TIMEOUT, socket.next())
+                .await
+                .ok()
+                .flatten();
+            let connected = matches!(
+                hello,
+                Some(Ok(Message::Text(frame)))
+                    if serde_json::from_str::<serde_json::Value>(&frame)
+                        .ok()
+                        .is_some_and(|json| {
+                            json.get("type").and_then(serde_json::Value::as_str) == Some("hello")
+                        })
+            );
             let _ = socket.close(None).await;
-            PhaseOutcome::Passed
+            if connected {
+                PhaseOutcome::Passed
+            } else {
+                PhaseOutcome::Failed
+            }
         }
         Err(_) => PhaseOutcome::Failed,
     }
