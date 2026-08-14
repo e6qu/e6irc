@@ -614,6 +614,13 @@ async fn slack_connection_requires_the_hello_frame() {
     );
 }
 
+#[test]
+fn slack_hello_has_a_closed_shape() {
+    assert!(slack_hello(r#"{"type":"hello"}"#));
+    assert!(!slack_hello(r#"{"type":"disconnect"}"#));
+    assert!(!slack_hello(r#"{"type":1}"#));
+}
+
 #[tokio::test]
 async fn oidc_oracle_proves_all_required_phases_and_cleanup() {
     let _environment = ENVIRONMENT

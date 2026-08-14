@@ -593,12 +593,7 @@ async fn slack_connect(http: &Client, base: &CampaignUrl, app: &str) -> PhaseOut
                 .flatten();
             let connected = matches!(
                 hello,
-                Some(Ok(Message::Text(frame)))
-                    if serde_json::from_str::<serde_json::Value>(&frame)
-                        .ok()
-                        .is_some_and(|json| {
-                            json.get("type").and_then(serde_json::Value::as_str) == Some("hello")
-                        })
+                Some(Ok(Message::Text(frame))) if slack_hello(&frame)
             );
             let _ = socket.close(None).await;
             if connected {
@@ -609,6 +604,27 @@ async fn slack_connect(http: &Client, base: &CampaignUrl, app: &str) -> PhaseOut
         }
         Err(_) => PhaseOutcome::Failed,
     }
+}
+
+#[derive(serde::Deserialize)]
+struct SlackHello {
+    #[serde(rename = "type")]
+    kind: SlackSocketFrame,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SlackSocketFrame {
+    Hello,
+}
+
+fn slack_hello(frame: &str) -> bool {
+    matches!(
+        serde_json::from_str(frame),
+        Ok(SlackHello {
+            kind: SlackSocketFrame::Hello
+        })
+    )
 }
 
 async fn oidc(target: &str) -> ProbeReport {
