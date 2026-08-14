@@ -467,9 +467,8 @@ pub(super) async fn oidc_callback(
             Some("A verified email claim in an allowed domain is required."),
         );
     }
-    let sid = jwt_string_claim(&id_token.to_string(), "sid")
-        .ok()
-        .flatten();
+    let token_claims = jwt_string_claims(&id_token.to_string()).ok();
+    let sid = token_claims.as_ref().and_then(|claims| claims.sid.clone());
     // Link flow: attach this identity to the account that started it,
     // rather than logging in / provisioning a new account.
     if let Some(account) = &pending.link_account {
@@ -505,16 +504,10 @@ pub(super) async fn oidc_callback(
     // extended-join, account= tag); strip anything that isn't a safe nick-like
     // character so a spaced/control-laden username can't split a line.
     let preferred = crate::sanitize::account_name(&preferred);
-    // The `role` claim is free-form text from the provider, but the server only
-    // models `developer`/`admin` (they gate the shauth developer portal) and the
-    // `web_sessions.oidc_role` CHECK admits only those two. Parse it into `Role`
-    // at the edge so any other value (`user`, `member`, …) becomes `None` here —
-    // never a raw string forwarded to the session INSERT, which the CHECK would
-    // reject with a 503 that locks an otherwise-valid login out entirely.
-    let role = jwt_string_claim(&id_token.to_string(), "role")
-        .ok()
-        .flatten()
-        .as_deref()
+    // Only stored roles reach the database.
+    let role = token_claims
+        .as_ref()
+        .and_then(|claims| claims.role.as_deref())
         .and_then(Role::from_claim);
     let verified_shauth_identity =
         email.is_some() && claims.email_verified() == Some(true) && role.is_some();
@@ -694,6 +687,16 @@ pub(super) struct LogoutTokenHeader {
     pub(super) typ: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct JwtStringClaims {
+    #[serde(default)]
+    iss: Option<String>,
+    #[serde(default)]
+    sid: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+}
+
 pub(super) fn base64url_decode(segment: &str) -> Result<Vec<u8>, String> {
     if segment.is_empty()
         || segment.contains('=')
@@ -708,17 +711,22 @@ pub(super) fn base64url_decode(segment: &str) -> Result<Vec<u8>, String> {
     e6irc_proto::base64::decode(&standard).ok_or_else(|| "invalid base64url segment".into())
 }
 
-pub(super) fn jwt_string_claim(raw: &str, name: &str) -> Result<Option<String>, String> {
-    let segments: Vec<&str> = raw.split('.').collect();
-    if segments.len() != 3 {
+fn jwt_string_claims(raw: &str) -> Result<JwtStringClaims, String> {
+    let mut segments = raw.split('.');
+    let Some(_) = segments.next() else {
+        return Err("JWT must have three segments".into());
+    };
+    let Some(payload) = segments.next() else {
+        return Err("JWT must have three segments".into());
+    };
+    let Some(_) = segments.next() else {
+        return Err("JWT must have three segments".into());
+    };
+    if segments.next().is_some() {
         return Err("JWT must have three segments".into());
     }
-    let payload: serde_json::Value = serde_json::from_slice(&base64url_decode(segments[1])?)
-        .map_err(|_| "JWT payload is not JSON")?;
-    Ok(payload
-        .get(name)
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string))
+    serde_json::from_slice(&base64url_decode(payload)?)
+        .map_err(|_| "JWT payload is not JSON".into())
 }
 
 pub(super) fn verify_logout_token_with_metadata(
@@ -816,8 +824,10 @@ pub(super) async fn oidc_backchannel_logout(
         Ok(value) => value,
         Err(_) => return problem(StatusCode::BAD_REQUEST, "Invalid logout token", None),
     };
-    let unverified_issuer = match jwt_string_claim(form.logout_token.trim(), "iss") {
-        Ok(Some(value)) => value,
+    let unverified_issuer = match jwt_string_claims(form.logout_token.trim()) {
+        Ok(JwtStringClaims {
+            iss: Some(value), ..
+        }) => value,
         _ => return problem(StatusCode::BAD_REQUEST, "Invalid logout token", None),
     };
     let Some(provider) = state
@@ -1576,6 +1586,26 @@ pub(super) fn session_user_agent(
 #[cfg(test)]
 mod domain_policy_tests {
     use super::*;
+
+    #[test]
+    fn jwt_string_claims_parse_only_string_claims() {
+        let payload = e6irc_proto::base64::encode(
+            br#"{"iss":"https://identity.example","sid":"session-1","role":"admin"}"#,
+        )
+        .replace(['+', '/'], "-")
+        .trim_end_matches('=')
+        .to_string();
+        let claims = jwt_string_claims(&format!("header.{payload}.signature")).expect("claims");
+        assert_eq!(claims.iss.as_deref(), Some("https://identity.example"));
+        assert_eq!(claims.sid.as_deref(), Some("session-1"));
+        assert_eq!(claims.role.as_deref(), Some("admin"));
+
+        let non_string = e6irc_proto::base64::encode(br#"{"iss":1}"#)
+            .replace(['+', '/'], "-")
+            .trim_end_matches('=')
+            .to_string();
+        assert!(jwt_string_claims(&format!("header.{non_string}.signature")).is_err());
+    }
 
     fn provider(domains: &[&str]) -> OidcProviderConfig {
         OidcProviderConfig {

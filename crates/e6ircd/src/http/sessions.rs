@@ -16,6 +16,11 @@ struct BrowserSessionListResponse {
     sessions: Vec<BrowserSessionResponse>,
 }
 
+#[derive(serde::Serialize)]
+struct BrowserSessionBulkDeleteResponse {
+    revoked: u64,
+}
+
 /// List the caller's unexpired browser sessions. Stable resource identifiers
 /// permit revocation; token hashes never leave PostgreSQL.
 pub(super) async fn list_browser_sessions(
@@ -123,7 +128,7 @@ pub(super) async fn revoke_other_browser_sessions(
         );
     };
     match crate::db::delete_other_web_sessions(pool_of(&state), &account, &current).await {
-        Ok(revoked) => json_no_store(serde_json::json!({ "revoked": revoked })),
+        Ok(revoked) => json_no_store(BrowserSessionBulkDeleteResponse { revoked }),
         Err(error) => {
             eprintln!("http: other browser sessions revoke failed: {error}");
             problem(

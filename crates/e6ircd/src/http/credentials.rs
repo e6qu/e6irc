@@ -55,6 +55,35 @@ struct ApiTokenListResponse {
     tokens: Vec<ApiTokenResponse>,
 }
 
+#[derive(serde::Serialize)]
+struct ProfileResponse {
+    account: String,
+    contact_email: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct SecurityActivityResponse {
+    activity: Vec<SecurityActivityEntry>,
+    next_before_id: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+struct SecurityActivityEntry {
+    id: i64,
+    actor: String,
+    action: String,
+    target: String,
+    detail: String,
+    at: String,
+}
+
+#[derive(serde::Serialize)]
+struct AppPasswordResponse {
+    app_password: String,
+    label: String,
+    note: &'static str,
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub(super) enum ContactEmailUpdate {
@@ -82,10 +111,10 @@ pub(super) async fn me_profile(
     Authenticated(account): Authenticated,
 ) -> Response {
     match crate::db::account_contact_email(pool_of(&state), &account).await {
-        Ok(contact_email) => json_no_store(serde_json::json!({
-            "account": account,
-            "contact_email": contact_email,
-        })),
+        Ok(contact_email) => json_no_store(ProfileResponse {
+            account,
+            contact_email,
+        }),
         Err(error) => database_unavailable("profile read", error),
     }
 }
@@ -175,19 +204,21 @@ pub(super) async fn me_security_activity(
     )
     .await
     {
-        Ok(page) => json_no_store(serde_json::json!({
-            "activity": page.entries.into_iter().map(|entry| {
-                serde_json::json!({
-                    "id": entry.id,
-                    "actor": entry.actor,
-                    "action": entry.action,
-                    "target": entry.target,
-                    "detail": entry.detail,
-                    "at": entry.created_at,
+        Ok(page) => json_no_store(SecurityActivityResponse {
+            activity: page
+                .entries
+                .into_iter()
+                .map(|entry| SecurityActivityEntry {
+                    id: entry.id,
+                    actor: entry.actor,
+                    action: entry.action,
+                    target: entry.target,
+                    detail: entry.detail,
+                    at: entry.created_at,
                 })
-            }).collect::<Vec<_>>(),
-            "next_before_id": page.next_before_id,
-        })),
+                .collect(),
+            next_before_id: page.next_before_id,
+        }),
         Err(error) => database_unavailable("security activity", error),
     }
 }
@@ -330,13 +361,11 @@ fn app_password_issue_response(
     match result {
         Ok(secret) => (
             StatusCode::CREATED,
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({
-                "app_password": secret,
-                "label": label,
-                "note": "Store this now; it is not retrievable later.",
-            })
-            .to_string(),
+            axum::Json(AppPasswordResponse {
+                app_password: secret,
+                label,
+                note: "Store this now; it is not retrievable later.",
+            }),
         )
             .into_response(),
         Err(crate::db::DbError::BadCredentials) => problem(
