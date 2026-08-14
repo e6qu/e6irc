@@ -171,17 +171,25 @@ async fn discord_session(mut socket: WebSocket) {
 #[derive(Clone)]
 struct SlackOracle {
     websocket: String,
+    sends_hello: bool,
+    opens: Arc<AtomicUsize>,
     posts: Arc<AtomicUsize>,
     reads: Arc<AtomicUsize>,
     deletes: Arc<AtomicUsize>,
 }
 
 async fn start_slack_oracle() -> SlackOracle {
+    start_slack_oracle_with_hello(true).await
+}
+
+async fn start_slack_oracle_with_hello(sends_hello: bool) -> SlackOracle {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind oracle");
     let state = SlackOracle {
         websocket: format!("ws://{}/socket", listener.local_addr().expect("address")),
+        sends_hello,
+        opens: Arc::new(AtomicUsize::new(0)),
         posts: Arc::new(AtomicUsize::new(0)),
         reads: Arc::new(AtomicUsize::new(0)),
         deletes: Arc::new(AtomicUsize::new(0)),
@@ -219,6 +227,7 @@ async fn slack_auth(headers: HeaderMap) -> impl IntoResponse {
 
 async fn slack_open(State(state): State<SlackOracle>, headers: HeaderMap) -> impl IntoResponse {
     if slack_authorized(&headers, "app") {
+        state.opens.fetch_add(1, Ordering::SeqCst);
         (
             StatusCode::OK,
             Json(serde_json::json!({"ok":true,"url":state.websocket})),
@@ -297,8 +306,20 @@ async fn slack_delete(
     }
 }
 
-async fn slack_socket(websocket: WebSocketUpgrade) -> impl IntoResponse {
-    websocket.on_upgrade(|mut socket| async move { while socket.recv().await.is_some() {} })
+async fn slack_socket(
+    State(state): State<SlackOracle>,
+    websocket: WebSocketUpgrade,
+) -> impl IntoResponse {
+    websocket.on_upgrade(move |mut socket| async move {
+        if !state.sends_hello {
+            return;
+        }
+        socket
+            .send(AxumMessage::Text(r#"{"type":"hello"}"#.into()))
+            .await
+            .expect("send hello");
+        while socket.recv().await.is_some() {}
+    })
 }
 
 #[derive(Clone)]
@@ -570,9 +591,34 @@ async fn slack_oracle_proves_all_required_phases_and_cleanup() {
         super::super::ClosedOutcome::Passed,
         "{result:?}"
     );
+    assert_eq!(oracle.opens.load(Ordering::SeqCst), 2);
     assert_eq!(oracle.posts.load(Ordering::SeqCst), 1);
     assert_eq!(oracle.reads.load(Ordering::SeqCst), 1);
     assert_eq!(oracle.deletes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn slack_connection_requires_the_hello_frame() {
+    let oracle = start_slack_oracle_with_hello(false).await;
+    let base = format!(
+        "http://{}/",
+        oracle
+            .websocket
+            .trim_start_matches("ws://")
+            .trim_end_matches("/socket")
+    );
+    let base = safe_url(&base).expect("safe base");
+    assert_eq!(
+        slack_connect(&client().expect("client"), &base, "app").await,
+        PhaseOutcome::Failed
+    );
+}
+
+#[test]
+fn slack_hello_has_a_closed_shape() {
+    assert!(slack_hello(r#"{"type":"hello"}"#));
+    assert!(!slack_hello(r#"{"type":"disconnect"}"#));
+    assert!(!slack_hello(r#"{"type":1}"#));
 }
 
 #[tokio::test]
