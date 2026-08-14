@@ -594,7 +594,7 @@ impl BinaryEvidence {
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         {
-            return Err("executable.sha256 needs a 64-character hexadecimal digest".into());
+            return Err("subject.sha256 needs a 64-character hexadecimal digest".into());
         }
         Ok(())
     }
