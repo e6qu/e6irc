@@ -429,6 +429,14 @@ fn provider_socket_urls_require_secure_or_loopback_transport() {
 }
 
 #[test]
+fn provider_channel_ids_cannot_change_endpoint_paths() {
+    assert!(ProviderChannelId::parse("42".into()).is_some());
+    assert!(ProviderChannelId::parse("C42".into()).is_some());
+    assert!(ProviderChannelId::parse("../../gateway".into()).is_none());
+    assert!(ProviderChannelId::parse("C42?token=secret".into()).is_none());
+}
+
+#[test]
 fn oidc_metadata_endpoints_cannot_cross_the_loopback_boundary() {
     let external = safe_url("https://issuer.example").expect("issuer");
     let loopback = safe_url("http://127.0.0.1/issuer").expect("issuer");
