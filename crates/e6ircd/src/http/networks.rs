@@ -212,71 +212,205 @@ struct PreflightNetworkResponse {
     result: crate::bouncer::IrcPreflight,
 }
 
-pub(super) fn runtime_json(runtime: &crate::bouncer::NetworkRuntimeSnapshot) -> serde_json::Value {
-    let timestamp =
-        |value: Option<e6irc_proto::time::Millis>| value.map(e6irc_proto::time::server_time);
-    serde_json::json!({
-        "state": runtime.lifecycle.as_str(),
-        "state_changed_at": e6irc_proto::time::server_time(runtime.state_changed_at),
-        "next_retry_at": timestamp(runtime.next_retry_at),
-        "recent_failures": runtime.recent_failures.iter().map(|record| serde_json::json!({
-            "at": e6irc_proto::time::server_time(record.at),
-            "code": record.code(),
-            "summary": record.summary(),
-        })).collect::<Vec<_>>(),
-        "connected_at": timestamp(runtime.connected_at),
-        "last_input_at": timestamp(runtime.last_input_at),
-        "last_output_at": timestamp(runtime.last_output_at),
-        "last_error_at": timestamp(runtime.last_error_at),
-        "last_error": runtime.last_error.map(|error| serde_json::json!({
-            "code": error.code(),
-            "summary": error.summary(),
-        })),
-        "connect_latency_ms": runtime.connect_latency_ms,
-        "connection_attempts": runtime.connection_attempts,
-        "errors": runtime.errors,
-        "attached_clients": runtime.attached_clients,
-        "traffic": {
-            "lines_in": runtime.lines_in,
-            "bytes_in": runtime.bytes_in,
-            "lines_out": runtime.lines_out,
-            "bytes_out": runtime.bytes_out,
-        },
-        "buffer": {
-            "lines": runtime.buffer_lines,
-            "capacity": runtime.buffer_capacity,
-        },
-    })
+#[derive(serde::Serialize)]
+pub(super) struct NetworkRuntimeResponse {
+    state: &'static str,
+    state_changed_at: String,
+    next_retry_at: Option<String>,
+    recent_failures: Vec<NetworkFailureResponse>,
+    connected_at: Option<String>,
+    last_input_at: Option<String>,
+    last_output_at: Option<String>,
+    last_error_at: Option<String>,
+    last_error: Option<NetworkFailureResponse>,
+    connect_latency_ms: Option<u64>,
+    connection_attempts: u64,
+    errors: u64,
+    attached_clients: u64,
+    traffic: NetworkTrafficResponse,
+    buffer: NetworkBufferResponse,
 }
 
-pub(super) fn network_json(
+#[derive(serde::Serialize)]
+struct NetworkFailureResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at: Option<String>,
+    code: &'static str,
+    summary: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct NetworkTrafficResponse {
+    lines_in: u64,
+    bytes_in: u64,
+    lines_out: u64,
+    bytes_out: u64,
+}
+
+#[derive(serde::Serialize)]
+struct NetworkBufferResponse {
+    lines: usize,
+    capacity: usize,
+}
+
+pub(super) fn runtime_response(
+    runtime: &crate::bouncer::NetworkRuntimeSnapshot,
+) -> NetworkRuntimeResponse {
+    let timestamp =
+        |value: Option<e6irc_proto::time::Millis>| value.map(e6irc_proto::time::server_time);
+    NetworkRuntimeResponse {
+        state: runtime.lifecycle.as_str(),
+        state_changed_at: e6irc_proto::time::server_time(runtime.state_changed_at),
+        next_retry_at: timestamp(runtime.next_retry_at),
+        recent_failures: runtime
+            .recent_failures
+            .iter()
+            .map(|record| NetworkFailureResponse {
+                at: Some(e6irc_proto::time::server_time(record.at)),
+                code: record.code(),
+                summary: record.summary(),
+            })
+            .collect(),
+        connected_at: timestamp(runtime.connected_at),
+        last_input_at: timestamp(runtime.last_input_at),
+        last_output_at: timestamp(runtime.last_output_at),
+        last_error_at: timestamp(runtime.last_error_at),
+        last_error: runtime.last_error.map(|error| NetworkFailureResponse {
+            at: None,
+            code: error.code(),
+            summary: error.summary(),
+        }),
+        connect_latency_ms: runtime.connect_latency_ms,
+        connection_attempts: runtime.connection_attempts,
+        errors: runtime.errors,
+        attached_clients: runtime.attached_clients,
+        traffic: NetworkTrafficResponse {
+            lines_in: runtime.lines_in,
+            bytes_in: runtime.bytes_in,
+            lines_out: runtime.lines_out,
+            bytes_out: runtime.bytes_out,
+        },
+        buffer: NetworkBufferResponse {
+            lines: runtime.buffer_lines,
+            capacity: runtime.buffer_capacity,
+        },
+    }
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct NetworkResponse {
+    name: String,
+    kind: &'static str,
+    addr: String,
+    tls: bool,
+    nick: String,
+    realname: Option<String>,
+    autojoin: Vec<String>,
+    sasl_account: Option<String>,
+    has_sasl_account: bool,
+    has_sasl_password: bool,
+    enabled: bool,
+    connected: Option<bool>,
+    runtime: Option<NetworkRuntimeResponse>,
+}
+
+#[derive(serde::Serialize)]
+struct NetworkListResponse {
+    networks: Vec<NetworkResponse>,
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct AdminNetworkResponse {
+    #[serde(flatten)]
+    kind: AdminNetworkKind,
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum AdminNetworkKind {
+    Owned {
+        owner: String,
+        #[serde(flatten)]
+        network: NetworkResponse,
+    },
+    Shared {
+        owner: &'static str,
+        name: String,
+        kind: &'static str,
+        enabled: bool,
+        connected: bool,
+        runtime: NetworkRuntimeResponse,
+        shared: bool,
+    },
+}
+
+impl AdminNetworkResponse {
+    pub(super) fn owner(&self) -> &str {
+        match &self.kind {
+            AdminNetworkKind::Owned { owner, .. } => owner,
+            AdminNetworkKind::Shared { owner, .. } => owner,
+        }
+    }
+
+    pub(super) fn name(&self) -> &str {
+        match &self.kind {
+            AdminNetworkKind::Owned { network, .. } => &network.name,
+            AdminNetworkKind::Shared { name, .. } => name,
+        }
+    }
+}
+
+pub(super) fn owned_admin_network_response(
+    owner: String,
+    network: NetworkResponse,
+) -> AdminNetworkResponse {
+    AdminNetworkResponse {
+        kind: AdminNetworkKind::Owned { owner, network },
+    }
+}
+
+pub(super) fn shared_admin_network_response(
+    status: crate::bouncer::NetworkStatus,
+) -> AdminNetworkResponse {
+    AdminNetworkResponse {
+        kind: AdminNetworkKind::Shared {
+            owner: "shared",
+            name: status.name,
+            kind: status.kind,
+            enabled: true,
+            connected: status.connected,
+            runtime: runtime_response(&status.runtime),
+            shared: true,
+        },
+    }
+}
+
+pub(super) fn network_response(
     network: crate::db::BncNetworkRow,
     runtime: Option<&crate::bouncer::NetworkRuntimeSnapshot>,
-) -> serde_json::Value {
+) -> NetworkResponse {
     let has_sasl_account = network.sasl_account.is_some();
     let has_sasl_password = network.sasl_password_sealed.is_some();
     let account = if network.kind.account_is_secret() {
-        serde_json::Value::Null
+        None
     } else {
-        serde_json::json!(&network.sasl_account)
+        network.sasl_account.clone()
     };
-    serde_json::json!({
-        "name": network.name,
-        "kind": network.kind.as_db_str(),
-        "addr": network.addr,
-        "tls": network.tls,
-        "nick": network.nick,
-        "realname": network.realname,
-        "autojoin": network.autojoin,
-        "sasl_account": account,
-        "has_sasl_account": has_sasl_account,
-        "has_sasl_password": has_sasl_password,
-        "enabled": network.enabled,
-        "connected": runtime.map(|r| {
-            r.lifecycle == crate::bouncer::NetworkLifecycle::Connected
-        }),
-        "runtime": runtime.map(runtime_json),
-    })
+    NetworkResponse {
+        name: network.name,
+        kind: network.kind.as_db_str(),
+        addr: network.addr,
+        tls: network.tls,
+        nick: network.nick,
+        realname: network.realname,
+        autojoin: network.autojoin,
+        sasl_account: account,
+        has_sasl_account,
+        has_sasl_password,
+        enabled: network.enabled,
+        connected: runtime.map(|r| r.lifecycle == crate::bouncer::NetworkLifecycle::Connected),
+        runtime: runtime.map(runtime_response),
+    }
 }
 
 /// The account's own networks (metadata only — never the secret).
@@ -289,28 +423,22 @@ pub(super) async fn list_networks(
     // render cleanly (a 404 here shows up as a failed resource load in the
     // browser console). The mutation endpoints still 404 when the bouncer is off.
     let Some(registry) = &state.bnc_registry else {
-        return (
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({ "networks": [] }).to_string(),
-        )
-            .into_response();
+        return json_no_store(NetworkListResponse {
+            networks: Vec::new(),
+        });
     };
     let pool = pool_of(&state);
     match crate::db::list_bnc_networks(pool, &account).await {
         Ok(rows) => {
-            let nets: Vec<serde_json::Value> = rows
+            let networks: Vec<NetworkResponse> = rows
                 .into_iter()
                 .map(|n| {
                     let handle = registry.get_owned(&account, &n.name);
                     let runtime = handle.as_ref().map(|handle| handle.runtime_snapshot());
-                    network_json(n, runtime.as_ref())
+                    network_response(n, runtime.as_ref())
                 })
                 .collect();
-            (
-                [(header::CONTENT_TYPE, "application/json")],
-                serde_json::json!({ "networks": nets }).to_string(),
-            )
-                .into_response()
+            json_no_store(NetworkListResponse { networks })
         }
         Err(e) => {
             eprintln!("http: network list failed: {e}");
@@ -348,11 +476,7 @@ pub(super) async fn get_network(
         .as_ref()
         .and_then(|registry| registry.get_owned(&account, &name));
     let runtime = handle.as_ref().map(|handle| handle.runtime_snapshot());
-    (
-        [(header::CONTENT_TYPE, "application/json")],
-        network_json(network, runtime.as_ref()).to_string(),
-    )
-        .into_response()
+    json_no_store(network_response(network, runtime.as_ref()))
 }
 
 /// Create a network the caller owns, persist it, and start its always-on
@@ -1415,7 +1539,7 @@ pub(super) async fn delete_network(
 #[cfg(test)]
 mod tests {
     use super::{
-        IRC_NETWORK_PRESETS, network_name_ok, runtime_json, upstream_addr_is_internal,
+        IRC_NETWORK_PRESETS, network_name_ok, runtime_response, upstream_addr_is_internal,
         validate_irc_upstream,
     };
 
@@ -1425,7 +1549,8 @@ mod tests {
         ends.emit(crate::bouncer::ConnectionEvent::Reconnecting(
             crate::bouncer::NetworkFailure::SecureConnectionFailed,
         ));
-        let json = runtime_json(&handle.runtime_snapshot());
+        let json = serde_json::to_value(runtime_response(&handle.runtime_snapshot()))
+            .expect("runtime response is serializable");
         assert_eq!(
             json["last_error"]["code"], "secure_connection_failed",
             "{json}"

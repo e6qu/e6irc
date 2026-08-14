@@ -2,6 +2,59 @@
 
 use super::*;
 
+#[derive(serde::Serialize)]
+struct CredentialResponse {
+    id: i64,
+    kind: String,
+    label: Option<String>,
+    created_at: String,
+    last_used_at: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct CredentialListResponse {
+    credentials: Vec<CredentialResponse>,
+}
+
+#[derive(serde::Serialize)]
+struct OidcIdentityResponse {
+    id: i64,
+    issuer: String,
+    subject: String,
+    created_at: String,
+}
+
+#[derive(serde::Serialize)]
+struct OidcIdentityListResponse<'a> {
+    identities: Vec<OidcIdentityResponse>,
+    link_providers: Vec<&'a str>,
+}
+
+#[derive(serde::Serialize)]
+struct ReadMarkerResponse {
+    target: String,
+    timestamp: String,
+}
+
+#[derive(serde::Serialize)]
+struct ReadMarkerListResponse {
+    markers: Vec<ReadMarkerResponse>,
+}
+
+#[derive(serde::Serialize)]
+struct ApiTokenResponse {
+    id: i64,
+    label: String,
+    created_at: String,
+    expires_at: String,
+    scopes: Vec<crate::identity::ApiTokenScope>,
+}
+
+#[derive(serde::Serialize)]
+struct ApiTokenListResponse {
+    tokens: Vec<ApiTokenResponse>,
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub(super) enum ContactEmailUpdate {
@@ -378,19 +431,17 @@ pub(super) async fn list_credentials(
     let pool = pool_of(&state);
     match crate::db::list_credentials(pool, &account).await {
         Ok(rows) => {
-            let creds: Vec<serde_json::Value> = rows
+            let credentials = rows
                 .into_iter()
-                .map(|row| {
-                    serde_json::json!({
-                        "id": row.id,
-                        "kind": row.kind,
-                        "label": row.label,
-                        "created_at": row.created_at,
-                        "last_used_at": row.last_used_at,
-                    })
+                .map(|row| CredentialResponse {
+                    id: row.id,
+                    kind: row.kind,
+                    label: row.label,
+                    created_at: row.created_at,
+                    last_used_at: row.last_used_at,
                 })
                 .collect();
-            json_no_store(serde_json::json!({ "credentials": creds }))
+            json_no_store(CredentialListResponse { credentials })
         }
         Err(error) => database_unavailable("credential list", error),
     }
@@ -405,15 +456,13 @@ pub(super) async fn me_identities(
     let pool = pool_of(&state);
     match crate::db::list_oidc_identities(pool, &account).await {
         Ok(rows) => {
-            let identities: Vec<serde_json::Value> = rows
+            let identities = rows
                 .into_iter()
-                .map(|row| {
-                    serde_json::json!({
-                        "id": row.id,
-                        "issuer": row.issuer,
-                        "subject": row.subject,
-                        "created_at": row.created_at,
-                    })
+                .map(|row| OidcIdentityResponse {
+                    id: row.id,
+                    issuer: row.issuer,
+                    subject: row.subject,
+                    created_at: row.created_at,
                 })
                 .collect();
             let link_providers: Vec<&str> = state
@@ -421,10 +470,10 @@ pub(super) async fn me_identities(
                 .iter()
                 .map(|provider| provider.name.as_str())
                 .collect();
-            json_no_store(serde_json::json!({
-                "identities": identities,
-                "link_providers": link_providers,
-            }))
+            json_no_store(OidcIdentityListResponse {
+                identities,
+                link_providers,
+            })
         }
         Err(error) => database_unavailable("identity list", error),
     }
@@ -481,13 +530,11 @@ pub(super) async fn me_read_markers(
     let pool = pool_of(&state);
     match crate::db::list_read_markers(pool, &account).await {
         Ok(rows) => {
-            let markers: Vec<serde_json::Value> = rows
+            let markers = rows
                 .into_iter()
-                .map(|(target, timestamp)| {
-                    serde_json::json!({ "target": target, "timestamp": timestamp })
-                })
+                .map(|(target, timestamp)| ReadMarkerResponse { target, timestamp })
                 .collect();
-            json_no_store(serde_json::json!({ "markers": markers }))
+            json_no_store(ReadMarkerListResponse { markers })
         }
         Err(error) => database_unavailable("read-marker list", error),
     }
@@ -502,19 +549,17 @@ pub(super) async fn me_tokens_list(
     let pool = pool_of(&state);
     match crate::db::list_api_tokens(pool, &account).await {
         Ok(rows) => {
-            let tokens: Vec<serde_json::Value> = rows
+            let tokens = rows
                 .into_iter()
-                .map(|token| {
-                    serde_json::json!({
-                        "id": token.id,
-                        "label": token.label,
-                        "created_at": token.created_at,
-                        "expires_at": token.expires_at,
-                        "scopes": token.scopes.iter().collect::<Vec<_>>(),
-                    })
+                .map(|token| ApiTokenResponse {
+                    id: token.id,
+                    label: token.label,
+                    created_at: token.created_at,
+                    expires_at: token.expires_at,
+                    scopes: token.scopes.iter().collect(),
                 })
                 .collect();
-            json_no_store(serde_json::json!({ "tokens": tokens }))
+            json_no_store(ApiTokenListResponse { tokens })
         }
         Err(error) => database_unavailable("token list", error),
     }

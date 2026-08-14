@@ -1,5 +1,21 @@
 use super::*;
 
+#[derive(serde::Serialize)]
+struct BrowserSessionResponse {
+    id: i64,
+    created_at: String,
+    expires_at: String,
+    method: &'static str,
+    provider: Option<String>,
+    user_agent: Option<String>,
+    current: bool,
+}
+
+#[derive(serde::Serialize)]
+struct BrowserSessionListResponse {
+    sessions: Vec<BrowserSessionResponse>,
+}
+
 /// List the caller's unexpired browser sessions. Stable resource identifiers
 /// permit revocation; token hashes never leave PostgreSQL.
 pub(super) async fn list_browser_sessions(
@@ -12,19 +28,21 @@ pub(super) async fn list_browser_sessions(
         Ok(rows) => {
             let sessions = rows
                 .into_iter()
-                .map(|row| {
-                    serde_json::json!({
-                        "id": row.id,
-                        "created_at": row.created_at,
-                        "expires_at": row.expires_at,
-                        "method": if row.provider.is_some() { "oidc" } else { "local" },
-                        "provider": row.provider,
-                        "user_agent": row.user_agent,
-                        "current": row.current,
-                    })
+                .map(|row| BrowserSessionResponse {
+                    id: row.id,
+                    created_at: row.created_at,
+                    expires_at: row.expires_at,
+                    method: if row.provider.is_some() {
+                        "oidc"
+                    } else {
+                        "local"
+                    },
+                    provider: row.provider,
+                    user_agent: row.user_agent,
+                    current: row.current,
                 })
                 .collect::<Vec<_>>();
-            json_no_store(serde_json::json!({ "sessions": sessions }))
+            json_no_store(BrowserSessionListResponse { sessions })
         }
         Err(error) => {
             eprintln!("http: browser session list failed: {error}");
@@ -243,19 +261,39 @@ pub(super) fn validate_live_connection_query(
     })
 }
 
-fn live_connection_json(entry: crate::core::LiveConnectionInfo) -> serde_json::Value {
-    serde_json::json!({
-        "id": entry.id.to_string(),
-        "nick": entry.nick,
-        "user": entry.user,
-        "host": entry.host,
-        "account": entry.account,
-        "oper": entry.oper,
-        "transport": entry.transport.as_str(),
-        "connected_at": e6irc_proto::time::server_time(entry.connected_at),
-        "idle_seconds": entry.idle_seconds,
-        "channels": entry.channels,
-    })
+#[derive(serde::Serialize)]
+struct LiveConnectionResponse {
+    id: String,
+    nick: String,
+    user: String,
+    host: String,
+    account: Option<String>,
+    oper: bool,
+    transport: &'static str,
+    connected_at: String,
+    idle_seconds: u64,
+    channels: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct LiveConnectionPageResponse {
+    connections: Vec<LiveConnectionResponse>,
+    next_before_id: Option<String>,
+}
+
+fn live_connection_response(entry: crate::core::LiveConnectionInfo) -> LiveConnectionResponse {
+    LiveConnectionResponse {
+        id: entry.id.to_string(),
+        nick: entry.nick,
+        user: entry.user,
+        host: entry.host,
+        account: entry.account,
+        oper: entry.oper,
+        transport: entry.transport.as_str(),
+        connected_at: e6irc_proto::time::server_time(entry.connected_at),
+        idle_seconds: entry.idle_seconds,
+        channels: entry.channels,
+    }
 }
 
 async fn connection_page(
@@ -284,10 +322,14 @@ async fn connection_page(
 }
 
 fn live_connection_page_response(page: crate::core::LiveConnectionPage) -> Response {
-    json_no_store(serde_json::json!({
-        "connections": page.entries.into_iter().map(live_connection_json).collect::<Vec<_>>(),
-        "next_before_id": page.next_before_id.map(|id| id.to_string()),
-    }))
+    json_no_store(LiveConnectionPageResponse {
+        connections: page
+            .entries
+            .into_iter()
+            .map(live_connection_response)
+            .collect(),
+        next_before_id: page.next_before_id.map(|id| id.to_string()),
+    })
 }
 
 pub(super) async fn admin_connections(

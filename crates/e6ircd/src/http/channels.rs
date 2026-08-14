@@ -4,20 +4,47 @@
 
 use super::*;
 
-fn channel_json(channel: crate::db::OwnedChannel) -> serde_json::Value {
-    serde_json::json!({
-        "name": channel.name,
-        "founder": channel.founder,
-        "keeptopic": channel.keeptopic,
-        "topic": channel.topic,
-        "topic_setter": channel.topic_setter,
-        "topic_set_at": channel.topic_set_at_millis,
-        "mlock": channel.mlock,
-        "access": channel.access.into_iter().map(|entry| serde_json::json!({
-            "account": entry.account,
-            "flags": entry.flags,
-        })).collect::<Vec<_>>(),
-    })
+#[derive(serde::Serialize)]
+struct OwnedChannelResponse {
+    name: String,
+    founder: String,
+    keeptopic: bool,
+    topic: Option<String>,
+    topic_setter: Option<String>,
+    topic_set_at: Option<i64>,
+    mlock: Option<String>,
+    access: Vec<ChannelAccessResponse>,
+}
+
+#[derive(serde::Serialize)]
+struct ChannelAccessResponse {
+    account: String,
+    flags: String,
+}
+
+#[derive(serde::Serialize)]
+struct OwnedChannelListResponse {
+    channels: Vec<OwnedChannelResponse>,
+}
+
+fn channel_response(channel: crate::db::OwnedChannel) -> OwnedChannelResponse {
+    OwnedChannelResponse {
+        name: channel.name,
+        founder: channel.founder,
+        keeptopic: channel.keeptopic,
+        topic: channel.topic,
+        topic_setter: channel.topic_setter,
+        topic_set_at: channel.topic_set_at_millis,
+        mlock: channel.mlock,
+        access: channel
+            .access
+            .into_iter()
+            .map(|entry| ChannelAccessResponse {
+                account: entry.account,
+                flags: entry.flags,
+            })
+            .collect(),
+    }
 }
 
 pub(super) async fn list_owned_channels(
@@ -25,14 +52,9 @@ pub(super) async fn list_owned_channels(
     Authenticated(account): Authenticated,
 ) -> Response {
     match crate::db::list_owned_channels(pool_of(&state), &account).await {
-        Ok(channels) => (
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({
-                "channels": channels.into_iter().map(channel_json).collect::<Vec<_>>()
-            })
-            .to_string(),
-        )
-            .into_response(),
+        Ok(channels) => json_no_store(OwnedChannelListResponse {
+            channels: channels.into_iter().map(channel_response).collect(),
+        }),
         Err(error) => {
             eprintln!("http: owned channel list failed: {error}");
             problem(
@@ -72,11 +94,7 @@ pub(super) async fn get_owned_channel(
         Ok(channels) => match channels.into_iter().find(|channel| {
             e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&channel.name) == folded
         }) {
-            Some(channel) => (
-                [(header::CONTENT_TYPE, "application/json")],
-                channel_json(channel).to_string(),
-            )
-                .into_response(),
+            Some(channel) => json_no_store(channel_response(channel)),
             None => problem(StatusCode::NOT_FOUND, "No such owned channel", None),
         },
         Err(error) => {
