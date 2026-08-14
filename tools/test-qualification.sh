@@ -72,6 +72,12 @@ if "$bin" verify "$temporary/wrong-subject-evidence.json"; then
   exit 1
 fi
 
+jq '.subject.sha256 = "g" + .subject.sha256[1:]' "$temporary/passed.json" >"$temporary/nonhex-subject.json"
+if "$bin" verify "$temporary/nonhex-subject.json"; then
+  echo 'non-hexadecimal subject digest unexpectedly verified' >&2
+  exit 1
+fi
+
 jq '.outcome = "passed" | .probe.authentication = "rejected"' \
   "$temporary/passed.json" >"$temporary/inconsistent.json"
 if "$bin" verify "$temporary/inconsistent.json"; then
