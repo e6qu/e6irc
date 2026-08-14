@@ -55,8 +55,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build qualification executables
-        run: cargo build --release -p e6ircd -p e6irc-qualification
+      - name: Build qualification runner
+        run: cargo build --release -p e6irc-qualification
 
       - id: campaign
         name: Run external campaign
@@ -75,7 +75,6 @@ jobs:
                   --target "$QUALIFICATION_TARGET" \
                   --source "$GITHUB_SHA" \
                   --host "$QUALIFICATION_HOST" \
-                  --executable target/release/e6ircd \
                   --output "$evidence" \
                   --workload "$QUALIFICATION_WORKLOAD" \
                   --budget "$QUALIFICATION_BUDGET"
@@ -90,7 +89,6 @@ jobs:
                   --target "$QUALIFICATION_TARGET" \
                   --source "$GITHUB_SHA" \
                   --host "$QUALIFICATION_HOST" \
-                  --executable target/release/e6ircd \
                   --output "$evidence" \
                   --workload "$QUALIFICATION_WORKLOAD" \
                   --budget "$QUALIFICATION_BUDGET" \
