@@ -33,12 +33,12 @@ run() {
     slack) target=slack.com ;;
     oidc) target=https://issuer.example.test ;;
     public-irc) target=libera ;;
+    scale) set -- --executable "$bin" "$@" ;;
   esac
   "$bin" "$kind" \
     --target "$target" \
     --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     --host qualification-host \
-    --executable "$bin" \
     --workload sessions=1 \
     --budget timeout_seconds=1 \
     "$@"
@@ -52,10 +52,31 @@ run public-irc --output "$temporary/passed.json" --probe "$pass_probe"
 jq -e '
   .kind == "public_irc" and .outcome == "passed" and
   (.probe | .authentication == "passed" and .delivery == "not_applicable" and .reconnect == "passed" and .cleanup == "passed" and .persistence == "not_applicable") and
-  (.executable.sha256 | test("^[0-9a-f]{64}$")) and
-  (.executable | has("path") | not)
+  (.subject.kind == "qualification_runner") and
+  (.subject.sha256 | test("^[0-9a-f]{64}$")) and
+  (.subject | has("path") | not)
 ' "$temporary/passed.json" >/dev/null
 "$bin" verify "$temporary/passed.json"
+
+if run public-irc --output "$temporary/wrong-subject.json" --executable "$bin" --probe "$pass_probe"; then
+  echo 'public IRC campaign accepted a daemon subject' >&2
+  exit 1
+else
+  [[ $? -eq 2 ]]
+fi
+[[ ! -e "$temporary/wrong-subject.json" ]]
+
+jq '.subject.kind = "target_daemon"' "$temporary/passed.json" >"$temporary/wrong-subject-evidence.json"
+if "$bin" verify "$temporary/wrong-subject-evidence.json"; then
+  echo 'public IRC evidence accepted a daemon subject' >&2
+  exit 1
+fi
+
+jq '.subject.sha256 = "g" + .subject.sha256[1:]' "$temporary/passed.json" >"$temporary/nonhex-subject.json"
+if "$bin" verify "$temporary/nonhex-subject.json"; then
+  echo 'non-hexadecimal subject digest unexpectedly verified' >&2
+  exit 1
+fi
 
 jq '.outcome = "passed" | .probe.authentication = "rejected"' \
   "$temporary/passed.json" >"$temporary/inconsistent.json"
@@ -112,7 +133,6 @@ if "$bin" public-irc \
   --target unknown \
   --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --host qualification-host \
-  --executable "$bin" \
   --output "$temporary/unknown-public-irc.json" \
   --workload sessions=1 \
   --budget timeout_seconds=1 \
@@ -137,7 +157,6 @@ if "$bin" discord \
   --target example.test \
   --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --host qualification-host \
-  --executable "$bin" \
   --output "$temporary/mislabeled-discord.json" \
   --workload sessions=1 \
   --budget timeout_seconds=1; then
@@ -152,7 +171,6 @@ if "$bin" slack \
   --target example.test \
   --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --host qualification-host \
-  --executable "$bin" \
   --output "$temporary/mislabeled-slack.json" \
   --workload sessions=1 \
   --budget timeout_seconds=1; then
@@ -167,7 +185,6 @@ if "$bin" oidc \
   --target http://127.0.0.1:1 \
   --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --host qualification-host \
-  --executable "$bin" \
   --output "$temporary/oracle-oidc.json" \
   --workload sessions=1 \
   --budget timeout_seconds=1; then

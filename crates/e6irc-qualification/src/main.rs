@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-const USAGE: &str = "usage: e6irc-qualification KIND --target TARGET --source REVISION --host HOST --executable PATH --output PATH --workload NAME=VALUE --budget NAME=VALUE [--probe PATH [-- PROBE_ARGS...]]\n       e6irc-qualification verify EVIDENCE";
+const USAGE: &str = "usage: e6irc-qualification KIND --target TARGET --source REVISION --host HOST --output PATH --workload NAME=VALUE --budget NAME=VALUE [--executable PATH] [--probe PATH [-- PROBE_ARGS...]]\n       e6irc-qualification verify EVIDENCE";
 
 fn main() -> ExitCode {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -280,7 +280,7 @@ struct Campaign {
     target: CampaignTarget,
     source: SourceRevision,
     host: SafeText,
-    executable: PathBuf,
+    executable: Option<PathBuf>,
     output: PathBuf,
     workload: Measurements,
     budgets: Measurements,
@@ -380,14 +380,20 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Campaign,
             output.display()
         ));
     }
-    let executable = executable.ok_or_else(|| "--executable is required".to_string())?;
-    if !executable.is_file() {
+    if let Some(path) = executable.as_ref().filter(|path| !path.is_file()) {
         return Err(format!(
             "--executable is not a regular file: {}",
-            executable.display()
+            path.display()
         ));
     }
     let kind = TargetKind::parse(&kind)?;
+    if matches!(kind, TargetKind::Scale) != executable.is_some() {
+        return Err(if matches!(kind, TargetKind::Scale) {
+            "--executable is required for scale".into()
+        } else {
+            "--executable is only valid for scale".into()
+        });
+    }
     if kind.rejects_oracle_endpoint() {
         return Err("external campaigns cannot set a local oracle endpoint".into());
     }
@@ -576,21 +582,47 @@ enum ClosedOutcome {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ExecutableEvidence {
+struct BinaryEvidence {
     sha256: String,
 }
 
-impl ExecutableEvidence {
+impl BinaryEvidence {
     fn validate(&self) -> Result<(), String> {
         if self.sha256.len() != 64
             || !self
                 .sha256
                 .bytes()
-                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         {
-            return Err("executable.sha256 needs a 64-character hexadecimal digest".into());
+            return Err("subject.sha256 needs a 64-character hexadecimal digest".into());
         }
         Ok(())
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum EvidenceSubject {
+    QualificationRunner(BinaryEvidence),
+    TargetDaemon(BinaryEvidence),
+}
+
+impl EvidenceSubject {
+    fn validate(&self, kind: TargetKind) -> Result<(), String> {
+        match (kind, self) {
+            (TargetKind::Scale, Self::TargetDaemon(binary))
+            | (
+                TargetKind::Discord | TargetKind::Slack | TargetKind::Oidc | TargetKind::PublicIrc,
+                Self::QualificationRunner(binary),
+            ) => binary.validate(),
+            (TargetKind::Scale, Self::QualificationRunner(_)) => {
+                Err("scale evidence must identify its target daemon".into())
+            }
+            (_, Self::TargetDaemon(_)) => Err(
+                "provider and public-network evidence must identify its qualification runner"
+                    .into(),
+            ),
+        }
     }
 }
 
@@ -601,7 +633,7 @@ struct QualificationEvidence {
     kind: TargetKind,
     target: CampaignTarget,
     source: SourceRevision,
-    executable: ExecutableEvidence,
+    subject: EvidenceSubject,
     host: SafeText,
     started_at_unix_ms: u128,
     finished_at_unix_ms: u128,
@@ -614,12 +646,12 @@ struct QualificationEvidence {
 
 impl QualificationEvidence {
     fn validate(&self) -> Result<(), String> {
-        if self.format_version != 1 {
+        if self.format_version != 2 {
             return Err("unsupported evidence format version".into());
         }
         self.target.validate(self.kind)?;
         self.source.validate("source")?;
-        self.executable.validate()?;
+        self.subject.validate(self.kind)?;
         SafeText::parse(self.host.0.clone(), "host")?;
         if self.started_at_unix_ms > self.finished_at_unix_ms {
             return Err("evidence finished before it started".into());
@@ -678,15 +710,15 @@ fn verify(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
 }
 
 fn run(args: Campaign) -> ExitCode {
-    let executable_sha256 = match sha256_file(&args.executable) {
+    let subject = match evidence_subject(&args) {
         Ok(digest) => digest,
         Err(error) => {
-            eprintln!("e6irc-qualification: cannot hash executable: {error}");
+            eprintln!("e6irc-qualification: cannot identify campaign subject: {error}");
             return ExitCode::FAILURE;
         }
     };
     let started_at_unix_ms = now_ms();
-    let challenge = challenge(&args, &executable_sha256, started_at_unix_ms);
+    let challenge = challenge(&args, subject_sha256(&subject), started_at_unix_ms);
     let probe_directory = match probe_directory(&args.output, &challenge) {
         Ok(directory) => directory,
         Err(error) => {
@@ -718,13 +750,11 @@ fn run(args: Campaign) -> ExitCode {
         }
     };
     let evidence = QualificationEvidence {
-        format_version: 1,
+        format_version: 2,
         kind: args.kind,
         target: args.target,
         source: args.source,
-        executable: ExecutableEvidence {
-            sha256: executable_sha256,
-        },
+        subject,
         host: args.host,
         started_at_unix_ms,
         finished_at_unix_ms: now_ms(),
@@ -743,6 +773,25 @@ fn run(args: Campaign) -> ExitCode {
         ClosedOutcome::Passed => ExitCode::SUCCESS,
         ClosedOutcome::Rejected => ExitCode::from(3),
         ClosedOutcome::Failed => ExitCode::FAILURE,
+    }
+}
+
+fn evidence_subject(args: &Campaign) -> std::io::Result<EvidenceSubject> {
+    match args.executable.as_deref() {
+        Some(path) => {
+            sha256_file(path).map(|sha256| EvidenceSubject::TargetDaemon(BinaryEvidence { sha256 }))
+        }
+        None => std::env::current_exe()
+            .and_then(|path| sha256_file(&path))
+            .map(|sha256| EvidenceSubject::QualificationRunner(BinaryEvidence { sha256 })),
+    }
+}
+
+fn subject_sha256(subject: &EvidenceSubject) -> &str {
+    match subject {
+        EvidenceSubject::QualificationRunner(binary) | EvidenceSubject::TargetDaemon(binary) => {
+            &binary.sha256
+        }
     }
 }
 

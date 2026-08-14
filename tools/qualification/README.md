@@ -1,7 +1,7 @@
 # External qualification
 
 `e6irc-qualification` writes one new JSON evidence file for a live probe. It
-never writes credential values. The file has a source revision, executable
+never writes credential values. The file has a source revision, campaign-subject
 digest, host, target, workload, budgets, start/end times, phase results, and a
 closed `passed`, `rejected`, or `failed` outcome. Only every required phase
 passed can produce `passed`.
@@ -16,7 +16,7 @@ output path, workload, and budget values:
 
 ```text
 e6irc-qualification KIND --target TARGET --source REVISION --host HOST \
-  --executable PATH --output EVIDENCE --workload NAME=VALUE \
+  --output EVIDENCE --workload NAME=VALUE \
   --budget NAME=VALUE
 ```
 
@@ -79,7 +79,10 @@ tuned Linux host, use `tools/load/qualify-linux.sh`; it supplies the scale
 probe and its measured load result.
 
 The runner creates an isolated report directory and accepts only its fresh
-challenge. It records an executable digest, never a local path. Local oracles
+challenge. Provider and public-network campaigns record the qualification-runner
+digest; scale records its target daemon digest. Evidence never records a local
+path. Provider and public-network records qualify their stated remote protocol
+campaigns; they do not claim that a deployed daemon binary was run. Local oracles
 prove the adapter contract. They do not qualify a commercial provider, public
 network, or tuned host. Publish a passed claim only with retained evidence.
 

@@ -1507,7 +1507,10 @@ try {
     messages.style.flex = "none";
     messages.style.height = "5rem";
     messages.style.overflowY = "scroll";
+    messages.scrollTop = messages.scrollHeight;
+    messages.dispatchEvent(new Event("scroll"));
   });
+  await page.locator("#jump-latest").waitFor({ state: "hidden" });
   for (let index = 0; index < 12; index += 1) {
     mockSocket.send(
       JSON.stringify({

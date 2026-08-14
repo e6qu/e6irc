@@ -6,7 +6,7 @@ use reqwest::{Client, RequestBuilder, StatusCode, Url};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{PhaseOutcome, ProbeReport, QualificationPhase, SafeText, TargetKind};
+use super::{PhaseOutcome, ProbeReport, QualificationPhase, TargetKind};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -69,6 +69,20 @@ fn failed(kind: TargetKind) -> ProbeReport {
 
 fn setting(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+#[derive(Clone, Debug)]
+struct ProviderChannelId(String);
+
+impl ProviderChannelId {
+    fn parse(value: String) -> Option<Self> {
+        (value.len() <= 255 && value.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+            .then_some(Self(value))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// A credential-free campaign endpoint. HTTP is safe only for a loopback oracle.
@@ -209,12 +223,10 @@ async fn discord(_target: &str) -> ProbeReport {
     let Some(token) = setting("E6IRC_DISCORD_BOT_TOKEN") else {
         return not_run(TargetKind::Discord);
     };
-    let Some(channel) = setting("E6IRC_DISCORD_CHANNEL_ID") else {
+    let Some(channel) = setting("E6IRC_DISCORD_CHANNEL_ID").and_then(ProviderChannelId::parse)
+    else {
         return not_run(TargetKind::Discord);
     };
-    if SafeText::parse(channel.clone(), "E6IRC_DISCORD_CHANNEL_ID").is_err() {
-        return not_run(TargetKind::Discord);
-    }
     let base =
         setting("E6IRC_DISCORD_API_BASE").unwrap_or_else(|| "https://discord.com/api/v10".into());
     let Some(base) = safe_url(&base) else {
@@ -227,7 +239,7 @@ async fn discord(_target: &str) -> ProbeReport {
         return failed(TargetKind::Discord);
     };
     let authorization = format!("Bot {token}");
-    let Some(channel_url) = endpoint(&base, &format!("channels/{channel}")) else {
+    let Some(channel_url) = endpoint(&base, &format!("channels/{}", channel.as_str())) else {
         return not_run(TargetKind::Discord);
     };
     let auth = request_outcome(
@@ -286,10 +298,11 @@ async fn discord(_target: &str) -> ProbeReport {
         );
     }
     let message = marker("discord");
-    let message_collection = match endpoint(&base, &format!("channels/{channel}/messages")) {
-        Some(url) => url,
-        None => return not_run(TargetKind::Discord),
-    };
+    let message_collection =
+        match endpoint(&base, &format!("channels/{}/messages", channel.as_str())) {
+            Some(url) => url,
+            None => return not_run(TargetKind::Discord),
+        };
     let posted = match success_json(
         http.post(message_collection.into_url())
             .header("Authorization", &authorization)
@@ -319,7 +332,10 @@ async fn discord(_target: &str) -> ProbeReport {
             PhaseOutcome::NotRun,
         );
     };
-    let Some(message_url) = endpoint(&base, &format!("channels/{channel}/messages/{id}")) else {
+    let Some(message_url) = endpoint(
+        &base,
+        &format!("channels/{}/messages/{id}", channel.as_str()),
+    ) else {
         return report(
             TargetKind::Discord,
             PhaseOutcome::Passed,
@@ -409,13 +425,10 @@ async fn slack(_target: &str) -> ProbeReport {
     let (Some(bot), Some(app), Some(channel)) = (
         setting("E6IRC_SLACK_BOT_TOKEN"),
         setting("E6IRC_SLACK_APP_TOKEN"),
-        setting("E6IRC_SLACK_CHANNEL_ID"),
+        setting("E6IRC_SLACK_CHANNEL_ID").and_then(ProviderChannelId::parse),
     ) else {
         return not_run(TargetKind::Slack);
     };
-    if SafeText::parse(channel.clone(), "E6IRC_SLACK_CHANNEL_ID").is_err() {
-        return not_run(TargetKind::Slack);
-    }
     let base = setting("E6IRC_SLACK_API_BASE").unwrap_or_else(|| "https://slack.com/api/".into());
     let Some(base) = safe_url(&base) else {
         return not_run(TargetKind::Slack);
@@ -477,7 +490,7 @@ async fn slack(_target: &str) -> ProbeReport {
     let posted = match success_json(
         http.post(post_url.into_url())
             .header("Authorization", &authorization)
-            .json(&serde_json::json!({"channel":channel,"text":message})),
+            .json(&serde_json::json!({"channel":channel.as_str(),"text":message})),
     )
     .await
     {
@@ -518,7 +531,7 @@ async fn slack(_target: &str) -> ProbeReport {
     let persistence = json_outcome(
         http.get(replies_url.into_url())
             .header("Authorization", &authorization)
-            .query(&[("channel", &channel), ("ts", &timestamp)]),
+            .query(&[("channel", channel.as_str()), ("ts", &timestamp)]),
         |json| slack_readback_contains(json, &timestamp),
     )
     .await;
@@ -528,7 +541,7 @@ async fn slack(_target: &str) -> ProbeReport {
     let cleanup = json_outcome(
         http.post(delete_url.into_url())
             .header("Authorization", &authorization)
-            .json(&serde_json::json!({"channel":channel,"ts":timestamp})),
+            .json(&serde_json::json!({"channel":channel.as_str(),"ts":timestamp})),
         slack_ok,
     )
     .await;
