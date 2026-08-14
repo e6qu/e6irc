@@ -345,12 +345,20 @@ function matchingPath(paths, pathname) {
 }
 
 export function operationResponseSchema(document, method, url, status = 200) {
-  const { pathname, operation } = declaredOperation(document, method, url);
-  const schema = operation?.responses?.[String(status)]?.content?.["application/json"]?.schema;
+    const { pathname, operation } = declaredOperation(document, method, url);
+  const schema = declaredResponse(operation, method, pathname, status)?.content?.["application/json"]?.schema;
   if (!objectValue(schema)) {
     throw new ApiSchemaError(`The API contract does not describe ${method.toUpperCase()} ${pathname}.`);
   }
   return schema;
+}
+
+function declaredResponse(operation, method, pathname, status) {
+  const response = operation.responses?.[String(status)];
+  if (!objectValue(response)) {
+    throw new ApiSchemaError(`The API contract does not describe ${method.toUpperCase()} ${pathname}.`);
+  }
+  return response;
 }
 
 export function operationRequestSchema(document, method, url) {
@@ -457,6 +465,9 @@ export async function getOperationJson(fetcher, document, method, url, options =
     headers: { Accept: "application/json", ...request.headers },
   });
   if (!response.ok) await apiFailure(response);
-  if (response.status === 204) return undefined;
+  if (response.status === 204) {
+    declaredResponse(operation, method, new URL(url, "https://e6irc.invalid").pathname, response.status);
+    return undefined;
+  }
   return parseOperationResponse(document, method, url, await readApiJson(response), "API response", response.status);
 }

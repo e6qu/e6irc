@@ -943,11 +943,8 @@ pub(crate) async fn bridge_ws_connect(
     String,
 > {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let (host, port) = bridge_gateway_authority(url)?;
     let request = url.into_client_request().map_err(|e| e.to_string())?;
-    let uri = request.uri();
-    let host = uri.host().ok_or("gateway url has no host")?.to_string();
-    // Gateways are always wss:// (TLS); default to 443 when the URL omits a port.
-    let port = uri.port_u16().unwrap_or(443);
     let vetted = tokio::net::lookup_host((host.as_str(), port))
         .await
         .map_err(|e| e.to_string())?
@@ -961,6 +958,24 @@ pub(crate) async fn bridge_ws_connect(
             .await
             .map_err(|e| e.to_string())?;
     Ok(ws)
+}
+
+#[cfg(any(feature = "discord", feature = "slack"))]
+fn bridge_gateway_authority(url: &str) -> Result<(String, u16), String> {
+    let parsed = openidconnect::url::Url::parse(url)
+        .map_err(|_| "gateway URL must be an absolute ws(s) URL".to_string())?;
+    if !matches!(parsed.scheme(), "ws" | "wss")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("gateway URL must be absolute ws(s), without credentials or fragment".into());
+    }
+    let port = parsed
+        .port_or_known_default()
+        .ok_or("gateway URL has no known default port")?;
+    Ok((parsed.host_str().expect("checked host").to_string(), port))
 }
 
 /// Largest HTTP response body a bridge will read from an upstream before
@@ -2842,6 +2857,27 @@ mod tests {
             err.contains("permitted") || err.contains("SSRF"),
             "refusal must name the SSRF block, got: {err}"
         );
+    }
+
+    #[test]
+    #[cfg(any(feature = "discord", feature = "slack"))]
+    fn bridge_gateway_url_is_closed_to_websocket_origins() {
+        assert_eq!(
+            bridge_gateway_authority("wss://gateway.example/socket"),
+            Ok(("gateway.example".into(), 443))
+        );
+        assert_eq!(
+            bridge_gateway_authority("ws://127.0.0.1:8080/socket"),
+            Ok(("127.0.0.1".into(), 8080))
+        );
+        for url in [
+            "https://gateway.example/socket",
+            "wss://user:secret@gateway.example/socket",
+            "wss://gateway.example/socket#fragment",
+            "/socket",
+        ] {
+            assert!(bridge_gateway_authority(url).is_err(), "accepted {url}");
+        }
     }
 
     #[tokio::test]

@@ -626,13 +626,9 @@ pub(super) async fn create_account_lifecycle(
     Ok(account_id)
 }
 
-fn account_invitation_url(state: &AppState, token: &str) -> String {
+fn account_invitation_url(public_url: &str, token: &str) -> String {
     let path = format!("/invite/{token}");
-    state
-        .public_url
-        .as_deref()
-        .map(|base| format!("{}{path}", base.trim_end_matches('/')))
-        .unwrap_or(path)
+    format!("{}{path}", public_url.trim_end_matches('/'))
 }
 
 pub(super) async fn delete_account_lifecycle(
@@ -3769,6 +3765,19 @@ mod credential_input_tests {
         assert!(password_input_error("").is_some());
         assert!(password_input_error(&"p".repeat(513)).is_some());
         assert_eq!(password_input_error(&"p".repeat(512)), None);
+    }
+}
+
+#[cfg(test)]
+mod invitation_url_tests {
+    use super::account_invitation_url;
+
+    #[test]
+    fn invitation_url_keeps_the_deployment_path() {
+        assert_eq!(
+            account_invitation_url("https://chat.example/e6irc/", "token"),
+            "https://chat.example/e6irc/invite/token"
+        );
     }
 }
 

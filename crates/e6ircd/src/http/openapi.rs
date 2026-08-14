@@ -852,7 +852,7 @@ fn document() -> serde_json::Value {
                     "responses": {
                         "200": security_activity_response["200"],
                         "400": { "description": "invalid limit or cursor" },
-                        "503": { "description": "database unavailable" }
+                        "503": { "description": "database or absolute public URL unavailable" }
                     }
                 }
             },
@@ -1020,7 +1020,8 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/auth/device/start": {
                 "post": { "summary": "Begin an RFC 8628 device authorization grant",
-                    "responses": { "200": { "description": "device_code, user_code, verification_uri" } } }
+                    "responses": { "200": { "description": "device_code, user_code, verification_uri" },
+                        "503": { "description": "database or absolute public URL unavailable" } } }
             },
             "/api/v1/auth/device/token": {
                 "post": { "summary": "Poll for the device grant's token",
@@ -1569,7 +1570,7 @@ fn document() -> serde_json::Value {
                         "201": invitation_created_response["201"],
                         "400": { "description": "invalid account, email, or lifetime" },
                         "409": { "description": "name unavailable or administrator invitation cap reached" },
-                        "503": { "description": "database unavailable" }
+                        "503": { "description": "database or absolute public URL unavailable" }
                     }
                 }
             },

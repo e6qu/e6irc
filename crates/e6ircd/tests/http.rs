@@ -126,6 +126,18 @@ async fn healthz_is_public_and_ok() {
 }
 
 #[tokio::test]
+async fn device_authorization_requires_an_absolute_public_url() {
+    let running = net::start(test_config()).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    let start_request = "POST /api/v1/auth/device/start HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    let (status, headers, body) = request(http, start_request).await;
+    assert_eq!(status, 503);
+    assert!(headers.contains("application/problem+json"), "{headers}");
+    assert!(body.contains("Device authorization unavailable"), "{body}");
+}
+
+#[tokio::test]
 async fn bootstrap_routes_are_closed_when_not_configured() {
     let running = net::start(test_config()).await.expect("start");
     let http = running.http_addr.expect("HTTP bound");
@@ -3383,7 +3395,7 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
-            public_url: None,
+            public_url: Some("https://irc.onboarding.example".into()),
             secure_cookies: false,
             admin_accounts: vec![],
         }),
@@ -3432,7 +3444,13 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
     let invitation_url = invitation["invitation_url"]
         .as_str()
         .expect("single-use URL");
-    assert!(invitation_url.starts_with("/invite/e6i_"), "{body}");
+    assert!(
+        invitation_url.starts_with("https://irc.onboarding.example/invite/e6i_"),
+        "{body}"
+    );
+    let invitation_path = invitation_url
+        .strip_prefix("https://irc.onboarding.example")
+        .expect("configured public origin");
     let invitation_directory = format!(
         "GET /api/v1/admin/invitations?limit=1 HTTP/1.1\r\nHost: t\r\n\
          Authorization: Bearer {alice_token}\r\nConnection: close\r\n\r\n"
@@ -3453,7 +3471,7 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
     let (status, _, body) = request(http, &invalid_directory).await;
     assert_eq!(status, 400, "{body}");
 
-    let (status, invite_headers, invite_page) = request(http, &get(invitation_url)).await;
+    let (status, invite_headers, invite_page) = request(http, &get(invitation_path)).await;
     assert_eq!(status, 200, "{invite_page}");
     assert!(
         invite_page.contains("Create <code>Bob</code>"),
@@ -3469,7 +3487,7 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
     let bad_accept =
         "invitation_state=wrong&password=bob-password&password_confirmation=bob-password";
     let bad_request = format!(
-        "POST {invitation_url} HTTP/1.1\r\nHost: t\r\nCookie: {invitation_cookie}\r\n\
+        "POST {invitation_path} HTTP/1.1\r\nHost: t\r\nCookie: {invitation_cookie}\r\n\
          Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{bad_accept}",
         bad_accept.len()
@@ -3477,7 +3495,7 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
     let (status, _, body) = request(http, &bad_request).await;
     assert_eq!(status, 403, "{body}");
 
-    let (status, invite_headers, invite_page) = request(http, &get(invitation_url)).await;
+    let (status, invite_headers, invite_page) = request(http, &get(invitation_path)).await;
     assert_eq!(status, 200, "{invite_page}");
     let invitation_state = invitation_state_from_html(&invite_page).to_string();
     let invitation_cookie = response_header(&invite_headers, "set-cookie")
@@ -3490,7 +3508,7 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
         form_value(&invitation_state)
     );
     let accept_request = format!(
-        "POST {invitation_url} HTTP/1.1\r\nHost: t\r\nCookie: {invitation_cookie}\r\n\
+        "POST {invitation_path} HTTP/1.1\r\nHost: t\r\nCookie: {invitation_cookie}\r\n\
          Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{accept_body}",
         accept_body.len()
@@ -3516,7 +3534,7 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
             .expect("Bob password"),
         Some("Bob".into())
     );
-    let (status, _, body) = request(http, &get(invitation_url)).await;
+    let (status, _, body) = request(http, &get(invitation_path)).await;
     assert_eq!(status, 404, "{body}");
 
     let bob_export = format!(
@@ -5664,7 +5682,10 @@ async fn device_authorization_grant_flow() {
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
     let device_code = v["device_code"].as_str().unwrap().to_string();
     let user_code = v["user_code"].as_str().unwrap().to_string();
-    assert!(v["verification_uri"].as_str().unwrap().ends_with("/device"));
+    assert_eq!(
+        v["verification_uri"].as_str(),
+        Some("https://e6.example/device")
+    );
 
     let (status, _, _) = request(
         http,

@@ -454,6 +454,12 @@ test("operation requests serialize only contract-checked JSON", async () => {
     getOperationJson(async () => new Response(), document, "POST", "/api/v1/me/widgets"),
     ApiSchemaError,
   );
+  await assert.rejects(
+    getOperationJson(async () => new Response(null, { status: 204 }), {
+      paths: { "/api/v1/me/widgets": { post: { responses: {} } } },
+    }, "POST", "/api/v1/me/widgets"),
+    ApiSchemaError,
+  );
 });
 
 test("operation requests preserve an API problem detail", async () => {
