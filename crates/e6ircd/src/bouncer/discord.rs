@@ -1,20 +1,6 @@
-//! The `discord` bridge driver (DESIGN §10.5): a [`NetworkDriver`] that
-//! presents a Discord bot session as a BNC network. It connects to the
-//! Discord gateway (a WebSocket), IDENTIFYs with a bot token, keeps the
-//! heartbeat, and bridges `MESSAGE_CREATE` events to IRC PRIVMSG lines and
-//! back (the reverse direction sends via the REST API). All of its HTTP
-//! and WebSocket code lives behind the `discord` feature.
+//! Discord gateway and REST bridge.
 //!
-//! Mapping: each configured Discord channel id is looked up once for its
-//! name and bridged as IRC channel `#name`; a message author's username ⇄
-//! nick; message `content` ⇄ PRIVMSG text. The bot's own messages and
-//! non-message events are dropped.
-//!
-//! There is no self-hostable Discord server to test against. CI therefore
-//! drives the complete HTTP/WebSocket transport against a strict in-process
-//! protocol oracle (authorization, gateway discovery, HELLO/IDENTIFY/READY,
-//! inbound dispatch, and outbound REST), while live provider qualification
-//! remains credential-gated.
+//! CI drives its HTTP and WebSocket contract through a local protocol oracle.
 
 use super::BoundedJson;
 #[cfg(test)]
@@ -26,21 +12,13 @@ use tokio_tungstenite::tungstenite::Message as Ws;
 
 use super::{ConnectionEvent, DriverEnds, NetworkDriver, NetworkHandle};
 
-/// Default Discord REST base; overridable via config `addr` for a custom
-/// or self-hosted API-compatible endpoint.
 const DEFAULT_API: &str = "https://discord.com/api/v10";
-/// Gateway intents: GUILDS (1<<0) | GUILD_MESSAGES (1<<9) |
-/// MESSAGE_CONTENT (1<<15) — the minimum to receive channel message text.
 const INTENTS: u64 = (1 << 0) | (1 << 9) | (1 << 15);
 
 #[derive(Debug, Clone)]
 pub struct DiscordConfig {
-    /// Bot token (used raw in the gateway IDENTIFY and as `Bot <token>`
-    /// on REST calls).
     pub token: String,
-    /// REST API base; empty means [`DEFAULT_API`].
     pub api_base: String,
-    /// Discord channel ids to bridge.
     pub channels: Vec<String>,
     pub buffer_cap: usize,
 }
@@ -63,16 +41,11 @@ impl NetworkDriver for DiscordDriver {
     super::bridge_start!();
 }
 
-// Always-on: reconnect (from scratch) with backoff on any gateway drop,
-// rather than dying on the first disconnect and silently dropping all
-// later messages. Only a dropped handle stops the driver.
 super::bridge_run!(DiscordConfig);
 
 async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
     use super::NetworkFailure;
     use super::SessionOutcome::Dropped;
-    // Bound REST calls so a hung request can't stall the gateway loop; vet every
-    // resolved IP and refuse redirects (SSRF control; see `bridge_http_client`).
     let http = match super::bridge_http_or_outcome("discord", Duration::from_secs(30)) {
         Ok(c) => c,
         Err(outcome) => return outcome,
@@ -113,16 +86,12 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
             return Dropped(NetworkFailure::UpstreamProtocolFailed);
         }
     };
-    // Bound the WS handshake so a black-holed gateway (accepts the connection
-    // then goes silent) can't wedge the driver — the same guard irc_driver and
-    // matrix already have.
     let ws = match super::bridge_ws_open(&url, "discord", "gateway").await {
         Ok(ws) => ws,
         Err(outcome) => return outcome,
     };
     let (mut write, mut read) = ws.split();
 
-    // First frame must be HELLO, carrying the heartbeat interval.
     let hb_interval = match tokio::time::timeout(Duration::from_secs(30), read.next()).await {
         Ok(Some(Ok(Ws::Text(t)))) => match parse_frame(t.as_str()) {
             Ok(Frame {
@@ -156,15 +125,14 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
         }
     };
 
-    let identify = serde_json::json!({
-        "op": 2,
-        "d": {
-            "token": config.token,
-            "intents": INTENTS,
-            "properties": { "os": "linux", "browser": "e6irc", "device": "e6irc" },
+    let identify = match encode_gateway(&IdentifyFrame::new(&config.token)) {
+        Ok(identify) => identify,
+        Err(error) => {
+            eprintln!("discord: could not encode IDENTIFY: {error}");
+            return Dropped(NetworkFailure::UpstreamProtocolFailed);
         }
-    });
-    if write.send(Ws::text(identify.to_string())).await.is_err() {
+    };
+    if write.send(identify).await.is_err() {
         return Dropped(NetworkFailure::UpstreamWriteFailed);
     }
     ends.emit(ConnectionEvent::Connected);
@@ -173,24 +141,23 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_seq: Option<u64> = None;
     let mut our_id = String::new();
-    // A healthy gateway sends heartbeat ACKs each interval, so no data for well
-    // past two intervals means it's black-holed — reconnect instead of hanging.
     let read_timeout = Duration::from_millis(hb_interval.saturating_mul(2).max(60_000));
 
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                let hb = serde_json::json!({ "op": 1, "d": last_seq });
-                if write.send(Ws::text(hb.to_string())).await.is_err() {
+                let heartbeat = match encode_gateway(&HeartbeatFrame::new(last_seq)) {
+                    Ok(heartbeat) => heartbeat,
+                    Err(error) => {
+                        eprintln!("discord: could not encode heartbeat: {error}");
+                        return Dropped(NetworkFailure::UpstreamProtocolFailed);
+                    }
+                };
+                if write.send(heartbeat).await.is_err() {
                     return Dropped(NetworkFailure::UpstreamWriteFailed);
                 }
             }
             text = super::next_bridge_text(&mut read, &mut write, read_timeout, "discord", "gateway", |code| {
-                // Discord close code 4004 = authentication failed (bad token);
-                // 4013/4014 = invalid/disallowed gateway intents. These are
-                // permanent config errors — stop re-dialing (like the IRC driver
-                // on a rejected password) rather than reconnecting forever with
-                // the same bad token.
                 if matches!(code, Some(4004 | 4013 | 4014)) {
                     eprintln!(
                         "discord: gateway closed with fatal auth/intents code {code:?}; \
@@ -218,10 +185,6 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                 }
                 match frame.event {
                     Event::Ready(id) => {
-                        // Own-echo suppression keys on this id; an empty one
-                        // would loop our own posts back. A READY without a user
-                        // id is a broken session — drop it and reconnect rather
-                        // than run with echo suppression silently disabled.
                         if id.is_empty() {
                             eprintln!("discord: READY without user id");
                             return Dropped(NetworkFailure::UpstreamProtocolFailed);
@@ -229,21 +192,21 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                         our_id = id;
                     }
                     Event::HeartbeatRequest => {
-                        let hb = serde_json::json!({ "op": 1, "d": last_seq });
-                        if write.send(Ws::text(hb.to_string())).await.is_err() {
+                        let heartbeat = match encode_gateway(&HeartbeatFrame::new(last_seq)) {
+                            Ok(heartbeat) => heartbeat,
+                            Err(error) => {
+                                eprintln!("discord: could not encode heartbeat: {error}");
+                                return Dropped(NetworkFailure::UpstreamProtocolFailed);
+                            }
+                        };
+                        if write.send(heartbeat).await.is_err() {
                             return Dropped(NetworkFailure::UpstreamWriteFailed);
                         }
                     }
                     Event::Message { channel_id, author_id, author, content, attachments } => {
-                        // Skip our own messages (the attached client already saw
-                        // what it sent).
                         if author_id == our_id {
                             continue;
                         }
-                        // Render the text, or the attachment URLs when there is no
-                        // text body — an image/file-only message must not silently
-                        // vanish on the IRC side. A message with neither (e.g. a
-                        // bare embed we don't render) is skipped.
                         let body = if !content.is_empty() {
                             content
                         } else if !attachments.is_empty() {
@@ -263,8 +226,6 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                 }
             }
             cmd = ends.next_command() => match cmd {
-                // One line may resolve to several targets (a comma list); each
-                // target's outcome is surfaced independently by `relay_routed`.
                 Some(cmd) => {
                     let routed = super::route_privmsg(&cmd.line, &channel_to_id);
                     super::relay_routed(ends, routed, "Discord", "channel", |id, text| {
@@ -281,8 +242,6 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
     }
 }
 
-/// A parsed gateway frame: its sequence number (if any) and classified
-/// event. Kept pure so it can be unit-tested with synthetic frames.
 struct Frame {
     seq: Option<u64>,
     event: Event,
@@ -296,13 +255,66 @@ enum Event {
         author_id: String,
         author: String,
         content: String,
-        /// Attachment URLs — rendered when there is no text `content`, so an
-        /// image/file-only message doesn't vanish on the IRC side.
         attachments: Vec<String>,
     },
     HeartbeatRequest,
     Ack,
     Ignore,
+}
+
+#[derive(serde::Serialize)]
+struct IdentifyFrame<'a> {
+    op: u8,
+    d: IdentifyData<'a>,
+}
+
+impl<'a> IdentifyFrame<'a> {
+    fn new(token: &'a str) -> Self {
+        Self {
+            op: 2,
+            d: IdentifyData {
+                token,
+                intents: INTENTS,
+                properties: IdentifyProperties {
+                    os: "linux",
+                    browser: "e6irc",
+                    device: "e6irc",
+                },
+            },
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct IdentifyData<'a> {
+    token: &'a str,
+    intents: u64,
+    properties: IdentifyProperties,
+}
+
+#[derive(serde::Serialize)]
+struct IdentifyProperties {
+    os: &'static str,
+    browser: &'static str,
+    device: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct HeartbeatFrame {
+    op: u8,
+    d: Option<u64>,
+}
+
+impl HeartbeatFrame {
+    fn new(sequence: Option<u64>) -> Self {
+        Self { op: 1, d: sequence }
+    }
+}
+
+fn encode_gateway<T: serde::Serialize>(value: &T) -> Result<Ws, String> {
+    serde_json::to_string(value)
+        .map(Ws::text)
+        .map_err(|error| format!("gateway JSON: {error}"))
 }
 
 #[derive(serde::Deserialize)]
@@ -312,8 +324,11 @@ struct GatewayFrame {
     s: Option<u64>,
     #[serde(default)]
     t: Option<String>,
-    #[serde(default)]
-    d: serde_json::Value,
+}
+
+#[derive(serde::Deserialize)]
+struct GatewayPayload<T> {
+    d: T,
 }
 
 #[derive(serde::Deserialize)]
@@ -351,11 +366,10 @@ struct MessageAttachment {
     url: String,
 }
 
-fn decode_data<T: serde::de::DeserializeOwned>(
-    value: serde_json::Value,
-    event: &str,
-) -> Result<T, String> {
-    serde_json::from_value(value).map_err(|e| format!("{event} data: {e}"))
+fn decode_data<T: serde::de::DeserializeOwned>(text: &str, event: &str) -> Result<T, String> {
+    serde_json::from_str::<GatewayPayload<T>>(text)
+        .map(|payload| payload.d)
+        .map_err(|e| format!("{event} data: {e}"))
 }
 
 fn parse_frame(text: &str) -> Result<Frame, String> {
@@ -363,7 +377,7 @@ fn parse_frame(text: &str) -> Result<Frame, String> {
         serde_json::from_str(text).map_err(|e| format!("gateway JSON: {e}"))?;
     let event = match frame.op {
         10 => {
-            let hello: HelloData = decode_data(frame.d, "HELLO")?;
+            let hello: HelloData = decode_data(text, "HELLO")?;
             if hello.heartbeat_interval == 0 {
                 return Err("HELLO heartbeat_interval was zero".to_string());
             }
@@ -381,11 +395,11 @@ fn parse_frame(text: &str) -> Result<Frame, String> {
             }
             match name {
                 "READY" => {
-                    let ready: ReadyData = decode_data(frame.d, "READY")?;
+                    let ready: ReadyData = decode_data(text, "READY")?;
                     Event::Ready(ready.user.id)
                 }
                 "MESSAGE_CREATE" => {
-                    let message: MessageData = decode_data(frame.d, "MESSAGE_CREATE")?;
+                    let message: MessageData = decode_data(text, "MESSAGE_CREATE")?;
                     Event::Message {
                         channel_id: message.channel_id,
                         author_id: message.author.id,
@@ -410,14 +424,20 @@ fn parse_frame(text: &str) -> Result<Frame, String> {
 }
 
 async fn gateway_url(http: &reqwest::Client, base: &str) -> Result<String, String> {
-    let v: serde_json::Value = super::bridge_send(http.get(format!("{base}/gateway")))
+    #[derive(serde::Deserialize)]
+    struct GatewayResponse {
+        url: String,
+    }
+
+    let response: GatewayResponse = super::bridge_send(http.get(format!("{base}/gateway")))
         .await?
         .bounded_json()
         .await?;
-    v["url"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| "gateway response had no url".to_string())
+    if response.url.is_empty() {
+        Err("gateway response had an empty url".into())
+    } else {
+        Ok(response.url)
+    }
 }
 
 fn gateway_connection_url(gateway: &str) -> Result<String, String> {
@@ -450,17 +470,23 @@ async fn fetch_channel_name(
     token: &str,
     id: &str,
 ) -> Result<String, String> {
-    let v: serde_json::Value = super::bridge_send(
+    #[derive(serde::Deserialize)]
+    struct ChannelResponse {
+        name: String,
+    }
+
+    let response: ChannelResponse = super::bridge_send(
         http.get(format!("{base}/channels/{id}"))
             .header("Authorization", format!("Bot {token}")),
     )
     .await?
     .bounded_json()
     .await?;
-    v["name"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| format!("channel {id} response had no name"))
+    if response.name.is_empty() {
+        Err(format!("channel {id} response had an empty name"))
+    } else {
+        Ok(response.name)
+    }
 }
 
 async fn send_message(
@@ -470,10 +496,15 @@ async fn send_message(
     channel_id: &str,
     text: &str,
 ) -> Result<(), String> {
+    #[derive(serde::Serialize)]
+    struct MessageRequest<'a> {
+        content: &'a str,
+    }
+
     let req = http
         .post(format!("{base}/channels/{channel_id}/messages"))
         .header("Authorization", format!("Bot {token}"))
-        .json(&serde_json::json!({ "content": text }));
+        .json(&MessageRequest { content: text });
     super::bridge_send(req).await?;
     Ok(())
 }

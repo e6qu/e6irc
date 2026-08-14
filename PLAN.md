@@ -15,12 +15,12 @@ and integration claims.
 The console reads and writes only through `/api/v1`. Browser chat and console
 load the served OpenAPI contract, parse each successful API response into a
 closed immutable projection, and serialize each JSON mutation from its closed
-request shape before a view uses or sends it. Browser chat parses each UI
-WebSocket event into its closed
-shape before handling it and serializes each composer request from its closed
-shape before sending it. Immutable console mutation operations are checked
-against the router. Successful mutations refresh their API-backed view without
-a document reload.
+request shape before a view uses or sends it. Browser chat does the same for UI
+WebSocket events and composer requests. Immutable console mutation operations
+are checked against the router. Successful mutations refresh their API-backed
+view without a document reload. Bridge provider frames and REST bodies cross
+typed contracts. History accepts one typed cursor window and a bounded page
+size.
 Chat, console, and identity pages share accessible light and dark palettes.
 Browser tests cover WCAG AA contrast, keyboard focus, Escape dismissal,
 reduced motion, forced colors, and responsive chat controls.

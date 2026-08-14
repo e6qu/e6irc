@@ -1,26 +1,13 @@
-//! The `slack` bridge driver (DESIGN §10.5): a [`NetworkDriver`] that
-//! presents a Slack workspace as a BNC network over Socket Mode. It opens
-//! a Socket Mode WebSocket with the app-level token, ACKs event envelopes,
-//! and bridges channel `message` events to IRC PRIVMSG lines; the reverse
-//! direction posts via the Web API `chat.postMessage` with the bot token.
-//! All HTTP/WebSocket code lives behind the `slack` feature.
+//! Slack Socket Mode bridge.
 //!
-//! Mapping: each configured channel id is looked up once for its name and
-//! bridged as IRC channel `#name`; a message's `user` ⇄ nick; `text` ⇄
-//! PRIVMSG text. Bot messages (which carry `bot_id`) are dropped so the
-//! bridge does not echo its own posts into a loop.
-//!
-//! There is no self-hostable Slack server. CI therefore drives the complete
-//! HTTP/WebSocket transport against a strict in-process protocol oracle
-//! (authorization, channel/user lookup, Socket Mode open/event/ACK, inbound
-//! mapping, and outbound Web API), while live provider qualification remains
-//! credential-gated.
+//! CI drives its HTTP and WebSocket contract through a local protocol oracle.
 
 use super::BoundedJson;
 use std::collections::HashMap;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_tungstenite::tungstenite::Message as Ws;
 
 use super::{ConnectionEvent, DriverEnds, NetworkDriver, NetworkHandle};
@@ -59,17 +46,11 @@ impl NetworkDriver for SlackDriver {
     super::bridge_start!();
 }
 
-// Always-on: reconnect (from scratch) with backoff on any socket drop —
-// including Slack's routine `disconnect` envelope, which expects a
-// reconnect — rather than dying and silently dropping all later messages.
-// Only a dropped handle stops the driver.
 super::bridge_run!(SlackConfig);
 
 async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
     use super::NetworkFailure;
     use super::SessionOutcome::Dropped;
-    // Bound REST calls so a hung request can't stall the socket loop; vet every
-    // resolved IP and refuse redirects (SSRF control; see `bridge_http_client`).
     let http = match super::bridge_http_or_outcome("slack", Duration::from_secs(30)) {
         Ok(c) => c,
         Err(outcome) => return outcome,
@@ -99,7 +80,6 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
             return slack_failure("apps.connections.open failed", &e);
         }
     };
-    // Bound the WS handshake so a black-holed socket can't wedge the driver.
     let ws = match super::bridge_ws_open(&ws_url, "slack", "socket").await {
         Ok(ws) => ws,
         Err(outcome) => return outcome,
@@ -107,11 +87,8 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
     let (mut write, mut read) = ws.split();
     ends.emit(ConnectionEvent::Connected);
 
-    // User-id → display-name cache, populated lazily via users.info.
     let mut user_names: HashMap<String, String> = HashMap::new();
 
-    // Slack sends pings and disconnect envelopes regularly; no data for well
-    // over a minute means the socket is black-holed — reconnect, don't hang.
     let read_timeout = Duration::from_secs(90);
     loop {
         tokio::select! {
@@ -130,10 +107,15 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                         return Dropped(NetworkFailure::UpstreamProtocolFailed);
                     }
                 };
-                // Socket Mode requires acknowledging each envelope by id.
                 if let Some(ack_id) = &envelope.ack {
-                    let ack = serde_json::json!({ "envelope_id": ack_id });
-                    if write.send(Ws::text(ack.to_string())).await.is_err() {
+                    let ack = match socket_ack(ack_id) {
+                        Ok(ack) => ack,
+                        Err(error) => {
+                            eprintln!("slack: could not encode Socket Mode ACK: {error}");
+                            return Dropped(NetworkFailure::UpstreamProtocolFailed);
+                        }
+                    };
+                    if write.send(ack).await.is_err() {
                         return Dropped(NetworkFailure::UpstreamWriteFailed);
                     }
                 }
@@ -143,9 +125,6 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                 if let Some(m) = envelope.message
                     && let Some(channel) = id_to_channel.get(&m.channel).cloned()
                 {
-                    // Resolve the opaque user id to a display name once, cached;
-                    // fall back to the raw id if the lookup fails (better an ugly
-                    // nick than a dropped message).
                     let sender = match user_names.get(&m.user) {
                         Some(name) => name.clone(),
                         None => {
@@ -169,10 +148,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                 }
             }
             cmd = ends.next_command() => match cmd {
-                // One line may resolve to several targets (a comma list).
                 Some(cmd) => {
-                    // One line may resolve to several targets (a comma list); each
-                    // target's outcome is surfaced independently by `relay_routed`.
                     let routed = super::route_privmsg(&cmd.line, &channel_to_id);
                     super::relay_routed(ends, routed, "Slack", "channel", |id, text| {
                         let http = http.clone();
@@ -188,41 +164,61 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
     }
 }
 
-/// One bridged Slack message.
 struct SlackMessage {
     channel: String,
     user: String,
     text: String,
 }
 
-/// A parsed Socket Mode frame: the envelope id to acknowledge (if any),
-/// whether Slack asked us to disconnect, and any user message it carried.
-/// Pure, so it is unit-tested with synthetic frames.
 struct Envelope {
     ack: Option<String>,
     disconnect: bool,
     message: Option<SlackMessage>,
 }
 
+#[derive(Serialize)]
+struct SocketAck<'a> {
+    envelope_id: &'a str,
+}
+
+fn socket_ack(envelope_id: &str) -> Result<Ws, String> {
+    serde_json::to_string(&SocketAck { envelope_id })
+        .map(Ws::text)
+        .map_err(|error| format!("Socket Mode ACK: {error}"))
+}
+
 #[derive(serde::Deserialize)]
 struct SocketFrame {
     #[serde(rename = "type")]
-    kind: String,
+    kind: SocketFrameKind,
     #[serde(default)]
     envelope_id: Option<String>,
-    #[serde(default)]
-    payload: Option<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SocketFrameKind {
+    Disconnect,
+    EventsApi,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(serde::Deserialize)]
+struct EventsApiFrame {
+    envelope_id: String,
+    payload: SocketPayload,
 }
 
 #[derive(serde::Deserialize)]
 struct SocketPayload {
-    event: serde_json::Value,
+    event: SlackEvent,
 }
 
 #[derive(serde::Deserialize)]
 struct SlackEvent {
     #[serde(rename = "type")]
-    kind: String,
+    kind: SlackEventKind,
     #[serde(default)]
     bot_id: Option<String>,
     #[serde(default)]
@@ -235,17 +231,25 @@ struct SlackEvent {
     text: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SlackEventKind {
+    Message,
+    #[serde(other)]
+    Other,
+}
+
 fn parse_envelope(text: &str) -> Result<Envelope, String> {
     let frame: SocketFrame =
         serde_json::from_str(text).map_err(|e| format!("Socket Mode JSON: {e}"))?;
-    if frame.kind == "disconnect" {
+    if matches!(frame.kind, SocketFrameKind::Disconnect) {
         return Ok(Envelope {
             ack: frame.envelope_id,
             disconnect: true,
             message: None,
         });
     }
-    if frame.kind != "events_api" {
+    if matches!(frame.kind, SocketFrameKind::Other) {
         return Ok(Envelope {
             ack: frame.envelope_id,
             disconnect: false,
@@ -253,17 +257,14 @@ fn parse_envelope(text: &str) -> Result<Envelope, String> {
         });
     }
 
-    let ack = frame
-        .envelope_id
-        .ok_or("events_api frame had no envelope_id")?;
-    let payload: SocketPayload =
-        serde_json::from_value(frame.payload.ok_or("events_api frame had no payload")?)
-            .map_err(|e| format!("events_api payload: {e}"))?;
-    let event: SlackEvent =
-        serde_json::from_value(payload.event).map_err(|e| format!("events_api event: {e}"))?;
-    // A real user message: inner event type "message", no bot_id (drop our
-    // own and other bots' posts), and no subtype (edits/joins/etc. carry one).
-    let message = if event.kind == "message" && event.bot_id.is_none() && event.subtype.is_none() {
+    let events: EventsApiFrame =
+        serde_json::from_str(text).map_err(|e| format!("events_api frame: {e}"))?;
+    let ack = events.envelope_id;
+    let event = events.payload.event;
+    let message = if matches!(event.kind, SlackEventKind::Message)
+        && event.bot_id.is_none()
+        && event.subtype.is_none()
+    {
         Some(SlackMessage {
             channel: event.channel.ok_or("user message event had no channel")?,
             user: event.user.ok_or("user message event had no user")?,
@@ -279,20 +280,65 @@ fn parse_envelope(text: &str) -> Result<Envelope, String> {
     })
 }
 
-/// A Slack Web API response's `ok` field is the error contract: `false`
-/// carries an `error` string.
-fn check_ok(v: &serde_json::Value) -> Result<(), String> {
-    if v["ok"].as_bool() == Some(true) {
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum SlackResponse<T> {
+    Success(SlackSuccess<T>),
+    Failure(SlackFailure),
+}
+
+#[derive(serde::Deserialize)]
+struct SlackSuccess<T> {
+    #[serde(rename = "ok", deserialize_with = "true_only")]
+    _ok: (),
+    #[serde(flatten)]
+    value: T,
+}
+
+#[derive(serde::Deserialize)]
+struct SlackFailure {
+    #[serde(rename = "ok", deserialize_with = "false_only")]
+    _ok: (),
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn true_only<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
+    if bool::deserialize(deserializer)? {
         Ok(())
     } else {
-        Err(v["error"].as_str().unwrap_or("slack api error").to_string())
+        Err(serde::de::Error::custom("expected ok=true"))
     }
 }
 
-/// Turn a Slack REST failure into a session outcome. Slack signals auth failures
-/// with HTTP 200 + `ok:false` and an `error` naming a bad/revoked/expired token;
-/// those are permanent, so stop re-dialing (like the IRC driver on a rejected
-/// password) rather than reconnecting forever. Anything else is transient.
+fn false_only<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
+    if bool::deserialize(deserializer)? {
+        Err(serde::de::Error::custom("expected ok=false"))
+    } else {
+        Ok(())
+    }
+}
+
+impl<T> SlackResponse<T> {
+    fn into_result(self) -> Result<T, String> {
+        match self {
+            Self::Success(response) => Ok(response.value),
+            Self::Failure(response) => {
+                Err(response.error.unwrap_or_else(|| "slack api error".into()))
+            }
+        }
+    }
+}
+
+async fn decode_slack_response<T: DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, String> {
+    response
+        .bounded_json::<SlackResponse<T>>()
+        .await?
+        .into_result()
+}
+
 fn slack_failure(context: &str, err: &str) -> super::SessionOutcome {
     const AUTH_ERRORS: &[&str] = &[
         "invalid_auth",
@@ -317,19 +363,20 @@ async fn open_socket(
     base: &str,
     app_token: &str,
 ) -> Result<String, String> {
-    let v: serde_json::Value = http
-        .post(format!("{base}/apps.connections.open"))
-        .header("Authorization", format!("Bearer {app_token}"))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .bounded_json()
-        .await?;
-    check_ok(&v)?;
-    v["url"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| "apps.connections.open had no url".to_string())
+    #[derive(serde::Deserialize)]
+    struct SocketOpen {
+        url: String,
+    }
+
+    decode_slack_response::<SocketOpen>(
+        http.post(format!("{base}/apps.connections.open"))
+            .header("Authorization", format!("Bearer {app_token}"))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
+    .map(|response| response.url)
 }
 
 async fn fetch_channel_name(
@@ -338,7 +385,16 @@ async fn fetch_channel_name(
     bot_token: &str,
     id: &str,
 ) -> Result<String, String> {
-    let v = slack_get_json(
+    #[derive(serde::Deserialize)]
+    struct ChannelInfo {
+        channel: SlackChannel,
+    }
+    #[derive(serde::Deserialize)]
+    struct SlackChannel {
+        name: String,
+    }
+
+    let response: ChannelInfo = slack_get_json(
         http,
         base,
         bot_token,
@@ -346,58 +402,67 @@ async fn fetch_channel_name(
         &[("channel", id)],
     )
     .await?;
-    v["channel"]["name"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| format!("conversations.info for {id} had no name"))
+    if response.channel.name.is_empty() {
+        Err(format!("conversations.info for {id} had an empty name"))
+    } else {
+        Ok(response.channel.name)
+    }
 }
 
-/// Call a Slack Web API GET method with the bearer token and return its JSON
-/// body, checking the `ok` flag. Shared by the `*.info` lookups so the
-/// request/error shape can't drift.
-async fn slack_get_json(
+async fn slack_get_json<T: DeserializeOwned>(
     http: &reqwest::Client,
     base: &str,
     token: &str,
     method: &str,
     query: &[(&str, &str)],
-) -> Result<serde_json::Value, String> {
-    let v: serde_json::Value = http
-        .get(format!("{base}/{method}"))
-        .header("Authorization", format!("Bearer {token}"))
-        .query(query)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .bounded_json()
-        .await?;
-    check_ok(&v)?;
-    Ok(v)
+) -> Result<T, String> {
+    decode_slack_response(
+        http.get(format!("{base}/{method}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .query(query)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?,
+    )
+    .await
 }
 
-/// Resolve a Slack user id (`U12345678`) to a human display name via
-/// `users.info`. The `message` event carries only the opaque id, so without
-/// this every Slack message on IRC would come from a nick like `U12345678`
-/// instead of the sender's actual name. Prefers the display name, then the
-/// real name, then the handle.
 async fn fetch_user_name(
     http: &reqwest::Client,
     base: &str,
     bot_token: &str,
     id: &str,
 ) -> Result<String, String> {
-    let v = slack_get_json(http, base, bot_token, "users.info", &[("user", id)]).await?;
-    let u = &v["user"];
-    ["profile.display_name", "profile.real_name"]
-        .iter()
-        .filter_map(|path| {
-            let (a, b) = path.split_once('.').unwrap();
-            u[a][b].as_str().filter(|s| !s.is_empty())
-        })
-        .next()
-        .or_else(|| u["name"].as_str())
-        .map(str::to_string)
-        .ok_or_else(|| format!("users.info for {id} had no name"))
+    #[derive(serde::Deserialize)]
+    struct UserInfo {
+        user: SlackUser,
+    }
+    #[derive(serde::Deserialize)]
+    struct SlackUser {
+        #[serde(default)]
+        profile: SlackProfile,
+        #[serde(default)]
+        name: Option<String>,
+    }
+    #[derive(Default, serde::Deserialize)]
+    struct SlackProfile {
+        #[serde(default)]
+        display_name: Option<String>,
+        #[serde(default)]
+        real_name: Option<String>,
+    }
+
+    let response: UserInfo =
+        slack_get_json(http, base, bot_token, "users.info", &[("user", id)]).await?;
+    [
+        response.user.profile.display_name,
+        response.user.profile.real_name,
+        response.user.name,
+    ]
+    .into_iter()
+    .flatten()
+    .find(|name| !name.is_empty())
+    .ok_or_else(|| format!("users.info for {id} had no name"))
 }
 
 async fn post_message(
@@ -407,15 +472,24 @@ async fn post_message(
     channel_id: &str,
     text: &str,
 ) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct PostMessage<'a> {
+        channel: &'a str,
+        text: &'a str,
+    }
+
     let req = http
         .post(format!("{base}/chat.postMessage"))
         .header("Authorization", format!("Bearer {bot_token}"))
-        .json(&serde_json::json!({ "channel": channel_id, "text": text }));
-    // Checked send catches a transport error or non-2xx (e.g. a 429/5xx whose
-    // body isn't the usual JSON); `check_ok` then catches Slack's in-body
-    // `ok:false` on an otherwise-200 response.
-    let v: serde_json::Value = super::bridge_send(req).await?.bounded_json().await?;
-    check_ok(&v)
+        .json(&PostMessage {
+            channel: channel_id,
+            text,
+        });
+    #[derive(serde::Deserialize)]
+    struct Accepted {}
+
+    decode_slack_response::<Accepted>(super::bridge_send(req).await?).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -491,12 +565,28 @@ mod tests {
     }
 
     #[test]
-    fn ok_contract() {
-        assert!(check_ok(&serde_json::json!({ "ok": true })).is_ok());
+    fn response_contract() {
+        #[derive(serde::Deserialize, PartialEq, Debug)]
+        struct Payload {
+            value: String,
+        }
+        let parsed: SlackResponse<Payload> = serde_json::from_value(serde_json::json!({
+            "ok": true,
+            "value": "present"
+        }))
+        .expect("success response");
         assert_eq!(
-            check_ok(&serde_json::json!({ "ok": false, "error": "not_authed" })),
-            Err("not_authed".to_string())
+            parsed.into_result(),
+            Ok(Payload {
+                value: "present".into()
+            })
         );
+        let parsed: SlackResponse<Payload> = serde_json::from_value(serde_json::json!({
+            "ok": false,
+            "error": "not_authed"
+        }))
+        .expect("failure response");
+        assert_eq!(parsed.into_result(), Err("not_authed".to_string()));
     }
 
     #[test]

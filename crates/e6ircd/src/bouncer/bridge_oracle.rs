@@ -1,9 +1,4 @@
-//! In-process protocol oracle for the Discord and Slack driver tests.
-//!
-//! It implements only the provider messages the production sessions consume,
-//! but those messages cross real HTTP and WebSocket sockets. Keeping the mock
-//! transport here gives both drivers one oracle instead of two drifting piles
-//! of ad-hoc server code.
+//! In-process Discord and Slack protocol oracle.
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -20,16 +15,52 @@ pub enum Provider {
 
 #[derive(Debug)]
 pub enum OracleEvent {
-    DiscordIdentify(serde_json::Value),
+    DiscordIdentify(DiscordIdentify),
     DiscordPost {
         authorization: String,
-        body: serde_json::Value,
+        body: DiscordPost,
     },
-    SlackAck(serde_json::Value),
+    SlackAck(SlackAck),
     SlackPost {
         authorization: String,
-        body: serde_json::Value,
+        body: SlackPost,
     },
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct DiscordIdentify {
+    op: u8,
+    d: DiscordIdentifyData,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DiscordIdentifyData {
+    token: String,
+    intents: u64,
+    properties: DiscordIdentifyProperties,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DiscordIdentifyProperties {
+    os: String,
+    browser: String,
+    device: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct DiscordPost {
+    content: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct SlackAck {
+    envelope_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct SlackPost {
+    channel: String,
+    text: String,
 }
 
 #[derive(Clone)]
@@ -85,10 +116,6 @@ pub async fn start(provider: Provider) -> Oracle {
     }
 }
 
-/// Assert the transport-independent lifecycle plus each provider's exact
-/// authentication, inbound mapping, outbound request, and clean shutdown.
-/// Keeping this orchestration here makes the two bridge tests differ only in
-/// how they construct their real production session.
 pub async fn verify_round_trip(
     provider: Provider,
     handle: super::NetworkHandle,
@@ -101,8 +128,12 @@ pub async fn verify_round_trip(
         let OracleEvent::DiscordIdentify(identify) = identify else {
             panic!("first oracle event was not Discord IDENTIFY: {identify:?}");
         };
-        assert_eq!(identify["d"]["token"], "discord-token");
-        assert_eq!(identify["d"]["intents"], (1 << 0) | (1 << 9) | (1 << 15));
+        assert_eq!(identify.op, 2);
+        assert_eq!(identify.d.token, "discord-token");
+        assert_eq!(identify.d.intents, (1 << 0) | (1 << 9) | (1 << 15));
+        assert_eq!(identify.d.properties.os, "linux");
+        assert_eq!(identify.d.properties.browser, "e6irc");
+        assert_eq!(identify.d.properties.device, "e6irc");
     }
 
     assert_eq!(
@@ -125,7 +156,7 @@ pub async fn verify_round_trip(
         let OracleEvent::SlackAck(ack) = ack else {
             panic!("first oracle event was not a Slack ACK: {ack:?}");
         };
-        assert_eq!(ack["envelope_id"], "env-1");
+        assert_eq!(ack.envelope_id, "env-1");
     }
 
     let expected_line = match provider {
@@ -155,7 +186,7 @@ pub async fn verify_round_trip(
             },
         ) => {
             assert_eq!(authorization, "Bot discord-token");
-            assert_eq!(body["content"], "hello from IRC");
+            assert_eq!(body.content, "hello from IRC");
         }
         (
             Provider::Slack,
@@ -165,8 +196,8 @@ pub async fn verify_round_trip(
             },
         ) => {
             assert_eq!(authorization, "Bearer xoxb-token");
-            assert_eq!(body["channel"], "C1");
-            assert_eq!(body["text"], "hello from IRC");
+            assert_eq!(body.channel, "C1");
+            assert_eq!(body.text, "hello from IRC");
         }
         (_, event) => panic!("wrong provider REST event: {event:?}"),
     }
@@ -224,7 +255,7 @@ async fn discord_post(
     State(state): State<OracleState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    axum::Json(body): axum::Json<serde_json::Value>,
+    axum::Json(body): axum::Json<DiscordPost>,
 ) -> impl IntoResponse {
     if !matches!(state.provider, Provider::Discord) || id != "42" {
         return StatusCode::NOT_FOUND;
@@ -239,8 +270,6 @@ async fn discord_post(
     StatusCode::NO_CONTENT
 }
 
-/// The Slack oracle's request gate: right provider, right query value, right
-/// bot bearer — or the Slack-shaped auth failure.
 fn slack_gate(
     state: &OracleState,
     headers: &HeaderMap,
@@ -303,7 +332,7 @@ async fn slack_open(State(state): State<OracleState>, headers: HeaderMap) -> imp
 async fn slack_post(
     State(state): State<OracleState>,
     headers: HeaderMap,
-    axum::Json(body): axum::Json<serde_json::Value>,
+    axum::Json(body): axum::Json<SlackPost>,
 ) -> impl IntoResponse {
     if !matches!(state.provider, Provider::Slack) {
         return axum::Json(serde_json::json!({ "ok": false, "error": "wrong_provider" }));
@@ -338,9 +367,8 @@ async fn drive_websocket(state: OracleState, mut socket: WebSocket) {
                 let Some(Ok(Message::Text(text))) = socket.recv().await else {
                     return;
                 };
-                let frame: serde_json::Value =
-                    serde_json::from_str(&text).expect("discord client frame");
-                if frame["op"] == 2 {
+                let frame: DiscordIdentify = serde_json::from_str(&text).expect("discord IDENTIFY");
+                if frame.op == 2 {
                     state
                         .events
                         .send(OracleEvent::DiscordIdentify(frame))
