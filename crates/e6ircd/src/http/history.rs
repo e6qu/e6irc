@@ -2,9 +2,11 @@
 
 use super::*;
 
-// ---- history ------------------------------------------------------------
+const DEFAULT_HISTORY_PAGE_SIZE: usize = 50;
+const MAX_HISTORY_PAGE_SIZE: usize = 500;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct HistoryParams {
     pub(super) target: String,
     #[serde(default)]
@@ -15,35 +17,66 @@ pub(super) struct HistoryParams {
     pub(super) limit: Option<usize>,
 }
 
-/// Paged history for the authenticated account.
-///
-/// For a **channel** target this sees exactly the IRC path's history. For a
-/// **direct-message** target the correspondent is addressed by the casefolded
-/// name as given — which matches the IRC path only when that name equals the
-/// correspondent's stored identity (their account, or, for an unauthenticated
-/// correspondent, a `~`-prefixed nick). The HTTP layer has no live session
-/// state, so it cannot resolve a current nick to the account it was speaking
-/// under; a DM whose correspondent's nick differs from their account name (or
-/// who was unauthenticated) reads empty here. This is a scope limit of the REST
-/// endpoint, not a divergence in what is stored.
+#[derive(Clone, Copy)]
+struct HistoryPageSize(usize);
+
+impl HistoryPageSize {
+    fn parse(value: Option<usize>) -> Result<Self, &'static str> {
+        let value = value.unwrap_or(DEFAULT_HISTORY_PAGE_SIZE);
+        if !(1..=MAX_HISTORY_PAGE_SIZE).contains(&value) {
+            return Err("limit must be between 1 and 500");
+        }
+        Ok(Self(value))
+    }
+
+    fn get(self) -> usize {
+        self.0
+    }
+}
+
+fn parse_history_query(params: &HistoryParams) -> Result<crate::core::HistoryQuery, &'static str> {
+    if params.target.is_empty() {
+        return Err("target must not be empty");
+    }
+    let limit = HistoryPageSize::parse(params.limit)?.get();
+    match (&params.before, &params.after) {
+        (Some(_), Some(_)) => Err("before and after are mutually exclusive"),
+        (Some(ts), None) => e6irc_proto::time::parse_server_time_millis(ts)
+            .map(|before_ts| crate::core::HistoryQuery::Before { before_ts, limit })
+            .ok_or("invalid before timestamp"),
+        (None, Some(ts)) => e6irc_proto::time::parse_server_time_millis(ts)
+            .map(|after_ts| crate::core::HistoryQuery::After { after_ts, limit })
+            .ok_or("invalid after timestamp"),
+        (None, None) => Ok(crate::core::HistoryQuery::Latest { limit }),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct HistoryMessage {
+    msgid: String,
+    time: String,
+    from: String,
+    kind: String,
+    body: String,
+}
+
+#[derive(serde::Serialize)]
+struct HistoryResponse {
+    target: String,
+    messages: Vec<HistoryMessage>,
+}
 pub(super) async fn history(
     State(state): State<Arc<AppState>>,
     Authenticated(account): Authenticated,
     Query(params): Query<HistoryParams>,
 ) -> Response {
     let pool = pool_of(&state);
-    // Authorize the target: without a view of live membership this endpoint
-    // must fail closed, so restrict it to channels the account has a
-    // registered relationship with (founder or access). Otherwise any account
-    // could read any channel's history, including secret (+s) ones.
+    let query = match parse_history_query(&params) {
+        Ok(query) => query,
+        Err(message) => return problem(StatusCode::BAD_REQUEST, message, None),
+    };
     let target_folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&params.target);
     let account_folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account);
-    // A channel needs an explicit authorization check. Anything else names a
-    // direct-message correspondent, and the conversation key is built *from the
-    // authenticated account* — so a caller can only ever address a conversation
-    // it is part of, and no check is needed because none can be bypassed. A
-    // caller passing a raw conversation key gets a key derived from it in turn,
-    // which matches nothing.
     let target_folded = if target_folded.starts_with('#') {
         match crate::db::account_may_read_channel(pool, &target_folded, &account_folded).await {
             Ok(true) => target_folded,
@@ -66,23 +99,8 @@ pub(super) async fn history(
     } else {
         crate::core::dm_conversation_key(&account_folded, &target_folded).0
     };
-    let limit = params.limit.unwrap_or(50).min(500);
-    let query = match (&params.before, &params.after) {
-        (Some(ts), _) => match e6irc_proto::time::parse_server_time_millis(ts) {
-            Some(before_ts) => crate::core::HistoryQuery::Before { before_ts, limit },
-            None => return problem(StatusCode::BAD_REQUEST, "Invalid 'before' timestamp", None),
-        },
-        (None, Some(ts)) => match e6irc_proto::time::parse_server_time_millis(ts) {
-            Some(after_ts) => crate::core::HistoryQuery::After { after_ts, limit },
-            None => return problem(StatusCode::BAD_REQUEST, "Invalid 'after' timestamp", None),
-        },
-        (None, None) => crate::core::HistoryQuery::Latest { limit },
-    };
     let rows = match crate::db::query_history(pool, &target_folded, query).await {
         Ok(rows) => rows,
-        // A store fault is a 503, never a 200 with an empty list — the rest of
-        // this API fails loud on DB errors, and "no history" must not be
-        // synthesized from a transient failure.
         Err(e) => {
             eprintln!("http: history query failed: {e}");
             return problem(
@@ -92,23 +110,60 @@ pub(super) async fn history(
             );
         }
     };
-    let messages: Vec<serde_json::Value> = rows
+    let messages = rows
         .into_iter()
-        .map(|r| {
-            serde_json::json!({
-                "msgid": r.msgid,
-                // `HistoryRow::ts` is already milliseconds; scaling it again
-                // put every REST timestamp a thousand-fold into the future.
-                "time": e6irc_proto::time::server_time(r.ts),
-                "from": r.sender_prefix,
-                "kind": r.kind.wire(),
-                "body": r.body,
-            })
+        .map(|row| HistoryMessage {
+            msgid: row.msgid,
+            time: e6irc_proto::time::server_time(row.ts),
+            from: row.sender_prefix,
+            kind: row.kind.wire().into(),
+            body: row.body,
         })
         .collect();
-    (
-        [(header::CONTENT_TYPE, "application/json")],
-        serde_json::json!({ "target": params.target, "messages": messages }).to_string(),
-    )
-        .into_response()
+    axum::Json(HistoryResponse {
+        target: params.target,
+        messages,
+    })
+    .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(limit: Option<usize>, before: Option<&str>, after: Option<&str>) -> HistoryParams {
+        HistoryParams {
+            target: "#channel".into(),
+            before: before.map(str::to_owned),
+            after: after.map(str::to_owned),
+            limit,
+        }
+    }
+
+    #[test]
+    fn history_page_window_is_closed() {
+        assert!(matches!(
+            parse_history_query(&params(None, None, None)),
+            Ok(crate::core::HistoryQuery::Latest { limit: 50 })
+        ));
+        assert!(parse_history_query(&params(Some(0), None, None)).is_err());
+        assert!(parse_history_query(&params(Some(501), None, None)).is_err());
+        assert!(
+            parse_history_query(&HistoryParams {
+                target: String::new(),
+                before: None,
+                after: None,
+                limit: None,
+            })
+            .is_err()
+        );
+        assert!(
+            parse_history_query(&params(
+                Some(1),
+                Some("2026-01-01T00:00:00.000Z"),
+                Some("2026-01-02T00:00:00.000Z"),
+            ))
+            .is_err()
+        );
+    }
 }

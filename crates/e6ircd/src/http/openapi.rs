@@ -34,6 +34,25 @@ fn document() -> serde_json::Value {
         "type": "object", "additionalProperties": false, "required": ["message"],
         "properties": { "message": { "type": "string" } }
     });
+    let history_response = json_response(
+        "paged message history",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false,
+            "required": ["target", "messages"],
+            "properties": {
+                "target": { "type": "string" },
+                "messages": { "type": "array", "items": {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["msgid", "time", "from", "kind", "body"],
+                    "properties": {
+                        "msgid": { "type": "string" }, "time": { "type": "string", "format": "date-time" },
+                        "from": { "type": "string" }, "kind": { "type": "string", "enum": ["PRIVMSG", "NOTICE"] },
+                        "body": { "type": "string" }
+                    }
+                }}
+            }
+        }),
+    );
     let app_password_created_response = json_response_status(
         201,
         "the app password, shown once",
@@ -1430,7 +1449,20 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/history": {
                 "get": { "summary": "Paged message history for the account", "security": authenticated,
-                    "responses": ok_json }
+                    "parameters": [
+                        { "name": "target", "in": "query", "required": true,
+                            "schema": { "type": "string", "minLength": 1 } },
+                        { "name": "before", "in": "query", "required": false,
+                            "schema": { "type": "string", "format": "date-time" } },
+                        { "name": "after", "in": "query", "required": false,
+                            "schema": { "type": "string", "format": "date-time" } },
+                        { "name": "limit", "in": "query", "required": false,
+                            "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 } }
+                    ],
+                    "responses": { "200": history_response["200"],
+                        "400": { "description": "invalid window, timestamp, or limit" },
+                        "403": { "description": "not allowed to read this channel" },
+                        "503": { "description": "database unavailable" } } }
             },
             "/api/v1/admin/accounts": {
                 "get": { "summary": "Filter and page administrator-safe account posture (admin only)",

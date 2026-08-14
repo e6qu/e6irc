@@ -627,11 +627,25 @@ pub(super) struct BackchannelLogoutClaims {
     #[serde(default)]
     pub(super) exp: Option<i64>,
     pub(super) jti: String,
-    pub(super) events: HashMap<String, serde_json::Value>,
+    pub(super) events: HashMap<String, serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
     pub(super) azp: Option<String>,
     #[serde(default)]
-    pub(super) nonce: Option<serde_json::Value>,
+    pub(super) nonce: ClaimPresence,
+}
+
+#[derive(Debug, Default)]
+pub(super) enum ClaimPresence {
+    #[default]
+    Missing,
+    Present,
+}
+
+impl<'de> Deserialize<'de> for ClaimPresence {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(Self::Present)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -729,18 +743,13 @@ pub(super) fn verify_logout_token_with_metadata(
         // that merely also lists our client_id.
         || claims.azp.as_deref().is_some_and(|azp| azp != provider.client_id)
         || claims.jti.trim().is_empty()
-        || claims.nonce.is_some()
+        || matches!(claims.nonce, ClaimPresence::Present)
         || (!has_subject && !has_sid)
         || claims.iat < now - 600
         || claims.iat > now + 60
         || claims.exp.is_some_and(|exp| exp <= now)
         || claims.events.len() != 1
-        // The backchannel-logout event's value is a JSON object that MAY
-        // carry data — require it present and an object, not exactly empty.
-        || !claims
-            .events
-            .get(BACKCHANNEL_LOGOUT_EVENT)
-            .is_some_and(serde_json::Value::is_object)
+        || !claims.events.contains_key(BACKCHANNEL_LOGOUT_EVENT)
     {
         return Err("logout token claims are invalid".into());
     }

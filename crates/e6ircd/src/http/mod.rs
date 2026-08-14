@@ -4087,6 +4087,17 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
             .is_ok(),
             "non-empty event object must be accepted"
         );
+        assert!(
+            verify(base(serde_json::json!({
+                "events": { BACKCHANNEL_LOGOUT_EVENT: "not an object" }
+            })))
+            .is_err(),
+            "event data must be an object"
+        );
+        assert!(
+            verify(base(serde_json::json!({"nonce": null}))).is_err(),
+            "a present nonce is forbidden, including null"
+        );
 
         // A7: a present azp must name this client.
         assert!(

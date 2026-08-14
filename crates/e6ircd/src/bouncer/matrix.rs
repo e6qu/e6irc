@@ -1,19 +1,12 @@
-//! The `matrix` bridge driver (DESIGN §10.5): a [`NetworkDriver`] that
-//! presents a Matrix homeserver as a BNC network. It logs in over the
-//! Matrix client-server API, joins the configured rooms, and bridges
-//! `m.room.message` events to IRC PRIVMSG lines and back. All of its HTTP
-//! (reqwest) lives behind the `matrix` feature.
-//!
-//! Mapping: a room alias `#name:server` ⇄ IRC channel `#name`; a Matrix
-//! sender `@user:server` ⇄ nick `user`; `m.text` message body ⇄ PRIVMSG
-//! text. Non-text events and the bridge user's own echoes are dropped.
+//! Matrix client-server bridge.
 
 use super::BoundedJson;
 use std::collections::HashMap;
 
+use serde::Serialize;
+
 use super::{ConnectionEvent, DriverEnds, NetworkDriver, NetworkHandle};
 
-/// Static configuration for one bridged Matrix homeserver.
 #[derive(Debug, Clone)]
 pub struct MatrixConfig {
     /// Homeserver base URL, e.g. `http://127.0.0.1:16167`.
@@ -44,22 +37,16 @@ impl NetworkDriver for MatrixDriver {
     super::bridge_start!();
 }
 
-/// Session state after login.
 struct Session {
     http: reqwest::Client,
     base: String,
     token: String,
     user_id: String,
-    /// Bridged channel name (`#name`) → Matrix room id.
     channel_to_room: HashMap<String, String>,
-    /// Matrix room id → channel name.
     room_to_channel: HashMap<String, String>,
     txn: u64,
 }
 
-// Always-on: a transient failure reconnects with backoff rather than
-// permanently killing the network (which would silently drop every later
-// upstream message). Only a dropped handle stops the driver.
 super::bridge_run!(MatrixConfig);
 
 async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
@@ -69,7 +56,6 @@ async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::Se
     };
     ends.emit(ConnectionEvent::Connected);
 
-    // Initial sync to get a stream position without replaying all history.
     let mut since = match sync(&session, None).await {
         Ok((next, _)) => next,
         Err(e) => {
@@ -84,8 +70,6 @@ async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::Se
                 Ok((next, messages)) => {
                     since = next;
                     for m in messages {
-                        // Skip our own echoes (the attached client already
-                        // saw what it sent).
                         if m.sender == session.user_id {
                             continue;
                         }
@@ -116,31 +100,19 @@ async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::Se
     }
 }
 
-/// Log in and join the configured rooms.
 async fn connect(config: &MatrixConfig) -> Result<Session, super::ConnectFail> {
-    // Vets every resolved IP and refuses redirects (SSRF control; see
-    // `bridge_http_client`). The 60s timeout is longer than the /sync long-poll
-    // (20s) so a black-holed connection fails the request — otherwise the future
-    // never resolves, `session_once` never returns, and the reconnect loop never
-    // runs.
     let http =
         super::bridge_http_client(std::time::Duration::from_secs(60)).map_err(|e| e.to_string())?;
     let base = config.homeserver.trim_end_matches('/').to_string();
 
     let resp = http
         .post(format!("{base}/_matrix/client/v3/login"))
-        .json(&serde_json::json!({
-            "type": "m.login.password",
-            "identifier": { "type": "m.id.user", "user": config.user },
-            "password": config.password,
-        }))
+        .json(&LoginRequest::password(&config.user, &config.password))
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    // A 401/403 here is a rejected password/user — permanent, so surface it as an
-    // auth rejection that stops the reconnect loop rather than a transient drop.
     let status = resp.status();
-    let login: serde_json::Value = match resp.error_for_status() {
+    let login: LoginResponse = match resp.error_for_status() {
         Ok(r) => r.bounded_json().await?,
         Err(e) => {
             let msg = format!("login rejected: {e}");
@@ -151,44 +123,28 @@ async fn connect(config: &MatrixConfig) -> Result<Session, super::ConnectFail> {
             });
         }
     };
-    let token = login["access_token"]
-        .as_str()
-        .ok_or("no access_token in login response")?
-        .to_string();
-    // Own-echo suppression keys on this id (`m.sender == user_id`); an empty
-    // fallback would silently defeat it and loop our own messages back, so a
-    // login response without a user_id is a hard failure.
-    let user_id = login["user_id"]
-        .as_str()
-        .ok_or("no user_id in login response")?
-        .to_string();
+    if login.access_token.is_empty() || login.user_id.is_empty() {
+        return Err(super::ConnectFail::Transient(
+            "login response had an empty access token or user id".into(),
+        ));
+    }
 
     let mut session = Session {
         http,
         base,
-        token,
-        user_id,
+        token: login.access_token,
+        user_id: login.user_id,
         channel_to_room: HashMap::new(),
         room_to_channel: HashMap::new(),
         txn: 0,
     };
     for alias in &config.rooms {
         let channel = alias_to_channel(alias);
-        // The alias comes from config (trusted), but it lands in a PRIVMSG
-        // middle parameter, so refuse one that isn't a legal channel — a space
-        // or `:` in it would forge extra params. Fail loudly, as the Slack and
-        // Discord bridges already do for their fetched names.
         if !crate::sanitize::valid_channel_name(&channel) {
             return Err(super::ConnectFail::Transient(format!(
                 "matrix: room alias {alias:?} maps to an unsafe IRC channel {channel:?}"
             )));
         }
-        // Two rooms that derive the same IRC channel name — *under the
-        // casemapping* — would silently overwrite each other in the map:
-        // outbound reaching only one room, inbound from both collapsing under one
-        // channel. The forward map is keyed by the folded name so a case variant
-        // (`#General` vs `#general`) is caught by this guard and routes
-        // correctly; the reverse map keeps the display casing.
         let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&channel);
         if session.channel_to_room.contains_key(&folded) {
             return Err(super::ConnectFail::Transient(format!(
@@ -204,11 +160,11 @@ async fn connect(config: &MatrixConfig) -> Result<Session, super::ConnectFail> {
 
 async fn join_room(s: &Session, alias: &str) -> Result<String, String> {
     let encoded = urlencode(alias);
-    let resp: serde_json::Value = s
+    let response: JoinResponse = s
         .http
         .post(format!("{}/_matrix/client/v3/join/{encoded}", s.base))
         .bearer_auth(&s.token)
-        .json(&serde_json::json!({}))
+        .json(&EmptyObject {})
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -216,13 +172,70 @@ async fn join_room(s: &Session, alias: &str) -> Result<String, String> {
         .map_err(|e| format!("join {alias} rejected: {e}"))?
         .bounded_json()
         .await?;
-    resp["room_id"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| format!("no room_id joining {alias}"))
+    if response.room_id.is_empty() {
+        Err(format!("join {alias} returned an empty room id"))
+    } else {
+        Ok(response.room_id)
+    }
 }
 
-/// One incoming Matrix text message, mapped to bridge terms.
+#[derive(Serialize)]
+struct LoginRequest<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    identifier: LoginIdentifier<'a>,
+    password: &'a str,
+}
+
+impl<'a> LoginRequest<'a> {
+    fn password(user: &'a str, password: &'a str) -> Self {
+        Self {
+            kind: "m.login.password",
+            identifier: LoginIdentifier {
+                kind: "m.id.user",
+                user,
+            },
+            password,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct LoginIdentifier<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    user: &'a str,
+}
+
+#[derive(serde::Deserialize)]
+struct LoginResponse {
+    access_token: String,
+    user_id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct JoinResponse {
+    room_id: String,
+}
+
+#[derive(Serialize)]
+struct EmptyObject {}
+
+#[derive(Serialize)]
+struct MatrixMessageRequest<'a> {
+    msgtype: &'static str,
+    body: &'a str,
+}
+
+impl<'a> MatrixMessageRequest<'a> {
+    fn text(body: &'a str) -> Self {
+        Self {
+            msgtype: "m.text",
+            body,
+        }
+    }
+}
+
 struct Incoming {
     room_id: String,
     sender: String,
@@ -249,24 +262,35 @@ struct JoinedRoom {
 
 #[derive(serde::Deserialize)]
 struct Timeline {
-    events: Vec<serde_json::Value>,
+    events: Vec<TimelineEvent>,
 }
 
 #[derive(serde::Deserialize)]
-struct EventHeader {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default)]
-    sender: Option<String>,
-    #[serde(default)]
-    content: serde_json::Value,
+#[serde(tag = "type")]
+enum TimelineEvent {
+    #[serde(rename = "m.room.message")]
+    Message {
+        #[serde(default)]
+        sender: Option<String>,
+        content: MessageContent,
+    },
+    #[serde(other)]
+    Other,
 }
 
 #[derive(serde::Deserialize)]
 struct MessageContent {
-    msgtype: String,
+    msgtype: MatrixMessageType,
     #[serde(default)]
     body: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+enum MatrixMessageType {
+    #[serde(rename = "m.text")]
+    Text,
+    #[serde(other)]
+    Other,
 }
 
 fn collect_sync_messages(body: SyncResponse) -> Result<(String, Vec<Incoming>), String> {
@@ -276,21 +300,15 @@ fn collect_sync_messages(body: SyncResponse) -> Result<(String, Vec<Incoming>), 
     let mut messages = Vec::new();
     for (room_id, room) in body.rooms.join {
         for event in room.timeline.events {
-            let header: EventHeader = serde_json::from_value(event)
-                .map_err(|e| format!("timeline event in {room_id}: {e}"))?;
-            if header.kind != "m.room.message" {
+            let TimelineEvent::Message { sender, content } = event else {
                 continue;
-            }
-            let content: MessageContent = serde_json::from_value(header.content)
-                .map_err(|e| format!("m.room.message in {room_id}: {e}"))?;
-            if content.msgtype != "m.text" {
+            };
+            if !matches!(content.msgtype, MatrixMessageType::Text) {
                 continue;
             }
             messages.push(Incoming {
                 room_id: room_id.clone(),
-                sender: header
-                    .sender
-                    .ok_or_else(|| format!("m.text event in {room_id} had no sender"))?,
+                sender: sender.ok_or_else(|| format!("m.text event in {room_id} had no sender"))?,
                 body: content
                     .body
                     .ok_or_else(|| format!("m.text event in {room_id} had no body"))?,
@@ -300,7 +318,6 @@ fn collect_sync_messages(body: SyncResponse) -> Result<(String, Vec<Incoming>), 
     Ok((body.next_batch, messages))
 }
 
-/// Long-poll `/sync`; returns the next batch token and any text messages.
 async fn sync(s: &Session, since: Option<&str>) -> Result<(String, Vec<Incoming>), String> {
     let timeout = if since.is_some() { 20000 } else { 0 };
     let mut req = s
@@ -315,18 +332,9 @@ async fn sync(s: &Session, since: Option<&str>) -> Result<(String, Vec<Incoming>
     collect_sync_messages(body)
 }
 
-/// Deliver a downstream PRIVMSG to Matrix. Returns `Some(target)` when a
-/// PRIVMSG could not be delivered because no bridged room maps to it, so the
-/// Relay one downstream command line to Matrix. A comma list resolves to several
-/// targets; each is delivered and its outcome surfaced independently through the
-/// shared [`super::relay_routed`], so an unmapped target or a failed send is
-/// never dropped — not even when it is one of several on the line.
 async fn handle_command(s: &mut Session, ends: &super::DriverEnds, line: &str) {
     let routed = super::route_privmsg(line, &s.channel_to_room);
     super::relay_routed(ends, routed, "Matrix", "room", |room_id, text| {
-        // Build the request synchronously (touching `s.txn`/`s.http`); only the
-        // owned request moves into the returned future, so nothing borrows `s`
-        // across the await.
         s.txn += 1;
         let txn = s.txn;
         let url = format!(
@@ -338,15 +346,12 @@ async fn handle_command(s: &mut Session, ends: &super::DriverEnds, line: &str) {
             .http
             .put(url)
             .bearer_auth(&s.token)
-            .json(&serde_json::json!({ "msgtype": "m.text", "body": text }));
-        // The checked send: a 403 (bot no longer in the room), 429, or 5xx comes
-        // back as `Err`, not a delivered-looking `Ok(Response)`.
+            .json(&MatrixMessageRequest::text(&text));
         async move { super::bridge_send(req).await.map(|_| ()) }
     })
     .await;
 }
 
-/// `#name:server` → IRC channel `#name`.
 fn alias_to_channel(alias: &str) -> String {
     match alias.split_once(':') {
         Some((local, _)) => local.to_string(),
@@ -354,9 +359,6 @@ fn alias_to_channel(alias: &str) -> String {
     }
 }
 
-/// `@user:server` → `user`. The shared renderer reduces whatever this returns
-/// to a safe nick token; without the localpart the `@` and `:` of a full Matrix
-/// ID would survive as underscores and every bridged nick would change.
 fn matrix_localpart(sender: &str) -> &str {
     sender
         .strip_prefix('@')
@@ -364,7 +366,6 @@ fn matrix_localpart(sender: &str) -> &str {
         .unwrap_or(sender)
 }
 
-/// Percent-encode a path segment (room ids/aliases contain `!`, `#`, `:`).
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
