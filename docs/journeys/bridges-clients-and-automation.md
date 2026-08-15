@@ -90,7 +90,8 @@ or deliberately chooses anonymous IRC.
   and atomically saves the issued bearer token.
 - `e6irc api METHOD PATH` performs one bounded HTTP/HTTPS REST request. An
   explicit token, `E6IRC_API_TOKEN`, or the login cache supplies bearer
-  authentication; with no `--base`, the cached issuing origin is used.
+  authentication; with no `--base`, it uses the cached issuing origin or
+  fails if none exists.
 - IRC authentication is anonymous, paired SASL PLAIN, direct OAUTHBEARER, or
   OAUTHBEARER from that same cache.
 - IRC connections support plaintext or public-CA TLS with an explicit server

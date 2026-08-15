@@ -4,7 +4,7 @@
 //! counts deliveries. Reports connect rate and fan-out throughput.
 //!
 //! Usage:
-//!   e6irc-load [--addr host:port] [--clients N] [--channel #c]
+//!   e6irc-load --addr host:port [--clients N] [--channel #c]
 //!              [--burst K] [--tls]
 //!
 //! It exercises the exact paths the server's scale target stresses
@@ -120,11 +120,12 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, String> {
+    let mut addr = None;
     let mut clients = 100;
     let mut channels = 1;
     let mut burst = 10;
     let mut args = Args {
-        addr: "127.0.0.1:6667".to_string(),
+        addr: String::new(),
         workload: Workload::new(100, 1, 10).expect("default workload is valid"),
         channel: "#load".to_string(),
         tls: false,
@@ -140,9 +141,10 @@ fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, 
     while let Some(flag) = it.next() {
         match flag.as_str() {
             "--addr" => {
-                args.addr = it
-                    .next()
-                    .ok_or_else(|| "--addr needs a value".to_string())?
+                addr = Some(
+                    it.next()
+                        .ok_or_else(|| "--addr needs a value".to_string())?,
+                )
             }
             "--clients" => {
                 clients = parse_num(
@@ -227,6 +229,9 @@ fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, 
             other => return Err(format!("unknown argument: {other}")),
         }
     }
+    args.addr = addr
+        .filter(|addr: &String| !addr.trim().is_empty())
+        .ok_or_else(|| "--addr is required".to_string())?;
     args.workload = Workload::new(clients, channels, burst)?;
     if args.maximum_server_rss_per_connection_bytes.is_some() && args.server_pid.is_none() {
         return Err("--maximum-server-rss-per-connection-bytes requires --server-pid".to_string());
@@ -914,7 +919,12 @@ mod tests {
     use super::*;
 
     fn args(values: &[&str]) -> Result<Args, String> {
-        parse_args_from(values.iter().map(|value| (*value).to_owned()))
+        parse_args_from(
+            ["--addr", "irc.example:6697"]
+                .into_iter()
+                .chain(values.iter().copied())
+                .map(str::to_owned),
+        )
     }
 
     fn sample_report() -> CompletedRunReport {
@@ -950,6 +960,8 @@ mod tests {
 
     #[test]
     fn arguments_reject_vacuous_runs_and_invalid_thresholds() {
+        assert!(parse_args_from(Vec::new()).is_err());
+        assert!(parse_args_from(["--addr".into(), " ".into()]).is_err());
         assert!(args(&["--burst", "0"]).is_err());
         assert!(args(&["--clients", "8", "--channels", "8"]).is_err());
         assert!(args(&["--minimum-connect-rate", "0"]).is_err());
