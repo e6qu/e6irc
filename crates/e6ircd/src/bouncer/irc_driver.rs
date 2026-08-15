@@ -272,6 +272,7 @@ fn classify_registration(
     match result {
         Ok(Ok(nick)) => RegistrationResult::Ok(nick),
         Ok(Err(e)) if let Some(refusal) = e6irc_client::RegistrationRefusal::from_error(&e) => {
+            eprintln!("irc registration rejected: {e}");
             match refusal {
                 e6irc_client::RegistrationRefusal::NicknameInUse => RegistrationResult::NickInUse,
                 refusal => RegistrationResult::Rejected(refusal),
