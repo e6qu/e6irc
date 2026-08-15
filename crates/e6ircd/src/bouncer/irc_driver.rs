@@ -334,7 +334,11 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     // wedge the driver forever — that would starve the reconnect loop, the
     // same failure the Matrix driver's timeout guards against.
     let connect_fut = connect(config);
-    let mut conn = match tokio::time::timeout(Duration::from_secs(30), connect_fut).await {
+    let connected = tokio::select! {
+        _ = ends.shutdown_signalled() => return super::SessionOutcome::Stopped,
+        result = tokio::time::timeout(Duration::from_secs(30), connect_fut) => result,
+    };
+    let mut conn = match connected {
         Ok(Ok(c)) => c,
         Ok(Err(_)) => {
             let failure = if config.tls {
@@ -355,9 +359,11 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
             None => conn.register(&config.nick, &config.realname).await,
         }
     };
-    let mut current_nick = match classify_registration(
-        tokio::time::timeout(Duration::from_secs(30), register_fut).await,
-    ) {
+    let registration = tokio::select! {
+        _ = ends.shutdown_signalled() => return super::SessionOutcome::Stopped,
+        result = tokio::time::timeout(Duration::from_secs(30), register_fut) => result,
+    };
+    let mut current_nick = match classify_registration(registration) {
         RegistrationResult::NickInUse if config.sasl.is_none() => {
             // A lingering ghost of our own previous session (not yet timed out
             // upstream) holds the nick. Offer one replacement rather than
@@ -366,9 +372,11 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
             // nick is genuinely claimed elsewhere, and silently renaming would
             // mask that.
             let alt = format!("{}_", config.nick);
-            match into_outcome(classify_registration(
-                tokio::time::timeout(Duration::from_secs(30), conn.retry_nick(&alt)).await,
-            )) {
+            let retry = tokio::select! {
+                _ = ends.shutdown_signalled() => return super::SessionOutcome::Stopped,
+                result = tokio::time::timeout(Duration::from_secs(30), conn.retry_nick(&alt)) => result,
+            };
+            match into_outcome(classify_registration(retry)) {
                 Ok(nick) => nick,
                 Err(outcome) => return outcome,
             }
