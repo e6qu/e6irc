@@ -558,6 +558,8 @@ pub struct OidcProviderConfig {
     pub issuer_url: String,
     pub client_id: String,
     pub client_secret: String,
+    /// Claim used as the local account name.
+    pub account_claim: OidcAccountClaim,
     /// OAuth scopes to request in addition to `openid`. Defaults to
     /// `profile` + `email`; providers like Shauth also accept
     /// `offline_access`.
@@ -579,16 +581,21 @@ pub struct OidcProviderConfig {
     /// discovery cannot supply it: a provider that advertises several methods
     /// still rejects every one the client was not registered for. Shauth
     /// registers managed applications with `client_secret_post`.
-    #[serde(default)]
     pub token_endpoint_auth_method: TokenEndpointAuthMethod,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OidcAccountClaim {
+    PreferredUsername,
+    Email,
+}
+
 /// Client authentication methods e6irc supports at the token endpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenEndpointAuthMethod {
     /// HTTP Basic credentials, the OAuth 2.0 default.
-    #[default]
     ClientSecretBasic,
     /// Credentials in the request body, which Shauth's registrations require.
     ClientSecretPost,
@@ -2087,10 +2094,11 @@ mod tests {
                 issuer_url: issuer.into(),
                 client_id: "e6irc".into(),
                 client_secret: "secret".into(),
+                account_claim: OidcAccountClaim::PreferredUsername,
                 scopes: vec![],
                 allowed_email_domains: vec![],
                 end_session_endpoint: end_session.map(str::to_string),
-                token_endpoint_auth_method: Default::default(),
+                token_endpoint_auth_method: TokenEndpointAuthMethod::ClientSecretBasic,
             }],
             application_release_revision: Some("0123456789ab".into()),
             ..Config::default()
@@ -2177,10 +2185,11 @@ mod tests {
             issuer_url: "https://auth.example".into(), // same issuer
             client_id: "e6irc2".into(),
             client_secret: "secret2".into(),
+            account_claim: OidcAccountClaim::PreferredUsername,
             scopes: vec![],
             allowed_email_domains: vec![],
             end_session_endpoint: None,
-            token_endpoint_auth_method: Default::default(),
+            token_endpoint_auth_method: TokenEndpointAuthMethod::ClientSecretBasic,
         });
         assert!(
             config
@@ -2223,6 +2232,8 @@ name = "corp"
 issuer_url = "https://auth.example"
 client_id = "e6irc"
 client_secret = "secret"
+account_claim = "preferred_username"
+token_endpoint_auth_method = "client_secret_basic"
 allowed_email_domains = ["Example.COM", "subsidiary.example"]
 "#,
         )
@@ -2232,6 +2243,36 @@ allowed_email_domains = ["Example.COM", "subsidiary.example"]
             "example.com"
         );
         parsed.validate().expect("valid domain policy");
+
+        let missing_claim = toml::from_str::<Config>(
+            r#"
+[[oidc]]
+name = "corp"
+issuer_url = "https://auth.example"
+client_id = "e6irc"
+client_secret = "secret"
+token_endpoint_auth_method = "client_secret_basic"
+"#,
+        )
+        .expect_err("OIDC account claim is required");
+        assert!(missing_claim.to_string().contains("account_claim"));
+
+        let missing_token_auth = toml::from_str::<Config>(
+            r#"
+[[oidc]]
+name = "corp"
+issuer_url = "https://auth.example"
+client_id = "e6irc"
+client_secret = "secret"
+account_claim = "preferred_username"
+"#,
+        )
+        .expect_err("OIDC token authentication is required");
+        assert!(
+            missing_token_auth
+                .to_string()
+                .contains("token_endpoint_auth_method")
+        );
     }
 
     #[test]
@@ -2317,10 +2358,11 @@ allowed_email_domains = ["Example.COM", "subsidiary.example"]
                 issuer_url: "https://issuer.example".into(),
                 client_id: "cid".into(),
                 client_secret: key.seal("oidcsecret", crate::secret::CONFIG_CONTEXT),
+                account_claim: OidcAccountClaim::PreferredUsername,
                 scopes: vec![],
                 allowed_email_domains: vec![],
                 end_session_endpoint: None,
-                token_endpoint_auth_method: Default::default(),
+                token_endpoint_auth_method: TokenEndpointAuthMethod::ClientSecretBasic,
             }],
             secrets: secrets_at(&path),
             ..Config::default()

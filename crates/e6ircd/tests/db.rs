@@ -4245,10 +4245,11 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
         issuer_url: "https://issuer.example".into(),
         client_id: "e6irc".into(),
         client_secret: old.seal("oidc-secret", CONFIG_CONTEXT),
+        account_claim: e6ircd::config::OidcAccountClaim::PreferredUsername,
         scopes: vec!["openid".into()],
         allowed_email_domains: Vec::new(),
         end_session_endpoint: None,
-        token_endpoint_auth_method: Default::default(),
+        token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
     });
     managed.networks.push(NetworkEntry {
         name: "workspace".into(),

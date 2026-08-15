@@ -52,6 +52,37 @@ fn get(path: &str) -> String {
     format!("GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
 }
 
+async fn wait_http_ready(addr: std::net::SocketAddr) {
+    for _ in 0..200 {
+        let (status, _, _) = request(addr, &get("/readyz")).await;
+        if status == 200 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("HTTP server did not become ready");
+}
+
+async fn wait_irc_ready(addr: std::net::SocketAddr) {
+    static NEXT_NICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..20 {
+        let nick = format!(
+            "ready{}",
+            NEXT_NICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let mut client = e6irc_client::Connection::connect(&addr.to_string()).await?;
+            client.register(&nick, "readiness").await
+        })
+        .await;
+        if matches!(result, Ok(Ok(_))) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("IRC server did not become ready");
+}
+
 fn response_header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
     headers.lines().find_map(|line| {
         let (header, value) = line.split_once(':')?;
@@ -404,7 +435,7 @@ async fn app_password_requires_database() {
 use e6ircd::config::BncConfig;
 
 /// Start a throwaway plain e6ircd to act as an upstream network.
-async fn upstream_server() -> std::net::SocketAddr {
+async fn upstream_server() -> net::Running {
     let cfg = Config {
         server_name: "irc.up.example".into(),
         network_name: "Up".into(),
@@ -415,7 +446,7 @@ async fn upstream_server() -> std::net::SocketAddr {
         }],
         ..Config::default()
     };
-    net::start(cfg).await.expect("upstream start").addrs[0]
+    net::start(cfg).await.expect("upstream start")
 }
 
 async fn post_json(
@@ -463,7 +494,8 @@ async fn bnc_network_management_lifecycle() {
         .expect("token");
     drop(pool);
 
-    let up = upstream_server().await;
+    let upstream = upstream_server().await;
+    let up = upstream.addrs[0];
 
     let config = Config {
         server_name: "irc.mgmt.example".into(),
@@ -488,6 +520,7 @@ async fn bnc_network_management_lifecycle() {
     let running = net::start(config).await.expect("start");
     let http = running.http_addr.expect("http bound");
     let bnc = running.bnc_addr.expect("bnc bound");
+    wait_http_ready(http).await;
 
     // Qualifying a network uses the production resolver, transport, and IRC
     // registration path, but does not persist or start it.
@@ -670,9 +703,11 @@ async fn bnc_network_management_lifecycle() {
     let (status, _, body) = request(http, &patch(true)).await;
     assert_eq!(status, 200, "enable: {body}");
     let mut reconnected = false;
+    let mut latest_status = String::new();
     for _ in 0..30 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let (_, _, body) = request(http, &list_req).await;
+        latest_status = body.clone();
         let v: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(v["networks"][0]["enabled"], true, "{body}");
         if v["networks"][0]["connected"] == true {
@@ -680,7 +715,10 @@ async fn bnc_network_management_lifecycle() {
             break;
         }
     }
-    assert!(reconnected, "re-enabled driver never reconnected");
+    assert!(
+        reconnected,
+        "re-enabled driver never reconnected: {latest_status}"
+    );
 
     // delete it
     let del_req = format!(
@@ -1980,6 +2018,7 @@ async fn console_configuration_manages_every_credential_collection() {
     };
     let running = net::start(config).await.expect("start");
     let http = running.http_addr.expect("http");
+    wait_http_ready(http).await;
     let page_request = format!(
         "GET /console/configuration HTTP/1.1\r\nHost: t\r\n\
          Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
@@ -2028,9 +2067,20 @@ async fn console_configuration_manages_every_credential_collection() {
     );
     assert!(!body.contains(oper_secret), "{body}");
 
+    let missing_claim_body = r#"{"revision":2,"name":"incomplete","issuer_url":"https://id.example","client_id":"e6irc","client_secret":"secret","token_endpoint_auth_method":"client_secret_post"}"#;
+    let missing_claim_request = format!(
+        "POST /api/v1/admin/configuration/oidc-providers HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{missing_claim_body}",
+        missing_claim_body.len()
+    );
+    let (status, _, body) = request(http, &missing_claim_request).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("account_claim"), "{body}");
+
     let oidc_secret = "provider-secret-must-not-render";
     let oidc_body = format!(
-        r#"{{"revision":2,"name":"workforce","issuer_url":"https://id.example","client_id":"e6irc","client_secret":"{oidc_secret}","scopes":["openid","profile"],"allowed_email_domains":[],"end_session_endpoint":"https://id.example/logout","token_endpoint_auth_method":"client_secret_post"}}"#
+        r#"{{"revision":2,"name":"workforce","issuer_url":"https://id.example","client_id":"e6irc","client_secret":"{oidc_secret}","account_claim":"email","scopes":["openid","profile"],"allowed_email_domains":[],"end_session_endpoint":"https://id.example/logout","token_endpoint_auth_method":"client_secret_post"}}"#
     );
     let oidc_request = format!(
         "POST /api/v1/admin/configuration/oidc-providers HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
@@ -2079,6 +2129,10 @@ async fn console_configuration_manages_every_credential_collection() {
     assert_eq!(api["runtime"]["master_key_count"], 1);
     assert_eq!(api["settings"]["opers"][0]["password"], "");
     assert_eq!(api["settings"]["oidc_providers"][0]["client_secret"], "");
+    assert_eq!(
+        api["settings"]["oidc_providers"][0]["account_claim"],
+        "email"
+    );
     assert!(api["settings"]["networks"][0]["sasl_password"].is_null());
     assert!(api["settings"]["credentials_from_bootstrap"].is_boolean());
     let mut scalar_settings = api["settings"].clone();
@@ -2514,6 +2568,8 @@ async fn owned_channel_api_and_console_shell_are_scoped_and_csrf_protected() {
     };
     let running = net::start(config).await.expect("start");
     let http = running.http_addr.expect("http");
+    wait_http_ready(http).await;
+    wait_irc_ready(running.addrs[0]).await;
     let page_request = |session: &str| {
         format!(
             "GET /console/channels HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
@@ -6382,10 +6438,11 @@ async fn rp_initiated_logout_redirects_to_provider() {
             issuer_url: "https://auth.example".into(),
             client_id: "e6irc".into(),
             client_secret: "x".repeat(32),
+            account_claim: e6ircd::config::OidcAccountClaim::PreferredUsername,
             scopes: vec![],
             allowed_email_domains: vec![],
             end_session_endpoint: Some("https://auth.example/oauth2/sessions/logout".into()),
-            token_endpoint_auth_method: Default::default(),
+            token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
         }],
         application_release_revision: Some("0123456789ab".into()),
         ..Config::default()
@@ -6613,10 +6670,11 @@ async fn application_entry_starts_shauth_when_configured() {
             issuer_url: "https://auth.example".into(),
             client_id: "e6irc".into(),
             client_secret: "x".repeat(32),
+            account_claim: e6ircd::config::OidcAccountClaim::PreferredUsername,
             scopes: vec![],
             allowed_email_domains: vec![],
             end_session_endpoint: Some("https://auth.example/oauth2/sessions/logout".into()),
-            token_endpoint_auth_method: Default::default(),
+            token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
         }],
         application_release_revision: Some("0123456789ab".into()),
         ..Config::default()
@@ -6708,10 +6766,11 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
             issuer_url: "https://auth.example".into(),
             client_id: "e6irc".into(),
             client_secret: "x".repeat(32),
+            account_claim: e6ircd::config::OidcAccountClaim::PreferredUsername,
             scopes: vec![],
             allowed_email_domains: vec![],
             end_session_endpoint: None,
-            token_endpoint_auth_method: Default::default(),
+            token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
         }],
         application_release_revision: Some("0123456789ab".into()),
         ..Config::default()

@@ -1177,6 +1177,9 @@ pub struct NetworkHandle {
     /// and its decrypted SASL password would persist until the last client
     /// detached, so an operator could not sever a compromised network).
     shutdown: tokio::sync::watch::Sender<bool>,
+    /// Signals after the driver task has dropped its endpoint and released any
+    /// upstream transport.
+    stopped: tokio::sync::watch::Receiver<bool>,
     /// Detached buffer of recent upstream lines (newest last).
     buffer: std::sync::Arc<std::sync::Mutex<Buffer>>,
     /// Runtime state and per-network counters, shared with the driver endpoint.
@@ -1234,6 +1237,7 @@ pub enum NetworkFailure {
     RegistrationFailed,
     RegistrationRejected,
     InvalidNickname,
+    InvalidUsername,
     NicknameInUse,
     ServerPasswordRejected,
     NetworkBanned,
@@ -1263,6 +1267,7 @@ impl NetworkFailure {
             Self::RegistrationFailed => "registration_failed",
             Self::RegistrationRejected => "registration_rejected",
             Self::InvalidNickname => "invalid_nickname",
+            Self::InvalidUsername => "invalid_username",
             Self::NicknameInUse => "nickname_in_use",
             Self::ServerPasswordRejected => "server_password_rejected",
             Self::NetworkBanned => "network_banned",
@@ -1294,6 +1299,7 @@ impl NetworkFailure {
                 "The upstream rejected IRC registration; check the nickname and network policy."
             }
             Self::InvalidNickname => "The upstream rejected the configured nickname.",
+            Self::InvalidUsername => "The upstream rejected the IRC username.",
             Self::NicknameInUse => "The configured nickname is already in use.",
             Self::ServerPasswordRejected => "The upstream rejected the configured server password.",
             Self::NetworkBanned => "The upstream network banned this connection.",
@@ -1931,6 +1937,7 @@ impl NetworkHandle {
         // memory. Shared across all clients attached to this one network.
         let (command_tx, command_rx) = mpsc::channel(BNC_COMMAND_QUEUE);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (stopped_tx, stopped_rx) = tokio::sync::watch::channel(false);
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Buffer::new(buffer_cap)));
         let runtime = std::sync::Arc::new(NetworkRuntime::new());
         let telemetry = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -1941,6 +1948,7 @@ impl NetworkHandle {
             commands: command_tx,
             attach_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             shutdown: shutdown_tx,
+            stopped: stopped_rx,
             history: history.clone(),
             history_ready,
             buffer: buffer.clone(),
@@ -1955,6 +1963,7 @@ impl NetworkHandle {
             events,
             commands: command_rx,
             shutdown: shutdown_rx,
+            stopped: Some(stopped_tx),
             buffer,
             runtime,
             telemetry,
@@ -1968,6 +1977,17 @@ impl NetworkHandle {
     /// / `run_with_backoff` and tears down even while clients are attached.
     pub fn shutdown(&self) {
         self.shutdown.send_replace(true);
+    }
+
+    /// Stop the driver and wait until its upstream transport is released.
+    pub async fn shutdown_and_wait(&self) {
+        self.shutdown();
+        let mut stopped = self.stopped.clone();
+        while !*stopped.borrow() {
+            if stopped.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     pub(crate) fn set_telemetry(&self, telemetry: std::sync::Arc<crate::observability::Telemetry>) {
@@ -2045,6 +2065,7 @@ pub struct DriverEnds {
     /// observes it in `next_command` and `run_with_backoff` so it tears down
     /// promptly on removal, not when the last client happens to detach.
     shutdown: tokio::sync::watch::Receiver<bool>,
+    stopped: Option<tokio::sync::watch::Sender<bool>>,
     buffer: std::sync::Arc<std::sync::Mutex<Buffer>>,
     runtime: std::sync::Arc<NetworkRuntime>,
     telemetry:
@@ -2053,6 +2074,14 @@ pub struct DriverEnds {
     /// concurrent drivers de-correlate (see [`Backoff`]). Assigned once at
     /// construction from a process-wide counter.
     reconnect_seed: u64,
+}
+
+impl Drop for DriverEnds {
+    fn drop(&mut self) {
+        if let Some(stopped) = self.stopped.take() {
+            stopped.send_replace(true);
+        }
+    }
 }
 
 impl DriverEnds {
@@ -2244,6 +2273,7 @@ impl DriverEnds {
 const fn registration_failure(refusal: e6irc_client::RegistrationRefusal) -> NetworkFailure {
     match refusal {
         e6irc_client::RegistrationRefusal::InvalidNickname => NetworkFailure::InvalidNickname,
+        e6irc_client::RegistrationRefusal::InvalidUsername => NetworkFailure::InvalidUsername,
         e6irc_client::RegistrationRefusal::NicknameInUse => NetworkFailure::NicknameInUse,
         e6irc_client::RegistrationRefusal::ServerPasswordRejected => {
             NetworkFailure::ServerPasswordRejected

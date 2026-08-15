@@ -10151,7 +10151,7 @@ fn reason_bearing_relays_fit_the_wire_limit() {
     let long_nick = "n".repeat(16);
     let alice = s.connect(1);
     s.line(alice, &format!("NICK {long_nick}"));
-    s.line(alice, &format!("USER {} 0 * :real", "u".repeat(32)));
+    s.line(alice, &format!("USER {} 0 * :real", "u".repeat(10)));
     let reg = s.drain(alice);
     assert!(
         reg.iter().any(|l| l.contains(" 001 ")),
@@ -10230,19 +10230,17 @@ fn echoed_tokens_never_overflow_the_reply_explaining_them() {
 }
 
 #[test]
-fn username_is_sanitized_so_the_source_prefix_cannot_be_spoofed() {
-    // A username containing `@` or `!` would make the `nick!user@host` prefix
-    // ambiguous: a client reads `nick!a@evil@host` as host `evil@host`, letting
-    // a user spoof part of their apparent host. Such characters are dropped at
-    // intake, so the relayed prefix always has exactly one `!` and one `@`.
+fn invalid_username_is_rejected_without_rewriting_identity() {
     let mut s = TestServer::new();
     let alice = s.connect(1);
     s.line(alice, "NICK alice");
     s.line(alice, "USER a@evil.com!x 0 * :real");
     assert!(
-        s.drain(alice).iter().any(|l| l.contains(" 001 ")),
-        "alice should register"
+        s.drain(alice).iter().any(|l| l.contains(" 468 ")),
+        "invalid username must fail loudly"
     );
+    s.line(alice, "USER alice 0 * :real");
+    assert!(s.drain(alice).iter().any(|l| l.contains(" 001 ")));
     let bob = s.register(2, "bob");
     for c in [alice, bob] {
         s.line(c, "JOIN #c");
@@ -10262,9 +10260,8 @@ fn username_is_sanitized_so_the_source_prefix_cannot_be_spoofed() {
         .expect("source prefix");
     assert_eq!(prefix.matches('@').count(), 1, "one @ in prefix: {prefix}");
     assert_eq!(prefix.matches('!').count(), 1, "one ! in prefix: {prefix}");
-    // The username part carries none of the stripped characters.
     let user = prefix.split('!').nth(1).and_then(|r| r.split('@').next());
-    assert_eq!(user, Some("aevil.comx"), "sanitized username: {prefix}");
+    assert_eq!(user, Some("alice"), "username: {prefix}");
 }
 
 #[test]

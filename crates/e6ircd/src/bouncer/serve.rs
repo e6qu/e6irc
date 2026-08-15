@@ -93,8 +93,8 @@ impl Slot {
     /// refcount alone would keep the upstream connection (and its decrypted
     /// SASL password) alive until the last client detached. The persistence
     /// task is aborted too so it stops writing for a network that is gone.
-    fn stop(self) {
-        self.handle.shutdown();
+    async fn stop(self) {
+        self.handle.shutdown_and_wait().await;
         if let Some(task) = self.persistence {
             task.abort();
         }
@@ -203,20 +203,38 @@ impl Registry {
             persistence,
             kind,
         };
-        // Replacing a key must stop the old driver, not leak it.
-        if let Some(old) = self
+        let old = self
             .networks
             .lock()
             .expect("registry poisoned")
-            .insert(key, slot)
-        {
-            old.stop();
+            .insert(key, slot);
+        assert!(
+            old.is_none(),
+            "registry add replaced a live network; use replace instead"
+        );
+    }
+
+    /// Replace one live driver only after its predecessor has disconnected.
+    pub async fn replace(
+        &self,
+        owner: Option<&str>,
+        name: &str,
+        driver: Box<dyn super::NetworkDriver>,
+    ) {
+        let old = self
+            .networks
+            .lock()
+            .expect("registry poisoned")
+            .remove(&NetworkKey::new(owner, name));
+        if let Some(old) = old {
+            old.stop().await;
         }
+        self.add(owner, name, driver);
     }
 
     /// Remove `owner`'s network `name`, stopping its driver. Returns
     /// whether a network was removed.
-    pub fn remove(&self, owner: Option<&str>, name: &str) -> bool {
+    pub async fn remove(&self, owner: Option<&str>, name: &str) -> bool {
         let removed = self
             .networks
             .lock()
@@ -224,7 +242,7 @@ impl Registry {
             .remove(&NetworkKey::new(owner, name));
         match removed {
             Some(slot) => {
-                slot.stop();
+                slot.stop().await;
                 true
             }
             None => false,
@@ -233,7 +251,7 @@ impl Registry {
 
     /// Stop every active upstream owned by one account while preserving its
     /// durable definitions for possible reactivation.
-    pub fn remove_owner(&self, owner: &str) -> usize {
+    pub async fn remove_owner(&self, owner: &str) -> usize {
         let owner = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(owner);
         let removed: Vec<Slot> = {
             let mut networks = self.networks.lock().expect("registry poisoned");
@@ -248,7 +266,7 @@ impl Registry {
         };
         let count = removed.len();
         for slot in removed {
-            slot.stop();
+            slot.stop().await;
         }
         count
     }
@@ -946,7 +964,7 @@ mod key_tests {
         let bob = registry.get_owned("bob", "libera").expect("Bob network");
         let shared = registry.get_shared("shared").expect("shared network");
 
-        assert_eq!(registry.remove_owner("aLICE"), 2);
+        assert_eq!(registry.remove_owner("aLICE").await, 2);
         assert!(*alice_libera.watch_shutdown().borrow());
         assert!(*alice_oftc.watch_shutdown().borrow());
         assert!(!*bob.watch_shutdown().borrow());
@@ -955,6 +973,10 @@ mod key_tests {
         assert!(registry.get_owned("alice", "oftc").is_none());
         assert!(registry.get_owned("bob", "libera").is_some());
         assert!(registry.get_shared("shared").is_some());
-        assert_eq!(registry.remove_owner("alice"), 0, "retries are idempotent");
+        assert_eq!(
+            registry.remove_owner("alice").await,
+            0,
+            "retries are idempotent"
+        );
     }
 }

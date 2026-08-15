@@ -999,6 +999,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
           scopes: splitValues(String(fields.get("scopes") || ""), /[,\s]+/),
           allowed_email_domains: splitValues(String(fields.get("allowed_email_domains") || ""), /[,\s]+/),
           end_session_endpoint: optionalValue(String(fields.get("end_session_endpoint") || "")),
+          account_claim: String(fields.get("account_claim") || ""),
           token_endpoint_auth_method: String(fields.get("token_endpoint_auth_method") || ""),
         },
         `added OpenID Connect provider ${name}`,
@@ -1166,7 +1167,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       const article = document.createElement("article");
       const domains = apiCollection(provider, "allowed_email_domains", "identity-provider");
       const scopes = apiCollection(provider, "scopes", "identity-provider");
-      article.append(append(element("div"), element("strong", "", provider.name), element("span", "tag", provider.token_endpoint_auth_method)), element("code", "", provider.issuer_url), element("span", "meta", `Client ${provider.client_id} · scopes ${scopes.join(" ")}`), element("span", "meta", `Allowed email domains: ${domains.length ? domains.join(", ") : "any verified provider identity"}`), configurationDeleteForm("oidc", provider.name, revision, csrf));
+      article.append(append(element("div"), element("strong", "", provider.name), element("span", "tag", provider.token_endpoint_auth_method)), element("code", "", provider.issuer_url), element("span", "meta", `Client ${provider.client_id} · account claim ${provider.account_claim} · scopes ${scopes.join(" ")}`), element("span", "meta", `Allowed email domains: ${domains.length ? domains.join(", ") : "any verified provider identity"}`), configurationDeleteForm("oidc", provider.name, revision, csrf));
       return article;
     });
     const providerTarget = root.querySelector("[data-configuration-oidc-providers]");

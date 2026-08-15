@@ -43,12 +43,13 @@ async fn full_oidc_login_provisions_account_and_session() {
             issuer_url: dex_url,
             client_id: "e6irc-test".into(),
             client_secret: "e6irc-test-secret".into(),
+            account_claim: e6ircd::config::OidcAccountClaim::Email,
             scopes: vec![],
             allowed_email_domains: vec![
                 e6ircd::identity::EmailDomain::parse("kilgore.trout").expect("test domain"),
             ],
             end_session_endpoint: None,
-            token_endpoint_auth_method: Default::default(),
+            token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
         }],
         ..Config::default()
     };
@@ -275,10 +276,11 @@ async fn oidc_identity_link_flow_and_conflict() {
             issuer_url: dex_url,
             client_id: "e6irc-test".into(),
             client_secret: "e6irc-test-secret".into(),
+            account_claim: e6ircd::config::OidcAccountClaim::Email,
             scopes: vec![],
             allowed_email_domains: vec![],
             end_session_endpoint: None,
-            token_endpoint_auth_method: Default::default(),
+            token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
         }],
         ..Config::default()
     };
@@ -401,10 +403,11 @@ async fn oidc_silent_sso_reuses_provider_session() {
             issuer_url: dex_url,
             client_id: "e6irc-test".into(),
             client_secret: "e6irc-test-secret".into(),
+            account_claim: e6ircd::config::OidcAccountClaim::Email,
             scopes: vec![],
             allowed_email_domains: vec![],
             end_session_endpoint: None,
-            token_endpoint_auth_method: Default::default(),
+            token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
         }],
         ..Config::default()
     };

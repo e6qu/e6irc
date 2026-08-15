@@ -84,6 +84,13 @@ impl ContactEmail {
         &self.0
     }
 
+    pub fn local_part(&self) -> &str {
+        self.0
+            .split_once('@')
+            .map(|(local, _)| local)
+            .expect("ContactEmail construction requires @")
+    }
+
     pub fn domain(&self) -> &str {
         self.0
             .rsplit_once('@')
@@ -285,6 +292,7 @@ mod tests {
     fn contact_email_parses_once_and_normalizes_only_the_domain() {
         let email = ContactEmail::parse("Alice+IRC@Example.COM").expect("valid");
         assert_eq!(email.as_str(), "Alice+IRC@example.com");
+        assert_eq!(email.local_part(), "Alice+IRC");
     }
 
     #[test]

@@ -2928,11 +2928,8 @@ fn history_row_from_db(row: HistoryDbRow) -> crate::core::HistoryRow {
         ts: e6irc_proto::time::Millis::from_millis(row.ts_millis as u64),
         sender_prefix: row.sender_prefix,
         sender_account: row.sender_account,
-        // The `kind` column is written only from `MessageKind::db`, so an
-        // unrecognized value is a corrupt row — fall back to PRIVMSG (the louder
-        // kind) rather than drop the message.
         kind: crate::core::MessageKind::from_db(&row.kind)
-            .unwrap_or(crate::core::MessageKind::Privmsg),
+            .expect("messages.kind is constrained to known message kinds"),
         body: row.body,
         sender_is_bot: row.sender_is_bot,
         multiline: row.multiline,

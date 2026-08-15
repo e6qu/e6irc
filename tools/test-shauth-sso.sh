@@ -197,6 +197,7 @@ name = "shauth"
 issuer_url = "http://localhost:8080"
 client_id = "${client_id}"
 client_secret = "${client_secret}"
+account_claim = "preferred_username"
 scopes = ["profile", "email", "offline_access"]
 # Shauth registers every managed application with client_secret_post, so the
 # client must authenticate that way; the OAuth 2.0 default of HTTP Basic is

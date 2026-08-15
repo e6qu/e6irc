@@ -593,14 +593,19 @@ impl Connection {
     /// has been offered.
     async fn await_authenticate_challenge(&mut self) -> io::Result<()> {
         loop {
-            let msg = self.recv("closed during SASL").await?;
-            if let Some(err) = self.sasl_terminal_error(&msg).await? {
-                return Err(err);
-            }
+            let msg = self.recv_sasl_message().await?;
             if msg.command == "AUTHENTICATE" {
                 return Ok(());
             }
         }
+    }
+
+    async fn recv_sasl_message(&mut self) -> io::Result<OwnedMessage> {
+        let msg = self.recv("closed during SASL").await?;
+        if let Some(err) = self.sasl_terminal_error(&msg).await? {
+            return Err(err);
+        }
+        Ok(msg)
     }
 
     /// In a SASL wait loop: the terminal errors — a registration-refusal
@@ -627,10 +632,7 @@ impl Connection {
     /// can't complete registration ahead of it and mask a failure.
     async fn finish_sasl_then_welcome(&mut self, nick: &str) -> io::Result<String> {
         loop {
-            let msg = self.recv("closed during SASL").await?;
-            if let Some(err) = self.sasl_terminal_error(&msg).await? {
-                return Err(err);
-            }
+            let msg = self.recv_sasl_message().await?;
             // 903 RPL_SASLSUCCESS: authenticated — now finish CAP.
             if msg.command == "903" {
                 self.send_line("CAP END").await?;
@@ -700,9 +702,7 @@ impl Connection {
         realname: &str,
         payload: String,
     ) -> io::Result<String> {
-        self.send_line(&format!("NICK {nick}")).await?;
-        self.send_line(&format!("USER {nick} 0 * :{realname}"))
-            .await?;
+        self.send_registration_identity(nick, realname).await?;
         self.send_line(&format!("AUTHENTICATE {payload}")).await?;
         self.finish_sasl_then_welcome(nick).await
     }
@@ -730,11 +730,18 @@ impl Connection {
     pub async fn register(&mut self, nick: &str, realname: &str) -> io::Result<String> {
         self.begin_cap().await?;
         self.request_metadata_capabilities().await?;
-        self.send_line(&format!("NICK {nick}")).await?;
-        self.send_line(&format!("USER {nick} 0 * :{realname}"))
-            .await?;
+        self.send_registration_identity(nick, realname).await?;
         self.send_line("CAP END").await?;
         self.await_welcome(nick).await
+    }
+
+    async fn send_registration_identity(&mut self, nick: &str, realname: &str) -> io::Result<()> {
+        self.send_line(&format!("NICK {nick}")).await?;
+        self.send_line(&format!(
+            "USER {} 0 * :{realname}",
+            registration_username(nick)
+        ))
+        .await
     }
 
     /// Offer a replacement nick after the server refused the requested one
@@ -926,6 +933,17 @@ pub fn is_join_refusal(command: &str) -> bool {
     )
 }
 
+/// Return a USER field that fits the portable ten-character limit.
+fn registration_username(nick: &str) -> &str {
+    let end = nick
+        .char_indices()
+        .map(|(start, character)| start + character.len_utf8())
+        .take_while(|&end| end <= 10)
+        .last()
+        .unwrap_or(0);
+    &nick[..end]
+}
+
 /// Map a registration-refusal numeric to a terminal error, if it is one. These
 /// are the replies a server sends when it will not complete registration for
 /// the requested nick/credentials; a client that keeps waiting for `001` after
@@ -933,6 +951,7 @@ pub fn is_join_refusal(command: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistrationRefusal {
     InvalidNickname,
+    InvalidUsername,
     NicknameInUse,
     ServerPasswordRejected,
     NetworkBanned,
@@ -969,6 +988,7 @@ impl RegistrationRefusal {
         let kind = match self {
             Self::NicknameInUse => io::ErrorKind::AlreadyExists,
             Self::InvalidNickname => io::ErrorKind::InvalidInput,
+            Self::InvalidUsername => io::ErrorKind::InvalidInput,
             Self::ServerPasswordRejected => io::ErrorKind::PermissionDenied,
             Self::NetworkBanned => io::ErrorKind::ConnectionAborted,
             Self::NotRegistered => io::ErrorKind::Other,
@@ -986,6 +1006,7 @@ impl RegistrationRefusal {
 fn registration_refused(message: &OwnedMessage) -> Option<io::Error> {
     let refusal = match message.command.as_str() {
         "432" => RegistrationRefusal::InvalidNickname,
+        "468" => RegistrationRefusal::InvalidUsername,
         "433" => RegistrationRefusal::NicknameInUse,
         "464" => RegistrationRefusal::ServerPasswordRejected,
         "465" => RegistrationRefusal::NetworkBanned,
@@ -1039,6 +1060,7 @@ mod tests {
     fn registration_refusals_keep_the_server_cause() {
         for (numeric, expected) in [
             ("432", RegistrationRefusal::InvalidNickname),
+            ("468", RegistrationRefusal::InvalidUsername),
             ("433", RegistrationRefusal::NicknameInUse),
             ("464", RegistrationRefusal::ServerPasswordRejected),
             ("465", RegistrationRefusal::NetworkBanned),
@@ -1050,6 +1072,13 @@ mod tests {
             let error = registration_refused(&message).expect("known refusal numeric");
             assert_eq!(RegistrationRefusal::from_error(&error), Some(expected));
         }
+    }
+
+    #[test]
+    fn registration_username_fits_the_portable_limit() {
+        assert_eq!(registration_username("alice_updated"), "alice_upda");
+        assert_eq!(registration_username("short"), "short");
+        assert_eq!(registration_username("ééééééééééx"), "ééééé");
     }
 
     #[test]
