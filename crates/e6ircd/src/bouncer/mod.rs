@@ -1237,6 +1237,7 @@ pub enum NetworkFailure {
     RegistrationFailed,
     RegistrationRejected,
     InvalidNickname,
+    InvalidUsername,
     NicknameInUse,
     ServerPasswordRejected,
     NetworkBanned,
@@ -1266,6 +1267,7 @@ impl NetworkFailure {
             Self::RegistrationFailed => "registration_failed",
             Self::RegistrationRejected => "registration_rejected",
             Self::InvalidNickname => "invalid_nickname",
+            Self::InvalidUsername => "invalid_username",
             Self::NicknameInUse => "nickname_in_use",
             Self::ServerPasswordRejected => "server_password_rejected",
             Self::NetworkBanned => "network_banned",
@@ -1297,6 +1299,7 @@ impl NetworkFailure {
                 "The upstream rejected IRC registration; check the nickname and network policy."
             }
             Self::InvalidNickname => "The upstream rejected the configured nickname.",
+            Self::InvalidUsername => "The upstream rejected the IRC username.",
             Self::NicknameInUse => "The configured nickname is already in use.",
             Self::ServerPasswordRejected => "The upstream rejected the configured server password.",
             Self::NetworkBanned => "The upstream network banned this connection.",
@@ -2270,6 +2273,7 @@ impl DriverEnds {
 const fn registration_failure(refusal: e6irc_client::RegistrationRefusal) -> NetworkFailure {
     match refusal {
         e6irc_client::RegistrationRefusal::InvalidNickname => NetworkFailure::InvalidNickname,
+        e6irc_client::RegistrationRefusal::InvalidUsername => NetworkFailure::InvalidUsername,
         e6irc_client::RegistrationRefusal::NicknameInUse => NetworkFailure::NicknameInUse,
         e6irc_client::RegistrationRefusal::ServerPasswordRejected => {
             NetworkFailure::ServerPasswordRejected

@@ -63,6 +63,26 @@ async fn wait_http_ready(addr: std::net::SocketAddr) {
     panic!("HTTP server did not become ready");
 }
 
+async fn wait_irc_ready(addr: std::net::SocketAddr) {
+    static NEXT_NICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..20 {
+        let nick = format!(
+            "ready{}",
+            NEXT_NICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let mut client = e6irc_client::Connection::connect(&addr.to_string()).await?;
+            client.register(&nick, "readiness").await
+        })
+        .await;
+        if matches!(result, Ok(Ok(_))) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("IRC server did not become ready");
+}
+
 fn response_header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
     headers.lines().find_map(|line| {
         let (header, value) = line.split_once(':')?;
@@ -415,7 +435,7 @@ async fn app_password_requires_database() {
 use e6ircd::config::BncConfig;
 
 /// Start a throwaway plain e6ircd to act as an upstream network.
-async fn upstream_server() -> std::net::SocketAddr {
+async fn upstream_server() -> net::Running {
     let cfg = Config {
         server_name: "irc.up.example".into(),
         network_name: "Up".into(),
@@ -426,7 +446,7 @@ async fn upstream_server() -> std::net::SocketAddr {
         }],
         ..Config::default()
     };
-    net::start(cfg).await.expect("upstream start").addrs[0]
+    net::start(cfg).await.expect("upstream start")
 }
 
 async fn post_json(
@@ -474,7 +494,8 @@ async fn bnc_network_management_lifecycle() {
         .expect("token");
     drop(pool);
 
-    let up = upstream_server().await;
+    let upstream = upstream_server().await;
+    let up = upstream.addrs[0];
 
     let config = Config {
         server_name: "irc.mgmt.example".into(),
@@ -682,9 +703,11 @@ async fn bnc_network_management_lifecycle() {
     let (status, _, body) = request(http, &patch(true)).await;
     assert_eq!(status, 200, "enable: {body}");
     let mut reconnected = false;
+    let mut latest_status = String::new();
     for _ in 0..30 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let (_, _, body) = request(http, &list_req).await;
+        latest_status = body.clone();
         let v: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(v["networks"][0]["enabled"], true, "{body}");
         if v["networks"][0]["connected"] == true {
@@ -692,7 +715,10 @@ async fn bnc_network_management_lifecycle() {
             break;
         }
     }
-    assert!(reconnected, "re-enabled driver never reconnected");
+    assert!(
+        reconnected,
+        "re-enabled driver never reconnected: {latest_status}"
+    );
 
     // delete it
     let del_req = format!(
@@ -2543,6 +2569,7 @@ async fn owned_channel_api_and_console_shell_are_scoped_and_csrf_protected() {
     let running = net::start(config).await.expect("start");
     let http = running.http_addr.expect("http");
     wait_http_ready(http).await;
+    wait_irc_ready(running.addrs[0]).await;
     let page_request = |session: &str| {
         format!(
             "GET /console/channels HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"

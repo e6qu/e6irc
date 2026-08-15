@@ -861,8 +861,16 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     }
     drop(db_tx);
     let mut core_workers = tokio::task::JoinSet::new();
+    let mut core_ready = Vec::with_capacity(shard_count.len());
     for (core, receiver) in cores.into_iter().zip(core_receivers) {
-        core_workers.spawn(core_worker(core, receiver, core_tx.clone()));
+        let (ready, received) = tokio::sync::oneshot::channel();
+        core_workers.spawn(core_worker(core, receiver, core_tx.clone(), ready));
+        core_ready.push(received);
+    }
+    for ready in core_ready {
+        ready
+            .await
+            .map_err(|_| io::Error::other("core worker stopped during startup"))?;
     }
 
     // Liveness reaper tick: drives the core's registration deadline and idle
@@ -977,7 +985,15 @@ fn pem_err(e: rustls_pki_types::pem::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, format!("TLS PEM: {e}"))
 }
 
-async fn core_worker(core: Core, rx: Receiver<Input>, ingress: CoreIngress) {
+async fn core_worker(
+    core: Core,
+    rx: Receiver<Input>,
+    ingress: CoreIngress,
+    ready: tokio::sync::oneshot::Sender<()>,
+) {
+    if ready.send(()).is_err() {
+        return;
+    }
     CoreWorker::new(core, rx, ingress).run().await;
 }
 
@@ -1625,11 +1641,14 @@ mod tests {
             policy: Policy::Fifo,
         });
         let core = Core::new(test_core_config(), db_tx);
+        let (ready, received) = tokio::sync::oneshot::channel();
         let worker = tokio::spawn(core_worker(
             core,
             core_rx,
             CoreIngress::single(core_tx.clone()),
+            ready,
         ));
+        received.await.expect("core worker ready");
 
         // Register one client so there is a session to notify. Its send queue's
         // receiver is held here to observe the ERROR.

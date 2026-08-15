@@ -97,6 +97,7 @@ pub enum IrcPreflightFailure {
     AuthenticationRejected,
     RegistrationRejected,
     InvalidNickname,
+    InvalidUsername,
     NicknameInUse,
     ServerPasswordRejected,
     NetworkBanned,
@@ -116,6 +117,7 @@ impl IrcPreflightFailure {
             Self::AuthenticationRejected => "authentication_rejected",
             Self::RegistrationRejected => "registration_rejected",
             Self::InvalidNickname => "invalid_nickname",
+            Self::InvalidUsername => "invalid_username",
             Self::NicknameInUse => "nickname_in_use",
             Self::ServerPasswordRejected => "server_password_rejected",
             Self::NetworkBanned => "network_banned",
@@ -139,6 +141,7 @@ impl IrcPreflightFailure {
             Self::AuthenticationRejected => "The upstream rejected the SASL credentials.",
             Self::RegistrationRejected => "The upstream rejected IRC registration.",
             Self::InvalidNickname => "The upstream rejected the configured nickname.",
+            Self::InvalidUsername => "The upstream rejected the IRC username.",
             Self::NicknameInUse => "The configured nickname is already in use.",
             Self::ServerPasswordRejected => "The upstream rejected the configured server password.",
             Self::NetworkBanned => "The upstream network banned this connection.",
@@ -316,6 +319,7 @@ fn into_outcome(result: RegistrationResult) -> Result<String, super::SessionOutc
 fn preflight_refusal(refusal: e6irc_client::RegistrationRefusal) -> IrcPreflightFailure {
     match refusal {
         e6irc_client::RegistrationRefusal::InvalidNickname => IrcPreflightFailure::InvalidNickname,
+        e6irc_client::RegistrationRefusal::InvalidUsername => IrcPreflightFailure::InvalidUsername,
         e6irc_client::RegistrationRefusal::NicknameInUse => IrcPreflightFailure::NicknameInUse,
         e6irc_client::RegistrationRefusal::ServerPasswordRejected => {
             IrcPreflightFailure::ServerPasswordRejected
