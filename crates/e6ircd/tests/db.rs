@@ -4245,6 +4245,7 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
         issuer_url: "https://issuer.example".into(),
         client_id: "e6irc".into(),
         client_secret: old.seal("oidc-secret", CONFIG_CONTEXT),
+        account_claim: Default::default(),
         scopes: vec!["openid".into()],
         allowed_email_domains: Vec::new(),
         end_session_endpoint: None,
