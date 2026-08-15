@@ -51,9 +51,9 @@ async fn next_interactive_message(
 #[derive(Parser)]
 #[command(name = "e6irc", about = "Scripting-oriented IRC client", version)]
 struct Cli {
-    /// Server address (host:port).
-    #[arg(long, short, default_value = "127.0.0.1:6667", global = true)]
-    server: String,
+    /// Server address (host:port) for IRC commands.
+    #[arg(long, short, global = true)]
+    server: Option<String>,
     /// Nickname to register with.
     #[arg(long, short, default_value = "e6irc", global = true)]
     nick: String,
@@ -130,7 +130,7 @@ enum Command {
         method: String,
         /// Request path, e.g. /api/v1/me/networks.
         path: String,
-        /// API base URL. Defaults to the cached login origin, then localhost.
+        /// API base URL. Defaults to the cached login origin.
         #[arg(long)]
         base: Option<String>,
         /// Bearer token; falls back to E6IRC_API_TOKEN, then the login cache.
@@ -144,7 +144,7 @@ enum Command {
     /// the resulting bearer token.
     Login {
         /// API origin hosting the device authorization endpoints.
-        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        #[arg(long)]
         base: String,
     },
 }
@@ -195,6 +195,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
         .await;
     }
 
+    let server = irc_server(cli.server.as_deref())?;
     let authentication = match (
         &cli.account,
         &cli.password,
@@ -229,7 +230,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
         }
     };
     let mut conn = ConnectionOptions {
-        address: cli.server.clone(),
+        address: server.to_owned(),
         tls: cli.tls,
         tls_server_name: cli.tls_name.clone(),
         nick: cli.nick.clone(),
@@ -401,6 +402,17 @@ async fn run(cli: Cli) -> std::io::Result<()> {
     Ok(())
 }
 
+fn irc_server(server: Option<&str>) -> std::io::Result<&str> {
+    server
+        .filter(|server| !server.trim().is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--server is required for IRC commands",
+            )
+        })
+}
+
 fn token_path(explicit: Option<&Path>) -> std::io::Result<PathBuf> {
     explicit
         .map(Path::to_path_buf)
@@ -457,10 +469,22 @@ mod tests {
 
     #[test]
     fn authentication_shapes_are_explicit() {
-        assert!(Cli::try_parse_from(["e6irc", "send", "nick", "hello"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "e6irc",
+                "--server",
+                "irc.example:6697",
+                "send",
+                "nick",
+                "hello"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "e6irc",
+                "--server",
+                "irc.example:6697",
                 "--account",
                 "alice",
                 "--password",
@@ -472,11 +496,29 @@ mod tests {
             .is_ok()
         );
         assert!(
-            Cli::try_parse_from(["e6irc", "--oauth-token", "token", "send", "nick", "hello",])
-                .is_ok()
+            Cli::try_parse_from([
+                "e6irc",
+                "--server",
+                "irc.example:6697",
+                "--oauth-token",
+                "token",
+                "send",
+                "nick",
+                "hello",
+            ])
+            .is_ok()
         );
         assert!(
-            Cli::try_parse_from(["e6irc", "--oauth-from-cache", "send", "nick", "hello",]).is_ok()
+            Cli::try_parse_from([
+                "e6irc",
+                "--server",
+                "irc.example:6697",
+                "--oauth-from-cache",
+                "send",
+                "nick",
+                "hello",
+            ])
+            .is_ok()
         );
         assert!(
             Cli::try_parse_from(["e6irc", "--account", "alice", "send", "nick", "hello"]).is_err()
@@ -493,6 +535,22 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn irc_commands_require_a_server() {
+        assert_eq!(
+            irc_server(Some("irc.example:6697")).unwrap(),
+            "irc.example:6697"
+        );
+        assert!(irc_server(None).is_err());
+        assert!(irc_server(Some(" ")).is_err());
+    }
+
+    #[test]
+    fn login_requires_an_api_origin() {
+        assert!(Cli::try_parse_from(["e6irc", "login"]).is_err());
+        assert!(Cli::try_parse_from(["e6irc", "login", "--base", "https://irc.example"]).is_ok());
     }
 
     #[test]

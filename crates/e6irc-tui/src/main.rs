@@ -21,7 +21,8 @@ use tokio::sync::mpsc;
 #[derive(Parser)]
 #[command(name = "e6irc-tui", about = "Terminal IRC client", version)]
 struct Cli {
-    #[arg(long, short, default_value = "127.0.0.1:6667")]
+    /// IRC server address (host:port).
+    #[arg(long, short)]
     server: String,
     #[arg(long, short, default_value = "e6irc")]
     nick: String,
@@ -494,6 +495,8 @@ mod tests {
         assert!(
             Cli::try_parse_from([
                 "e6irc-tui",
+                "--server",
+                "irc.example:6697",
                 "--account",
                 "alice/work",
                 "--password",
@@ -501,11 +504,30 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["e6irc-tui", "--oauth-token", "device-token"]).is_ok());
-        assert!(Cli::try_parse_from(["e6irc-tui", "--oauth-from-cache"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "e6irc-tui",
+                "--server",
+                "irc.example:6697",
+                "--oauth-token",
+                "device-token"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "e6irc-tui",
+                "--server",
+                "irc.example:6697",
+                "--oauth-from-cache"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "e6irc-tui",
+                "--server",
+                "irc.example:6697",
                 "--oauth-from-cache",
                 "--token-file",
                 "token.json",
@@ -531,13 +553,39 @@ mod tests {
 
     #[test]
     fn transport_and_reconnect_constraints_fail_at_argument_parsing() {
-        assert!(Cli::try_parse_from(["e6irc-tui", "--tls"]).is_ok());
-        assert!(Cli::try_parse_from(["e6irc-tui", "--tls", "--tls-name", "irc.example"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["e6irc-tui", "--server", "irc.example:6697", "--tls"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "e6irc-tui",
+                "--server",
+                "irc.example:6697",
+                "--tls",
+                "--tls-name",
+                "irc.example"
+            ])
+            .is_ok()
+        );
         assert!(Cli::try_parse_from(["e6irc-tui", "--tls-name", "irc.example"]).is_err());
         assert!(Cli::try_parse_from(["e6irc-tui", "--reconnect-delay", "0"]).is_err());
         assert!(Cli::try_parse_from(["e6irc-tui", "--reconnect-delay", "301"]).is_err());
-        assert!(Cli::try_parse_from(["e6irc-tui", "--history-lines", "1000"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "e6irc-tui",
+                "--server",
+                "irc.example:6697",
+                "--history-lines",
+                "1000"
+            ])
+            .is_ok()
+        );
         assert!(Cli::try_parse_from(["e6irc-tui", "--history-lines", "1001"]).is_err());
+    }
+
+    #[test]
+    fn server_is_required() {
+        assert!(Cli::try_parse_from(["e6irc-tui"]).is_err());
     }
 
     fn message(raw: &str) -> OwnedMessage {

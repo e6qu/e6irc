@@ -70,6 +70,17 @@ fn normalized_base(base: &str) -> io::Result<String> {
     Ok(base.to_owned())
 }
 
+fn api_base(requested: Option<&str>, cached: Option<&CachedToken>) -> io::Result<String> {
+    match (requested, cached) {
+        (Some(base), _) => normalized_base(base),
+        (None, Some(token)) => normalized_base(token.base_url()),
+        (None, None) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--base is required when no cached login supplies an API origin",
+        )),
+    }
+}
+
 fn endpoint(base: &str, path: &str) -> io::Result<String> {
     if !path.starts_with('/') || path.starts_with("//") {
         return Err(io::Error::new(
@@ -271,13 +282,7 @@ pub async fn api(
     } else {
         None
     };
-    let base = match requested_base {
-        Some(base) => normalized_base(base)?,
-        None => cached
-            .as_ref()
-            .map(|token| token.base_url().to_owned())
-            .unwrap_or_else(|| "http://127.0.0.1:8080".to_owned()),
-    };
+    let base = api_base(requested_base, cached.as_ref())?;
     let token = match (explicit_token, cached) {
         (Some(token), _) => Some(token),
         (None, Some(cached)) => {
@@ -356,6 +361,20 @@ mod tests {
         ] {
             assert!(verification_uri(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn api_base_requires_provenance() {
+        let cached = CachedToken::new("https://irc.example".into(), "token".into()).unwrap();
+        assert_eq!(
+            api_base(None, Some(&cached)).unwrap(),
+            "https://irc.example"
+        );
+        assert_eq!(
+            api_base(Some("https://other.example"), None).unwrap(),
+            "https://other.example"
+        );
+        assert!(api_base(None, None).is_err());
     }
 
     #[tokio::test]
