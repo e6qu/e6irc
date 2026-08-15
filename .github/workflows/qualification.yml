@@ -13,8 +13,8 @@ on:
         required: true
         type: string
       host:
-        description: Non-secret host name; required except for scale
-        required: false
+        description: Non-secret host label for retained evidence
+        required: true
         type: string
       workload:
         description: One NAME=VALUE workload measurement; not used by scale
@@ -99,10 +99,10 @@ jobs:
             scale)
               evidence='qualification/scale/qualification.json'
               read -r addr server_pid core_workers clients channels burst minimum_connect_rate minimum_fanout_rate maximum_p99_ms maximum_rss_bytes extra <<< "$QUALIFICATION_SCALE_ARGUMENTS"
-              if [[ "$QUALIFICATION_TARGET" != "$addr" || -n "${extra:-}" || -z "${maximum_rss_bytes:-}" ]]; then
-                echo 'scale_arguments needs exactly ten values' >&2
+              if [[ -z "$QUALIFICATION_HOST" || "$QUALIFICATION_TARGET" != "$addr" || -n "${extra:-}" || -z "${maximum_rss_bytes:-}" ]]; then
+                echo 'host and exactly ten scale arguments are required' >&2
               else
-                tools/load/qualify-linux.sh \
+                E6IRC_QUALIFICATION_HOST="$QUALIFICATION_HOST" tools/load/qualify-linux.sh \
                   "$addr" "$server_pid" "$core_workers" "$clients" "$channels" "$burst" \
                   qualification/scale "$minimum_connect_rate" "$minimum_fanout_rate" \
                   "$maximum_p99_ms" "$maximum_rss_bytes"

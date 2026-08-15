@@ -23,6 +23,7 @@ minimum_connect_rate="$8"
 minimum_fanout_rate="$9"
 maximum_p99_ms="${10}"
 maximum_rss_per_connection="${11}"
+qualification_host="${E6IRC_QUALIFICATION_HOST:?E6IRC_QUALIFICATION_HOST is required}"
 
 for value in "$server_pid" "$core_workers" "$maximum_rss_per_connection"; do
   positive_integer "$value" || { echo "positive integer required: $value" >&2; exit 2; }
@@ -95,7 +96,6 @@ host="$output_dir/host.txt"
 } > "$host"
 host_sha256="$(sha256sum "$host" | awk '{print $1}')"
 
-qualification_host="$(hostname -f 2>/dev/null || hostname)"
 set +e
 "$qualification_bin" scale \
   --target "$addr" \
