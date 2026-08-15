@@ -112,9 +112,8 @@ Firefox, and WebKit each repeat that qualification-before-create journey
 through the rendered controls and local live upstream;
 `bnc_network_management_lifecycle` proves the REST qualification contract,
 empty-registry invariant, mutation, live driver start, BNC attach,
-update/toggle/delete, and secret handling. The live public-network probe in
-`irc_driver.rs` is opt-in, so real Libera DNS/TLS/SASL behavior is externally
-qualified rather than CI-proven.
+update/toggle/delete, and secret handling. The opt-in BNC-driver probes cover
+Libera, OFTC, and Ergo; public-server qualification remains outside CI.
 
 ## Diagnose an upstream connection
 
