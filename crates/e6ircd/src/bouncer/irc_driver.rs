@@ -806,42 +806,55 @@ mod tests {
         ));
     }
 
-    /// Exercises the actual always-on driver path (DNS vetting, pinned-IP TLS
-    /// with hostname verification, IRC registration, and lifecycle reporting),
-    /// not only the lower-level client probe in `tests/live_compat.rs`.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "live network: briefly connects the BNC driver to Libera.Chat"]
-    async fn live_driver_connects_to_libera() {
-        let nick = format!("e6b{:05}", std::process::id() % 100000);
-        let handle = IrcNetwork::start(NetworkConfig {
-            addr: "irc.libera.chat:6697".into(),
-            tls: true,
-            nick,
-            realname: "e6irc BNC interop probe".into(),
-            buffer_cap: 32,
-            ..NetworkConfig::default()
-        });
-
-        let connected = tokio::time::timeout(Duration::from_secs(35), async {
-            loop {
-                let runtime = handle.runtime_snapshot();
-                if runtime.lifecycle == super::super::NetworkLifecycle::Connected {
-                    break runtime;
+    async fn assert_live_driver(network: &str, addr: &str) {
+        for attempt in 0..2 {
+            let nick = format!("e6b{:04}{attempt}", std::process::id() % 10000);
+            let handle = IrcNetwork::start(NetworkConfig {
+                addr: addr.into(),
+                tls: true,
+                nick,
+                realname: "e6irc BNC interop probe".into(),
+                buffer_cap: 32,
+                ..NetworkConfig::default()
+            });
+            let connected = tokio::time::timeout(Duration::from_secs(35), async {
+                loop {
+                    let runtime = handle.runtime_snapshot();
+                    if runtime.lifecycle == super::super::NetworkLifecycle::Connected {
+                        break runtime;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "Libera driver did not connect: {:?}",
-                handle.runtime_snapshot()
-            )
-        });
-        assert!(connected.connect_latency_ms.is_some());
-        assert!(connected.lines_in > 0, "{connected:?}");
-        assert_eq!(connected.last_error, None, "{connected:?}");
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{network} driver did not connect: {:?}",
+                    handle.runtime_snapshot()
+                )
+            });
+            assert!(connected.connect_latency_ms.is_some());
+            assert!(connected.lines_in > 0, "{connected:?}");
+            assert_eq!(connected.last_error, None, "{connected:?}");
+            handle.shutdown();
+        }
+    }
 
-        handle.shutdown();
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "live network: twice connects the BNC driver to Libera.Chat"]
+    async fn live_driver_connects_to_libera() {
+        assert_live_driver("Libera.Chat", "irc.libera.chat:6697").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "live network: twice connects the BNC driver to OFTC"]
+    async fn live_driver_connects_to_oftc() {
+        assert_live_driver("OFTC", "irc.oftc.net:6697").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "live network: twice connects the BNC driver to the Ergo test network"]
+    async fn live_driver_connects_to_ergo() {
+        assert_live_driver("Ergo", "testnet.ergo.chat:6697").await;
     }
 }
