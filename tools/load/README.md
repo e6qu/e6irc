@@ -11,7 +11,7 @@ cargo build --release -p e6irc-load -p e6ircd
 target/release/e6irc-load --addr 127.0.0.1:6667 --clients 1000 --burst 20
 ```
 
-Flags: `--addr host:port` (default `127.0.0.1:6667`), `--clients N`
+Flags: `--addr host:port` (required), `--clients N`
 (default 100), `--channels C` (default 1 — spread clients across C
 channels), `--channel PREFIX` (default `#load`; actual channel is
 `PREFIX{index}`), `--burst K` (default 10), `--tls`,

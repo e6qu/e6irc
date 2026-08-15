@@ -80,7 +80,7 @@ grep -F '"status": "completed"' "$rejected_report" >/dev/null
 grep -F '"outcome": "rejected"' "$rejected_report" >/dev/null
 
 failed_report="$test_dir/failed-load-report.json"
-if "$load_bin" --server-pid 4294967295 --maximum-server-rss-per-connection-bytes 1 --report-json "$failed_report"; then
+if "$load_bin" --addr 127.0.0.1:16671 --server-pid 4294967295 --maximum-server-rss-per-connection-bytes 1 --report-json "$failed_report"; then
   echo "load harness unexpectedly sampled a nonexistent server" >&2
   exit 1
 fi
