@@ -11,16 +11,6 @@ macro_rules! json_or_response {
     };
 }
 
-fn json_response<T: serde::Serialize>(body: T) -> Response {
-    axum::Json(body).into_response()
-}
-
-fn no_store_json<T: serde::Serialize>(body: T) -> Response {
-    let mut response = json_response(body);
-    no_store(response.headers_mut());
-    response
-}
-
 #[derive(serde::Serialize)]
 struct DeviceStartResponse {
     device_code: String,
@@ -858,7 +848,7 @@ pub(super) async fn admin_delete_account(
 }
 
 pub(super) fn admin_json<T: serde::Serialize>(body: T) -> Response {
-    no_store_json(body)
+    json_no_store(body)
 }
 
 pub(super) fn admin_db_error(what: &str, e: impl std::fmt::Display) -> Response {

@@ -294,20 +294,29 @@ pub(super) fn parse_json<T>(
     }
 }
 
+#[derive(Serialize)]
+struct ProblemResponse<'a> {
+    status: u16,
+    title: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'a str>,
+}
+
 fn problem(status: StatusCode, title: &str, detail: Option<&str>) -> Response {
-    let mut body = serde_json::json!({
-        "status": status.as_u16(),
-        "title": title,
-    });
-    if let Some(d) = detail {
-        body["detail"] = serde_json::Value::String(d.to_string());
-    }
-    (
+    let mut response = (
         status,
-        [(header::CONTENT_TYPE, "application/problem+json")],
-        body.to_string(),
+        axum::Json(ProblemResponse {
+            status: status.as_u16(),
+            title,
+            detail,
+        }),
     )
-        .into_response()
+        .into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/problem+json"),
+    );
+    response
 }
 
 /// Map an account-authority lifecycle failure to its HTTP status: the
@@ -331,8 +340,12 @@ fn authority_error_status(context: &str, error: crate::db::DbError) -> (StatusCo
 
 /// A JSON response with `no-store` cache control — the shared shape for
 /// private, per-account API payloads that must never be cached.
-fn json_no_store(value: impl serde::Serialize) -> Response {
-    let mut response = axum::Json(value).into_response();
+pub(super) fn json_response(value: impl serde::Serialize) -> Response {
+    axum::Json(value).into_response()
+}
+
+pub(super) fn json_no_store(value: impl serde::Serialize) -> Response {
+    let mut response = json_response(value);
     no_store(response.headers_mut());
     response
 }
@@ -748,6 +761,28 @@ async fn undo_account_deletion_gate(
 #[cfg(test)]
 mod query_limit_tests {
     use super::*;
+
+    #[test]
+    fn problem_response_has_one_closed_optional_detail() {
+        let without_detail = serde_json::to_string(&ProblemResponse {
+            status: 404,
+            title: "Not Found",
+            detail: None,
+        })
+        .expect("problem response");
+        assert_eq!(without_detail, r#"{"status":404,"title":"Not Found"}"#);
+
+        let with_detail = serde_json::to_string(&ProblemResponse {
+            status: 400,
+            title: "Invalid request",
+            detail: Some("unknown field"),
+        })
+        .expect("problem response");
+        assert_eq!(
+            with_detail,
+            r#"{"status":400,"title":"Invalid request","detail":"unknown field"}"#
+        );
+    }
 
     #[test]
     fn bounded_limits_default_accept_and_reject_without_clamping() {
@@ -1366,6 +1401,11 @@ fn oper_configuration_item() -> ManagedConfigurationItem<crate::config::OperConf
 mod pages {
     use super::*;
     use askama::Template;
+
+    #[derive(Serialize)]
+    struct OperationalLogResponse {
+        entries: Vec<crate::observability::OperationalLogEntry>,
+    }
 
     #[derive(Template)]
     #[template(path = "login.html")]
@@ -2882,9 +2922,9 @@ mod pages {
     /// A bounded, redacted event feed for the server components. It is live
     /// process state, not a substitute for the durable privileged audit log.
     pub async fn admin_logs(State(state): State<Arc<AppState>>, _admin: AdminAccount) -> Response {
-        super::json_no_store(serde_json::json!({
-            "entries": state.telemetry.operational_log(1_000),
-        }))
+        super::json_no_store(OperationalLogResponse {
+            entries: state.telemetry.operational_log(1_000),
+        })
     }
 
     pub async fn console_logs(

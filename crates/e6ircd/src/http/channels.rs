@@ -27,6 +27,23 @@ struct OwnedChannelListResponse {
     channels: Vec<OwnedChannelResponse>,
 }
 
+#[derive(serde::Serialize)]
+struct ChannelControlResponse {
+    ok: ChannelControlSuccess,
+    detail: String,
+}
+
+struct ChannelControlSuccess;
+
+impl serde::Serialize for ChannelControlSuccess {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bool(true)
+    }
+}
+
 fn channel_response(channel: crate::db::OwnedChannel) -> OwnedChannelResponse {
     OwnedChannelResponse {
         name: channel.name,
@@ -239,8 +256,10 @@ async fn control_response(
     match core_reply(state, request).await {
         Ok(crate::core::AdminReply::Ok(detail)) => (
             success,
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({ "ok": true, "detail": detail }).to_string(),
+            axum::Json(ChannelControlResponse {
+                ok: ChannelControlSuccess,
+                detail,
+            }),
         )
             .into_response(),
         Ok(crate::core::AdminReply::ChannelErr { kind, message }) => {
@@ -287,4 +306,19 @@ fn channel_error_response(
         ),
     };
     problem(status, title, Some(&message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn successful_channel_control_cannot_serialize_a_false_result() {
+        let response = serde_json::to_string(&ChannelControlResponse {
+            ok: ChannelControlSuccess,
+            detail: "updated".into(),
+        })
+        .expect("channel control response");
+        assert_eq!(response, r#"{"ok":true,"detail":"updated"}"#);
+    }
 }
