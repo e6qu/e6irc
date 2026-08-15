@@ -137,7 +137,7 @@ async fn discord_post(
 ) -> impl IntoResponse {
     if id == "42" && discord_authorized(&headers) && !body.content.is_empty() {
         *state.content.lock().expect("content lock") = Some(body.content);
-        (StatusCode::OK, Json(DiscordCreated { id: "m1" })).into_response()
+        (StatusCode::OK, Json(DiscordCreated { id: "1" })).into_response()
     } else {
         (StatusCode::UNAUTHORIZED, Json(Empty {})).into_response()
     }
@@ -148,14 +148,14 @@ async fn discord_message(
     Path((_id, message)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if message == "m1"
+    if message == "1"
         && discord_authorized(&headers)
         && let Some(content) = state.content.lock().expect("content lock").clone()
     {
         (
             StatusCode::OK,
             Json(DiscordMessage {
-                id: "m1".into(),
+                id: DiscordMessageId::parse("1".into()).expect("message ID"),
                 content,
             }),
         )
@@ -170,7 +170,7 @@ async fn discord_delete(
     Path((_id, message)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> StatusCode {
-    if message == "m1" && discord_authorized(&headers) {
+    if message == "1" && discord_authorized(&headers) {
         state.deletes.fetch_add(1, Ordering::SeqCst);
         StatusCode::NO_CONTENT
     } else {
@@ -290,7 +290,7 @@ async fn slack_post(
             StatusCode::OK,
             Json(SlackMessagePost {
                 ok: true,
-                ts: Some("1".into()),
+                ts: Some(SlackTimestamp::parse("1.0".into()).expect("timestamp")),
                 message: None,
             }),
         )
@@ -315,14 +315,16 @@ async fn slack_replies(
 ) -> impl IntoResponse {
     if slack_authorized(&headers, "bot")
         && query.get("channel").is_some_and(|channel| channel == "C42")
-        && query.get("ts").is_some_and(|timestamp| timestamp == "1")
+        && query.get("ts").is_some_and(|timestamp| timestamp == "1.0")
     {
         state.reads.fetch_add(1, Ordering::SeqCst);
         (
             StatusCode::OK,
             Json(SlackReplies {
                 ok: true,
-                messages: vec![SlackReply { ts: "1".into() }],
+                messages: vec![SlackReply {
+                    ts: SlackTimestamp::parse("1.0".into()).expect("timestamp"),
+                }],
             }),
         )
             .into_response()
@@ -343,7 +345,7 @@ async fn slack_delete(
     headers: HeaderMap,
     Json(body): Json<SlackDeleteRequest>,
 ) -> impl IntoResponse {
-    if slack_authorized(&headers, "bot") && body.channel == "C42" && body.ts == "1" {
+    if slack_authorized(&headers, "bot") && body.channel == "C42" && body.ts == "1.0" {
         state.deletes.fetch_add(1, Ordering::SeqCst);
         (StatusCode::OK, Json(SlackResult { ok: true })).into_response()
     } else {
@@ -510,11 +512,15 @@ fn provider_socket_urls_require_secure_or_loopback_transport() {
 }
 
 #[test]
-fn provider_channel_ids_cannot_change_endpoint_paths() {
-    assert!(ProviderChannelId::parse("42".into()).is_some());
-    assert!(ProviderChannelId::parse("C42".into()).is_some());
-    assert!(ProviderChannelId::parse("../../gateway".into()).is_none());
-    assert!(ProviderChannelId::parse("C42?token=secret".into()).is_none());
+fn provider_identifiers_have_distinct_closed_syntaxes() {
+    assert!(Secret::parse("credential".into()).is_some());
+    assert!(Secret::parse("credential\nvalue".into()).is_none());
+    assert!(DiscordChannelId::parse("42".into()).is_some());
+    assert!(DiscordChannelId::parse("C42".into()).is_none());
+    assert!(SlackChannelId::parse("C42".into()).is_some());
+    assert!(SlackChannelId::parse("42".into()).is_none());
+    assert!(DiscordMessageId::parse("../../gateway".into()).is_none());
+    assert!(SlackTimestamp::parse("1?token=secret".into()).is_none());
 }
 
 #[test]
@@ -583,16 +589,20 @@ fn slack_readback_requires_the_posted_message() {
     assert!(slack_readback_contains(
         &SlackReplies {
             ok: true,
-            messages: vec![SlackReply { ts: "1".into() }],
+            messages: vec![SlackReply {
+                ts: SlackTimestamp::parse("1.0".into()).expect("timestamp")
+            }],
         },
-        "1"
+        &SlackTimestamp::parse("1.0".into()).expect("timestamp")
     ));
     assert!(!slack_readback_contains(
         &SlackReplies {
             ok: true,
-            messages: vec![SlackReply { ts: "other".into() }],
+            messages: vec![SlackReply {
+                ts: SlackTimestamp::parse("2.0".into()).expect("timestamp")
+            }],
         },
-        "1"
+        &SlackTimestamp::parse("1.0".into()).expect("timestamp")
     ));
 }
 
@@ -600,26 +610,26 @@ fn slack_readback_requires_the_posted_message() {
 fn discord_readback_requires_the_posted_message() {
     assert!(discord_readback_matches(
         &DiscordMessage {
-            id: "m1".into(),
+            id: DiscordMessageId::parse("1".into()).expect("message ID"),
             content: "marker".into(),
         },
-        "m1",
+        &DiscordMessageId::parse("1".into()).expect("message ID"),
         "marker"
     ));
     assert!(!discord_readback_matches(
         &DiscordMessage {
-            id: "other".into(),
+            id: DiscordMessageId::parse("2".into()).expect("message ID"),
             content: "marker".into(),
         },
-        "m1",
+        &DiscordMessageId::parse("1".into()).expect("message ID"),
         "marker"
     ));
     assert!(!discord_readback_matches(
         &DiscordMessage {
-            id: "m1".into(),
+            id: DiscordMessageId::parse("1".into()).expect("message ID"),
             content: "other".into(),
         },
-        "m1",
+        &DiscordMessageId::parse("1".into()).expect("message ID"),
         "marker"
     ));
 }
@@ -654,10 +664,19 @@ async fn discord_oracle_proves_all_required_phases_and_cleanup() {
         ("E6IRC_DISCORD_CHANNEL_ID", "42"),
         ("E6IRC_DISCORD_API_BASE", &base),
     ]);
-    assert_eq!(setting("E6IRC_DISCORD_BOT_TOKEN").as_deref(), Some("token"));
-    assert_eq!(setting("E6IRC_DISCORD_CHANNEL_ID").as_deref(), Some("42"));
-    assert!(safe_url(&setting("E6IRC_DISCORD_API_BASE").expect("base")).is_some());
-    let base = safe_url(&setting("E6IRC_DISCORD_API_BASE").expect("base")).expect("safe base");
+    assert_eq!(
+        Secret::setting("E6IRC_DISCORD_BOT_TOKEN")
+            .map(|value| value.as_str().to_string())
+            .as_deref(),
+        Some("token")
+    );
+    assert_eq!(
+        environment_value("E6IRC_DISCORD_CHANNEL_ID").as_deref(),
+        Some("42")
+    );
+    assert!(safe_url(&environment_value("E6IRC_DISCORD_API_BASE").expect("base")).is_some());
+    let base =
+        safe_url(&environment_value("E6IRC_DISCORD_API_BASE").expect("base")).expect("safe base");
     let status = client()
         .expect("client")
         .get(
@@ -724,7 +743,12 @@ async fn slack_connection_requires_the_hello_frame() {
     );
     let base = safe_url(&base).expect("safe base");
     assert_eq!(
-        slack_connect(&client().expect("client"), &base, "app").await,
+        slack_connect(
+            &client().expect("client"),
+            &base,
+            &Secret::parse("app".into()).expect("app token")
+        )
+        .await,
         PhaseOutcome::Failed
     );
 }

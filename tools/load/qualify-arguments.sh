@@ -16,6 +16,10 @@ positive_decimal() {
   [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ && "${1//[.0]/}" ]]
 }
 
+qualification_host_label() {
+  [[ ${#1} -gt 0 && ${#1} -le 253 && "$1" =~ ^[[:alnum:]]([[:alnum:]._-]*[[:alnum:]])?$ ]]
+}
+
 target_port() {
   local target="$1" port
   if [[ "$target" =~ ^\[[^]]+\]:([0-9]+)$ ]]; then

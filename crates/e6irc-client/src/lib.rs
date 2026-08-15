@@ -514,10 +514,30 @@ impl Connection {
         Ok(false)
     }
 
-    /// `CAP LS` then request `sasl`, returning once the server ACKs it (or
-    /// erroring on NAK). The shared prologue of every SASL path.
-    async fn negotiate_sasl_cap(&mut self) -> io::Result<()> {
+    async fn begin_cap(&mut self) -> io::Result<()> {
         self.send_line("CAP LS 302").await?;
+        loop {
+            let msg = self.recv("closed during CAP discovery").await?;
+            if msg.command == "ERROR" {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "server refused the connection during CAP discovery",
+                ));
+            }
+            if msg.command == "CAP" && msg.params.get(1).map(String::as_str) == Some("LS") {
+                if msg.params.get(2).map(String::as_str) != Some("*") {
+                    return Ok(());
+                }
+            } else {
+                self.answer_ping(&msg).await?;
+            }
+        }
+    }
+
+    /// Request `sasl` after capability discovery, returning once the server
+    /// acknowledges it. The shared prologue of every SASL path.
+    async fn negotiate_sasl_cap(&mut self) -> io::Result<()> {
+        self.begin_cap().await?;
         self.send_line("CAP REQ :sasl").await?;
         loop {
             let msg = self.recv("closed during CAP").await?;
@@ -545,12 +565,26 @@ impl Connection {
         }
     }
 
-    /// Ask for the optional metadata capabilities shared by every registration
-    /// mode. Request each separately so one unsupported capability cannot NAK
-    /// the others as part of an atomic request.
+    /// Ask for each optional metadata capability after discovery. A refusal is
+    /// harmless, but its reply must be consumed before registration continues.
     async fn request_metadata_capabilities(&mut self) -> io::Result<()> {
         for capability in METADATA_CAPABILITIES {
             self.send_line(&format!("CAP REQ :{capability}")).await?;
+            loop {
+                let msg = self.recv("closed during capability negotiation").await?;
+                if msg.command == "ERROR" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "server refused the connection during capability negotiation",
+                    ));
+                }
+                if msg.command == "CAP"
+                    && matches!(msg.params.get(1).map(String::as_str), Some("ACK" | "NAK"))
+                {
+                    break;
+                }
+                self.answer_ping(&msg).await?;
+            }
         }
         Ok(())
     }
@@ -697,7 +731,7 @@ impl Connection {
     /// Register with a nick and realname, answering PINGs, until the
     /// welcome (001) arrives. Returns the confirmed nick.
     pub async fn register(&mut self, nick: &str, realname: &str) -> io::Result<String> {
-        self.send_line("CAP LS 302").await?;
+        self.begin_cap().await?;
         self.request_metadata_capabilities().await?;
         self.send_line(&format!("NICK {nick}")).await?;
         self.send_line(&format!("USER {nick} 0 * :{realname}"))
@@ -1037,7 +1071,7 @@ mod tests {
     #[tokio::test]
     async fn register_sasl_fails_loudly_on_reject_numeric() {
         use std::time::Duration;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
         // A server that ACKs sasl, then answers the AUTHENTICATE with a 904
         // failure numeric and holds the socket open. Without the terminal-numeric
         // handling in `await_authenticate_challenge`, this loops forever; with it,
@@ -1048,13 +1082,32 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (sr, mut sw) = tokio::io::split(server_io);
+            let mut lines = tokio::io::BufReader::new(sr).lines();
+            assert_eq!(lines.next_line().await.unwrap().unwrap(), "CAP LS 302");
+            sw.write_all(b":srv CAP * LS :sasl server-time message-tags account-tag\r\n")
+                .await
+                .unwrap();
+            assert_eq!(lines.next_line().await.unwrap().unwrap(), "CAP REQ :sasl");
             sw.write_all(b":srv CAP * ACK :sasl\r\n").await.unwrap();
+            for capability in METADATA_CAPABILITIES {
+                assert_eq!(
+                    lines.next_line().await.unwrap().unwrap(),
+                    format!("CAP REQ :{capability}")
+                );
+                sw.write_all(format!(":srv CAP * ACK :{capability}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                lines.next_line().await.unwrap().unwrap(),
+                "AUTHENTICATE PLAIN"
+            );
             sw.write_all(b":srv 904 * :SASL authentication failed\r\n")
                 .await
                 .unwrap();
             // Keep draining and holding the socket open so the client can't rely
             // on EOF to unblock — the failure must come from the numeric itself.
-            let mut reader = sr;
+            let mut reader = lines.into_inner();
             let mut buf = vec![0u8; 1024];
             loop {
                 if reader.read(&mut buf).await.unwrap_or(0) == 0 {
@@ -1114,6 +1167,9 @@ mod tests {
             let (sr, mut sw) = tokio::io::split(server_io);
             let mut lines = tokio::io::BufReader::new(sr).lines();
             assert_eq!(lines.next_line().await.unwrap().unwrap(), "CAP LS 302");
+            sw.write_all(b":srv CAP * LS :sasl server-time message-tags account-tag\r\n")
+                .await
+                .unwrap();
             assert_eq!(lines.next_line().await.unwrap().unwrap(), "CAP REQ :sasl");
             sw.write_all(b":srv CAP * ACK :sasl\r\n").await.unwrap();
             for capability in METADATA_CAPABILITIES {
@@ -1121,6 +1177,9 @@ mod tests {
                     lines.next_line().await.unwrap().unwrap(),
                     format!("CAP REQ :{capability}")
                 );
+                sw.write_all(format!(":srv CAP * ACK :{capability}\r\n").as_bytes())
+                    .await
+                    .unwrap();
             }
             assert_eq!(
                 lines.next_line().await.unwrap().unwrap(),

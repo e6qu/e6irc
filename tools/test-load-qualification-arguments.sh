@@ -10,6 +10,13 @@ positive_decimal 0.01
 ! positive_decimal 0.0
 ! positive_decimal nan
 
+qualification_host_label scale-host-01
+qualification_host_label host.example
+! qualification_host_label ''
+! qualification_host_label -host
+! qualification_host_label host-
+! qualification_host_label 'host name'
+
 [[ "$(target_port 127.0.0.1:6667)" == 6667 ]]
 [[ "$(target_port '[::1]:6697')" == 6697 ]]
 ! target_port 127.0.0.1

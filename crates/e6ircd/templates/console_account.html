@@ -40,11 +40,11 @@
 
       <section class="panel">
         <div class="panel-head"><div><h2>Personal access tokens</h2><p>Expiring bearer grants for API clients, IRC authentication, and automation.</p></div><span class="count" id="account-token-count">…</span></div>
-        <form class="inline-create" method="post" action="/api/v1/me/tokens" data-api-account-token>
+        <form class="inline-create token-create" method="post" action="/api/v1/me/tokens" data-api-account-token>
           <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
           <label class="field"><span>Label</span><input name="label" maxlength="64" placeholder="Monitoring automation" required /></label>
           <label class="field"><span>Lifetime</span><select name="expires_in_days"><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option><option value="365">365 days</option></select></label>
-          <fieldset class="field"><legend>Scopes</legend><label><input type="checkbox" name="scope_read" checked /> Read</label><label><input type="checkbox" name="scope_write" checked /> Write</label><label><input type="checkbox" name="scope_irc" checked /> IRC sign-in</label>{% if shell.is_admin %}<label><input type="checkbox" name="scope_administrator" /> Administrator</label>{% endif %}</fieldset>
+          <fieldset class="field token-scopes"><legend>Scopes</legend><label><input type="checkbox" name="scope_read" checked /> Read</label><label><input type="checkbox" name="scope_write" checked /> Write</label><label><input type="checkbox" name="scope_irc" checked /> IRC sign-in</label>{% if shell.is_admin %}<label><input type="checkbox" name="scope_administrator" /> Administrator</label>{% endif %}</fieldset>
           <button class="primary" type="submit">Create token</button>
         </form>
         <div class="scroll" tabindex="0" aria-label="Personal access tokens"><table><caption class="sr-only">Personal access tokens</caption><thead><tr><th>Label</th><th>Scopes</th><th>Created</th><th>Expiry</th><th>Actions</th></tr></thead><tbody id="account-token-rows" data-api-account-token-list data-csrf="{{ shell.csrf }}"><tr><td colspan="5" class="empty">Loading personal access tokens…</td></tr></tbody></table></div>

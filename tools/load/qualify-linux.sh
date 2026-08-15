@@ -24,6 +24,10 @@ minimum_fanout_rate="$9"
 maximum_p99_ms="${10}"
 maximum_rss_per_connection="${11}"
 qualification_host="${E6IRC_QUALIFICATION_HOST:?E6IRC_QUALIFICATION_HOST is required}"
+qualification_host_label "$qualification_host" || {
+  echo "E6IRC_QUALIFICATION_HOST must be a non-secret host label" >&2
+  exit 2
+}
 
 for value in "$server_pid" "$core_workers" "$maximum_rss_per_connection"; do
   positive_integer "$value" || { echo "positive integer required: $value" >&2; exit 2; }
