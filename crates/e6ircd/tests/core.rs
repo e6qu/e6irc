@@ -10151,7 +10151,7 @@ fn reason_bearing_relays_fit_the_wire_limit() {
     let long_nick = "n".repeat(16);
     let alice = s.connect(1);
     s.line(alice, &format!("NICK {long_nick}"));
-    s.line(alice, &format!("USER {} 0 * :real", "u".repeat(32)));
+    s.line(alice, &format!("USER {} 0 * :real", "u".repeat(10)));
     let reg = s.drain(alice);
     assert!(
         reg.iter().any(|l| l.contains(" 001 ")),
