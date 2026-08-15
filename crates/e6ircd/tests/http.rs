@@ -2028,9 +2028,20 @@ async fn console_configuration_manages_every_credential_collection() {
     );
     assert!(!body.contains(oper_secret), "{body}");
 
+    let missing_claim_body = r#"{"revision":2,"name":"incomplete","issuer_url":"https://id.example","client_id":"e6irc","client_secret":"secret","token_endpoint_auth_method":"client_secret_post"}"#;
+    let missing_claim_request = format!(
+        "POST /api/v1/admin/configuration/oidc-providers HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{missing_claim_body}",
+        missing_claim_body.len()
+    );
+    let (status, _, body) = request(http, &missing_claim_request).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("account_claim"), "{body}");
+
     let oidc_secret = "provider-secret-must-not-render";
     let oidc_body = format!(
-        r#"{{"revision":2,"name":"workforce","issuer_url":"https://id.example","client_id":"e6irc","client_secret":"{oidc_secret}","scopes":["openid","profile"],"allowed_email_domains":[],"end_session_endpoint":"https://id.example/logout","token_endpoint_auth_method":"client_secret_post"}}"#
+        r#"{{"revision":2,"name":"workforce","issuer_url":"https://id.example","client_id":"e6irc","client_secret":"{oidc_secret}","account_claim":"email","scopes":["openid","profile"],"allowed_email_domains":[],"end_session_endpoint":"https://id.example/logout","token_endpoint_auth_method":"client_secret_post"}}"#
     );
     let oidc_request = format!(
         "POST /api/v1/admin/configuration/oidc-providers HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
@@ -2079,6 +2090,10 @@ async fn console_configuration_manages_every_credential_collection() {
     assert_eq!(api["runtime"]["master_key_count"], 1);
     assert_eq!(api["settings"]["opers"][0]["password"], "");
     assert_eq!(api["settings"]["oidc_providers"][0]["client_secret"], "");
+    assert_eq!(
+        api["settings"]["oidc_providers"][0]["account_claim"],
+        "email"
+    );
     assert!(api["settings"]["networks"][0]["sasl_password"].is_null());
     assert!(api["settings"]["credentials_from_bootstrap"].is_boolean());
     let mut scalar_settings = api["settings"].clone();
@@ -6382,11 +6397,11 @@ async fn rp_initiated_logout_redirects_to_provider() {
             issuer_url: "https://auth.example".into(),
             client_id: "e6irc".into(),
             client_secret: "x".repeat(32),
-            account_claim: Default::default(),
+            account_claim: e6ircd::config::OidcAccountClaim::PreferredUsername,
             scopes: vec![],
             allowed_email_domains: vec![],
             end_session_endpoint: Some("https://auth.example/oauth2/sessions/logout".into()),
-            token_endpoint_auth_method: Default::default(),
+            token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
         }],
         application_release_revision: Some("0123456789ab".into()),
         ..Config::default()
@@ -6614,11 +6629,11 @@ async fn application_entry_starts_shauth_when_configured() {
             issuer_url: "https://auth.example".into(),
             client_id: "e6irc".into(),
             client_secret: "x".repeat(32),
-            account_claim: Default::default(),
+            account_claim: e6ircd::config::OidcAccountClaim::PreferredUsername,
             scopes: vec![],
             allowed_email_domains: vec![],
             end_session_endpoint: Some("https://auth.example/oauth2/sessions/logout".into()),
-            token_endpoint_auth_method: Default::default(),
+            token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
         }],
         application_release_revision: Some("0123456789ab".into()),
         ..Config::default()
@@ -6710,11 +6725,11 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
             issuer_url: "https://auth.example".into(),
             client_id: "e6irc".into(),
             client_secret: "x".repeat(32),
-            account_claim: Default::default(),
+            account_claim: e6ircd::config::OidcAccountClaim::PreferredUsername,
             scopes: vec![],
             allowed_email_domains: vec![],
             end_session_endpoint: None,
-            token_endpoint_auth_method: Default::default(),
+            token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
         }],
         application_release_revision: Some("0123456789ab".into()),
         ..Config::default()

@@ -4019,10 +4019,11 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
             issuer_url: "https://auth.example".into(),
             client_id: "e6irc".into(),
             client_secret: "secret".into(),
+            account_claim: crate::config::OidcAccountClaim::PreferredUsername,
             scopes: vec![],
             allowed_email_domains: vec![],
             end_session_endpoint: None,
-            token_endpoint_auth_method: Default::default(),
+            token_endpoint_auth_method: crate::config::TokenEndpointAuthMethod::ClientSecretBasic,
         }
     }
 

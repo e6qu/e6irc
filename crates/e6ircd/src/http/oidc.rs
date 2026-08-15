@@ -491,17 +491,21 @@ pub(super) async fn oidc_callback(
             }
         };
     }
-    let account_claim = match provider.account_claim {
-        crate::config::OidcAccountClaim::PreferredUsername => {
-            claims.preferred_username().map(|value| value.as_str())
-        }
-        crate::config::OidcAccountClaim::Email => claims.email().map(|value| value.as_str()),
+    let (account_claim, detail) = match provider.account_claim {
+        crate::config::OidcAccountClaim::PreferredUsername => (
+            claims.preferred_username().map(|value| value.as_str()),
+            "The configured preferred_username claim must contain an IRC-safe account name.",
+        ),
+        crate::config::OidcAccountClaim::Email => (
+            claims.email().map(|value| value.as_str()),
+            "The configured email claim must contain an IRC-safe account name.",
+        ),
     };
     let Some(preferred) = account_claim.and_then(crate::sanitize::account_name) else {
         return problem(
             StatusCode::UNAUTHORIZED,
-            "Provider sent no usable preferred username",
-            Some("A preferred_username claim with an IRC-safe account name is required."),
+            "Provider sent no usable account claim",
+            Some(detail),
         );
     };
     // Only stored roles reach the database.
@@ -1613,13 +1617,14 @@ mod domain_policy_tests {
             issuer_url: "https://identity.example".into(),
             client_id: "e6irc".into(),
             client_secret: "secret".into(),
+            account_claim: crate::config::OidcAccountClaim::PreferredUsername,
             scopes: vec![],
             allowed_email_domains: domains
                 .iter()
                 .map(|domain| crate::identity::EmailDomain::parse(domain).expect("test domain"))
                 .collect(),
             end_session_endpoint: None,
-            token_endpoint_auth_method: Default::default(),
+            token_endpoint_auth_method: crate::config::TokenEndpointAuthMethod::ClientSecretBasic,
         }
     }
 

@@ -1020,7 +1020,6 @@ pub(super) struct AdminOidcBody {
     #[serde(default)]
     allowed_email_domains: Vec<String>,
     end_session_endpoint: Option<String>,
-    #[serde(default)]
     account_claim: crate::config::OidcAccountClaim,
     token_endpoint_auth_method: crate::config::TokenEndpointAuthMethod,
 }
