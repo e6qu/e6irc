@@ -253,6 +253,10 @@
       .access-grid .panel { margin-top: 0; }
       .inline-create { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end;
         gap: 0.65rem; margin: 1rem 0; }
+      .token-create { grid-template-columns: minmax(0, 1fr) minmax(8rem, 0.35fr) auto; }
+      .token-scopes { grid-column: 1 / -1; margin: 0; padding: 0.7rem 0.8rem; }
+      .token-scopes > label { display: inline-flex; align-items: center; gap: 0.4rem; margin: 0.2rem 1rem 0.2rem 0; }
+      .token-scopes input { width: 1rem; height: 1rem; margin: 0; accent-color: var(--accent); }
       .secret-reveal { display: grid; grid-template-columns: minmax(12rem, 0.55fr) minmax(0, 1fr);
         gap: 1rem; align-items: center; padding: 1rem 1.2rem; margin: 0 0 1.2rem;
         color: var(--fg); background: color-mix(in srgb, var(--ok) 10%, var(--panel));
