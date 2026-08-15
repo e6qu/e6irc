@@ -503,8 +503,8 @@ function renderActive({ atLatest = true } = {}) {
   renderNickList();
 }
 
-function isNearLatest() {
-  return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 40;
+function isAtLatest() {
+  return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight <= 1;
 }
 
 function renderJumpLatest() {
@@ -518,7 +518,7 @@ function renderJumpLatest() {
 }
 
 messagesEl.addEventListener("scroll", () => {
-  if (!isNearLatest()) return;
+  if (!isAtLatest()) return;
   const b = buffers.get(active);
   if (!b || b.pendingVisibleMessages === 0) return;
   b.pendingVisibleMessages = 0;
@@ -661,7 +661,7 @@ function addLine(bufName, kind, bufKind, from, text, tags = null) {
   b.lines.push(line);
   if (b.lines.length > MAX_LINES) b.lines.shift();
   if (b.key === active) {
-    const nearBottom = isNearLatest();
+    const atLatest = isAtLatest();
     messagesEl.appendChild(messageRow(line));
     // Trim on the actual DOM node count — the model was already clamped above,
     // so a guard on `b.lines.length` would never fire and the DOM would grow
@@ -669,7 +669,7 @@ function addLine(bufName, kind, bufKind, from, text, tags = null) {
     while (messagesEl.children.length > MAX_LINES && messagesEl.firstChild) {
       messagesEl.removeChild(messagesEl.firstChild);
     }
-    if (nearBottom) {
+    if (atLatest) {
       messagesEl.scrollTop = messagesEl.scrollHeight;
       b.pendingVisibleMessages = 0;
     } else {
