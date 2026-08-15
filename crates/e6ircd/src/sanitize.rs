@@ -19,30 +19,21 @@
 //! (`truncate_chars`, `fit_trailing`, `fit_relayed_text`) over
 //! `e6irc_proto::message::truncate_on_char_boundary`.
 
-/// A username reduced to one safe for the `nick!user@host` source prefix. `!`
-/// (the nick/user separator) and `@` (the user/host one) would make the prefix
-/// ambiguous — a client reading `nick!a@evil@host` sees host `evil@host` — and
-/// RFC 2812 already forbids `@` and space in a username. Those and control bytes
-/// are dropped; the result is byte-bounded to `max_len`, with a fallback so an
-/// all-`@` username cannot collapse to the malformed `nick!@host`.
-pub(crate) fn username(raw: &str, max_len: usize) -> String {
-    let cleaned: String = raw
-        .chars()
-        .filter(|&c| !matches!(c, '!' | '@' | ' ') && !c.is_control())
-        .collect();
-    let cleaned = e6irc_proto::message::truncate_on_char_boundary(&cleaned, max_len);
-    if cleaned.is_empty() {
-        "user".to_string()
-    } else {
-        cleaned.to_string()
-    }
+/// Validate a username for the `nick!user@host` source prefix.
+pub(crate) fn username(raw: &str, max_len: usize) -> Option<String> {
+    (!raw.is_empty()
+        && raw.len() <= max_len
+        && raw
+            .chars()
+            .all(|c| !matches!(c, '!' | '@' | ' ') && !c.is_control()))
+    .then(|| raw.to_string())
 }
 
 /// A provider-supplied name reduced to a nick-like account name: ASCII
 /// alphanumerics and the RFC1459 "special" nick characters survive, everything
-/// else (spaces, control, line/tag separators) is dropped, bounded to 32, with a
-/// fallback when nothing is left. Used for OIDC provisioning.
-pub(crate) fn account_name(raw: &str) -> String {
+/// else (spaces, control, line/tag separators) is dropped and bounded to 32.
+/// Returns `None` when no usable name remains. Used for OIDC provisioning.
+pub(crate) fn account_name(raw: &str) -> Option<String> {
     let cleaned: String = raw
         .chars()
         .filter(|c| {
@@ -54,11 +45,7 @@ pub(crate) fn account_name(raw: &str) -> String {
         })
         .take(32)
         .collect();
-    if cleaned.is_empty() {
-        "user".to_string()
-    } else {
-        cleaned
-    }
+    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 /// An arbitrary upstream display name reduced to a safe nick token for the
@@ -193,10 +180,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn username_drops_prefix_breaking_chars() {
-        assert_eq!(username("a@evil.com!x", 10), "aevil.comx");
-        assert_eq!(username("@@@", 10), "user");
-        assert_eq!(username("ok_name", 10), "ok_name");
+    fn username_rejects_prefix_breaking_chars() {
+        assert_eq!(username("a@evil.com!x", 10), None);
+        assert_eq!(username("@@@", 10), None);
+        assert_eq!(username("ok_name", 10), Some("ok_name".to_string()));
     }
 
     #[test]
@@ -234,10 +221,11 @@ mod tests {
     }
 
     #[test]
-    fn username_output_is_prefix_safe() {
+    fn username_is_prefix_safe_or_rejected() {
         each_input(|raw| {
-            let out = username(raw, 8);
-            assert!(!out.is_empty(), "username empty for {raw:?}");
+            let Some(out) = username(raw, 8) else {
+                return;
+            };
             assert!(out.len() <= 8, "username over budget: {out:?}");
             for c in out.chars() {
                 assert!(
@@ -249,10 +237,11 @@ mod tests {
     }
 
     #[test]
-    fn account_name_output_is_nick_charset() {
+    fn account_name_is_nick_charset_or_rejected() {
         each_input(|raw| {
-            let out = account_name(raw);
-            assert!(!out.is_empty(), "account_name empty for {raw:?}");
+            let Some(out) = account_name(raw) else {
+                return;
+            };
             assert!(out.chars().count() <= 32, "account_name too long: {out:?}");
             for c in out.chars() {
                 assert!(
@@ -265,6 +254,12 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn account_name_rejects_an_empty_sanitized_value() {
+        assert_eq!(account_name(" @!\r\n"), None);
+        assert_eq!(account_name("valid_name"), Some("valid_name".to_string()));
     }
 
     #[test]

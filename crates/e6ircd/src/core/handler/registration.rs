@@ -111,16 +111,20 @@ pub(super) fn cmd_user(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.err_needmoreparams(conn, "USER");
         return;
     }
+    let Some(user) = crate::sanitize::username(p[0], USERLEN) else {
+        state.numeric(
+            conn,
+            e6irc_proto::numerics::ERR_INVALIDUSERNAME,
+            &[p[0]],
+            Some("Invalid username"),
+        );
+        return;
+    };
     let session = state
         .sessions
         .get_mut(&conn)
         .expect("session checked in dispatch");
-    // Identity fields are bounded at intake (USERLEN/REALLEN below, nick by
-    // nicklen): they ride in the source prefix or WHOIS replies of *other*
-    // lines, so an unbounded one makes every such line's fixed head unbounded
-    // and no per-line fitting can save it. Truncation here is the protocol
-    // norm (Solanum does the same) and USERLEN is advertised in ISUPPORT.
-    session.set_user(crate::sanitize::username(p[0], USERLEN));
+    session.set_user(user);
     session.set_realname(truncate_chars(p[3], REALLEN).to_string());
     maybe_complete_registration(state, conn);
 }

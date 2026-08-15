@@ -491,19 +491,16 @@ pub(super) async fn oidc_callback(
             }
         };
     }
-    let preferred = claims
+    let Some(preferred) = claims
         .preferred_username()
-        .map(|u| u.as_str().to_string())
-        .or_else(|| {
-            claims
-                .email()
-                .and_then(|e| e.as_str().split('@').next().map(str::to_string))
-        })
-        .unwrap_or_else(|| "user".to_string());
-    // The provider-supplied name is echoed into IRC numerics/tags (WHOISACCOUNT,
-    // extended-join, account= tag); strip anything that isn't a safe nick-like
-    // character so a spaced/control-laden username can't split a line.
-    let preferred = crate::sanitize::account_name(&preferred);
+        .and_then(|value| crate::sanitize::account_name(value.as_str()))
+    else {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "Provider sent no usable preferred username",
+            Some("A preferred_username claim with an IRC-safe account name is required."),
+        );
+    };
     // Only stored roles reach the database.
     let role = token_claims
         .as_ref()
