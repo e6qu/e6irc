@@ -214,6 +214,19 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
             line.clear();
             let bytes_read = read.read_until(b'\n', &mut line).await.unwrap();
             assert_ne!(bytes_read, 0, "driver closed during registration");
+            if line == b"CAP LS 302\r\n" {
+                write
+                    .write_all(b":up CAP * LS :server-time message-tags account-tag\r\n")
+                    .await
+                    .unwrap();
+            } else if let Some(capability) = line
+                .strip_prefix(b"CAP REQ :")
+                .and_then(|line| line.strip_suffix(b"\r\n"))
+            {
+                write.write_all(b":up CAP * ACK :").await.unwrap();
+                write.write_all(capability).await.unwrap();
+                write.write_all(b"\r\n").await.unwrap();
+            }
             if line == b"CAP END\r\n" {
                 break;
             }
@@ -1038,9 +1051,20 @@ impl FakeSession {
             .expect("upstream write failed");
     }
 
+    async fn negotiate_capabilities(&mut self) {
+        assert_eq!(self.read_line().await, "CAP LS 302");
+        self.send(":up CAP * LS :server-time message-tags account-tag")
+            .await;
+        for capability in ["server-time", "message-tags", "account-tag"] {
+            assert_eq!(self.read_line().await, format!("CAP REQ :{capability}"));
+            self.send(&format!(":up CAP * ACK :{capability}")).await;
+        }
+    }
+
     /// Read until the registration burst (NICK/USER) completes, then welcome
     /// the client. Returns nothing; the driver treats 001 as registered.
     async fn complete_registration(&mut self, nick: &str) {
+        self.negotiate_capabilities().await;
         loop {
             let line = self.read_line().await;
             if line.starts_with("USER ") {
@@ -1069,6 +1093,7 @@ async fn nick_conflict_retries_with_alt_nick() {
     let (nick_tx, mut nick_rx) = tokio::sync::mpsc::channel(4);
     tokio::spawn(async move {
         let mut session = fake_accept(&listener).await;
+        session.negotiate_capabilities().await;
         let mut refused = false;
         // The registration burst is pipelined (NICK, USER, CAP END arrive
         // together), so the 433 meets the client in await_welcome; the retry
