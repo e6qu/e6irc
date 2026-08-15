@@ -608,7 +608,7 @@ impl Connection {
     /// SASL failure numeric. `Ok(None)` means keep looping; a PING was
     /// answered on the way.
     async fn sasl_terminal_error(&mut self, msg: &OwnedMessage) -> io::Result<Option<io::Error>> {
-        if let Some(err) = registration_refused(&msg.command) {
+        if let Some(err) = registration_refused(msg) {
             return Ok(Some(err));
         }
         if matches!(msg.command.as_str(), "902" | "904" | "905" | "906" | "908") {
@@ -646,14 +646,11 @@ impl Connection {
     async fn await_welcome(&mut self, nick: &str) -> io::Result<String> {
         loop {
             let msg = self.recv("closed before welcome").await?;
-            if let Some(err) = registration_refused(&msg.command) {
+            if let Some(err) = registration_refused(&msg) {
                 return Err(err);
             }
             if msg.command == "ERROR" {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    "server refused registration",
-                ));
+                return Err(RegistrationRefusal::NotRegistered.error(&msg));
             }
             match msg.command.as_str() {
                 "001" => {
@@ -943,11 +940,18 @@ pub enum RegistrationRefusal {
 }
 
 #[derive(Debug)]
-struct RegistrationRefusalError(RegistrationRefusal);
+struct RegistrationRefusalError {
+    refusal: RegistrationRefusal,
+    diagnostic: String,
+}
 
 impl std::fmt::Display for RegistrationRefusalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "IRC registration refusal: {:?}", self.0)
+        write!(
+            f,
+            "IRC registration refusal: {:?}: {}",
+            self.refusal, self.diagnostic
+        )
     }
 }
 
@@ -958,10 +962,10 @@ impl RegistrationRefusal {
         error
             .get_ref()?
             .downcast_ref::<RegistrationRefusalError>()
-            .map(|error| error.0)
+            .map(|error| error.refusal)
     }
 
-    fn error(self) -> io::Error {
+    fn error(self, message: &OwnedMessage) -> io::Error {
         let kind = match self {
             Self::NicknameInUse => io::ErrorKind::AlreadyExists,
             Self::InvalidNickname => io::ErrorKind::InvalidInput,
@@ -969,12 +973,18 @@ impl RegistrationRefusal {
             Self::NetworkBanned => io::ErrorKind::ConnectionAborted,
             Self::NotRegistered => io::ErrorKind::Other,
         };
-        io::Error::new(kind, RegistrationRefusalError(self))
+        io::Error::new(
+            kind,
+            RegistrationRefusalError {
+                refusal: self,
+                diagnostic: registration_diagnostic(message),
+            },
+        )
     }
 }
 
-fn registration_refused(command: &str) -> Option<io::Error> {
-    let refusal = match command {
+fn registration_refused(message: &OwnedMessage) -> Option<io::Error> {
+    let refusal = match message.command.as_str() {
         "432" => RegistrationRefusal::InvalidNickname,
         "433" => RegistrationRefusal::NicknameInUse,
         "464" => RegistrationRefusal::ServerPasswordRejected,
@@ -982,7 +992,26 @@ fn registration_refused(command: &str) -> Option<io::Error> {
         "451" => RegistrationRefusal::NotRegistered,
         _ => return None,
     };
-    Some(refusal.error())
+    Some(refusal.error(message))
+}
+
+fn registration_diagnostic(message: &OwnedMessage) -> String {
+    let detail = message
+        .params
+        .last()
+        .map(String::as_str)
+        .unwrap_or("no detail");
+    detail
+        .chars()
+        .take(160)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 /// Install aws-lc-rs as the process rustls provider, once.
@@ -1015,9 +1044,25 @@ mod tests {
             ("465", RegistrationRefusal::NetworkBanned),
             ("451", RegistrationRefusal::NotRegistered),
         ] {
-            let error = registration_refused(numeric).expect("known refusal numeric");
+            let message = OwnedMessage::from(
+                &Message::parse(&format!(":srv {numeric} nick :refused")).expect("numeric"),
+            );
+            let error = registration_refused(&message).expect("known refusal numeric");
             assert_eq!(RegistrationRefusal::from_error(&error), Some(expected));
         }
+    }
+
+    #[test]
+    fn registration_diagnostic_is_bounded_and_control_safe() {
+        let message = OwnedMessage {
+            tags: Vec::new(),
+            source: None,
+            command: "ERROR".into(),
+            params: vec![format!("{}\r\nnext", "x".repeat(200))],
+        };
+        let diagnostic = registration_diagnostic(&message);
+        assert_eq!(diagnostic.chars().count(), 160);
+        assert!(!diagnostic.chars().any(char::is_control));
     }
 
     #[test]
