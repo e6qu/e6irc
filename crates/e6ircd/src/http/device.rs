@@ -1020,6 +1020,8 @@ pub(super) struct AdminOidcBody {
     #[serde(default)]
     allowed_email_domains: Vec<String>,
     end_session_endpoint: Option<String>,
+    #[serde(default)]
+    account_claim: crate::config::OidcAccountClaim,
     token_endpoint_auth_method: crate::config::TokenEndpointAuthMethod,
 }
 
@@ -1395,6 +1397,7 @@ pub(super) async fn admin_create_oidc_provider(
                 scopes,
                 allowed_email_domains: domains,
                 end_session_endpoint,
+                account_claim: body.account_claim,
                 token_endpoint_auth_method: body.token_endpoint_auth_method,
             },
         )

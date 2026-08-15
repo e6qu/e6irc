@@ -558,6 +558,8 @@ pub struct OidcProviderConfig {
     pub issuer_url: String,
     pub client_id: String,
     pub client_secret: String,
+    #[serde(default)]
+    pub account_claim: OidcAccountClaim,
     /// OAuth scopes to request in addition to `openid`. Defaults to
     /// `profile` + `email`; providers like Shauth also accept
     /// `offline_access`.
@@ -581,6 +583,14 @@ pub struct OidcProviderConfig {
     /// registers managed applications with `client_secret_post`.
     #[serde(default)]
     pub token_endpoint_auth_method: TokenEndpointAuthMethod,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OidcAccountClaim {
+    #[default]
+    PreferredUsername,
+    Email,
 }
 
 /// Client authentication methods e6irc supports at the token endpoint.

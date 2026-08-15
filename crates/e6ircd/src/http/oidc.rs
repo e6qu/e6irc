@@ -491,10 +491,13 @@ pub(super) async fn oidc_callback(
             }
         };
     }
-    let Some(preferred) = claims
-        .preferred_username()
-        .and_then(|value| crate::sanitize::account_name(value.as_str()))
-    else {
+    let account_claim = match provider.account_claim {
+        crate::config::OidcAccountClaim::PreferredUsername => {
+            claims.preferred_username().map(|value| value.as_str())
+        }
+        crate::config::OidcAccountClaim::Email => claims.email().map(|value| value.as_str()),
+    };
+    let Some(preferred) = account_claim.and_then(crate::sanitize::account_name) else {
         return problem(
             StatusCode::UNAUTHORIZED,
             "Provider sent no usable preferred username",
