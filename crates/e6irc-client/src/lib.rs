@@ -593,14 +593,19 @@ impl Connection {
     /// has been offered.
     async fn await_authenticate_challenge(&mut self) -> io::Result<()> {
         loop {
-            let msg = self.recv("closed during SASL").await?;
-            if let Some(err) = self.sasl_terminal_error(&msg).await? {
-                return Err(err);
-            }
+            let msg = self.recv_sasl_message().await?;
             if msg.command == "AUTHENTICATE" {
                 return Ok(());
             }
         }
+    }
+
+    async fn recv_sasl_message(&mut self) -> io::Result<OwnedMessage> {
+        let msg = self.recv("closed during SASL").await?;
+        if let Some(err) = self.sasl_terminal_error(&msg).await? {
+            return Err(err);
+        }
+        Ok(msg)
     }
 
     /// In a SASL wait loop: the terminal errors — a registration-refusal
@@ -627,10 +632,7 @@ impl Connection {
     /// can't complete registration ahead of it and mask a failure.
     async fn finish_sasl_then_welcome(&mut self, nick: &str) -> io::Result<String> {
         loop {
-            let msg = self.recv("closed during SASL").await?;
-            if let Some(err) = self.sasl_terminal_error(&msg).await? {
-                return Err(err);
-            }
+            let msg = self.recv_sasl_message().await?;
             // 903 RPL_SASLSUCCESS: authenticated — now finish CAP.
             if msg.command == "903" {
                 self.send_line("CAP END").await?;
