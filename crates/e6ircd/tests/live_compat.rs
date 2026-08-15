@@ -16,10 +16,7 @@ async fn probe(addr: &str, server_name: &str) -> std::io::Result<(bool, HashMap<
     let mut conn = Connection::connect_tls(addr, server_name, webpki_root_store()).await?;
     // Use a brief unique nick.
     let nick = format!("e6c{:05}", std::process::id() % 100000);
-    conn.send_line("CAP LS 302").await?;
-    conn.send_line(&format!("NICK {nick}")).await?;
-    conn.send_line(&format!("USER {nick} 0 * :e6irc interop probe"))
-        .await?;
+    conn.register(&nick, "e6irc interop probe").await?;
 
     let mut welcomed = false;
     let mut isupport: HashMap<String, String> = HashMap::new();
@@ -30,10 +27,6 @@ async fn probe(addr: &str, server_name: &str) -> std::io::Result<(bool, HashMap<
                 "PING" => {
                     let token = msg.params.first().cloned().unwrap_or_default();
                     conn.send_line(&format!("PONG :{token}")).await?;
-                }
-                // Complete CAP negotiation.
-                "CAP" if msg.params.get(1).map(String::as_str) == Some("LS") => {
-                    conn.send_line("CAP END").await?;
                 }
                 "001" => welcomed = true,
                 // RPL_ISUPPORT.
