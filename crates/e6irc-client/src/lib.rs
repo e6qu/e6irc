@@ -1142,10 +1142,45 @@ mod tests {
         assert!(address_host("[2001:db8::1]").is_err());
     }
 
+    async fn negotiate_sasl(
+        server_io: tokio::io::DuplexStream,
+        mechanism: &str,
+    ) -> (
+        tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (reader, mut writer) = tokio::io::split(server_io);
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        assert_eq!(lines.next_line().await.unwrap().unwrap(), "CAP LS 302");
+        writer
+            .write_all(b":srv CAP * LS :sasl server-time message-tags account-tag\r\n")
+            .await
+            .unwrap();
+        assert_eq!(lines.next_line().await.unwrap().unwrap(), "CAP REQ :sasl");
+        writer.write_all(b":srv CAP * ACK :sasl\r\n").await.unwrap();
+        for capability in METADATA_CAPABILITIES {
+            assert_eq!(
+                lines.next_line().await.unwrap().unwrap(),
+                format!("CAP REQ :{capability}")
+            );
+            writer
+                .write_all(format!(":srv CAP * ACK :{capability}\r\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            lines.next_line().await.unwrap().unwrap(),
+            format!("AUTHENTICATE {mechanism}")
+        );
+        (lines, writer)
+    }
+
     #[tokio::test]
     async fn register_sasl_fails_loudly_on_reject_numeric() {
         use std::time::Duration;
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         // A server that ACKs sasl, then answers the AUTHENTICATE with a 904
         // failure numeric and holds the socket open. Without the terminal-numeric
         // handling in `await_authenticate_challenge`, this loops forever; with it,
@@ -1155,27 +1190,7 @@ mod tests {
         let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
 
         let server = tokio::spawn(async move {
-            let (sr, mut sw) = tokio::io::split(server_io);
-            let mut lines = tokio::io::BufReader::new(sr).lines();
-            assert_eq!(lines.next_line().await.unwrap().unwrap(), "CAP LS 302");
-            sw.write_all(b":srv CAP * LS :sasl server-time message-tags account-tag\r\n")
-                .await
-                .unwrap();
-            assert_eq!(lines.next_line().await.unwrap().unwrap(), "CAP REQ :sasl");
-            sw.write_all(b":srv CAP * ACK :sasl\r\n").await.unwrap();
-            for capability in METADATA_CAPABILITIES {
-                assert_eq!(
-                    lines.next_line().await.unwrap().unwrap(),
-                    format!("CAP REQ :{capability}")
-                );
-                sw.write_all(format!(":srv CAP * ACK :{capability}\r\n").as_bytes())
-                    .await
-                    .unwrap();
-            }
-            assert_eq!(
-                lines.next_line().await.unwrap().unwrap(),
-                "AUTHENTICATE PLAIN"
-            );
+            let (lines, mut sw) = negotiate_sasl(server_io, "PLAIN").await;
             sw.write_all(b":srv 904 * :SASL authentication failed\r\n")
                 .await
                 .unwrap();
@@ -1232,33 +1247,13 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_registration_requests_the_same_metadata_as_other_modes() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let (client_io, server_io) = tokio::io::duplex(16 * 1024);
         let (cr, cw) = tokio::io::split(client_io);
         let mut connection = Connection::from_halves(Box::new(cr), Box::new(cw));
         let server = tokio::spawn(async move {
-            let (sr, mut sw) = tokio::io::split(server_io);
-            let mut lines = tokio::io::BufReader::new(sr).lines();
-            assert_eq!(lines.next_line().await.unwrap().unwrap(), "CAP LS 302");
-            sw.write_all(b":srv CAP * LS :sasl server-time message-tags account-tag\r\n")
-                .await
-                .unwrap();
-            assert_eq!(lines.next_line().await.unwrap().unwrap(), "CAP REQ :sasl");
-            sw.write_all(b":srv CAP * ACK :sasl\r\n").await.unwrap();
-            for capability in METADATA_CAPABILITIES {
-                assert_eq!(
-                    lines.next_line().await.unwrap().unwrap(),
-                    format!("CAP REQ :{capability}")
-                );
-                sw.write_all(format!(":srv CAP * ACK :{capability}\r\n").as_bytes())
-                    .await
-                    .unwrap();
-            }
-            assert_eq!(
-                lines.next_line().await.unwrap().unwrap(),
-                "AUTHENTICATE OAUTHBEARER"
-            );
+            let (mut lines, mut sw) = negotiate_sasl(server_io, "OAUTHBEARER").await;
             sw.write_all(b"AUTHENTICATE +\r\n").await.unwrap();
             assert_eq!(lines.next_line().await.unwrap().unwrap(), "NICK nick");
             assert_eq!(

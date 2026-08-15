@@ -3156,6 +3156,7 @@ mod ingress_tests {
                 op: true,
                 voice: false,
             },
+            e6irc_proto::time::MonoMillis::from_millis(1),
         );
         first.state.channels.entry(key).or_insert(channel);
         let other = ["#delta", "#echo", "#foxtrot"]
@@ -3509,6 +3510,7 @@ mod ingress_tests {
             ),
             MemberIdentity::new("remote".into(), "remote!u@host.test".into(), false),
             MemberModes::default(),
+            e6irc_proto::time::MonoMillis::from_millis(1),
         );
         first.state.channels.entry(key.clone()).or_insert(channel);
         first_tx
@@ -3577,6 +3579,7 @@ mod ingress_tests {
             ),
             MemberIdentity::new("peer".into(), "peer!u@host.test".into(), false),
             MemberModes::default(),
+            e6irc_proto::time::MonoMillis::from_millis(1),
         );
         first.state.channels.entry(key).or_insert(channel);
 

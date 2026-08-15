@@ -1026,7 +1026,7 @@ pub(crate) struct ChannelMemberProfile {
 
 impl ChannelMemberProfile {
     #[cfg(test)]
-    fn derived(identity: &MemberIdentity) -> Self {
+    fn derived(identity: &MemberIdentity, last_active: e6irc_proto::time::MonoMillis) -> Self {
         let (_, user_host) = identity
             .prefix
             .split_once('!')
@@ -1040,7 +1040,7 @@ impl ChannelMemberProfile {
             away: false,
             oper: false,
             bot: false,
-            last_active: e6irc_proto::time::MonoMillis::default(),
+            last_active,
         }
     }
 }
@@ -2111,10 +2111,11 @@ impl Channel {
         recipient: Recipient,
         identity: MemberIdentity,
         modes: MemberModes,
+        last_active: e6irc_proto::time::MonoMillis,
     ) {
         self.add_member_with_profile(
             recipient,
-            ChannelMemberProfile::derived(&identity),
+            ChannelMemberProfile::derived(&identity, last_active),
             identity,
             modes,
         );
@@ -4668,6 +4669,7 @@ mod session_store_tests {
                 op: true,
                 voice: false,
             },
+            e6irc_proto::time::MonoMillis::from_millis(1),
         );
 
         let first = channel.recipients();
@@ -4684,6 +4686,7 @@ mod session_store_tests {
                 op: false,
                 voice: false,
             },
+            e6irc_proto::time::MonoMillis::from_millis(1),
         );
         let changed = channel.recipients();
         assert!(!Arc::ptr_eq(&first, &changed));
@@ -4712,6 +4715,7 @@ mod session_store_tests {
             ),
             MemberIdentity::new("[Alice]".into(), "[Alice]!u@h".into(), false),
             MemberModes::default(),
+            e6irc_proto::time::MonoMillis::from_millis(1),
         );
 
         let (conn, recipient, identity) = channel
@@ -4733,6 +4737,7 @@ mod session_store_tests {
             recipient,
             MemberIdentity::new("one".into(), "one!u@h".into(), false),
             MemberModes::default(),
+            e6irc_proto::time::MonoMillis::from_millis(1),
         );
         state.channels.entry(key.clone()).or_insert(channel);
         state
@@ -4772,6 +4777,7 @@ mod session_store_tests {
             },
             MemberIdentity::new("remote".into(), "remote!u@h".into(), false),
             MemberModes::default(),
+            e6irc_proto::time::MonoMillis::from_millis(1),
         );
         state.channels.entry(key.clone()).or_insert(channel);
 
