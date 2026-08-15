@@ -128,6 +128,35 @@ impl SafeText {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+struct EvidenceHost(String);
+
+impl EvidenceHost {
+    fn parse(value: String, flag: &str) -> Result<Self, String> {
+        SafeText::parse(value.clone(), flag)?;
+        if value.len() > 253
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+            || !value
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            || !value
+                .bytes()
+                .last()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Err(format!("{flag} must be a non-secret host label"));
+        }
+        Ok(Self(value))
+    }
+
+    fn validate(&self, flag: &str) -> Result<(), String> {
+        Self::parse(self.0.clone(), flag).map(|_| ())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(transparent)]
 struct CampaignTarget(SafeText);
 
@@ -164,16 +193,14 @@ impl CampaignTarget {
 
 fn validate_external_oidc_issuer(value: &str) -> Result<(), String> {
     let url = Url::parse(value).map_err(|_| "OIDC target must be an HTTPS issuer URL")?;
-    let loopback = url.host_str().is_some_and(native::is_loopback_host);
     if url.scheme() != "https"
-        || url.host_str().is_none()
+        || !url.host_str().is_some_and(native::is_external_host)
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
-        || loopback
     {
-        return Err("OIDC target must be a non-loopback HTTPS issuer URL".into());
+        return Err("OIDC target must be an HTTPS issuer URL with a public DNS host".into());
     }
     Ok(())
 }
@@ -279,7 +306,7 @@ struct Campaign {
     kind: TargetKind,
     target: CampaignTarget,
     source: SourceRevision,
-    host: SafeText,
+    host: EvidenceHost,
     executable: Option<PathBuf>,
     output: PathBuf,
     workload: Measurements,
@@ -338,7 +365,10 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Campaign,
                 if host.is_some() {
                     return Err("--host must occur once".into());
                 }
-                host = Some(SafeText::parse(value(&mut arguments, "--host")?, "--host")?);
+                host = Some(EvidenceHost::parse(
+                    value(&mut arguments, "--host")?,
+                    "--host",
+                )?);
             }
             "--executable" => {
                 if executable.is_some() {
@@ -634,7 +664,7 @@ struct QualificationEvidence {
     target: CampaignTarget,
     source: SourceRevision,
     subject: EvidenceSubject,
-    host: SafeText,
+    host: EvidenceHost,
     started_at_unix_ms: u128,
     finished_at_unix_ms: u128,
     workload: Measurements,
@@ -652,7 +682,7 @@ impl QualificationEvidence {
         self.target.validate(self.kind)?;
         self.source.validate("source")?;
         self.subject.validate(self.kind)?;
-        SafeText::parse(self.host.0.clone(), "host")?;
+        self.host.validate("host")?;
         if self.started_at_unix_ms > self.finished_at_unix_ms {
             return Err("evidence finished before it started".into());
         }
@@ -937,6 +967,26 @@ mod tests {
         assert!(CampaignTarget::parse(TargetKind::Slack, "slack.com".into()).is_ok());
         assert!(CampaignTarget::parse(TargetKind::Discord, "example.test".into()).is_err());
         assert!(CampaignTarget::parse(TargetKind::Slack, "example.test".into()).is_err());
+    }
+
+    #[test]
+    fn external_oidc_issuers_cannot_use_ip_literals() {
+        assert!(CampaignTarget::parse(TargetKind::Oidc, "https://issuer.example".into()).is_ok());
+        assert!(CampaignTarget::parse(TargetKind::Oidc, "https://127.0.0.1".into()).is_err());
+        assert!(CampaignTarget::parse(TargetKind::Oidc, "https://10.0.0.1".into()).is_err());
+        assert!(CampaignTarget::parse(TargetKind::Oidc, "https://[fd00::1]".into()).is_err());
+        assert!(
+            CampaignTarget::parse(TargetKind::Oidc, "https://issuer.localhost".into()).is_err()
+        );
+    }
+
+    #[test]
+    fn evidence_host_is_a_bounded_non_secret_label() {
+        assert!(EvidenceHost::parse("scale-host-01".into(), "--host").is_ok());
+        assert!(EvidenceHost::parse("host.example".into(), "--host").is_ok());
+        assert!(EvidenceHost::parse("host name".into(), "--host").is_err());
+        assert!(EvidenceHost::parse("-host".into(), "--host").is_err());
+        assert!(EvidenceHost::parse("host-".into(), "--host").is_err());
     }
 
     #[test]

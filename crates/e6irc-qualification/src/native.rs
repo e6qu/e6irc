@@ -87,77 +87,110 @@ impl ProviderChannelId {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndpointScope {
+    Loopback,
+    External,
+}
+
+impl EndpointScope {
+    fn parse_host(host: &str) -> Option<Self> {
+        if is_loopback_host(host) {
+            return Some(Self::Loopback);
+        }
+        host.trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_err()
+            .then_some(Self::External)
+    }
+}
+
 /// A credential-free campaign endpoint. HTTP is safe only for a loopback oracle.
 #[derive(Clone, Debug)]
-struct CampaignUrl(Url);
+struct CampaignUrl {
+    url: Url,
+    scope: EndpointScope,
+}
 
 impl CampaignUrl {
     fn as_url(&self) -> &Url {
-        &self.0
+        &self.url
     }
 
     fn as_str(&self) -> &str {
-        self.0.as_str()
+        self.url.as_str()
     }
 
     fn into_url(self) -> Url {
-        self.0
+        self.url
     }
 
-    fn is_loopback(&self) -> bool {
-        self.0.host_str().is_some_and(is_loopback_host)
+    fn has_scope(&self, scope: EndpointScope) -> bool {
+        self.scope == scope
     }
 }
 
 fn safe_url(value: &str) -> Option<CampaignUrl> {
     let url = Url::parse(value).ok()?;
-    let loopback = url.host_str().is_some_and(is_loopback_host);
-    ((url.scheme() == "https" || (url.scheme() == "http" && loopback))
+    let scope = url.host_str().and_then(EndpointScope::parse_host)?;
+    ((url.scheme() == "https" || (url.scheme() == "http" && scope == EndpointScope::Loopback))
         && url.host_str().is_some()
         && url.username().is_empty()
         && url.password().is_none()
         && url.query().is_none()
         && url.fragment().is_none())
-    .then_some(CampaignUrl(url))
+    .then_some(CampaignUrl { url, scope })
 }
 
 #[derive(Clone, Debug)]
-struct CampaignSocketUrl(Url);
+struct CampaignSocketUrl {
+    url: Url,
+    scope: EndpointScope,
+}
 
 impl CampaignSocketUrl {
     fn parse(value: &str) -> Option<Self> {
         let url = Url::parse(value).ok()?;
-        let loopback = url.host_str().is_some_and(is_loopback_host);
-        ((url.scheme() == "wss" || (url.scheme() == "ws" && loopback))
+        let scope = url.host_str().and_then(EndpointScope::parse_host)?;
+        ((url.scheme() == "wss" || (url.scheme() == "ws" && scope == EndpointScope::Loopback))
             && url.host_str().is_some()
             && url.username().is_empty()
             && url.password().is_none()
             && url.fragment().is_none())
-        .then_some(Self(url))
+        .then_some(Self { url, scope })
     }
 
     fn with_query(&self, values: &[(&str, &str)]) -> String {
-        let mut url = self.0.clone();
+        let mut url = self.url.clone();
         url.query_pairs_mut().extend_pairs(values);
         url.into()
     }
 
     fn as_str(&self) -> &str {
-        self.0.as_str()
+        self.url.as_str()
+    }
+
+    fn has_scope(&self, scope: EndpointScope) -> bool {
+        self.scope == scope
     }
 }
 
 fn oidc_endpoint(issuer: &CampaignUrl, value: &str) -> Option<CampaignUrl> {
     let endpoint = safe_url(value)?;
-    (issuer.is_loopback() == endpoint.is_loopback()).then_some(endpoint)
+    endpoint.has_scope(issuer.scope).then_some(endpoint)
 }
 
 pub(super) fn is_loopback_host(host: &str) -> bool {
     host == "localhost"
+        || host.ends_with(".localhost")
         || host
             .trim_matches(['[', ']'])
             .parse::<std::net::IpAddr>()
             .is_ok_and(|address| address.is_loopback())
+}
+
+pub(super) fn is_external_host(host: &str) -> bool {
+    EndpointScope::parse_host(host) == Some(EndpointScope::External)
 }
 
 fn endpoint(base: &CampaignUrl, path: &str) -> Option<CampaignUrl> {
@@ -170,7 +203,10 @@ fn endpoint(base: &CampaignUrl, path: &str) -> Option<CampaignUrl> {
                 && url.query().is_none()
                 && url.fragment().is_none()
         })
-        .map(CampaignUrl)
+        .and_then(|url| {
+            let scope = url.host_str().and_then(EndpointScope::parse_host)?;
+            (scope == base.scope).then_some(CampaignUrl { url, scope })
+        })
 }
 
 fn client() -> Result<Client, ()> {
@@ -404,6 +440,16 @@ async fn discord(_target: &str) -> ProbeReport {
             PhaseOutcome::NotRun,
         );
     };
+    if !gateway_url.has_scope(base.scope) {
+        return report(
+            TargetKind::Discord,
+            PhaseOutcome::Passed,
+            PhaseOutcome::NotRun,
+            PhaseOutcome::Failed,
+            PhaseOutcome::NotRun,
+            PhaseOutcome::NotRun,
+        );
+    }
     let reconnect = match discord_connect(&gateway_url, &token).await {
         PhaseOutcome::Passed => discord_connect(&gateway_url, &token).await,
         outcome => outcome,
@@ -694,10 +740,14 @@ async fn slack_socket(
     if !response.ok {
         return Err(PhaseOutcome::Rejected);
     }
-    response
+    let socket = response
         .url
         .as_deref()
         .and_then(CampaignSocketUrl::parse)
+        .ok_or(PhaseOutcome::Rejected)?;
+    socket
+        .has_scope(base.scope)
+        .then_some(socket)
         .ok_or(PhaseOutcome::Rejected)
 }
 
@@ -848,6 +898,7 @@ fn oidc_issuer_matches(configuration: &OidcDiscovery, issuer: &CampaignUrl) -> b
 }
 
 fn oidc_discovery_url(issuer: &CampaignUrl) -> Option<CampaignUrl> {
+    let scope = issuer.scope;
     let mut issuer = issuer.as_url().clone();
     if !issuer.path().ends_with('/') {
         issuer.set_path(&format!("{}/", issuer.path()));
@@ -855,7 +906,7 @@ fn oidc_discovery_url(issuer: &CampaignUrl) -> Option<CampaignUrl> {
     issuer
         .join(".well-known/openid-configuration")
         .ok()
-        .map(CampaignUrl)
+        .map(|url| CampaignUrl { url, scope })
 }
 
 async fn oidc_token(

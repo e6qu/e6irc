@@ -494,6 +494,8 @@ fn endpoint_urls_cannot_carry_credentials_or_tokens() {
     assert!(safe_url("https://user:secret@issuer.example/api").is_none());
     assert!(safe_url("https://issuer.example/api?token=secret").is_none());
     assert!(safe_url("https://issuer.example/api#secret").is_none());
+    assert!(safe_url("https://10.0.0.1/api").is_none());
+    assert!(safe_url("https://[fd00::1]/api").is_none());
 }
 
 #[test]
@@ -504,6 +506,7 @@ fn provider_socket_urls_require_secure_or_loopback_transport() {
     assert!(CampaignSocketUrl::parse("ws://gateway.example/socket").is_none());
     assert!(CampaignSocketUrl::parse("wss://user:secret@gateway.example/socket").is_none());
     assert!(CampaignSocketUrl::parse("wss://gateway.example/socket#fragment").is_none());
+    assert!(CampaignSocketUrl::parse("wss://10.0.0.1/socket").is_none());
 }
 
 #[test]
@@ -522,6 +525,25 @@ fn oidc_metadata_endpoints_cannot_cross_the_loopback_boundary() {
     assert!(oidc_endpoint(&external, "http://127.0.0.1/token").is_none());
     assert!(oidc_endpoint(&loopback, "http://127.0.0.1/token").is_some());
     assert!(oidc_endpoint(&loopback, "https://tokens.example/token").is_none());
+    assert!(oidc_endpoint(&external, "https://10.0.0.1/token").is_none());
+}
+
+#[test]
+fn provider_sockets_stay_in_their_endpoint_scope() {
+    let external = safe_url("https://provider.example").expect("provider");
+    let loopback = safe_url("http://127.0.0.1/provider").expect("provider");
+    assert!(
+        CampaignSocketUrl::parse("wss://gateway.example/socket")
+            .is_some_and(|url| url.has_scope(external.scope))
+    );
+    assert!(
+        !CampaignSocketUrl::parse("ws://127.0.0.1/socket")
+            .is_some_and(|url| url.has_scope(external.scope))
+    );
+    assert!(
+        CampaignSocketUrl::parse("ws://127.0.0.1/socket")
+            .is_some_and(|url| url.has_scope(loopback.scope))
+    );
 }
 
 #[test]

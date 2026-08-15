@@ -103,7 +103,8 @@ must name a new directory; it creates one JSON result per client count.
 ## Controlled Linux qualification
 
 `qualify-linux.sh` runs one explicit-budget campaign and writes `result.json`,
-`qualification.json`, and `host.txt`. It requires a clean source tree and records the source revision,
+`qualification.json`, and `host.txt`. It requires a clean source tree and the
+non-secret `E6IRC_QUALIFICATION_HOST` label. It records the source revision,
 the load and server executable hashes, host limits, configured core-worker count,
 and exact workload/budgets.
 It rejects a non-e6ircd PID, insufficient file-descriptor limits, a target
@@ -114,7 +115,8 @@ directory must not exist, so it cannot overwrite prior evidence. A failed
 harness run still writes `result.json`; preflight failures create no evidence.
 
 ```
-tools/load/qualify-linux.sh 127.0.0.1:6667 "$SERVER_PID" 2 20000 200 20 results/20000 \
+E6IRC_QUALIFICATION_HOST=scale-host-01 \
+  tools/load/qualify-linux.sh 127.0.0.1:6667 "$SERVER_PID" 2 20000 200 20 results/20000 \
   100 1000 500 262144
 ```
 

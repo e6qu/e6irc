@@ -60,7 +60,8 @@ output path for every run.
 probe for targets `libera`, `oftc`, or `ergo`. It makes two sequential TLS
 sessions to prove registration, reconnect, and cleanup. `scale-probe.sh`
 wraps `e6irc-load`; `qualify-linux.sh` writes its load result, host provenance,
-and common qualification evidence together.
+and common qualification evidence together. Set `E6IRC_QUALIFICATION_HOST` to
+a non-secret host label; it never derives or records the runner hostname.
 
 ## Live campaigns
 
@@ -73,6 +74,9 @@ common arguments above. For Slack, set `E6IRC_SLACK_BOT_TOKEN`,
 `E6IRC_OIDC_CLIENT_SECRET`, use its credential-free issuer URL as `--target`,
 then run `e6irc-qualification oidc`. The process exits 3 and writes rejected
 evidence when required configuration is absent.
+
+`--host` is a retained non-secret label: letters, digits, `.`, `_`, and `-`;
+it must start and end with a letter or digit.
 
 For public IRC, add `--probe tools/qualification/public-irc-probe.sh`. For a
 tuned Linux host, use `tools/load/qualify-linux.sh`; it supplies the scale
@@ -91,7 +95,6 @@ network, or tuned host. Publish a passed claim only with retained evidence.
 Run **External qualification** from the Actions page. It is manual only. Pick
 one campaign and supply non-secret target, host, workload, and budget values.
 Use `discord.com` or `slack.com` for those provider campaigns.
-The scale campaign measures its host itself and does not use `host`.
 The workflow sets provider credentials only from these repository secrets:
 
 - `E6IRC_DISCORD_BOT_TOKEN`, `E6IRC_DISCORD_CHANNEL_ID`
@@ -108,5 +111,6 @@ The `scale` campaign runs only on a self-hosted runner with the
 `target` to its listener address and provide `scale_arguments` in this order:
 `ADDR SERVER_PID CORE_WORKERS CLIENTS CHANNELS BURST MIN_CONNECT_RATE
 MIN_FANOUT_RATE MAX_P99_MS MAX_RSS_BYTES_PER_CONNECTION`. The first value must
-equal `target`. The host checks in `qualify-linux.sh` reject an untuned or
-wrong-process run.
+equal `target`. The required `host` input is the retained non-secret evidence
+label. The host checks in `qualify-linux.sh` reject an untuned or wrong-process
+run.
