@@ -1522,6 +1522,11 @@ try {
     );
   }
   await page.getByText("scrollback filler 11", { exact: true }).waitFor();
+  await page.waitForFunction(() =>
+    [...document.querySelectorAll("#messages .text")].filter((node) =>
+      node.textContent?.startsWith("scrollback filler ")
+    ).length === 12
+  );
   await page.locator("#messages").evaluate((node) => {
     node.scrollTop = 0;
     node.dispatchEvent(new Event("scroll"));
