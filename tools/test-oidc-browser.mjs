@@ -1528,6 +1528,11 @@ try {
     ).length === 12
   );
   await page.locator("#messages").evaluate((node) => {
+    node.scrollTop = node.scrollHeight;
+    node.dispatchEvent(new Event("scroll"));
+  });
+  await page.locator("#jump-latest").waitFor({ state: "hidden" });
+  await page.locator("#messages").evaluate((node) => {
     node.scrollTop = 0;
     node.dispatchEvent(new Event("scroll"));
   });
