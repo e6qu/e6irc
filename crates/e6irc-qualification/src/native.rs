@@ -69,21 +69,155 @@ fn failed(kind: TargetKind) -> ProbeReport {
     )
 }
 
-fn setting(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.is_empty())
-}
+struct Secret(String);
 
-#[derive(Clone, Debug)]
-struct ProviderChannelId(String);
+impl Secret {
+    fn setting(name: &str) -> Option<Self> {
+        Self::parse(env::var(name).ok()?)
+    }
 
-impl ProviderChannelId {
     fn parse(value: String) -> Option<Self> {
-        (value.len() <= 255 && value.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        (!value.is_empty() && value.len() <= 4096 && !value.contains(char::is_control))
             .then_some(Self(value))
     }
 
     fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+fn environment_value(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+struct DiscordChannelId(String);
+
+impl DiscordChannelId {
+    fn parse(value: String) -> Option<Self> {
+        decimal_identifier(value).map(Self)
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for DiscordChannelId {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value).ok_or("invalid Discord channel ID")
+    }
+}
+
+impl From<DiscordChannelId> for String {
+    fn from(value: DiscordChannelId) -> Self {
+        value.0
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+struct DiscordMessageId(String);
+
+impl DiscordMessageId {
+    fn parse(value: String) -> Option<Self> {
+        decimal_identifier(value).map(Self)
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for DiscordMessageId {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value).ok_or("invalid Discord message ID")
+    }
+}
+
+impl From<DiscordMessageId> for String {
+    fn from(value: DiscordMessageId) -> Self {
+        value.0
+    }
+}
+
+fn decimal_identifier(value: String) -> Option<String> {
+    (value.len() <= 20
+        && !value.starts_with('0')
+        && value.bytes().all(|byte| byte.is_ascii_digit()))
+    .then_some(value)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+struct SlackChannelId(String);
+
+impl SlackChannelId {
+    fn parse(value: String) -> Option<Self> {
+        (value.len() >= 2
+            && value.len() <= 16
+            && matches!(value.as_bytes().first(), Some(b'C' | b'G'))
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()))
+        .then_some(Self(value))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for SlackChannelId {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value).ok_or("invalid Slack channel ID")
+    }
+}
+
+impl From<SlackChannelId> for String {
+    fn from(value: SlackChannelId) -> Self {
+        value.0
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+struct SlackTimestamp(String);
+
+impl SlackTimestamp {
+    fn parse(value: String) -> Option<Self> {
+        let (seconds, fraction) = value.split_once('.')?;
+        (!seconds.is_empty()
+            && !fraction.is_empty()
+            && seconds.bytes().all(|byte| byte.is_ascii_digit())
+            && fraction.bytes().all(|byte| byte.is_ascii_digit())
+            && value.len() <= 32)
+            .then_some(Self(value))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for SlackTimestamp {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value).ok_or("invalid Slack timestamp")
+    }
+}
+
+impl From<SlackTimestamp> for String {
+    fn from(value: SlackTimestamp) -> Self {
+        value.0
     }
 }
 
@@ -260,13 +394,13 @@ struct DiscordGateway {
 
 #[derive(Deserialize, Serialize)]
 struct DiscordMessage {
-    id: String,
+    id: DiscordMessageId,
     content: String,
 }
 
 #[derive(Deserialize)]
 struct DiscordMessageCreated {
-    id: String,
+    id: DiscordMessageId,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -337,13 +471,13 @@ struct SlackSocketOpen {
 #[derive(Deserialize, Serialize)]
 struct SlackMessagePost {
     ok: bool,
-    ts: Option<String>,
+    ts: Option<SlackTimestamp>,
     message: Option<SlackMessageTimestamp>,
 }
 
 #[derive(Deserialize, Serialize)]
 struct SlackMessageTimestamp {
-    ts: String,
+    ts: SlackTimestamp,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -354,7 +488,7 @@ struct SlackReplies {
 
 #[derive(Deserialize, Serialize)]
 struct SlackReply {
-    ts: String,
+    ts: SlackTimestamp,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -380,15 +514,16 @@ fn marker(kind: &str) -> String {
 }
 
 async fn discord(_target: &str) -> ProbeReport {
-    let Some(token) = setting("E6IRC_DISCORD_BOT_TOKEN") else {
+    let Some(token) = Secret::setting("E6IRC_DISCORD_BOT_TOKEN") else {
         return not_run(TargetKind::Discord);
     };
-    let Some(channel) = setting("E6IRC_DISCORD_CHANNEL_ID").and_then(ProviderChannelId::parse)
+    let Some(channel) =
+        environment_value("E6IRC_DISCORD_CHANNEL_ID").and_then(DiscordChannelId::parse)
     else {
         return not_run(TargetKind::Discord);
     };
-    let base =
-        setting("E6IRC_DISCORD_API_BASE").unwrap_or_else(|| "https://discord.com/api/v10".into());
+    let base = environment_value("E6IRC_DISCORD_API_BASE")
+        .unwrap_or_else(|| "https://discord.com/api/v10".into());
     let Some(base) = safe_url(&base) else {
         return not_run(TargetKind::Discord);
     };
@@ -398,7 +533,7 @@ async fn discord(_target: &str) -> ProbeReport {
     let Ok(http) = client() else {
         return failed(TargetKind::Discord);
     };
-    let authorization = format!("Bot {token}");
+    let authorization = format!("Bot {}", token.as_str());
     let Some(channel_url) = endpoint(&base, &format!("channels/{}", channel.as_str())) else {
         return not_run(TargetKind::Discord);
     };
@@ -501,7 +636,7 @@ async fn discord(_target: &str) -> ProbeReport {
     };
     let Some(message_url) = endpoint(
         &base,
-        &format!("channels/{}/messages/{id}", channel.as_str()),
+        &format!("channels/{}/messages/{}", channel.as_str(), id.as_str()),
     ) else {
         return report(
             TargetKind::Discord,
@@ -533,11 +668,15 @@ async fn discord(_target: &str) -> ProbeReport {
     )
 }
 
-fn discord_readback_matches(message: &DiscordMessage, id: &str, content: &str) -> bool {
-    message.id == id && message.content == content
+fn discord_readback_matches(
+    message: &DiscordMessage,
+    id: &DiscordMessageId,
+    content: &str,
+) -> bool {
+    message.id.0 == id.0 && message.content == content
 }
 
-async fn discord_connect(url: &CampaignSocketUrl, token: &str) -> PhaseOutcome {
+async fn discord_connect(url: &CampaignSocketUrl, token: &Secret) -> PhaseOutcome {
     let Ok(mut socket) = connect_async(url.with_query(&[("v", "10"), ("encoding", "json")]))
         .await
         .map(|(socket, _)| socket)
@@ -557,7 +696,7 @@ async fn discord_connect(url: &CampaignSocketUrl, token: &str) -> PhaseOutcome {
     let identify = DiscordIdentify {
         op: 2,
         d: DiscordIdentifyData {
-            token,
+            token: token.as_str(),
             intents: 0,
             properties: DiscordIdentifyProperties {
                 os: "linux",
@@ -596,20 +735,21 @@ async fn discord_connect(url: &CampaignSocketUrl, token: &str) -> PhaseOutcome {
 
 async fn slack(_target: &str) -> ProbeReport {
     let (Some(bot), Some(app), Some(channel)) = (
-        setting("E6IRC_SLACK_BOT_TOKEN"),
-        setting("E6IRC_SLACK_APP_TOKEN"),
-        setting("E6IRC_SLACK_CHANNEL_ID").and_then(ProviderChannelId::parse),
+        Secret::setting("E6IRC_SLACK_BOT_TOKEN"),
+        Secret::setting("E6IRC_SLACK_APP_TOKEN"),
+        environment_value("E6IRC_SLACK_CHANNEL_ID").and_then(SlackChannelId::parse),
     ) else {
         return not_run(TargetKind::Slack);
     };
-    let base = setting("E6IRC_SLACK_API_BASE").unwrap_or_else(|| "https://slack.com/api/".into());
+    let base = environment_value("E6IRC_SLACK_API_BASE")
+        .unwrap_or_else(|| "https://slack.com/api/".into());
     let Some(base) = safe_url(&base) else {
         return not_run(TargetKind::Slack);
     };
     let Ok(http) = client() else {
         return failed(TargetKind::Slack);
     };
-    let authorization = format!("Bearer {bot}");
+    let authorization = format!("Bearer {}", bot.as_str());
     let Some(auth_url) = endpoint(&base, "auth.test") else {
         return not_run(TargetKind::Slack);
     };
@@ -689,7 +829,7 @@ async fn slack(_target: &str) -> ProbeReport {
     let persistence = json_outcome(
         http.get(replies_url.into_url())
             .header("Authorization", &authorization)
-            .query(&[("channel", channel.as_str()), ("ts", &timestamp)]),
+            .query(&[("channel", channel.as_str()), ("ts", timestamp.as_str())]),
         |json: &SlackReplies| slack_readback_contains(json, &timestamp),
     )
     .await;
@@ -701,7 +841,7 @@ async fn slack(_target: &str) -> ProbeReport {
             .header("Authorization", &authorization)
             .json(&SlackMessageDelete {
                 channel: channel.as_str(),
-                ts: &timestamp,
+                ts: timestamp.as_str(),
             }),
         |response: &SlackResult| response.ok,
     )
@@ -716,25 +856,25 @@ async fn slack(_target: &str) -> ProbeReport {
     )
 }
 
-fn slack_readback_contains(response: &SlackReplies, timestamp: &str) -> bool {
+fn slack_readback_contains(response: &SlackReplies, timestamp: &SlackTimestamp) -> bool {
     response.ok
         && response
             .messages
             .iter()
-            .any(|message| message.ts == timestamp)
+            .any(|message| message.ts.0 == timestamp.0)
 }
 
 async fn slack_socket(
     http: &Client,
     base: &CampaignUrl,
-    app: &str,
+    app: &Secret,
 ) -> Result<CampaignSocketUrl, PhaseOutcome> {
     let Some(url) = endpoint(base, "apps.connections.open") else {
         return Err(PhaseOutcome::Rejected);
     };
     let response = success_json::<SlackSocketOpen>(
         http.post(url.into_url())
-            .header("Authorization", format!("Bearer {app}")),
+            .header("Authorization", format!("Bearer {}", app.as_str())),
     )
     .await?;
     if !response.ok {
@@ -751,7 +891,7 @@ async fn slack_socket(
         .ok_or(PhaseOutcome::Rejected)
 }
 
-async fn slack_connect(http: &Client, base: &CampaignUrl, app: &str) -> PhaseOutcome {
+async fn slack_connect(http: &Client, base: &CampaignUrl, app: &Secret) -> PhaseOutcome {
     let url = match slack_socket(http, base, app).await {
         Ok(url) => url,
         Err(outcome) => return outcome,
@@ -800,8 +940,8 @@ fn slack_hello(frame: &str) -> bool {
 
 async fn oidc(target: &str) -> ProbeReport {
     let (Some(client_id), Some(secret)) = (
-        setting("E6IRC_OIDC_CLIENT_ID"),
-        setting("E6IRC_OIDC_CLIENT_SECRET"),
+        Secret::setting("E6IRC_OIDC_CLIENT_ID"),
+        Secret::setting("E6IRC_OIDC_CLIENT_SECRET"),
     ) else {
         return not_run(TargetKind::Oidc);
     };
@@ -861,21 +1001,21 @@ async fn oidc(target: &str) -> ProbeReport {
     };
     let persistence = json_outcome(
         http.post(introspection_endpoint.clone().into_url())
-            .basic_auth(&client_id, Some(&secret))
+            .basic_auth(client_id.as_str(), Some(secret.as_str()))
             .form(&[("token", token.as_str())]),
         |response: &OidcIntrospection| response.active,
     )
     .await;
     let revoked = request_outcome(
         http.post(revocation_endpoint.into_url())
-            .basic_auth(&client_id, Some(&secret))
+            .basic_auth(client_id.as_str(), Some(secret.as_str()))
             .form(&[("token", token.as_str())]),
     )
     .await;
     let cleanup = if revoked == PhaseOutcome::Passed {
         json_outcome(
             http.post(introspection_endpoint.into_url())
-                .basic_auth(&client_id, Some(&secret))
+                .basic_auth(client_id.as_str(), Some(secret.as_str()))
                 .form(&[("token", token.as_str())]),
             |response: &OidcIntrospection| !response.active,
         )
@@ -912,18 +1052,16 @@ fn oidc_discovery_url(issuer: &CampaignUrl) -> Option<CampaignUrl> {
 async fn oidc_token(
     http: &Client,
     endpoint: &CampaignUrl,
-    client_id: &str,
-    secret: &str,
-) -> Result<String, PhaseOutcome> {
+    client_id: &Secret,
+    secret: &Secret,
+) -> Result<Secret, PhaseOutcome> {
     let response = success_json::<OidcToken>(
         http.post(endpoint.clone().into_url())
-            .basic_auth(client_id, Some(secret))
+            .basic_auth(client_id.as_str(), Some(secret.as_str()))
             .form(&[("grant_type", "client_credentials")]),
     )
     .await?;
-    (!response.access_token.is_empty())
-        .then_some(response.access_token)
-        .ok_or(PhaseOutcome::Rejected)
+    Secret::parse(response.access_token).ok_or(PhaseOutcome::Rejected)
 }
 
 #[cfg(test)]

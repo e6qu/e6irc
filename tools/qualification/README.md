@@ -39,7 +39,8 @@ trust domains. Provider-signed WebSocket query parameters stay in memory.
 The adapter tests can select credential-free loopback or provider endpoints.
 The external command rejects custom Discord and Slack endpoints. It always
 uses the public provider endpoint. Evidence records every required
-environment-variable name, never its value.
+environment-variable name, never its value. Credentials and provider IDs are
+parsed before they enter requests.
 
 `public-irc` and `scale` need their supplied probe path. A probe writes this
 exact JSON, with the runner-provided challenge, to
@@ -61,7 +62,7 @@ probe for targets `libera`, `oftc`, or `ergo`. It makes two sequential TLS
 sessions to prove registration, reconnect, and cleanup. `scale-probe.sh`
 wraps `e6irc-load`; `qualify-linux.sh` writes its load result, host provenance,
 and common qualification evidence together. Set `E6IRC_QUALIFICATION_HOST` to
-a non-secret host label; it never derives or records the runner hostname.
+a non-secret host label; it validates the label before host inspection or load.
 
 ## Live campaigns
 
