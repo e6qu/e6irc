@@ -24,9 +24,11 @@ struct Cli {
     /// IRC server address (host:port).
     #[arg(long, short)]
     server: String,
-    #[arg(long, short, default_value = "e6irc")]
+    /// Nickname to register with.
+    #[arg(long, short)]
     nick: String,
-    #[arg(long, short, default_value = "#e6irc")]
+    /// Initial channel to join.
+    #[arg(long, short)]
     channel: String,
     /// SASL PLAIN account. For BNC attachment use account/network.
     #[arg(long, requires = "password", conflicts_with = "oauth_token")]
@@ -497,6 +499,10 @@ mod tests {
                 "e6irc-tui",
                 "--server",
                 "irc.example:6697",
+                "--nick",
+                "alice",
+                "--channel",
+                "#chat",
                 "--account",
                 "alice/work",
                 "--password",
@@ -509,6 +515,10 @@ mod tests {
                 "e6irc-tui",
                 "--server",
                 "irc.example:6697",
+                "--nick",
+                "alice",
+                "--channel",
+                "#chat",
                 "--oauth-token",
                 "device-token"
             ])
@@ -519,6 +529,10 @@ mod tests {
                 "e6irc-tui",
                 "--server",
                 "irc.example:6697",
+                "--nick",
+                "alice",
+                "--channel",
+                "#chat",
                 "--oauth-from-cache"
             ])
             .is_ok()
@@ -528,6 +542,10 @@ mod tests {
                 "e6irc-tui",
                 "--server",
                 "irc.example:6697",
+                "--nick",
+                "alice",
+                "--channel",
+                "#chat",
                 "--oauth-from-cache",
                 "--token-file",
                 "token.json",
@@ -554,13 +572,27 @@ mod tests {
     #[test]
     fn transport_and_reconnect_constraints_fail_at_argument_parsing() {
         assert!(
-            Cli::try_parse_from(["e6irc-tui", "--server", "irc.example:6697", "--tls"]).is_ok()
+            Cli::try_parse_from([
+                "e6irc-tui",
+                "--server",
+                "irc.example:6697",
+                "--nick",
+                "alice",
+                "--channel",
+                "#chat",
+                "--tls"
+            ])
+            .is_ok()
         );
         assert!(
             Cli::try_parse_from([
                 "e6irc-tui",
                 "--server",
                 "irc.example:6697",
+                "--nick",
+                "alice",
+                "--channel",
+                "#chat",
                 "--tls",
                 "--tls-name",
                 "irc.example"
@@ -575,6 +607,10 @@ mod tests {
                 "e6irc-tui",
                 "--server",
                 "irc.example:6697",
+                "--nick",
+                "alice",
+                "--channel",
+                "#chat",
                 "--history-lines",
                 "1000"
             ])
