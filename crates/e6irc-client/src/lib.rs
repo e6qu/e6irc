@@ -700,12 +700,7 @@ impl Connection {
         realname: &str,
         payload: String,
     ) -> io::Result<String> {
-        self.send_line(&format!("NICK {nick}")).await?;
-        self.send_line(&format!(
-            "USER {} 0 * :{realname}",
-            registration_username(nick)
-        ))
-        .await?;
+        self.send_registration_identity(nick, realname).await?;
         self.send_line(&format!("AUTHENTICATE {payload}")).await?;
         self.finish_sasl_then_welcome(nick).await
     }
@@ -733,14 +728,18 @@ impl Connection {
     pub async fn register(&mut self, nick: &str, realname: &str) -> io::Result<String> {
         self.begin_cap().await?;
         self.request_metadata_capabilities().await?;
+        self.send_registration_identity(nick, realname).await?;
+        self.send_line("CAP END").await?;
+        self.await_welcome(nick).await
+    }
+
+    async fn send_registration_identity(&mut self, nick: &str, realname: &str) -> io::Result<()> {
         self.send_line(&format!("NICK {nick}")).await?;
         self.send_line(&format!(
             "USER {} 0 * :{realname}",
             registration_username(nick)
         ))
-        .await?;
-        self.send_line("CAP END").await?;
-        self.await_welcome(nick).await
+        .await
     }
 
     /// Offer a replacement nick after the server refused the requested one
