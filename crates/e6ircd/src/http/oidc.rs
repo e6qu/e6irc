@@ -491,17 +491,22 @@ pub(super) async fn oidc_callback(
             }
         };
     }
-    let (account_claim, detail) = match provider.account_claim {
+    let (account_name, detail) = match provider.account_claim {
         crate::config::OidcAccountClaim::PreferredUsername => (
-            claims.preferred_username().map(|value| value.as_str()),
+            claims
+                .preferred_username()
+                .and_then(|value| crate::sanitize::account_name(value.as_str())),
             "The configured preferred_username claim must contain an IRC-safe account name.",
         ),
         crate::config::OidcAccountClaim::Email => (
-            claims.email().map(|value| value.as_str()),
-            "The configured email claim must contain an IRC-safe account name.",
+            claims
+                .email()
+                .and_then(|value| crate::identity::ContactEmail::parse(value.as_str()).ok())
+                .and_then(|email| crate::sanitize::account_name(email.local_part())),
+            "The configured email claim must be a valid email with an IRC-safe local part.",
         ),
     };
-    let Some(preferred) = account_claim.and_then(crate::sanitize::account_name) else {
+    let Some(preferred) = account_name else {
         return problem(
             StatusCode::UNAUTHORIZED,
             "Provider sent no usable account claim",
