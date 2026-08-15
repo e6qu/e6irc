@@ -431,7 +431,7 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     let mut awaiting_keepalive = false;
     // The host half of synthesized self-echo prefixes.
     let upstream = upstream_host(&config.addr)
-        .unwrap_or(config.addr.as_str())
+        .expect("IRC driver starts only from a validated upstream address")
         .to_string();
     loop {
         tokio::select! {

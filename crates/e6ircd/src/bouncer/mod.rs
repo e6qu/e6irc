@@ -201,6 +201,11 @@ pub fn build_driver(
         // The Irc arm uses every parameter, so they are never "unused" even in a
         // build with no bridge features — the bridge arms below just don't run.
         NetworkKind::Irc => {
+            if !validate_irc_upstream_addr(&addr) {
+                return Err(
+                    "kind=irc requires addr as host:port with a nonzero numeric port".into(),
+                );
+            }
             let sasl = match (sasl_account, sasl_password) {
                 (Some(account), Some(password)) => Some((
                     required_field(account, "SASL account", 255)?,
@@ -2615,6 +2620,10 @@ mod tests {
     #[test]
     fn driver_factory_rejects_incomplete_credentials_before_any_connection() {
         use crate::config::NetworkKind;
+        assert!(
+            driver_factory_error(NetworkKind::Irc, "missing-port", "nick", None, None)
+                .contains("host:port")
+        );
         assert!(
             driver_factory_error(
                 NetworkKind::Irc,
