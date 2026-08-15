@@ -110,6 +110,7 @@ issuer_url = ${JSON.stringify(issuerURL)}
 client_id = "e6irc-test"
 client_secret = "e6irc-test-secret"
 account_claim = "email"
+token_endpoint_auth_method = "client_secret_basic"
 `,
 );
 
