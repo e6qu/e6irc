@@ -1032,7 +1032,7 @@ pub(super) async fn update_network_core(
         "update failed",
     )?;
     if let Some(driver) = driver {
-        registry.add(Some(account), name, driver);
+        registry.replace(Some(account), name, driver).await;
     }
     audit_network_mutation(
         state,
@@ -1459,7 +1459,7 @@ pub(super) async fn set_network_enabled_core(
     if let Some(driver) = driver {
         registry.add(Some(account), name, driver);
     } else {
-        registry.remove(Some(account), name);
+        registry.remove(Some(account), name).await;
     }
     audit_network_mutation(
         state,
@@ -1488,7 +1488,7 @@ pub(super) async fn delete_network_core(
         crate::db::delete_bnc_network(pool_of(state), account, name).await,
         "delete failed",
     )?;
-    registry.remove(Some(account), name);
+    registry.remove(Some(account), name).await;
     audit_network_mutation(state, account, "NETWORK_DELETE", account, name, "").await;
     Ok(())
 }

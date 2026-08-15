@@ -485,7 +485,7 @@ pub(super) async fn mutate_account_suspension(
     .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
 
     if suspended {
-        let stopped_networks = registry.remove_owner(&change.folded);
+        let stopped_networks = registry.remove_owner(&change.folded).await;
         core_action(
             state,
             crate::core::AdminRequest::SetAccountSuspended {
@@ -705,7 +705,7 @@ pub(super) async fn delete_account_lifecycle(
             return Err(account_deletion_error(error));
         }
     };
-    let stopped_networks = registry.remove_owner(&deleted.folded);
+    let stopped_networks = registry.remove_owner(&deleted.folded).await;
     state
         .admin_accounts
         .write()

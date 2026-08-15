@@ -52,6 +52,17 @@ fn get(path: &str) -> String {
     format!("GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
 }
 
+async fn wait_http_ready(addr: std::net::SocketAddr) {
+    for _ in 0..200 {
+        let (status, _, _) = request(addr, &get("/readyz")).await;
+        if status == 200 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("HTTP server did not become ready");
+}
+
 fn response_header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
     headers.lines().find_map(|line| {
         let (header, value) = line.split_once(':')?;
@@ -488,6 +499,7 @@ async fn bnc_network_management_lifecycle() {
     let running = net::start(config).await.expect("start");
     let http = running.http_addr.expect("http bound");
     let bnc = running.bnc_addr.expect("bnc bound");
+    wait_http_ready(http).await;
 
     // Qualifying a network uses the production resolver, transport, and IRC
     // registration path, but does not persist or start it.
@@ -1980,6 +1992,7 @@ async fn console_configuration_manages_every_credential_collection() {
     };
     let running = net::start(config).await.expect("start");
     let http = running.http_addr.expect("http");
+    wait_http_ready(http).await;
     let page_request = format!(
         "GET /console/configuration HTTP/1.1\r\nHost: t\r\n\
          Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
@@ -2529,6 +2542,7 @@ async fn owned_channel_api_and_console_shell_are_scoped_and_csrf_protected() {
     };
     let running = net::start(config).await.expect("start");
     let http = running.http_addr.expect("http");
+    wait_http_ready(http).await;
     let page_request = |session: &str| {
         format!(
             "GET /console/channels HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
