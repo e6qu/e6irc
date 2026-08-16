@@ -663,8 +663,7 @@ pub(super) struct BackchannelLogoutClaims {
     #[serde(default)]
     pub(super) sid: Option<String>,
     pub(super) iat: i64,
-    #[serde(default)]
-    pub(super) exp: Option<i64>,
+    pub(super) exp: i64,
     pub(super) jti: String,
     pub(super) events: HashMap<String, serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
@@ -801,7 +800,7 @@ pub(super) fn verify_logout_token_with_metadata(
         || (!has_subject && !has_sid)
         || claims.iat < now - 600
         || claims.iat > now + 60
-        || claims.exp.is_some_and(|exp| exp <= now)
+        || claims.exp <= now
         || claims.events.len() != 1
         || !claims.events.contains_key(BACKCHANNEL_LOGOUT_EVENT)
     {
@@ -867,14 +866,13 @@ pub(super) async fn oidc_backchannel_logout(
         Ok(value) => value,
         Err(_) => return problem(StatusCode::BAD_REQUEST, "Invalid logout token", None),
     };
-    let expires_at = claims.exp.unwrap_or(claims.iat + 600);
     match crate::db::consume_oidc_backchannel_logout(
         pool,
         &claims.iss,
         claims.sub.as_deref(),
         claims.sid.as_deref(),
         &claims.jti,
-        expires_at,
+        claims.exp,
     )
     .await
     {

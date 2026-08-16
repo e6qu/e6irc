@@ -4120,6 +4120,7 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
             let mut v = serde_json::json!({
                 "iss": "https://auth.example", "aud": "e6irc",
                 "sid": "session-1", "iat": now, "jti": "j-1",
+                "exp": now + 600,
                 "events": { BACKCHANNEL_LOGOUT_EVENT: {} }
             });
             v.as_object_mut()
@@ -4156,6 +4157,15 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
         assert!(
             verify(base(serde_json::json!({"nonce": null}))).is_err(),
             "a present nonce is forbidden, including null"
+        );
+        let mut missing_expiry = base(serde_json::json!({}));
+        missing_expiry
+            .as_object_mut()
+            .expect("logout-token object")
+            .remove("exp");
+        assert!(
+            verify(missing_expiry).is_err(),
+            "a logout token without its required expiry must be rejected"
         );
 
         // A7: a present azp must name this client.
