@@ -832,7 +832,7 @@ try {
     await page.evaluate(() => matchMedia("(prefers-reduced-motion: reduce)").matches),
     true,
   );
-  const monitoringURL = `${applicationOrigin}/api/v1/admin/monitoring?minutes=60`;
+  const monitoringURL = `${applicationOrigin}/api/v1/admin/observability?minutes=60`;
   let releaseInitialMonitoring;
   const initialMonitoringReleased = new Promise((resolve) => {
     releaseInitialMonitoring = resolve;
@@ -899,6 +899,11 @@ try {
     applicationRequests.some((url) => url.includes("/console/monitoring/panel")),
     false,
     "monitoring must read its documented JSON endpoint, not an HTML fragment",
+  );
+  assert.equal(
+    applicationRequests.some((url) => url.includes("/api/v1/admin/monitoring")),
+    false,
+    "monitoring must consume the typed observability API",
   );
 
   await page.goto(`${applicationOrigin}/console/bans`);

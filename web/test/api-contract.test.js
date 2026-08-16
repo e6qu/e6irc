@@ -63,6 +63,17 @@ test("schema parser rejects incompatible and drifted JSON before a view uses it"
   }
 });
 
+test("schema parser preserves only values admitted by an explicit map schema", () => {
+  const schema = {
+    type: "object", additionalProperties: false, required: ["errors"], properties: {
+      errors: { type: "object", additionalProperties: { type: "integer", minimum: 0 }, properties: {} },
+    },
+  };
+  assert.deepEqual(parseApiSchema(schema, { errors: { database: 2, http: 0 } }), { errors: { database: 2, http: 0 } });
+  assert.throws(() => parseApiSchema(schema, { errors: { database: -1 } }), ApiSchemaError);
+  assert.throws(() => parseApiSchema({ type: "object", additionalProperties: { type: "record" }, properties: {} }, {}), ApiSchemaError);
+});
+
 test("schema parser rejects malformed constraints instead of weakening a projection", () => {
   const valid = { name: "Libera", enabled: true, state: "connected" };
   for (const schema of [
