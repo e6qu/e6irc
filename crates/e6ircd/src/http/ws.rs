@@ -299,16 +299,9 @@ pub(super) async fn ws_ui_conn(
     // client attaching to an already-connected network would otherwise see no
     // status until the next connect/disconnect transition. The sticky flag
     // exists precisely to close this subscribe-timing gap.
-    let status = if handle.is_connected() {
-        ConnStatus::Connected
-    } else {
-        ConnStatus::Disconnected
-    };
+    let runtime = handle.runtime_snapshot();
     if socket
-        .send(WsMessage::text(status_event(
-            status,
-            disconnect_reason(&handle),
-        )))
+        .send(WsMessage::text(runtime_status_event(&runtime)))
         .await
         .is_err()
     {
@@ -371,21 +364,9 @@ pub(super) async fn ws_ui_conn(
                         break;
                     }
                 }
-                Ok(DriverEvent::Connected) => {
+                Ok(DriverEvent::Status(status)) => {
                     if socket
-                        .send(WsMessage::text(status_event(ConnStatus::Connected, None)))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Ok(DriverEvent::Disconnected) => {
-                    if socket
-                        .send(WsMessage::text(status_event(
-                            ConnStatus::Disconnected,
-                            disconnect_reason(&handle),
-                        )))
+                        .send(WsMessage::text(driver_status_event(status)))
                         .await
                         .is_err()
                     {
@@ -693,20 +674,22 @@ pub(super) enum ConnStatus {
     Unavailable,
 }
 
-/// The operator-safe summary of the driver's classified last failure, when
-/// the network is currently disconnected. The taxonomy is closed and the
-/// summaries are static strings, so this can never carry untrusted text into
-/// the event stream.
-fn disconnect_reason(
-    handle: &std::sync::Arc<crate::bouncer::NetworkHandle>,
-) -> Option<&'static str> {
-    if handle.is_connected() {
-        return None;
-    }
-    handle
-        .runtime_snapshot()
-        .last_error
-        .map(|failure| failure.summary())
+fn runtime_status_event(runtime: &crate::bouncer::NetworkRuntimeSnapshot) -> String {
+    let status = if runtime.lifecycle == crate::bouncer::NetworkLifecycle::Connected {
+        ConnStatus::Connected
+    } else {
+        ConnStatus::Disconnected
+    };
+    status_event(status, runtime.last_error.map(|failure| failure.summary()))
+}
+
+fn driver_status_event(status: crate::bouncer::DriverConnectionStatus) -> String {
+    let ui_status = if status.lifecycle() == crate::bouncer::NetworkLifecycle::Connected {
+        ConnStatus::Connected
+    } else {
+        ConnStatus::Disconnected
+    };
+    status_event(ui_status, status.failure().map(|failure| failure.summary()))
 }
 
 /// A connection-status change as a JSON event:
@@ -775,6 +758,24 @@ mod tests {
             let event: serde_json::Value = serde_json::from_str(&wire).expect("UI event JSON");
             assert_eq!(event, expected, "{wire}");
         }
+    }
+
+    #[test]
+    fn driver_status_event_preserves_the_emitted_failure() {
+        let event: serde_json::Value = serde_json::from_str(&driver_status_event(
+            crate::bouncer::DriverConnectionStatus::RegistrationFailed(
+                crate::bouncer::NetworkFailure::InvalidNickname,
+            ),
+        ))
+        .expect("status JSON");
+        assert_eq!(
+            event,
+            serde_json::json!({
+                "t": "status",
+                "v": "disconnected",
+                "reason": "The upstream rejected the configured nickname."
+            })
+        );
     }
 
     #[test]

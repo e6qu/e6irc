@@ -298,7 +298,9 @@ mod tests {
         let out_tx = finish_registration(&mut core_rx).await;
         assert!(matches!(
             events.recv().await,
-            Ok(super::super::DriverEvent::Connected)
+            Ok(super::super::DriverEvent::Status(
+                super::super::DriverConnectionStatus::Connected
+            ))
         ));
         (core_rx, handle, events, task, out_tx)
     }

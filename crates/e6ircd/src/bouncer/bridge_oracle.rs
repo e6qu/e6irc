@@ -291,7 +291,7 @@ pub async fn verify_round_trip(
             .await
             .expect("connected timeout")
             .expect("connected event"),
-        super::DriverEvent::Connected
+        super::DriverEvent::Status(super::DriverConnectionStatus::Connected)
     );
     assert!(matches!(
         tokio::time::timeout(std::time::Duration::from_secs(2), driver_events.recv())
