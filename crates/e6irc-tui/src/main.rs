@@ -492,136 +492,71 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    fn parses(arguments: &[&str]) -> bool {
+        Cli::try_parse_from(
+            [
+                "e6irc-tui",
+                "--server",
+                "irc.example:6697",
+                "--nick",
+                "alice",
+                "--channel",
+                "#chat",
+            ]
+            .into_iter()
+            .chain(arguments.iter().copied()),
+        )
+        .is_ok()
+    }
+
     #[test]
     fn authentication_shapes_are_explicit() {
-        assert!(
-            Cli::try_parse_from([
-                "e6irc-tui",
-                "--server",
-                "irc.example:6697",
-                "--nick",
-                "alice",
-                "--channel",
-                "#chat",
-                "--account",
-                "alice/work",
-                "--password",
-                "secret",
-            ])
-            .is_ok()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "e6irc-tui",
-                "--server",
-                "irc.example:6697",
-                "--nick",
-                "alice",
-                "--channel",
-                "#chat",
-                "--oauth-token",
-                "device-token"
-            ])
-            .is_ok()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "e6irc-tui",
-                "--server",
-                "irc.example:6697",
-                "--nick",
-                "alice",
-                "--channel",
-                "#chat",
-                "--oauth-from-cache"
-            ])
-            .is_ok()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "e6irc-tui",
-                "--server",
-                "irc.example:6697",
-                "--nick",
-                "alice",
-                "--channel",
-                "#chat",
-                "--oauth-from-cache",
-                "--token-file",
-                "token.json",
-            ])
-            .is_ok()
-        );
-        assert!(Cli::try_parse_from(["e6irc-tui", "--token-file", "token.json"]).is_err());
-        assert!(Cli::try_parse_from(["e6irc-tui", "--account", "alice"]).is_err());
-        assert!(Cli::try_parse_from(["e6irc-tui", "--password", "secret"]).is_err());
-        assert!(
-            Cli::try_parse_from([
-                "e6irc-tui",
-                "--account",
-                "alice",
-                "--password",
-                "secret",
-                "--oauth-token",
-                "device-token",
-            ])
-            .is_err()
-        );
+        assert!(parses(&["--account", "alice/work", "--password", "secret"]));
+        assert!(parses(&["--oauth-token", "device-token"]));
+        assert!(parses(&["--oauth-from-cache"]));
+        assert!(parses(&[
+            "--oauth-from-cache",
+            "--token-file",
+            "token.json"
+        ]));
+        assert!(!parses(&["--token-file", "token.json"]));
+        assert!(!parses(&["--account", "alice"]));
+        assert!(!parses(&["--password", "secret"]));
+        assert!(!parses(&[
+            "--account",
+            "alice",
+            "--password",
+            "secret",
+            "--oauth-token",
+            "device-token",
+        ]));
     }
 
     #[test]
     fn transport_and_reconnect_constraints_fail_at_argument_parsing() {
-        assert!(
-            Cli::try_parse_from([
-                "e6irc-tui",
-                "--server",
-                "irc.example:6697",
-                "--nick",
-                "alice",
-                "--channel",
-                "#chat",
-                "--tls"
-            ])
-            .is_ok()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "e6irc-tui",
-                "--server",
-                "irc.example:6697",
-                "--nick",
-                "alice",
-                "--channel",
-                "#chat",
-                "--tls",
-                "--tls-name",
-                "irc.example"
-            ])
-            .is_ok()
-        );
-        assert!(Cli::try_parse_from(["e6irc-tui", "--tls-name", "irc.example"]).is_err());
-        assert!(Cli::try_parse_from(["e6irc-tui", "--reconnect-delay", "0"]).is_err());
-        assert!(Cli::try_parse_from(["e6irc-tui", "--reconnect-delay", "301"]).is_err());
-        assert!(
-            Cli::try_parse_from([
-                "e6irc-tui",
-                "--server",
-                "irc.example:6697",
-                "--nick",
-                "alice",
-                "--channel",
-                "#chat",
-                "--history-lines",
-                "1000"
-            ])
-            .is_ok()
-        );
-        assert!(Cli::try_parse_from(["e6irc-tui", "--history-lines", "1001"]).is_err());
+        assert!(parses(&["--tls"]));
+        assert!(parses(&["--tls", "--tls-name", "irc.example"]));
+        assert!(!parses(&["--tls-name", "irc.example"]));
+        assert!(!parses(&["--reconnect-delay", "0"]));
+        assert!(!parses(&["--reconnect-delay", "301"]));
+        assert!(parses(&["--history-lines", "1000"]));
+        assert!(!parses(&["--history-lines", "1001"]));
     }
 
     #[test]
-    fn server_is_required() {
+    fn connection_arguments_are_required() {
         assert!(Cli::try_parse_from(["e6irc-tui"]).is_err());
+        assert!(Cli::try_parse_from(["e6irc-tui", "--server", "irc.example:6697"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "e6irc-tui",
+                "--server",
+                "irc.example:6697",
+                "--nick",
+                "alice",
+            ])
+            .is_err()
+        );
     }
 
     fn message(raw: &str) -> OwnedMessage {
