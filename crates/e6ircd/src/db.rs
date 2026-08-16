@@ -29,6 +29,9 @@ const DATABASE_STATEMENT_TIMEOUT_MS: i64 = 15_000;
 const DATABASE_LOCK_TIMEOUT_MS: i64 = 5_000;
 const ACCOUNT_FLAG_ADMIN: i64 = 1;
 const ACCOUNT_FLAG_SUSPENDED: i64 = 2;
+/// The largest millisecond value that a PostgreSQL `double precision`
+/// seconds binding can represent without losing a millisecond.
+const MAX_DATABASE_MILLIS: u64 = 1 << 53;
 
 #[derive(Debug)]
 pub enum DbError {
@@ -47,6 +50,8 @@ pub enum DbError {
     SecretRotation(String),
     /// Persisted token scopes are outside the closed authorization model.
     InvalidApiTokenScopes(String),
+    /// A persisted or outbound timestamp cannot preserve its epoch-millisecond value.
+    InvalidDatabaseTimestamp(String),
     /// A console write was based on an older settings revision.
     StaleServerSettings,
     /// Unknown account or wrong password (indistinguishable on purpose).
@@ -99,6 +104,9 @@ impl std::fmt::Display for DbError {
             Self::InvalidApiTokenScopes(error) => {
                 write!(f, "invalid persisted personal access token scopes: {error}")
             }
+            Self::InvalidDatabaseTimestamp(error) => {
+                write!(f, "invalid database timestamp: {error}")
+            }
             Self::StaleServerSettings => write!(f, "server settings changed concurrently"),
             Self::BadCredentials => write!(f, "invalid account or password"),
             Self::LocalPasswordExists => write!(f, "account already has a primary password"),
@@ -135,6 +143,38 @@ impl std::fmt::Display for DbError {
 }
 
 impl std::error::Error for DbError {}
+
+fn millis_from_database(value: i64, column: &str) -> Result<e6irc_proto::time::Millis, DbError> {
+    let value = u64::try_from(value).map_err(|_| {
+        DbError::InvalidDatabaseTimestamp(format!("{column} is before the Unix epoch: {value}"))
+    })?;
+    if value > MAX_DATABASE_MILLIS {
+        return Err(DbError::InvalidDatabaseTimestamp(format!(
+            "{column} exceeds exact millisecond range: {value}"
+        )));
+    }
+    Ok(e6irc_proto::time::Millis::from_millis(value))
+}
+
+fn millis_for_database(value: e6irc_proto::time::Millis, column: &str) -> Result<i64, DbError> {
+    let value = value.as_millis();
+    if value > MAX_DATABASE_MILLIS {
+        return Err(DbError::InvalidDatabaseTimestamp(format!(
+            "{column} exceeds exact millisecond range: {value}"
+        )));
+    }
+    Ok(value as i64)
+}
+
+fn seconds_for_database(value: u64, column: &str) -> Result<f64, DbError> {
+    let millis = value.checked_mul(1000).ok_or_else(|| {
+        DbError::InvalidDatabaseTimestamp(format!("{column} overflows milliseconds: {value}"))
+    })?;
+    Ok(
+        millis_for_database(e6irc_proto::time::Millis::from_millis(millis), column)? as f64
+            / 1000.0,
+    )
+}
 
 pub async fn connect_and_migrate(url: &str) -> Result<PgPool, DbError> {
     // Every caller shares this pool, including HTTP handlers and the database
@@ -1886,7 +1926,11 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) -> bool {
         bodies.push(body);
         bots.push(sender_is_bot);
         multilines.push(multiline);
-        tss.push(ts.as_millis() as i64);
+        let Ok(ts) = millis_for_database(ts, "messages.ts") else {
+            eprintln!("db: message logging skipped: timestamp exceeds exact database range");
+            return false;
+        };
+        tss.push(ts);
     }
     let result = sqlx::query(
         "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts, dm_peers, sender_is_bot, multiline)
@@ -2121,7 +2165,9 @@ async fn handle_request(
             label,
         } => {
             let rows = async {
-                let effective = resolve_history_target(pool, targets).await?;
+                let effective = resolve_history_target(pool, targets)
+                    .await
+                    .map_err(DbError::Query)?;
                 query_history(pool, &effective, query).await
             }
             .await
@@ -2432,14 +2478,25 @@ pub async fn list_read_markers(
 /// for the core's boot-time preload of its hot mirror of the `read_markers`
 /// table. Without this the mirror starts empty after a restart and MARKREAD
 /// queries wrongly report `*` for markers that are in fact persisted.
-pub async fn list_all_read_markers(pool: &PgPool) -> Result<Vec<(String, String, i64)>, DbError> {
-    sqlx::query_as(
+pub async fn list_all_read_markers(
+    pool: &PgPool,
+) -> Result<Vec<(String, String, e6irc_proto::time::Millis)>, DbError> {
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
         "SELECT a.name, r.target, (EXTRACT(EPOCH FROM r.marker_ts) * 1000)::bigint
          FROM read_markers r JOIN accounts a ON a.id = r.account_id",
     )
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)
+    .map_err(DbError::Query)?;
+    rows.into_iter()
+        .map(|(account, target, millis)| {
+            Ok((
+                account,
+                target,
+                millis_from_database(millis, "read_markers.marker_ts")?,
+            ))
+        })
+        .collect()
 }
 
 async fn set_read_marker(
@@ -2458,7 +2515,7 @@ async fn set_read_marker(
          RETURNING (EXTRACT(EPOCH FROM marker_ts) * 1000)::bigint",
     )
     .bind(target)
-    .bind(marker_ms.as_millis() as i64)
+    .bind(millis_for_database(marker_ms, "read_markers.marker_ts")?)
     .bind(&folded)
     .fetch_optional(pool)
     .await
@@ -2468,7 +2525,7 @@ async fn set_read_marker(
     let Some(stored) = stored else {
         return Err(DbError::UnknownAccount(account.to_string()));
     };
-    Ok(e6irc_proto::time::Millis::from_millis(stored as u64))
+    millis_from_database(stored, "read_markers.marker_ts")
 }
 
 /// Outcome of linking an OIDC identity to an account.
@@ -2666,7 +2723,11 @@ pub async fn set_channel_topic(
     topic: Option<(String, String, u64)>,
 ) -> Result<Option<bool>, DbError> {
     let (text, setter, set_at) = match topic {
-        Some((text, setter, set_at)) => (Some(text), Some(setter), Some(set_at as f64)),
+        Some((text, setter, set_at)) => (
+            Some(text),
+            Some(setter),
+            Some(seconds_for_database(set_at, "channels.topic_set_at")?),
+        ),
         None => (None, None, None),
     };
     sqlx::query_scalar(
@@ -2772,7 +2833,7 @@ pub async fn query_history(
     pool: &PgPool,
     target: &str,
     query: crate::core::HistoryQuery,
-) -> Result<Vec<crate::core::HistoryRow>, sqlx::Error> {
+) -> Result<Vec<crate::core::HistoryRow>, DbError> {
     use crate::core::HistoryQuery;
     // BETWEEN resolves each pivot's `(ts, id)` in the DB and derives its own
     // direction, so it produces its final oldest-first order itself rather than
@@ -2812,7 +2873,7 @@ pub async fn query_history(
                     "WHERE target = $1 AND ts < to_timestamp($2::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $3"
                 ))
             .bind(target)
-            .bind(before_ts.as_millis() as i64)
+            .bind(millis_for_database(before_ts, "history before selector")?)
             .bind(limit as i64)
             .fetch_all(pool)
             .await
@@ -2825,7 +2886,7 @@ pub async fn query_history(
                     "WHERE target = $1 AND ts > to_timestamp($2::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $3"
                 ))
             .bind(target)
-            .bind(after_ts.as_millis() as i64)
+            .bind(millis_for_database(after_ts, "history after selector")?)
             .bind(limit as i64)
             .fetch_all(pool)
             .await
@@ -2845,7 +2906,7 @@ pub async fn query_history(
                     "WHERE target = $1 AND ts > to_timestamp($2::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $3"
                 ))
             .bind(target)
-            .bind(after_ts.as_millis() as i64)
+            .bind(millis_for_database(after_ts, "history after selector")?)
             .bind(limit as i64)
             .fetch_all(pool)
             .await
@@ -2859,7 +2920,7 @@ pub async fn query_history(
                     "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $4"
                 ))
             .bind(target)
-            .bind(around_ts.as_millis() as i64)
+            .bind(millis_for_database(around_ts, "history around selector")?)
             .bind(before)
             .bind(after)
             .fetch_all(pool)
@@ -2914,18 +2975,18 @@ pub async fn query_history(
         // Returned early above.
         HistoryQuery::BetweenSelectors { .. } => unreachable!("handled before the match"),
     };
-    let mut rows = rows?;
+    let mut rows = rows.map_err(DbError::Query)?;
     if newest_first {
         rows.reverse();
     }
-    Ok(rows.into_iter().map(history_row_from_db).collect())
+    rows.into_iter().map(history_row_from_db).collect()
 }
 
 /// Map a raw history row to a [`HistoryRow`].
-fn history_row_from_db(row: HistoryDbRow) -> crate::core::HistoryRow {
-    crate::core::HistoryRow {
+fn history_row_from_db(row: HistoryDbRow) -> Result<crate::core::HistoryRow, DbError> {
+    Ok(crate::core::HistoryRow {
         msgid: row.msgid,
-        ts: e6irc_proto::time::Millis::from_millis(row.ts_millis as u64),
+        ts: millis_from_database(row.ts_millis, "messages.ts")?,
         sender_prefix: row.sender_prefix,
         sender_account: row.sender_account,
         kind: crate::core::MessageKind::from_db(&row.kind)
@@ -2933,7 +2994,7 @@ fn history_row_from_db(row: HistoryDbRow) -> crate::core::HistoryRow {
         body: row.body,
         sender_is_bot: row.sender_is_bot,
         multiline: row.multiline,
-    }
+    })
 }
 
 /// The BETWEEN query with each endpoint resolved to a `(ts, id)` position *in the
@@ -2948,7 +3009,7 @@ async fn query_between_selectors(
     first: &crate::core::SelectorBound,
     second: &crate::core::SelectorBound,
     limit: usize,
-) -> Result<Vec<crate::core::HistoryRow>, sqlx::Error> {
+) -> Result<Vec<crate::core::HistoryRow>, DbError> {
     use crate::core::SelectorBound;
     struct HistoryMarker {
         ts_millis: i64,
@@ -2966,10 +3027,10 @@ async fn query_between_selectors(
         pool: &PgPool,
         target: &str,
         b: &SelectorBound,
-    ) -> Result<Option<HistoryMarker>, sqlx::Error> {
+    ) -> Result<Option<HistoryMarker>, DbError> {
         match b {
             SelectorBound::Timestamp(t) => Ok(Some(HistoryMarker {
-                ts_millis: t.as_millis() as i64,
+                ts_millis: millis_for_database(*t, "history selector")?,
                 id: 0,
                 is_timestamp: true,
             })),
@@ -2981,7 +3042,8 @@ async fn query_between_selectors(
                 .bind(m)
                 .bind(target)
                 .fetch_optional(pool)
-                .await?;
+                .await
+                .map_err(DbError::Query)?;
                 Ok(row.map(|row| HistoryMarker {
                     ts_millis: row.ts_millis,
                     id: row.id,
@@ -3049,11 +3111,11 @@ async fn query_between_selectors(
         .bind(limit as i64)
         .fetch_all(pool)
         .await;
-    let mut rows = rows?;
+    let mut rows = rows.map_err(DbError::Query)?;
     if newest_first {
         rows.reverse();
     }
-    Ok(rows.into_iter().map(history_row_from_db).collect())
+    rows.into_iter().map(history_row_from_db).collect()
 }
 
 #[derive(sqlx::FromRow)]
@@ -3070,7 +3132,9 @@ pub async fn query_targets(
     min_ts: e6irc_proto::time::Millis,
     max_ts: e6irc_proto::time::Millis,
     limit: usize,
-) -> Result<Vec<(String, e6irc_proto::time::Millis)>, sqlx::Error> {
+) -> Result<Vec<(String, e6irc_proto::time::Millis)>, DbError> {
+    let min_ts = millis_for_database(min_ts, "history target minimum")?;
+    let max_ts = millis_for_database(max_ts, "history target maximum")?;
     let rows: Result<Vec<HistoryTargetRow>, sqlx::Error> = sqlx::query_as(
         "SELECT name, (EXTRACT(EPOCH FROM MAX(latest)) * 1000)::bigint AS latest FROM (
              SELECT target AS name, MAX(ts) AS latest
@@ -3094,21 +3158,21 @@ pub async fn query_targets(
          LIMIT $4",
     )
     .bind(channels)
-    .bind(min_ts.as_millis() as f64)
-    .bind(max_ts.as_millis() as f64)
+    .bind(min_ts as f64)
+    .bind(max_ts as f64)
     .bind(limit as i64)
     .bind(me)
     .fetch_all(pool)
     .await;
-    Ok(rows?
+    rows.map_err(DbError::Query)?
         .into_iter()
         .map(|row| {
-            (
+            Ok((
                 row.name,
-                e6irc_proto::time::Millis::from_millis(row.latest as u64),
-            )
+                millis_from_database(row.latest, "history target latest")?,
+            ))
         })
-        .collect())
+        .collect()
 }
 
 /// Most access entries (auto-op/voice grants) one channel may hold. Bounds both
@@ -3251,7 +3315,11 @@ pub async fn persist_owned_channel_mutation(
                 return Ok(ChannelControlResult::KeeptopicDisabled);
             }
             let (text, setter, set_at) = match topic {
-                Some((text, setter, set_at)) => (Some(text), Some(setter), Some(*set_at as f64)),
+                Some((text, setter, set_at)) => (
+                    Some(text),
+                    Some(setter),
+                    Some(seconds_for_database(*set_at, "channels.topic_set_at")?),
+                ),
                 None => (None, None, None),
             };
             sqlx::query(
@@ -3278,9 +3346,11 @@ pub async fn persist_owned_channel_mutation(
         }
         PersistedChannelMutation::SetKeeptopic { enabled, topic } => {
             let (text, setter, set_at) = match topic {
-                Some((text, setter, set_at)) if *enabled => {
-                    (Some(text), Some(setter), Some(*set_at as f64))
-                }
+                Some((text, setter, set_at)) if *enabled => (
+                    Some(text),
+                    Some(setter),
+                    Some(seconds_for_database(*set_at, "channels.topic_set_at")?),
+                ),
                 _ => (None, None, None),
             };
             sqlx::query(
@@ -4018,7 +4088,7 @@ pub async fn persist_channel_registration(
         Some((text, setter, set_at)) => (
             Some(text.as_str()),
             Some(setter.as_str()),
-            Some(*set_at as f64),
+            Some(seconds_for_database(*set_at, "channels.topic_set_at")?),
         ),
         None => (None, None, None),
     };
@@ -5193,10 +5263,21 @@ pub async fn list_channel_topics(
     .fetch_all(pool)
     .await
     .map_err(DbError::Query)?;
-    Ok(rows
-        .into_iter()
-        .map(|(n, t, s, ts)| (n, t, s, ts as u64))
-        .collect())
+    rows.into_iter()
+        .map(|(name, topic, setter, seconds)| {
+            let millis = seconds.checked_mul(1000).ok_or_else(|| {
+                DbError::InvalidDatabaseTimestamp(format!(
+                    "channels.topic_set_at overflows milliseconds: {seconds}"
+                ))
+            })?;
+            Ok((
+                name,
+                topic,
+                setter,
+                millis_from_database(millis, "channels.topic_set_at")?.as_secs(),
+            ))
+        })
+        .collect()
 }
 
 /// Persist a registered channel's KEEPTOPIC option on its `channels` row.
@@ -5207,9 +5288,11 @@ pub async fn set_channel_keeptopic(
     topic: Option<(String, String, u64)>,
 ) -> Result<bool, DbError> {
     let (text, setter, set_at) = match topic {
-        Some((text, setter, set_at)) if keeptopic => {
-            (Some(text), Some(setter), Some(set_at as f64))
-        }
+        Some((text, setter, set_at)) if keeptopic => (
+            Some(text),
+            Some(setter),
+            Some(seconds_for_database(set_at, "channels.topic_set_at")?),
+        ),
         _ => (None, None, None),
     };
     sqlx::query(
@@ -5754,12 +5837,14 @@ pub async fn bnc_buffer_summary(
     .await
     .map_err(DbError::Query)?;
     let timestamp = |value: Option<i64>| {
-        value.map(|millis| e6irc_proto::time::Millis::from_millis(millis.max(0) as u64))
+        value
+            .map(|millis| millis_from_database(millis, "bnc_buffer.created_at"))
+            .transpose()
     };
     Ok(BncBufferSummary {
         lines,
-        oldest_at: timestamp(oldest_at),
-        newest_at: timestamp(newest_at),
+        oldest_at: timestamp(oldest_at)?,
+        newest_at: timestamp(newest_at)?,
     })
 }
 
@@ -6680,7 +6765,41 @@ pub async fn revoke_credential(pool: &PgPool, account: &str, id: i64) -> Result<
 
 #[cfg(test)]
 mod history_sql_tests {
-    use super::{DbError, stored_network_kind};
+    use super::{
+        DbError, MAX_DATABASE_MILLIS, millis_for_database, millis_from_database,
+        stored_network_kind,
+    };
+    use e6irc_proto::time::Millis;
+
+    #[test]
+    fn database_millis_rejects_values_that_would_wrap_or_lose_precision() {
+        for value in [-1, i64::MAX] {
+            assert!(matches!(
+                millis_from_database(value, "test timestamp"),
+                Err(DbError::InvalidDatabaseTimestamp(_))
+            ));
+        }
+        assert!(matches!(
+            millis_for_database(
+                Millis::from_millis(MAX_DATABASE_MILLIS + 1),
+                "test timestamp"
+            ),
+            Err(DbError::InvalidDatabaseTimestamp(_))
+        ));
+    }
+
+    #[test]
+    fn database_millis_preserves_the_exact_boundary() {
+        let millis = Millis::from_millis(MAX_DATABASE_MILLIS);
+        assert_eq!(
+            millis_from_database(MAX_DATABASE_MILLIS as i64, "test timestamp").unwrap(),
+            millis
+        );
+        assert_eq!(
+            millis_for_database(millis, "test timestamp").unwrap(),
+            MAX_DATABASE_MILLIS as i64
+        );
+    }
 
     #[test]
     fn unknown_persisted_network_kind_is_an_error() {
