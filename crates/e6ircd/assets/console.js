@@ -378,6 +378,48 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     return section;
   };
 
+  const monitoringWindowLabel = (minutes) => ({ 60: "1 hour", 360: "6 hours", 1440: "24 hours", 10080: "7 days" })[minutes];
+  const monitoringAge = (now, then) => {
+    const seconds = Math.max(0, Math.floor((now - then) / 1000));
+    if (seconds < 60) return `${seconds}s ago`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+    return `${Math.floor(seconds / 86400)}d ago`;
+  };
+  const monitoringLatency = (micros) => micros >= 1000000 ? `${(micros / 1000000).toFixed(2)} s` : micros >= 1000 ? `${(micros / 1000).toFixed(1)} ms` : `${micros} µs`;
+  const monitoringHeight = (value, peak) => value === 0 ? 0 : Math.max(1, Math.floor(value * 100 / Math.max(1, peak)));
+  const monitoringDeltaBars = (samples, inbound, outbound, inboundLabel, outboundLabel, now) => {
+    const values = samples.slice(1).map((sample, index) => ({ inbound: Math.max(0, inbound(sample) - inbound(samples[index])), outbound: Math.max(0, outbound(sample) - outbound(samples[index])), at: sample.sampled_at_ms }));
+    const peak = Math.max(1, ...values.flatMap((value) => [value.inbound, value.outbound]));
+    return values.map((value) => ({ inbound_height: monitoringHeight(value.inbound, peak), outbound_height: monitoringHeight(value.outbound, peak), title: `${formatBytes(value.inbound)} ${inboundLabel} · ${formatBytes(value.outbound)} ${outboundLabel} · ${monitoringAge(now, value.at)}` }));
+  };
+  const monitoringView = ({ current, history }, minutes) => {
+    const samples = [...history.filter((sample) => sample.sampled_at_ms !== current.sampled_at_ms), current];
+    const first = samples[0];
+    const elapsed = Math.max(1, Math.floor((current.sampled_at_ms - first.sampled_at_ms) / 1000));
+    const errorTotal = Object.values(current.errors).reduce((sum, count) => sum + count, 0);
+    const connectionPeak = Math.max(1, ...samples.map((sample) => Math.max(sample.active_connections, sample.bnc_client_connections)));
+    const latencyPeak = Math.max(1, ...samples.map((sample) => Math.max(sample.core_latency.p95_us, sample.database_latency.p95_us, sample.http_latency.p95_us)));
+    const queuePressure = (queue) => queue.capacity === 0 ? 0 : Math.floor(queue.depth * 100 / queue.capacity);
+    const corePressure = (sample) => Math.max(0, ...Object.entries(sample.queues).filter(([name]) => name === "core" || name.startsWith("core-")).map(([, queue]) => queuePressure(queue)));
+    const errorBars = samples.slice(1).map((sample, index) => ({ count: Math.max(0, Object.values(sample.errors).reduce((sum, count) => sum + count, 0) - Object.values(samples[index].errors).reduce((sum, count) => sum + count, 0)), at: sample.sampled_at_ms }));
+    const errorPeak = Math.max(1, ...errorBars.map((bar) => bar.count));
+    return {
+      core_ready: current.core_heartbeat_age_ms <= 45000, database_ready: true,
+      active_connections: current.active_connections, registered_connections: current.registered_connections, channels: current.channels, opened_total: current.connections_opened_total, rejected_total: current.connections_rejected_total,
+      traffic_in: formatBytes(current.irc_bytes_in_total), traffic_out: formatBytes(current.irc_bytes_out_total), upstream_in: formatBytes(current.bnc_bytes_in_total), upstream_out: formatBytes(current.bnc_bytes_out_total),
+      inbound_rate: `${formatBytes(Math.max(0, current.irc_bytes_in_total - first.irc_bytes_in_total) / elapsed)}/s`, outbound_rate: `${formatBytes(Math.max(0, current.irc_bytes_out_total - first.irc_bytes_out_total) / elapsed)}/s`, upstream_inbound_rate: `${formatBytes(Math.max(0, current.bnc_bytes_in_total - first.bnc_bytes_in_total) / elapsed)}/s`, upstream_outbound_rate: `${formatBytes(Math.max(0, current.bnc_bytes_out_total - first.bnc_bytes_out_total) / elapsed)}/s`,
+      http_requests: current.http_requests_total, database_requests: current.database_requests_total, bnc_connected: current.bnc_connected, bnc_networks: current.bnc_networks, upstreams_ready: current.bnc_networks > 0 && current.bnc_connected === current.bnc_networks, upstreams_degraded: current.bnc_connected > 0 && current.bnc_connected < current.bnc_networks, bnc_clients: current.bnc_client_connections, error_total: errorTotal, sendq_kills: current.sendq_kills_total,
+      core_p50: monitoringLatency(current.core_latency.p50_us), core_p95: monitoringLatency(current.core_latency.p95_us), core_p99: monitoringLatency(current.core_latency.p99_us), database_p50: monitoringLatency(current.database_latency.p50_us), database_p95: monitoringLatency(current.database_latency.p95_us), database_p99: monitoringLatency(current.database_latency.p99_us), http_p50: monitoringLatency(current.http_latency.p50_us), http_p95: monitoringLatency(current.http_latency.p95_us), http_p99: monitoringLatency(current.http_latency.p99_us),
+      traffic_bars: monitoringDeltaBars(samples, (sample) => sample.irc_bytes_in_total, (sample) => sample.irc_bytes_out_total, "inbound", "outbound", current.sampled_at_ms), upstream_traffic_bars: monitoringDeltaBars(samples, (sample) => sample.bnc_bytes_in_total, (sample) => sample.bnc_bytes_out_total, "received", "sent", current.sampled_at_ms),
+      connection_bars: samples.filter((sample) => sample.schema_version === current.schema_version).map((sample) => ({ irc_height: monitoringHeight(sample.active_connections, connectionPeak), bnc_height: monitoringHeight(sample.bnc_client_connections, connectionPeak), title: `${sample.active_connections} IRC · ${sample.bnc_client_connections} BNC · ${monitoringAge(current.sampled_at_ms, sample.sampled_at_ms)}` })),
+      upstream_bars: samples.map((sample) => ({ height: sample.bnc_networks === 0 ? 0 : Math.floor(sample.bnc_connected * 100 / sample.bnc_networks), status_class: sample.bnc_networks === 0 || sample.bnc_connected === 0 ? "bar-off" : sample.bnc_connected === sample.bnc_networks ? "bar-ok" : "bar-warn", title: `${sample.bnc_connected} of ${sample.bnc_networks} connected · ${monitoringAge(current.sampled_at_ms, sample.sampled_at_ms)}` })),
+      error_bars: errorBars.map((bar) => ({ height: monitoringHeight(bar.count, errorPeak), title: `${bar.count} new errors · ${monitoringAge(current.sampled_at_ms, bar.at)}` })), latency_bars: samples.map((sample) => ({ core_height: monitoringHeight(sample.core_latency.p95_us, latencyPeak), database_height: monitoringHeight(sample.database_latency.p95_us, latencyPeak), http_height: monitoringHeight(sample.http_latency.p95_us, latencyPeak), title: `Core ${monitoringLatency(sample.core_latency.p95_us)} · PostgreSQL ${monitoringLatency(sample.database_latency.p95_us)} · HTTP ${monitoringLatency(sample.http_latency.p95_us)} · ${monitoringAge(current.sampled_at_ms, sample.sampled_at_ms)}` })), queue_bars: samples.map((sample) => ({ core_height: corePressure(sample), database_height: sample.queues.db === undefined ? 0 : queuePressure(sample.queues.db), title: `Core ${corePressure(sample)}% · PostgreSQL ${sample.queues.db === undefined ? 0 : queuePressure(sample.queues.db)}% · ${monitoringAge(current.sampled_at_ms, sample.sampled_at_ms)}` })),
+      queues: Object.entries(current.queues).map(([name, queue]) => ({ label: name === "db" ? "Database worker" : `IRC core shard ${name.slice(5)}`, depth: queue.depth, capacity: queue.capacity, pressure: queuePressure(queue), mode: queue.mode.toUpperCase(), mode_switches: queue.mode_switches })), errors: Object.entries(current.errors).filter(([, count]) => count > 0).map(([kind, count]) => ({ kind: kind.replaceAll("_", " "), count, last_seen: monitoringAge(current.sampled_at_ms, current.error_last_seen_ms[kind]) })),
+      sampled_age: monitoringAge(current.sampled_at_ms, current.sampled_at_ms), history_samples: samples.length - 1, window_label: monitoringWindowLabel(minutes), window_minutes: minutes,
+    };
+  };
+
   const renderMonitoring = (panel, view) => {
     const fragment = document.createDocumentFragment();
     fragment.append(monitoringHealth(view), monitoringMetrics(view));
@@ -406,7 +448,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     fragment.append(ledger);
     const foot = element("div", "monitoring-foot");
     const json = element("a", "", "JSON");
-    json.href = `/api/v1/admin/monitoring?minutes=${encodeURIComponent(view.window_minutes)}`;
+    json.href = `/api/v1/admin/observability?minutes=${encodeURIComponent(view.window_minutes)}`;
     const prometheus = element("a", "", "Prometheus");
     prometheus.href = "/api/v1/admin/metrics";
     foot.append(element("span", "", `${view.history_samples} stored samples · ${view.window_label}`), element("span", "", `Updated ${view.sampled_age}`), json, prometheus);
@@ -424,7 +466,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     try {
       const minutes = Number(panel.dataset.minutes);
       if (!Number.isSafeInteger(minutes) || minutes < 1) throw new Error("The monitoring window is invalid. Reload and try again.");
-      const view = await apiRead(`/api/v1/admin/monitoring?minutes=${encodeURIComponent(minutes)}`);
+      const view = monitoringView(await apiRead(`/api/v1/admin/observability?minutes=${encodeURIComponent(minutes)}`), minutes);
       renderMonitoring(panel, view);
       if (status) status.textContent = "Live data refreshed.";
     } catch (error) {
