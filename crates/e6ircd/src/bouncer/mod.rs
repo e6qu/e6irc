@@ -543,7 +543,13 @@ async fn wait_for_reconnect(
     failure: NetworkFailure,
 ) -> bool {
     ends.emit(ConnectionEvent::Reconnecting(failure));
-    ends.schedule_retry(backoff.next_delay(attempt_elapsed));
+    if let Err(lifecycle) = ends.schedule_retry(backoff.next_delay(attempt_elapsed)) {
+        eprintln!(
+            "bnc: cannot schedule reconnect from {} state",
+            lifecycle.as_str()
+        );
+        return false;
+    }
     tokio::select! {
         biased;
         _ = ends.shutdown_signalled() => false,
@@ -1406,28 +1412,75 @@ pub struct NetworkRuntimeSnapshot {
 }
 
 struct NetworkRuntimeState {
-    lifecycle: NetworkLifecycle,
-    /// When the next reconnect attempt fires (while reconnecting; `None`
-    /// once a session connects or the driver parks).
-    next_retry_at: Option<e6irc_proto::time::Millis>,
+    phase: NetworkRuntimePhase,
     /// The last few classified failures, newest last — a flap pattern is a
     /// sequence, and "last error" alone hides it. Bounded; runtime state is
     /// restart-ephemeral by design.
     recent_failures: std::collections::VecDeque<FailureRecord>,
     state_changed_at: e6irc_proto::time::Millis,
-    connected_at: Option<e6irc_proto::time::Millis>,
     attempt_started: std::time::Instant,
     connect_latency_ms: Option<u64>,
     connection_attempts: u64,
     errors: u64,
-    last_error_at: Option<e6irc_proto::time::Millis>,
-    last_error: Option<NetworkFailure>,
+    last_error: Option<FailureRecord>,
 }
 
 #[derive(Clone, Copy)]
 enum FailureDisposition {
     Retry,
-    Terminal(NetworkLifecycle),
+    Terminal(TerminalNetworkLifecycle),
+}
+
+#[derive(Clone, Copy)]
+enum TerminalNetworkLifecycle {
+    AuthenticationFailed,
+    RegistrationFailed,
+}
+
+impl TerminalNetworkLifecycle {
+    const fn lifecycle(self) -> NetworkLifecycle {
+        match self {
+            Self::AuthenticationFailed => NetworkLifecycle::AuthenticationFailed,
+            Self::RegistrationFailed => NetworkLifecycle::RegistrationFailed,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NetworkRuntimePhase {
+    Connecting,
+    Reconnecting {
+        next_retry_at: Option<e6irc_proto::time::Millis>,
+    },
+    Connected {
+        connected_at: e6irc_proto::time::Millis,
+    },
+    Terminal(TerminalNetworkLifecycle),
+}
+
+impl NetworkRuntimePhase {
+    const fn lifecycle(self) -> NetworkLifecycle {
+        match self {
+            Self::Connecting => NetworkLifecycle::Connecting,
+            Self::Reconnecting { .. } => NetworkLifecycle::Reconnecting,
+            Self::Connected { .. } => NetworkLifecycle::Connected,
+            Self::Terminal(lifecycle) => lifecycle.lifecycle(),
+        }
+    }
+
+    const fn next_retry_at(self) -> Option<e6irc_proto::time::Millis> {
+        match self {
+            Self::Reconnecting { next_retry_at } => next_retry_at,
+            Self::Connecting | Self::Connected { .. } | Self::Terminal(_) => None,
+        }
+    }
+
+    const fn connected_at(self) -> Option<e6irc_proto::time::Millis> {
+        match self {
+            Self::Connected { connected_at } => Some(connected_at),
+            Self::Connecting | Self::Reconnecting { .. } | Self::Terminal(_) => None,
+        }
+    }
 }
 
 struct NetworkRuntime {
@@ -1459,16 +1512,13 @@ impl NetworkRuntime {
     fn new() -> Self {
         Self {
             state: std::sync::Mutex::new(NetworkRuntimeState {
-                lifecycle: NetworkLifecycle::Connecting,
-                next_retry_at: None,
+                phase: NetworkRuntimePhase::Connecting,
                 recent_failures: std::collections::VecDeque::new(),
                 state_changed_at: epoch_millis(),
-                connected_at: None,
                 attempt_started: std::time::Instant::now(),
                 connect_latency_ms: None,
                 connection_attempts: 0,
                 errors: 0,
-                last_error_at: None,
                 last_error: None,
             }),
             label: std::sync::Mutex::new(None),
@@ -1482,21 +1532,26 @@ impl NetworkRuntime {
         }
     }
 
-    fn schedule_retry(&self, delay: std::time::Duration) {
+    fn schedule_retry(&self, delay: std::time::Duration) -> Result<(), NetworkLifecycle> {
         let mut state = self.state.lock().expect("network runtime poisoned");
+        let NetworkRuntimePhase::Reconnecting { next_retry_at } = &mut state.phase else {
+            return Err(state.phase.lifecycle());
+        };
         let at = epoch_millis()
             .as_millis()
             .saturating_add(delay.as_millis() as u64);
-        state.next_retry_at = Some(e6irc_proto::time::Millis::from_millis(at));
+        *next_retry_at = Some(e6irc_proto::time::Millis::from_millis(at));
+        Ok(())
     }
 
     fn begin_attempt(&self) {
         let mut state = self.state.lock().expect("network runtime poisoned");
-        state.next_retry_at = None;
-        state.lifecycle = if state.connection_attempts == 0 {
-            NetworkLifecycle::Connecting
+        state.phase = if state.connection_attempts == 0 {
+            NetworkRuntimePhase::Connecting
         } else {
-            NetworkLifecycle::Reconnecting
+            NetworkRuntimePhase::Reconnecting {
+                next_retry_at: None,
+            }
         };
         state.connection_attempts = state.connection_attempts.saturating_add(1);
         state.state_changed_at = epoch_millis();
@@ -1509,10 +1564,8 @@ impl NetworkRuntime {
             state.connection_attempts = 1;
         }
         let now = epoch_millis();
-        state.lifecycle = NetworkLifecycle::Connected;
+        state.phase = NetworkRuntimePhase::Connected { connected_at: now };
         state.state_changed_at = now;
-        state.connected_at = Some(now);
-        state.next_retry_at = None;
         state.connect_latency_ms = Some(
             state
                 .attempt_started
@@ -1525,12 +1578,13 @@ impl NetworkRuntime {
     fn failed(&self, disposition: FailureDisposition, failure: NetworkFailure) {
         let now = epoch_millis();
         let mut state = self.state.lock().expect("network runtime poisoned");
-        state.lifecycle = match disposition {
-            FailureDisposition::Retry => NetworkLifecycle::Reconnecting,
-            FailureDisposition::Terminal(lifecycle) => lifecycle,
+        state.phase = match disposition {
+            FailureDisposition::Retry => NetworkRuntimePhase::Reconnecting {
+                next_retry_at: None,
+            },
+            FailureDisposition::Terminal(lifecycle) => NetworkRuntimePhase::Terminal(lifecycle),
         };
         state.state_changed_at = now;
-        state.connected_at = None;
         Self::set_error(&mut state, now, failure);
     }
 
@@ -1546,11 +1600,9 @@ impl NetworkRuntime {
         failure: NetworkFailure,
     ) {
         state.errors = state.errors.saturating_add(1);
-        state.last_error_at = Some(now);
-        state.last_error = Some(failure);
-        state
-            .recent_failures
-            .push_back(FailureRecord { at: now, failure });
+        let record = FailureRecord { at: now, failure };
+        state.last_error = Some(record);
+        state.recent_failures.push_back(record);
         while state.recent_failures.len() > NETWORK_FAILURE_HISTORY_LIMIT {
             state.recent_failures.pop_front();
         }
@@ -1858,7 +1910,8 @@ impl NetworkHandle {
             .state
             .lock()
             .expect("network runtime poisoned")
-            .lifecycle
+            .phase
+            .lifecycle()
             == NetworkLifecycle::Connected
     }
 
@@ -1884,15 +1937,15 @@ impl NetworkHandle {
         let state = self.state_snapshot();
         let buffer = self.buffer.lock().expect("buffer poisoned");
         NetworkRuntimeSnapshot {
-            lifecycle: state.lifecycle,
+            lifecycle: state.phase.lifecycle(),
             state_changed_at: state.state_changed_at,
-            next_retry_at: state.next_retry_at,
+            next_retry_at: state.phase.next_retry_at(),
             recent_failures: state.recent_failures.iter().copied().collect(),
-            connected_at: state.connected_at,
+            connected_at: state.phase.connected_at(),
             last_input_at: atomic_millis(&self.runtime.last_input_at),
             last_output_at: atomic_millis(&self.runtime.last_output_at),
-            last_error_at: state.last_error_at,
-            last_error: state.last_error,
+            last_error_at: state.last_error.map(|record| record.at),
+            last_error: state.last_error.map(|record| record.failure),
             connect_latency_ms: state.connect_latency_ms,
             connection_attempts: state.connection_attempts,
             errors: state.errors,
@@ -1924,16 +1977,13 @@ impl NetworkHandle {
     fn state_snapshot(&self) -> NetworkRuntimeState {
         let state = self.runtime.state.lock().expect("network runtime poisoned");
         NetworkRuntimeState {
-            lifecycle: state.lifecycle,
-            next_retry_at: state.next_retry_at,
+            phase: state.phase,
             recent_failures: state.recent_failures.clone(),
             state_changed_at: state.state_changed_at,
-            connected_at: state.connected_at,
             attempt_started: state.attempt_started,
             connect_latency_ms: state.connect_latency_ms,
             connection_attempts: state.connection_attempts,
             errors: state.errors,
-            last_error_at: state.last_error_at,
             last_error: state.last_error,
         }
     }
@@ -2184,11 +2234,13 @@ impl DriverEnds {
                 let (disposition, failure) = match failure_event {
                     ConnectionEvent::Reconnecting(failure) => (FailureDisposition::Retry, failure),
                     ConnectionEvent::AuthenticationFailed => (
-                        FailureDisposition::Terminal(NetworkLifecycle::AuthenticationFailed),
+                        FailureDisposition::Terminal(
+                            TerminalNetworkLifecycle::AuthenticationFailed,
+                        ),
                         NetworkFailure::AuthenticationRejected,
                     ),
                     ConnectionEvent::RegistrationFailed(refusal) => (
-                        FailureDisposition::Terminal(NetworkLifecycle::RegistrationFailed),
+                        FailureDisposition::Terminal(TerminalNetworkLifecycle::RegistrationFailed),
                         registration_failure(refusal),
                     ),
                     ConnectionEvent::Connected => {
@@ -2208,7 +2260,7 @@ impl DriverEnds {
                     FailureDisposition::Terminal(lifecycle) => eprintln!(
                         "bnc: {} parked ({}): {}",
                         self.runtime.label(),
-                        lifecycle.as_str(),
+                        lifecycle.lifecycle().as_str(),
                         failure.summary(),
                     ),
                     FailureDisposition::Retry => eprintln!(
@@ -2219,7 +2271,7 @@ impl DriverEnds {
                 }
                 let state = match disposition {
                     FailureDisposition::Retry => "reconnecting",
-                    FailureDisposition::Terminal(lifecycle) => lifecycle.as_str(),
+                    FailureDisposition::Terminal(lifecycle) => lifecycle.lifecycle().as_str(),
                 };
                 (
                     DriverEvent::Disconnected,
@@ -2243,8 +2295,8 @@ impl DriverEnds {
 
     /// Record when the next reconnect attempt fires (visible in the runtime
     /// snapshot as `next_retry_at`), then cleared when a session connects.
-    fn schedule_retry(&self, delay: std::time::Duration) {
-        self.runtime.schedule_retry(delay);
+    fn schedule_retry(&self, delay: std::time::Duration) -> Result<(), NetworkLifecycle> {
+        self.runtime.schedule_retry(delay)
     }
 
     /// Await the next downstream command; `None` when every handle is dropped
@@ -2734,6 +2786,8 @@ mod tests {
         assert_eq!(connected.buffer_lines, 2);
         assert_eq!(connected.buffer_capacity, 16);
         assert_eq!(connected.attached_clients, 1);
+        assert!(connected.connected_at.is_some());
+        assert_eq!(connected.next_retry_at, None);
         assert!(connected.last_input_at.is_some());
         assert!(connected.last_output_at.is_some());
         assert_eq!(connected.last_error, None);
@@ -2747,18 +2801,39 @@ mod tests {
         assert_eq!(reconnecting.lifecycle, NetworkLifecycle::Reconnecting);
         assert_eq!(reconnecting.errors, 1);
         assert_eq!(reconnecting.attached_clients, 0);
+        assert_eq!(reconnecting.connected_at, None);
+        assert_eq!(reconnecting.next_retry_at, None);
         assert!(reconnecting.last_error_at.is_some());
         assert_eq!(
             reconnecting.last_error,
             Some(NetworkFailure::ConnectionLost)
         );
+        assert_eq!(
+            reconnecting.last_error_at,
+            reconnecting.recent_failures.last().map(|record| record.at),
+            "the latest error and its timestamp come from one record"
+        );
+        ends.schedule_retry(std::time::Duration::from_secs(1))
+            .expect("reconnecting state accepts a retry schedule");
+        assert!(handle.runtime_snapshot().next_retry_at.is_some());
 
         ends.emit(ConnectionEvent::AuthenticationFailed);
         let failed = handle.runtime_snapshot();
         assert_eq!(failed.lifecycle, NetworkLifecycle::AuthenticationFailed);
+        assert_eq!(failed.connected_at, None);
+        assert_eq!(failed.next_retry_at, None);
         assert_eq!(
             failed.last_error,
             Some(NetworkFailure::AuthenticationRejected)
+        );
+        assert_eq!(
+            ends.schedule_retry(std::time::Duration::from_secs(1)),
+            Err(NetworkLifecycle::AuthenticationFailed),
+            "a parked network cannot be revived by retry scheduling"
+        );
+        assert_eq!(
+            handle.runtime_snapshot().lifecycle,
+            NetworkLifecycle::AuthenticationFailed
         );
 
         ends.emit(ConnectionEvent::RegistrationFailed(
