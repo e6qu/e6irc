@@ -70,10 +70,10 @@ cargo build --release -p e6ircd
 
 # Native clients
 cargo build --profile release-client -p e6irc-cli -p e6irc-tui
-./target/release-client/e6irc --server 127.0.0.1:6667 send '#chan' 'hello'
+./target/release-client/e6irc --server 127.0.0.1:6667 --nick alice send '#chan' 'hello'
 
 # TUI (TLS + BNC account/network selection; history/read markers are automatic)
-./target/release-client/e6irc-tui --server bnc.example:6697 --tls \
+./target/release-client/e6irc-tui --server bnc.example:6697 --nick alice --tls \
   --account alice/libera --password 'app-password' --channel '#e6irc'
 ```
 
@@ -82,9 +82,9 @@ For a browser-approved token shared by the CLI and TUI:
 ```sh
 e6irc login --base https://irc.example
 e6irc api GET /api/v1/me
-e6irc --server irc.example:6697 --tls --oauth-from-cache \
+e6irc --server irc.example:6697 --nick alice --tls --oauth-from-cache \
   tail '#e6irc' --json
-e6irc-tui --server irc.example:6697 --tls --oauth-from-cache \
+e6irc-tui --server irc.example:6697 --nick alice --tls --oauth-from-cache \
   --channel '#e6irc'
 ```
 

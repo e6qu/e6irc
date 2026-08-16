@@ -54,9 +54,9 @@ struct Cli {
     /// Server address (host:port) for IRC commands.
     #[arg(long, short, global = true)]
     server: Option<String>,
-    /// Nickname to register with.
-    #[arg(long, short, default_value = "e6irc", global = true)]
-    nick: String,
+    /// Nickname to register with IRC commands.
+    #[arg(long, short, global = true)]
+    nick: Option<String>,
     /// SASL account (enables SASL PLAIN when set with --password).
     #[arg(
         long,
@@ -196,6 +196,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
     }
 
     let server = irc_server(cli.server.as_deref())?;
+    let nick = irc_nick(cli.nick.as_deref())?;
     let authentication = match (
         &cli.account,
         &cli.password,
@@ -233,7 +234,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
         address: server.to_owned(),
         tls: cli.tls,
         tls_server_name: cli.tls_name.clone(),
-        nick: cli.nick.clone(),
+        nick: nick.to_owned(),
         realname: "e6irc-cli".into(),
         authentication,
     }
@@ -403,12 +404,20 @@ async fn run(cli: Cli) -> std::io::Result<()> {
 }
 
 fn irc_server(server: Option<&str>) -> std::io::Result<&str> {
-    server
-        .filter(|server| !server.trim().is_empty())
+    irc_argument(server, "--server")
+}
+
+fn irc_nick(nick: Option<&str>) -> std::io::Result<&str> {
+    irc_argument(nick, "--nick")
+}
+
+fn irc_argument<'a>(value: Option<&'a str>, flag: &str) -> std::io::Result<&'a str> {
+    value
+        .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "--server is required for IRC commands",
+                format!("{flag} is required for IRC commands"),
             )
         })
 }
@@ -545,6 +554,13 @@ mod tests {
         );
         assert!(irc_server(None).is_err());
         assert!(irc_server(Some(" ")).is_err());
+    }
+
+    #[test]
+    fn irc_commands_require_a_nickname() {
+        assert_eq!(irc_nick(Some("alice")).unwrap(), "alice");
+        assert!(irc_nick(None).is_err());
+        assert!(irc_nick(Some(" ")).is_err());
     }
 
     #[test]
