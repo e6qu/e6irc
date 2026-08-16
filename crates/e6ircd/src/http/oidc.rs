@@ -801,6 +801,7 @@ pub(super) fn verify_logout_token_with_metadata(
         || claims.iat < now - 600
         || claims.iat > now + 60
         || claims.exp <= now
+        || claims.exp <= claims.iat
         || claims.events.len() != 1
         || !claims.events.contains_key(BACKCHANNEL_LOGOUT_EVENT)
     {
