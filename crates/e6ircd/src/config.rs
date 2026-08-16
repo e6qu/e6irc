@@ -180,7 +180,10 @@ pub struct Config {
     pub storage: StorageConfig,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+const DEFAULT_API_RATE_BURST: usize = 240;
+const DEFAULT_ADMINISTRATOR_API_RATE_BURST: usize = 60;
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
     /// Maximum simultaneous connections from one IP; `None` = unlimited.
@@ -203,19 +206,39 @@ pub struct LimitsConfig {
     /// `None` disables auth rate limiting.
     #[serde(default)]
     pub auth_rate_burst: Option<usize>,
-    /// Authenticated REST requests per account per minute. `None` uses the
-    /// built-in production default.
-    #[serde(default)]
-    pub api_rate_burst: Option<usize>,
-    /// Administrator REST requests per administrator per minute. `None` uses
-    /// the smaller built-in production default.
-    #[serde(default)]
-    pub administrator_api_rate_burst: Option<usize>,
+    /// Authenticated REST requests per account per minute.
+    #[serde(default = "default_api_rate_burst")]
+    pub api_rate_burst: usize,
+    /// Administrator REST requests per administrator per minute.
+    #[serde(default = "default_administrator_api_rate_burst")]
+    pub administrator_api_rate_burst: usize,
     /// Token-bucket size for account creation (REGISTER / NickServ REGISTER),
     /// per client IP; the bucket refills to full over one hour. Bounds bulk
     /// account minting from one address. `None` disables the throttle.
     #[serde(default)]
     pub registration_burst: Option<usize>,
+}
+
+const fn default_api_rate_burst() -> usize {
+    DEFAULT_API_RATE_BURST
+}
+
+const fn default_administrator_api_rate_burst() -> usize {
+    DEFAULT_ADMINISTRATOR_API_RATE_BURST
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_connections_per_ip: None,
+            command_burst: None,
+            trusted_proxies: Vec::new(),
+            auth_rate_burst: None,
+            api_rate_burst: DEFAULT_API_RATE_BURST,
+            administrator_api_rate_burst: DEFAULT_ADMINISTRATOR_API_RATE_BURST,
+            registration_burst: None,
+        }
+    }
 }
 
 /// Operational settings owned by the database-backed control plane.
@@ -951,14 +974,14 @@ impl Config {
                 "limits.auth_rate_burst must be nonzero when set".into(),
             ));
         }
-        if self.limits.api_rate_burst == Some(0) {
+        if self.limits.api_rate_burst == 0 {
             return Err(ConfigError::Invalid(
-                "limits.api_rate_burst must be nonzero when set".into(),
+                "limits.api_rate_burst must be nonzero".into(),
             ));
         }
-        if self.limits.administrator_api_rate_burst == Some(0) {
+        if self.limits.administrator_api_rate_burst == 0 {
             return Err(ConfigError::Invalid(
-                "limits.administrator_api_rate_burst must be nonzero when set".into(),
+                "limits.administrator_api_rate_burst must be nonzero".into(),
             ));
         }
         if self.limits.registration_burst == Some(0) {

@@ -605,8 +605,8 @@ fn document() -> serde_json::Value {
             "command_burst": { "type": ["integer", "null"], "minimum": 1 },
             "trusted_proxies": { "type": "array", "items": { "type": "string" } },
             "auth_rate_burst": { "type": ["integer", "null"], "minimum": 1 },
-            "api_rate_burst": { "type": ["integer", "null"], "minimum": 1 },
-            "administrator_api_rate_burst": { "type": ["integer", "null"], "minimum": 1 },
+            "api_rate_burst": { "type": "integer", "minimum": 1 },
+            "administrator_api_rate_burst": { "type": "integer", "minimum": 1 },
             "registration_burst": { "type": ["integer", "null"], "minimum": 1 }
         }
     });

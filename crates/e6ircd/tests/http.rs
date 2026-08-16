@@ -6137,7 +6137,7 @@ async fn authenticated_api_limit_is_per_account_shared_across_bearers_and_bounde
         }),
         database: Some(DatabaseConfig { url }),
         limits: e6ircd::config::LimitsConfig {
-            api_rate_burst: Some(2),
+            api_rate_burst: 2,
             ..Default::default()
         },
         ..Config::default()
