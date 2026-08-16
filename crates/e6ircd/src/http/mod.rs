@@ -3095,30 +3095,18 @@ mod pages {
     }
 
     #[derive(Serialize)]
-    struct NetworkOperationsView {
-        state: String,
-        connected: bool,
-        state_changed: String,
-        next_retry: String,
-        recent_failures: Vec<String>,
-        connected_since: String,
-        last_input: String,
-        last_output: String,
-        last_error: String,
-        last_error_reason: String,
-        connect_latency: String,
-        connection_attempts: u64,
-        errors: u64,
-        attached_clients: u64,
-        traffic_in: String,
-        traffic_out: String,
-        lines_in: u64,
-        lines_out: u64,
-        memory_buffer: String,
-        stored_lines: i64,
-        stored_oldest: String,
-        stored_newest: String,
+    struct NetworkOperationsResponse {
+        enabled: bool,
+        runtime: Option<super::networks::NetworkRuntimeResponse>,
+        storage: NetworkStoredBacklogResponse,
         recent_lines: Vec<String>,
+    }
+
+    #[derive(Serialize)]
+    struct NetworkStoredBacklogResponse {
+        lines: u64,
+        oldest_at: Option<String>,
+        newest_at: Option<String>,
     }
 
     #[derive(Template)]
@@ -3162,32 +3150,12 @@ mod pages {
             .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account))
     }
 
-    fn runtime_time(value: Option<e6irc_proto::time::Millis>) -> String {
-        value
-            .map(e6irc_proto::time::server_time)
-            .unwrap_or_else(|| "never".into())
-    }
-
-    fn now_millis() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before Unix epoch")
-            .as_millis()
-            .min(u64::MAX as u128) as u64
-    }
-
-    fn runtime_age(value: Option<e6irc_proto::time::Millis>) -> String {
-        value
-            .map(|at| format_age(now_millis(), at.as_millis()))
-            .unwrap_or_else(|| "never".into())
-    }
-
-    async fn network_operations_view(
+    async fn network_operations_response(
         state: &AppState,
         account: &str,
         name: &str,
         enabled: bool,
-    ) -> Result<NetworkOperationsView, Response> {
+    ) -> Result<NetworkOperationsResponse, Response> {
         let runtime = state
             .bnc_registry
             .as_ref()
@@ -3213,87 +3181,22 @@ mod pages {
                     None,
                 )
             })?;
-        let state_label = if !enabled {
-            "disabled".into()
-        } else {
-            runtime
-                .as_ref()
-                .map(|runtime| runtime.lifecycle.as_str().replace('_', " "))
-                .unwrap_or_else(|| "not running".into())
-        };
-        let connected = runtime.as_ref().is_some_and(|runtime| {
-            runtime.lifecycle == crate::bouncer::NetworkLifecycle::Connected
-        });
-        Ok(NetworkOperationsView {
-            state: state_label,
-            connected,
-            state_changed: runtime
-                .as_ref()
-                .map(|runtime| e6irc_proto::time::server_time(runtime.state_changed_at))
-                .unwrap_or_else(|| "not available".into()),
-            next_retry: runtime
-                .as_ref()
-                .and_then(|runtime| runtime.next_retry_at)
-                .map(|at| {
-                    format!(
-                        "{} (in {})",
-                        e6irc_proto::time::server_time(at),
-                        format_latency(
-                            at.as_millis()
-                                .saturating_sub(now_millis())
-                                .saturating_mul(1_000)
-                        ),
-                    )
-                })
-                .unwrap_or_else(|| "not scheduled".into()),
-            recent_failures: runtime
-                .as_ref()
-                .map(|runtime| {
-                    runtime
-                        .recent_failures
-                        .iter()
-                        .map(|record| {
-                            format!(
-                                "{} — {}",
-                                e6irc_proto::time::server_time(record.at),
-                                record.summary(),
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            connected_since: runtime_age(runtime.as_ref().and_then(|runtime| runtime.connected_at)),
-            last_input: runtime_age(runtime.as_ref().and_then(|runtime| runtime.last_input_at)),
-            last_output: runtime_age(runtime.as_ref().and_then(|runtime| runtime.last_output_at)),
-            last_error: runtime_age(runtime.as_ref().and_then(|runtime| runtime.last_error_at)),
-            last_error_reason: runtime
-                .as_ref()
-                .and_then(|runtime| runtime.last_error)
-                .map(|failure| failure.summary().to_string())
-                .unwrap_or_else(|| "No classified runtime failure.".into()),
-            connect_latency: runtime
-                .as_ref()
-                .and_then(|runtime| runtime.connect_latency_ms)
-                .map(|millis| format_latency(millis.saturating_mul(1_000)))
-                .unwrap_or_else(|| "not measured".into()),
-            connection_attempts: runtime
-                .as_ref()
-                .map_or(0, |runtime| runtime.connection_attempts),
-            errors: runtime.as_ref().map_or(0, |runtime| runtime.errors),
-            attached_clients: runtime
-                .as_ref()
-                .map_or(0, |runtime| runtime.attached_clients),
-            traffic_in: format_bytes(runtime.as_ref().map_or(0, |runtime| runtime.bytes_in)),
-            traffic_out: format_bytes(runtime.as_ref().map_or(0, |runtime| runtime.bytes_out)),
-            lines_in: runtime.as_ref().map_or(0, |runtime| runtime.lines_in),
-            lines_out: runtime.as_ref().map_or(0, |runtime| runtime.lines_out),
-            memory_buffer: runtime
-                .as_ref()
-                .map(|runtime| format!("{} / {}", runtime.buffer_lines, runtime.buffer_capacity))
-                .unwrap_or_else(|| "0 / 0".into()),
-            stored_lines: summary.lines,
-            stored_oldest: runtime_time(summary.oldest_at),
-            stored_newest: runtime_time(summary.newest_at),
+        let lines = u64::try_from(summary.lines).map_err(|_| {
+            eprintln!("console: negative network buffer summary");
+            problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid stored backlog count",
+                None,
+            )
+        })?;
+        Ok(NetworkOperationsResponse {
+            enabled,
+            runtime: runtime.as_ref().map(super::networks::runtime_response),
+            storage: NetworkStoredBacklogResponse {
+                lines,
+                oldest_at: summary.oldest_at.map(e6irc_proto::time::server_time),
+                newest_at: summary.newest_at.map(e6irc_proto::time::server_time),
+            },
             recent_lines,
         })
     }
@@ -3330,8 +3233,7 @@ mod pages {
         })
     }
 
-    /// Bounded owner-scoped Operations projection. The console reads this JSON
-    /// resource directly instead of refreshing a parallel HTML fragment.
+    /// Bounded owner-scoped network runtime and persisted backlog.
     pub async fn owner_network_operations(
         State(state): State<Arc<AppState>>,
         Authenticated(account): Authenticated,
@@ -3342,9 +3244,32 @@ mod pages {
             Ok(None) => return problem(StatusCode::NOT_FOUND, "No such network", None),
             Err(error) => return super::device::admin_db_error("network operations", error),
         };
-        match network_operations_view(&state, &account, &network.name, network.enabled).await {
-            Ok(view) => super::json_no_store(view),
+        match network_operations_response(&state, &account, &network.name, network.enabled).await {
+            Ok(response) => super::json_no_store(response),
             Err(response) => response,
+        }
+    }
+
+    #[cfg(test)]
+    mod network_operations_tests {
+        use super::{NetworkOperationsResponse, NetworkStoredBacklogResponse};
+
+        #[test]
+        fn no_running_driver_is_null_not_synthetic_zero_metrics() {
+            let value = serde_json::to_value(NetworkOperationsResponse {
+                enabled: true,
+                runtime: None,
+                storage: NetworkStoredBacklogResponse {
+                    lines: 0,
+                    oldest_at: None,
+                    newest_at: None,
+                },
+                recent_lines: vec![],
+            })
+            .expect("operations response is serializable");
+            assert_eq!(value["runtime"], serde_json::Value::Null);
+            assert_eq!(value["storage"]["lines"], 0);
+            assert!(value.get("errors").is_none(), "{value}");
         }
     }
 

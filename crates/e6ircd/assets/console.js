@@ -454,14 +454,18 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     }
   }
 
+  const operationTime = (value, absent) => value === null ? absent : new Date(value).toLocaleString();
+
   const networkOperationsHealth = (view) => {
     const health = element("div", "health-strip");
     health.setAttribute("aria-label", "Network health");
+    const runtime = view.runtime;
+    const state = !view.enabled ? "disabled" : runtime === null ? "not running" : runtime.state.replaceAll("_", " ");
     const states = [
-      [view.connected ? "on" : "off", "Lifecycle", view.state],
-      [view.errors === 0 ? "on" : "warn", "Errors", view.errors],
-      [view.attached_clients > 0 ? "on" : "off", "Attached clients", view.attached_clients],
-      [view.stored_lines > 0 ? "on" : "off", "Stored backlog", `${view.stored_lines} ${view.stored_lines === 1 ? "line" : "lines"}`],
+      [runtime !== null && runtime.state === "connected" ? "on" : "off", "Lifecycle", state],
+      [runtime === null ? "off" : runtime.errors === 0 ? "on" : "warn", "Errors", runtime === null ? "Unavailable" : runtime.errors],
+      [runtime !== null && runtime.attached_clients > 0 ? "on" : "off", "Attached clients", runtime === null ? "Unavailable" : runtime.attached_clients],
+      [view.storage.lines > 0 ? "on" : "off", "Stored backlog", `${view.storage.lines} ${view.storage.lines === 1 ? "line" : "lines"}`],
     ];
     for (const [state, label, value] of states) {
       health.append(append(element("div"), element("span", `dot ${state}`), element("span", "", label), element("strong", "", value)));
@@ -469,13 +473,17 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     return health;
   };
 
-  const networkOperationsMetrics = (view) => {
+  const networkOperationsMetrics = (runtime) => {
     const grid = element("div", "metric-grid");
+    if (runtime === null) {
+      grid.append(append(element("article", "metric-card"), element("span", "metric-label", "Live metrics"), element("strong", "", "Unavailable"), element("small", "", "The network has no running driver.")));
+      return grid;
+    }
     const metrics = [
-      ["Received from upstream", view.traffic_in, `${view.lines_in} upstream ${view.lines_in === 1 ? "line" : "lines"}`],
-      ["Sent to upstream", view.traffic_out, `${view.lines_out} upstream ${view.lines_out === 1 ? "line" : "lines"}`],
-      ["Connect latency", view.connect_latency, `${view.connection_attempts} ${view.connection_attempts === 1 ? "attempt" : "attempts"} since start`],
-      ["Memory buffer", view.memory_buffer, "Current lines / capacity"],
+      ["Received from upstream", formatBytes(runtime.traffic.bytes_in), `${runtime.traffic.lines_in} upstream ${runtime.traffic.lines_in === 1 ? "line" : "lines"}`],
+      ["Sent to upstream", formatBytes(runtime.traffic.bytes_out), `${runtime.traffic.lines_out} upstream ${runtime.traffic.lines_out === 1 ? "line" : "lines"}`],
+      ["Connect latency", runtime.connect_latency_ms === null ? "Not measured" : `${runtime.connect_latency_ms} ms`, `${runtime.connection_attempts} ${runtime.connection_attempts === 1 ? "attempt" : "attempts"} since start`],
+      ["Memory buffer", `${runtime.buffer.lines} / ${runtime.buffer.capacity}`, "Current lines / capacity"],
     ];
     for (const [label, value, detail] of metrics) {
       grid.append(append(element("article", "metric-card"), element("span", "metric-label", label), element("strong", "", value), element("small", "", detail)));
@@ -485,23 +493,35 @@ import { loadSettings, saveSettings } from "/console-settings.js";
 
   const renderNetworkOperations = (panel, view) => {
     const fragment = document.createDocumentFragment();
-    fragment.append(networkOperationsHealth(view), networkOperationsMetrics(view));
+    const runtime = view.runtime;
+    fragment.append(networkOperationsHealth(view), networkOperationsMetrics(runtime));
     const timeline = element("section", "panel");
-    timeline.append(append(element("div", "panel-head"), append(element("div"), element("h2", "", "Connection timeline"), element("p", "", "Runtime-only timestamps reset when this network is restarted or reconfigured.")), element("span", "count", view.state_changed)));
+    const stateChanged = runtime === null ? "Unavailable" : operationTime(runtime.state_changed_at, "Unavailable");
+    timeline.append(append(element("div", "panel-head"), append(element("div"), element("h2", "", "Connection timeline"), element("p", "", "Runtime-only timestamps reset when this network is restarted or reconfigured.")), element("span", "count", stateChanged)));
     const summary = element("div", "network-summary");
-    const details = [["Connected since", view.connected_since], ["Next reconnect attempt", view.next_retry], ["Last received", view.last_input], ["Last sent", view.last_output], ["Last error", view.last_error], ["Last error reason", view.last_error_reason], ["Oldest stored line", view.stored_oldest], ["Newest stored line", view.stored_newest]];
+    const details = runtime === null
+      ? [["Live runtime", view.enabled ? "Not running" : "Disabled"]]
+      : [
+        ["Connected since", operationTime(runtime.connected_at, "Never")],
+        ["Next reconnect attempt", operationTime(runtime.next_retry_at, "Not scheduled")],
+        ["Last received", operationTime(runtime.last_input_at, "Never")],
+        ["Last sent", operationTime(runtime.last_output_at, "Never")],
+        ["Last error", operationTime(runtime.last_error_at, "Never")],
+        ["Last error reason", runtime.last_error === null ? "No classified runtime failure." : `${runtime.last_error.code}: ${runtime.last_error.summary}`],
+      ];
+    details.push(["Oldest stored line", operationTime(view.storage.oldest_at, "Never")], ["Newest stored line", operationTime(view.storage.newest_at, "Never")]);
     for (const [label, value] of details) summary.append(append(element("div"), element("span", "", label), element("strong", "", value)));
     timeline.append(summary);
-    if (view.recent_failures.length > 0) {
+    if (runtime !== null && runtime.recent_failures.length > 0) {
       const failures = element("div", "network-summary");
       const list = element("ul", "failure-history");
-      for (const failure of view.recent_failures) list.append(element("li", "", failure));
+      for (const failure of runtime.recent_failures) list.append(element("li", "", `${operationTime(failure.at, "Unknown time")} — ${failure.code}: ${failure.summary}`));
       failures.append(append(element("div"), element("span", "", "Recent failures"), list));
       timeline.append(failures);
     }
     fragment.append(timeline);
     const backlog = element("section", "panel");
-    backlog.append(append(element("div", "panel-head"), append(element("div"), element("h2", "", "Recent detached backlog"), element("p", "", "The newest 100 persisted upstream lines, shown oldest first. Client attachment replays the same stored stream.")), element("span", "count", `${view.stored_lines} stored`)));
+    backlog.append(append(element("div", "panel-head"), append(element("div"), element("h2", "", "Recent detached backlog"), element("p", "", "The newest 100 persisted upstream lines, shown oldest first. Client attachment replays the same stored stream.")), element("span", "count", `${view.storage.lines} stored`)));
     if (view.recent_lines.length === 0) {
       backlog.append(element("p", "empty", "No upstream lines have been stored for this network."));
     } else {

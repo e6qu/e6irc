@@ -1358,7 +1358,9 @@ above the trait, provides for every network kind:
   connection attempts/errors, connect latency, attached-client count,
   line/byte traffic, last-activity times, and buffer occupancy. Driver endpoints
   can change lifecycle and record inbound lines only through that shared state;
-  downstream traffic crosses the handle's counted bounded-send funnel.
+  downstream traffic crosses the handle's counted bounded-send funnel. The
+  Operations API returns this runtime shape without display strings; the browser
+  formats it and combines it with typed persisted backlog metadata.
 
 ### 10.2 `local` driver — always-on on our own server
 
