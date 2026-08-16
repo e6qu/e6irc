@@ -1126,7 +1126,20 @@ async fn openapi_spec_is_served() {
     );
     assert!(v["paths"]["/healthz"]["get"].is_object());
     assert!(v["paths"]["/readyz"]["get"].is_object());
-    assert!(v["paths"]["/api/v1/admin/observability"]["get"].is_object());
+    let observability_schema = &v["paths"]["/api/v1/admin/observability"]["get"]["responses"]["200"]
+        ["content"]["application/json"]["schema"];
+    assert_eq!(observability_schema["type"], "object");
+    assert_eq!(observability_schema["additionalProperties"], false);
+    assert_eq!(
+        observability_schema["required"],
+        serde_json::json!(["current", "history"])
+    );
+    let snapshot_schema = &observability_schema["properties"]["current"];
+    assert_eq!(snapshot_schema["additionalProperties"], false);
+    assert_eq!(
+        snapshot_schema["properties"]["queues"]["additionalProperties"]["properties"]["mode"]["enum"],
+        serde_json::json!(["fifo", "lifo"])
+    );
     let buffer = &v["paths"]["/api/v1/me/networks/{name}/buffer"]["get"]["responses"]["200"]["content"]
         ["application/json"]["schema"]["properties"]["lines"];
     assert_eq!(buffer["maxItems"], 1_000);

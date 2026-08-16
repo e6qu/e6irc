@@ -50,8 +50,8 @@ function finiteNumber(schema, key, label) {
   }
 }
 
-function closedObjectSchema(schema, label) {
-  if (schema.additionalProperties !== false) {
+function objectSchema(schema, label) {
+  if (schema.additionalProperties !== false && !objectValue(schema.additionalProperties)) {
     throw new ApiSchemaError(`The ${label} schema is invalid.`);
   }
   if ("properties" in schema && !objectValue(schema.properties)) {
@@ -65,7 +65,7 @@ function closedObjectSchema(schema, label) {
   if (required.some((field) => typeof field !== "string" || !(field in properties)) || new Set(required).size !== required.length) {
     throw new ApiSchemaError(`The ${label} schema is invalid.`);
   }
-  return { properties, required };
+  return { properties, required, additionalProperties: schema.additionalProperties };
 }
 
 function validateApiSchema(schema, label) {
@@ -123,8 +123,9 @@ function validateApiSchema(schema, label) {
     validateApiSchema(schema.items, label);
   }
   if (types.includes("object")) {
-    const { properties } = closedObjectSchema(schema, label);
+    const { properties, additionalProperties } = objectSchema(schema, label);
     for (const property of Object.values(properties)) validateApiSchema(property, label);
+    if (additionalProperties !== false) validateApiSchema(additionalProperties, label);
   }
   return types;
 }
@@ -189,17 +190,22 @@ export function parseApiSchema(schema, value, label = "API response", path = "$"
   }
   if (!objectValue(value)) return value;
 
-  const { properties, required: requiredFields } = closedObjectSchema(schema, label);
+  const { properties, required: requiredFields, additionalProperties } = objectSchema(schema, label);
   const required = new Set(requiredFields);
   for (const field of required) {
     if (!(field in value)) schemaError(label, `${path}.${field}`);
   }
-  if (schema.additionalProperties === false && Object.keys(value).some((field) => !(field in properties))) {
+  if (additionalProperties === false && Object.keys(value).some((field) => !(field in properties))) {
     schemaError(label, path);
   }
   const parsed = {};
   for (const [field, fieldSchema] of Object.entries(properties)) {
-    if (field in value) parsed[field] = parseApiSchema(fieldSchema, value[field], label, `${path}.${field}`);
+    if (field in value) Object.defineProperty(parsed, field, { enumerable: true, value: parseApiSchema(fieldSchema, value[field], label, `${path}.${field}`) });
+  }
+  if (additionalProperties !== false) {
+    for (const [field, fieldValue] of Object.entries(value)) {
+      if (!(field in properties)) Object.defineProperty(parsed, field, { enumerable: true, value: parseApiSchema(additionalProperties, fieldValue, label, `${path}.${field}`) });
+    }
   }
   return Object.freeze(parsed);
 }
