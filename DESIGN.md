@@ -340,6 +340,8 @@ These are project-wide rules, enforced in review and (where possible) CI:
     same-second messages unpageable, and a `* 1000` that put REST timestamps a
     thousandfold into the future for six sweeps) are now type errors; the two
     conversions live behind `as_secs()` and the SQL edge, named and greppable.
+    The SQL boundary rejects pre-epoch and precision-losing values, so corrupt
+    signed storage cannot wrap into a future protocol time or become epoch.
   - The wire-length **runtime** invariant (§7.1): where a *type* is
     impractical (every outbound line is a `String`), a debug-build assertion
     at the one send funnel makes the class machine-checked by the test and

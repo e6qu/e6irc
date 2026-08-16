@@ -836,13 +836,6 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             .await
             .map_err(io::Error::other)?
             .into_iter()
-            .map(|(account, target, ms)| {
-                (
-                    account,
-                    target,
-                    e6irc_proto::time::Millis::from_millis(ms.max(0) as u64),
-                )
-            })
             .collect::<Vec<_>>();
         let suspended = crate::db::list_suspended_accounts(pool)
             .await
