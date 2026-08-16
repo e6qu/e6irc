@@ -1137,11 +1137,12 @@ async fn openapi_spec_is_served() {
         runtime_failures["maxItems"],
         e6ircd::bouncer::NETWORK_FAILURE_HISTORY_LIMIT
     );
-    let operation_failures = &v["paths"]["/api/v1/me/networks/{name}/operations"]["get"]["responses"]
-        ["200"]["content"]["application/json"]["schema"]["properties"]["recent_failures"];
+    let operation_runtime = &v["paths"]["/api/v1/me/networks/{name}/operations"]["get"]["responses"]
+        ["200"]["content"]["application/json"]["schema"]["properties"]["runtime"];
     assert_eq!(
-        operation_failures["maxItems"],
-        e6ircd::bouncer::NETWORK_FAILURE_HISTORY_LIMIT
+        operation_runtime,
+        &v["paths"]["/api/v1/me/networks/{name}"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["properties"]["runtime"]
     );
     assert!(v["paths"]["/api/v1/admin/monitoring"]["get"].is_object());
     assert!(v["paths"]["/api/v1/admin/metrics"]["get"].is_object());
@@ -1627,13 +1628,10 @@ async fn console_networks_page_lists_the_callers_networks() {
     );
     let operations: serde_json::Value =
         serde_json::from_str(&operations).expect("network operations JSON");
-    assert!(
-        operations["state"]
-            .as_str()
-            .is_some_and(|state| !state.is_empty()),
-        "{operations}"
-    );
-    assert_eq!(operations["stored_lines"], 1);
+    assert_eq!(operations["enabled"], true, "{operations}");
+    assert!(operations["runtime"]["state"].is_string(), "{operations}");
+    assert_eq!(operations["storage"]["lines"], 1, "{operations}");
+    assert!(operations.get("errors").is_none(), "{operations}");
     assert_eq!(
         operations["recent_lines"][0],
         ":mallory PRIVMSG #e6irc :<script>alert('escaped')</script>"

@@ -152,7 +152,7 @@ classification, counters are bounded, and message text is confined to the
 owner’s backlog rather than metrics or global logs.
 
 **Evidence.** Snapshot/accounting/error-ledger behavior is unit-tested; the
-owner-scoped Operations API and its browser rendering are HTTP- and
+owner-scoped typed Operations API and its browser rendering are HTTP- and
 Chromium-tested; monitoring aggregation/history is tested at HTTP/DB level.
 
 ## Attach any IRC client to an owned network

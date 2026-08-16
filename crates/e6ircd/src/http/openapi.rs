@@ -250,23 +250,24 @@ fn document() -> serde_json::Value {
     );
     let network_response = json_response(
         "stored network configuration and runtime",
-        network_response_schema,
+        network_response_schema.clone(),
     );
     let network_operations_response = json_response(
-        "network Operations projection",
+        "network runtime and persisted backlog",
         serde_json::json!({
             "type": "object", "additionalProperties": false,
-            "required": ["state", "connected", "state_changed", "next_retry", "recent_failures", "connected_since", "last_input", "last_output", "last_error", "last_error_reason", "connect_latency", "connection_attempts", "errors", "attached_clients", "traffic_in", "traffic_out", "lines_in", "lines_out", "memory_buffer", "stored_lines", "stored_oldest", "stored_newest", "recent_lines"],
+            "required": ["enabled", "runtime", "storage", "recent_lines"],
             "properties": {
-                "state": { "type": "string" }, "connected": { "type": "boolean" }, "state_changed": { "type": "string" }, "next_retry": { "type": "string" },
-                "recent_failures": { "type": "array", "maxItems": crate::bouncer::NETWORK_FAILURE_HISTORY_LIMIT, "items": { "type": "string" } }, "connected_since": { "type": "string" },
-                "last_input": { "type": "string" }, "last_output": { "type": "string" }, "last_error": { "type": "string" },
-                "last_error_reason": { "type": "string" }, "connect_latency": { "type": "string" },
-                "connection_attempts": { "type": "integer", "minimum": 0 }, "errors": { "type": "integer", "minimum": 0 },
-                "attached_clients": { "type": "integer", "minimum": 0 }, "traffic_in": { "type": "string" }, "traffic_out": { "type": "string" },
-                "lines_in": { "type": "integer", "minimum": 0 }, "lines_out": { "type": "integer", "minimum": 0 },
-                "memory_buffer": { "type": "string" }, "stored_lines": { "type": "integer", "minimum": 0 },
-                "stored_oldest": { "type": "string" }, "stored_newest": { "type": "string" },
+                "enabled": { "type": "boolean" },
+                "runtime": network_response_schema["properties"]["runtime"].clone(),
+                "storage": { "type": "object", "additionalProperties": false,
+                    "required": ["lines", "oldest_at", "newest_at"],
+                    "properties": {
+                        "lines": { "type": "integer", "minimum": 0 },
+                        "oldest_at": { "type": ["string", "null"] },
+                        "newest_at": { "type": ["string", "null"] }
+                    }
+                },
                 "recent_lines": { "type": "array", "maxItems": 100,
                     "items": { "type": "string", "maxLength": 510 } }
             }
@@ -1498,7 +1499,7 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/me/networks/{name}/operations": {
                 "get": { "summary": "Read bounded network Operations data",
-                    "description": "Returns the owner-scoped, render-ready Operations projection: live lifecycle and traffic, bounded failure history, persisted backlog summary, and the newest 100 detached upstream lines. Secret material is never returned.",
+                    "description": "Returns owner-scoped typed runtime state, persisted backlog metadata, and the newest 100 detached upstream lines. Secret material is never returned.",
                     "security": authenticated,
                     "parameters": network_name_parameter,
                     "responses": { "200": network_operations_response["200"],
@@ -2060,6 +2061,16 @@ mod tests {
     fn openapi_covers_every_documented_router_operation_exactly() {
         let spec = super::document();
         assert_eq!(super::validate_documented_operations(&spec), Ok(()));
+    }
+
+    #[test]
+    fn network_operations_reuses_the_network_runtime_contract() {
+        let spec = super::document();
+        let network_runtime = &spec["paths"]["/api/v1/me/networks/{name}"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["properties"]["runtime"];
+        let operations_runtime = &spec["paths"]["/api/v1/me/networks/{name}/operations"]["get"]["responses"]
+            ["200"]["content"]["application/json"]["schema"]["properties"]["runtime"];
+        assert_eq!(operations_runtime, network_runtime);
     }
 
     #[test]
