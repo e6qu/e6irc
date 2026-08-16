@@ -1424,6 +1424,12 @@ struct NetworkRuntimeState {
     last_error: Option<NetworkFailure>,
 }
 
+#[derive(Clone, Copy)]
+enum FailureDisposition {
+    Retry,
+    Terminal(NetworkLifecycle),
+}
+
 struct NetworkRuntime {
     state: std::sync::Mutex<NetworkRuntimeState>,
     /// The registry's owner/name label, assigned once when the network is
@@ -1516,10 +1522,13 @@ impl NetworkRuntime {
         );
     }
 
-    fn failed(&self, terminal: Option<NetworkLifecycle>, failure: NetworkFailure) {
+    fn failed(&self, disposition: FailureDisposition, failure: NetworkFailure) {
         let now = epoch_millis();
         let mut state = self.state.lock().expect("network runtime poisoned");
-        state.lifecycle = terminal.unwrap_or(NetworkLifecycle::Reconnecting);
+        state.lifecycle = match disposition {
+            FailureDisposition::Retry => NetworkLifecycle::Reconnecting,
+            FailureDisposition::Terminal(lifecycle) => lifecycle,
+        };
         state.state_changed_at = now;
         state.connected_at = None;
         Self::set_error(&mut state, now, failure);
@@ -2172,21 +2181,21 @@ impl DriverEnds {
                 )
             }
             failure_event => {
-                let (terminal, failure) = match failure_event {
-                    ConnectionEvent::Reconnecting(failure) => (None, failure),
+                let (disposition, failure) = match failure_event {
+                    ConnectionEvent::Reconnecting(failure) => (FailureDisposition::Retry, failure),
                     ConnectionEvent::AuthenticationFailed => (
-                        Some(NetworkLifecycle::AuthenticationFailed),
+                        FailureDisposition::Terminal(NetworkLifecycle::AuthenticationFailed),
                         NetworkFailure::AuthenticationRejected,
                     ),
                     ConnectionEvent::RegistrationFailed(refusal) => (
-                        Some(NetworkLifecycle::RegistrationFailed),
+                        FailureDisposition::Terminal(NetworkLifecycle::RegistrationFailed),
                         registration_failure(refusal),
                     ),
                     ConnectionEvent::Connected => {
                         unreachable!("connected handled before failure transition")
                     }
                 };
-                self.runtime.failed(terminal, failure);
+                self.runtime.failed(disposition, failure);
                 if let Some(telemetry) = self
                     .telemetry
                     .lock()
@@ -2195,20 +2204,23 @@ impl DriverEnds {
                 {
                     telemetry.record_error(crate::observability::ErrorKind::Bouncer);
                 }
-                match terminal {
-                    Some(lifecycle) => eprintln!(
+                match disposition {
+                    FailureDisposition::Terminal(lifecycle) => eprintln!(
                         "bnc: {} parked ({}): {}",
                         self.runtime.label(),
                         lifecycle.as_str(),
                         failure.summary(),
                     ),
-                    None => eprintln!(
+                    FailureDisposition::Retry => eprintln!(
                         "bnc: {} disconnected ({}); reconnecting",
                         self.runtime.label(),
                         failure.code(),
                     ),
                 }
-                let state = terminal.map_or("reconnecting", NetworkLifecycle::as_str);
+                let state = match disposition {
+                    FailureDisposition::Retry => "reconnecting",
+                    FailureDisposition::Terminal(lifecycle) => lifecycle.as_str(),
+                };
                 (
                     DriverEvent::Disconnected,
                     format!(
