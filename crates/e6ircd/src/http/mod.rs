@@ -4167,6 +4167,14 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
             verify(missing_expiry).is_err(),
             "a logout token without its required expiry must be rejected"
         );
+        assert!(
+            verify(base(serde_json::json!({
+                "iat": now + 60,
+                "exp": now + 1,
+            })))
+            .is_err(),
+            "a token cannot expire before it is issued"
+        );
 
         // A7: a present azp must name this client.
         assert!(
