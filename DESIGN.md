@@ -1277,9 +1277,10 @@ driver enter the same measurement path; both raw-IRC and web attachments use
 the counted `send` funnel. A reconnecting session must return a
 `SessionOutcome::Dropped(NetworkFailure)`, making an unclassified transient
 failure a type error across IRC, local, Matrix, Discord, and Slack. Its public
-connection event also carries that failure and lifecycle, error reason,
-timestamp, and count change under one runtime-state lock; monitoring therefore
-cannot observe a new disconnect paired with a stale or missing cause.
+connection event enters a typed runtime phase: only `Connected` carries a
+connection time, only `Reconnecting` can carry a retry time, and a parked
+network cannot be scheduled to retry. The latest error is one timestamped
+record, so monitoring cannot pair a failure with another failure's time.
 Recoverable
 message-delivery and detached-backlog storage failures use the same closed
 classification-and-accounting choke point, so an error counter or timestamp
