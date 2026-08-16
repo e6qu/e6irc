@@ -3668,6 +3668,16 @@ async fn server_bans_persist_and_load() {
         .await
         .expect("connect");
 
+    let invalid =
+        sqlx::query("INSERT INTO server_bans (mask, reason, set_by, kind) VALUES ($1, $2, $3, $4)")
+            .bind("invalid@*")
+            .bind("invalid")
+            .bind("test")
+            .bind("unknown")
+            .execute(&pool)
+            .await;
+    assert!(invalid.is_err(), "server-ban kind must be constrained");
+
     db::add_server_ban(&pool, "baddie@*", "baddie@*", "spam", "god", "kline")
         .await
         .expect("add1");

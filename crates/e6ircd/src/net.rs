@@ -854,7 +854,8 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             core.preload_mlock(mlock.clone())
                 .map_err(io::Error::other)?;
             core.preload_access(access.clone());
-            core.preload_server_bans(bans.clone());
+            core.preload_server_bans(bans.clone())
+                .map_err(io::Error::other)?;
             core.preload_read_markers(read_markers.clone());
             core.preload_suspended_accounts(suspended.clone());
         }

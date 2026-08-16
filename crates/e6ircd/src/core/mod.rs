@@ -1988,8 +1988,11 @@ impl Core {
 
     /// Seed server bans from persisted rows before the worker loop starts
     /// (see [`ServerState::preload_server_bans`]).
-    pub fn preload_server_bans(&mut self, rows: Vec<(String, String, String, String)>) {
-        self.state.preload_server_bans(rows);
+    pub fn preload_server_bans(
+        &mut self,
+        rows: Vec<(String, String, String, String)>,
+    ) -> Result<(), String> {
+        self.state.preload_server_bans(rows)
     }
 
     /// Seed the read-marker mirror from persisted rows before the worker loop
@@ -2744,6 +2747,20 @@ mod ingress_tests {
             Some("+im".into())
         );
         assert_eq!(second.state.access_modes(&key, "alice"), (true, true));
+    }
+
+    #[test]
+    fn corrupt_persisted_server_ban_aborts_preload() {
+        let TwoWorkerHarness { mut first, .. } = two_worker_harness();
+        let error = first
+            .preload_server_bans(vec![(
+                "bad@host".into(),
+                "reason".into(),
+                "oper".into(),
+                "unknown".into(),
+            )])
+            .expect_err("unknown server-ban kind must abort startup");
+        assert!(error.contains("server-ban kind"), "{error}");
     }
 
     #[test]
