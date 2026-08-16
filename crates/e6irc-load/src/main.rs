@@ -283,12 +283,12 @@ fn die(msg: &str) -> ! {
 
 async fn connect(args: &Args) -> std::io::Result<Connection> {
     if args.tls {
-        let name = args
-            .addr
-            .rsplit_once(':')
-            .map(|(h, _)| h.to_string())
-            .unwrap_or_else(|| args.addr.clone());
-        Connection::connect_tls(&args.addr, &name, e6irc_client::webpki_root_store()).await
+        Connection::connect_tls(
+            &args.addr,
+            e6irc_client::tls_server_name(&args.addr)?,
+            e6irc_client::webpki_root_store(),
+        )
+        .await
     } else {
         Connection::connect(&args.addr).await
     }

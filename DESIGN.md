@@ -171,7 +171,8 @@ These are project-wide rules, enforced in review and (where possible) CI:
     overlay orders pipelined TOPIC and KEEPTOPIC without reading stale
     committed state, while pending channel
     registrations reserve both the channel name and the founder's cap slot.
-    K/D/X-line add/remove writes the ban row and audit row in one transaction;
+    K/D/X-line storage is constrained to that closed set; a corrupt row aborts
+    startup. Add/remove writes the ban row and audit row in one transaction;
     enforcement, disconnects, operator notices, and HTTP admin responses happen
     only after it commits. The IRC and HTTP origins are typed requesters, so a
     global committed result does not depend on a still-live `ConnId`, and no

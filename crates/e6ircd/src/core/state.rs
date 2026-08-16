@@ -3457,35 +3457,24 @@ impl ServerState {
     }
 
     /// Load persisted server bans as `(mask, reason, set_by, kind)` rows.
-    /// A row whose kind token is unrecognized is skipped loudly — bans are
-    /// security-critical, so a corrupt kind must not silently become a
-    /// default that bans (or fails to ban) the wrong sessions.
-    pub fn preload_server_bans(&mut self, rows: Vec<(String, String, String, String)>) {
+    pub fn preload_server_bans(
+        &mut self,
+        rows: Vec<(String, String, String, String)>,
+    ) -> Result<(), String> {
         let casemap = self.casemap;
-        self.server_bans = rows
-            .into_iter()
-            .filter_map(
-                |(mask, reason, set_by, kind)| match BanKind::from_token(&kind) {
-                    // `mask` is the stored *display* form (`COALESCE(mask_display,
-                    // mask)`); `MaskKey::new` folds it for comparison, so removal
-                    // matches regardless of casing while STATS shows the original.
-                    // A legacy/externally-inserted row surfaces its stored casing;
-                    // its fold still governs enforcement and `UNKLINE`.
-                    Some(kind) => Some(ServerBan {
-                        mask: MaskKey::new(&mask, casemap),
-                        reason,
-                        set_by,
-                        kind,
-                    }),
-                    None => {
-                        eprintln!(
-                            "server ban: dropping row with unknown kind {kind:?} (mask {mask:?})"
-                        );
-                        None
-                    }
-                },
-            )
-            .collect();
+        let mut bans = Vec::with_capacity(rows.len());
+        for (mask, reason, set_by, kind) in rows {
+            let kind = BanKind::from_token(&kind)
+                .ok_or_else(|| format!("invalid persisted server-ban kind {kind:?}"))?;
+            bans.push(ServerBan {
+                mask: MaskKey::new(&mask, casemap),
+                reason,
+                set_by,
+                kind,
+            });
+        }
+        self.server_bans = bans;
+        Ok(())
     }
 
     /// The subject a ban of `kind` is tested against, from a session's

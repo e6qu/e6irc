@@ -193,7 +193,7 @@ impl ConnectionOptions {
                         "TLS server name cannot be empty",
                     ));
                 }
-                None => address_host(&self.address)?,
+                None => tls_server_name(&self.address)?,
             };
             Connection::connect_tls(&self.address, name, webpki_root_store()).await?
         } else {
@@ -220,7 +220,7 @@ impl ConnectionOptions {
 
 /// Extract a TLS validation name from `host:port`, including bracketed IPv6.
 /// A bare IPv6 address is not a valid endpoint because its port is ambiguous.
-fn address_host(address: &str) -> io::Result<&str> {
+pub fn tls_server_name(address: &str) -> io::Result<&str> {
     if let Some(bracketed) = address.strip_prefix('[') {
         let (host, suffix) = bracketed.split_once(']').ok_or_else(|| {
             io::Error::new(
@@ -1134,12 +1134,15 @@ mod tests {
 
     #[test]
     fn tls_name_is_derived_without_misparsing_ipv6() {
-        assert_eq!(address_host("irc.example:6697").unwrap(), "irc.example");
-        assert_eq!(address_host("127.0.0.1:6697").unwrap(), "127.0.0.1");
-        assert_eq!(address_host("[2001:db8::1]:6697").unwrap(), "2001:db8::1");
-        assert!(address_host("2001:db8::1:6697").is_err());
-        assert!(address_host("missing-port").is_err());
-        assert!(address_host("[2001:db8::1]").is_err());
+        assert_eq!(tls_server_name("irc.example:6697").unwrap(), "irc.example");
+        assert_eq!(tls_server_name("127.0.0.1:6697").unwrap(), "127.0.0.1");
+        assert_eq!(
+            tls_server_name("[2001:db8::1]:6697").unwrap(),
+            "2001:db8::1"
+        );
+        assert!(tls_server_name("2001:db8::1:6697").is_err());
+        assert!(tls_server_name("missing-port").is_err());
+        assert!(tls_server_name("[2001:db8::1]").is_err());
     }
 
     async fn negotiate_sasl(
