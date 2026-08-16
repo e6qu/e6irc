@@ -798,8 +798,8 @@ import { loadSettings, saveSettings } from "/console-settings.js";
             .map((entry) => entry.trim())
             .filter(Boolean),
           auth_rate_burst: optionalPositiveInteger(fields, "auth_rate_burst", "Authentication burst"),
-          api_rate_burst: optionalPositiveInteger(fields, "api_rate_burst", "Authenticated API burst"),
-          administrator_api_rate_burst: optionalPositiveInteger(fields, "administrator_api_rate_burst", "Administrator API burst"),
+          api_rate_burst: positiveInteger(fields, "api_rate_burst", "Authenticated API burst"),
+          administrator_api_rate_burst: positiveInteger(fields, "administrator_api_rate_burst", "Administrator API burst"),
           registration_burst: optionalPositiveInteger(fields, "registration_burst", "Registration burst"),
         },
         observability: {
