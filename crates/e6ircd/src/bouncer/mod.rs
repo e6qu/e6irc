@@ -1113,8 +1113,8 @@ pub(crate) fn filter_tags(line: &str, caps: AttachCaps) -> String {
 /// An event a driver emits upward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverEvent {
-    /// The upstream connection registered successfully.
-    Connected,
+    /// A classified upstream connection state change.
+    Status(DriverConnectionStatus),
     /// One line received from upstream (CRLF stripped).
     Line(String),
     /// A safe component notice for attached clients. It intentionally does not
@@ -1129,16 +1129,64 @@ pub enum DriverEvent {
     /// the originator itself is excluded unless it negotiated echo-message on
     /// attach, mirroring how a real server treats that capability.
     Echo { line: String, origin: u64 },
-    /// The upstream connection dropped; the driver will retry.
-    Disconnected,
 }
 
 impl DriverEvent {
     pub(crate) fn display_line(&self) -> Option<&str> {
         match self {
             Self::Line(line) | Self::Notice(line) => Some(line),
-            Self::Connected | Self::Echo { .. } | Self::Disconnected => None,
+            Self::Status(_) | Self::Echo { .. } => None,
         }
+    }
+}
+
+/// A driver status event. A non-connected status always carries the precise
+/// safe failure class when one exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverConnectionStatus {
+    Connected,
+    Reconnecting(NetworkFailure),
+    AuthenticationFailed,
+    RegistrationFailed(NetworkFailure),
+}
+
+impl DriverConnectionStatus {
+    pub const fn lifecycle(self) -> NetworkLifecycle {
+        match self {
+            Self::Connected => NetworkLifecycle::Connected,
+            Self::Reconnecting(_) => NetworkLifecycle::Reconnecting,
+            Self::AuthenticationFailed => NetworkLifecycle::AuthenticationFailed,
+            Self::RegistrationFailed(_) => NetworkLifecycle::RegistrationFailed,
+        }
+    }
+
+    pub const fn failure(self) -> Option<NetworkFailure> {
+        match self {
+            Self::Connected => None,
+            Self::Reconnecting(failure) | Self::RegistrationFailed(failure) => Some(failure),
+            Self::AuthenticationFailed => Some(NetworkFailure::AuthenticationRejected),
+        }
+    }
+}
+
+fn status_notice(status: DriverConnectionStatus) -> String {
+    match status {
+        DriverConnectionStatus::Connected => ":*bnc* NOTICE * :upstream connected".to_string(),
+        DriverConnectionStatus::Reconnecting(failure) => format!(
+            ":*bnc* NOTICE * :upstream reconnecting: {} ({})",
+            failure.summary(),
+            failure.code()
+        ),
+        DriverConnectionStatus::AuthenticationFailed => format!(
+            ":*bnc* NOTICE * :upstream authentication failed: {} ({})",
+            NetworkFailure::AuthenticationRejected.summary(),
+            NetworkFailure::AuthenticationRejected.code()
+        ),
+        DriverConnectionStatus::RegistrationFailed(failure) => format!(
+            ":*bnc* NOTICE * :upstream registration failed: {} ({})",
+            failure.summary(),
+            failure.code()
+        ),
     }
 }
 
@@ -2223,7 +2271,7 @@ impl DriverEnds {
                 self.runtime.connected();
                 eprintln!("bnc: {} connected", self.runtime.label());
                 (
-                    DriverEvent::Connected,
+                    DriverEvent::Status(DriverConnectionStatus::Connected),
                     format!(
                         ":*bnc* NOTICE * :component connected: {}",
                         self.runtime.label()
@@ -2231,18 +2279,29 @@ impl DriverEnds {
                 )
             }
             failure_event => {
-                let (disposition, failure) = match failure_event {
-                    ConnectionEvent::Reconnecting(failure) => (FailureDisposition::Retry, failure),
+                let (status, disposition, failure) = match failure_event {
+                    ConnectionEvent::Reconnecting(failure) => (
+                        DriverConnectionStatus::Reconnecting(failure),
+                        FailureDisposition::Retry,
+                        failure,
+                    ),
                     ConnectionEvent::AuthenticationFailed => (
+                        DriverConnectionStatus::AuthenticationFailed,
                         FailureDisposition::Terminal(
                             TerminalNetworkLifecycle::AuthenticationFailed,
                         ),
                         NetworkFailure::AuthenticationRejected,
                     ),
-                    ConnectionEvent::RegistrationFailed(refusal) => (
-                        FailureDisposition::Terminal(TerminalNetworkLifecycle::RegistrationFailed),
-                        registration_failure(refusal),
-                    ),
+                    ConnectionEvent::RegistrationFailed(refusal) => {
+                        let failure = registration_failure(refusal);
+                        (
+                            DriverConnectionStatus::RegistrationFailed(failure),
+                            FailureDisposition::Terminal(
+                                TerminalNetworkLifecycle::RegistrationFailed,
+                            ),
+                            failure,
+                        )
+                    }
                     ConnectionEvent::Connected => {
                         unreachable!("connected handled before failure transition")
                     }
@@ -2269,12 +2328,9 @@ impl DriverEnds {
                         failure.code(),
                     ),
                 }
-                let state = match disposition {
-                    FailureDisposition::Retry => "reconnecting",
-                    FailureDisposition::Terminal(lifecycle) => lifecycle.lifecycle().as_str(),
-                };
+                let state = status.lifecycle().as_str();
                 (
-                    DriverEvent::Disconnected,
+                    DriverEvent::Status(status),
                     format!(
                         ":*bnc* NOTICE * :component {state}: {} ({})",
                         failure.summary(),
@@ -2471,8 +2527,8 @@ where
     // Send the current upstream connection status up front, so a client that
     // attaches to an already-connected (or still-reconnecting) network learns the
     // state now rather than only at the next connect/disconnect transition — the
-    // same up-front status `/ws/ui` sends over WebSocket. The wording matches the
-    // live `DriverEvent::Connected`/`Disconnected` lines below.
+    // same up-front status `/ws/ui` sends over WebSocket. Live status events
+    // below include the classified failure when the upstream is not connected.
     let status: &[u8] = if handle.is_connected() {
         b":*bnc* NOTICE * :upstream connected\r\n"
     } else {
@@ -2521,12 +2577,9 @@ where
                         write.flush().await?;
                     }
                 }
-                Ok(DriverEvent::Connected) => {
-                    write.write_all(b":*bnc* NOTICE * :upstream connected\r\n").await?;
-                    write.flush().await?;
-                }
-                Ok(DriverEvent::Disconnected) => {
-                    write.write_all(b":*bnc* NOTICE * :upstream disconnected\r\n").await?;
+                Ok(DriverEvent::Status(status)) => {
+                    write.write_all(status_notice(status).as_bytes()).await?;
+                    write.write_all(b"\r\n").await?;
                     write.flush().await?;
                 }
                 // Lagged (slow client): the gap is unrecoverable, but surface
@@ -2853,6 +2906,40 @@ mod tests {
                 ":*bnc* NOTICE * :component authentication_failed: The upstream rejected the configured credentials. (authentication_rejected)".to_string(),
                 ":*bnc* NOTICE * :component registration_failed: The upstream rejected the configured nickname. (invalid_nickname)".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn driver_status_events_keep_lifecycle_and_failure_together() {
+        let (handle, ends) = NetworkHandle::channels(8);
+        let mut events = handle.subscribe();
+
+        ends.emit(ConnectionEvent::Connected);
+        assert_eq!(
+            events.try_recv(),
+            Ok(DriverEvent::Status(DriverConnectionStatus::Connected))
+        );
+        assert!(matches!(events.try_recv(), Ok(DriverEvent::Line(_))));
+
+        ends.emit(ConnectionEvent::Reconnecting(
+            NetworkFailure::ConnectionLost,
+        ));
+        let reconnecting = DriverConnectionStatus::Reconnecting(NetworkFailure::ConnectionLost);
+        assert_eq!(events.try_recv(), Ok(DriverEvent::Status(reconnecting)));
+        assert!(matches!(events.try_recv(), Ok(DriverEvent::Line(_))));
+        assert_eq!(
+            status_notice(reconnecting),
+            ":*bnc* NOTICE * :upstream reconnecting: The established upstream connection was lost. (connection_lost)"
+        );
+
+        ends.emit(ConnectionEvent::RegistrationFailed(
+            e6irc_client::RegistrationRefusal::InvalidNickname,
+        ));
+        assert_eq!(
+            events.try_recv(),
+            Ok(DriverEvent::Status(
+                DriverConnectionStatus::RegistrationFailed(NetworkFailure::InvalidNickname)
+            ))
         );
     }
 

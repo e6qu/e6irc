@@ -1281,6 +1281,9 @@ connection event enters a typed runtime phase: only `Connected` carries a
 connection time, only `Reconnecting` can carry a retry time, and a parked
 network cannot be scheduled to retry. The latest error is one timestamped
 record, so monitoring cannot pair a failure with another failure's time.
+Live driver status events carry the same closed failure classification, so raw
+IRC attachments and WebSocket clients do not re-read mutable state to explain
+a disconnect.
 Recoverable
 message-delivery and detached-backlog storage failures use the same closed
 classification-and-accounting choke point, so an error counter or timestamp

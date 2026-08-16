@@ -10,7 +10,9 @@
 
 use std::time::Duration;
 
-use e6ircd::bouncer::{DriverEvent, MatrixConfig, MatrixDriver, NetworkDriver};
+use e6ircd::bouncer::{
+    DriverConnectionStatus, DriverEvent, MatrixConfig, MatrixDriver, NetworkDriver,
+};
 
 fn base() -> String {
     std::env::var("E6IRC_TEST_MATRIX_URL").expect("E6IRC_TEST_MATRIX_URL (a Conduit homeserver)")
@@ -91,7 +93,7 @@ async fn matrix_bridge_relays_both_ways() {
     let connected = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match events.recv().await {
-                Ok(DriverEvent::Connected) => return true,
+                Ok(DriverEvent::Status(DriverConnectionStatus::Connected)) => return true,
                 Ok(_) => {}
                 Err(_) => return false,
             }

@@ -32,7 +32,9 @@ async fn wait_connected(handle: &NetworkHandle) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match events.recv().await {
-                Ok(e6ircd::bouncer::DriverEvent::Connected) => return,
+                Ok(e6ircd::bouncer::DriverEvent::Status(
+                    e6ircd::bouncer::DriverConnectionStatus::Connected,
+                )) => return,
                 Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     panic!("driver event stream closed before connecting");
