@@ -590,6 +590,7 @@ try {
   await serverNetworks.getByLabel("Network name").fill("shared-browser");
   await serverNetworks.getByLabel("Address").fill(upstream.address);
   await serverNetworks.getByLabel("Nickname / user").fill("sharedbrowser");
+  await serverNetworks.getByLabel("Real name").fill("Shared Browser");
   await serverNetworks.getByLabel("Autojoin").fill("#shared");
   await serverNetworks.getByLabel("Use TLS").uncheck();
   await serverNetworks.getByLabel("SASL account").fill("shared-account");
@@ -1025,6 +1026,7 @@ try {
   await page.locator('input[name="name"]').fill("journey");
   await page.locator('input[name="addr"]').fill(upstream.address);
   await page.locator('input[name="nick"]').fill("webjourney");
+  await page.locator('input[name="realname"]').fill("Web Journey");
   await page.locator('input[name="autojoin"]').fill("#journey");
   await page.locator('input[name="tls"]').uncheck();
   const preflightResponse = page.waitForResponse(

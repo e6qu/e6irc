@@ -522,13 +522,39 @@ async fn bnc_network_management_lifecycle() {
     let bnc = running.bnc_addr.expect("bnc bound");
     wait_http_ready(http).await;
 
+    // Missing or wrong-kind fields fail at the HTTP boundary.
+    let (status, _) = post_json(
+        http,
+        "/api/v1/me/networks/preflight",
+        &token,
+        &format!(r#"{{"addr":"{up}","nick":"probe","realname":"Preflight"}}"#),
+    )
+    .await;
+    assert_eq!(status, 400, "preflight must require tls");
+    let (status, _) = post_json(
+        http,
+        "/api/v1/me/networks",
+        &token,
+        &format!(r#"{{"name":"implicit","addr":"{up}","tls":false,"nick":"probe","realname":"Probe","autojoin":[]}}"#),
+    )
+    .await;
+    assert_eq!(status, 400, "network creation must require kind");
+    let (status, _) = post_json(
+        http,
+        "/api/v1/me/networks",
+        &token,
+        r#"{"kind":"discord","name":"wrong-fields","addr":"","tls":true,"nick":"x","autojoin":[],"sasl_password":"token"}"#,
+    )
+    .await;
+    assert_eq!(status, 400, "discord creation must reject IRC fields");
+
     // Qualifying a network uses the production resolver, transport, and IRC
     // registration path, but does not persist or start it.
     let (status, body) = post_json(
         http,
         "/api/v1/me/networks/preflight",
         &token,
-        &format!(r#"{{"addr":"{up}","nick":"probe"}}"#),
+        &format!(r#"{{"addr":"{up}","tls":false,"nick":"probe","realname":"Preflight"}}"#),
     )
     .await;
     assert_eq!(status, 200, "{body}");
@@ -544,7 +570,7 @@ async fn bnc_network_management_lifecycle() {
         http,
         "/api/v1/me/networks/preflight",
         &token,
-        &format!(r#"{{"addr":"{up}","nick":"probe","sasl_account":"alice"}}"#),
+        &format!(r#"{{"addr":"{up}","tls":false,"nick":"probe","realname":"Preflight","sasl_account":"alice"}}"#),
     )
     .await;
     assert_eq!(status, 400, "{body}");
@@ -572,7 +598,7 @@ async fn bnc_network_management_lifecycle() {
         http,
         "/api/v1/me/networks",
         &token,
-        &format!(r##"{{"name":"work","addr":"{up}","nick":"alice_","autojoin":["#lobby"]}}"##),
+        &format!(r##"{{"kind":"irc","name":"work","addr":"{up}","tls":false,"nick":"alice_","realname":"Alice","autojoin":["#lobby"]}}"##),
     )
     .await;
     assert_eq!(status, 201, "create should succeed");
@@ -587,7 +613,7 @@ async fn bnc_network_management_lifecycle() {
         "/api/v1/me/networks",
         &token,
         &format!(
-            r#"{{"name":"big","addr":"up.example:1","nick":"n","sasl_account":"a","sasl_password":"{big}"}}"#
+            r#"{{"kind":"irc","name":"big","addr":"up.example:1","tls":false,"nick":"n","realname":"N","autojoin":[],"sasl_account":"a","sasl_password":"{big}"}}"#
         ),
     )
     .await;
@@ -596,7 +622,7 @@ async fn bnc_network_management_lifecycle() {
         http,
         "/api/v1/me/networks",
         &token,
-        r#"{"name":"nul","addr":"up.example:1","nick":"n","sasl_account":"a\u0000b","sasl_password":"p"}"#,
+        r#"{"kind":"irc","name":"nul","addr":"up.example:1","tls":false,"nick":"n","realname":"N","autojoin":[],"sasl_account":"a\u0000b","sasl_password":"p"}"#,
     )
     .await;
     assert_eq!(status, 400, "NUL in sasl_account must be refused");
@@ -755,7 +781,7 @@ async fn bnc_network_upstream_secret_requires_master_key() {
             addr: "up.example:6697".into(),
             tls: true,
             nick: "alice_".into(),
-            realname: None,
+            realname: Some("Alice".into()),
             autojoin: vec![],
             sasl_account: Some("alice".into()),
             // Simulates a deployment whose key was removed after credentials
@@ -799,7 +825,7 @@ async fn bnc_network_upstream_secret_requires_master_key() {
         http,
         "/api/v1/me/networks",
         &token,
-        r#"{"name":"work","addr":"irc.example:6697","nick":"alice_","sasl_account":"alice","sasl_password":"upstreampass"}"#,
+        r#"{"kind":"irc","name":"work","addr":"irc.example:6697","tls":true,"nick":"alice_","realname":"Alice","autojoin":[],"sasl_account":"alice","sasl_password":"upstreampass"}"#,
     )
     .await;
     assert_eq!(
@@ -807,7 +833,7 @@ async fn bnc_network_upstream_secret_requires_master_key() {
         "must refuse to store an upstream secret unsealed"
     );
 
-    let remove = r#"{"addr":"up.example:6697","tls":true,"nick":"alice_","credentials":{"action":"remove"}}"#;
+    let remove = r#"{"addr":"up.example:6697","tls":true,"nick":"alice_","realname":"Alice","credentials":{"action":"remove"}}"#;
     let remove_req = format!(
         "PUT /api/v1/me/networks/stored-secret HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{remove}",
@@ -981,7 +1007,29 @@ async fn openapi_spec_is_served() {
     );
     let create_network_schema = &v["paths"]["/api/v1/me/networks"]["post"]["requestBody"]["content"]
         ["application/json"]["schema"];
-    assert_eq!(create_network_schema["additionalProperties"], false);
+    let create_variants = create_network_schema["oneOf"]
+        .as_array()
+        .expect("network creation variants");
+    assert_eq!(create_variants.len(), 4);
+    for variant in create_variants {
+        assert_eq!(variant["additionalProperties"], false);
+    }
+    assert_eq!(
+        create_variants[0]["required"],
+        serde_json::json!([
+            "kind", "name", "addr", "tls", "nick", "realname", "autojoin"
+        ])
+    );
+    assert_eq!(create_variants[0]["properties"]["kind"]["const"], "irc");
+    assert_eq!(create_variants[1]["properties"]["kind"]["const"], "matrix");
+    assert_eq!(create_variants[2]["properties"]["kind"]["const"], "discord");
+    assert_eq!(create_variants[3]["properties"]["kind"]["const"], "slack");
+    let preflight_schema = &v["paths"]["/api/v1/me/networks/preflight"]["post"]["requestBody"]["content"]
+        ["application/json"]["schema"];
+    assert_eq!(
+        preflight_schema["required"],
+        serde_json::json!(["addr", "tls", "nick", "realname"])
+    );
     let app_password_schema = &v["paths"]["/api/v1/auth/app-passwords"]["post"]["requestBody"]["content"]
         ["application/json"]["schema"];
     assert_eq!(app_password_schema["additionalProperties"], false);
@@ -1491,12 +1539,12 @@ async fn console_networks_page_lists_the_callers_networks() {
         &pool,
         "alice",
         &e6ircd::db::BncNetworkRow {
-            kind: Default::default(),
+            kind: e6ircd::config::NetworkKind::Irc,
             name: "libera".into(),
             addr: "irc.libera.chat:6697".into(),
             tls: true,
             nick: "alice_".into(),
-            realname: None,
+            realname: Some("Alice".into()),
             autojoin: vec!["#e6irc".into()],
             sasl_account: None,
             sasl_password_sealed: None,
@@ -5349,7 +5397,7 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         addr: "irc.example:6697".into(),
         tls: true,
         nick: "alice".into(),
-        realname: None,
+        realname: Some("Alice".into()),
         autojoin: vec![],
         sasl_account: None,
         sasl_password_sealed: None,
@@ -6190,12 +6238,12 @@ async fn network_buffer_read() {
         &pool,
         "alice",
         &e6ircd::db::BncNetworkRow {
-            kind: Default::default(),
+            kind: e6ircd::config::NetworkKind::Irc,
             name: "work".into(),
             addr: "127.0.0.1:1".into(),
             tls: false,
             nick: "alice_".into(),
-            realname: None,
+            realname: Some("Alice".into()),
             autojoin: vec![],
             sasl_account: None,
             sasl_password_sealed: None,
@@ -6828,12 +6876,12 @@ async fn admin_networks_fleet_view_and_toggle() {
         &pool,
         "bob",
         &e6ircd::db::BncNetworkRow {
-            kind: Default::default(),
+            kind: e6ircd::config::NetworkKind::Irc,
             name: "work".into(),
             addr: "127.0.0.1:1".into(),
             tls: false,
             nick: "bob_".into(),
-            realname: None,
+            realname: Some("Bob".into()),
             autojoin: vec![],
             sasl_account: None,
             sasl_password_sealed: None,

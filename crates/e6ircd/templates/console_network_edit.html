@@ -9,7 +9,7 @@
           <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
           <label class="field"><span>Server and port</span><input name="addr" required /></label>
           <label class="field"><span>Nickname</span><input name="nick" required /></label>
-          <label class="field field-wide"><span>Real name <em>optional</em></span><input name="realname" /></label>
+          <label class="field field-wide"><span>Real name</span><input name="realname" required /></label>
           <label class="field field-wide"><span>Channels to join <em>optional</em></span><input name="autojoin" /><small>Comma-separated channel names.</small></label>
           <label class="field"><span>Upstream SASL account <em>optional</em></span><input name="sasl_account" autocomplete="username" maxlength="255" data-sasl-account /></label>
           <label class="field"><span>New SASL password <em>optional</em></span><input type="password" name="sasl_password" autocomplete="new-password" maxlength="512" data-sasl-password /><small>Leave blank to keep an existing stored password; required when adding credentials.</small></label>

@@ -55,7 +55,7 @@ credentials are supplied.
    TLS checkbox. Server-side preset resolution repeats this step on submit, so
    the safety defaults do not depend on JavaScript or client-supplied hidden
    values.
-3. Supply nickname, optional real name and comma-separated autojoin channels,
+3. Supply nickname, real name, and comma-separated autojoin channels,
    and optional upstream SASL account/password.
 4. Choose **Test connection** before saving. The owner-scoped preflight applies
    the same server-side preset and validation rules, then uses the production
@@ -63,9 +63,10 @@ credentials are supplied.
    IRC registration path. It renders DNS, connect, and registration timings,
    the confirmed nickname, and vetted address count without inserting a row,
    starting a reconnect loop, or joining channels.
-5. Submit the CSRF-protected form. The server validates all sizes and syntax,
-   blocks prohibited IP literals, seals any password, constructs the driver,
-   inserts the owner-scoped row, and starts the driver immediately. Each DNS
+5. Submit the CSRF-protected form. Creation names one driver and its complete
+   fields; absent kind, TLS, or IRC identity is rejected. The server validates
+   sizes and syntax, blocks prohibited IP literals, seals any password,
+   constructs the driver, inserts the owner-scoped row, and starts it. Each DNS
    result is vetted again at dial time.
 6. The committed result reloads the network list. The list reads only
    `GET /api/v1/me/networks`; status comes from its live runtime snapshot,

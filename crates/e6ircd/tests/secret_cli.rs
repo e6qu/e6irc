@@ -69,9 +69,11 @@ fn genkey_seal_and_load_round_trip() {
         addr = "127.0.0.1:0"
         [[network]]
         name = "up"
+        kind = "irc"
         addr = "irc.example:6697"
         tls = true
         nick = "e6bnc"
+        realname = "e6bnc"
         sasl_account = "e6bnc"
         sasl_password = "{sealed}"
         "#,

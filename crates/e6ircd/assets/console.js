@@ -929,20 +929,68 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       const value = String(fields.get(name) || "").trim();
       return value ? { [name]: value } : {};
     };
-    return {
+    const required = (name, label) => {
+      const value = String(fields.get(name) || "").trim();
+      if (!value) throw new Error(`${label} is required.`);
+      return value;
+    };
+    const kind = required("kind", "Driver");
+    const common = {
       revision,
-      name: String(fields.get("name") || "").trim(),
-      kind: String(fields.get("kind") || ""),
-      addr: String(fields.get("addr") || "").trim(),
+      name: required("name", "Network name"),
+      kind,
       tls: fields.has("tls"),
-      nick: String(fields.get("nick") || "").trim(),
       autojoin: splitValues(String(fields.get("autojoin") || ""), ","),
       buffer_cap: number,
       ...optional("owner"),
-      ...optional("realname"),
-      ...optional("sasl_account"),
-      ...optional("sasl_password"),
     };
+    const addr = String(fields.get("addr") || "").trim();
+    switch (kind) {
+      case "irc": {
+        const saslAccount = optional("sasl_account");
+        const saslPassword = optional("sasl_password");
+        if (Boolean(saslAccount.sasl_account) !== Boolean(saslPassword.sasl_password)) {
+          throw new Error("IRC SASL account and password must be provided together.");
+        }
+        return {
+          ...common,
+          addr: required("addr", "Address"),
+          nick: required("nick", "Nickname / user"),
+          realname: required("realname", "Real name"),
+          ...saslAccount,
+          ...saslPassword,
+        };
+      }
+      case "local":
+        return {
+          ...common,
+          addr,
+          nick: required("nick", "Nickname / user"),
+          realname: required("realname", "Real name"),
+        };
+      case "matrix":
+        return {
+          ...common,
+          addr,
+          nick: required("nick", "Nickname / user"),
+          sasl_password: required("sasl_password", "Login password"),
+        };
+      case "discord":
+        return {
+          ...common,
+          addr,
+          sasl_password: required("sasl_password", "Bot token"),
+        };
+      case "slack":
+        return {
+          ...common,
+          addr,
+          sasl_account: required("sasl_account", "Bot token"),
+          sasl_password: required("sasl_password", "App-level token"),
+        };
+      default:
+        throw new Error(`Unsupported network driver: ${kind}.`);
+    }
   };
 
   const setConfigurationResult = (message, success) => {
@@ -2390,7 +2438,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     addr: fieldValue(fields, "addr"),
     tls: fields.has("tls"),
     nick: fieldValue(fields, "nick"),
-    realname: optionalValue(String(fields.get("realname") || "")),
+    realname: fieldValue(fields, "realname"),
     autojoin: splitValues(String(fields.get("autojoin") || ""), ","),
     sasl_account: optionalValue(String(fields.get("sasl_account") || "")),
     sasl_password: optionalValue(String(fields.get("sasl_password") || "")),
@@ -2403,8 +2451,8 @@ import { loadSettings, saveSettings } from "/console-settings.js";
         const fields = new FormData(form);
         const name = fieldValue(fields, "name");
         const connection = ownerNetworkConnection(fields);
-        if (!name || !connection.addr || !connection.nick) {
-          setOwnerNetworkResult("Enter a network ID, server, and nickname.", false);
+        if (!name || !connection.addr || !connection.nick || !connection.realname) {
+          setOwnerNetworkResult("Enter a network ID, server, nickname, and real name.", false);
           return;
         }
         const { addr, tls, nick, realname, sasl_account, sasl_password } = connection;
@@ -2418,8 +2466,8 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       const fields = new FormData(form);
       const name = fieldValue(fields, "name");
       const connection = ownerNetworkConnection(fields);
-      if (!name || !connection.addr || !connection.nick) {
-        setOwnerNetworkResult("Enter a network ID, server, and nickname.", false);
+      if (!name || !connection.addr || !connection.nick || !connection.realname) {
+        setOwnerNetworkResult("Enter a network ID, server, nickname, and real name.", false);
         return;
       }
       void mutateOwnerNetwork(form, form.action, "POST", { kind: "irc", name, ...connection });
@@ -2437,13 +2485,13 @@ import { loadSettings, saveSettings } from "/console-settings.js";
         setOwnerNetworkResult("Enter every required bridge value.", false);
         return;
       }
-      void mutateOwnerNetwork(form, form.action, "POST", {
-        kind, name, addr: fieldValue(fields, "addr"), tls: true,
-        nick: fieldValue(fields, "nick"), realname: null,
-        autojoin: splitValues(String(fields.get("autojoin") || ""), ","),
-        sasl_account: optionalValue(String(fields.get("sasl_account") || "")),
-        sasl_password: password,
-      });
+      const base = { kind, name, addr: fieldValue(fields, "addr"), tls: true, autojoin: splitValues(String(fields.get("autojoin") || ""), ","), sasl_password: password };
+      const body = kind === "matrix"
+        ? { ...base, nick: fieldValue(fields, "nick") }
+        : kind === "slack"
+          ? { ...base, sasl_account: fieldValue(fields, "sasl_account") }
+          : base;
+      void mutateOwnerNetwork(form, form.action, "POST", body);
     });
   }
 
@@ -2459,11 +2507,11 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     const body = {
       addr: fieldValue(fields, "addr"), tls: bridge || fields.has("tls"),
       nick: fieldValue(fields, "nick"),
-      realname: bridge ? null : optionalValue(String(fields.get("realname") || "")),
+      realname: bridge ? null : fieldValue(fields, "realname"),
       autojoin: splitValues(String(fields.get("autojoin") || ""), ","), credentials,
     };
-    if (!bridge && (!body.addr || !body.nick)) {
-      throw new Error("Enter the required network connection values.");
+    if (!bridge && (!body.addr || !body.nick || !body.realname)) {
+      throw new Error("Enter the server, nickname, and real name.");
     }
     return body;
   };

@@ -1339,21 +1339,23 @@ fn document() -> serde_json::Value {
                     "description": "Each network includes stored configuration, `connected` (true/false, or null with no running handle), and an owner-safe `runtime` object when its driver is active: lifecycle/timestamps, a credential-safe last-error code and summary, connect latency, attempts/errors, attached clients, traffic, and in-memory buffer usage.",
                     "security": authenticated, "responses": network_list_response },
                 "post": { "summary": "Create a BNC network and start its driver",
-                    "description": "kind defaults to `irc`. IRC requires addr/nick and optional paired SASL credentials. Matrix requires an HTTP(S) homeserver in addr, a provider user in nick, tls=true, and sasl_password. Discord requires tls=true, empty nick, a bot token in sasl_password, and an optional HTTP(S) API base in addr. Slack requires tls=true, empty nick, a bot token in sasl_account, an app token in sasl_password, and an optional HTTP(S) API base in addr. realname is IRC-only.",
+                    "description": "Every request explicitly selects one driver and its complete connection intent. IRC requires addr, tls, nick, realname, and autojoin, with paired optional SASL credentials. Matrix requires an HTTP(S) homeserver, tls=true, provider user, autojoin, and password. Discord requires tls=true, autojoin, and a bot token. Slack requires tls=true, autojoin, bot token, and app token. An empty bridge addr explicitly selects that provider's built-in endpoint.",
                     "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": {
-                        "schema": { "type": "object", "additionalProperties": false,
-                            "required": ["name", "addr", "nick"],
-                            "properties": {
-                                "kind": { "type": "string", "enum": ["irc", "matrix", "discord", "slack"], "default": "irc" },
-                                "name": { "type": "string" },
-                                "addr": { "type": "string" },
-                                "tls": { "type": "boolean" },
-                                "nick": { "type": "string" },
-                                "realname": { "type": ["string", "null"] },
-                                "autojoin": { "type": "array", "items": { "type": "string" } },
-                                "sasl_account": { "type": ["string", "null"] },
-                                "sasl_password": { "type": ["string", "null"] } } } } } },
+                        "schema": { "oneOf": [
+                            { "type": "object", "additionalProperties": false,
+                                "required": ["kind", "name", "addr", "tls", "nick", "realname", "autojoin"],
+                                "properties": { "kind": { "const": "irc" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] } } },
+                            { "type": "object", "additionalProperties": false,
+                                "required": ["kind", "name", "addr", "tls", "nick", "autojoin", "sasl_password"],
+                                "properties": { "kind": { "const": "matrix" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "const": true }, "nick": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "sasl_password": { "type": "string", "writeOnly": true } } },
+                            { "type": "object", "additionalProperties": false,
+                                "required": ["kind", "name", "addr", "tls", "autojoin", "sasl_password"],
+                                "properties": { "kind": { "const": "discord" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "const": true }, "autojoin": { "type": "array", "items": { "type": "string" } }, "sasl_password": { "type": "string", "writeOnly": true } } },
+                            { "type": "object", "additionalProperties": false,
+                                "required": ["kind", "name", "addr", "tls", "autojoin", "sasl_account", "sasl_password"],
+                                "properties": { "kind": { "const": "slack" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "const": true }, "autojoin": { "type": "array", "items": { "type": "string" } }, "sasl_account": { "type": "string", "writeOnly": true }, "sasl_password": { "type": "string", "writeOnly": true } } }
+                        ] } } } },
                     "responses": { "201": network_created_response["201"],
                         "409": { "description": "duplicate name, or upstream secret with no master key" } } }
             },
@@ -1364,12 +1366,12 @@ fn document() -> serde_json::Value {
                     "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "type": "object", "additionalProperties": false,
-                            "required": ["addr", "nick"],
+                            "required": ["addr", "tls", "nick", "realname"],
                             "properties": {
                                 "addr": { "type": "string", "minLength": 1, "maxLength": 255 },
                                 "tls": { "type": "boolean" },
                                 "nick": { "type": "string", "minLength": 1, "maxLength": 64 },
-                                "realname": { "type": ["string", "null"], "maxLength": 128 },
+                                "realname": { "type": "string", "minLength": 1, "maxLength": 128 },
                                 "sasl_account": { "type": ["string", "null"], "minLength": 1, "maxLength": 255, "writeOnly": true },
                                 "sasl_password": { "type": ["string", "null"], "minLength": 1, "maxLength": 512, "writeOnly": true }
                             } } } } },
@@ -2173,17 +2175,34 @@ mod tests {
     }
 
     #[test]
-    fn optional_network_request_fields_accept_null() {
+    fn network_request_optionality_matches_the_kind_contract() {
         let spec = super::document();
-        for path in ["/api/v1/me/networks", "/api/v1/me/networks/preflight"] {
-            for field in ["realname", "sasl_account", "sasl_password"] {
-                assert_eq!(
-                    spec["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]
-                        ["properties"][field]["type"],
-                    serde_json::json!(["string", "null"]),
-                    "{path} {field}",
-                );
-            }
+        let create = &spec["paths"]["/api/v1/me/networks"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["oneOf"];
+        assert_eq!(create[0]["properties"]["realname"]["type"], "string");
+        for field in ["sasl_account", "sasl_password"] {
+            assert_eq!(
+                create[0]["properties"][field]["type"],
+                serde_json::json!(["string", "null"]),
+                "IRC {field}",
+            );
+        }
+        for variant in [1, 2, 3] {
+            assert_eq!(
+                create[variant]["properties"]["sasl_password"]["type"],
+                "string"
+            );
+        }
+        assert_eq!(create[3]["properties"]["sasl_account"]["type"], "string");
+        let preflight = &spec["paths"]["/api/v1/me/networks/preflight"]["post"]["requestBody"]["content"]
+            ["application/json"]["schema"];
+        assert_eq!(preflight["properties"]["realname"]["type"], "string");
+        for field in ["sasl_account", "sasl_password"] {
+            assert_eq!(
+                preflight["properties"][field]["type"],
+                serde_json::json!(["string", "null"]),
+                "preflight {field}",
+            );
         }
     }
 

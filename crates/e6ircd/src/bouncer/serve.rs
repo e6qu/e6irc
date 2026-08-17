@@ -142,12 +142,22 @@ impl Registry {
             // `local` needs the in-process core handles, so it stays special; all
             // other kinds go through the shared feature-gated `build_driver`
             // factory (the same one the DB create/boot/re-enable paths use).
+            let realname = match e.kind {
+                NetworkKind::Irc | NetworkKind::Local => e.realname.clone().ok_or_else(|| {
+                    format!(
+                        "network '{}' (kind={}) requires realname",
+                        e.name,
+                        e.kind.as_db_str()
+                    )
+                })?,
+                NetworkKind::Matrix | NetworkKind::Discord | NetworkKind::Slack => String::new(),
+            };
             let driver: Box<dyn super::NetworkDriver> = if e.kind == NetworkKind::Local {
                 let config = NetworkConfig {
                     addr: e.addr.clone(),
                     tls: e.tls,
                     nick: e.nick.clone(),
-                    realname: e.realname.clone().unwrap_or_else(|| e.nick.clone()),
+                    realname,
                     autojoin: e.autojoin.clone(),
                     buffer_cap: e.buffer_cap,
                     sasl: None,
@@ -160,7 +170,7 @@ impl Registry {
                     e.addr.clone(),
                     e.tls,
                     e.nick.clone(),
-                    e.realname.clone().unwrap_or_else(|| e.nick.clone()),
+                    realname,
                     e.autojoin.clone(),
                     e.buffer_cap,
                     e.sasl_account.clone(),

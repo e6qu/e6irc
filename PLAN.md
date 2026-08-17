@@ -21,7 +21,9 @@ are checked against the router. Successful mutations refresh their API-backed
 view without a document reload. Bridge provider frames and REST bodies cross
 typed contracts. Server routes emit closed response models, including one
 current-schema observability snapshot/history contract; URL queries and forms
-reject unknown fields.
+reject unknown fields. Network creation and IRC preflight require explicit
+driver, transport, and identity fields; kind-specific requests reject
+incompatible fields.
 History accepts one typed cursor window and a bounded page size.
 Chat, console, and identity pages share accessible light and dark palettes.
 Browser tests cover WCAG AA contrast, keyboard focus, Escape dismissal,

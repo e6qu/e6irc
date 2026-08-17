@@ -5,7 +5,7 @@
 //!   E6IRC_TEST_DATABASE_URL=postgres://... cargo test --test db -- --ignored
 
 use e6irc_queue::{Config as QueueConfig, Policy, queue};
-use e6ircd::config::{Config, DatabaseConfig, ListenerConfig};
+use e6ircd::config::{Config, DatabaseConfig, ListenerConfig, NetworkKind};
 use e6ircd::core::{CoreIngress, DbReply, DbRequest, HistoryTargets, Input};
 use e6ircd::{db, net};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1141,12 +1141,12 @@ async fn bnc_networks_are_capped_per_account() {
         .await
         .expect("create");
     let row = |i: usize| db::BncNetworkRow {
-        kind: Default::default(),
+        kind: NetworkKind::Irc,
         name: format!("net{i}"),
         addr: "irc.example:6697".into(),
         tls: true,
         nick: "ncap".into(),
-        realname: None,
+        realname: Some("Network Cap".into()),
         autojoin: vec![],
         sasl_account: None,
         sasl_password_sealed: None,
@@ -2204,7 +2204,7 @@ async fn bnc_networks_crud() {
     db::create_account(&pool, "bob", "pw").await.expect("acct");
 
     let libera = db::BncNetworkRow {
-        kind: Default::default(),
+        kind: NetworkKind::Irc,
         name: "libera".into(),
         addr: "irc.libera.chat:6697".into(),
         tls: true,
@@ -2284,7 +2284,7 @@ async fn bnc_networks_crud() {
         addr: "https://matrix.example".into(),
         tls: true,
         nick: "e6bot".into(),
-        realname: None,
+        realname: Some("Alice".into()),
         autojoin: vec!["#room:matrix.example".into()],
         sasl_account: None,
         sasl_password_sealed: Some("enc:v2:sealed".into()),
@@ -2356,12 +2356,12 @@ async fn bnc_network_name_selection_is_case_insensitive() {
         .expect("acct");
 
     let libera = db::BncNetworkRow {
-        kind: Default::default(),
+        kind: NetworkKind::Irc,
         name: "libera".into(),
         addr: "irc.libera.chat:6697".into(),
         tls: true,
         nick: "alice_".into(),
-        realname: None,
+        realname: Some("Mixed Case".into()),
         autojoin: vec![],
         sasl_account: None,
         sasl_password_sealed: None,
@@ -2462,12 +2462,12 @@ async fn deleting_a_bnc_network_purges_its_casefolded_buffer() {
         .await
         .expect("acct");
     let net = db::BncNetworkRow {
-        kind: Default::default(),
+        kind: NetworkKind::Irc,
         name: "libera".into(),
         addr: "irc.libera.chat:6697".into(),
         tls: true,
         nick: "mc".into(),
-        realname: None,
+        realname: Some("Mixed Case".into()),
         autojoin: vec![],
         sasl_account: None,
         sasl_password_sealed: None,
@@ -4385,7 +4385,7 @@ async fn unreadable_secret_rolls_back_the_entire_rotation() {
             addr: "irc.example:6697".into(),
             tls: true,
             nick: "alice".into(),
-            realname: None,
+            realname: Some("Alice".into()),
             autojoin: Vec::new(),
             sasl_account: Some("alice".into()),
             sasl_password_sealed: Some("enc:v2:not-base64".into()),
