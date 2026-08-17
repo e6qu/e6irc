@@ -1798,6 +1798,12 @@ mod tests {
         }
     }
 
+    fn config_with_static_network(network: &str) -> String {
+        format!(
+            "server_name = 'irc.example.test'\nnetwork_name = 'Example'\n[[listeners]]\naddr = '127.0.0.1:0'\n[database]\nurl = 'postgres://localhost/example'\n[[network]]\n{network}"
+        )
+    }
+
     #[test]
     fn static_network_entries_are_driver_specific() {
         for entry in [
@@ -1808,6 +1814,10 @@ mod tests {
             "kind = 'slack'\nname = 'slack'\naddr = ''\ntls = true\nautojoin = []\nbuffer_cap = 1000\nsasl_account = 'xoxb-token'\nsasl_password = 'xapp-token'",
         ] {
             assert!(toml::from_str::<NetworkEntryWire>(entry).is_ok(), "{entry}");
+            assert!(
+                toml::from_str::<Config>(&config_with_static_network(entry)).is_ok(),
+                "{entry}"
+            );
         }
         let incompatible = "kind = 'discord'\nname = 'discord'\naddr = ''\ntls = true\nnick = 'alice'\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'token'";
         assert!(
@@ -1818,11 +1828,6 @@ mod tests {
 
     #[test]
     fn static_network_ingress_rejects_invalid_driver_fields() {
-        let config = |network: &str| {
-            format!(
-                "server_name = 'irc.example.test'\nnetwork_name = 'Example'\n[[listeners]]\naddr = '127.0.0.1:0'\n[database]\nurl = 'postgres://localhost/example'\n[[network]]\n{network}"
-            )
-        };
         for network in [
             "kind = 'matrix'\nname = 'matrix'\naddr = '   '\ntls = true\nnick = '@alice:example.test'\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'password'",
             "kind = 'matrix'\nname = 'matrix'\naddr = 'https://matrix.example.test'\ntls = true\nnick = '   '\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'password'",
@@ -1830,7 +1835,7 @@ mod tests {
             "kind = 'slack'\nname = 'slack'\naddr = ''\ntls = true\nautojoin = []\nbuffer_cap = 1000\nsasl_account = 'xoxb-token'\nsasl_password = '   '",
         ] {
             assert!(
-                toml::from_str::<Config>(&config(network)).is_err(),
+                toml::from_str::<Config>(&config_with_static_network(network)).is_err(),
                 "{network}"
             );
         }
