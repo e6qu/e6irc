@@ -1746,7 +1746,7 @@ mod tests {
     #[test]
     fn network_buffer_cap_zero_is_rejected() {
         // A zero backlog cap is otherwise silently coerced to 1 by Buffer::push.
-        let c: Config = toml::from_str(
+        let error = toml::from_str::<Config>(
             r#"
             server_name = "irc.x.example"
             network_name = "XNet"
@@ -1767,9 +1767,9 @@ mod tests {
             buffer_cap = 0
             "#,
         )
-        .expect("parse");
-        let err = c.validate().unwrap_err().to_string();
-        assert!(err.contains("buffer_cap"), "{err}");
+        .expect_err("zero buffer cap must fail at configuration ingress")
+        .to_string();
+        assert!(error.contains("buffer_cap"), "{error}");
     }
 
     #[test]
@@ -2179,7 +2179,7 @@ mod tests {
                 .validate()
                 .unwrap_err()
                 .to_string()
-                .contains("non-empty")
+                .contains("non-blank")
         );
     }
 

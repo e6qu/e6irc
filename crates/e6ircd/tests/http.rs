@@ -1054,7 +1054,14 @@ async fn openapi_spec_is_served() {
     ] {
         let schema =
             &v["paths"][path][method]["requestBody"]["content"]["application/json"]["schema"];
-        assert_eq!(schema["additionalProperties"], false, "{method} {path}");
+        let closed = schema["additionalProperties"] == false
+            || schema["oneOf"].as_array().is_some_and(|variants| {
+                !variants.is_empty()
+                    && variants
+                        .iter()
+                        .all(|variant| variant["additionalProperties"] == false)
+            });
+        assert!(closed, "{method} {path}");
     }
     let patch_network_schema = &v["paths"]["/api/v1/me/networks/{name}"]["patch"]["requestBody"]["content"]
         ["application/json"]["schema"];
