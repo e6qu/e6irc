@@ -916,7 +916,9 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   };
 
   const syncNetworkForm = (form) => {
-    const kind = form.elements.kind?.value;
+    const driver = form.elements.namedItem("kind");
+    if (!(driver instanceof HTMLSelectElement)) throw new Error("Network form has no driver selector.");
+    const kind = driver.value;
     const requirements = {
       irc: { required: ["addr", "nick", "realname"], visible: ["addr", "nick", "realname", "sasl_account", "sasl_password"] },
       local: { required: ["nick", "realname"], visible: ["addr", "nick", "realname"] },
@@ -924,13 +926,16 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       discord: { required: ["sasl_password"], visible: ["addr", "sasl_password"] },
       slack: { required: ["sasl_account", "sasl_password"], visible: ["addr", "sasl_account", "sasl_password"] },
     }[kind];
-    if (!requirements) return;
+    if (!requirements) throw new Error(`Unsupported network driver: ${kind}`);
     for (const name of ["addr", "nick", "realname", "sasl_account", "sasl_password"]) {
-      const input = form.elements[name];
+      const input = form.elements.namedItem(name);
+      if (!(input instanceof HTMLInputElement)) throw new Error(`Network form has no ${name} input.`);
       const active = requirements.visible.includes(name);
       input.disabled = !active;
       input.required = requirements.required.includes(name);
-      input.closest("label").hidden = !active;
+      const label = input.closest("label");
+      if (!label) throw new Error(`Network form ${name} input has no label.`);
+      label.hidden = !active;
     }
   };
 
@@ -1050,7 +1055,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
 
   for (const form of document.querySelectorAll("[data-api-network-create]")) {
     form.addEventListener("change", (event) => {
-      if (event.target === form.elements.kind) syncNetworkForm(form);
+      if (event.target === form.elements.namedItem("kind")) syncNetworkForm(form);
     });
     form.addEventListener("submit", (event) => {
       event.preventDefault();
