@@ -2158,6 +2158,45 @@ async fn console_configuration_manages_every_credential_collection() {
     );
     assert!(!body.contains(upstream_secret), "{body}");
 
+    for (revision, network_body, secret) in [
+        (
+            4,
+            r#"{"revision":4,"name":"local","kind":"local","addr":"","tls":false,"nick":"alice","realname":"Alice","autojoin":[],"buffer_cap":321}"#,
+            None,
+        ),
+        (
+            5,
+            r#"{"revision":5,"name":"matrix","kind":"matrix","addr":"https://matrix.example.test","tls":true,"nick":"@alice:example.test","autojoin":[],"buffer_cap":321,"sasl_password":"matrix-secret"}"#,
+            Some("matrix-secret"),
+        ),
+        (
+            6,
+            r#"{"revision":6,"name":"discord","kind":"discord","addr":"","tls":true,"autojoin":[],"buffer_cap":321,"sasl_password":"discord-secret"}"#,
+            Some("discord-secret"),
+        ),
+        (
+            7,
+            r#"{"revision":7,"name":"slack","kind":"slack","addr":"","tls":true,"autojoin":[],"buffer_cap":321,"sasl_account":"slack-account","sasl_password":"slack-secret"}"#,
+            Some("slack-secret"),
+        ),
+    ] {
+        let network_request = format!(
+            "POST /api/v1/admin/configuration/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+             X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{network_body}",
+            network_body.len()
+        );
+        let (status, _, body) = request(http, &network_request).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+            revision + 1
+        );
+        if let Some(secret) = secret {
+            assert!(!body.contains(secret), "{body}");
+        }
+    }
+
     let configuration_api = format!(
         "GET /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          Connection: close\r\n\r\n"
@@ -2168,7 +2207,7 @@ async fn console_configuration_manages_every_credential_collection() {
     assert!(!body.contains(oidc_secret), "{body}");
     assert!(!body.contains(upstream_secret), "{body}");
     let api: serde_json::Value = serde_json::from_str(&body).expect("configuration JSON");
-    assert_eq!(api["revision"], 4);
+    assert_eq!(api["revision"], 8);
     assert_eq!(api["runtime"]["has_master_key"], true);
     assert_eq!(api["runtime"]["master_key_count"], 1);
     assert_eq!(api["settings"]["opers"][0]["password"], "");
@@ -2177,7 +2216,13 @@ async fn console_configuration_manages_every_credential_collection() {
         api["settings"]["oidc_providers"][0]["account_claim"],
         "email"
     );
-    assert!(api["settings"]["networks"][0]["sasl_password"].is_null());
+    assert_eq!(
+        api["settings"]["networks"].as_array().map(Vec::len),
+        Some(5)
+    );
+    for network in api["settings"]["networks"].as_array().unwrap() {
+        assert!(network["sasl_password"].is_null(), "{network}");
+    }
     assert!(api["settings"]["credentials_from_bootstrap"].is_boolean());
     let mut scalar_settings = api["settings"].clone();
     let scalar = scalar_settings.as_object_mut().expect("settings object");
@@ -2189,7 +2234,7 @@ async fn console_configuration_manages_every_credential_collection() {
         "description".into(),
         serde_json::Value::String("API-managed description".into()),
     );
-    let patch_body = serde_json::json!({ "revision": 4, "settings": scalar_settings }).to_string();
+    let patch_body = serde_json::json!({ "revision": 8, "settings": scalar_settings }).to_string();
     let patch_request = format!(
         "PATCH /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
@@ -2200,7 +2245,7 @@ async fn console_configuration_manages_every_credential_collection() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
-        5
+        9
     );
 
     let verification_pool = e6ircd::db::connect_and_migrate(&url)
