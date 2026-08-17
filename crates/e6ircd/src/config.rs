@@ -1282,7 +1282,9 @@ impl Config {
                     n.name
                 )));
             }
-            if matches!(n.kind, NetworkKind::Irc | NetworkKind::Local) && n.realname.is_none() {
+            if matches!(n.kind, NetworkKind::Irc | NetworkKind::Local)
+                && !matches!(n.realname.as_deref(), Some(realname) if !realname.trim().is_empty())
+            {
                 return Err(ConfigError::Invalid(format!(
                     "network '{}' (kind={}) requires realname",
                     n.name,

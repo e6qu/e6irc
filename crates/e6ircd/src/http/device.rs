@@ -390,7 +390,7 @@ pub(super) async fn approve_user_code(
 
 #[cfg(test)]
 mod tests {
-    use super::device_verification_uri;
+    use super::{AdminNetworkBody, device_verification_uri};
 
     #[test]
     fn device_verification_uri_requires_a_public_origin() {
@@ -399,6 +399,13 @@ mod tests {
             device_verification_uri(Some("https://chat.example/e6irc/")),
             Some("https://chat.example/e6irc/device".into())
         );
+    }
+
+    #[test]
+    fn managed_network_requests_are_driver_specific() {
+        assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"irc","revision":1,"name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#).is_ok());
+        assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"irc","revision":1,"name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#).is_err());
+        assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"discord","revision":1,"name":"bot","addr":"","tls":true,"nick":"alice","autojoin":[],"buffer_cap":1000,"sasl_password":"token"}"#).is_err());
     }
 }
 
@@ -1025,23 +1032,228 @@ pub(super) struct AdminOidcBody {
 }
 
 #[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct AdminNetworkBody {
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub(super) enum AdminNetworkBody {
+    Irc {
+        revision: i64,
+        name: String,
+        owner: Option<String>,
+        addr: String,
+        tls: bool,
+        nick: String,
+        realname: String,
+        autojoin: Vec<String>,
+        buffer_cap: usize,
+        sasl_account: Option<String>,
+        sasl_password: Option<String>,
+    },
+    Local {
+        revision: i64,
+        name: String,
+        owner: Option<String>,
+        addr: String,
+        tls: bool,
+        nick: String,
+        realname: String,
+        autojoin: Vec<String>,
+        buffer_cap: usize,
+    },
+    Matrix {
+        revision: i64,
+        name: String,
+        owner: Option<String>,
+        addr: String,
+        tls: bool,
+        nick: String,
+        autojoin: Vec<String>,
+        buffer_cap: usize,
+        sasl_password: String,
+    },
+    Discord {
+        revision: i64,
+        name: String,
+        owner: Option<String>,
+        addr: String,
+        tls: bool,
+        autojoin: Vec<String>,
+        buffer_cap: usize,
+        sasl_password: String,
+    },
+    Slack {
+        revision: i64,
+        name: String,
+        owner: Option<String>,
+        addr: String,
+        tls: bool,
+        autojoin: Vec<String>,
+        buffer_cap: usize,
+        sasl_account: String,
+        sasl_password: String,
+    },
+}
+
+struct AdminNetworkRequest {
     revision: i64,
-    name: String,
-    owner: Option<String>,
-    kind: crate::config::NetworkKind,
-    #[serde(default)]
-    addr: String,
-    tls: bool,
-    #[serde(default)]
-    nick: String,
-    realname: Option<String>,
-    #[serde(default)]
-    autojoin: Vec<String>,
-    buffer_cap: usize,
-    sasl_account: Option<String>,
-    sasl_password: Option<String>,
+    network: crate::config::NetworkEntry,
+}
+
+impl AdminNetworkBody {
+    fn into_request(self) -> AdminNetworkRequest {
+        let make = |revision: i64,
+                    name: String,
+                    owner: Option<String>,
+                    kind: crate::config::NetworkKind,
+                    addr: String,
+                    tls: bool,
+                    nick: String,
+                    realname: Option<String>,
+                    autojoin: Vec<String>,
+                    buffer_cap: usize,
+                    sasl_account: Option<String>,
+                    sasl_password: Option<String>| AdminNetworkRequest {
+            revision,
+            network: crate::config::NetworkEntry {
+                name: name.trim().to_string(),
+                owner: optional_config_string(owner),
+                kind,
+                addr: addr.trim().to_string(),
+                tls,
+                nick: nick.trim().to_string(),
+                realname: realname.map(|value| value.trim().to_string()),
+                autojoin: autojoin
+                    .into_iter()
+                    .map(|channel| channel.trim().to_string())
+                    .filter(|channel| !channel.is_empty())
+                    .collect(),
+                buffer_cap,
+                sasl_account: optional_config_string(sasl_account),
+                sasl_password: optional_config_string(sasl_password),
+            },
+        };
+        match self {
+            Self::Irc {
+                revision,
+                name,
+                owner,
+                addr,
+                tls,
+                nick,
+                realname,
+                autojoin,
+                buffer_cap,
+                sasl_account,
+                sasl_password,
+            } => make(
+                revision,
+                name,
+                owner,
+                crate::config::NetworkKind::Irc,
+                addr,
+                tls,
+                nick,
+                Some(realname),
+                autojoin,
+                buffer_cap,
+                sasl_account,
+                sasl_password,
+            ),
+            Self::Local {
+                revision,
+                name,
+                owner,
+                addr,
+                tls,
+                nick,
+                realname,
+                autojoin,
+                buffer_cap,
+            } => make(
+                revision,
+                name,
+                owner,
+                crate::config::NetworkKind::Local,
+                addr,
+                tls,
+                nick,
+                Some(realname),
+                autojoin,
+                buffer_cap,
+                None,
+                None,
+            ),
+            Self::Matrix {
+                revision,
+                name,
+                owner,
+                addr,
+                tls,
+                nick,
+                autojoin,
+                buffer_cap,
+                sasl_password,
+            } => make(
+                revision,
+                name,
+                owner,
+                crate::config::NetworkKind::Matrix,
+                addr,
+                tls,
+                nick,
+                None,
+                autojoin,
+                buffer_cap,
+                None,
+                Some(sasl_password),
+            ),
+            Self::Discord {
+                revision,
+                name,
+                owner,
+                addr,
+                tls,
+                autojoin,
+                buffer_cap,
+                sasl_password,
+            } => make(
+                revision,
+                name,
+                owner,
+                crate::config::NetworkKind::Discord,
+                addr,
+                tls,
+                String::new(),
+                None,
+                autojoin,
+                buffer_cap,
+                None,
+                Some(sasl_password),
+            ),
+            Self::Slack {
+                revision,
+                name,
+                owner,
+                addr,
+                tls,
+                autojoin,
+                buffer_cap,
+                sasl_account,
+                sasl_password,
+            } => make(
+                revision,
+                name,
+                owner,
+                crate::config::NetworkKind::Slack,
+                addr,
+                tls,
+                String::new(),
+                None,
+                autojoin,
+                buffer_cap,
+                Some(sasl_account),
+                Some(sasl_password),
+            ),
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1240,55 +1452,40 @@ pub(super) async fn admin_create_network(
         Ok(body) => body,
         Err(response) => return response,
     };
-    if body.kind.is_bridge() && !kind_feature_available(body.kind) {
+    let request = body.into_request();
+    let kind = request.network.kind;
+    if kind.is_bridge() && !kind_feature_available(kind) {
         return problem(
             StatusCode::BAD_REQUEST,
             "Unsupported network kind",
             Some(&format!(
                 "This server was not built with the {} feature.",
-                body.kind.as_db_str()
+                kind.as_db_str()
             )),
         );
     }
-    let sasl_account = optional_config_string(body.sasl_account);
-    let sasl_password = optional_config_string(body.sasl_password);
+    let AdminNetworkRequest { revision, network } = request;
+    let sasl_account = network.sasl_account.clone();
+    let sasl_password = network.sasl_password.clone();
     let secret_needed =
-        sasl_password.is_some() || (body.kind.account_is_secret() && sasl_account.is_some());
+        sasl_password.is_some() || (kind.account_is_secret() && sasl_account.is_some());
     let key = state.secret_key.clone();
     if secret_needed && key.is_none() {
         return master_key_required("Upstream credentials");
     }
-    let name = body.name.trim().to_string();
-    let owner = optional_config_string(body.owner);
-    let addr = body.addr.trim().to_string();
-    let nick = body.nick.trim().to_string();
-    let realname = optional_config_string(body.realname);
-    let autojoin = body
-        .autojoin
-        .into_iter()
-        .map(|channel| channel.trim().to_string())
-        .filter(|channel| !channel.is_empty())
-        .collect();
-    mutate_managed_configuration(&state, &actor, body.revision, move |settings| {
+    let name = network.name.clone();
+    mutate_managed_configuration(&state, &actor, revision, move |settings| {
         reject_bootstrap_credential_change(settings, "network")?;
-        let sealed_account = if body.kind.account_is_secret() {
+        let sealed_account = if kind.account_is_secret() {
             seal_configuration_secret(sasl_account, key.as_ref())?
         } else {
             sasl_account
         };
         let sealed_password = seal_configuration_secret(sasl_password, key.as_ref())?;
         settings.networks.push(crate::config::NetworkEntry {
-            name: name.clone(),
-            kind: body.kind,
-            owner,
-            addr,
-            tls: body.tls,
-            nick,
-            realname,
-            autojoin,
-            buffer_cap: body.buffer_cap,
             sasl_account: sealed_account,
             sasl_password: sealed_password,
+            ..network
         });
         Ok(format!("added server network {name}"))
     })
