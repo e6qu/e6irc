@@ -408,12 +408,24 @@ mod tests {
         assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"discord","revision":1,"name":"bot","addr":"","tls":true,"nick":"alice","autojoin":[],"buffer_cap":1000,"sasl_password":"token"}"#).is_err());
         for request in [
             r#"{"kind":"local","revision":1,"name":"home","addr":"","tls":false,"nick":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000}"#,
-            r#"{"kind":"matrix","revision":1,"name":"matrix","addr":"","tls":true,"nick":"@alice:example.test","autojoin":[],"buffer_cap":1000,"sasl_password":"password"}"#,
+            r#"{"kind":"matrix","revision":1,"name":"matrix","addr":"https://matrix.example.test","tls":true,"nick":"@alice:example.test","autojoin":[],"buffer_cap":1000,"sasl_password":"password"}"#,
             r#"{"kind":"discord","revision":1,"name":"discord","addr":"","tls":true,"autojoin":[],"buffer_cap":1000,"sasl_password":"token"}"#,
             r#"{"kind":"slack","revision":1,"name":"slack","addr":"","tls":true,"autojoin":[],"buffer_cap":1000,"sasl_account":"xoxb-token","sasl_password":"xapp-token"}"#,
         ] {
             assert!(
                 serde_json::from_str::<AdminNetworkBody>(request).is_ok(),
+                "{request}"
+            );
+        }
+        for request in [
+            r#"{"kind":"irc","revision":1,"name":"irc","addr":"irc.example:6697","tls":true,"nick":"alice","realname":" ","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#,
+            r#"{"kind":"matrix","revision":1,"name":"matrix","addr":"","tls":true,"nick":"@alice:example.test","autojoin":[],"buffer_cap":1000,"sasl_password":"password"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<AdminNetworkBody>(request)
+                    .unwrap()
+                    .into_request()
+                    .is_err(),
                 "{request}"
             );
         }
@@ -1109,7 +1121,7 @@ struct AdminNetworkRequest {
 }
 
 impl AdminNetworkBody {
-    fn into_request(self) -> AdminNetworkRequest {
+    fn into_request(self) -> Result<AdminNetworkRequest, &'static str> {
         let make = |revision: i64,
                     name: String,
                     owner: Option<String>,
@@ -1141,7 +1153,7 @@ impl AdminNetworkBody {
                 sasl_password: optional_config_string(sasl_password),
             },
         };
-        match self {
+        let request = match self {
             Self::Irc {
                 revision,
                 name,
@@ -1263,7 +1275,62 @@ impl AdminNetworkBody {
                 Some(sasl_account),
                 Some(sasl_password),
             ),
-        }
+        };
+        let network = &request.network;
+        let blank = |value: &str| value.trim().is_empty();
+        let valid = match network.kind {
+            crate::config::NetworkKind::Irc => {
+                !blank(&network.name)
+                    && !blank(&network.addr)
+                    && !blank(&network.nick)
+                    && network
+                        .realname
+                        .as_deref()
+                        .is_some_and(|realname| !blank(realname))
+                    && network.sasl_account.is_some() == network.sasl_password.is_some()
+            }
+            crate::config::NetworkKind::Local => {
+                !blank(&network.name)
+                    && !blank(&network.nick)
+                    && network
+                        .realname
+                        .as_deref()
+                        .is_some_and(|realname| !blank(realname))
+            }
+            crate::config::NetworkKind::Matrix => {
+                !blank(&network.name)
+                    && !blank(&network.addr)
+                    && !blank(&network.nick)
+                    && network
+                        .sasl_password
+                        .as_deref()
+                        .is_some_and(|password| !blank(password))
+                    && network.tls
+            }
+            crate::config::NetworkKind::Discord => {
+                !blank(&network.name)
+                    && network
+                        .sasl_password
+                        .as_deref()
+                        .is_some_and(|password| !blank(password))
+                    && network.tls
+            }
+            crate::config::NetworkKind::Slack => {
+                !blank(&network.name)
+                    && network
+                        .sasl_account
+                        .as_deref()
+                        .is_some_and(|token| !blank(token))
+                    && network
+                        .sasl_password
+                        .as_deref()
+                        .is_some_and(|token| !blank(token))
+                    && network.tls
+            }
+        };
+        valid
+            .then_some(request)
+            .ok_or("The selected network driver has missing or invalid required fields.")
     }
 }
 
@@ -1463,7 +1530,16 @@ pub(super) async fn admin_create_network(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let request = body.into_request();
+    let request = match body.into_request() {
+        Ok(request) => request,
+        Err(detail) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid network configuration",
+                Some(detail),
+            );
+        }
+    };
     let kind = request.network.kind;
     if kind.is_bridge() && !kind_feature_available(kind) {
         return problem(
