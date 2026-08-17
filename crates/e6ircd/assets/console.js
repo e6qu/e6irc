@@ -1054,9 +1054,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   }
 
   for (const form of document.querySelectorAll("[data-api-network-create]")) {
-    form.addEventListener("change", (event) => {
-      if (event.target === form.elements.namedItem("kind")) syncNetworkForm(form);
-    });
+    form.addEventListener("change", () => syncNetworkForm(form));
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       let body;
