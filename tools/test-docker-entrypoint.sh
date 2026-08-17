@@ -57,3 +57,48 @@ env \
   sh "$workspace/deploy/docker-entrypoint.sh"
 [ "$(sed -n '1p' "$result")" = "$explicit" ]
 [ "$(sed -n '2p' "$result")" = "600" ]
+
+# The OIDC branch was never exercised here, and it shipped a config e6ircd's own
+# parser rejects: OidcProviderConfig::account_claim carries no serde default, so
+# the omission failed the whole parse and the container crash-looped with
+# "invalid config: missing field `account_claim`" before it ever listened. Every
+# field the provider struct requires must therefore appear in the rendered block.
+env \
+  TMPDIR="$scratch" \
+  E6IRC_BINARY="$probe" \
+  E6IRC_TEST_RESULT="$result" \
+  E6IRC_SERVER_NAME="irc.example.test" \
+  E6IRC_PUBLIC_URL="https://irc.example.test" \
+  E6IRC_DATABASE_URL="postgres://example.invalid/e6irc" \
+  APPLICATION_RELEASE_REVISION="0123456789ab" \
+  E6IRC_OIDC_ISSUER="https://auth.example.test" \
+  E6IRC_OIDC_CLIENT_ID="e6irc-dev" \
+  E6IRC_OIDC_CLIENT_SECRET="s3cr3t" \
+  E6IRC_OIDC_END_SESSION="https://auth.example.test/oauth2/sessions/logout" \
+  sh "$workspace/deploy/docker-entrypoint.sh"
+
+for field in name issuer_url client_id client_secret account_claim \
+  token_endpoint_auth_method end_session_endpoint; do
+  grep -E "^$field = " "$result" >/dev/null || {
+    echo "entrypoint rendered an [[oidc]] block without a $field; e6ircd requires it" >&2
+    exit 1
+  }
+done
+grep -F 'account_claim = "preferred_username"' "$result" >/dev/null
+
+# ...and the claim stays operator-selectable.
+env \
+  TMPDIR="$scratch" \
+  E6IRC_BINARY="$probe" \
+  E6IRC_TEST_RESULT="$result" \
+  E6IRC_SERVER_NAME="irc.example.test" \
+  E6IRC_PUBLIC_URL="https://irc.example.test" \
+  E6IRC_DATABASE_URL="postgres://example.invalid/e6irc" \
+  APPLICATION_RELEASE_REVISION="0123456789ab" \
+  E6IRC_OIDC_ISSUER="https://auth.example.test" \
+  E6IRC_OIDC_CLIENT_ID="e6irc-dev" \
+  E6IRC_OIDC_CLIENT_SECRET="s3cr3t" \
+  E6IRC_OIDC_END_SESSION="https://auth.example.test/oauth2/sessions/logout" \
+  E6IRC_OIDC_ACCOUNT_CLAIM="email" \
+  sh "$workspace/deploy/docker-entrypoint.sh"
+grep -F 'account_claim = "email"' "$result" >/dev/null
