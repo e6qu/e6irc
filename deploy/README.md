@@ -71,7 +71,8 @@ reverse proxy or an explicit, reviewed service override.
 ## Bootstrap configuration (env → TOML)
 
 `e6ircd` reads a TOML config file. `deploy/docker-entrypoint.sh` renders that
-file from environment at container start (the deployment injects secrets —
+file from environment at container start, validates it with `e6ircd
+check-config`, then starts the daemon (the deployment injects secrets —
 `E6IRC_DATABASE_URL`, `E6IRC_OIDC_CLIENT_SECRET` — from AWS Secrets Manager)
 and then execs the server. The generated file has mode `0600`; when no explicit
 path is supplied its name is unpredictable. Missing required values fail the

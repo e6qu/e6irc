@@ -8,6 +8,8 @@ use e6ircd::secret::SecretKey;
 
 const USAGE: &str = "usage:\n  \
     e6ircd [--config <path>]        run the server\n  \
+    e6ircd check-config [--config <path>]\n  \
+                                     validate configuration and exit\n  \
     e6ircd genkey                   print a new base64 master key\n  \
     e6ircd seal [--key-file <path>] seal stdin into an enc:v2: blob\n  \
     e6ircd rotate-secrets [--config <path>]\n  \
@@ -19,7 +21,15 @@ fn main() -> ExitCode {
         Some("genkey") => genkey(),
         Some("seal") => seal(&args[1..]),
         Some("rotate-secrets") => rotate_secrets(&args[1..]),
+        Some("check-config") => check_config(&args[1..]),
         _ => run(&args),
+    }
+}
+
+fn check_config(args: &[String]) -> ExitCode {
+    match load_config_or_fail(args, "e6ircd check-config") {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(code) => code,
     }
 }
 

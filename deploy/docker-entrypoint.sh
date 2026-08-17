@@ -88,4 +88,6 @@ fi
 
 chmod 0600 "$CONFIG"
 
-exec "${E6IRC_BINARY:-/usr/local/bin/e6ircd}" --config "$CONFIG"
+binary="${E6IRC_BINARY:-/usr/local/bin/e6ircd}"
+"$binary" check-config --config "$CONFIG"
+exec "$binary" --config "$CONFIG"
