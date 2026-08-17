@@ -715,7 +715,7 @@ fn document() -> serde_json::Value {
         "type": "object", "additionalProperties": false,
         "required": ["depth", "capacity", "mode", "mode_switches"],
         "properties": {
-            "depth": { "type": "integer", "minimum": 0 }, "capacity": { "type": "integer", "minimum": 0 },
+            "depth": { "type": "integer", "minimum": 0 }, "capacity": { "type": "integer", "minimum": 1 },
             "mode": { "type": "string", "enum": ["fifo", "lifo"] }, "mode_switches": { "type": "integer", "minimum": 0 }
         }
     });
@@ -723,7 +723,7 @@ fn document() -> serde_json::Value {
         "type": "object", "additionalProperties": false,
         "required": ["schema_version", "sampled_at_ms", "uptime_seconds", "core_heartbeat_age_ms", "active_connections", "registered_connections", "unregistered_connections", "channels", "connections_opened_total", "connections_closed_total", "connections_rejected_total", "irc_lines_in_total", "irc_bytes_in_total", "irc_lines_out_total", "irc_bytes_out_total", "bnc_lines_in_total", "bnc_bytes_in_total", "bnc_lines_out_total", "bnc_bytes_out_total", "bnc_client_connections", "bnc_client_connections_opened_total", "sendq_kills_total", "http_requests_total", "http_server_errors_total", "database_requests_total", "bnc_networks", "bnc_connected", "queues", "errors", "error_last_seen_ms", "core_latency", "database_latency", "http_latency"],
         "properties": {
-            "schema_version": { "type": "integer", "minimum": 1 }, "sampled_at_ms": { "type": "integer", "minimum": 0 }, "uptime_seconds": { "type": "integer", "minimum": 0 }, "core_heartbeat_age_ms": { "type": "integer", "minimum": 0 },
+            "schema_version": { "type": "integer", "const": crate::observability::SNAPSHOT_SCHEMA_VERSION }, "sampled_at_ms": { "type": "integer", "minimum": 0 }, "uptime_seconds": { "type": "integer", "minimum": 0 }, "core_heartbeat_age_ms": { "type": "integer", "minimum": 0 },
             "active_connections": { "type": "integer", "minimum": 0 }, "registered_connections": { "type": "integer", "minimum": 0 }, "unregistered_connections": { "type": "integer", "minimum": 0 }, "channels": { "type": "integer", "minimum": 0 },
             "connections_opened_total": { "type": "integer", "minimum": 0 }, "connections_closed_total": { "type": "integer", "minimum": 0 }, "connections_rejected_total": { "type": "integer", "minimum": 0 },
             "irc_lines_in_total": { "type": "integer", "minimum": 0 }, "irc_bytes_in_total": { "type": "integer", "minimum": 0 }, "irc_lines_out_total": { "type": "integer", "minimum": 0 }, "irc_bytes_out_total": { "type": "integer", "minimum": 0 },
@@ -740,29 +740,6 @@ fn document() -> serde_json::Value {
         serde_json::json!({
             "type": "object", "additionalProperties": false, "required": ["current", "history"],
             "properties": { "current": snapshot_schema, "history": { "type": "array", "items": snapshot_schema } }
-        }),
-    );
-    let monitoring_response = json_response(
-        "monitoring view",
-        serde_json::json!({
-            "type": "object", "additionalProperties": false,
-            "required": ["core_ready", "database_ready", "active_connections", "registered_connections", "channels", "opened_total", "rejected_total", "traffic_in", "traffic_out", "upstream_in", "upstream_out", "inbound_rate", "outbound_rate", "upstream_inbound_rate", "upstream_outbound_rate", "http_requests", "database_requests", "bnc_connected", "bnc_networks", "upstreams_ready", "upstreams_degraded", "bnc_clients", "error_total", "sendq_kills", "core_p50", "core_p95", "core_p99", "database_p50", "database_p95", "database_p99", "http_p50", "http_p95", "http_p99", "traffic_bars", "upstream_traffic_bars", "connection_bars", "upstream_bars", "error_bars", "latency_bars", "queue_bars", "queues", "errors", "sampled_age", "history_samples", "window_label", "window_minutes", "window_links"],
-            "properties": {
-                "core_ready": { "type": "boolean" }, "database_ready": { "type": "boolean" }, "active_connections": { "type": "integer", "minimum": 0 }, "registered_connections": { "type": "integer", "minimum": 0 }, "channels": { "type": "integer", "minimum": 0 }, "opened_total": { "type": "integer", "minimum": 0 }, "rejected_total": { "type": "integer", "minimum": 0 },
-                "traffic_in": { "type": "string" }, "traffic_out": { "type": "string" }, "upstream_in": { "type": "string" }, "upstream_out": { "type": "string" }, "inbound_rate": { "type": "string" }, "outbound_rate": { "type": "string" }, "upstream_inbound_rate": { "type": "string" }, "upstream_outbound_rate": { "type": "string" },
-                "http_requests": { "type": "integer", "minimum": 0 }, "database_requests": { "type": "integer", "minimum": 0 }, "bnc_connected": { "type": "integer", "minimum": 0 }, "bnc_networks": { "type": "integer", "minimum": 0 }, "upstreams_ready": { "type": "boolean" }, "upstreams_degraded": { "type": "boolean" }, "bnc_clients": { "type": "integer", "minimum": 0 }, "error_total": { "type": "integer", "minimum": 0 }, "sendq_kills": { "type": "integer", "minimum": 0 },
-                "core_p50": { "type": "string" }, "core_p95": { "type": "string" }, "core_p99": { "type": "string" }, "database_p50": { "type": "string" }, "database_p95": { "type": "string" }, "database_p99": { "type": "string" }, "http_p50": { "type": "string" }, "http_p95": { "type": "string" }, "http_p99": { "type": "string" },
-                "traffic_bars": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["inbound_height", "outbound_height", "title"], "properties": { "inbound_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "outbound_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "title": { "type": "string" } } } },
-                "upstream_traffic_bars": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["inbound_height", "outbound_height", "title"], "properties": { "inbound_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "outbound_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "title": { "type": "string" } } } },
-                "connection_bars": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["irc_height", "bnc_height", "title"], "properties": { "irc_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "bnc_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "title": { "type": "string" } } } },
-                "upstream_bars": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["height", "status_class", "title"], "properties": { "height": { "type": "integer", "minimum": 0, "maximum": 100 }, "status_class": { "type": "string", "enum": ["bar-off", "bar-ok", "bar-warn"] }, "title": { "type": "string" } } } },
-                "error_bars": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["height", "title"], "properties": { "height": { "type": "integer", "minimum": 0, "maximum": 100 }, "title": { "type": "string" } } } },
-                "latency_bars": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["core_height", "database_height", "http_height", "title"], "properties": { "core_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "database_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "http_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "title": { "type": "string" } } } },
-                "queue_bars": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["core_height", "database_height", "title"], "properties": { "core_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "database_height": { "type": "integer", "minimum": 0, "maximum": 100 }, "title": { "type": "string" } } } },
-                "queues": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["label", "depth", "capacity", "pressure", "mode", "mode_switches"], "properties": { "label": { "type": "string" }, "depth": { "type": "integer", "minimum": 0 }, "capacity": { "type": "integer", "minimum": 1 }, "pressure": { "type": "integer", "minimum": 0, "maximum": 100 }, "mode": { "type": "string" }, "mode_switches": { "type": "integer", "minimum": 0 } } } },
-                "errors": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["kind", "count", "last_seen"], "properties": { "kind": { "type": "string" }, "count": { "type": "integer", "minimum": 1 }, "last_seen": { "type": "string" } } } },
-                "sampled_age": { "type": "string" }, "history_samples": { "type": "integer", "minimum": 0 }, "window_label": { "type": "string" }, "window_minutes": { "type": "integer", "enum": [60, 360, 1440, 10080] }, "window_links": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["label", "minutes", "active"], "properties": { "label": { "type": "string" }, "minutes": { "type": "integer", "enum": [60, 360, 1440, 10080] }, "active": { "type": "boolean" } } } }
-            }
         }),
     );
     let stats_response = json_response(
@@ -1813,6 +1790,7 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/admin/observability": {
                 "get": { "summary": "Live telemetry and bounded history (admin only)",
+                    "description": "Returns the current snapshot and up to 1,000 historical samples of the same schema version.",
                     "security": authenticated,
                     "parameters": [{ "name": "minutes", "in": "query",
                         "schema": { "type": "integer", "minimum": 1, "maximum": 10080,
@@ -1821,14 +1799,6 @@ fn document() -> serde_json::Value {
                         "400": { "description": "history range outside 1–10080 minutes" },
                         "403": { "description": "not an admin account" },
                         "503": { "description": "monitoring storage unavailable" } } }
-            },
-            "/api/v1/admin/monitoring": {
-                "get": { "summary": "Render-ready monitoring projection (admin only)",
-                    "description": "Returns the bounded administrator monitoring view used by API clients, including current health, historical charts, queue state, latency, and the fixed error ledger.",
-                    "security": authenticated,
-                    "parameters": [{ "name": "minutes", "in": "query", "schema": { "type": "integer", "enum": [60, 360, 1440, 10080], "default": 60 } }],
-                    "responses": { "200": monitoring_response["200"], "400": { "description": "unsupported monitoring window" }, "403": { "description": "not an admin account" } }
-                }
             },
             "/api/v1/admin/logs": {
                 "get": { "summary": "Read recent redacted operational events (admin only)",

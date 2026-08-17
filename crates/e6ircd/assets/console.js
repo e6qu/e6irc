@@ -378,7 +378,11 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     return section;
   };
 
-  const monitoringWindowLabel = (minutes) => ({ 60: "1 hour", 360: "6 hours", 1440: "24 hours", 10080: "7 days" })[minutes];
+  const monitoringWindowLabel = (minutes) => {
+    const label = ({ 60: "1 hour", 360: "6 hours", 1440: "24 hours", 10080: "7 days" })[minutes];
+    if (label === undefined) throw new Error("The monitoring window is invalid.");
+    return label;
+  };
   const monitoringAge = (now, then) => {
     const seconds = Math.max(0, Math.floor((now - then) / 1000));
     if (seconds < 60) return `${seconds}s ago`;
@@ -388,6 +392,24 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   };
   const monitoringLatency = (micros) => micros >= 1000000 ? `${(micros / 1000000).toFixed(2)} s` : micros >= 1000 ? `${(micros / 1000).toFixed(1)} ms` : `${micros} µs`;
   const monitoringHeight = (value, peak) => value === 0 ? 0 : Math.max(1, Math.floor(value * 100 / Math.max(1, peak)));
+  const monitoringQueue = (queue, name) => {
+    if (!Number.isSafeInteger(queue.capacity) || queue.capacity < 1) throw new Error(`Telemetry queue ${name} has an invalid capacity.`);
+    return queue;
+  };
+  const monitoringDatabaseQueue = (sample) => {
+    if (sample.queues.db === undefined) throw new Error("Telemetry is missing the database queue.");
+    return monitoringQueue(sample.queues.db, "db");
+  };
+  const monitoringCoreQueues = (sample) => {
+    const queues = Object.entries(sample.queues).filter(([name]) => name.startsWith("core-"));
+    if (queues.length === 0) throw new Error("Telemetry is missing IRC core queues.");
+    return queues.map(([name, queue]) => monitoringQueue(queue, name));
+  };
+  const monitoringLastSeen = (sample, kind) => {
+    const timestamp = sample.error_last_seen_ms[kind];
+    if (!Number.isSafeInteger(timestamp) || timestamp < 0) throw new Error(`Telemetry is missing the last-seen time for ${kind}.`);
+    return timestamp;
+  };
   const monitoringDeltaBars = (samples, inbound, outbound, inboundLabel, outboundLabel, now) => {
     const values = samples.slice(1).map((sample, index) => ({ inbound: Math.max(0, inbound(sample) - inbound(samples[index])), outbound: Math.max(0, outbound(sample) - outbound(samples[index])), at: sample.sampled_at_ms }));
     const peak = Math.max(1, ...values.flatMap((value) => [value.inbound, value.outbound]));
@@ -400,8 +422,8 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     const errorTotal = Object.values(current.errors).reduce((sum, count) => sum + count, 0);
     const connectionPeak = Math.max(1, ...samples.map((sample) => Math.max(sample.active_connections, sample.bnc_client_connections)));
     const latencyPeak = Math.max(1, ...samples.map((sample) => Math.max(sample.core_latency.p95_us, sample.database_latency.p95_us, sample.http_latency.p95_us)));
-    const queuePressure = (queue) => queue.capacity === 0 ? 0 : Math.floor(queue.depth * 100 / queue.capacity);
-    const corePressure = (sample) => Math.max(0, ...Object.entries(sample.queues).filter(([name]) => name === "core" || name.startsWith("core-")).map(([, queue]) => queuePressure(queue)));
+    const queuePressure = (queue) => Math.floor(queue.depth * 100 / queue.capacity);
+    const corePressure = (sample) => Math.max(...monitoringCoreQueues(sample).map(queuePressure));
     const errorBars = samples.slice(1).map((sample, index) => ({ count: Math.max(0, Object.values(sample.errors).reduce((sum, count) => sum + count, 0) - Object.values(samples[index].errors).reduce((sum, count) => sum + count, 0)), at: sample.sampled_at_ms }));
     const errorPeak = Math.max(1, ...errorBars.map((bar) => bar.count));
     return {
@@ -414,8 +436,17 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       traffic_bars: monitoringDeltaBars(samples, (sample) => sample.irc_bytes_in_total, (sample) => sample.irc_bytes_out_total, "inbound", "outbound", current.sampled_at_ms), upstream_traffic_bars: monitoringDeltaBars(samples, (sample) => sample.bnc_bytes_in_total, (sample) => sample.bnc_bytes_out_total, "received", "sent", current.sampled_at_ms),
       connection_bars: samples.filter((sample) => sample.schema_version === current.schema_version).map((sample) => ({ irc_height: monitoringHeight(sample.active_connections, connectionPeak), bnc_height: monitoringHeight(sample.bnc_client_connections, connectionPeak), title: `${sample.active_connections} IRC · ${sample.bnc_client_connections} BNC · ${monitoringAge(current.sampled_at_ms, sample.sampled_at_ms)}` })),
       upstream_bars: samples.map((sample) => ({ height: sample.bnc_networks === 0 ? 0 : Math.floor(sample.bnc_connected * 100 / sample.bnc_networks), status_class: sample.bnc_networks === 0 || sample.bnc_connected === 0 ? "bar-off" : sample.bnc_connected === sample.bnc_networks ? "bar-ok" : "bar-warn", title: `${sample.bnc_connected} of ${sample.bnc_networks} connected · ${monitoringAge(current.sampled_at_ms, sample.sampled_at_ms)}` })),
-      error_bars: errorBars.map((bar) => ({ height: monitoringHeight(bar.count, errorPeak), title: `${bar.count} new errors · ${monitoringAge(current.sampled_at_ms, bar.at)}` })), latency_bars: samples.map((sample) => ({ core_height: monitoringHeight(sample.core_latency.p95_us, latencyPeak), database_height: monitoringHeight(sample.database_latency.p95_us, latencyPeak), http_height: monitoringHeight(sample.http_latency.p95_us, latencyPeak), title: `Core ${monitoringLatency(sample.core_latency.p95_us)} · PostgreSQL ${monitoringLatency(sample.database_latency.p95_us)} · HTTP ${monitoringLatency(sample.http_latency.p95_us)} · ${monitoringAge(current.sampled_at_ms, sample.sampled_at_ms)}` })), queue_bars: samples.map((sample) => ({ core_height: corePressure(sample), database_height: sample.queues.db === undefined ? 0 : queuePressure(sample.queues.db), title: `Core ${corePressure(sample)}% · PostgreSQL ${sample.queues.db === undefined ? 0 : queuePressure(sample.queues.db)}% · ${monitoringAge(current.sampled_at_ms, sample.sampled_at_ms)}` })),
-      queues: Object.entries(current.queues).map(([name, queue]) => ({ label: name === "db" ? "Database worker" : `IRC core shard ${name.slice(5)}`, depth: queue.depth, capacity: queue.capacity, pressure: queuePressure(queue), mode: queue.mode.toUpperCase(), mode_switches: queue.mode_switches })), errors: Object.entries(current.errors).filter(([, count]) => count > 0).map(([kind, count]) => ({ kind: kind.replaceAll("_", " "), count, last_seen: monitoringAge(current.sampled_at_ms, current.error_last_seen_ms[kind]) })),
+      error_bars: errorBars.map((bar) => ({ height: monitoringHeight(bar.count, errorPeak), title: `${bar.count} new errors · ${monitoringAge(current.sampled_at_ms, bar.at)}` })), latency_bars: samples.map((sample) => ({ core_height: monitoringHeight(sample.core_latency.p95_us, latencyPeak), database_height: monitoringHeight(sample.database_latency.p95_us, latencyPeak), http_height: monitoringHeight(sample.http_latency.p95_us, latencyPeak), title: `Core ${monitoringLatency(sample.core_latency.p95_us)} · PostgreSQL ${monitoringLatency(sample.database_latency.p95_us)} · HTTP ${monitoringLatency(sample.http_latency.p95_us)} · ${monitoringAge(current.sampled_at_ms, sample.sampled_at_ms)}` })), queue_bars: samples.map((sample) => {
+        const core = corePressure(sample);
+        const database = queuePressure(monitoringDatabaseQueue(sample));
+        return { core_height: core, database_height: database, title: `Core ${core}% · PostgreSQL ${database}% · ${monitoringAge(current.sampled_at_ms, sample.sampled_at_ms)}` };
+      }),
+      queues: Object.entries(current.queues).map(([name, queue]) => {
+        const checked = monitoringQueue(queue, name);
+        if (name === "db") return { label: "Database worker", depth: checked.depth, capacity: checked.capacity, pressure: queuePressure(checked), mode: checked.mode.toUpperCase(), mode_switches: checked.mode_switches };
+        if (!name.startsWith("core-")) throw new Error(`Telemetry has an unknown queue ${name}.`);
+        return { label: `IRC core shard ${name.slice(5)}`, depth: checked.depth, capacity: checked.capacity, pressure: queuePressure(checked), mode: checked.mode.toUpperCase(), mode_switches: checked.mode_switches };
+      }), errors: Object.entries(current.errors).filter(([, count]) => count > 0).map(([kind, count]) => ({ kind: kind.replaceAll("_", " "), count, last_seen: monitoringAge(current.sampled_at_ms, monitoringLastSeen(current, kind)) })),
       sampled_age: monitoringAge(current.sampled_at_ms, current.sampled_at_ms), history_samples: samples.length - 1, window_label: monitoringWindowLabel(minutes), window_minutes: minutes,
     };
   };
