@@ -2261,7 +2261,7 @@ async fn console_configuration_manages_every_credential_collection() {
     let snapshot = e6ircd::db::load_managed_config(&verification_pool)
         .await
         .expect("managed configuration");
-    assert_eq!(snapshot.revision, 5);
+    assert_eq!(snapshot.revision, 9);
     assert_eq!(snapshot.settings.description, "API-managed description");
     assert_eq!(snapshot.updated_by, "alice");
     assert_eq!(snapshot.settings.opers.len(), 1);
@@ -2284,7 +2284,21 @@ async fn console_configuration_manages_every_credential_collection() {
             .expect("open provider secret"),
         oidc_secret
     );
-    assert_eq!(snapshot.settings.networks.len(), 1);
+    assert_eq!(
+        snapshot
+            .settings
+            .networks
+            .iter()
+            .map(|network| (network.name.as_str(), network.kind.as_db_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("staffnet", "irc"),
+            ("local", "local"),
+            ("matrix", "matrix"),
+            ("discord", "discord"),
+            ("slack", "slack"),
+        ]
+    );
     let stored_network = &snapshot.settings.networks[0];
     assert_eq!(stored_network.owner.as_deref(), Some("alice"));
     assert_eq!(stored_network.autojoin, ["#staff"]);
@@ -2301,23 +2315,70 @@ async fn console_configuration_manages_every_credential_collection() {
             .expect("open upstream password"),
         upstream_secret
     );
+    for (name, password) in [
+        ("matrix", "matrix-secret"),
+        ("discord", "discord-secret"),
+        ("slack", "slack-secret"),
+    ] {
+        let network = snapshot
+            .settings
+            .networks
+            .iter()
+            .find(|network| network.name == name)
+            .expect("stored network");
+        assert_eq!(
+            secret_key
+                .open(
+                    network.sasl_password.as_deref().expect("stored password"),
+                    e6ircd::secret::CONFIG_CONTEXT,
+                )
+                .expect("open stored password"),
+            password
+        );
+    }
+    let slack = snapshot
+        .settings
+        .networks
+        .iter()
+        .find(|network| network.name == "slack")
+        .expect("stored Slack network");
+    assert_eq!(
+        secret_key
+            .open(
+                slack
+                    .sasl_account
+                    .as_deref()
+                    .expect("stored Slack bot token"),
+                e6ircd::secret::CONFIG_CONTEXT,
+            )
+            .expect("open stored Slack bot token"),
+        "slack-account"
+    );
 
     let audit_details: Vec<String> =
         sqlx::query_scalar("SELECT detail FROM audit_log WHERE action = 'CONFIG' ORDER BY id")
             .fetch_all(&verification_pool)
             .await
             .expect("configuration audit");
-    assert_eq!(audit_details.len(), 4);
+    assert_eq!(audit_details.len(), 8);
     assert!(audit_details[0].contains("added IRC operator netop"));
     assert!(audit_details[1].contains("added OpenID Connect provider workforce"));
     assert!(audit_details[2].contains("added server network staffnet"));
+    for name in ["local", "matrix", "discord", "slack"] {
+        assert!(
+            audit_details
+                .iter()
+                .any(|detail| detail.contains(&format!("added server network {name}"))),
+            "missing audit entry for {name}"
+        );
+    }
     for detail in &audit_details {
         assert!(!detail.contains(oper_secret), "{detail}");
         assert!(!detail.contains(oidc_secret), "{detail}");
         assert!(!detail.contains(upstream_secret), "{detail}");
     }
 
-    let delete_oper_body = r#"{"revision":5}"#;
+    let delete_oper_body = r#"{"revision":9}"#;
     let delete_oper = format!(
         "DELETE /api/v1/admin/configuration/opers/netop HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
@@ -2328,10 +2389,10 @@ async fn console_configuration_manages_every_credential_collection() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
-        6
+        10
     );
 
-    let delete_oidc_body = r#"{"revision":6}"#;
+    let delete_oidc_body = r#"{"revision":10}"#;
     let delete_oidc = format!(
         "DELETE /api/v1/admin/configuration/oidc-providers/workforce HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
@@ -2342,25 +2403,36 @@ async fn console_configuration_manages_every_credential_collection() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
-        7
+        11
     );
-    let delete_network_body = r#"{"revision":7,"owner":"alice"}"#;
-    let delete_network = format!(
-        "DELETE /api/v1/admin/configuration/networks/staffnet HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{delete_network_body}",
-        delete_network_body.len()
-    );
-    let (status, _, body) = request(http, &delete_network).await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
-        8
-    );
+    let mut revision = 11;
+    for (name, owner) in [
+        ("staffnet", Some("alice")),
+        ("local", None),
+        ("matrix", None),
+        ("discord", None),
+        ("slack", None),
+    ] {
+        let delete_network_body =
+            serde_json::json!({ "revision": revision, "owner": owner }).to_string();
+        let delete_network = format!(
+            "DELETE /api/v1/admin/configuration/networks/{name} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+             X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{delete_network_body}",
+            delete_network_body.len()
+        );
+        let (status, _, body) = request(http, &delete_network).await;
+        assert_eq!(status, 200, "{body}");
+        revision += 1;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+            revision
+        );
+    }
     let snapshot = e6ircd::db::load_managed_config(&verification_pool)
         .await
         .expect("managed configuration after deletes");
-    assert_eq!(snapshot.revision, 8);
+    assert_eq!(snapshot.revision, 16);
     assert!(snapshot.settings.opers.is_empty());
     assert!(snapshot.settings.oidc_providers.is_empty());
     assert!(snapshot.settings.networks.is_empty());

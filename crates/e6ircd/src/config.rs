@@ -463,179 +463,164 @@ fn default_bnc_buffer() -> usize {
 
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
-enum NetworkEntryWire {
+pub(crate) enum NetworkEntryWire {
     Irc {
-        name: String,
-        owner: Option<String>,
-        addr: String,
-        tls: bool,
+        #[serde(flatten)]
+        common: NetworkEntryCommon,
         nick: String,
         realname: String,
-        autojoin: Vec<String>,
-        buffer_cap: usize,
         sasl_account: Option<String>,
         sasl_password: Option<String>,
     },
     Local {
-        name: String,
-        owner: Option<String>,
-        addr: String,
-        tls: bool,
+        #[serde(flatten)]
+        common: NetworkEntryCommon,
         nick: String,
         realname: String,
-        autojoin: Vec<String>,
-        buffer_cap: usize,
     },
     Matrix {
-        name: String,
-        owner: Option<String>,
-        addr: String,
-        tls: bool,
+        #[serde(flatten)]
+        common: NetworkEntryCommon,
         nick: String,
-        autojoin: Vec<String>,
-        buffer_cap: usize,
         sasl_password: String,
     },
     Discord {
-        name: String,
-        owner: Option<String>,
-        addr: String,
-        tls: bool,
-        autojoin: Vec<String>,
-        buffer_cap: usize,
+        #[serde(flatten)]
+        common: NetworkEntryCommon,
         sasl_password: String,
     },
     Slack {
-        name: String,
-        owner: Option<String>,
-        addr: String,
-        tls: bool,
-        autojoin: Vec<String>,
-        buffer_cap: usize,
+        #[serde(flatten)]
+        common: NetworkEntryCommon,
         sasl_account: String,
         sasl_password: String,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NetworkEntryCommon {
+    #[serde(default)]
+    revision: Option<i64>,
+    name: String,
+    owner: Option<String>,
+    addr: String,
+    tls: bool,
+    autojoin: Vec<String>,
+    buffer_cap: usize,
 }
 
 impl From<NetworkEntryWire> for NetworkEntry {
     fn from(value: NetworkEntryWire) -> Self {
         match value {
             NetworkEntryWire::Irc {
-                name,
-                owner,
-                addr,
-                tls,
+                common,
                 nick,
                 realname,
-                autojoin,
-                buffer_cap,
                 sasl_account,
                 sasl_password,
-            } => Self {
-                name,
-                owner,
-                kind: NetworkKind::Irc,
-                addr,
-                tls,
+            } => common.into_entry(
+                NetworkKind::Irc,
                 nick,
-                realname: Some(realname),
-                autojoin,
-                buffer_cap,
+                Some(realname),
                 sasl_account,
                 sasl_password,
-            },
+            ),
             NetworkEntryWire::Local {
-                name,
-                owner,
-                addr,
-                tls,
+                common,
                 nick,
                 realname,
-                autojoin,
-                buffer_cap,
-            } => Self {
-                name,
-                owner,
-                kind: NetworkKind::Local,
-                addr,
-                tls,
-                nick,
-                realname: Some(realname),
-                autojoin,
-                buffer_cap,
-                sasl_account: None,
-                sasl_password: None,
-            },
+            } => common.into_entry(NetworkKind::Local, nick, Some(realname), None, None),
             NetworkEntryWire::Matrix {
-                name,
-                owner,
-                addr,
-                tls,
+                common,
                 nick,
-                autojoin,
-                buffer_cap,
                 sasl_password,
-            } => Self {
-                name,
-                owner,
-                kind: NetworkKind::Matrix,
-                addr,
-                tls,
-                nick,
-                realname: None,
-                autojoin,
-                buffer_cap,
-                sasl_account: None,
-                sasl_password: Some(sasl_password),
-            },
+            } => common.into_entry(NetworkKind::Matrix, nick, None, None, Some(sasl_password)),
             NetworkEntryWire::Discord {
-                name,
-                owner,
-                addr,
-                tls,
-                autojoin,
-                buffer_cap,
+                common,
                 sasl_password,
-            } => Self {
-                name,
-                owner,
-                kind: NetworkKind::Discord,
-                addr,
-                tls,
-                nick: String::new(),
-                realname: None,
-                autojoin,
-                buffer_cap,
-                sasl_account: None,
-                sasl_password: Some(sasl_password),
-            },
+            } => common.into_entry(
+                NetworkKind::Discord,
+                String::new(),
+                None,
+                None,
+                Some(sasl_password),
+            ),
             NetworkEntryWire::Slack {
-                name,
-                owner,
-                addr,
-                tls,
-                autojoin,
-                buffer_cap,
+                common,
                 sasl_account,
                 sasl_password,
-            } => Self {
-                name,
-                owner,
-                kind: NetworkKind::Slack,
-                addr,
-                tls,
-                nick: String::new(),
-                realname: None,
-                autojoin,
-                buffer_cap,
-                sasl_account: Some(sasl_account),
-                sasl_password: Some(sasl_password),
-            },
+            } => common.into_entry(
+                NetworkKind::Slack,
+                String::new(),
+                None,
+                Some(sasl_account),
+                Some(sasl_password),
+            ),
+        }
+    }
+}
+
+impl NetworkEntryCommon {
+    fn into_entry(
+        self,
+        kind: NetworkKind,
+        nick: String,
+        realname: Option<String>,
+        sasl_account: Option<String>,
+        sasl_password: Option<String>,
+    ) -> NetworkEntry {
+        NetworkEntry {
+            name: self.name,
+            owner: self.owner,
+            kind,
+            addr: self.addr,
+            tls: self.tls,
+            nick,
+            realname,
+            autojoin: self.autojoin,
+            buffer_cap: self.buffer_cap,
+            sasl_account,
+            sasl_password,
+        }
+    }
+}
+
+impl NetworkEntryWire {
+    pub(crate) fn into_network_entry(self) -> NetworkEntry {
+        self.into()
+    }
+
+    pub(crate) fn revision(&self) -> Option<i64> {
+        match self {
+            Self::Irc { common, .. }
+            | Self::Local { common, .. }
+            | Self::Matrix { common, .. }
+            | Self::Discord { common, .. }
+            | Self::Slack { common, .. } => common.revision,
         }
     }
 }
 
 impl NetworkEntry {
+    pub(crate) fn normalized_connection_intent(mut self) -> Self {
+        self.name = self.name.trim().to_string();
+        self.owner = self.owner.map(|owner| owner.trim().to_string());
+        self.addr = self.addr.trim().to_string();
+        self.nick = self.nick.trim().to_string();
+        self.realname = self.realname.map(|realname| realname.trim().to_string());
+        self.autojoin = self
+            .autojoin
+            .into_iter()
+            .map(|channel| channel.trim().to_string())
+            .collect();
+        self.sasl_account = self.sasl_account.map(|account| account.trim().to_string());
+        self.sasl_password = self
+            .sasl_password
+            .map(|password| password.trim().to_string());
+        self
+    }
+
     /// Validate fields shared by every configuration ingress.
     pub(crate) fn validate_connection_intent(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
@@ -650,6 +635,13 @@ impl NetworkEntry {
         }
         if self.buffer_cap == 0 {
             return Err("buffer_cap must be nonzero".into());
+        }
+        if self
+            .autojoin
+            .iter()
+            .any(|channel| channel.trim().is_empty())
+        {
+            return Err("autojoin entries must be non-blank".into());
         }
         if let Some(account) = self.sasl_account.as_deref() {
             crate::bouncer::validate_network_credential(account, 255)
@@ -754,6 +746,11 @@ where
         entries
             .into_iter()
             .map(|entry| {
+                if entry.revision().is_some() {
+                    return Err(serde::de::Error::custom(
+                        "static network configuration does not accept revision",
+                    ));
+                }
                 let network = NetworkEntry::from(entry);
                 network
                     .validate_connection_intent()
@@ -1829,6 +1826,8 @@ mod tests {
     #[test]
     fn static_network_ingress_rejects_invalid_driver_fields() {
         for network in [
+            "kind = 'irc'\nrevision = 1\nname = 'irc'\naddr = 'irc.example:6697'\ntls = true\nnick = 'alice'\nrealname = 'Alice'\nautojoin = []\nbuffer_cap = 1000\nsasl_account = 'alice'\nsasl_password = 'password'",
+            "kind = 'local'\nname = 'local'\naddr = ''\ntls = false\nnick = 'alice'\nrealname = 'Alice'\nautojoin = ['   ']\nbuffer_cap = 1000",
             "kind = 'matrix'\nname = 'matrix'\naddr = '   '\ntls = true\nnick = '@alice:example.test'\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'password'",
             "kind = 'matrix'\nname = 'matrix'\naddr = 'https://matrix.example.test'\ntls = true\nnick = '   '\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'password'",
             "kind = 'discord'\nname = 'discord'\naddr = ''\ntls = true\nautojoin = []\nbuffer_cap = 1000\nsasl_password = '   '",
