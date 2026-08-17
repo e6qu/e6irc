@@ -65,6 +65,7 @@ jobs:
           set -uo pipefail
           mkdir -p qualification
           evidence='qualification/evidence.json'
+          artifact="$evidence"
           status=2
           case '${{ inputs.campaign }}' in
             discord|slack|oidc)
@@ -98,6 +99,7 @@ jobs:
               ;;
             scale)
               evidence='qualification/scale/qualification.json'
+              artifact='qualification/scale'
               read -r addr server_pid core_workers clients channels burst minimum_connect_rate minimum_fanout_rate maximum_p99_ms maximum_rss_bytes extra <<< "$QUALIFICATION_SCALE_ARGUMENTS"
               if [[ -z "$QUALIFICATION_HOST" || "$QUALIFICATION_TARGET" != "$addr" || -n "${extra:-}" || -z "${maximum_rss_bytes:-}" ]]; then
                 echo 'host and exactly ten scale arguments are required' >&2
@@ -111,7 +113,7 @@ jobs:
               ;;
             *) echo 'unsupported campaign' >&2 ;;
           esac
-          printf 'evidence=%s\nstatus=%s\n' "$evidence" "$status" >> "$GITHUB_OUTPUT"
+          printf 'evidence=%s\nartifact=%s\nstatus=%s\n' "$evidence" "$artifact" "$status" >> "$GITHUB_OUTPUT"
 
       - id: verify
         if: always()
@@ -121,14 +123,17 @@ jobs:
           set -euo pipefail
           evidence='${{ steps.campaign.outputs.evidence }}'
           [[ -n "$evidence" && -f "$evidence" ]]
-          target/release/e6irc-qualification verify "$evidence"
+          target/release/e6irc-qualification verify "$evidence" \
+            --source "$GITHUB_SHA" \
+            --target "$QUALIFICATION_TARGET" \
+            --max-age-seconds 3600
 
       - if: ${{ always() && steps.verify.outcome == 'success' }}
         name: Retain verified evidence
         uses: actions/upload-artifact@v4
         with:
           name: qualification-${{ inputs.campaign }}-${{ github.run_id }}
-          path: ${{ steps.campaign.outputs.evidence }}
+          path: ${{ steps.campaign.outputs.artifact }}
           if-no-files-found: error
           retention-days: 90
 

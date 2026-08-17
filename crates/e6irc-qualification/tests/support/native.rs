@@ -184,20 +184,35 @@ async fn discord_socket(websocket: WebSocketUpgrade) -> impl IntoResponse {
 
 async fn discord_session(mut socket: WebSocket) {
     socket
-        .send(AxumMessage::Text("{\"op\":10,\"d\":{}}".into()))
+        .send(AxumMessage::Text(
+            "{\"op\":10,\"d\":{\"heartbeat_interval\":1000}}".into(),
+        ))
         .await
         .expect("hello");
     let Some(Ok(AxumMessage::Text(identify))) = socket.next().await else {
         return;
     };
     assert_eq!(
-        serde_json::from_str::<DiscordHello>(&identify)
+        serde_json::from_str::<serde_json::Value>(&identify)
             .ok()
-            .map(|frame| frame.op),
+            .and_then(|frame| frame.get("op").and_then(serde_json::Value::as_u64)),
         Some(2)
     );
     socket
-        .send(AxumMessage::Text("{\"t\":\"READY\"}".into()))
+        .send(AxumMessage::Text("{\"op\":1}".into()))
+        .await
+        .expect("heartbeat request");
+    let Some(Ok(AxumMessage::Text(heartbeat))) = socket.next().await else {
+        return;
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&heartbeat)
+            .ok()
+            .and_then(|frame| frame.get("op").and_then(serde_json::Value::as_u64)),
+        Some(1)
+    );
+    socket
+        .send(AxumMessage::Text("{\"op\":0,\"t\":\"READY\"}".into()))
         .await
         .expect("ready");
 }
