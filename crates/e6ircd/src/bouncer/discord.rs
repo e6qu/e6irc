@@ -33,6 +33,26 @@ impl DiscordDriver {
     }
 }
 
+type GatewaySink = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    Ws,
+>;
+
+async fn send_heartbeat(
+    write: &mut GatewaySink,
+    sequence: Option<u64>,
+) -> Result<(), super::SessionOutcome> {
+    use super::{NetworkFailure, SessionOutcome::Dropped};
+    let heartbeat = encode_gateway(&HeartbeatFrame::new(sequence)).map_err(|error| {
+        eprintln!("discord: could not encode heartbeat: {error}");
+        Dropped(NetworkFailure::UpstreamProtocolFailed)
+    })?;
+    write
+        .send(heartbeat)
+        .await
+        .map_err(|_| Dropped(NetworkFailure::UpstreamWriteFailed))
+}
+
 impl NetworkDriver for DiscordDriver {
     fn kind(&self) -> &'static str {
         "discord"
@@ -146,15 +166,8 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                let heartbeat = match encode_gateway(&HeartbeatFrame::new(last_seq)) {
-                    Ok(heartbeat) => heartbeat,
-                    Err(error) => {
-                        eprintln!("discord: could not encode heartbeat: {error}");
-                        return Dropped(NetworkFailure::UpstreamProtocolFailed);
-                    }
-                };
-                if write.send(heartbeat).await.is_err() {
-                    return Dropped(NetworkFailure::UpstreamWriteFailed);
+                if let Err(outcome) = send_heartbeat(&mut write, last_seq).await {
+                    return outcome;
                 }
             }
             text = super::next_bridge_text(&mut read, &mut write, read_timeout, "discord", "gateway", |code| {
@@ -192,15 +205,8 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                         our_id = id;
                     }
                     Event::HeartbeatRequest => {
-                        let heartbeat = match encode_gateway(&HeartbeatFrame::new(last_seq)) {
-                            Ok(heartbeat) => heartbeat,
-                            Err(error) => {
-                                eprintln!("discord: could not encode heartbeat: {error}");
-                                return Dropped(NetworkFailure::UpstreamProtocolFailed);
-                            }
-                        };
-                        if write.send(heartbeat).await.is_err() {
-                            return Dropped(NetworkFailure::UpstreamWriteFailed);
+                        if let Err(outcome) = send_heartbeat(&mut write, last_seq).await {
+                            return outcome;
                         }
                     }
                     Event::Message { channel_id, author_id, author, content, attachments } => {
@@ -655,14 +661,10 @@ mod tests {
             channels: vec![],
             buffer_cap: 10,
         };
-        assert_eq!(
-            crate::bouncer::bridge_api_base(&c.api_base, DEFAULT_API),
-            DEFAULT_API
-        );
-        c.api_base = "http://localhost:8080/".into();
-        assert_eq!(
-            crate::bouncer::bridge_api_base(&c.api_base, DEFAULT_API),
-            "http://localhost:8080"
+        crate::bouncer::assert_bridge_api_base(
+            &mut c.api_base,
+            DEFAULT_API,
+            "http://localhost:8080/",
         );
     }
 

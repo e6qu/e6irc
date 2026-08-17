@@ -163,27 +163,138 @@ pub(super) fn irc_network_preset(id: &str) -> Option<IrcNetworkPreset> {
         .find(|preset| preset.id == id)
 }
 
+/// Complete, kind-specific network creation request.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct CreateNetwork {
-    /// Driver kind; defaults to `irc`. A bridge kind requires its build feature.
-    #[serde(default)]
-    pub(super) kind: crate::config::NetworkKind,
-    pub(super) name: String,
-    pub(super) addr: String,
-    #[serde(default)]
-    pub(super) tls: bool,
-    pub(super) nick: String,
-    #[serde(default)]
-    pub(super) realname: Option<String>,
-    #[serde(default)]
-    pub(super) autojoin: Vec<String>,
-    /// Kind-specific account/login field. Plaintext over the API; sealed when
-    /// the selected driver treats it as a secret.
-    #[serde(default)]
-    pub(super) sasl_account: Option<String>,
-    #[serde(default)]
-    pub(super) sasl_password: Option<String>,
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub(super) enum CreateNetwork {
+    Irc {
+        name: String,
+        addr: String,
+        tls: bool,
+        nick: String,
+        realname: String,
+        autojoin: Vec<String>,
+        #[serde(default)]
+        sasl_account: Option<String>,
+        #[serde(default)]
+        sasl_password: Option<String>,
+    },
+    Matrix {
+        name: String,
+        addr: String,
+        tls: bool,
+        nick: String,
+        autojoin: Vec<String>,
+        sasl_password: String,
+    },
+    Discord {
+        name: String,
+        addr: String,
+        tls: bool,
+        autojoin: Vec<String>,
+        sasl_password: String,
+    },
+    Slack {
+        name: String,
+        addr: String,
+        tls: bool,
+        autojoin: Vec<String>,
+        sasl_account: String,
+        sasl_password: String,
+    },
+}
+
+struct NetworkCreation {
+    kind: crate::config::NetworkKind,
+    name: String,
+    addr: String,
+    tls: bool,
+    nick: String,
+    realname: String,
+    autojoin: Vec<String>,
+    sasl_account: Option<String>,
+    sasl_password: Option<String>,
+}
+
+impl From<CreateNetwork> for NetworkCreation {
+    fn from(request: CreateNetwork) -> Self {
+        use crate::config::NetworkKind;
+        match request {
+            CreateNetwork::Irc {
+                name,
+                addr,
+                tls,
+                nick,
+                realname,
+                autojoin,
+                sasl_account,
+                sasl_password,
+            } => Self {
+                kind: NetworkKind::Irc,
+                name,
+                addr,
+                tls,
+                nick,
+                realname,
+                autojoin,
+                sasl_account,
+                sasl_password,
+            },
+            CreateNetwork::Matrix {
+                name,
+                addr,
+                tls,
+                nick,
+                autojoin,
+                sasl_password,
+            } => Self {
+                kind: NetworkKind::Matrix,
+                name,
+                addr,
+                tls,
+                nick,
+                realname: String::new(),
+                autojoin,
+                sasl_account: None,
+                sasl_password: Some(sasl_password),
+            },
+            CreateNetwork::Discord {
+                name,
+                addr,
+                tls,
+                autojoin,
+                sasl_password,
+            } => Self {
+                kind: NetworkKind::Discord,
+                name,
+                addr,
+                tls,
+                nick: String::new(),
+                realname: String::new(),
+                autojoin,
+                sasl_account: None,
+                sasl_password: Some(sasl_password),
+            },
+            CreateNetwork::Slack {
+                name,
+                addr,
+                tls,
+                autojoin,
+                sasl_account,
+                sasl_password,
+            } => Self {
+                kind: NetworkKind::Slack,
+                name,
+                addr,
+                tls,
+                nick: String::new(),
+                realname: String::new(),
+                autojoin,
+                sasl_account: Some(sasl_account),
+                sasl_password: Some(sasl_password),
+            },
+        }
+    }
 }
 
 /// An ephemeral qualification request. It intentionally omits the durable
@@ -194,11 +305,9 @@ pub(super) struct CreateNetwork {
 #[serde(deny_unknown_fields)]
 pub(super) struct PreflightNetwork {
     pub(super) addr: String,
-    #[serde(default)]
     pub(super) tls: bool,
     pub(super) nick: String,
-    #[serde(default)]
-    pub(super) realname: Option<String>,
+    pub(super) realname: String,
     #[serde(default)]
     pub(super) sasl_account: Option<String>,
     #[serde(default)]
@@ -513,6 +622,7 @@ pub(super) async fn create_network(
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
+    let req = NetworkCreation::from(req);
 
     match create_network_core(&state, registry, &account, &req).await {
         Ok(()) => (
@@ -543,7 +653,7 @@ pub(super) async fn preflight_network(
 pub(super) async fn preflight_network_core(
     req: PreflightNetwork,
 ) -> Result<crate::bouncer::IrcPreflight, NetworkMutationError> {
-    validate_irc_upstream(&req.addr, &req.nick, req.realname.as_deref(), &[])?;
+    validate_irc_upstream(&req.addr, &req.nick, Some(&req.realname), &[])?;
     if let Some(account) = req.sasl_account.as_deref()
         && let Err(error) = validate_credential_field(account, 255)
     {
@@ -566,7 +676,7 @@ pub(super) async fn preflight_network_core(
         addr: req.addr,
         tls: req.tls,
         nick: req.nick,
-        realname: req.realname.unwrap_or_else(|| "e6irc preflight".into()),
+        realname: req.realname,
         autojoin: Vec::new(),
         buffer_cap: 1,
         sasl: req.sasl_account.zip(req.sasl_password),
@@ -1013,6 +1123,14 @@ pub(super) async fn update_network_core(
     let _mutation = registry.mutation_guard().await;
     let pool = pool_of(state);
     let mut row = editable_network(state, account, name, "update").await?;
+    if row.kind == crate::config::NetworkKind::Irc && realname.is_none() {
+        return Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Missing required fields",
+            Some("realname is required for IRC networks"),
+        )
+        .with_field("realname"));
+    }
     if row.kind == crate::config::NetworkKind::Irc {
         validate_irc_upstream(addr, nick, realname, autojoin)?;
     } else {
@@ -1046,11 +1164,11 @@ pub(super) async fn update_network_core(
     Ok(())
 }
 
-pub(super) async fn create_network_core(
+async fn create_network_core(
     state: &AppState,
     registry: &crate::bouncer::Registry,
     account: &str,
-    req: &CreateNetwork,
+    req: &NetworkCreation,
 ) -> Result<(), NetworkMutationError> {
     // The name is the client-facing /network selector; see network_name_ok.
     if !network_name_ok(&req.name) {
@@ -1078,54 +1196,14 @@ pub(super) async fn create_network_core(
             }),
         ));
     }
-    // Per-kind required fields (mirrors the config-file validation): an IRC/Matrix
-    // upstream needs an address and nick; every bridge needs its secret token(s).
-    let missing = match kind {
-        NetworkKind::Irc => req.addr.is_empty() || req.nick.is_empty(),
-        NetworkKind::Matrix => {
-            req.addr.is_empty() || req.nick.is_empty() || req.sasl_password.is_none()
-        }
-        NetworkKind::Discord => req.sasl_password.is_none(),
-        NetworkKind::Slack => req.sasl_account.is_none() || req.sasl_password.is_none(),
-        NetworkKind::Local => true,
-    };
-    if missing {
-        return Err(network_error(
-            StatusCode::BAD_REQUEST,
-            "Missing required fields for this network kind",
-            Some(match kind {
-                NetworkKind::Matrix => {
-                    "matrix requires addr (homeserver), nick (user), sasl_password (password)"
-                }
-                NetworkKind::Discord => "discord requires sasl_password (bot token)",
-                NetworkKind::Slack => {
-                    "slack requires sasl_account (bot token) and sasl_password (app token)"
-                }
-                _ => "addr and nick are required",
-            }),
-        )
-        .with_field(match kind {
-            NetworkKind::Irc if req.addr.is_empty() => "addr",
-            NetworkKind::Irc => "nick",
-            NetworkKind::Slack if req.sasl_account.is_none() => "sasl_account",
-            _ => "sasl_password",
-        }));
-    }
     // Bound + injection-check + SSRF-check the connection/identity fields (the
     // subset shared with the edit path). `addr`/`nick`/`realname`/`autojoin` are
     // interpolated into NICK/USER/JOIN lines, so a CR/LF/NUL there is a
     // line-injection primitive; `addr` is SSRF-vetted; all are length-bounded.
     if kind == NetworkKind::Irc {
-        validate_irc_upstream(&req.addr, &req.nick, req.realname.as_deref(), &req.autojoin)?;
+        validate_irc_upstream(&req.addr, &req.nick, Some(&req.realname), &req.autojoin)?;
     } else {
-        validate_bridge_upstream(
-            kind,
-            &req.addr,
-            req.tls,
-            &req.nick,
-            req.realname.as_deref(),
-            &req.autojoin,
-        )?;
+        validate_bridge_upstream(kind, &req.addr, req.tls, &req.nick, None, &req.autojoin)?;
     }
     // Fields that are create-only (the name) or SASL-specific (bounds + the NUL
     // check that matters because PLAIN uses NUL as its field separator, and the
@@ -1200,7 +1278,7 @@ pub(super) async fn create_network_core(
         req.addr.clone(),
         req.tls,
         req.nick.clone(),
-        req.realname.clone().unwrap_or_else(|| req.nick.clone()),
+        req.realname.clone(),
         req.autojoin.clone(),
         1000,
         req.sasl_account.clone(),
@@ -1214,7 +1292,7 @@ pub(super) async fn create_network_core(
         addr: req.addr.clone(),
         tls: req.tls,
         nick: req.nick.clone(),
-        realname: req.realname.clone(),
+        realname: (kind == NetworkKind::Irc).then(|| req.realname.clone()),
         autojoin: req.autojoin.clone(),
         sasl_account: stored_account,
         sasl_password_sealed: sealed_password,
@@ -1563,9 +1641,43 @@ pub(super) async fn delete_network(
 #[cfg(test)]
 mod tests {
     use super::{
-        BufferQuery, IRC_NETWORK_PRESETS, network_name_ok, runtime_response,
-        upstream_addr_is_internal, validate_irc_upstream,
+        BufferQuery, CreateNetwork, IRC_NETWORK_PRESETS, PreflightNetwork, network_name_ok,
+        runtime_response, upstream_addr_is_internal, validate_irc_upstream,
     };
+
+    #[test]
+    fn network_creation_is_complete_and_kind_specific() {
+        let irc = r#"{"kind":"irc","name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[]}"#;
+        assert!(serde_json::from_str::<CreateNetwork>(irc).is_ok());
+        assert!(serde_json::from_str::<CreateNetwork>(
+            r#"{"name":"implicit","addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[]}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<CreateNetwork>(
+            r#"{"kind":"irc","name":"incomplete","addr":"irc.example:6697","nick":"alice","realname":"Alice","autojoin":[]}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<CreateNetwork>(
+            r#"{"kind":"discord","name":"wrong","addr":"","tls":true,"nick":"alice","autojoin":[],"sasl_password":"token"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn preflight_requires_explicit_transport_and_identity() {
+        assert!(
+            serde_json::from_str::<PreflightNetwork>(
+                r#"{"addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice"}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_str::<PreflightNetwork>(
+                r#"{"addr":"irc.example:6697","nick":"alice","realname":"Alice"}"#
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn runtime_json_exposes_only_the_safe_failure_classification() {

@@ -422,9 +422,8 @@ pub struct SecretsConfig {
 pub struct NetworkEntry {
     /// Selector used by clients (the /network suffix on the nick).
     pub name: String,
-    /// Driver kind: an outbound `irc` upstream (default), or the
-    /// in-process `local` network (this e6ircd itself).
-    #[serde(default)]
+    /// Driver kind: an outbound `irc` upstream or the in-process `local`
+    /// network (this e6ircd itself).
     pub kind: NetworkKind,
     /// e6irc account that owns this network. When set, only that account
     /// may attach to it; when absent the network is shared (any
@@ -432,14 +431,11 @@ pub struct NetworkEntry {
     /// (DB-backed) reuses this ownership.
     #[serde(default)]
     pub owner: Option<String>,
-    /// IRC `host:port` or a bridge's HTTP(S) provider base. Empty selects the
-    /// provider default only for bridge kinds that define one. Ignored for
-    /// `local`.
-    #[serde(default)]
+    /// IRC `host:port` or a bridge's HTTP(S) provider base. An explicit empty
+    /// value selects a bridge provider default. Ignored for `local`.
     pub addr: String,
     /// IRC transport security. Bridge entries require `true` as the canonical
     /// marker that the transport is HTTP(S), whose URL scheme controls security.
-    #[serde(default)]
     pub tls: bool,
     pub nick: String,
     #[serde(default)]
@@ -462,11 +458,10 @@ fn default_bnc_buffer() -> usize {
 }
 
 /// Which driver backs a BNC network.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NetworkKind {
     /// A persistent outbound IRC client to an external network.
-    #[default]
     Irc,
     /// This e6ircd itself, joined in-process — an always-on local
     /// presence with backlog, no external connection.
@@ -1287,6 +1282,13 @@ impl Config {
                     n.name
                 )));
             }
+            if matches!(n.kind, NetworkKind::Irc | NetworkKind::Local) && n.realname.is_none() {
+                return Err(ConfigError::Invalid(format!(
+                    "network '{}' (kind={}) requires realname",
+                    n.name,
+                    n.kind.as_db_str()
+                )));
+            }
             if n.kind.is_bridge() {
                 if !n.tls {
                     return Err(ConfigError::Invalid(format!(
@@ -1562,15 +1564,67 @@ mod tests {
             addr = "127.0.0.1:0"
             [[network]]
             name = "libera"
+            kind = "irc"
             addr = "irc.libera.chat:6697"
             tls = true
             nick = "n"
+            realname = "n"
             buffer_cap = 0
             "#,
         )
         .expect("parse");
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("buffer_cap"), "{err}");
+    }
+
+    #[test]
+    fn network_connection_intent_is_required() {
+        let config = r#"
+            server_name = "irc.x.example"
+            network_name = "XNet"
+            [[listeners]]
+            addr = "127.0.0.1:0"
+            [database]
+            url = "postgres://localhost/x"
+            [bnc]
+            addr = "127.0.0.1:0"
+            [[network]]
+            name = "libera"
+            addr = "irc.libera.chat:6697"
+            tls = true
+            nick = "n"
+        "#;
+        assert!(toml::from_str::<Config>(config).is_err());
+        for entry in [
+            "name = 'libera'\nkind = 'irc'\ntls = true\nnick = 'n'",
+            "name = 'libera'\nkind = 'irc'\naddr = 'irc.libera.chat:6697'\nnick = 'n'",
+        ] {
+            assert!(toml::from_str::<NetworkEntry>(entry).is_err(), "{entry}");
+        }
+    }
+
+    #[test]
+    fn irc_network_requires_realname() {
+        let config: Config = toml::from_str(
+            r#"
+            server_name = "irc.x.example"
+            network_name = "XNet"
+            [[listeners]]
+            addr = "127.0.0.1:0"
+            [database]
+            url = "postgres://localhost/x"
+            [bnc]
+            addr = "127.0.0.1:0"
+            [[network]]
+            name = "libera"
+            kind = "irc"
+            addr = "irc.libera.chat:6697"
+            tls = true
+            nick = "n"
+            "#,
+        )
+        .expect("network parses before cross-field validation");
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -1652,13 +1706,13 @@ mod tests {
 
         let mut cfg = Config {
             networks: vec![NetworkEntry {
-                kind: Default::default(),
+                kind: NetworkKind::Irc,
                 name: "libera".into(),
                 owner: None,
                 addr: "irc.libera.chat:6697".into(),
                 tls: true,
                 nick: "e6bnc".into(),
-                realname: None,
+                realname: Some("e6bnc".into()),
                 autojoin: Vec::new(),
                 buffer_cap: 1000,
                 sasl_account: Some(sealed_account),
@@ -1724,13 +1778,13 @@ mod tests {
 
     fn net(name: &str, owner: Option<&str>) -> NetworkEntry {
         NetworkEntry {
-            kind: Default::default(),
+            kind: NetworkKind::Irc,
             name: name.into(),
             owner: owner.map(str::to_string),
             addr: "irc.example:6667".into(),
             tls: false,
             nick: "n".into(),
-            realname: None,
+            realname: Some("n".into()),
             autojoin: Vec::new(),
             buffer_cap: 1000,
             sasl_account: None,
@@ -1821,6 +1875,7 @@ mod tests {
         matrix.addr = "https://matrix.example".into();
         matrix.tls = true;
         matrix.nick = "@alice:matrix.example".into();
+        matrix.realname = None;
         matrix.sasl_password = Some("secret".into());
         bridge_config(matrix.clone())
             .validate()
@@ -1840,6 +1895,7 @@ mod tests {
         slack.addr.clear();
         slack.tls = true;
         slack.nick.clear();
+        slack.realname = None;
         slack.sasl_account = Some("xoxb-token".into());
         slack.sasl_password = Some("xapp-token".into());
         bridge_config(slack.clone())
@@ -1874,6 +1930,7 @@ mod tests {
         slack.addr.clear();
         slack.tls = true;
         slack.nick.clear();
+        slack.realname = None;
         slack.sasl_account = Some(String::new());
         slack.sasl_password = Some("xapp-token".into());
         assert!(

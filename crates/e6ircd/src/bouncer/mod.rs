@@ -344,12 +344,23 @@ pub fn driver_from_row(
         Some(account) if row.kind.account_is_secret() => Some(unseal(account)?),
         other => other.clone(),
     };
+    let realname = match row.kind {
+        crate::config::NetworkKind::Irc => row.realname.clone().ok_or_else(|| {
+            "kind=irc stored network has no realname; update the network configuration".to_string()
+        })?,
+        crate::config::NetworkKind::Local => {
+            return Err("kind=local is not a stored bouncer network".into());
+        }
+        crate::config::NetworkKind::Matrix
+        | crate::config::NetworkKind::Discord
+        | crate::config::NetworkKind::Slack => String::new(),
+    };
     build_driver(
         row.kind,
         row.addr.clone(),
         row.tls,
         row.nick.clone(),
-        row.realname.clone().unwrap_or_else(|| row.nick.clone()),
+        realname,
         row.autojoin.clone(),
         DB_NETWORK_BUFFER_CAP,
         account,
@@ -774,6 +785,16 @@ pub(crate) fn bridge_api_base(configured: &str, default: &str) -> String {
     } else {
         configured.trim_end_matches('/').to_string()
     }
+}
+
+#[cfg(all(test, any(feature = "discord", feature = "slack")))]
+pub(crate) fn assert_bridge_api_base(base: &mut String, default: &str, override_base: &str) {
+    assert_eq!(bridge_api_base(base, default), default);
+    *base = override_base.into();
+    assert_eq!(
+        bridge_api_base(base, default),
+        override_base.trim_end_matches('/')
+    );
 }
 
 /// Build the bridge HTTP client, mapping a build failure to the session
@@ -2819,6 +2840,26 @@ mod tests {
             .err()
             .expect("noncanonical stored bridge should be rejected");
         assert!(error.contains("real name field"), "{error}");
+    }
+
+    #[test]
+    fn stored_irc_factory_requires_realname() {
+        let row = crate::db::BncNetworkRow {
+            kind: crate::config::NetworkKind::Irc,
+            name: "libera".into(),
+            addr: "irc.libera.chat:6697".into(),
+            tls: true,
+            nick: "alice".into(),
+            realname: None,
+            autojoin: vec![],
+            sasl_account: None,
+            sasl_password_sealed: None,
+            enabled: false,
+        };
+        let error = driver_from_row(&row, None, "owner")
+            .err()
+            .expect("stored IRC network without realname should fail");
+        assert!(error.contains("no realname"), "{error}");
     }
 
     #[test]

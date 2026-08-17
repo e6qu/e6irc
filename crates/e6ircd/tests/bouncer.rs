@@ -6,7 +6,7 @@ use e6ircd::bouncer::{
     DriverConnectionStatus, DriverEvent, IrcNetwork, NetworkConfig, NetworkHandle, SendOutcome,
     preflight_irc,
 };
-use e6ircd::config::{Config, ListenerConfig};
+use e6ircd::config::{Config, ListenerConfig, NetworkKind};
 use e6ircd::net;
 
 mod support;
@@ -359,13 +359,13 @@ fn bnc_config(up: std::net::SocketAddr, url: String) -> Config {
         database: Some(DatabaseConfig { url }),
         networks: vec![
             NetworkEntry {
-                kind: Default::default(),
+                kind: NetworkKind::Irc,
                 name: "up".into(),
                 owner: Some("alice".into()),
                 addr: up.to_string(),
                 tls: false,
                 nick: "bncnick".into(),
-                realname: None,
+                realname: Some("bncnick".into()),
                 autojoin: vec!["#lobby".into()],
                 buffer_cap: 1000,
                 sasl_account: None,
@@ -373,13 +373,13 @@ fn bnc_config(up: std::net::SocketAddr, url: String) -> Config {
             },
             // A network owned by a different account: alice must not see it.
             NetworkEntry {
-                kind: Default::default(),
+                kind: NetworkKind::Irc,
                 name: "bobnet".into(),
                 owner: Some("bob".into()),
                 addr: up.to_string(),
                 tls: false,
                 nick: "bobnick".into(),
-                realname: None,
+                realname: Some("bobnick".into()),
                 autojoin: vec![],
                 buffer_cap: 1000,
                 sasl_account: None,
@@ -724,13 +724,13 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
         }],
         database: Some(DatabaseConfig { url: url.clone() }),
         networks: vec![NetworkEntry {
-            kind: Default::default(),
+            kind: NetworkKind::Irc,
             name: "up".into(),
             owner: Some("alice".into()),
             addr: "127.0.0.1:1".into(), // unreachable: no live traffic
             tls: false,
             nick: "bncnick".into(),
-            realname: None,
+            realname: Some("bncnick".into()),
             autojoin: vec![],
             buffer_cap: 1000,
             sasl_account: None,

@@ -623,15 +623,7 @@ mod tests {
             channels: vec![],
             buffer_cap: 10,
         };
-        assert_eq!(
-            crate::bouncer::bridge_api_base(&c.api_base, DEFAULT_API),
-            DEFAULT_API
-        );
-        c.api_base = "http://localhost:9/".into();
-        assert_eq!(
-            crate::bouncer::bridge_api_base(&c.api_base, DEFAULT_API),
-            "http://localhost:9"
-        );
+        crate::bouncer::assert_bridge_api_base(&mut c.api_base, DEFAULT_API, "http://localhost:9/");
     }
 
     #[tokio::test]

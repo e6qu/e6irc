@@ -2390,7 +2390,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     addr: fieldValue(fields, "addr"),
     tls: fields.has("tls"),
     nick: fieldValue(fields, "nick"),
-    realname: optionalValue(String(fields.get("realname") || "")),
+    realname: fieldValue(fields, "realname"),
     autojoin: splitValues(String(fields.get("autojoin") || ""), ","),
     sasl_account: optionalValue(String(fields.get("sasl_account") || "")),
     sasl_password: optionalValue(String(fields.get("sasl_password") || "")),
@@ -2403,8 +2403,8 @@ import { loadSettings, saveSettings } from "/console-settings.js";
         const fields = new FormData(form);
         const name = fieldValue(fields, "name");
         const connection = ownerNetworkConnection(fields);
-        if (!name || !connection.addr || !connection.nick) {
-          setOwnerNetworkResult("Enter a network ID, server, and nickname.", false);
+        if (!name || !connection.addr || !connection.nick || !connection.realname) {
+          setOwnerNetworkResult("Enter a network ID, server, nickname, and real name.", false);
           return;
         }
         const { addr, tls, nick, realname, sasl_account, sasl_password } = connection;
@@ -2418,8 +2418,8 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       const fields = new FormData(form);
       const name = fieldValue(fields, "name");
       const connection = ownerNetworkConnection(fields);
-      if (!name || !connection.addr || !connection.nick) {
-        setOwnerNetworkResult("Enter a network ID, server, and nickname.", false);
+      if (!name || !connection.addr || !connection.nick || !connection.realname) {
+        setOwnerNetworkResult("Enter a network ID, server, nickname, and real name.", false);
         return;
       }
       void mutateOwnerNetwork(form, form.action, "POST", { kind: "irc", name, ...connection });
@@ -2437,13 +2437,13 @@ import { loadSettings, saveSettings } from "/console-settings.js";
         setOwnerNetworkResult("Enter every required bridge value.", false);
         return;
       }
-      void mutateOwnerNetwork(form, form.action, "POST", {
-        kind, name, addr: fieldValue(fields, "addr"), tls: true,
-        nick: fieldValue(fields, "nick"), realname: null,
-        autojoin: splitValues(String(fields.get("autojoin") || ""), ","),
-        sasl_account: optionalValue(String(fields.get("sasl_account") || "")),
-        sasl_password: password,
-      });
+      const base = { kind, name, addr: fieldValue(fields, "addr"), tls: true, autojoin: splitValues(String(fields.get("autojoin") || ""), ","), sasl_password: password };
+      const body = kind === "matrix"
+        ? { ...base, nick: fieldValue(fields, "nick") }
+        : kind === "slack"
+          ? { ...base, sasl_account: fieldValue(fields, "sasl_account") }
+          : base;
+      void mutateOwnerNetwork(form, form.action, "POST", body);
     });
   }
 
@@ -2459,11 +2459,11 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     const body = {
       addr: fieldValue(fields, "addr"), tls: bridge || fields.has("tls"),
       nick: fieldValue(fields, "nick"),
-      realname: bridge ? null : optionalValue(String(fields.get("realname") || "")),
+      realname: bridge ? null : fieldValue(fields, "realname"),
       autojoin: splitValues(String(fields.get("autojoin") || ""), ","), credentials,
     };
-    if (!bridge && (!body.addr || !body.nick)) {
-      throw new Error("Enter the required network connection values.");
+    if (!bridge && (!body.addr || !body.nick || !body.realname)) {
+      throw new Error("Enter the server, nickname, and real name.");
     }
     return body;
   };

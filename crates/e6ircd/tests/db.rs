@@ -5,7 +5,7 @@
 //!   E6IRC_TEST_DATABASE_URL=postgres://... cargo test --test db -- --ignored
 
 use e6irc_queue::{Config as QueueConfig, Policy, queue};
-use e6ircd::config::{Config, DatabaseConfig, ListenerConfig};
+use e6ircd::config::{Config, DatabaseConfig, ListenerConfig, NetworkKind};
 use e6ircd::core::{CoreIngress, DbReply, DbRequest, HistoryTargets, Input};
 use e6ircd::{db, net};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1141,7 +1141,7 @@ async fn bnc_networks_are_capped_per_account() {
         .await
         .expect("create");
     let row = |i: usize| db::BncNetworkRow {
-        kind: Default::default(),
+        kind: NetworkKind::Irc,
         name: format!("net{i}"),
         addr: "irc.example:6697".into(),
         tls: true,
@@ -2204,7 +2204,7 @@ async fn bnc_networks_crud() {
     db::create_account(&pool, "bob", "pw").await.expect("acct");
 
     let libera = db::BncNetworkRow {
-        kind: Default::default(),
+        kind: NetworkKind::Irc,
         name: "libera".into(),
         addr: "irc.libera.chat:6697".into(),
         tls: true,
@@ -2356,7 +2356,7 @@ async fn bnc_network_name_selection_is_case_insensitive() {
         .expect("acct");
 
     let libera = db::BncNetworkRow {
-        kind: Default::default(),
+        kind: NetworkKind::Irc,
         name: "libera".into(),
         addr: "irc.libera.chat:6697".into(),
         tls: true,
@@ -2462,7 +2462,7 @@ async fn deleting_a_bnc_network_purges_its_casefolded_buffer() {
         .await
         .expect("acct");
     let net = db::BncNetworkRow {
-        kind: Default::default(),
+        kind: NetworkKind::Irc,
         name: "libera".into(),
         addr: "irc.libera.chat:6697".into(),
         tls: true,
