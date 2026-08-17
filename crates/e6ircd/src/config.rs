@@ -160,7 +160,11 @@ pub struct Config {
     pub opers: Vec<OperConfig>,
     /// BNC upstream networks (server-level; per-user comes with account
     /// integration).
-    #[serde(default, rename = "network")]
+    #[serde(
+        default,
+        rename = "network",
+        deserialize_with = "deserialize_static_networks"
+    )]
     pub networks: Vec<NetworkEntry>,
     /// The bouncer listener, where clients attach as nick/network.
     #[serde(default)]
@@ -455,6 +459,188 @@ pub struct NetworkEntry {
 
 fn default_bnc_buffer() -> usize {
     1000
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+enum NetworkEntryWire {
+    Irc {
+        name: String,
+        owner: Option<String>,
+        addr: String,
+        tls: bool,
+        nick: String,
+        realname: String,
+        autojoin: Vec<String>,
+        buffer_cap: usize,
+        sasl_account: Option<String>,
+        sasl_password: Option<String>,
+    },
+    Local {
+        name: String,
+        owner: Option<String>,
+        addr: String,
+        tls: bool,
+        nick: String,
+        realname: String,
+        autojoin: Vec<String>,
+        buffer_cap: usize,
+    },
+    Matrix {
+        name: String,
+        owner: Option<String>,
+        addr: String,
+        tls: bool,
+        nick: String,
+        autojoin: Vec<String>,
+        buffer_cap: usize,
+        sasl_password: String,
+    },
+    Discord {
+        name: String,
+        owner: Option<String>,
+        addr: String,
+        tls: bool,
+        autojoin: Vec<String>,
+        buffer_cap: usize,
+        sasl_password: String,
+    },
+    Slack {
+        name: String,
+        owner: Option<String>,
+        addr: String,
+        tls: bool,
+        autojoin: Vec<String>,
+        buffer_cap: usize,
+        sasl_account: String,
+        sasl_password: String,
+    },
+}
+
+impl From<NetworkEntryWire> for NetworkEntry {
+    fn from(value: NetworkEntryWire) -> Self {
+        match value {
+            NetworkEntryWire::Irc {
+                name,
+                owner,
+                addr,
+                tls,
+                nick,
+                realname,
+                autojoin,
+                buffer_cap,
+                sasl_account,
+                sasl_password,
+            } => Self {
+                name,
+                owner,
+                kind: NetworkKind::Irc,
+                addr,
+                tls,
+                nick,
+                realname: Some(realname),
+                autojoin,
+                buffer_cap,
+                sasl_account,
+                sasl_password,
+            },
+            NetworkEntryWire::Local {
+                name,
+                owner,
+                addr,
+                tls,
+                nick,
+                realname,
+                autojoin,
+                buffer_cap,
+            } => Self {
+                name,
+                owner,
+                kind: NetworkKind::Local,
+                addr,
+                tls,
+                nick,
+                realname: Some(realname),
+                autojoin,
+                buffer_cap,
+                sasl_account: None,
+                sasl_password: None,
+            },
+            NetworkEntryWire::Matrix {
+                name,
+                owner,
+                addr,
+                tls,
+                nick,
+                autojoin,
+                buffer_cap,
+                sasl_password,
+            } => Self {
+                name,
+                owner,
+                kind: NetworkKind::Matrix,
+                addr,
+                tls,
+                nick,
+                realname: None,
+                autojoin,
+                buffer_cap,
+                sasl_account: None,
+                sasl_password: Some(sasl_password),
+            },
+            NetworkEntryWire::Discord {
+                name,
+                owner,
+                addr,
+                tls,
+                autojoin,
+                buffer_cap,
+                sasl_password,
+            } => Self {
+                name,
+                owner,
+                kind: NetworkKind::Discord,
+                addr,
+                tls,
+                nick: String::new(),
+                realname: None,
+                autojoin,
+                buffer_cap,
+                sasl_account: None,
+                sasl_password: Some(sasl_password),
+            },
+            NetworkEntryWire::Slack {
+                name,
+                owner,
+                addr,
+                tls,
+                autojoin,
+                buffer_cap,
+                sasl_account,
+                sasl_password,
+            } => Self {
+                name,
+                owner,
+                kind: NetworkKind::Slack,
+                addr,
+                tls,
+                nick: String::new(),
+                realname: None,
+                autojoin,
+                buffer_cap,
+                sasl_account: Some(sasl_account),
+                sasl_password: Some(sasl_password),
+            },
+        }
+    }
+}
+
+fn deserialize_static_networks<'de, D>(deserializer: D) -> Result<Vec<NetworkEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<NetworkEntryWire>::deserialize(deserializer)
+        .map(|entries| entries.into_iter().map(NetworkEntry::from).collect())
 }
 
 /// Which driver backs a BNC network.
@@ -1571,6 +1757,7 @@ mod tests {
             tls = true
             nick = "n"
             realname = "n"
+            autojoin = []
             buffer_cap = 0
             "#,
         )
@@ -1607,7 +1794,7 @@ mod tests {
 
     #[test]
     fn irc_network_requires_realname() {
-        let config: Config = toml::from_str(
+        let config = toml::from_str::<Config>(
             r#"
             server_name = "irc.x.example"
             network_name = "XNet"
@@ -1624,9 +1811,11 @@ mod tests {
             tls = true
             nick = "n"
             "#,
-        )
-        .expect("network parses before cross-field validation");
-        assert!(config.validate().is_err());
+        );
+        assert!(
+            config.is_err(),
+            "IRC identity must fail at the parse boundary"
+        );
     }
 
     #[test]
