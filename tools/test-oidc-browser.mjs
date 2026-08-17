@@ -1026,6 +1026,7 @@ try {
   await page.locator('input[name="name"]').fill("journey");
   await page.locator('input[name="addr"]').fill(upstream.address);
   await page.locator('input[name="nick"]').fill("webjourney");
+  await page.locator('input[name="realname"]').fill("Web Journey");
   await page.locator('input[name="autojoin"]').fill("#journey");
   await page.locator('input[name="tls"]').uncheck();
   const preflightResponse = page.waitForResponse(

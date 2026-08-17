@@ -377,7 +377,9 @@ async fn ws_ui_detaches_when_its_network_is_removed() {
 
     // Create the network via REST (a config network has no DB row and can't be
     // deleted; a REST-created one can).
-    let body = format!(r#"{{"name":"up","addr":"{up}","nick":"alicebnc"}}"#);
+    let body = format!(
+        r#"{{"kind":"irc","name":"up","addr":"{up}","tls":false,"nick":"alicebnc","realname":"Alice BNC","autojoin":[]}}"#
+    );
     let (status, _) = http_req(
         http,
         &format!(
