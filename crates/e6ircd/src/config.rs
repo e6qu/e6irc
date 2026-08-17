@@ -639,8 +639,20 @@ fn deserialize_static_networks<'de, D>(deserializer: D) -> Result<Vec<NetworkEnt
 where
     D: serde::Deserializer<'de>,
 {
-    Vec::<NetworkEntryWire>::deserialize(deserializer)
-        .map(|entries| entries.into_iter().map(NetworkEntry::from).collect())
+    Vec::<NetworkEntryWire>::deserialize(deserializer).and_then(|entries| {
+        entries
+            .into_iter()
+            .map(|entry| {
+                let network = NetworkEntry::from(entry);
+                if matches!(network.kind, NetworkKind::Irc | NetworkKind::Local)
+                    && !matches!(network.realname.as_deref(), Some(realname) if !realname.trim().is_empty())
+                {
+                    return Err(serde::de::Error::custom("IRC and local networks require a non-blank realname"));
+                }
+                Ok(network)
+            })
+            .collect()
+    })
 }
 
 /// Which driver backs a BNC network.
@@ -1793,6 +1805,27 @@ mod tests {
     }
 
     #[test]
+    fn static_network_entries_are_driver_specific() {
+        for entry in [
+            "kind = 'irc'\nname = 'irc'\naddr = 'irc.example:6697'\ntls = true\nnick = 'alice'\nrealname = 'Alice'\nautojoin = []\nbuffer_cap = 1000\nsasl_account = 'alice'\nsasl_password = 'password'",
+            "kind = 'local'\nname = 'local'\naddr = ''\ntls = false\nnick = 'alice'\nrealname = 'Alice'\nautojoin = []\nbuffer_cap = 1000",
+            "kind = 'matrix'\nname = 'matrix'\naddr = ''\ntls = true\nnick = '@alice:example.test'\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'password'",
+            "kind = 'discord'\nname = 'discord'\naddr = ''\ntls = true\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'token'",
+            "kind = 'slack'\nname = 'slack'\naddr = ''\ntls = true\nautojoin = []\nbuffer_cap = 1000\nsasl_account = 'xoxb-token'\nsasl_password = 'xapp-token'",
+        ] {
+            assert!(toml::from_str::<NetworkEntryWire>(entry).is_ok(), "{entry}");
+        }
+        for entry in [
+            "kind = 'discord'\nname = 'discord'\naddr = ''\ntls = true\nnick = 'alice'\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'token'",
+        ] {
+            assert!(
+                toml::from_str::<NetworkEntryWire>(entry).is_err(),
+                "{entry}"
+            );
+        }
+    }
+
+    #[test]
     fn irc_network_requires_realname() {
         let config = toml::from_str::<Config>(
             r#"
@@ -1810,6 +1843,7 @@ mod tests {
             addr = "irc.libera.chat:6697"
             tls = true
             nick = "n"
+            realname = " "
             "#,
         );
         assert!(

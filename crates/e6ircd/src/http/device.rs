@@ -406,6 +406,17 @@ mod tests {
         assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"irc","revision":1,"name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#).is_ok());
         assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"irc","revision":1,"name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#).is_err());
         assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"discord","revision":1,"name":"bot","addr":"","tls":true,"nick":"alice","autojoin":[],"buffer_cap":1000,"sasl_password":"token"}"#).is_err());
+        for request in [
+            r#"{"kind":"local","revision":1,"name":"home","addr":"","tls":false,"nick":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000}"#,
+            r#"{"kind":"matrix","revision":1,"name":"matrix","addr":"","tls":true,"nick":"@alice:example.test","autojoin":[],"buffer_cap":1000,"sasl_password":"password"}"#,
+            r#"{"kind":"discord","revision":1,"name":"discord","addr":"","tls":true,"autojoin":[],"buffer_cap":1000,"sasl_password":"token"}"#,
+            r#"{"kind":"slack","revision":1,"name":"slack","addr":"","tls":true,"autojoin":[],"buffer_cap":1000,"sasl_account":"xoxb-token","sasl_password":"xapp-token"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<AdminNetworkBody>(request).is_ok(),
+                "{request}"
+            );
+        }
     }
 }
 
