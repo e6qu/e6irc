@@ -587,6 +587,19 @@ try {
   const serverNetworks = page.locator("section").filter({
     has: page.getByRole("heading", { name: "Server networks", exact: true }),
   });
+  const networkForm = serverNetworks.locator("form[data-api-network-create]");
+  const networkDriver = networkForm.getByLabel("Driver");
+  await networkDriver.selectOption("local");
+  assert.equal(await networkForm.locator('[name="addr"]').isVisible(), true);
+  assert.equal(await networkForm.locator('[name="nick"]').isVisible(), true);
+  assert.equal(await networkForm.locator('[name="realname"]').isVisible(), true);
+  assert.equal(await networkForm.locator('[name="sasl_account"]').isVisible(), false);
+  assert.equal(await networkForm.locator('[name="sasl_password"]').isVisible(), false);
+  await networkDriver.selectOption("irc");
+  assert.equal(await networkForm.locator('[name="addr"]').getAttribute("required"), "");
+  assert.equal(await networkForm.locator('[name="nick"]').getAttribute("required"), "");
+  assert.equal(await networkForm.locator('[name="realname"]').getAttribute("required"), "");
+  assert.equal(await networkForm.locator('[name="sasl_password"]').getAttribute("required"), null);
   await serverNetworks.getByLabel("Network name").fill("shared-browser");
   await serverNetworks.getByLabel("Address").fill(upstream.address);
   await serverNetworks.getByLabel("Nickname / user").fill("sharedbrowser");

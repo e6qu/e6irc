@@ -390,7 +390,9 @@ pub(super) async fn approve_user_code(
 
 #[cfg(test)]
 mod tests {
-    use super::device_verification_uri;
+    use super::{
+        AdminNetworkBody, ManagedNetworkOwner, admin_network_request, device_verification_uri,
+    };
 
     #[test]
     fn device_verification_uri_requires_a_public_origin() {
@@ -398,6 +400,51 @@ mod tests {
         assert_eq!(
             device_verification_uri(Some("https://chat.example/e6irc/")),
             Some("https://chat.example/e6irc/device".into())
+        );
+    }
+
+    #[test]
+    fn managed_network_requests_are_driver_specific() {
+        assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"irc","revision":1,"name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#).is_ok());
+        assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"irc","revision":1,"name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#).is_err());
+        assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"discord","revision":1,"name":"bot","addr":"","tls":true,"nick":"alice","autojoin":[],"buffer_cap":1000,"sasl_password":"token"}"#).is_err());
+        for request in [
+            r#"{"kind":"local","revision":1,"name":"home","addr":"","tls":false,"nick":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000}"#,
+            r#"{"kind":"matrix","revision":1,"name":"matrix","addr":"https://matrix.example.test","tls":true,"nick":"@alice:example.test","autojoin":[],"buffer_cap":1000,"sasl_password":"password"}"#,
+            r#"{"kind":"discord","revision":1,"name":"discord","addr":"","tls":true,"autojoin":[],"buffer_cap":1000,"sasl_password":"token"}"#,
+            r#"{"kind":"slack","revision":1,"name":"slack","addr":"","tls":true,"autojoin":[],"buffer_cap":1000,"sasl_account":"xoxb-token","sasl_password":"xapp-token"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<AdminNetworkBody>(request).is_ok(),
+                "{request}"
+            );
+        }
+        for request in [
+            r#"{"kind":"irc","revision":1,"name":"irc","addr":"irc.example:6697","tls":true,"nick":"alice","realname":" ","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#,
+            r#"{"kind":"matrix","revision":1,"name":"matrix","addr":"","tls":true,"nick":"@alice:example.test","autojoin":[],"buffer_cap":1000,"sasl_password":"password"}"#,
+            r#"{"kind":"irc","revision":1,"name":"irc","owner":" ","addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#,
+            r#"{"kind":"irc","revision":1,"name":"irc","addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[" "],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#,
+            r#"{"kind":"irc","revision":1,"name":"irc","addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"sasl_account":" ","sasl_password":" "}"#,
+        ] {
+            assert!(
+                admin_network_request(serde_json::from_str::<AdminNetworkBody>(request).unwrap())
+                    .is_err(),
+                "{request}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_network_delete_owner_is_explicit() {
+        assert_eq!(ManagedNetworkOwner::Shared(()).into_option(), Ok(None));
+        assert_eq!(
+            ManagedNetworkOwner::Owner(" alice ".into()).into_option(),
+            Ok(Some("alice".into()))
+        );
+        assert!(
+            ManagedNetworkOwner::Owner(" ".into())
+                .into_option()
+                .is_err()
         );
     }
 }
@@ -1024,24 +1071,26 @@ pub(super) struct AdminOidcBody {
     token_endpoint_auth_method: crate::config::TokenEndpointAuthMethod,
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct AdminNetworkBody {
+pub(super) type AdminNetworkBody = crate::config::NetworkEntryWire;
+
+struct AdminNetworkRequest {
     revision: i64,
-    name: String,
-    owner: Option<String>,
-    kind: crate::config::NetworkKind,
-    #[serde(default)]
-    addr: String,
-    tls: bool,
-    #[serde(default)]
-    nick: String,
-    realname: Option<String>,
-    #[serde(default)]
-    autojoin: Vec<String>,
-    buffer_cap: usize,
-    sasl_account: Option<String>,
-    sasl_password: Option<String>,
+    network: crate::config::NetworkEntry,
+}
+
+fn admin_network_request(body: AdminNetworkBody) -> Result<AdminNetworkRequest, &'static str> {
+    let revision = body
+        .revision()
+        .ok_or("The selected network driver requires revision.")?;
+    let request = AdminNetworkRequest {
+        revision,
+        network: body.into_network_entry().normalized_connection_intent(),
+    };
+    request
+        .network
+        .validate_connection_intent()
+        .map_err(|_| "The selected network driver has missing or invalid required fields.")?;
+    Ok(request)
 }
 
 #[derive(serde::Deserialize)]
@@ -1059,10 +1108,15 @@ enum ManagedNetworkOwner {
 }
 
 impl ManagedNetworkOwner {
-    fn into_option(self) -> Option<String> {
+    fn into_option(self) -> Result<Option<String>, &'static str> {
         match self {
-            Self::Owner(owner) => Some(owner),
-            Self::Shared(()) => None,
+            Self::Owner(owner) => {
+                let owner = owner.trim();
+                (!owner.is_empty())
+                    .then(|| Some(owner.to_string()))
+                    .ok_or("network owner must be non-blank when set")
+            }
+            Self::Shared(()) => Ok(None),
         }
     }
 }
@@ -1240,55 +1294,49 @@ pub(super) async fn admin_create_network(
         Ok(body) => body,
         Err(response) => return response,
     };
-    if body.kind.is_bridge() && !kind_feature_available(body.kind) {
+    let request = match admin_network_request(body) {
+        Ok(request) => request,
+        Err(detail) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid network configuration",
+                Some(detail),
+            );
+        }
+    };
+    let kind = request.network.kind;
+    if kind.is_bridge() && !kind_feature_available(kind) {
         return problem(
             StatusCode::BAD_REQUEST,
             "Unsupported network kind",
             Some(&format!(
                 "This server was not built with the {} feature.",
-                body.kind.as_db_str()
+                kind.as_db_str()
             )),
         );
     }
-    let sasl_account = optional_config_string(body.sasl_account);
-    let sasl_password = optional_config_string(body.sasl_password);
+    let AdminNetworkRequest { revision, network } = request;
+    let sasl_account = network.sasl_account.clone();
+    let sasl_password = network.sasl_password.clone();
     let secret_needed =
-        sasl_password.is_some() || (body.kind.account_is_secret() && sasl_account.is_some());
+        sasl_password.is_some() || (kind.account_is_secret() && sasl_account.is_some());
     let key = state.secret_key.clone();
     if secret_needed && key.is_none() {
         return master_key_required("Upstream credentials");
     }
-    let name = body.name.trim().to_string();
-    let owner = optional_config_string(body.owner);
-    let addr = body.addr.trim().to_string();
-    let nick = body.nick.trim().to_string();
-    let realname = optional_config_string(body.realname);
-    let autojoin = body
-        .autojoin
-        .into_iter()
-        .map(|channel| channel.trim().to_string())
-        .filter(|channel| !channel.is_empty())
-        .collect();
-    mutate_managed_configuration(&state, &actor, body.revision, move |settings| {
+    let name = network.name.clone();
+    mutate_managed_configuration(&state, &actor, revision, move |settings| {
         reject_bootstrap_credential_change(settings, "network")?;
-        let sealed_account = if body.kind.account_is_secret() {
+        let sealed_account = if kind.account_is_secret() {
             seal_configuration_secret(sasl_account, key.as_ref())?
         } else {
             sasl_account
         };
         let sealed_password = seal_configuration_secret(sasl_password, key.as_ref())?;
         settings.networks.push(crate::config::NetworkEntry {
-            name: name.clone(),
-            kind: body.kind,
-            owner,
-            addr,
-            tls: body.tls,
-            nick,
-            realname,
-            autojoin,
-            buffer_cap: body.buffer_cap,
             sasl_account: sealed_account,
             sasl_password: sealed_password,
+            ..network
         });
         Ok(format!("added server network {name}"))
     })
@@ -1305,7 +1353,16 @@ pub(super) async fn admin_delete_network(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let owner = optional_config_string(body.owner.into_option());
+    let owner = match body.owner.into_option() {
+        Ok(owner) => owner,
+        Err(detail) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid network configuration",
+                Some(detail),
+            );
+        }
+    };
     mutate_managed_configuration(&state, &actor, body.revision, move |settings| {
         reject_bootstrap_credential_change(settings, "network")?;
         let before = settings.networks.len();
@@ -1317,10 +1374,6 @@ pub(super) async fn admin_delete_network(
             .ok_or_else(|| format!("No matching server network named '{name}'."))
     })
     .await
-}
-
-fn optional_config_string(value: Option<String>) -> Option<String> {
-    value.and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()))
 }
 
 fn seal_configuration_secret(

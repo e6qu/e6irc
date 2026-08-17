@@ -1054,7 +1054,14 @@ async fn openapi_spec_is_served() {
     ] {
         let schema =
             &v["paths"][path][method]["requestBody"]["content"]["application/json"]["schema"];
-        assert_eq!(schema["additionalProperties"], false, "{method} {path}");
+        let closed = schema["additionalProperties"] == false
+            || schema["oneOf"].as_array().is_some_and(|variants| {
+                !variants.is_empty()
+                    && variants
+                        .iter()
+                        .all(|variant| variant["additionalProperties"] == false)
+            });
+        assert!(closed, "{method} {path}");
     }
     let patch_network_schema = &v["paths"]["/api/v1/me/networks/{name}"]["patch"]["requestBody"]["content"]
         ["application/json"]["schema"];
@@ -2158,6 +2165,45 @@ async fn console_configuration_manages_every_credential_collection() {
     );
     assert!(!body.contains(upstream_secret), "{body}");
 
+    for (revision, network_body, secret) in [
+        (
+            4,
+            r#"{"revision":4,"name":"local","kind":"local","addr":"","tls":false,"nick":"alice","realname":"Alice","autojoin":[],"buffer_cap":321}"#,
+            None,
+        ),
+        (
+            5,
+            r#"{"revision":5,"name":"matrix","kind":"matrix","addr":"https://matrix.example.test","tls":true,"nick":"@alice:example.test","autojoin":[],"buffer_cap":321,"sasl_password":"matrix-secret"}"#,
+            Some("matrix-secret"),
+        ),
+        (
+            6,
+            r#"{"revision":6,"name":"discord","kind":"discord","addr":"","tls":true,"autojoin":[],"buffer_cap":321,"sasl_password":"discord-secret"}"#,
+            Some("discord-secret"),
+        ),
+        (
+            7,
+            r#"{"revision":7,"name":"slack","kind":"slack","addr":"","tls":true,"autojoin":[],"buffer_cap":321,"sasl_account":"slack-account","sasl_password":"slack-secret"}"#,
+            Some("slack-secret"),
+        ),
+    ] {
+        let network_request = format!(
+            "POST /api/v1/admin/configuration/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+             X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{network_body}",
+            network_body.len()
+        );
+        let (status, _, body) = request(http, &network_request).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+            revision + 1
+        );
+        if let Some(secret) = secret {
+            assert!(!body.contains(secret), "{body}");
+        }
+    }
+
     let configuration_api = format!(
         "GET /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          Connection: close\r\n\r\n"
@@ -2168,7 +2214,7 @@ async fn console_configuration_manages_every_credential_collection() {
     assert!(!body.contains(oidc_secret), "{body}");
     assert!(!body.contains(upstream_secret), "{body}");
     let api: serde_json::Value = serde_json::from_str(&body).expect("configuration JSON");
-    assert_eq!(api["revision"], 4);
+    assert_eq!(api["revision"], 8);
     assert_eq!(api["runtime"]["has_master_key"], true);
     assert_eq!(api["runtime"]["master_key_count"], 1);
     assert_eq!(api["settings"]["opers"][0]["password"], "");
@@ -2177,7 +2223,13 @@ async fn console_configuration_manages_every_credential_collection() {
         api["settings"]["oidc_providers"][0]["account_claim"],
         "email"
     );
-    assert!(api["settings"]["networks"][0]["sasl_password"].is_null());
+    assert_eq!(
+        api["settings"]["networks"].as_array().map(Vec::len),
+        Some(5)
+    );
+    for network in api["settings"]["networks"].as_array().unwrap() {
+        assert!(network["sasl_password"].is_null(), "{network}");
+    }
     assert!(api["settings"]["credentials_from_bootstrap"].is_boolean());
     let mut scalar_settings = api["settings"].clone();
     let scalar = scalar_settings.as_object_mut().expect("settings object");
@@ -2189,7 +2241,7 @@ async fn console_configuration_manages_every_credential_collection() {
         "description".into(),
         serde_json::Value::String("API-managed description".into()),
     );
-    let patch_body = serde_json::json!({ "revision": 4, "settings": scalar_settings }).to_string();
+    let patch_body = serde_json::json!({ "revision": 8, "settings": scalar_settings }).to_string();
     let patch_request = format!(
         "PATCH /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
@@ -2200,7 +2252,7 @@ async fn console_configuration_manages_every_credential_collection() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
-        5
+        9
     );
 
     let verification_pool = e6ircd::db::connect_and_migrate(&url)
@@ -2209,7 +2261,7 @@ async fn console_configuration_manages_every_credential_collection() {
     let snapshot = e6ircd::db::load_managed_config(&verification_pool)
         .await
         .expect("managed configuration");
-    assert_eq!(snapshot.revision, 5);
+    assert_eq!(snapshot.revision, 9);
     assert_eq!(snapshot.settings.description, "API-managed description");
     assert_eq!(snapshot.updated_by, "alice");
     assert_eq!(snapshot.settings.opers.len(), 1);
@@ -2232,7 +2284,21 @@ async fn console_configuration_manages_every_credential_collection() {
             .expect("open provider secret"),
         oidc_secret
     );
-    assert_eq!(snapshot.settings.networks.len(), 1);
+    assert_eq!(
+        snapshot
+            .settings
+            .networks
+            .iter()
+            .map(|network| (network.name.as_str(), network.kind.as_db_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("staffnet", "irc"),
+            ("local", "local"),
+            ("matrix", "matrix"),
+            ("discord", "discord"),
+            ("slack", "slack"),
+        ]
+    );
     let stored_network = &snapshot.settings.networks[0];
     assert_eq!(stored_network.owner.as_deref(), Some("alice"));
     assert_eq!(stored_network.autojoin, ["#staff"]);
@@ -2249,23 +2315,70 @@ async fn console_configuration_manages_every_credential_collection() {
             .expect("open upstream password"),
         upstream_secret
     );
+    for (name, password) in [
+        ("matrix", "matrix-secret"),
+        ("discord", "discord-secret"),
+        ("slack", "slack-secret"),
+    ] {
+        let network = snapshot
+            .settings
+            .networks
+            .iter()
+            .find(|network| network.name == name)
+            .expect("stored network");
+        assert_eq!(
+            secret_key
+                .open(
+                    network.sasl_password.as_deref().expect("stored password"),
+                    e6ircd::secret::CONFIG_CONTEXT,
+                )
+                .expect("open stored password"),
+            password
+        );
+    }
+    let slack = snapshot
+        .settings
+        .networks
+        .iter()
+        .find(|network| network.name == "slack")
+        .expect("stored Slack network");
+    assert_eq!(
+        secret_key
+            .open(
+                slack
+                    .sasl_account
+                    .as_deref()
+                    .expect("stored Slack bot token"),
+                e6ircd::secret::CONFIG_CONTEXT,
+            )
+            .expect("open stored Slack bot token"),
+        "slack-account"
+    );
 
     let audit_details: Vec<String> =
         sqlx::query_scalar("SELECT detail FROM audit_log WHERE action = 'CONFIG' ORDER BY id")
             .fetch_all(&verification_pool)
             .await
             .expect("configuration audit");
-    assert_eq!(audit_details.len(), 4);
+    assert_eq!(audit_details.len(), 8);
     assert!(audit_details[0].contains("added IRC operator netop"));
     assert!(audit_details[1].contains("added OpenID Connect provider workforce"));
     assert!(audit_details[2].contains("added server network staffnet"));
+    for name in ["local", "matrix", "discord", "slack"] {
+        assert!(
+            audit_details
+                .iter()
+                .any(|detail| detail.contains(&format!("added server network {name}"))),
+            "missing audit entry for {name}"
+        );
+    }
     for detail in &audit_details {
         assert!(!detail.contains(oper_secret), "{detail}");
         assert!(!detail.contains(oidc_secret), "{detail}");
         assert!(!detail.contains(upstream_secret), "{detail}");
     }
 
-    let delete_oper_body = r#"{"revision":5}"#;
+    let delete_oper_body = r#"{"revision":9}"#;
     let delete_oper = format!(
         "DELETE /api/v1/admin/configuration/opers/netop HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
@@ -2276,10 +2389,10 @@ async fn console_configuration_manages_every_credential_collection() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
-        6
+        10
     );
 
-    let delete_oidc_body = r#"{"revision":6}"#;
+    let delete_oidc_body = r#"{"revision":10}"#;
     let delete_oidc = format!(
         "DELETE /api/v1/admin/configuration/oidc-providers/workforce HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
@@ -2290,25 +2403,36 @@ async fn console_configuration_manages_every_credential_collection() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
-        7
+        11
     );
-    let delete_network_body = r#"{"revision":7,"owner":"alice"}"#;
-    let delete_network = format!(
-        "DELETE /api/v1/admin/configuration/networks/staffnet HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{delete_network_body}",
-        delete_network_body.len()
-    );
-    let (status, _, body) = request(http, &delete_network).await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
-        8
-    );
+    let mut revision = 11;
+    for (name, owner) in [
+        ("staffnet", Some("alice")),
+        ("local", None),
+        ("matrix", None),
+        ("discord", None),
+        ("slack", None),
+    ] {
+        let delete_network_body =
+            serde_json::json!({ "revision": revision, "owner": owner }).to_string();
+        let delete_network = format!(
+            "DELETE /api/v1/admin/configuration/networks/{name} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+             X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{delete_network_body}",
+            delete_network_body.len()
+        );
+        let (status, _, body) = request(http, &delete_network).await;
+        assert_eq!(status, 200, "{body}");
+        revision += 1;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+            revision
+        );
+    }
     let snapshot = e6ircd::db::load_managed_config(&verification_pool)
         .await
         .expect("managed configuration after deletes");
-    assert_eq!(snapshot.revision, 8);
+    assert_eq!(snapshot.revision, 16);
     assert!(snapshot.settings.opers.is_empty());
     assert!(snapshot.settings.oidc_providers.is_empty());
     assert!(snapshot.settings.networks.is_empty());

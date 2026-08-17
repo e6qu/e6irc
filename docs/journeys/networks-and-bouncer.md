@@ -24,6 +24,11 @@ upstream credentials will be stored.
 4. Save the managed configuration revision. The UI reports which values
    applied live and which require restart.
 
+Managed network creation accepts one exact shape per driver. IRC and local
+networks require nickname and real name. Matrix requires a homeserver URL,
+user, and password. Discord requires a bot token. Slack requires bot and
+app-level tokens. The form hides incompatible fields.
+
 **Visible failures and recovery.** Without PostgreSQL, the registry is
 unavailable and network creation is disabled visibly. Without a master key,
 passwordless networks may still be created, but password fields are disabled

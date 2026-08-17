@@ -59,12 +59,12 @@ const DB_NETWORK_BUFFER_CAP: usize = 1000;
 /// The one credential-field shape accepted by config, HTTP, stored-row driver
 /// construction, and runtime edits.
 pub(crate) fn validate_network_credential(value: &str, maximum: usize) -> Result<(), String> {
-    if value.is_empty()
+    if value.trim().is_empty()
         || value.len() > maximum
         || value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0))
     {
         Err(format!(
-            "credentials must be non-empty, at most {maximum} bytes, and contain no CR, LF or NUL"
+            "credentials must be non-blank, at most {maximum} bytes, and contain no CR, LF or NUL"
         ))
     } else {
         Ok(())

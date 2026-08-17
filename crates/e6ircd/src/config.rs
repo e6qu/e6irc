@@ -160,7 +160,11 @@ pub struct Config {
     pub opers: Vec<OperConfig>,
     /// BNC upstream networks (server-level; per-user comes with account
     /// integration).
-    #[serde(default, rename = "network")]
+    #[serde(
+        default,
+        rename = "network",
+        deserialize_with = "deserialize_static_networks"
+    )]
     pub networks: Vec<NetworkEntry>,
     /// The bouncer listener, where clients attach as nick/network.
     #[serde(default)]
@@ -455,6 +459,306 @@ pub struct NetworkEntry {
 
 fn default_bnc_buffer() -> usize {
     1000
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub(crate) enum NetworkEntryWire {
+    Irc {
+        #[serde(flatten)]
+        common: NetworkEntryCommon,
+        nick: String,
+        realname: String,
+        sasl_account: Option<String>,
+        sasl_password: Option<String>,
+    },
+    Local {
+        #[serde(flatten)]
+        common: NetworkEntryCommon,
+        nick: String,
+        realname: String,
+    },
+    Matrix {
+        #[serde(flatten)]
+        common: NetworkEntryCommon,
+        nick: String,
+        sasl_password: String,
+    },
+    Discord {
+        #[serde(flatten)]
+        common: NetworkEntryCommon,
+        sasl_password: String,
+    },
+    Slack {
+        #[serde(flatten)]
+        common: NetworkEntryCommon,
+        sasl_account: String,
+        sasl_password: String,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NetworkEntryCommon {
+    #[serde(default)]
+    revision: Option<i64>,
+    name: String,
+    owner: Option<String>,
+    addr: String,
+    tls: bool,
+    autojoin: Vec<String>,
+    buffer_cap: usize,
+}
+
+impl From<NetworkEntryWire> for NetworkEntry {
+    fn from(value: NetworkEntryWire) -> Self {
+        match value {
+            NetworkEntryWire::Irc {
+                common,
+                nick,
+                realname,
+                sasl_account,
+                sasl_password,
+            } => common.into_entry(
+                NetworkKind::Irc,
+                nick,
+                Some(realname),
+                sasl_account,
+                sasl_password,
+            ),
+            NetworkEntryWire::Local {
+                common,
+                nick,
+                realname,
+            } => common.into_entry(NetworkKind::Local, nick, Some(realname), None, None),
+            NetworkEntryWire::Matrix {
+                common,
+                nick,
+                sasl_password,
+            } => common.into_entry(NetworkKind::Matrix, nick, None, None, Some(sasl_password)),
+            NetworkEntryWire::Discord {
+                common,
+                sasl_password,
+            } => common.into_entry(
+                NetworkKind::Discord,
+                String::new(),
+                None,
+                None,
+                Some(sasl_password),
+            ),
+            NetworkEntryWire::Slack {
+                common,
+                sasl_account,
+                sasl_password,
+            } => common.into_entry(
+                NetworkKind::Slack,
+                String::new(),
+                None,
+                Some(sasl_account),
+                Some(sasl_password),
+            ),
+        }
+    }
+}
+
+impl NetworkEntryCommon {
+    fn into_entry(
+        self,
+        kind: NetworkKind,
+        nick: String,
+        realname: Option<String>,
+        sasl_account: Option<String>,
+        sasl_password: Option<String>,
+    ) -> NetworkEntry {
+        NetworkEntry {
+            name: self.name,
+            owner: self.owner,
+            kind,
+            addr: self.addr,
+            tls: self.tls,
+            nick,
+            realname,
+            autojoin: self.autojoin,
+            buffer_cap: self.buffer_cap,
+            sasl_account,
+            sasl_password,
+        }
+    }
+}
+
+impl NetworkEntryWire {
+    pub(crate) fn into_network_entry(self) -> NetworkEntry {
+        self.into()
+    }
+
+    pub(crate) fn revision(&self) -> Option<i64> {
+        match self {
+            Self::Irc { common, .. }
+            | Self::Local { common, .. }
+            | Self::Matrix { common, .. }
+            | Self::Discord { common, .. }
+            | Self::Slack { common, .. } => common.revision,
+        }
+    }
+}
+
+impl NetworkEntry {
+    pub(crate) fn normalized_connection_intent(mut self) -> Self {
+        self.name = self.name.trim().to_string();
+        self.owner = self.owner.map(|owner| owner.trim().to_string());
+        self.addr = self.addr.trim().to_string();
+        self.nick = self.nick.trim().to_string();
+        self.realname = self.realname.map(|realname| realname.trim().to_string());
+        self.autojoin = self
+            .autojoin
+            .into_iter()
+            .map(|channel| channel.trim().to_string())
+            .collect();
+        self.sasl_account = self.sasl_account.map(|account| account.trim().to_string());
+        self.sasl_password = self
+            .sasl_password
+            .map(|password| password.trim().to_string());
+        self
+    }
+
+    /// Validate fields shared by every configuration ingress.
+    pub(crate) fn validate_connection_intent(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() {
+            return Err("network name must be non-blank".into());
+        }
+        if self
+            .owner
+            .as_deref()
+            .is_some_and(|owner| owner.trim().is_empty())
+        {
+            return Err("network owner must be non-blank when set".into());
+        }
+        if self.buffer_cap == 0 {
+            return Err("buffer_cap must be nonzero".into());
+        }
+        if self
+            .autojoin
+            .iter()
+            .any(|channel| channel.trim().is_empty())
+        {
+            return Err("autojoin entries must be non-blank".into());
+        }
+        if let Some(account) = self.sasl_account.as_deref() {
+            crate::bouncer::validate_network_credential(account, 255)
+                .map_err(|error| format!("invalid sasl_account: {error}"))?;
+        }
+        if let Some(password) = self.sasl_password.as_deref() {
+            crate::bouncer::validate_network_credential(password, 512)
+                .map_err(|error| format!("invalid sasl_password: {error}"))?;
+        }
+        match self.kind {
+            NetworkKind::Irc => {
+                if self.sasl_account.is_some() != self.sasl_password.is_some() {
+                    return Err(
+                        "kind=irc requires both sasl_account and sasl_password, or neither".into(),
+                    );
+                }
+                if self
+                    .realname
+                    .as_deref()
+                    .is_none_or(|realname| realname.trim().is_empty())
+                {
+                    return Err("kind=irc requires a non-blank realname".into());
+                }
+                if self.nick.trim().is_empty() {
+                    return Err("kind=irc requires a non-blank nick".into());
+                }
+                if !crate::bouncer::validate_irc_upstream_addr(&self.addr) {
+                    return Err(
+                        "kind=irc requires addr as host:port with a nonzero numeric port".into(),
+                    );
+                }
+            }
+            NetworkKind::Local => {
+                if self
+                    .realname
+                    .as_deref()
+                    .is_none_or(|realname| realname.trim().is_empty())
+                {
+                    return Err("kind=local requires a non-blank realname".into());
+                }
+                if self.nick.trim().is_empty() {
+                    return Err("kind=local requires a non-blank nick".into());
+                }
+            }
+            NetworkKind::Matrix | NetworkKind::Discord | NetworkKind::Slack => {
+                if !self.tls {
+                    return Err(format!(
+                        "kind={} requires tls=true as its HTTP transport marker",
+                        self.kind.as_db_str()
+                    ));
+                }
+                if self.realname.is_some() {
+                    return Err(format!(
+                        "kind={} does not accept realname",
+                        self.kind.as_db_str()
+                    ));
+                }
+                if matches!(self.kind, NetworkKind::Discord | NetworkKind::Slack)
+                    && !self.nick.is_empty()
+                {
+                    return Err(format!(
+                        "kind={} does not accept nick",
+                        self.kind.as_db_str()
+                    ));
+                }
+                if matches!(self.kind, NetworkKind::Matrix | NetworkKind::Discord)
+                    && self.sasl_account.is_some()
+                {
+                    return Err(format!(
+                        "kind={} does not accept sasl_account",
+                        self.kind.as_db_str()
+                    ));
+                }
+                crate::bouncer::validate_bridge_base(self.kind, &self.addr)?;
+                if self.kind == NetworkKind::Matrix && self.nick.trim().is_empty() {
+                    return Err("kind=matrix requires a non-blank nick".into());
+                }
+                if matches!(self.kind, NetworkKind::Matrix | NetworkKind::Discord)
+                    && self.sasl_password.is_none()
+                {
+                    return Err(format!(
+                        "kind={} requires sasl_password",
+                        self.kind.as_db_str()
+                    ));
+                }
+                if self.kind == NetworkKind::Slack
+                    && (self.sasl_account.is_none() || self.sasl_password.is_none())
+                {
+                    return Err("kind=slack requires sasl_account and sasl_password".into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn deserialize_static_networks<'de, D>(deserializer: D) -> Result<Vec<NetworkEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<NetworkEntryWire>::deserialize(deserializer).and_then(|entries| {
+        entries
+            .into_iter()
+            .map(|entry| {
+                if entry.revision().is_some() {
+                    return Err(serde::de::Error::custom(
+                        "static network configuration does not accept revision",
+                    ));
+                }
+                let network = NetworkEntry::from(entry);
+                network
+                    .validate_connection_intent()
+                    .map_err(serde::de::Error::custom)?;
+                Ok(network)
+            })
+            .collect()
+    })
 }
 
 /// Which driver backs a BNC network.
@@ -1250,121 +1554,8 @@ impl Config {
             )));
         }
         for n in &self.networks {
-            // A zero backlog cap is silently coerced to 1 by `Buffer::push`
-            // (`self.cap.max(1)`) — a silent fallback (DESIGN §2) an operator
-            // would not expect. Reject it loudly like the sibling zero-value
-            // guards (`max_hot_channels`, `command_burst`).
-            if n.buffer_cap == 0 {
-                return Err(ConfigError::Invalid(format!(
-                    "network '{}' buffer_cap must be nonzero",
-                    n.name
-                )));
-            }
-            if let Some(account) = n.sasl_account.as_deref() {
-                crate::bouncer::validate_network_credential(account, 255).map_err(|error| {
-                    ConfigError::Invalid(format!(
-                        "network '{}' has invalid sasl_account: {error}",
-                        n.name
-                    ))
-                })?;
-            }
-            if let Some(password) = n.sasl_password.as_deref() {
-                crate::bouncer::validate_network_credential(password, 512).map_err(|error| {
-                    ConfigError::Invalid(format!(
-                        "network '{}' has invalid sasl_password: {error}",
-                        n.name
-                    ))
-                })?;
-            }
-            if n.kind == NetworkKind::Irc && n.sasl_account.is_some() != n.sasl_password.is_some() {
-                return Err(ConfigError::Invalid(format!(
-                    "network '{}' (kind=irc) requires both sasl_account and sasl_password, or neither",
-                    n.name
-                )));
-            }
-            if matches!(n.kind, NetworkKind::Irc | NetworkKind::Local) && n.realname.is_none() {
-                return Err(ConfigError::Invalid(format!(
-                    "network '{}' (kind={}) requires realname",
-                    n.name,
-                    n.kind.as_db_str()
-                )));
-            }
-            if n.kind.is_bridge() {
-                if !n.tls {
-                    return Err(ConfigError::Invalid(format!(
-                        "network '{}' (kind={}) requires tls=true as its HTTP transport marker",
-                        n.name,
-                        n.kind.as_db_str()
-                    )));
-                }
-                if n.realname.is_some() {
-                    return Err(ConfigError::Invalid(format!(
-                        "network '{}' (kind={}) does not accept realname",
-                        n.name,
-                        n.kind.as_db_str()
-                    )));
-                }
-                if matches!(n.kind, NetworkKind::Discord | NetworkKind::Slack) && !n.nick.is_empty()
-                {
-                    return Err(ConfigError::Invalid(format!(
-                        "network '{}' (kind={}) does not accept nick",
-                        n.name,
-                        n.kind.as_db_str()
-                    )));
-                }
-                if matches!(n.kind, NetworkKind::Matrix | NetworkKind::Discord)
-                    && n.sasl_account.is_some()
-                {
-                    return Err(ConfigError::Invalid(format!(
-                        "network '{}' (kind={}) does not accept sasl_account",
-                        n.name,
-                        n.kind.as_db_str()
-                    )));
-                }
-                crate::bouncer::validate_bridge_base(n.kind, &n.addr).map_err(|error| {
-                    ConfigError::Invalid(format!("network '{}': {error}", n.name))
-                })?;
-            }
-            match n.kind {
-                NetworkKind::Irc if n.addr.is_empty() => {
-                    return Err(ConfigError::Invalid(format!(
-                        "network '{}' (kind=irc) requires addr",
-                        n.name
-                    )));
-                }
-                NetworkKind::Irc if !crate::bouncer::validate_irc_upstream_addr(&n.addr) => {
-                    return Err(ConfigError::Invalid(format!(
-                        "network '{}' (kind=irc) addr must be host:port with a nonzero numeric port",
-                        n.name
-                    )));
-                }
-                NetworkKind::Matrix if n.nick.is_empty() => {
-                    return Err(ConfigError::Invalid(format!(
-                        "network '{}' (kind=matrix) requires nick (provider user)",
-                        n.name
-                    )));
-                }
-                NetworkKind::Matrix if n.sasl_password.is_none() => {
-                    return Err(ConfigError::Invalid(format!(
-                        "network '{}' (kind=matrix) requires sasl_password (login password)",
-                        n.name
-                    )));
-                }
-                NetworkKind::Discord if n.sasl_password.is_none() => {
-                    return Err(ConfigError::Invalid(format!(
-                        "network '{}' (kind=discord) requires sasl_password (bot token)",
-                        n.name
-                    )));
-                }
-                NetworkKind::Slack if n.sasl_account.is_none() || n.sasl_password.is_none() => {
-                    return Err(ConfigError::Invalid(format!(
-                        "network '{}' (kind=slack) requires sasl_account (bot token) and \
-                         sasl_password (app-level token)",
-                        n.name
-                    )));
-                }
-                _ => {}
-            }
+            n.validate_connection_intent()
+                .map_err(|error| ConfigError::Invalid(format!("network '{}': {error}", n.name)))?;
         }
         // OPER blocks: an empty name or password is a dangerous silent default
         // (an empty password would let `OPER <name> ""` succeed), and a duplicate
@@ -1552,7 +1743,7 @@ mod tests {
     #[test]
     fn network_buffer_cap_zero_is_rejected() {
         // A zero backlog cap is otherwise silently coerced to 1 by Buffer::push.
-        let c: Config = toml::from_str(
+        let error = toml::from_str::<Config>(
             r#"
             server_name = "irc.x.example"
             network_name = "XNet"
@@ -1569,12 +1760,13 @@ mod tests {
             tls = true
             nick = "n"
             realname = "n"
+            autojoin = []
             buffer_cap = 0
             "#,
         )
-        .expect("parse");
-        let err = c.validate().unwrap_err().to_string();
-        assert!(err.contains("buffer_cap"), "{err}");
+        .expect_err("zero buffer cap must fail at configuration ingress")
+        .to_string();
+        assert!(error.contains("buffer_cap"), "{error}");
     }
 
     #[test]
@@ -1603,9 +1795,54 @@ mod tests {
         }
     }
 
+    fn config_with_static_network(network: &str) -> String {
+        format!(
+            "server_name = 'irc.example.test'\nnetwork_name = 'Example'\n[[listeners]]\naddr = '127.0.0.1:0'\n[database]\nurl = 'postgres://localhost/example'\n[[network]]\n{network}"
+        )
+    }
+
+    #[test]
+    fn static_network_entries_are_driver_specific() {
+        for entry in [
+            "kind = 'irc'\nname = 'irc'\naddr = 'irc.example:6697'\ntls = true\nnick = 'alice'\nrealname = 'Alice'\nautojoin = []\nbuffer_cap = 1000\nsasl_account = 'alice'\nsasl_password = 'password'",
+            "kind = 'local'\nname = 'local'\naddr = ''\ntls = false\nnick = 'alice'\nrealname = 'Alice'\nautojoin = []\nbuffer_cap = 1000",
+            "kind = 'matrix'\nname = 'matrix'\naddr = 'https://matrix.example.test'\ntls = true\nnick = '@alice:example.test'\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'password'",
+            "kind = 'discord'\nname = 'discord'\naddr = ''\ntls = true\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'token'",
+            "kind = 'slack'\nname = 'slack'\naddr = ''\ntls = true\nautojoin = []\nbuffer_cap = 1000\nsasl_account = 'xoxb-token'\nsasl_password = 'xapp-token'",
+        ] {
+            assert!(toml::from_str::<NetworkEntryWire>(entry).is_ok(), "{entry}");
+            assert!(
+                toml::from_str::<Config>(&config_with_static_network(entry)).is_ok(),
+                "{entry}"
+            );
+        }
+        let incompatible = "kind = 'discord'\nname = 'discord'\naddr = ''\ntls = true\nnick = 'alice'\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'token'";
+        assert!(
+            toml::from_str::<NetworkEntryWire>(incompatible).is_err(),
+            "{incompatible}"
+        );
+    }
+
+    #[test]
+    fn static_network_ingress_rejects_invalid_driver_fields() {
+        for network in [
+            "kind = 'irc'\nrevision = 1\nname = 'irc'\naddr = 'irc.example:6697'\ntls = true\nnick = 'alice'\nrealname = 'Alice'\nautojoin = []\nbuffer_cap = 1000\nsasl_account = 'alice'\nsasl_password = 'password'",
+            "kind = 'local'\nname = 'local'\naddr = ''\ntls = false\nnick = 'alice'\nrealname = 'Alice'\nautojoin = ['   ']\nbuffer_cap = 1000",
+            "kind = 'matrix'\nname = 'matrix'\naddr = '   '\ntls = true\nnick = '@alice:example.test'\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'password'",
+            "kind = 'matrix'\nname = 'matrix'\naddr = 'https://matrix.example.test'\ntls = true\nnick = '   '\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'password'",
+            "kind = 'discord'\nname = 'discord'\naddr = ''\ntls = true\nautojoin = []\nbuffer_cap = 1000\nsasl_password = '   '",
+            "kind = 'slack'\nname = 'slack'\naddr = ''\ntls = true\nautojoin = []\nbuffer_cap = 1000\nsasl_account = 'xoxb-token'\nsasl_password = '   '",
+        ] {
+            assert!(
+                toml::from_str::<Config>(&config_with_static_network(network)).is_err(),
+                "{network}"
+            );
+        }
+    }
+
     #[test]
     fn irc_network_requires_realname() {
-        let config: Config = toml::from_str(
+        let config = toml::from_str::<Config>(
             r#"
             server_name = "irc.x.example"
             network_name = "XNet"
@@ -1621,10 +1858,13 @@ mod tests {
             addr = "irc.libera.chat:6697"
             tls = true
             nick = "n"
+            realname = " "
             "#,
-        )
-        .expect("network parses before cross-field validation");
-        assert!(config.validate().is_err());
+        );
+        assert!(
+            config.is_err(),
+            "IRC identity must fail at the parse boundary"
+        );
     }
 
     #[test]
@@ -1938,7 +2178,7 @@ mod tests {
                 .validate()
                 .unwrap_err()
                 .to_string()
-                .contains("non-empty")
+                .contains("non-blank")
         );
     }
 

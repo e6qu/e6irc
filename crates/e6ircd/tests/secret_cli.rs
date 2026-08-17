@@ -74,6 +74,8 @@ fn genkey_seal_and_load_round_trip() {
         tls = true
         nick = "e6bnc"
         realname = "e6bnc"
+        autojoin = []
+        buffer_cap = 1000
         sasl_account = "e6bnc"
         sasl_password = "{sealed}"
         "#,
