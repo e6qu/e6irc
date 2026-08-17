@@ -915,6 +915,25 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     };
   };
 
+  const syncNetworkForm = (form) => {
+    const kind = form.elements.kind?.value;
+    const requirements = {
+      irc: { required: ["addr", "nick", "realname"], visible: ["addr", "nick", "realname", "sasl_account", "sasl_password"] },
+      local: { required: ["nick", "realname"], visible: ["addr", "nick", "realname"] },
+      matrix: { required: ["nick", "sasl_password"], visible: ["addr", "nick", "sasl_password"] },
+      discord: { required: ["sasl_password"], visible: ["addr", "sasl_password"] },
+      slack: { required: ["sasl_account", "sasl_password"], visible: ["addr", "sasl_account", "sasl_password"] },
+    }[kind];
+    if (!requirements) return;
+    for (const name of ["addr", "nick", "realname", "sasl_account", "sasl_password"]) {
+      const input = form.elements[name];
+      const active = requirements.visible.includes(name);
+      input.disabled = !active;
+      input.required = requirements.required.includes(name);
+      input.closest("label").hidden = !active;
+    }
+  };
+
   const networkBody = (form) => {
     const fields = new FormData(form);
     const number = Number(fields.get("buffer_cap"));
@@ -1030,6 +1049,9 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   }
 
   for (const form of document.querySelectorAll("[data-api-network-create]")) {
+    form.addEventListener("change", (event) => {
+      if (event.target === form.elements.kind) syncNetworkForm(form);
+    });
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       let body;
@@ -1298,6 +1320,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     const kinds = root.querySelector("[data-configuration-network-kinds]");
     kinds.replaceChildren(...apiCollection(runtime, "network_drivers", "configuration runtime").map((kind) => element("option", "", kind.toUpperCase())));
     for (const option of kinds.options) option.value = option.textContent.toLowerCase();
+    for (const networkForm of root.querySelectorAll("[data-api-network-create]")) syncNetworkForm(networkForm);
 
     const opers = apiCollection(settings, "opers", "configuration").map((oper) => append(element("div"), element("code", "", oper.name), configurationDeleteForm("oper", oper.name, revision, csrf)));
     const operTarget = root.querySelector("[data-configuration-opers]");

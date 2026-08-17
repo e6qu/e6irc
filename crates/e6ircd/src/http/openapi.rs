@@ -691,6 +691,25 @@ fn document() -> serde_json::Value {
             serde_json::json!("networks"),
             serde_json::json!("credentials_from_bootstrap"),
         ]);
+    let managed_network_variant = |kind: &str, required: &[&str], mut schema: serde_json::Value| {
+        let properties = schema["properties"]
+            .as_object_mut()
+            .expect("network properties");
+        properties.insert("kind".into(), serde_json::json!({ "const": kind }));
+        let required_fields = schema["required"]
+            .as_array_mut()
+            .expect("network required fields");
+        required_fields.push(serde_json::json!("kind"));
+        required_fields.extend(required.iter().map(|field| serde_json::json!(field)));
+        schema
+    };
+    let managed_network_request_schema = serde_json::json!({ "oneOf": [
+        managed_network_variant("irc", &["revision", "name", "addr", "tls", "nick", "realname", "autojoin", "buffer_cap", "sasl_account", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": ["string", "null"], "writeOnly": true }, "sasl_password": { "type": ["string", "null"], "writeOnly": true } } })),
+        managed_network_variant("local", &["revision", "name", "addr", "tls", "nick", "realname", "autojoin", "buffer_cap"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 } } })),
+        managed_network_variant("matrix", &["revision", "name", "addr", "tls", "nick", "autojoin", "buffer_cap", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_password": { "type": "string", "writeOnly": true } } })),
+        managed_network_variant("discord", &["revision", "name", "addr", "tls", "autojoin", "buffer_cap", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_password": { "type": "string", "writeOnly": true } } })),
+        managed_network_variant("slack", &["revision", "name", "addr", "tls", "autojoin", "buffer_cap", "sasl_account", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": "string", "writeOnly": true }, "sasl_password": { "type": "string", "writeOnly": true } } }))
+    ] });
     let configuration_response = json_response(
         "redacted settings, revision, and runtime/bootstrap status",
         serde_json::json!({
@@ -1766,7 +1785,7 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/admin/configuration/networks": {
                 "post": { "summary": "Add a managed server network", "security": authenticated,
-                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision", "name", "kind", "tls", "buffer_cap"], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": "string" }, "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": "string", "writeOnly": true }, "sasl_password": { "type": "string", "writeOnly": true } } } } } },
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": managed_network_request_schema } } },
                     "responses": { "200": revision_response["200"], "400": { "description": "invalid network" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision or master key unavailable" }, "503": { "description": "configuration unavailable" } } }
             },
             "/api/v1/admin/configuration/networks/{name}": {
@@ -2187,6 +2206,13 @@ mod tests {
                 "IRC {field}",
             );
         }
+        let managed = &spec["paths"]["/api/v1/admin/configuration/networks"]["post"]["requestBody"]
+            ["content"]["application/json"]["schema"]["oneOf"];
+        assert_eq!(managed.as_array().map(Vec::len), Some(5));
+        assert_eq!(managed[0]["properties"]["kind"]["const"], "irc");
+        assert_eq!(managed[4]["properties"]["kind"]["const"], "slack");
+        assert!(managed[3]["properties"].get("nick").is_none());
+        assert!(managed[2]["properties"].get("realname").is_none());
         for variant in [1, 2, 3] {
             assert_eq!(
                 create[variant]["properties"]["sasl_password"]["type"],
