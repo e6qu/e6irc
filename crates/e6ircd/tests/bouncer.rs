@@ -802,7 +802,7 @@ async fn local_driver_presents_the_in_process_network() {
             addr: String::new(),
             tls: false,
             nick: "alicelocal".into(),
-            realname: None,
+            realname: Some("Alice Local".into()),
             autojoin: vec!["#local".into()],
             buffer_cap: 1000,
             sasl_account: None,

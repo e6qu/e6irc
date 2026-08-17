@@ -929,20 +929,68 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       const value = String(fields.get(name) || "").trim();
       return value ? { [name]: value } : {};
     };
-    return {
+    const required = (name, label) => {
+      const value = String(fields.get(name) || "").trim();
+      if (!value) throw new Error(`${label} is required.`);
+      return value;
+    };
+    const kind = required("kind", "Driver");
+    const common = {
       revision,
-      name: String(fields.get("name") || "").trim(),
-      kind: String(fields.get("kind") || ""),
-      addr: String(fields.get("addr") || "").trim(),
+      name: required("name", "Network name"),
+      kind,
       tls: fields.has("tls"),
-      nick: String(fields.get("nick") || "").trim(),
       autojoin: splitValues(String(fields.get("autojoin") || ""), ","),
       buffer_cap: number,
       ...optional("owner"),
-      ...optional("realname"),
-      ...optional("sasl_account"),
-      ...optional("sasl_password"),
     };
+    const addr = String(fields.get("addr") || "").trim();
+    switch (kind) {
+      case "irc": {
+        const saslAccount = optional("sasl_account");
+        const saslPassword = optional("sasl_password");
+        if (Boolean(saslAccount.sasl_account) !== Boolean(saslPassword.sasl_password)) {
+          throw new Error("IRC SASL account and password must be provided together.");
+        }
+        return {
+          ...common,
+          addr: required("addr", "Address"),
+          nick: required("nick", "Nickname / user"),
+          realname: required("realname", "Real name"),
+          ...saslAccount,
+          ...saslPassword,
+        };
+      }
+      case "local":
+        return {
+          ...common,
+          addr,
+          nick: required("nick", "Nickname / user"),
+          realname: required("realname", "Real name"),
+        };
+      case "matrix":
+        return {
+          ...common,
+          addr,
+          nick: required("nick", "Nickname / user"),
+          sasl_password: required("sasl_password", "Login password"),
+        };
+      case "discord":
+        return {
+          ...common,
+          addr,
+          sasl_password: required("sasl_password", "Bot token"),
+        };
+      case "slack":
+        return {
+          ...common,
+          addr,
+          sasl_account: required("sasl_account", "Bot token"),
+          sasl_password: required("sasl_password", "App-level token"),
+        };
+      default:
+        throw new Error(`Unsupported network driver: ${kind}.`);
+    }
   };
 
   const setConfigurationResult = (message, success) => {

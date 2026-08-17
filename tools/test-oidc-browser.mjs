@@ -590,6 +590,7 @@ try {
   await serverNetworks.getByLabel("Network name").fill("shared-browser");
   await serverNetworks.getByLabel("Address").fill(upstream.address);
   await serverNetworks.getByLabel("Nickname / user").fill("sharedbrowser");
+  await serverNetworks.getByLabel("Real name").fill("Shared Browser");
   await serverNetworks.getByLabel("Autojoin").fill("#shared");
   await serverNetworks.getByLabel("Use TLS").uncheck();
   await serverNetworks.getByLabel("SASL account").fill("shared-account");
