@@ -5,21 +5,41 @@ workspace="$(cd "$(dirname "$0")/.." && pwd)"
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 
+cargo build -p e6ircd
+
+incomplete="$scratch/incomplete.toml"
+printf '%s\n' 'server_name = "irc.example.test"' > "$incomplete"
+if "$workspace/target/debug/e6ircd" check-config --config "$incomplete" 2>/dev/null; then
+  echo 'check-config accepted incomplete configuration' >&2
+  exit 1
+fi
+
 probe="$scratch/e6ircd-probe"
 result="$scratch/result"
 cat > "$probe" <<'PROBE'
 #!/bin/sh
 set -eu
-[ "$1" = "--config" ]
-mode="$(stat -c '%a' "$2" 2>/dev/null || stat -f '%Lp' "$2")"
-printf '%s\n' "$2" "$mode" > "$E6IRC_TEST_RESULT"
-cat "$2" >> "$E6IRC_TEST_RESULT"
+if [ -n "${E6IRC_TEST_COMMANDS:-}" ]; then
+  printf '%s\n' "$1" >> "$E6IRC_TEST_COMMANDS"
+fi
+case "$1" in
+  check-config)
+    [ "$2" = "--config" ]
+    config="$3"
+    ;;
+  --config) config="$2" ;;
+  *) exit 1 ;;
+esac
+mode="$(stat -c '%a' "$config" 2>/dev/null || stat -f '%Lp' "$config")"
+printf '%s\n' "$config" "$mode" > "$E6IRC_TEST_RESULT"
+cat "$config" >> "$E6IRC_TEST_RESULT"
 PROBE
 chmod 0700 "$probe"
 
 env \
   TMPDIR="$scratch" \
   E6IRC_BINARY="$probe" \
+  E6IRC_TEST_COMMANDS="$scratch/commands" \
   E6IRC_TEST_RESULT="$result" \
   E6IRC_SERVER_NAME="irc.example.test" \
   E6IRC_PUBLIC_URL="https://irc.example.test" \
@@ -44,6 +64,8 @@ esac
 grep -F 'server_name = "irc.example.test"' "$result" >/dev/null
 grep -F 'public_url = "https://irc.example.test"' "$result" >/dev/null
 grep -F 'token = "0123456789abcdef0123456789abcdef"' "$result" >/dev/null
+diff -u <(printf '%s\n' check-config --config) "$scratch/commands"
+"$workspace/target/debug/e6ircd" check-config --config "$config_path"
 
 explicit="$scratch/operator.toml"
 env \
@@ -57,6 +79,7 @@ env \
   sh "$workspace/deploy/docker-entrypoint.sh"
 [ "$(sed -n '1p' "$result")" = "$explicit" ]
 [ "$(sed -n '2p' "$result")" = "600" ]
+"$workspace/target/debug/e6ircd" check-config --config "$explicit"
 
 # The OIDC branch was never exercised here, and it shipped a config e6ircd's own
 # parser rejects: OidcProviderConfig::account_claim carries no serde default, so
@@ -85,6 +108,7 @@ for field in name issuer_url client_id client_secret account_claim \
   }
 done
 grep -F 'account_claim = "preferred_username"' "$result" >/dev/null
+"$workspace/target/debug/e6ircd" check-config --config "$(sed -n '1p' "$result")"
 
 # ...and the claim stays operator-selectable.
 env \
@@ -102,3 +126,4 @@ env \
   E6IRC_OIDC_ACCOUNT_CLAIM="email" \
   sh "$workspace/deploy/docker-entrypoint.sh"
 grep -F 'account_claim = "email"' "$result" >/dev/null
+"$workspace/target/debug/e6ircd" check-config --config "$(sed -n '1p' "$result")"
