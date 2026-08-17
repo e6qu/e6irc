@@ -74,6 +74,12 @@ fi
     printf 'issuer_url = "%s"\n' "$(toml "$E6IRC_OIDC_ISSUER")"
     printf 'client_id = "%s"\n' "$(toml "$E6IRC_OIDC_CLIENT_ID")"
     printf 'client_secret = "%s"\n' "$(toml "$E6IRC_OIDC_CLIENT_SECRET")"
+    # OidcProviderConfig::account_claim carries no serde default, so omitting it
+    # is not "take the usual one" -- it fails the whole config parse and e6ircd
+    # exits before it listens. Defaulting to preferred_username matches what
+    # tools/test-shauth-sso.sh configures against Shauth.
+    printf 'account_claim = "%s"\n' \
+      "$(toml "${E6IRC_OIDC_ACCOUNT_CLAIM:-preferred_username}")"
     printf 'token_endpoint_auth_method = "%s"\n' \
       "$(toml "${E6IRC_OIDC_TOKEN_AUTH:-client_secret_post}")"
     printf 'end_session_endpoint = "%s"\n' "$(toml "$E6IRC_OIDC_END_SESSION")"
