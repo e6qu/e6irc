@@ -1276,61 +1276,11 @@ impl AdminNetworkBody {
                 Some(sasl_password),
             ),
         };
-        let network = &request.network;
-        let blank = |value: &str| value.trim().is_empty();
-        let valid = match network.kind {
-            crate::config::NetworkKind::Irc => {
-                !blank(&network.name)
-                    && !blank(&network.addr)
-                    && !blank(&network.nick)
-                    && network
-                        .realname
-                        .as_deref()
-                        .is_some_and(|realname| !blank(realname))
-                    && network.sasl_account.is_some() == network.sasl_password.is_some()
-            }
-            crate::config::NetworkKind::Local => {
-                !blank(&network.name)
-                    && !blank(&network.nick)
-                    && network
-                        .realname
-                        .as_deref()
-                        .is_some_and(|realname| !blank(realname))
-            }
-            crate::config::NetworkKind::Matrix => {
-                !blank(&network.name)
-                    && !blank(&network.addr)
-                    && !blank(&network.nick)
-                    && network
-                        .sasl_password
-                        .as_deref()
-                        .is_some_and(|password| !blank(password))
-                    && network.tls
-            }
-            crate::config::NetworkKind::Discord => {
-                !blank(&network.name)
-                    && network
-                        .sasl_password
-                        .as_deref()
-                        .is_some_and(|password| !blank(password))
-                    && network.tls
-            }
-            crate::config::NetworkKind::Slack => {
-                !blank(&network.name)
-                    && network
-                        .sasl_account
-                        .as_deref()
-                        .is_some_and(|token| !blank(token))
-                    && network
-                        .sasl_password
-                        .as_deref()
-                        .is_some_and(|token| !blank(token))
-                    && network.tls
-            }
-        };
-        valid
-            .then_some(request)
-            .ok_or("The selected network driver has missing or invalid required fields.")
+        request
+            .network
+            .validate_connection_intent()
+            .map_err(|_| "The selected network driver has missing or invalid required fields.")?;
+        Ok(request)
     }
 }
 
