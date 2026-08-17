@@ -19,8 +19,9 @@ request shape before a view uses or sends it. Browser chat does the same for UI
 WebSocket events and composer requests. Immutable console mutation operations
 are checked against the router. Successful mutations refresh their API-backed
 view without a document reload. Bridge provider frames and REST bodies cross
-typed contracts. Server routes emit closed response models for owner, operator,
-and live-connection projections; URL queries and forms reject unknown fields.
+typed contracts. Server routes emit closed response models, including one
+current-schema observability snapshot/history contract; URL queries and forms
+reject unknown fields.
 History accepts one typed cursor window and a bounded page size.
 Chat, console, and identity pages share accessible light and dark palettes.
 Browser tests cover WCAG AA contrast, keyboard focus, Escape dismissal,
