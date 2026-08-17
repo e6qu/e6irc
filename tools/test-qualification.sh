@@ -33,7 +33,20 @@ run() {
     slack) target=slack.com ;;
     oidc) target=https://issuer.example.test ;;
     public-irc) target=libera ;;
-    scale) set -- --executable "$bin" "$@" ;;
+    scale)
+      local output= argument=
+      for argument in "$@"; do
+        if [[ "$output" == --output ]]; then
+          output="$argument"
+          break
+        fi
+        output="$argument"
+      done
+      output="${output#--output}"
+      printf '%s\n' 'qualification-host-provenance' >"$(dirname "$output")/host.txt"
+      printf '%s\n' '{"status":"completed","report":{"outcome":"passed"}}' >"$(dirname "$output")/result.json"
+      set -- --executable "$bin" "$@"
+      ;;
   esac
   "$bin" "$kind" \
     --target "$target" \
@@ -56,7 +69,27 @@ jq -e '
   (.subject.sha256 | test("^[0-9a-f]{64}$")) and
   (.subject | has("path") | not)
 ' "$temporary/passed.json" >/dev/null
-"$bin" verify "$temporary/passed.json"
+"$bin" verify "$temporary/passed.json" \
+  --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --target libera --max-age-seconds 60
+
+if "$bin" verify "$temporary/passed.json" --source bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --target libera --max-age-seconds 60; then
+  echo 'evidence verified for the wrong source revision' >&2
+  exit 1
+fi
+if "$bin" verify "$temporary/passed.json" --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --target oftc --max-age-seconds 60; then
+  echo 'evidence verified for the wrong target' >&2
+  exit 1
+fi
+if "$bin" verify "$temporary/passed.json" --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --target libera --max-age-seconds 0; then
+  echo 'evidence verified without a positive freshness bound' >&2
+  exit 1
+fi
+jq '.started_at_unix_ms = 0 | .finished_at_unix_ms = 0' "$temporary/passed.json" >"$temporary/stale-evidence.json"
+if "$bin" verify "$temporary/stale-evidence.json" --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --target libera --max-age-seconds 60; then
+  echo 'stale evidence unexpectedly verified' >&2
+  exit 1
+fi
 
 if run public-irc --output "$temporary/wrong-subject.json" --executable "$bin" --probe "$pass_probe"; then
   echo 'public IRC campaign accepted a daemon subject' >&2
@@ -67,32 +100,32 @@ fi
 [[ ! -e "$temporary/wrong-subject.json" ]]
 
 jq '.subject.kind = "target_daemon"' "$temporary/passed.json" >"$temporary/wrong-subject-evidence.json"
-if "$bin" verify "$temporary/wrong-subject-evidence.json"; then
+if "$bin" verify "$temporary/wrong-subject-evidence.json" --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --target libera --max-age-seconds 60; then
   echo 'public IRC evidence accepted a daemon subject' >&2
   exit 1
 fi
 
 jq '.subject.sha256 = "g" + .subject.sha256[1:]' "$temporary/passed.json" >"$temporary/nonhex-subject.json"
-if "$bin" verify "$temporary/nonhex-subject.json"; then
+if "$bin" verify "$temporary/nonhex-subject.json" --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --target libera --max-age-seconds 60; then
   echo 'non-hexadecimal subject digest unexpectedly verified' >&2
   exit 1
 fi
 
 jq '.outcome = "passed" | .probe.authentication = "rejected"' \
   "$temporary/passed.json" >"$temporary/inconsistent.json"
-if "$bin" verify "$temporary/inconsistent.json"; then
+if "$bin" verify "$temporary/inconsistent.json" --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --target libera --max-age-seconds 60; then
   echo 'inconsistent evidence unexpectedly verified' >&2
   exit 1
 fi
 
 jq '.unexpected = true' "$temporary/passed.json" >"$temporary/unknown-field.json"
-if "$bin" verify "$temporary/unknown-field.json"; then
+if "$bin" verify "$temporary/unknown-field.json" --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --target libera --max-age-seconds 60; then
   echo 'evidence with an unknown field unexpectedly verified' >&2
   exit 1
 fi
 
 jq '.source |= ascii_upcase' "$temporary/passed.json" >"$temporary/noncanonical-source.json"
-if "$bin" verify "$temporary/noncanonical-source.json"; then
+if "$bin" verify "$temporary/noncanonical-source.json" --source aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --target libera --max-age-seconds 60; then
   echo 'noncanonical source revision unexpectedly verified' >&2
   exit 1
 fi

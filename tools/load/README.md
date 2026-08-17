@@ -123,8 +123,10 @@ E6IRC_QUALIFICATION_HOST=scale-host-01 \
 The third value is the configured core-worker count. The final four values are
 minimum connect rate, minimum fan-out rate, maximum P99 milliseconds, and
 maximum incremental server resident bytes per requested connection. The result
-records the SHA-256 digest of `host.txt`; `qualification.json` adds common
-closed-outcome and phase evidence. Verify both before publishing a claim.
+records the SHA-256 digest of `host.txt`; `qualification.json` records digests
+for both raw files. Verify `qualification.json` with its sibling `result.json`
+and `host.txt`, the source revision, target, and an explicit maximum age before
+publishing a claim.
 
 CI runs 64 clients across eight channels with a four-message burst against a
 real debug daemon, requiring exact fan-out, at least 10 connections/second,

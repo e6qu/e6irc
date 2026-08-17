@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-const USAGE: &str = "usage: e6irc-qualification KIND --target TARGET --source REVISION --host HOST --output PATH --workload NAME=VALUE --budget NAME=VALUE [--executable PATH] [--probe PATH [-- PROBE_ARGS...]]\n       e6irc-qualification verify EVIDENCE";
+const USAGE: &str = "usage: e6irc-qualification KIND --target TARGET --source REVISION --host HOST --output PATH --workload NAME=VALUE --budget NAME=VALUE [--executable PATH] [--probe PATH [-- PROBE_ARGS...]]\n       e6irc-qualification verify EVIDENCE --source REVISION --target TARGET --max-age-seconds SECONDS";
 
 fn main() -> ExitCode {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -613,24 +613,40 @@ enum ClosedOutcome {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct BinaryEvidence {
-    sha256: String,
+    sha256: Sha256Digest,
 }
 
 impl BinaryEvidence {
     fn validate(&self) -> Result<(), String> {
-        if self.sha256.len() != 64
-            || !self
-                .sha256
+        self.sha256.validate("subject.sha256")
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(transparent)]
+struct Sha256Digest(String);
+
+impl Sha256Digest {
+    fn parse(value: String, field: &str) -> Result<Self, String> {
+        if value.len() != 64
+            || !value
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         {
-            return Err("subject.sha256 needs a 64-character hexadecimal digest".into());
+            return Err(format!(
+                "{field} needs a 64-character lowercase hexadecimal digest"
+            ));
         }
-        Ok(())
+        Ok(Self(value))
+    }
+
+    fn validate(&self, field: &str) -> Result<(), String> {
+        Self::parse(self.0.clone(), field).map(|_| ())
     }
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum EvidenceSubject {
     QualificationRunner(BinaryEvidence),
@@ -670,6 +686,7 @@ struct QualificationEvidence {
     workload: Measurements,
     budgets: Measurements,
     credential_environment: Vec<CredentialEnv>,
+    scale_artifacts: Option<ScaleArtifacts>,
     probe: ProbeReport,
     outcome: ClosedOutcome,
 }
@@ -700,6 +717,12 @@ impl QualificationEvidence {
                 return Err(format!("credential_environment omits {required}"));
             }
         }
+        match (self.kind, self.scale_artifacts.as_ref()) {
+            (TargetKind::Scale, Some(artifacts)) => artifacts.validate()?,
+            (TargetKind::Scale, None) => return Err("scale evidence omits raw artifacts".into()),
+            (_, None) => {}
+            (_, Some(_)) => return Err("only scale evidence may contain raw artifacts".into()),
+        }
         if !self.probe.has_valid_applicability(self.kind) {
             return Err("probe has invalid phase applicability".into());
         }
@@ -710,23 +733,245 @@ impl QualificationEvidence {
     }
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ScaleArtifacts {
+    result_sha256: Sha256Digest,
+    host_sha256: Sha256Digest,
+}
+
+impl ScaleArtifacts {
+    fn capture(evidence: &Path) -> Result<Self, String> {
+        let directory = evidence.parent().unwrap_or_else(|| Path::new("."));
+        let digest = |name| {
+            sha256_file(&directory.join(name))
+                .map(Sha256Digest)
+                .map_err(|error| format!("cannot read scale {name}: {error}"))
+        };
+        Ok(Self {
+            result_sha256: digest("result.json")?,
+            host_sha256: digest("host.txt")?,
+        })
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        self.result_sha256
+            .validate("scale_artifacts.result_sha256")?;
+        self.host_sha256.validate("scale_artifacts.host_sha256")
+    }
+
+    fn verify_files(&self, path: &Path, evidence: &QualificationEvidence) -> Result<(), String> {
+        let actual = Self::capture(path)?;
+        if actual.result_sha256.0 != self.result_sha256.0 {
+            return Err("scale result.json digest does not match evidence".into());
+        }
+        if actual.host_sha256.0 != self.host_sha256.0 {
+            return Err("scale host.txt digest does not match evidence".into());
+        }
+        verify_scale_result(
+            &path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("result.json"),
+            evidence,
+            self,
+        )
+    }
+}
+
+struct VerificationContext {
+    source: SourceRevision,
+    target: SafeText,
+    maximum_age_ms: u128,
+}
+
+impl VerificationContext {
+    fn parse(arguments: &[OsString]) -> Result<(&Path, Self), String> {
+        let [
+            path,
+            source_flag,
+            source,
+            target_flag,
+            target,
+            age_flag,
+            age,
+        ] = arguments
+        else {
+            return Err(
+                "verify needs EVIDENCE --source REVISION --target TARGET --max-age-seconds SECONDS"
+                    .into(),
+            );
+        };
+        if source_flag != "--source" || target_flag != "--target" || age_flag != "--max-age-seconds"
+        {
+            return Err(
+                "verify needs EVIDENCE --source REVISION --target TARGET --max-age-seconds SECONDS"
+                    .into(),
+            );
+        }
+        let source = SourceRevision::parse(
+            source
+                .clone()
+                .into_string()
+                .map_err(|_| "--source must be UTF-8")?,
+        )?;
+        let target = SafeText::parse(
+            target
+                .clone()
+                .into_string()
+                .map_err(|_| "--target must be UTF-8")?,
+            "--target",
+        )?;
+        let seconds = age
+            .to_str()
+            .ok_or("--max-age-seconds must be UTF-8")?
+            .parse::<u64>()
+            .map_err(|_| "--max-age-seconds needs a positive integer")?;
+        let maximum_age_ms = u128::from(seconds)
+            .checked_mul(1_000)
+            .filter(|age| *age > 0)
+            .ok_or("--max-age-seconds needs a positive integer")?;
+        Ok((
+            Path::new(path),
+            Self {
+                source,
+                target,
+                maximum_age_ms,
+            },
+        ))
+    }
+
+    fn verify(&self, evidence: &QualificationEvidence, path: &Path) -> Result<(), String> {
+        if evidence.source.0 != self.source.0 {
+            return Err("evidence source does not match the required revision".into());
+        }
+        if evidence.target.as_str() != self.target.0 {
+            return Err("evidence target does not match the required target".into());
+        }
+        let now = now_ms();
+        let age = now
+            .checked_sub(evidence.finished_at_unix_ms)
+            .ok_or("evidence finished in the future")?;
+        if age > self.maximum_age_ms {
+            return Err("evidence exceeds the permitted age".into());
+        }
+        if let Some(artifacts) = evidence.scale_artifacts.as_ref() {
+            artifacts.verify_files(path, evidence)?;
+        }
+        Ok(())
+    }
+}
+
+fn verify_scale_result(
+    path: &Path,
+    evidence: &QualificationEvidence,
+    artifacts: &ScaleArtifacts,
+) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_slice(
+        &fs::read(path).map_err(|error| format!("cannot read scale result.json: {error}"))?,
+    )
+    .map_err(|error| format!("cannot parse scale result.json: {error}"))?;
+    let report = value
+        .get("report")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("scale result.json omits its report object")?;
+    if report
+        .get("format_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(2)
+    {
+        return Err("scale result.json has an unsupported format version".into());
+    }
+    let request = report
+        .get("request")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("scale result.json omits its request object")?;
+    if request.get("addr").and_then(serde_json::Value::as_str) != Some(evidence.target.as_str()) {
+        return Err("scale result.json target does not match evidence".into());
+    }
+    if request
+        .get("host_provenance_sha256")
+        .and_then(serde_json::Value::as_str)
+        != Some(artifacts.host_sha256.0.as_str())
+    {
+        return Err("scale result.json host provenance does not match evidence".into());
+    }
+    for name in ["clients", "channels", "burst"] {
+        let expected = evidence
+            .workload
+            .0
+            .get(name)
+            .ok_or_else(|| format!("scale evidence omits workload {name}"))?
+            .0
+            .parse::<u64>()
+            .map_err(|_| format!("scale workload {name} must be an integer"))?;
+        if request.get(name).and_then(serde_json::Value::as_u64) != Some(expected) {
+            return Err(format!(
+                "scale result.json workload {name} does not match evidence"
+            ));
+        }
+    }
+    let thresholds = request
+        .get("thresholds")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("scale result.json omits its thresholds object")?;
+    for (evidence_name, result_name) in [
+        ("minimum_connect_rate", "minimum_connect_rate"),
+        ("minimum_fanout_rate", "minimum_fanout_rate"),
+        ("maximum_p99_ms", "maximum_p99_ms"),
+        (
+            "maximum_rss_per_connection",
+            "maximum_server_rss_per_connection_bytes",
+        ),
+    ] {
+        let expected = evidence
+            .budgets
+            .0
+            .get(evidence_name)
+            .ok_or_else(|| format!("scale evidence omits budget {evidence_name}"))?
+            .0
+            .parse::<f64>()
+            .map_err(|_| format!("scale budget {evidence_name} is invalid"))?;
+        if thresholds
+            .get(result_name)
+            .and_then(serde_json::Value::as_f64)
+            != Some(expected)
+        {
+            return Err(format!(
+                "scale result.json budget {evidence_name} does not match evidence"
+            ));
+        }
+    }
+    let expected_outcome = match (
+        value.get("status").and_then(serde_json::Value::as_str),
+        report.get("outcome").and_then(serde_json::Value::as_str),
+    ) {
+        (Some("completed"), Some("passed")) => ClosedOutcome::Passed,
+        (Some("completed"), Some("rejected")) => ClosedOutcome::Rejected,
+        (Some("failed"), None) => ClosedOutcome::Failed,
+        _ => return Err("scale result.json has an invalid status or outcome".into()),
+    };
+    if evidence.outcome != expected_outcome {
+        return Err("scale result.json outcome does not match evidence".into());
+    }
+    Ok(())
+}
+
 fn verify(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
     let arguments = arguments.into_iter().collect::<Vec<_>>();
-    let [path] = arguments.as_slice() else {
-        eprintln!("e6irc-qualification: verify needs one evidence path\n{USAGE}");
-        return ExitCode::from(2);
-    };
-    let path = PathBuf::from(path);
-    let result = fs::read(&path)
-        .map_err(|error| format!("cannot read evidence: {error}"))
-        .and_then(|bytes| {
-            serde_json::from_slice::<QualificationEvidence>(&bytes)
-                .map_err(|error| format!("cannot parse evidence: {error}"))
-        })
-        .and_then(|evidence| {
-            evidence.validate()?;
-            Ok((evidence.kind.name(), evidence.outcome))
-        });
+    let result = VerificationContext::parse(&arguments).and_then(|(path, context)| {
+        fs::read(path)
+            .map_err(|error| format!("cannot read evidence: {error}"))
+            .and_then(|bytes| {
+                serde_json::from_slice::<QualificationEvidence>(&bytes)
+                    .map_err(|error| format!("cannot parse evidence: {error}"))
+            })
+            .and_then(|evidence| {
+                evidence.validate()?;
+                context.verify(&evidence, path)?;
+                Ok((evidence.kind.name(), evidence.outcome))
+            })
+    });
     match result {
         Ok((kind, outcome)) => {
             println!("e6irc-qualification: verified {kind} evidence with {outcome:?} outcome");
@@ -779,6 +1024,17 @@ fn run(args: Campaign) -> ExitCode {
             (ProbeReport::not_run(args.kind), ClosedOutcome::Failed)
         }
     };
+    let scale_artifacts = if matches!(args.kind, TargetKind::Scale) {
+        match ScaleArtifacts::capture(&args.output) {
+            Ok(artifacts) => Some(artifacts),
+            Err(error) => {
+                eprintln!("e6irc-qualification: cannot retain scale raw evidence: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
     let evidence = QualificationEvidence {
         format_version: 2,
         kind: args.kind,
@@ -791,6 +1047,7 @@ fn run(args: Campaign) -> ExitCode {
         workload: args.workload,
         budgets: args.budgets,
         credential_environment: args.credentials,
+        scale_artifacts,
         probe: report,
         outcome,
     };
@@ -808,19 +1065,25 @@ fn run(args: Campaign) -> ExitCode {
 
 fn evidence_subject(args: &Campaign) -> std::io::Result<EvidenceSubject> {
     match args.executable.as_deref() {
-        Some(path) => {
-            sha256_file(path).map(|sha256| EvidenceSubject::TargetDaemon(BinaryEvidence { sha256 }))
-        }
+        Some(path) => sha256_file(path).map(|sha256| {
+            EvidenceSubject::TargetDaemon(BinaryEvidence {
+                sha256: Sha256Digest(sha256),
+            })
+        }),
         None => std::env::current_exe()
             .and_then(|path| sha256_file(&path))
-            .map(|sha256| EvidenceSubject::QualificationRunner(BinaryEvidence { sha256 })),
+            .map(|sha256| {
+                EvidenceSubject::QualificationRunner(BinaryEvidence {
+                    sha256: Sha256Digest(sha256),
+                })
+            }),
     }
 }
 
 fn subject_sha256(subject: &EvidenceSubject) -> &str {
     match subject {
         EvidenceSubject::QualificationRunner(binary) | EvidenceSubject::TargetDaemon(binary) => {
-            &binary.sha256
+            &binary.sha256.0
         }
     }
 }
@@ -978,6 +1241,98 @@ mod tests {
         assert!(
             CampaignTarget::parse(TargetKind::Oidc, "https://issuer.localhost".into()).is_err()
         );
+    }
+
+    #[test]
+    fn scale_evidence_binds_the_raw_result_and_host() {
+        let directory = std::env::temp_dir().join(format!(
+            "e6irc-qualification-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir(&directory).expect("create test directory");
+        let evidence_path = directory.join("qualification.json");
+        let host_path = directory.join("host.txt");
+        fs::write(&host_path, "controlled host\n").expect("write host provenance");
+        let host_sha256 = sha256_file(&host_path).expect("hash host provenance");
+        let result = |target: &str| {
+            format!(
+                r#"{{"status":"completed","report":{{"format_version":2,"request":{{"addr":"{target}","clients":2,"channels":1,"burst":3,"host_provenance_sha256":"{host_sha256}","thresholds":{{"minimum_connect_rate":1.0,"minimum_fanout_rate":2.0,"maximum_p99_ms":3.0,"maximum_server_rss_per_connection_bytes":4}}}},"outcome":"passed"}}}}"#
+            )
+        };
+        let result_path = directory.join("result.json");
+        fs::write(&result_path, result("127.0.0.1:6667")).expect("write result");
+        let mut evidence = QualificationEvidence {
+            format_version: 2,
+            kind: TargetKind::Scale,
+            target: CampaignTarget::parse(TargetKind::Scale, "127.0.0.1:6667".into())
+                .expect("scale target"),
+            source: SourceRevision::parse("a".repeat(40)).expect("source"),
+            subject: EvidenceSubject::TargetDaemon(BinaryEvidence {
+                sha256: Sha256Digest("b".repeat(64)),
+            }),
+            host: EvidenceHost::parse("scale-host".into(), "host").expect("host"),
+            started_at_unix_ms: now_ms(),
+            finished_at_unix_ms: now_ms(),
+            workload: Measurements::parse(
+                vec![
+                    "core_workers=1".into(),
+                    "clients=2".into(),
+                    "channels=1".into(),
+                    "burst=3".into(),
+                ],
+                "workload",
+            )
+            .expect("workload"),
+            budgets: Measurements::parse(
+                vec![
+                    "minimum_connect_rate=1".into(),
+                    "minimum_fanout_rate=2".into(),
+                    "maximum_p99_ms=3".into(),
+                    "maximum_rss_per_connection=4".into(),
+                ],
+                "budget",
+            )
+            .expect("budgets"),
+            credential_environment: Vec::new(),
+            scale_artifacts: Some(ScaleArtifacts::capture(&evidence_path).expect("capture raw")),
+            probe: ProbeReport {
+                authentication: PhaseOutcome::Passed,
+                delivery: PhaseOutcome::Passed,
+                reconnect: PhaseOutcome::NotApplicable,
+                cleanup: PhaseOutcome::Passed,
+                persistence: PhaseOutcome::NotApplicable,
+            },
+            outcome: ClosedOutcome::Passed,
+        };
+        evidence.validate().expect("validate evidence");
+        evidence
+            .scale_artifacts
+            .as_ref()
+            .expect("artifacts")
+            .verify_files(&evidence_path, &evidence)
+            .expect("verify raw evidence");
+
+        fs::write(&result_path, result("127.0.0.1:6668")).expect("rewrite result");
+        assert!(
+            evidence
+                .scale_artifacts
+                .as_ref()
+                .expect("artifacts")
+                .verify_files(&evidence_path, &evidence)
+                .is_err()
+        );
+        evidence.scale_artifacts =
+            Some(ScaleArtifacts::capture(&evidence_path).expect("recapture raw"));
+        assert!(
+            evidence
+                .scale_artifacts
+                .as_ref()
+                .expect("artifacts")
+                .verify_files(&evidence_path, &evidence)
+                .is_err()
+        );
+        fs::remove_dir_all(directory).expect("remove test directory");
     }
 
     #[test]

@@ -411,6 +411,12 @@ struct DiscordMessageCreate<'a> {
 #[derive(Deserialize, Serialize)]
 struct DiscordHello {
     op: u8,
+    d: DiscordHelloData,
+}
+
+#[derive(Deserialize, Serialize)]
+struct DiscordHelloData {
+    heartbeat_interval: u64,
 }
 
 #[derive(Serialize)]
@@ -434,9 +440,10 @@ struct DiscordIdentifyProperties {
 }
 
 #[derive(Deserialize)]
-struct DiscordReady {
+struct DiscordGatewayEvent {
+    op: u8,
     #[serde(rename = "t")]
-    event: DiscordReadyEvent,
+    event: Option<DiscordReadyEvent>,
 }
 
 #[derive(Deserialize)]
@@ -690,7 +697,10 @@ async fn discord_connect(url: &CampaignSocketUrl, token: &Secret) -> PhaseOutcom
     let Some(Ok(Message::Text(frame))) = hello else {
         return PhaseOutcome::Failed;
     };
-    if !matches!(serde_json::from_str(&frame), Ok(DiscordHello { op: 10 })) {
+    let Ok(DiscordHello { op: 10, d: hello }) = serde_json::from_str(&frame) else {
+        return PhaseOutcome::Rejected;
+    };
+    if hello.heartbeat_interval == 0 {
         return PhaseOutcome::Rejected;
     }
     let identify = DiscordIdentify {
@@ -711,23 +721,33 @@ async fn discord_connect(url: &CampaignSocketUrl, token: &Secret) -> PhaseOutcom
     if socket.send(Message::Text(identify.into())).await.is_err() {
         return PhaseOutcome::Failed;
     }
-    let ready = tokio::time::timeout(TIMEOUT, socket.next())
-        .await
-        .ok()
-        .flatten();
-    let outcome = match ready {
-        Some(Ok(Message::Text(frame)))
-            if matches!(
-                serde_json::from_str(&frame),
-                Ok(DiscordReady {
-                    event: DiscordReadyEvent::Ready
-                })
-            ) =>
-        {
-            PhaseOutcome::Passed
+    let mut heartbeat = tokio::time::interval(Duration::from_millis(hello.heartbeat_interval));
+    heartbeat.tick().await;
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    let outcome = loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break PhaseOutcome::Failed,
+            _ = heartbeat.tick() => {
+                if socket.send(Message::Text(r#"{"op":1,"d":null}"#.into())).await.is_err() {
+                    break PhaseOutcome::Failed;
+                }
+            }
+            frame = socket.next() => match frame {
+                Some(Ok(Message::Text(frame))) => match serde_json::from_str(&frame) {
+                    Ok(DiscordGatewayEvent { op: 0, event: Some(DiscordReadyEvent::Ready) }) => break PhaseOutcome::Passed,
+                    Ok(DiscordGatewayEvent { op: 9, .. }) => break PhaseOutcome::Rejected,
+                    Ok(DiscordGatewayEvent { op: 1, .. }) => {
+                        if socket.send(Message::Text(r#"{"op":1,"d":null}"#.into())).await.is_err() {
+                            break PhaseOutcome::Failed;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break PhaseOutcome::Rejected,
+                },
+                Some(Ok(Message::Close(_))) => break PhaseOutcome::Rejected,
+                Some(Ok(_)) | Some(Err(_)) | None => break PhaseOutcome::Failed,
+            },
         }
-        Some(Ok(_)) => PhaseOutcome::Rejected,
-        Some(Err(_)) | None => PhaseOutcome::Failed,
     };
     let _ = socket.close(None).await;
     outcome

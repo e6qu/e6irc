@@ -6,9 +6,11 @@ digest, host, target, workload, budgets, start/end times, phase results, and a
 closed `passed`, `rejected`, or `failed` outcome. Only every required phase
 passed can produce `passed`.
 
-Use `e6irc-qualification verify EVIDENCE` before retaining or publishing a
-file. It accepts only the current closed schema, valid non-secret metadata,
-valid phase applicability, and an outcome that matches the recorded phases.
+Use `e6irc-qualification verify EVIDENCE --source REVISION --target TARGET
+--max-age-seconds SECONDS` before retaining or publishing a file. It accepts
+only the current closed schema, the required source and target, fresh
+non-secret metadata, valid phase applicability, and an outcome that matches
+the recorded phases.
 
 Build it with `cargo build --release -p e6irc-qualification`. Every command
 needs a non-secret target identifier, source revision, host, executable, new
@@ -60,9 +62,12 @@ output path for every run.
 `public-irc-probe.sh` runs the ignored BNC-driver probe for Libera, OFTC, or
 Ergo targets. It makes two sequential TLS sessions to prove registration,
 reconnect, and cleanup. `scale-probe.sh`
-wraps `e6irc-load`; `qualify-linux.sh` writes its load result, host provenance,
-and common qualification evidence together. Set `E6IRC_QUALIFICATION_HOST` to
-a non-secret host label; it validates the label before host inspection or load.
+wraps `e6irc-load`; `qualify-linux.sh` writes `result.json`, `host.txt`, and
+`qualification.json` together. Scale evidence contains the digests of both raw
+files. Verification requires the sibling files and checks their digests,
+host provenance, target, workload, budgets, and outcome. Set
+`E6IRC_QUALIFICATION_HOST` to a non-secret host label; it validates the label
+before host inspection or load.
 
 ## Live campaigns
 
@@ -104,8 +109,9 @@ The workflow sets provider credentials only from these repository secrets:
 
 The workflow never sets a Discord or Slack test endpoint. These campaigns use
 the public provider endpoints. Missing credentials or required inputs fail the
-run and do not create a passed record. A verified evidence file is the only
-uploaded artifact. Rejected and failed campaigns retain verified evidence too.
+run and do not create a passed record. Provider and public-network campaigns
+upload one verified evidence file. Scale uploads its verified three-file
+evidence package. Rejected and failed campaigns retain verified evidence too.
 
 The `scale` campaign runs only on a self-hosted runner with the
 `qualification-scale` label. Start the target `e6ircd` there first. Set

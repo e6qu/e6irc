@@ -1426,6 +1426,11 @@ cannot cross between the external and loopback trust domains. Signed provider
 WebSocket query parameters stay inside the typed endpoint and never enter
 evidence.
 
+Qualification verification binds evidence to an explicit source revision,
+target, and freshness limit. Scale evidence also binds the retained raw load
+result and host provenance by digest and verifies their target, budgets,
+workload, host digest, and outcome before acceptance.
+
 Design constraints recorded now:
 
 - Per-user ("personal bouncer", Bitlbee-style) mode is the primary mode and
