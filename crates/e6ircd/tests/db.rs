@@ -13,6 +13,33 @@ use tokio::net::TcpStream;
 
 mod support;
 
+static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+const MANAGED_CONFIG_0052_FIELDS: &[&str] = &[
+    "server_name",
+    "network_name",
+    "description",
+    "motd",
+    "nicklen",
+    "sendq",
+    "core_queue",
+    "core_workers",
+    "max_hot_channels",
+    "listeners",
+    "registration",
+    "limits",
+    "observability",
+    "storage",
+    "bnc_addr",
+    "public_url",
+    "secure_cookies",
+    "admin_accounts",
+    "oidc_providers",
+    "opers",
+    "networks",
+    "credentials_from_bootstrap",
+];
+
 fn audit_page_size(value: usize) -> db::AuditLogPageSize {
     db::AuditLogPageSize::new(value).expect("test audit page size is in range")
 }
@@ -3266,8 +3293,6 @@ async fn channel_mlock_persist_and_load() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn channel_mlock_migration_normalizes_historical_rows() {
-    static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
-
     let url = support::test_db("channel_mlock_migration_normalizes_historical_rows").await;
     let pool = sqlx::PgPool::connect(&url).await.expect("connect");
     MIGRATIONS
@@ -3307,6 +3332,169 @@ async fn channel_mlock_migration_normalizes_historical_rows() {
             ("#reordered".into(), Some("+nt-i".into())),
         ]
     );
+}
+
+fn managed_settings_with_oidc_providers(
+    providers: Option<Vec<serde_json::Value>>,
+) -> serde_json::Value {
+    let managed = e6ircd::config::ManagedConfig::from_config(&Config::default(), None)
+        .expect("bootstrap managed settings");
+    let mut settings = serde_json::to_value(managed).expect("serialize managed settings");
+    settings
+        .as_object_mut()
+        .expect("managed settings object")
+        .retain(|field, _| MANAGED_CONFIG_0052_FIELDS.contains(&field.as_str()));
+    match providers {
+        Some(providers) => settings["oidc_providers"] = serde_json::Value::Array(providers),
+        None => {
+            settings
+                .as_object_mut()
+                .expect("managed settings object")
+                .remove("oidc_providers");
+        }
+    }
+    settings
+}
+
+fn oidc_provider(name: &str, account_claim: Option<&str>) -> serde_json::Value {
+    let mut provider = serde_json::json!({
+        "name": name,
+        "issuer_url": format!("https://{name}.example"),
+        "client_id": "e6irc",
+        "client_secret": "sealed",
+        "scopes": ["openid", "profile"],
+        "allowed_email_domains": [],
+        "end_session_endpoint": null,
+        "token_endpoint_auth_method": "client_secret_basic"
+    });
+    if let Some(account_claim) = account_claim {
+        provider["account_claim"] = serde_json::Value::String(account_claim.into());
+    }
+    provider
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn managed_config_migration_backfills_legacy_oidc_claims() {
+    let pool = sqlx::PgPool::connect(
+        &support::test_db("managed_config_migration_backfills_legacy_oidc_claims").await,
+    )
+    .await
+    .expect("connect");
+    MIGRATIONS
+        .run_to(52, &pool)
+        .await
+        .expect("migrate through 0052");
+    let settings = managed_settings_with_oidc_providers(Some(vec![
+        oidc_provider("legacy-first", None),
+        oidc_provider("explicit-email", Some("email")),
+        oidc_provider("legacy-last", None),
+    ]));
+    sqlx::query(
+        "INSERT INTO server_settings (singleton, revision, settings, updated_by)
+         VALUES (TRUE, 1, $1, 'legacy')",
+    )
+    .bind(settings)
+    .execute(&pool)
+    .await
+    .expect("legacy settings");
+
+    MIGRATIONS.run(&pool).await.expect("migrate current");
+    let loaded = db::load_managed_config(&pool)
+        .await
+        .expect("typed settings after migration");
+    assert_eq!(
+        loaded
+            .settings
+            .oidc_providers
+            .iter()
+            .map(|provider| (provider.name.clone(), provider.account_claim))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "legacy-first".to_string(),
+                e6ircd::config::OidcAccountClaim::PreferredUsername,
+            ),
+            (
+                "explicit-email".to_string(),
+                e6ircd::config::OidcAccountClaim::Email,
+            ),
+            (
+                "legacy-last".to_string(),
+                e6ircd::config::OidcAccountClaim::PreferredUsername,
+            ),
+        ]
+    );
+
+    let before: serde_json::Value =
+        sqlx::query_scalar("SELECT settings FROM server_settings WHERE singleton")
+            .fetch_one(&pool)
+            .await
+            .expect("migrated settings");
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0053_oidc_account_claim_backfill.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("repeat migration");
+    let after: serde_json::Value =
+        sqlx::query_scalar("SELECT settings FROM server_settings WHERE singleton")
+            .fetch_one(&pool)
+            .await
+            .expect("repeated settings");
+    assert_eq!(after, before, "backfill is idempotent");
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn managed_config_migration_leaves_empty_or_absent_provider_lists_unchanged() {
+    let pool = sqlx::PgPool::connect(
+        &support::test_db(
+            "managed_config_migration_leaves_empty_or_absent_provider_lists_unchanged",
+        )
+        .await,
+    )
+    .await
+    .expect("connect");
+    MIGRATIONS
+        .run_to(52, &pool)
+        .await
+        .expect("migrate through 0052");
+    let empty = managed_settings_with_oidc_providers(Some(Vec::new()));
+    sqlx::query(
+        "INSERT INTO server_settings (singleton, revision, settings, updated_by)
+         VALUES (TRUE, 1, $1, 'legacy')",
+    )
+    .bind(empty)
+    .execute(&pool)
+    .await
+    .expect("empty provider list");
+    MIGRATIONS.run(&pool).await.expect("migrate current");
+    let empty_after: serde_json::Value =
+        sqlx::query_scalar("SELECT settings FROM server_settings WHERE singleton")
+            .fetch_one(&pool)
+            .await
+            .expect("empty settings");
+    assert_eq!(empty_after["oidc_providers"], serde_json::json!([]));
+
+    let absent = managed_settings_with_oidc_providers(None);
+    sqlx::query("UPDATE server_settings SET settings = $1 WHERE singleton")
+        .bind(absent)
+        .execute(&pool)
+        .await
+        .expect("absent provider list");
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0053_oidc_account_claim_backfill.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("repeat migration for absent list");
+    let absent_after: serde_json::Value =
+        sqlx::query_scalar("SELECT settings FROM server_settings WHERE singleton")
+            .fetch_one(&pool)
+            .await
+            .expect("absent settings");
+    assert!(absent_after.get("oidc_providers").is_none());
 }
 
 #[tokio::test]

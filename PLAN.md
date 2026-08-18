@@ -24,6 +24,9 @@ current-schema observability snapshot/history contract; URL queries and forms
 reject unknown fields. Owner, administrator, and static network creation use
 the same explicit driver, transport, and identity fields; kind-specific
 requests reject incompatible fields.
+Container startup validates rendered TOML through the daemon parser. Managed
+configuration schema changes migrate persisted rows with their historic explicit
+behavior; new configuration never receives an implicit decode default.
 History accepts one typed cursor window and a bounded page size.
 Chat, console, and identity pages share accessible light and dark palettes.
 Browser tests cover WCAG AA contrast, keyboard focus, Escape dismissal,
