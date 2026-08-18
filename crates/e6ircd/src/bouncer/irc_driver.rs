@@ -300,12 +300,15 @@ fn classify_registration(
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             RegistrationResult::AuthRejected
         }
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::Unsupported => {
+            RegistrationResult::Rejected(e6irc_client::RegistrationRejection::without_diagnostic(
+                e6irc_client::RegistrationRefusal::NotRegistered,
+            ))
+        }
         Ok(Err(e))
             if matches!(
                 e.kind(),
-                std::io::ErrorKind::ConnectionRefused
-                    | std::io::ErrorKind::Other
-                    | std::io::ErrorKind::Unsupported
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::Other
             ) =>
         {
             RegistrationResult::Failed
