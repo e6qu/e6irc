@@ -86,7 +86,7 @@ pub struct IrcPreflight {
 /// Closed failure taxonomy for an IRC preflight. Raw resolver, TLS, and server
 /// errors stay in the server log; the API exposes only these actionable,
 /// non-secret stages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IrcPreflightFailure {
     InvalidAddress,
     NameResolutionFailed,
@@ -95,18 +95,18 @@ pub enum IrcPreflightFailure {
     SecureConnectionFailed,
     ConnectionTimedOut,
     AuthenticationRejected,
-    RegistrationRejected,
-    InvalidNickname,
-    InvalidUsername,
-    NicknameInUse,
-    ServerPasswordRejected,
-    NetworkBanned,
+    RegistrationRejected(Option<e6irc_client::RegistrationRejection>),
+    InvalidNickname(Option<e6irc_client::RegistrationRejection>),
+    InvalidUsername(Option<e6irc_client::RegistrationRejection>),
+    NicknameInUse(Option<e6irc_client::RegistrationRejection>),
+    ServerPasswordRejected(Option<e6irc_client::RegistrationRejection>),
+    NetworkBanned(Option<e6irc_client::RegistrationRejection>),
     RegistrationFailed,
     RegistrationTimedOut,
 }
 
 impl IrcPreflightFailure {
-    pub const fn code(self) -> &'static str {
+    pub const fn code(&self) -> &'static str {
         match self {
             Self::InvalidAddress => "invalid_address",
             Self::NameResolutionFailed => "name_resolution_failed",
@@ -115,18 +115,18 @@ impl IrcPreflightFailure {
             Self::SecureConnectionFailed => "secure_connection_failed",
             Self::ConnectionTimedOut => "connection_timed_out",
             Self::AuthenticationRejected => "authentication_rejected",
-            Self::RegistrationRejected => "registration_rejected",
-            Self::InvalidNickname => "invalid_nickname",
-            Self::InvalidUsername => "invalid_username",
-            Self::NicknameInUse => "nickname_in_use",
-            Self::ServerPasswordRejected => "server_password_rejected",
-            Self::NetworkBanned => "network_banned",
+            Self::RegistrationRejected(_) => "registration_rejected",
+            Self::InvalidNickname(_) => "invalid_nickname",
+            Self::InvalidUsername(_) => "invalid_username",
+            Self::NicknameInUse(_) => "nickname_in_use",
+            Self::ServerPasswordRejected(_) => "server_password_rejected",
+            Self::NetworkBanned(_) => "network_banned",
             Self::RegistrationFailed => "registration_failed",
             Self::RegistrationTimedOut => "registration_timed_out",
         }
     }
 
-    pub const fn summary(self) -> &'static str {
+    pub const fn summary(&self) -> &'static str {
         match self {
             Self::InvalidAddress => "The upstream address is not a valid host and port.",
             Self::NameResolutionFailed => "The upstream hostname could not be resolved.",
@@ -139,14 +139,28 @@ impl IrcPreflightFailure {
             }
             Self::ConnectionTimedOut => "Connecting to the upstream timed out.",
             Self::AuthenticationRejected => "The upstream rejected the SASL credentials.",
-            Self::RegistrationRejected => "The upstream rejected IRC registration.",
-            Self::InvalidNickname => "The upstream rejected the configured nickname.",
-            Self::InvalidUsername => "The upstream rejected the IRC username.",
-            Self::NicknameInUse => "The configured nickname is already in use.",
-            Self::ServerPasswordRejected => "The upstream rejected the configured server password.",
-            Self::NetworkBanned => "The upstream network banned this connection.",
+            Self::RegistrationRejected(_) => "The upstream rejected IRC registration.",
+            Self::InvalidNickname(_) => "The upstream rejected the configured nickname.",
+            Self::InvalidUsername(_) => "The upstream rejected the IRC username.",
+            Self::NicknameInUse(_) => "The configured nickname is already in use.",
+            Self::ServerPasswordRejected(_) => {
+                "The upstream rejected the configured server password."
+            }
+            Self::NetworkBanned(_) => "The upstream network banned this connection.",
             Self::RegistrationFailed => "IRC registration failed before a welcome was received.",
             Self::RegistrationTimedOut => "IRC registration timed out.",
+        }
+    }
+
+    pub fn diagnostic(&self) -> Option<&str> {
+        match self {
+            Self::RegistrationRejected(rejection)
+            | Self::InvalidNickname(rejection)
+            | Self::InvalidUsername(rejection)
+            | Self::NicknameInUse(rejection)
+            | Self::ServerPasswordRejected(rejection)
+            | Self::NetworkBanned(rejection) => rejection.as_ref().map(|value| value.diagnostic()),
+            _ => None,
         }
     }
 }
@@ -201,9 +215,9 @@ pub async fn preflight_irc(config: &NetworkConfig) -> Result<IrcPreflight, IrcPr
     let confirmed_nick = match tokio::time::timeout(Duration::from_secs(30), registration).await {
         Ok(Ok(confirmed_nick)) => confirmed_nick,
         Ok(Err(error))
-            if let Some(refusal) = e6irc_client::RegistrationRefusal::from_error(&error) =>
+            if let Some(rejection) = e6irc_client::RegistrationRejection::from_error(&error) =>
         {
-            return Err(preflight_refusal(refusal));
+            return Err(preflight_refusal(Some(rejection)));
         }
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
             return Err(IrcPreflightFailure::AuthenticationRejected);
@@ -216,7 +230,7 @@ pub async fn preflight_irc(config: &NetworkConfig) -> Result<IrcPreflight, IrcPr
                     | std::io::ErrorKind::Unsupported
             ) =>
         {
-            return Err(IrcPreflightFailure::RegistrationRejected);
+            return Err(IrcPreflightFailure::RegistrationRejected(None));
         }
         Ok(Err(error)) => {
             eprintln!("irc preflight: registration failed: {error}");
@@ -263,8 +277,8 @@ struct SharedDriver {
 enum RegistrationResult {
     Ok(String),
     AuthRejected,
-    NickInUse,
-    Rejected(e6irc_client::RegistrationRefusal),
+    NickInUse(e6irc_client::RegistrationRejection),
+    Rejected(e6irc_client::RegistrationRejection),
     Failed,
     TimedOut,
 }
@@ -274,11 +288,13 @@ fn classify_registration(
 ) -> RegistrationResult {
     match result {
         Ok(Ok(nick)) => RegistrationResult::Ok(nick),
-        Ok(Err(e)) if let Some(refusal) = e6irc_client::RegistrationRefusal::from_error(&e) => {
+        Ok(Err(e)) if let Some(rejection) = e6irc_client::RegistrationRejection::from_error(&e) => {
             eprintln!("irc registration rejected: {e}");
-            match refusal {
-                e6irc_client::RegistrationRefusal::NicknameInUse => RegistrationResult::NickInUse,
-                refusal => RegistrationResult::Rejected(refusal),
+            match rejection.refusal() {
+                e6irc_client::RegistrationRefusal::NicknameInUse => {
+                    RegistrationResult::NickInUse(rejection)
+                }
+                _ => RegistrationResult::Rejected(rejection),
             }
         }
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -292,7 +308,7 @@ fn classify_registration(
                     | std::io::ErrorKind::Unsupported
             ) =>
         {
-            RegistrationResult::Rejected(e6irc_client::RegistrationRefusal::NotRegistered)
+            RegistrationResult::Failed
         }
         Ok(Err(_)) => RegistrationResult::Failed,
         Err(_) => RegistrationResult::TimedOut,
@@ -305,9 +321,9 @@ fn into_outcome(result: RegistrationResult) -> Result<String, super::SessionOutc
     match result {
         RegistrationResult::Ok(nick) => Ok(nick),
         RegistrationResult::AuthRejected => Err(super::SessionOutcome::AuthRejected),
-        RegistrationResult::NickInUse => Err(super::SessionOutcome::RegistrationRejected(
-            e6irc_client::RegistrationRefusal::NicknameInUse,
-        )),
+        RegistrationResult::NickInUse(rejection) => {
+            Err(super::SessionOutcome::RegistrationRejected(rejection))
+        }
         RegistrationResult::Rejected(rejection) => {
             Err(super::SessionOutcome::RegistrationRejected(rejection))
         }
@@ -316,17 +332,30 @@ fn into_outcome(result: RegistrationResult) -> Result<String, super::SessionOutc
     }
 }
 
-fn preflight_refusal(refusal: e6irc_client::RegistrationRefusal) -> IrcPreflightFailure {
-    match refusal {
-        e6irc_client::RegistrationRefusal::InvalidNickname => IrcPreflightFailure::InvalidNickname,
-        e6irc_client::RegistrationRefusal::InvalidUsername => IrcPreflightFailure::InvalidUsername,
-        e6irc_client::RegistrationRefusal::NicknameInUse => IrcPreflightFailure::NicknameInUse,
-        e6irc_client::RegistrationRefusal::ServerPasswordRejected => {
-            IrcPreflightFailure::ServerPasswordRejected
+fn preflight_refusal(
+    rejection: Option<e6irc_client::RegistrationRejection>,
+) -> IrcPreflightFailure {
+    let Some(rejection) = rejection else {
+        return IrcPreflightFailure::RegistrationRejected(None);
+    };
+    match rejection.refusal() {
+        e6irc_client::RegistrationRefusal::InvalidNickname => {
+            IrcPreflightFailure::InvalidNickname(Some(rejection))
         }
-        e6irc_client::RegistrationRefusal::NetworkBanned => IrcPreflightFailure::NetworkBanned,
+        e6irc_client::RegistrationRefusal::InvalidUsername => {
+            IrcPreflightFailure::InvalidUsername(Some(rejection))
+        }
+        e6irc_client::RegistrationRefusal::NicknameInUse => {
+            IrcPreflightFailure::NicknameInUse(Some(rejection))
+        }
+        e6irc_client::RegistrationRefusal::ServerPasswordRejected => {
+            IrcPreflightFailure::ServerPasswordRejected(Some(rejection))
+        }
+        e6irc_client::RegistrationRefusal::NetworkBanned => {
+            IrcPreflightFailure::NetworkBanned(Some(rejection))
+        }
         e6irc_client::RegistrationRefusal::NotRegistered => {
-            IrcPreflightFailure::RegistrationRejected
+            IrcPreflightFailure::RegistrationRejected(Some(rejection))
         }
     }
 }
@@ -368,7 +397,7 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
         result = tokio::time::timeout(Duration::from_secs(30), register_fut) => result,
     };
     let mut current_nick = match classify_registration(registration) {
-        RegistrationResult::NickInUse if config.sasl.is_none() => {
+        RegistrationResult::NickInUse(_) if config.sasl.is_none() => {
             // A lingering ghost of our own previous session (not yet timed out
             // upstream) holds the nick. Offer one replacement rather than
             // parking a healthy network until an operator intervenes. SASL
@@ -807,18 +836,18 @@ mod tests {
     }
 
     #[test]
-    fn registration_error_line_is_a_terminal_rejection() {
+    fn generic_registration_error_is_not_mislabeled_as_a_server_refusal() {
         let error = std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             "server refused registration",
         );
         assert!(matches!(
             classify_registration(Ok(Err(error))),
-            RegistrationResult::Rejected(e6irc_client::RegistrationRefusal::NotRegistered)
+            RegistrationResult::Failed
         ));
     }
 
-    async fn assert_live_driver(network: &str, addr: &str) {
+    async fn assert_live_driver(network: &str, addr: &str, autojoin: &[&str]) {
         for attempt in 0..2 {
             let nick = format!("e6b{:04}{attempt}", std::process::id() % 10000);
             let handle = IrcNetwork::start(NetworkConfig {
@@ -827,6 +856,10 @@ mod tests {
                 nick,
                 realname: "e6irc BNC interop probe".into(),
                 buffer_cap: 32,
+                autojoin: autojoin
+                    .iter()
+                    .map(|channel| (*channel).to_string())
+                    .collect(),
                 ..NetworkConfig::default()
             });
             let connected = tokio::time::timeout(Duration::from_secs(35), async {
@@ -848,25 +881,43 @@ mod tests {
             assert!(connected.connect_latency_ms.is_some());
             assert!(connected.lines_in > 0, "{connected:?}");
             assert_eq!(connected.last_error, None, "{connected:?}");
+            if let Some(channel) = autojoin.first() {
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        if handle
+                            .buffer_snapshot()
+                            .iter()
+                            .any(|line| line.contains(channel))
+                        {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{network} did not receive channel traffic for {channel}")
+                });
+            }
             handle.shutdown();
         }
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "live network: twice connects the BNC driver to Libera.Chat"]
+    #[ignore = "live network: twice registers, joins #libera, and reads traffic from Libera.Chat"]
     async fn live_driver_connects_to_libera() {
-        assert_live_driver("Libera.Chat", "irc.libera.chat:6697").await;
+        assert_live_driver("Libera.Chat", "irc.libera.chat:6697", &["#libera"]).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "live network: twice connects the BNC driver to OFTC"]
     async fn live_driver_connects_to_oftc() {
-        assert_live_driver("OFTC", "irc.oftc.net:6697").await;
+        assert_live_driver("OFTC", "irc.oftc.net:6697", &[]).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "live network: twice connects the BNC driver to the Ergo test network"]
     async fn live_driver_connects_to_ergo() {
-        assert_live_driver("Ergo", "testnet.ergo.chat:6697").await;
+        assert_live_driver("Ergo", "testnet.ergo.chat:6697", &[]).await;
     }
 }

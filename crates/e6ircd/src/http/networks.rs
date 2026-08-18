@@ -688,7 +688,10 @@ pub(super) async fn preflight_network_core(
             network_error(
                 StatusCode::BAD_GATEWAY,
                 "IRC network preflight failed",
-                Some(&format!("{} ({})", failure.summary(), failure.code())),
+                Some(&match failure.diagnostic() {
+                    Some(detail) => format!("{} ({}): {detail}", failure.summary(), failure.code()),
+                    None => format!("{} ({})", failure.summary(), failure.code()),
+                }),
             )
         })
 }
