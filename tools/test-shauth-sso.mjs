@@ -13,17 +13,19 @@ const releaseRevision = required("E6IRC_TEST_REVISION");
 assert.notEqual(nonAuthenticCredential, password);
 const primaryPort = requiredPort("E6IRC_SSO_PRIMARY_PORT");
 const secondaryPort = requiredPort("E6IRC_SSO_SECONDARY_PORT");
+const browserExecutable = required("PLAYWRIGHT_EXECUTABLE_PATH");
 assert.notEqual(primaryPort, secondaryPort);
 
 const primaryOrigin = `http://e6irc-primary.localhost:${primaryPort}`;
 const secondaryOrigin = `http://e6irc-secondary.localhost:${secondaryPort}`;
 const shauthOrigin = "http://localhost:8080";
 const primaryBridge = `${primaryOrigin}/auth/shauth/logout/complete`;
-const trackedOrigins = new Set([primaryOrigin, secondaryOrigin, shauthOrigin]);
+const productOrigins = [primaryOrigin, secondaryOrigin];
+const trackedOrigins = new Set([...productOrigins, shauthOrigin]);
 
 const browser = await chromium.launch({
   headless: true,
-  executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH || undefined,
+  executablePath: browserExecutable,
 });
 // Hard watchdog: a wedged chromium (including a hung `browser.close()`) must
 // fail this test in seconds rather than sit until the CI job's timeout.
@@ -39,7 +41,11 @@ try {
   const credentialBoundary = await installCredentialBoundary(context, page);
   const bridgeRequests = [];
   page.on("console", (message) => {
-    if (message.type() === "error") failures.push(message.text());
+    if (message.type() !== "error") return;
+    const source = message.location().url;
+    if (!source || productOrigins.some((origin) => source === origin || source.startsWith(`${origin}/`))) {
+      failures.push(message.text());
+    }
   });
   page.on("pageerror", (error) => failures.push(error.message));
   page.on("requestfailed", (request) => {

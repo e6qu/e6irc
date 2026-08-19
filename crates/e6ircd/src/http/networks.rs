@@ -298,9 +298,8 @@ impl From<CreateNetwork> for NetworkCreation {
 }
 
 /// An ephemeral qualification request. It intentionally omits the durable
-/// network name and autojoin list: preflight proves the transport,
-/// authentication, and registration boundary without persisting anything or
-/// producing channel traffic.
+/// network name but exercises the configured connection and channel joins
+/// without persisting anything.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct PreflightNetwork {
@@ -308,6 +307,8 @@ pub(super) struct PreflightNetwork {
     pub(super) tls: bool,
     pub(super) nick: String,
     pub(super) realname: String,
+    #[serde(default)]
+    pub(super) autojoin: Vec<String>,
     #[serde(default)]
     pub(super) sasl_account: Option<String>,
     #[serde(default)]
@@ -653,7 +654,7 @@ pub(super) async fn preflight_network(
 pub(super) async fn preflight_network_core(
     req: PreflightNetwork,
 ) -> Result<crate::bouncer::IrcPreflight, NetworkMutationError> {
-    validate_irc_upstream(&req.addr, &req.nick, Some(&req.realname), &[])?;
+    validate_irc_upstream(&req.addr, &req.nick, Some(&req.realname), &req.autojoin)?;
     if let Some(account) = req.sasl_account.as_deref()
         && let Err(error) = validate_credential_field(account, 255)
     {
@@ -677,7 +678,7 @@ pub(super) async fn preflight_network_core(
         tls: req.tls,
         nick: req.nick,
         realname: req.realname,
-        autojoin: Vec::new(),
+        autojoin: req.autojoin,
         buffer_cap: 1,
         sasl: req.sasl_account.zip(req.sasl_password),
         keepalive_idle: crate::bouncer::KEEPALIVE_IDLE,

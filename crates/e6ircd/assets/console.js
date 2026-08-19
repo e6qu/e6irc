@@ -2445,7 +2445,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       const result = await apiRequest(form, apiMutation(method, url), body);
       if (mode === ownerNetworkPreflight) {
         setOwnerNetworkResult(
-          `Registered as ${result.confirmed_nick}. Resolved ${result.resolved_addresses} address${result.resolved_addresses === 1 ? "" : "es"}; DNS ${result.dns_ms}ms, connection ${result.connect_ms}ms, registration ${result.registration_ms}ms. No network was created.`,
+          `Registered as ${result.confirmed_nick}. Joined ${result.joined_channels.length} configured channel${result.joined_channels.length === 1 ? "" : "s"}. Resolved ${result.resolved_addresses} address${result.resolved_addresses === 1 ? "" : "es"}; DNS ${result.dns_ms}ms, connection ${result.connect_ms}ms, registration ${result.registration_ms}ms. No network was created.`,
           true,
         );
       } else {
@@ -2479,9 +2479,9 @@ import { loadSettings, saveSettings } from "/console-settings.js";
           setOwnerNetworkResult("Enter a server, nickname, and real name.", false);
           return;
         }
-        const { addr, tls, nick, realname, sasl_account, sasl_password } = connection;
+        const { addr, tls, nick, realname, autojoin, sasl_account, sasl_password } = connection;
         void mutateOwnerNetwork(form, "/api/v1/me/networks/preflight", "POST", {
-          addr, tls, nick, realname, sasl_account, sasl_password,
+          addr, tls, nick, realname, autojoin, sasl_account, sasl_password,
         }, ownerNetworkPreflight, preflightButton);
       });
     }

@@ -1192,6 +1192,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     #[cfg(feature = "embed-web")]
     let router = router
         .route("/", get(web::index))
+        .route("/favicon.ico", get(web::favicon))
         .route("/assets/{*path}", get(web::asset));
     router
         .fallback(async || problem(StatusCode::NOT_FOUND, "Not Found", None))
@@ -1309,6 +1310,24 @@ mod web {
 
     pub async fn asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
         serve(&format!("assets/{path}"))
+    }
+
+    pub async fn favicon() -> Response {
+        let mut response = (
+            [(header::CONTENT_TYPE, "image/svg+xml")],
+            include_bytes!("../../../../web/src/favicon.svg").as_slice(),
+        )
+            .into_response();
+        security_headers(response.headers_mut());
+        response
+    }
+
+    #[cfg(test)]
+    #[tokio::test]
+    async fn favicon_is_an_svg_response() {
+        let response = favicon().await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/svg+xml");
     }
 }
 

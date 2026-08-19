@@ -13,13 +13,19 @@ const repositoryRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const require = createRequire(new URL("../web/package.json", import.meta.url));
 const playwright = require("playwright");
 const AxeBuilder = require("@axe-core/playwright").default;
-const browserName = process.env.E6IRC_TEST_BROWSER ?? "chromium";
+const browserName = required("E6IRC_TEST_BROWSER");
 assert.ok(
   ["chromium", "firefox", "webkit"].includes(browserName),
   `E6IRC_TEST_BROWSER must be chromium, firefox, or webkit; got ${browserName}`,
 );
 const browserType = playwright[browserName];
 const requireNativeNotificationPermission = browserName === "chromium";
+
+function required(name) {
+  const value = process.env[name];
+  assert.ok(value, `${name} is required`);
+  return value;
+}
 
 async function clickAndWaitForURL(page, locator, expectedURL) {
   await locator.click({ noWaitAfter: true });
@@ -65,10 +71,8 @@ async function waitForBufferedLine(request, network, text) {
   assert.fail(`buffer did not contain ${JSON.stringify(text)}`);
 }
 
-const databaseURL = process.env.E6IRC_TEST_DATABASE_URL;
-const issuerURL = process.env.E6IRC_TEST_DEX_URL;
-assert.ok(databaseURL, "E6IRC_TEST_DATABASE_URL is required");
-assert.ok(issuerURL, "E6IRC_TEST_DEX_URL is required");
+const databaseURL = required("E6IRC_TEST_DATABASE_URL");
+const issuerURL = required("E6IRC_TEST_DEX_URL");
 
 const applicationOrigin = "http://127.0.0.1:18083";
 const temporaryDirectory = await mkdtemp(join(tmpdir(), "e6irc-oidc-browser-"));
@@ -114,7 +118,7 @@ token_endpoint_auth_method = "client_secret_basic"
 `,
 );
 
-const binary = resolve(repositoryRoot, process.env.E6IRC_TEST_SERVER_BINARY ?? "target/debug/e6ircd");
+const binary = resolve(repositoryRoot, required("E6IRC_TEST_SERVER_BINARY"));
 let server = startApplicationServer();
 
 // Hard watchdog: a hung browser, an unresponsive `browser.close()`, or a stuck
@@ -144,14 +148,12 @@ let page;
 let tracing = false;
 try {
   await waitForHealthyServer();
-  // Playwright's default Chromium headless shell accepts a notification
-  // permission grant but can only report it as denied because the shell omits
-  // the native notification service. The full Chromium channel uses the same
-  // new-headless engine as production Chromium and exposes the permission
-  // boundary this journey is meant to prove.
+  const launchOptions = { headless: true };
+  if (browserName === "chromium") {
+    launchOptions.executablePath = required("PLAYWRIGHT_EXECUTABLE_PATH");
+  }
   browser = await browserType.launch({
-    headless: true,
-    ...(browserName === "chromium" ? { channel: "chromium" } : {}),
+    ...launchOptions,
   });
   context = await browser.newContext();
   if (artifactDirectory) {
@@ -202,6 +204,7 @@ try {
       errorText === "net::ERR_ABORTED"
       || errorText.includes("NS_BINDING_ABORTED")
       || errorText.toLowerCase().includes("cancel")
+      || (request.isNavigationRequest() && errorText === "Frame load interrupted")
     ) return;
     applicationErrors.push(`${request.url()}: ${errorText}`);
   });
@@ -1056,6 +1059,7 @@ try {
   assert.equal(page.url(), `${applicationOrigin}/console/networks`);
   assert.equal(await page.getByRole("link", { name: "journey", exact: true }).count(), 0);
   assert.equal(await page.locator('input[name="addr"]').inputValue(), upstream.address);
+  upstream.resetJoin("#journey");
   const networkDocument = await page.evaluate(() => performance.timeOrigin);
   const refreshedNetworks = page.waitForResponse(
     (response) => response.url() === `${applicationOrigin}/api/v1/me/networks`
@@ -2101,6 +2105,9 @@ async function startIrcUpstream() {
     address: `127.0.0.1:${address.port}`,
     async waitForJoin(channel) {
       activeConnection = await joinedConnection(channel);
+    },
+    resetJoin(channel) {
+      joined.delete(channel);
     },
     async sendPeerMessage(target, text) {
       assert.ok(activeConnection, "select an upstream connection before sending a peer message");

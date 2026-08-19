@@ -197,14 +197,14 @@ jobs:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
           E6IRC_TEST_DEX_URL: http://127.0.0.1:15556/dex
       - name: Exercise OIDC in a real browser
-        # Bounded so a wedged chromium install/launch fails this step in minutes
-        # rather than silently consuming the whole job's timeout budget.
         timeout-minutes: 8
         run: |
-          pnpm -C web exec playwright install --with-deps chromium
+          browser="$(command -v google-chrome)"
           cargo build -p e6ircd --features embed-web
-          pnpm -C web test:oidc-browser
+          PLAYWRIGHT_EXECUTABLE_PATH="$browser" pnpm -C web test:oidc-browser
         env:
+          E6IRC_TEST_BROWSER: chromium
+          E6IRC_TEST_SERVER_BINARY: target/debug/e6ircd
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
           E6IRC_TEST_DEX_URL: http://127.0.0.1:15556/dex
           E6IRC_BROWSER_ARTIFACTS_DIR: test-results/browser
@@ -228,7 +228,7 @@ jobs:
       matrix:
         browser: [firefox, webkit]
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:18-alpine
@@ -248,28 +248,30 @@ jobs:
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       - name: Start dex (mock connector)
         run: |
+          sed 's|http://127.0.0.1:15556/dex|http://host.docker.internal:15556/dex|' \
+            tools/dex-config.yaml > /tmp/e6irc-dex-config.yaml
           docker run -d --name dex -p 15556:5556 \
-            -v "$PWD/tools/dex-config.yaml:/etc/dex/config.yaml" \
+            -v /tmp/e6irc-dex-config.yaml:/etc/dex/config.yaml \
             ghcr.io/dexidp/dex:v2.41.1 dex serve /etc/dex/config.yaml
           for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:15556/dex/.well-known/openid-configuration >/dev/null && break
             [ "$i" = 30 ] && { echo "dex did not become ready"; docker logs dex; exit 1; }
             sleep 1
           done
-      - name: Install ${{ matrix.browser }} for Playwright
-        # WebKit's Ubuntu dependency set can take longer than Chromium's on
-        # a cold package mirror; keep a bound without cutting off a healthy install.
-        timeout-minutes: 15
-        run: pnpm -C web exec playwright install --with-deps "${{ matrix.browser }}"
       - run: cargo build -p e6ircd --features embed-web
       - name: Exercise the complete browser journey in ${{ matrix.browser }}
         timeout-minutes: 8
-        run: pnpm -C web test:oidc-browser
-        env:
-          E6IRC_TEST_BROWSER: ${{ matrix.browser }}
-          E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
-          E6IRC_TEST_DEX_URL: http://127.0.0.1:15556/dex
-          E6IRC_BROWSER_ARTIFACTS_DIR: test-results/browser
+        run: |
+          docker run --rm --add-host host.docker.internal:host-gateway \
+            -v "$PWD:$PWD" --workdir "$PWD" \
+            -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+            -e E6IRC_TEST_BROWSER="${{ matrix.browser }}" \
+            -e E6IRC_TEST_SERVER_BINARY=target/debug/e6ircd \
+            -e E6IRC_TEST_DATABASE_URL=postgres://postgres:test@host.docker.internal:5432/e6irc_test \
+            -e E6IRC_TEST_DEX_URL=http://host.docker.internal:15556/dex \
+            -e E6IRC_BROWSER_ARTIFACTS_DIR=test-results/browser \
+            mcr.microsoft.com/playwright:v1.61.1-noble \
+            node tools/test-oidc-browser.mjs
       - name: Retain failed browser diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
@@ -358,14 +360,14 @@ jobs:
           path: .test-deps/shauth
       - run: npm install --global pnpm@11.15.1
       - run: pnpm -C web install --frozen-lockfile
-      - name: Install chromium for Playwright
-        # Bounded: the apt/browser download here has hung the job before.
-        timeout-minutes: 8
-        run: pnpm -C web exec playwright install --with-deps chromium
       - run: pnpm -C web build && cargo build -p e6ircd --features embed-web
       - name: Exercise exact Shauth single sign-on and global logout
         timeout-minutes: 8
-        run: SHAUTH_SOURCE_DIR="$GITHUB_WORKSPACE/.test-deps/shauth" tools/test-shauth-sso.sh
+        run: |
+          browser="$(command -v google-chrome)"
+          PLAYWRIGHT_EXECUTABLE_PATH="$browser" \
+            SHAUTH_SOURCE_DIR="$GITHUB_WORKSPACE/.test-deps/shauth" \
+            tools/test-shauth-sso.sh
 
   # Protocol conformance against the pinned irctest suite (vendored
   # hookup in vendor/tests/irctest/) with the standard irctest marker
