@@ -204,6 +204,7 @@ try {
       errorText === "net::ERR_ABORTED"
       || errorText.includes("NS_BINDING_ABORTED")
       || errorText.toLowerCase().includes("cancel")
+      || (request.isNavigationRequest() && errorText === "Frame load interrupted")
     ) return;
     applicationErrors.push(`${request.url()}: ${errorText}`);
   });
