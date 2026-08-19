@@ -29,6 +29,7 @@ test("shared relay-desk palette keeps text and actions above WCAG AA contrast", 
   for (const [foreground, background] of [
     ["#182326", "#fbfcfa"],
     ["#516266", "#fbfcfa"],
+    ["#516266", "#e1e9e8"],
     ["#ffffff", "#006b70"],
     ["#995100", "#fbfcfa"],
     ["#f0f5f3", "#152125"],

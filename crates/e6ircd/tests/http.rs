@@ -357,7 +357,10 @@ async fn signed_out_page_is_public_reload_safe_and_accessible() {
             headers.contains("content-security-policy: default-src 'none'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"),
             "attempt {attempt}: {headers}"
         );
-        assert!(body.contains("aria-label=\"e6irc\">e6irc</span>"), "{body}");
+        assert!(
+            body.contains("<span class=\"brand\">e6irc</span>"),
+            "{body}"
+        );
         assert!(
             body.contains("<h1 id=\"signed-out-title\">You are signed out</h1>"),
             "{body}"
