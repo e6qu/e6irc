@@ -248,8 +248,10 @@ jobs:
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       - name: Start dex (mock connector)
         run: |
+          sed 's|http://127.0.0.1:15556/dex|http://host.docker.internal:15556/dex|' \
+            tools/dex-config.yaml > /tmp/e6irc-dex-config.yaml
           docker run -d --name dex -p 15556:5556 \
-            -v "$PWD/tools/dex-config.yaml:/etc/dex/config.yaml" \
+            -v /tmp/e6irc-dex-config.yaml:/etc/dex/config.yaml \
             ghcr.io/dexidp/dex:v2.41.1 dex serve /etc/dex/config.yaml
           for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:15556/dex/.well-known/openid-configuration >/dev/null && break
@@ -260,13 +262,13 @@ jobs:
       - name: Exercise the complete browser journey in ${{ matrix.browser }}
         timeout-minutes: 8
         run: |
-          docker run --rm --network host \
+          docker run --rm --add-host host.docker.internal:host-gateway \
             -v "$PWD:/work" --workdir /work \
             -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
             -e E6IRC_TEST_BROWSER="${{ matrix.browser }}" \
             -e E6IRC_TEST_SERVER_BINARY=target/debug/e6ircd \
-            -e E6IRC_TEST_DATABASE_URL=postgres://postgres:test@127.0.0.1:5432/e6irc_test \
-            -e E6IRC_TEST_DEX_URL=http://127.0.0.1:15556/dex \
+            -e E6IRC_TEST_DATABASE_URL=postgres://postgres:test@host.docker.internal:5432/e6irc_test \
+            -e E6IRC_TEST_DEX_URL=http://host.docker.internal:15556/dex \
             -e E6IRC_BROWSER_ARTIFACTS_DIR=test-results/browser \
             mcr.microsoft.com/playwright:v1.61.1-noble \
             node tools/test-oidc-browser.mjs
