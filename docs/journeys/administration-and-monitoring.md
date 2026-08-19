@@ -119,9 +119,13 @@ disconnecting sessions, so an already-running password verification cannot
 authenticate after the administrative sweep.
 
 Every bounded console table and dynamically rendered backlog/live-log region
-is keyboard-scrollable. Dynamic log regions get their log role, accessible
-name, and focusability from one constructor so Safari does not strand overflow
-content outside the keyboard path.
+is keyboard-scrollable. Shared constructors give dynamic tables and logs their
+region role, purpose-specific accessible name, and focusability so Safari does
+not strand overflow content outside the keyboard path or a refresh rename the
+wrong directory. The shared confirmation dialog repeats the initiating action
+and severity, submits with that exact control's name/value, and resets before
+each opening so Escape cannot inherit a previous confirmation. On phones, the
+active route scrolls into the horizontal navigation viewport on load.
 
 **Evidence.** Proven by PostgreSQL cursor/filter/posture and atomic bearer
 revocation tests; ordered-core late-verdict/disconnect tests; exact-owner
@@ -134,6 +138,9 @@ real Chromium/PostgreSQL journey visits every full
 administrator directory, adds and removes a K-Line through the rendered
 policy controls, confirms both actions in the audit explorer, and exercises a
 transient audit-directory API failure followed by the rendered Retry control.
+Playwright runs the production console runtime to prove named confirmation,
+submitter preservation, safe repeat cancellation, active phone-route
+visibility, and distinct dynamic account/invitation table regions under axe.
 
 ## Inspect and terminate live connections
 

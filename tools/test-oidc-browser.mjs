@@ -843,7 +843,10 @@ try {
     await confirmation.waitFor();
     await clickAndWaitForURL(
       guest,
-      confirmation.getByRole("button", { name: "Continue", exact: true }),
+      confirmation.getByRole("button", {
+        name: "Delete my account permanently",
+        exact: true,
+      }),
       `${applicationOrigin}/auth/signed-out`,
     );
     assert.equal((await guestContext.request.get(`${applicationOrigin}/api/v1/me`)).status(), 401);
@@ -944,7 +947,7 @@ try {
   await banRow.getByRole("button", { name: "Remove", exact: true }).click();
   const banConfirmation = page.getByRole("dialog", { name: "Confirm action", exact: true });
   await banConfirmation.waitFor();
-  await banConfirmation.getByRole("button", { name: "Continue", exact: true }).click();
+  await banConfirmation.getByRole("button", { name: "Remove", exact: true }).click();
   await page.getByText("*@browser-policy.example", { exact: true }).waitFor({ state: "detached" });
 
   await page.goto(`${applicationOrigin}/console/audit`);

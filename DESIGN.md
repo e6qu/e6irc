@@ -346,6 +346,10 @@ These are project-wide rules, enforced in review and (where possible) CI:
     its bounded-scroll container, log role, accessible name, and keyboard focus
     in one constructor. A new Safari-inaccessible overflow region cannot be
     produced by copying only the visual `backlog` class.
+  - `scrollRegion` — every dynamically rendered console table gets its region
+    role, purpose-specific accessible name, and keyboard focus in one
+    constructor. Refresh code cannot overwrite a neighboring table's identity
+    after rendering.
   - The wire-length **runtime** invariant (§7.1): where a *type* is
     impractical (every outbound line is a `String`), a debug-build assertion
     at the one send funnel makes the class machine-checked by the test and
@@ -1563,7 +1567,12 @@ login, the user account section, and the `/console` admin/BNC/integrations
 console — are server-rendered Askama document shells. Their authenticated
 reads and mutations use `/api/v1`; no `/console` mutation route exists. The
 always-served, same-origin `/console.js` hydrates those API-backed controls,
-including explicit confirmation, retry, and failure states. The console works
+including explicit confirmation, retry, and failure states. The shared
+confirmation dialog repeats the initiating action label and severity, preserves
+the submitter's name/value semantics, and resets its return state before every
+opening so Escape can never inherit an earlier confirmation. On phone layouts,
+the active route is brought into the horizontal console-navigation viewport on
+load. The console works
 in the default build and `embed-web`; its private pages permit only that
 same-origin script. The shared browser contract parser validates each path,
 query, JSON request, and JSON response before a request or view uses it.
