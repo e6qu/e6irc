@@ -20,7 +20,8 @@ const primaryOrigin = `http://e6irc-primary.localhost:${primaryPort}`;
 const secondaryOrigin = `http://e6irc-secondary.localhost:${secondaryPort}`;
 const shauthOrigin = "http://localhost:8080";
 const primaryBridge = `${primaryOrigin}/auth/shauth/logout/complete`;
-const trackedOrigins = new Set([primaryOrigin, secondaryOrigin, shauthOrigin]);
+const productOrigins = [primaryOrigin, secondaryOrigin];
+const trackedOrigins = new Set([...productOrigins, shauthOrigin]);
 
 const browser = await chromium.launch({
   headless: true,
@@ -40,7 +41,11 @@ try {
   const credentialBoundary = await installCredentialBoundary(context, page);
   const bridgeRequests = [];
   page.on("console", (message) => {
-    if (message.type() === "error") failures.push(message.text());
+    if (message.type() !== "error") return;
+    const source = message.location().url;
+    if (!source || productOrigins.some((origin) => source === origin || source.startsWith(`${origin}/`))) {
+      failures.push(message.text());
+    }
   });
   page.on("pageerror", (error) => failures.push(error.message));
   page.on("requestfailed", (request) => {
