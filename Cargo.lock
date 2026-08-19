@@ -910,6 +910,7 @@ dependencies = [
  "e6irc-proto",
  "ratatui",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]

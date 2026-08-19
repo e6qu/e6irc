@@ -110,9 +110,11 @@ budget, phase, and closed-outcome evidence for stricter tuned-host campaigns.
 The CLI implements device login, a private origin-bound token cache, bounded
 HTTP/HTTPS, structured tail output, TLS, PLAIN/OAUTHBEARER, history, and
 failure-sensitive one-shot commands. The TUI consumes the shared cache, loads
-marker-relative history, maintains shared read positions/unread state, and
-rejoins confirmed channels. The real pseudo-terminal journey protects the
-terminal boundary. One TUI process intentionally presents buffers for one
+marker-relative history, maintains scrollback-aware shared read
+positions/unread state, exposes route and connection state, retains refused
+commands for correction, and rejoins confirmed channels. The real
+pseudo-terminal journey protects both the terminal boundary and the shipped
+relay-desk framing. One TUI process intentionally presents buffers for one
 attached network; the BNC is the cross-network multiplexer.
 
 ### External bridges and public networks

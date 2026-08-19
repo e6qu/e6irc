@@ -13,10 +13,12 @@ use e6irc_client::{Authentication, ClientEvent, Connection, ConnectionOptions, O
 use e6irc_tui::app::{Action, App};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::text::Line;
+use ratatui::layout::{Constraint, Direction, Layout, Position};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use tokio::sync::mpsc;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Parser)]
 #[command(name = "e6irc-tui", about = "Terminal IRC client", version)]
@@ -384,13 +386,22 @@ async fn run_ui(
             dirty = true;
             use crossterm::event::KeyModifiers;
             let alt = key.modifiers.contains(KeyModifiers::ALT);
+            let control = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
                 KeyCode::Left if alt => app.prev_buffer(),
                 KeyCode::Right if alt => app.next_buffer(),
+                KeyCode::Left => app.move_input_left(),
+                KeyCode::Right => app.move_input_right(),
+                KeyCode::Home => app.move_input_home(),
                 KeyCode::PageUp => app.scroll_up(10),
                 KeyCode::PageDown => app.scroll_down(10),
-                KeyCode::Char(c) => app.on_char(c),
+                KeyCode::End if control => app.jump_latest(),
+                KeyCode::End => app.move_input_end(),
+                KeyCode::Char('c' | 'C') if control => return Ok(()),
+                KeyCode::Char('u' | 'U') if control => app.clear_input(),
+                KeyCode::Char(c) if !control => app.on_char(c),
                 KeyCode::Backspace => app.on_backspace(),
+                KeyCode::Delete => app.on_delete(),
                 KeyCode::Esc => return Ok(()),
                 KeyCode::Enter => {
                     if let Action::Send(outbound) = app.on_enter() {
@@ -435,62 +446,210 @@ fn flush_read_marker(app: &mut App, out_tx: &mpsc::Sender<String>) {
 fn draw(f: &mut ratatui::Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
         .split(f.area());
 
     let buf = app.current();
-    let height = chunks[0].height.saturating_sub(2) as usize;
+    let connection = if app.connected() {
+        Span::styled(
+            "● CONNECTED",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            "● RECONNECTING",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let mut header = vec![
+        Span::styled(
+            " e6/irc ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ROUTE ", Style::default().fg(Color::DarkGray)),
+        Span::styled("→ ", Style::default().fg(Color::Yellow)),
+        Span::styled(
+            e6irc_client::TerminalSafe::from_untrusted(&buf.name).to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  ·  "),
+        connection,
+    ];
+    if app.total_unread() > 0 {
+        header.push(Span::styled(
+            format!("  ·  {} unread", app.total_unread()),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(header)), chunks[0]);
+
+    f.render_widget(
+        Paragraph::new(conversation_rail_text(app)).style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
+    );
+
+    let height = chunks[2].height.saturating_sub(2) as usize;
     let lines: Vec<Line> = buf
         .visible(height)
         .iter()
-        .map(|l| Line::from(format!("<{}> {}", l.from, l.text)))
-        .collect();
-    // Title shows the buffer and its position; flags scrollback. The buffer
-    // name is a server-supplied channel/nick, so neutralize its control bytes
-    // for display (the name stays raw in the model for identity/lookup).
-    let mut title = format!(
-        "{} ({}/{})",
-        e6irc_client::TerminalSafe::from_untrusted(&buf.name),
-        app.current + 1,
-        app.buffers.len()
-    );
-    if buf.scrolled_back() {
-        title.push_str(" [scrollback — PgDn to resume]");
-    }
-    let log = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
-    f.render_widget(log, chunks[0]);
-
-    // A one-line buffer list makes Alt-←/→ switching discoverable.
-    let bar: String = app
-        .buffers
-        .iter()
-        .enumerate()
-        .map(|(i, b)| {
-            let name = e6irc_client::TerminalSafe::from_untrusted(&b.name);
-            let unread = match b.unread() {
-                0 => String::new(),
-                count => format!(" ({count})"),
-            };
-            if i == app.current {
-                format!("[{name}{unread}]")
+        .map(|line| {
+            let route = if line.from.as_str() == "*" {
+                Span::styled(
+                    " route ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
             } else {
-                format!(" {name}{unread} ")
-            }
+                Span::styled(
+                    format!(" {} ", line.from),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            };
+            Line::from(vec![
+                route,
+                Span::styled("│ ", Style::default().fg(Color::DarkGray)),
+                Span::raw(line.text.to_string()),
+            ])
         })
-        .collect::<Vec<_>>()
-        .join(" ");
-    let input = Paragraph::new(app.input.as_str()).block(
+        .collect();
+    let position = format!(" {} / {} ", app.current + 1, app.buffers.len());
+    let mut title = vec![
+        Span::styled(
+            format!(
+                " {} ",
+                e6irc_client::TerminalSafe::from_untrusted(&buf.name)
+            ),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(position, Style::default().fg(Color::DarkGray)),
+    ];
+    if buf.scrolled_back() {
+        title.push(Span::styled(
+            format!(
+                " SCROLLBACK · {} lines behind · {} new · Ctrl-End latest ",
+                buf.lines_behind_latest(),
+                buf.unread()
+            ),
+            Style::default().fg(Color::Yellow),
+        ));
+    } else {
+        title.push(Span::styled(" LIVE ", Style::default().fg(Color::Green)));
+    }
+    let log = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!("input — Esc quit, Alt-←/→ switch | {bar}")),
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Line::from(title)),
     );
-    f.render_widget(input, chunks[1]);
+    f.render_widget(log, chunks[2]);
+
+    let composer_title = if app.connected() {
+        Line::from(vec![
+            Span::styled(
+                " MESSAGE ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("→ ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                e6irc_client::TerminalSafe::from_untrusted(&buf.name).to_string(),
+                Style::default().fg(Color::Yellow),
+            ),
+        ])
+    } else {
+        Line::from(Span::styled(
+            " OFFLINE · INPUT RETAINED ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))
+    };
+    let composer_inner_width = chunks[3].width.saturating_sub(2);
+    let (horizontal_scroll, cursor_column) =
+        composer_view(app.input(), app.input_cursor(), composer_inner_width);
+    let input = Paragraph::new(app.input())
+        .scroll((0, horizontal_scroll))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(if app.connected() {
+                    Color::Cyan
+                } else {
+                    Color::Red
+                }))
+                .title(composer_title),
+        );
+    f.render_widget(input, chunks[3]);
+    let cursor_x = chunks[3]
+        .x
+        .saturating_add(1)
+        .saturating_add(cursor_column)
+        .min(chunks[3].right().saturating_sub(2));
+    f.set_cursor_position(Position::new(cursor_x, chunks[3].y.saturating_add(1)));
+
+    f.render_widget(
+        Paragraph::new(
+            " Alt-←/→ switch · PgUp/PgDn scroll · Ctrl-End latest · /help commands · Esc/Ctrl-C quit",
+        )
+        .style(Style::default().fg(Color::DarkGray)),
+        chunks[4],
+    );
+}
+
+fn conversation_rail_text(app: &App) -> String {
+    let mut labels = Vec::with_capacity(app.buffers.len());
+    for offset in 0..app.buffers.len() {
+        let index = (app.current + offset) % app.buffers.len();
+        let buffer = &app.buffers[index];
+        let name = e6irc_client::TerminalSafe::from_untrusted(&buffer.name);
+        let unread = match buffer.unread() {
+            0 => String::new(),
+            count => format!(" · {count}"),
+        };
+        if offset == 0 {
+            labels.push(format!("[{name}{unread}]"));
+        } else {
+            labels.push(format!("{name}{unread}"));
+        }
+    }
+    format!(" CONVERSATIONS  {}", labels.join("  "))
+}
+
+fn composer_view(input: &str, cursor: usize, width: u16) -> (u16, u16) {
+    let input_width = UnicodeWidthStr::width(&input[..cursor]);
+    let visible_width = usize::from(width).saturating_sub(1);
+    let horizontal_scroll = input_width.saturating_sub(visible_width);
+    let cursor_column = input_width.saturating_sub(horizontal_scroll);
+    (
+        u16::try_from(horizontal_scroll).unwrap_or(u16::MAX),
+        u16::try_from(cursor_column).unwrap_or(u16::MAX),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+    use ratatui::backend::TestBackend;
 
     fn parses(arguments: &[&str]) -> bool {
         Cli::try_parse_from(
@@ -561,6 +720,40 @@ mod tests {
 
     fn message(raw: &str) -> OwnedMessage {
         OwnedMessage::from(&e6irc_proto::message::Message::parse(raw).unwrap())
+    }
+
+    #[test]
+    fn conversation_rail_keeps_the_active_buffer_first_and_exposes_unread() {
+        let mut app = App::new("#home".into(), "me".into());
+        app.on_message(&message(":alice!u@h PRIVMSG #other :hello"));
+        assert_eq!(
+            conversation_rail_text(&app),
+            " CONVERSATIONS  [#home]  #other · 1"
+        );
+        app.next_buffer();
+        assert_eq!(
+            conversation_rail_text(&app),
+            " CONVERSATIONS  [#other]  #home"
+        );
+    }
+
+    #[test]
+    fn composer_view_follows_long_and_wide_input() {
+        assert_eq!(composer_view("abc", 3, 4), (0, 3));
+        assert_eq!(composer_view("abcdef", 6, 4), (3, 3));
+        assert_eq!(composer_view("abcdef", 2, 4), (0, 2));
+        assert_eq!(composer_view("界x", 4, 4), (0, 3));
+        assert_eq!(composer_view("界x", 4, 0), (3, 0));
+    }
+
+    #[test]
+    fn tiny_terminals_render_without_panicking() {
+        let app = App::new("#home".into(), "me".into());
+        for (width, height) in [(1, 1), (10, 3), (24, 5)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+        }
     }
 
     #[test]
