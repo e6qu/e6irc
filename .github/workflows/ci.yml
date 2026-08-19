@@ -358,14 +358,14 @@ jobs:
           path: .test-deps/shauth
       - run: npm install --global pnpm@11.15.1
       - run: pnpm -C web install --frozen-lockfile
-      - name: Install chromium for Playwright
-        # Bounded: the apt/browser download here has hung the job before.
-        timeout-minutes: 8
-        run: pnpm -C web exec playwright install --with-deps chromium
       - run: pnpm -C web build && cargo build -p e6ircd --features embed-web
       - name: Exercise exact Shauth single sign-on and global logout
         timeout-minutes: 8
-        run: SHAUTH_SOURCE_DIR="$GITHUB_WORKSPACE/.test-deps/shauth" tools/test-shauth-sso.sh
+        run: |
+          browser="$(command -v google-chrome)"
+          PLAYWRIGHT_EXECUTABLE_PATH="$browser" \
+            SHAUTH_SOURCE_DIR="$GITHUB_WORKSPACE/.test-deps/shauth" \
+            tools/test-shauth-sso.sh
 
   # Protocol conformance against the pinned irctest suite (vendored
   # hookup in vendor/tests/irctest/) with the standard irctest marker

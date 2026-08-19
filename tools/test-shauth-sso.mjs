@@ -13,6 +13,7 @@ const releaseRevision = required("E6IRC_TEST_REVISION");
 assert.notEqual(nonAuthenticCredential, password);
 const primaryPort = requiredPort("E6IRC_SSO_PRIMARY_PORT");
 const secondaryPort = requiredPort("E6IRC_SSO_SECONDARY_PORT");
+const browserExecutable = required("PLAYWRIGHT_EXECUTABLE_PATH");
 assert.notEqual(primaryPort, secondaryPort);
 
 const primaryOrigin = `http://e6irc-primary.localhost:${primaryPort}`;
@@ -23,7 +24,7 @@ const trackedOrigins = new Set([primaryOrigin, secondaryOrigin, shauthOrigin]);
 
 const browser = await chromium.launch({
   headless: true,
-  executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH || undefined,
+  executablePath: browserExecutable,
 });
 // Hard watchdog: a wedged chromium (including a hung `browser.close()`) must
 // fail this test in seconds rather than sit until the CI job's timeout.
