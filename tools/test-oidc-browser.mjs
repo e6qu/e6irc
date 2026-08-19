@@ -332,6 +332,9 @@ try {
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
   assert.equal(await consoleTheme.inputValue(), "light");
   assert.equal(await page.locator("html").getAttribute("data-theme"), "light");
+  const explicitLightBackground = await page.evaluate(
+    () => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim(),
+  );
   await page.emulateMedia({ colorScheme: "light" });
   await consoleTheme.selectOption("auto");
   await page.waitForFunction(() => !document.documentElement.hasAttribute("data-theme"));
@@ -341,15 +344,19 @@ try {
   );
   assert.equal(
     await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()),
-    "#f5f8fa",
+    explicitLightBackground,
   );
   await page.emulateMedia({ colorScheme: "dark" });
-  assert.equal(
-    await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()),
-    "#0b1218",
+  const automaticDarkBackground = await page.evaluate(
+    () => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim(),
   );
+  assert.notEqual(automaticDarkBackground, explicitLightBackground);
   await consoleTheme.selectOption("dark");
   await page.waitForFunction(() => document.documentElement.dataset.theme === "dark");
+  assert.equal(
+    await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()),
+    automaticDarkBackground,
+  );
   // A narrow viewport keeps the console's complete navigation in its own
   // horizontal rail instead of creating a second tall page above the task.
   // The document itself must remain free of horizontal overflow, including
