@@ -118,6 +118,13 @@ fn invitation_state_from_html(html: &str) -> &str {
         .expect("invitation state in page")
 }
 
+fn assert_visible_e6irc_brand(html: &str) {
+    assert!(
+        html.contains("<span class=\"brand\">e6irc</span>"),
+        "{html}"
+    );
+}
+
 fn form_value(value: &str) -> String {
     value
         .bytes()
@@ -357,10 +364,7 @@ async fn signed_out_page_is_public_reload_safe_and_accessible() {
             headers.contains("content-security-policy: default-src 'none'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"),
             "attempt {attempt}: {headers}"
         );
-        assert!(
-            body.contains("<span class=\"brand\">e6irc</span>"),
-            "{body}"
-        );
+        assert_visible_e6irc_brand(&body);
         assert!(
             body.contains("<h1 id=\"signed-out-title\">You are signed out</h1>"),
             "{body}"
@@ -6760,7 +6764,7 @@ async fn rp_initiated_logout_redirects_to_provider() {
     for attempt in 1..=2 {
         let (status, headers, body) = request(http, &get("/auth/signed-out")).await;
         assert_eq!(status, 200, "attempt {attempt}: {headers}");
-        assert!(body.contains("aria-label=\"e6irc\">e6irc</span>"), "{body}");
+        assert_visible_e6irc_brand(&body);
         assert!(body.contains("You are signed out"), "{body}");
         // The control text is the provider's proper name (capitalized), which is
         // the exact accessible name Shauth's SSO validator matches
