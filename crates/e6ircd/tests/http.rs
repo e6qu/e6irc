@@ -548,19 +548,24 @@ async fn bnc_network_management_lifecycle() {
     .await;
     assert_eq!(status, 400, "discord creation must reject IRC fields");
 
-    // Qualifying a network uses the production resolver, transport, and IRC
-    // registration path, but does not persist or start it.
+    // Qualification uses the production resolver, transport, registration, and
+    // channel-join path without persisting or starting a driver.
     let (status, body) = post_json(
         http,
         "/api/v1/me/networks/preflight",
         &token,
-        &format!(r#"{{"addr":"{up}","tls":false,"nick":"probe","realname":"Preflight"}}"#),
+        &format!(r##"{{"addr":"{up}","tls":false,"nick":"probe","realname":"Preflight","autojoin":["#preflight"]}}"##),
     )
     .await;
     assert_eq!(status, 200, "{body}");
     let qualified: serde_json::Value = serde_json::from_str(&body).expect("preflight json");
     assert_eq!(qualified["ok"], true, "{body}");
     assert_eq!(qualified["confirmed_nick"], "probe", "{body}");
+    assert_eq!(
+        qualified["joined_channels"],
+        serde_json::json!(["#preflight"]),
+        "{body}"
+    );
     assert_eq!(qualified["resolved_addresses"], 1, "{body}");
     for stage in ["dns_ms", "connect_ms", "registration_ms"] {
         assert!(qualified[stage].is_u64(), "missing {stage}: {body}");
@@ -1030,6 +1035,7 @@ async fn openapi_spec_is_served() {
         preflight_schema["required"],
         serde_json::json!(["addr", "tls", "nick", "realname"])
     );
+    assert_eq!(preflight_schema["properties"]["autojoin"]["type"], "array");
     let app_password_schema = &v["paths"]["/api/v1/auth/app-passwords"]["post"]["requestBody"]["content"]
         ["application/json"]["schema"];
     assert_eq!(app_password_schema["additionalProperties"], false);

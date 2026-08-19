@@ -81,6 +81,7 @@ pub struct IrcPreflight {
     pub connect_ms: u64,
     pub registration_ms: u64,
     pub confirmed_nick: String,
+    pub joined_channels: Vec<String>,
 }
 
 /// Closed failure taxonomy for an IRC preflight. Raw resolver, TLS, and server
@@ -103,6 +104,8 @@ pub enum IrcPreflightFailure {
     NetworkBanned(Option<e6irc_client::RegistrationRejection>),
     RegistrationFailed,
     RegistrationTimedOut,
+    ChannelJoinFailed,
+    ChannelJoinTimedOut,
 }
 
 impl IrcPreflightFailure {
@@ -123,6 +126,8 @@ impl IrcPreflightFailure {
             Self::NetworkBanned(_) => "network_banned",
             Self::RegistrationFailed => "registration_failed",
             Self::RegistrationTimedOut => "registration_timed_out",
+            Self::ChannelJoinFailed => "channel_join_failed",
+            Self::ChannelJoinTimedOut => "channel_join_timed_out",
         }
     }
 
@@ -149,6 +154,10 @@ impl IrcPreflightFailure {
             Self::NetworkBanned(_) => "The upstream network banned this connection.",
             Self::RegistrationFailed => "IRC registration failed before a welcome was received.",
             Self::RegistrationTimedOut => "IRC registration timed out.",
+            Self::ChannelJoinFailed => "The upstream rejected a configured channel join.",
+            Self::ChannelJoinTimedOut => {
+                "The upstream did not confirm a configured channel join in time."
+            }
         }
     }
 
@@ -239,12 +248,30 @@ pub async fn preflight_irc(config: &NetworkConfig) -> Result<IrcPreflight, IrcPr
         Err(_) => return Err(IrcPreflightFailure::RegistrationTimedOut),
     };
 
+    let mut joined_channels = Vec::with_capacity(config.autojoin.len());
+    for channel in &config.autojoin {
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            connection.join_with_latest_history(channel, 0),
+        )
+        .await
+        {
+            Ok(Ok(_)) => joined_channels.push(channel.clone()),
+            Ok(Err(error)) => {
+                eprintln!("irc preflight: channel join failed: {error}");
+                return Err(IrcPreflightFailure::ChannelJoinFailed);
+            }
+            Err(_) => return Err(IrcPreflightFailure::ChannelJoinTimedOut),
+        }
+    }
+
     Ok(IrcPreflight {
         resolved_addresses,
         dns_ms,
         connect_ms,
         registration_ms: elapsed_millis(registration_started.elapsed()),
         confirmed_nick,
+        joined_channels,
     })
 }
 
