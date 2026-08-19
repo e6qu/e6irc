@@ -228,7 +228,7 @@ jobs:
       matrix:
         browser: [firefox, webkit]
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:18-alpine
@@ -256,10 +256,14 @@ jobs:
             [ "$i" = 30 ] && { echo "dex did not become ready"; docker logs dex; exit 1; }
             sleep 1
           done
+      - id: playwright
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ matrix.browser }}-${{ hashFiles('web/pnpm-lock.yaml') }}
       - name: Install ${{ matrix.browser }} for Playwright
-        # WebKit's Ubuntu dependency set can take longer than Chromium's on
-        # a cold package mirror; keep a bound without cutting off a healthy install.
-        timeout-minutes: 15
+        if: steps.playwright.outputs.cache-hit != 'true'
+        timeout-minutes: 25
         run: pnpm -C web exec playwright install --with-deps "${{ matrix.browser }}"
       - run: cargo build -p e6ircd --features embed-web
       - name: Exercise the complete browser journey in ${{ matrix.browser }}
