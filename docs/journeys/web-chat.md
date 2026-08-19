@@ -98,6 +98,9 @@ temporarily mutes its live region, so a buffer switch does not announce old
 messages as new; subsequent live additions remain politely announced. The
 new-message control is a native button with an exact accessible count and
 returns the reader to the latest line without moving them to another buffer.
+The network catalog exposes only routes that can open as links or selector
+options. Disabled and unbuilt routes remain readable status rows, so keyboard
+and pointer users do not enter a chat view that cannot attach.
 
 **Rejected sends.** A correlated server refusal never creates a local echo or
 automatically retries. It leaves the reason visible and offers a **Restore

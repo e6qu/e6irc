@@ -28,9 +28,12 @@ Container startup validates rendered TOML through the daemon parser. Managed
 configuration schema changes migrate persisted rows with their historic explicit
 behavior; new configuration never receives an implicit decode default.
 History accepts one typed cursor window and a bounded page size.
-Chat, console, and identity pages share accessible light and dark palettes.
-Browser tests cover WCAG AA contrast, keyboard focus, Escape dismissal,
-reduced motion, forced colors, and responsive chat controls.
+Chat, console, and identity pages share the relay-desk visual system and
+accessible light, dark, and forced-colors palettes. Browser snapshots cover all
+three shells; interaction tests cover WCAG AA contrast, keyboard focus, Escape
+dismissal, reduced motion, responsive controls, and non-interactive unavailable
+network routes. Dynamically rendered console logs share one keyboard-focusable
+log-region constructor.
 External qualification has one manual GitHub workflow. It selects one closed
 campaign, refuses local provider oracles, and uploads only evidence accepted by
 the runner verifier. Its Discord, Slack, and OpenID Connect boundaries use

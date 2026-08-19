@@ -1,15 +1,19 @@
 :root {
   color-scheme: light dark;
-  --page: #f5f8fa;
-  --surface: #ffffff;
-  --text: #17212b;
-  --muted: #475569;
-  --border: #c7d3dc;
-  --accent: #075985;
-  --accent-hover: #0c4a6e;
-  --focus: #075985;
-  --signal: #0f766e;
-  --shadow: 0 24px 70px rgb(23 33 43 / 16%);
+  --page: #e9eeee;
+  --surface: #fbfcfa;
+  --text: #182326;
+  --muted: #516266;
+  --border: #b8c5c5;
+  --accent: #006b70;
+  --accent-hover: #004f54;
+  --focus: #006b70;
+  --signal: #06704f;
+  --route: #995100;
+  --chrome: #14242b;
+  --shadow: 0 24px 70px rgb(20 36 43 / 18%);
+  --font-body: "Avenir Next", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
 }
 
 * {
@@ -20,11 +24,11 @@ body {
   min-height: 100vh;
   margin: 0;
   background:
-    radial-gradient(circle at 15% 15%, #d7eef7 0, transparent 32%),
-    radial-gradient(circle at 85% 10%, #e2eaf1 0, transparent 34%),
+    linear-gradient(90deg, color-mix(in srgb, var(--border) 36%, transparent) 1px, transparent 1px) 0 0 / 4rem 4rem,
+    linear-gradient(color-mix(in srgb, var(--border) 36%, transparent) 1px, transparent 1px) 0 0 / 4rem 4rem,
     var(--page);
   color: var(--text);
-  font: 1rem/1.5 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font: 1rem/1.5 var(--font-body);
 }
 
 .auth-shell {
@@ -35,34 +39,49 @@ body {
 }
 
 .auth-card {
+  position: relative;
   width: min(36rem, 100%);
   padding: clamp(2rem, 7vw, 4rem);
   border: 1px solid var(--border);
-  border-radius: 1rem;
+  border-top: 0.35rem solid var(--route);
+  border-radius: 0.3rem;
   background: var(--surface);
   box-shadow: var(--shadow);
 }
 
+.auth-card::before {
+  position: absolute;
+  top: -0.35rem;
+  right: 2rem;
+  width: 2.4rem;
+  height: 0.35rem;
+  background: var(--accent);
+  content: "";
+}
+
 .brand {
   display: inline-flex;
-  min-height: 3.5rem;
+  min-height: 2.75rem;
   align-items: center;
-  margin-bottom: 2rem;
-  padding: 0 1rem;
-  border-radius: 0.6rem;
-  background: var(--accent);
-  box-shadow: 0 12px 28px rgb(7 89 133 / 24%);
+  margin-bottom: 2.5rem;
+  padding: 0 0.75rem;
+  border-left: 0.5rem solid var(--route);
+  border-radius: 0.1rem;
+  background: var(--chrome);
+  box-shadow: none;
   color: #ffffff;
-  font-size: 1.35rem;
+  font-size: 1rem;
   font-weight: 800;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  letter-spacing: 0.06em;
+  font-family: var(--font-mono);
+  letter-spacing: 0.1em;
   text-transform: uppercase;
 }
 
 .eyebrow {
   margin: 0 0 0.7rem;
-  color: var(--signal);
+  color: var(--route);
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
   font-weight: 800;
   letter-spacing: 0.12em;
   text-transform: uppercase;
@@ -70,9 +89,10 @@ body {
 
 h1 {
   margin: 0;
-  font-size: clamp(2.5rem, 9vw, 4.5rem);
-  letter-spacing: -0.045em;
-  line-height: 1.02;
+  max-width: 11ch;
+  font-size: clamp(2.35rem, 8vw, 4rem);
+  letter-spacing: -0.055em;
+  line-height: 0.98;
 }
 
 .lede {
@@ -101,7 +121,7 @@ h1 {
 .device-code input {
   min-height: 3.25rem;
   border: 1px solid var(--border);
-  border-radius: 0.75rem;
+  border-radius: 0.25rem;
   background: var(--surface);
   color: var(--text);
   font: inherit;
@@ -131,7 +151,7 @@ h1 {
   width: 100%;
   min-height: 3.25rem;
   border: 1px solid var(--border);
-  border-radius: 0.75rem;
+  border-radius: 0.25rem;
   background: var(--surface);
   color: var(--text);
   font: inherit;
@@ -153,7 +173,8 @@ h1 {
 .auth-error {
   margin-top: 1.5rem;
   border: 1px solid #d13a4a;
-  border-radius: 0.75rem;
+  border-left: 0.3rem solid #b42335;
+  border-radius: 0.2rem;
   background: color-mix(in srgb, #d13a4a 10%, var(--surface));
   color: var(--text);
   padding: 0.85rem 1rem;
@@ -164,7 +185,8 @@ h1 {
   gap: 0.35rem;
   margin-top: 1.5rem;
   border: 1px solid var(--focus);
-  border-radius: 0.75rem;
+  border-left: 0.3rem solid var(--focus);
+  border-radius: 0.2rem;
   background: color-mix(in srgb, var(--focus) 8%, var(--surface));
   padding: 0.85rem 1rem;
 }
@@ -241,9 +263,9 @@ h1 {
   align-items: center;
   justify-content: center;
   padding: 0.75rem 1.15rem;
-  border-radius: 0.75rem;
+  border-radius: 0.25rem;
   background: var(--accent);
-  box-shadow: 0 10px 24px rgb(7 89 133 / 24%);
+  box-shadow: none;
   color: #ffffff;
   font-weight: 750;
   line-height: 1.25;
@@ -261,28 +283,38 @@ h1 {
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --page: #0b1218;
-    --surface: #111d26;
-    --text: #eef6fa;
-    --muted: #b7c6d2;
-    --border: #304352;
-    --accent: #7dd3fc;
-    --accent-hover: #bae6fd;
+    --page: #0d1518;
+    --surface: #152125;
+    --text: #f0f5f3;
+    --muted: #b3c0c1;
+    --border: #3a4d50;
+    --accent: #73d7d0;
+    --accent-hover: #a5ebe5;
     --focus: #fef08a;
-    --signal: #5eead4;
+    --signal: #66d7a9;
+    --route: #f2b84b;
+    --chrome: #091114;
     --shadow: 0 24px 70px rgb(0 0 0 / 42%);
   }
 
   body {
     background:
-      radial-gradient(circle at 15% 15%, #123c51 0, transparent 32%),
-      radial-gradient(circle at 85% 10%, #152b38 0, transparent 34%),
+      linear-gradient(90deg, color-mix(in srgb, var(--border) 28%, transparent) 1px, transparent 1px) 0 0 / 4rem 4rem,
+      linear-gradient(color-mix(in srgb, var(--border) 28%, transparent) 1px, transparent 1px) 0 0 / 4rem 4rem,
       var(--page);
   }
 
   .primary-action {
     color: #082f49;
   }
+}
+
+@media (forced-colors: active) {
+  body { background: Canvas; }
+  .auth-card { border-color: CanvasText; box-shadow: none; }
+  .brand { border-color: Highlight; background: Canvas; color: CanvasText; }
+  .primary-action { forced-color-adjust: none; background: Highlight; color: HighlightText; }
+  :is(a, button, input):focus-visible { outline-color: Highlight; }
 }
 
 @media (prefers-reduced-motion: no-preference) {

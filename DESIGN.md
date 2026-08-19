@@ -342,6 +342,10 @@ These are project-wide rules, enforced in review and (where possible) CI:
     conversions live behind `as_secs()` and the SQL edge, named and greppable.
     The SQL boundary rejects pre-epoch and precision-losing values, so corrupt
     signed storage cannot wrap into a future protocol time or become epoch.
+  - `logRegion` — every dynamically rendered console backlog or live log gets
+    its bounded-scroll container, log role, accessible name, and keyboard focus
+    in one constructor. A new Safari-inaccessible overflow region cannot be
+    produced by copying only the visual `backlog` class.
   - The wire-length **runtime** invariant (§7.1): where a *type* is
     impractical (every outbound line is a `String`), a debug-build assertion
     at the one send funnel makes the class machine-checked by the test and
@@ -1590,7 +1594,13 @@ transient drop self-heals; opening the page without a `?network=` selector
 shows a picker of the caller's networks (its entry point). The persistent
 top-bar selector changes networks from every chat view, the preferences menu
 owns validated theme/notification settings, and responsive conversation
-navigation preserves the full chat pane on phones. Identity, network-list,
+navigation preserves the full chat pane on phones. The identity, console, and
+chat surfaces share the relay-desk visual system: dark routing chrome, compact
+monospaced provenance labels, high-contrast state colors, and one amber route
+trace joining network context to the active conversation. The network catalog
+links only enabled networks with a running driver; disabled or unbuilt entries
+remain visible status rows and point recovery toward management instead of
+offering a dead-end chat action. Identity, network-list,
 history, storage, notification, and socket-protocol failures have visible,
 actionable states; an API failure is never rendered as an empty account. The
 member list is rank-ordered with sigils kept live from channel `MODE`, and the

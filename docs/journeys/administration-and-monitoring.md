@@ -118,6 +118,11 @@ one mutation lane. The core suspension event installs its deny key before
 disconnecting sessions, so an already-running password verification cannot
 authenticate after the administrative sweep.
 
+Every bounded console table and dynamically rendered backlog/live-log region
+is keyboard-scrollable. Dynamic log regions get their log role, accessible
+name, and focusability from one constructor so Safari does not strand overflow
+content outside the keyboard path.
+
 **Evidence.** Proven by PostgreSQL cursor/filter/posture and atomic bearer
 revocation tests; ordered-core late-verdict/disconnect tests; exact-owner
 registry-stop tests; and a real HTTP suspend/reactivate journey covering

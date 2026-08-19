@@ -332,6 +332,9 @@ try {
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
   assert.equal(await consoleTheme.inputValue(), "light");
   assert.equal(await page.locator("html").getAttribute("data-theme"), "light");
+  const explicitLightBackground = await page.evaluate(
+    () => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim(),
+  );
   await page.emulateMedia({ colorScheme: "light" });
   await consoleTheme.selectOption("auto");
   await page.waitForFunction(() => !document.documentElement.hasAttribute("data-theme"));
@@ -341,15 +344,19 @@ try {
   );
   assert.equal(
     await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()),
-    "#f5f8fa",
+    explicitLightBackground,
   );
   await page.emulateMedia({ colorScheme: "dark" });
-  assert.equal(
-    await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()),
-    "#0b1218",
+  const automaticDarkBackground = await page.evaluate(
+    () => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim(),
   );
+  assert.notEqual(automaticDarkBackground, explicitLightBackground);
   await consoleTheme.selectOption("dark");
   await page.waitForFunction(() => document.documentElement.dataset.theme === "dark");
+  assert.equal(
+    await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()),
+    automaticDarkBackground,
+  );
   // A narrow viewport keeps the console's complete navigation in its own
   // horizontal rail instead of creating a second tall page above the task.
   // The document itself must remain free of horizontal overflow, including
@@ -1081,9 +1088,10 @@ try {
   const componentLogPage = await page.goto(`${applicationOrigin}/console/networks/journey/logs`);
   assert.equal(componentLogPage.status(), 200);
   assert.equal((await componentLogBuffer).status(), 200);
-  await page.getByRole("log", { name: "Component log", exact: true })
-    .getByText("browser replays through the real stack", { exact: false })
+  const componentLog = page.getByRole("log", { name: "Component log", exact: true });
+  await componentLog.getByText("browser replays through the real stack", { exact: false })
     .waitFor();
+  assert.equal(await componentLog.getAttribute("tabindex"), "0");
   await page.getByRole("heading", { name: "journey log", exact: true }).waitFor();
 
   const serverLogRead = page.waitForResponse(
@@ -1094,6 +1102,10 @@ try {
   assert.equal(serverLogPage.status(), 200);
   assert.equal((await serverLogRead).status(), 200);
   await page.getByRole("heading", { name: "Live logs", exact: true }).waitFor();
+  assert.equal(
+    await page.getByRole("log", { name: "Live server logs", exact: true }).getAttribute("tabindex"),
+    "0",
+  );
   await page.getByText("This feed never includes request data, IRC traffic, or secrets.", { exact: false }).waitFor();
 
   const initialBuffer = page.waitForResponse(

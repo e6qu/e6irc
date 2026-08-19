@@ -37,11 +37,24 @@ class TemplateParser(HTMLParser):
                 "navigation landmark has no accessible name"
             )
         elif tag == "div" and "scroll" in attributes.get("class", "").split():
-            if attributes.get("tabindex") != "0" or not attributes.get("aria-label"):
+            if (
+                attributes.get("tabindex") != "0"
+                or attributes.get("role") != "region"
+                or not attributes.get("aria-label")
+            ):
                 self.errors.append(
                     f"{self.path.relative_to(ROOT)}:{self.getpos()[0]}: "
-                    "scroll region must be focusable and named"
+                    "scroll region must be focusable, named, and carry region semantics"
                 )
+        elif (
+            tag in {"div", "span"}
+            and (attributes.get("aria-label") or attributes.get("aria-labelledby"))
+            and not attributes.get("role")
+        ):
+            self.errors.append(
+                f"{self.path.relative_to(ROOT)}:{self.getpos()[0]}: "
+                "generic element with an accessible name must declare valid semantics"
+            )
         elif tag == "label":
             self.label_depth += 1
         elif tag in {"input", "select", "textarea"}:

@@ -1,5 +1,6 @@
 import playwrightTest from "playwright/test";
 import AxeBuilder from "@axe-core/playwright";
+import { readFile } from "node:fs/promises";
 
 const { expect, test } = playwrightTest;
 
@@ -69,6 +70,43 @@ async function mockSession(page, networks, failureStatus = 503, identityPayload 
   });
 }
 
+async function setStyledFixture(page, fixture, styles) {
+  const html = await readFile(new URL(`fixtures/${fixture}`, import.meta.url), "utf8");
+  await page.setContent(html.replace("/* TEST_STYLES */", styles));
+}
+
+test("identity entry uses the shared relay-desk system", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "light", reducedMotion: "reduce" });
+  await page.setViewportSize({ width: 1280, height: 800 });
+  const styles = await readFile(new URL("../../crates/e6ircd/assets/auth.css", import.meta.url), "utf8");
+  await setStyledFixture(page, "identity-entry.html", styles);
+
+  await expectAccessible(page);
+  await expect(page).toHaveScreenshot("identity-entry-light.png", { animations: "disabled", fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await expectAccessible(page);
+  await page.emulateMedia({ forcedColors: "active" });
+  await expectAccessible(page);
+});
+
+test("console shell keeps operations dense and legible", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "light", reducedMotion: "reduce" });
+  await page.setViewportSize({ width: 1280, height: 800 });
+  const template = await readFile(new URL("../../crates/e6ircd/templates/console_base.html", import.meta.url), "utf8");
+  const styles = template.match(/<style>([\s\S]+)<\/style>/)?.[1];
+  expect(styles).toBeTruthy();
+  await setStyledFixture(page, "console-overview.html", styles);
+
+  await expectAccessible(page);
+  await expect(page).toHaveScreenshot("console-overview-light.png", { animations: "disabled", fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await expectAccessible(page);
+  await page.emulateMedia({ forcedColors: "active" });
+  await expectAccessible(page);
+});
+
 test("network picker renders the empty account state", async ({ page }) => {
   await page.emulateMedia({ colorScheme: "light", reducedMotion: "reduce" });
   await page.setViewportSize({ width: 1280, height: 800 });
@@ -77,6 +115,7 @@ test("network picker renders the empty account state", async ({ page }) => {
 
   await expect(page.getByText("No networks are configured for this account.")).toBeVisible();
   await expect(page.locator("ol#messages[aria-live=polite]")).toBeVisible();
+  await expect(page.getByRole("list", { name: "Messages" })).toHaveAttribute("tabindex", "0");
   await expect(page.getByRole("button", { name: "Join channel" })).toBeDisabled();
   await expectAccessible(page);
   await expect(page).toHaveScreenshot("network-picker-empty-light.png", {
@@ -155,8 +194,10 @@ test("network picker renders typed network states on tablets", async ({ page }) 
   ]);
   await page.goto("/");
 
-  await expect(page.getByRole("link", { name: /Libera.*reconnecting/ })).toBeVisible();
-  await expect(page.getByRole("link", { name: /Archive.*disabled/ })).toBeVisible();
+  await expect(page.getByRole("link", { name: /Libera.*reconnecting/ })).toHaveAttribute("data-state", "reconnecting");
+  await expect(page.getByText("Archive", { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: /Archive.*disabled/ })).toHaveCount(0);
+  await expect(page.getByLabel("Active network").locator('option[value="Archive"]')).toHaveAttribute("disabled", "");
   await expectAccessible(page);
   await expect(page).toHaveScreenshot("network-picker-tablet.png", {
     animations: "disabled",

@@ -12,7 +12,7 @@
     <a class="skip-link" href="#chatpane">Skip to chat</a>
     <main id="app">
       <header id="topbar">
-        <a id="brand" href="/">e6irc</a>
+        <a id="brand" href="/" aria-label="e6irc home"><span>e6</span><strong>irc</strong></a>
         <button
           id="sidebar-toggle"
           type="button"
@@ -20,7 +20,7 @@
           aria-controls="sidebar"
         >Conversations</button>
         <label id="network-control">
-          <span>Network</span>
+          <span>Route</span>
           <select id="network-select" aria-label="Active network">
             <option value="">Choose a network</option>
           </select>
@@ -54,23 +54,25 @@
       <div id="alerts"></div>
 
       <div id="workspace">
-        <aside id="sidebar" aria-label="Buffers">
-          <div class="side-head">Buffers</div>
+        <aside id="sidebar" aria-label="Conversations">
+          <div class="side-head">Conversations</div>
           <form id="join-form" autocomplete="off">
             <input type="text" id="join-input" placeholder="join #channel" aria-label="Join a channel" autocomplete="off" disabled />
-            <button type="submit" aria-label="Join channel" title="Join channel" disabled>+</button>
+            <button type="submit" aria-label="Join channel" title="Join channel" disabled>Join</button>
           </form>
           <ul id="buffers"></ul>
         </aside>
 
         <section id="chatpane" tabindex="-1">
           <div id="bufhead">
-            <h1 id="bufname">—</h1>
-            <span id="buftopic" class="topic"></span>
+            <div class="buffer-identity">
+              <p class="route-kicker"><span id="route-network">No network</span><span aria-hidden="true">→</span><span>Conversation</span></p>
+              <div class="buffer-title"><h1 id="bufname">—</h1><span id="buftopic" class="topic"></span></div>
+            </div>
             <button id="buffer-action" type="button" hidden>Close</button>
           </div>
           <button id="load-earlier" type="button" hidden>Load earlier messages</button>
-          <ol id="messages" aria-live="polite" aria-relevant="additions text" aria-label="Messages"></ol>
+          <ol id="messages" tabindex="0" aria-live="polite" aria-relevant="additions text" aria-label="Messages"></ol>
           <button id="jump-latest" type="button" hidden>Jump to latest messages</button>
           <form id="composer" autocomplete="off">
             <input

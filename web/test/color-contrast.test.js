@@ -15,26 +15,28 @@ function ratio(a, b) {
   return (light + 0.05) / (dark + 0.05);
 }
 
-test("shared signal-room palette keeps text and actions above WCAG AA contrast", async () => {
+test("shared relay-desk palette keeps text and actions above WCAG AA contrast", async () => {
   const [chat, console, identity] = await Promise.all([
     readFile(new URL("../src/style.css", import.meta.url), "utf8"),
     readFile(new URL("../../crates/e6ircd/templates/console_base.html", import.meta.url), "utf8"),
     readFile(new URL("../../crates/e6ircd/assets/auth.css", import.meta.url), "utf8"),
   ]);
   for (const stylesheet of [chat, console, identity]) {
-    assert.match(stylesheet, /#075985/);
-    assert.match(stylesheet, /#17212b/);
+    assert.match(stylesheet, /#006b70/);
+    assert.match(stylesheet, /#182326/);
   }
   assert.doesNotMatch(identity, /rgb\(113 39 232/);
   for (const [foreground, background] of [
-    ["#17212b", "#ffffff"],
-    ["#475569", "#ffffff"],
-    ["#ffffff", "#075985"],
-    ["#eef6fa", "#111d26"],
-    ["#b7c6d2", "#111d26"],
-    ["#082f49", "#7dd3fc"],
-    ["#ffffff", "#a64b00"],
-    ["#17212b", "#fdba74"],
+    ["#182326", "#fbfcfa"],
+    ["#516266", "#fbfcfa"],
+    ["#516266", "#e1e9e8"],
+    ["#ffffff", "#006b70"],
+    ["#995100", "#fbfcfa"],
+    ["#f0f5f3", "#152125"],
+    ["#b3c0c1", "#152125"],
+    ["#082f32", "#73d7d0"],
+    ["#ffffff", "#a45d00"],
+    ["#2b1b00", "#f2b84b"],
   ]) {
     assert.ok(ratio(foreground, background) >= 4.5, `${foreground} on ${background} is below 4.5:1`);
   }
