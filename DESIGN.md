@@ -1706,13 +1706,22 @@ The shipped ratatui client uses one owned `e6irc-client::ConnectionOptions`
 request for plaintext/public-CA TLS and anonymous, SASL PLAIN, or SASL
 OAUTHBEARER registration. An `account/network` SASL account selects an owned
 BNC network. It has bounded channel/query buffers, Alt-Left/Right switching,
-bounded scrollback, `/join`, `/win`, `/quit`, automatic reconnect with the
-same explicit request, and loud disconnect/write/drop state. On initial
+bounded scrollback, a relay/status strip, an active-first conversation rail,
+a visible horizontally-following composer caret, `/help`, `/join`, `/msg`,
+`/win`, `/raw`, literal-slash escape with `//`, `/quit`, Ctrl-End return to the
+latest message, Ctrl-C exit, automatic reconnect with the same explicit
+request, and loud disconnect/write/drop state. The slash-command grammar is
+closed: malformed
+or unknown commands remain in the composer with an explanation instead of
+silently doing nothing or leaking into a conversation. On initial
 connect and reconnect it requires the history/read-marker capabilities it
 uses, rejoins every channel confirmed for the client, loads bounded
 CHATHISTORY after the server's marker (or the latest bounded window), and
-coalesces shared read-marker writes as buffer focus advances. Unread counts are
-visible and history/live overlap is deduplicated by stable message ID.
+coalesces shared read-marker writes as buffer focus advances. While the current
+buffer is in scrollback, new messages increase its unread count and cannot
+advance its marker; returning to the live edge clears that count and queues the
+latest marker. Unread counts are visible and history/live overlap is
+deduplicated by stable message ID.
 The composer and socket-writer queue are both bounded. A message is locally
 echoed only after bounded-queue admission; a full queue, disconnected socket,
 or over-limit complete IRC line leaves the input available and reports the

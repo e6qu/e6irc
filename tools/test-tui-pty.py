@@ -7,6 +7,7 @@ import fcntl
 import os
 import pathlib
 import pty
+import re
 import select
 import signal
 import socket
@@ -25,6 +26,12 @@ TUI = pathlib.Path(
     os.environ.get("E6IRC_TEST_TUI_BINARY", ROOT / "target/debug/e6irc-tui")
 )
 TIMEOUT = 15.0
+ANSI_CONTROL = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def visible_text(output: bytes | bytearray) -> bytes:
+    """Remove ANSI controls so individually styled visible copy is searchable."""
+    return ANSI_CONTROL.sub(b"", bytes(output))
 
 
 def available_port() -> int:
@@ -197,6 +204,15 @@ def main() -> None:
                 raise AssertionError("TUI did not render the inbound message text")
             if b"\x1b[?1049h" not in output:
                 raise AssertionError("TUI did not enter the alternate screen")
+            for label in (b"e6/irc", b"ROUTE", b"CONNECTED", b"CONVERSATIONS"):
+                if label not in output:
+                    raise AssertionError(f"TUI did not render product state {label!r}")
+
+            os.write(master, b"/help\r")
+            read_pty_until(master, output, b"commands:")
+            help_output = visible_text(output)
+            if not all(part in help_output for part in (b"/msg", b"nick", b"text")):
+                raise AssertionError("TUI help did not expose direct messages")
 
             os.write(master, b"hello from pty")
             drain_pty(master, output, 0.5)
@@ -212,7 +228,10 @@ def main() -> None:
                 raise RuntimeError(f"TUI exited {tui.returncode}")
             if b"\x1b[?1049l" not in output:
                 raise AssertionError("TUI did not restore the alternate screen")
-            print("TUI PTY journey passed: render, inbound, outbound, clean restore")
+            print(
+                "TUI PTY journey passed: product state, help, inbound, outbound, "
+                "clean restore"
+            )
         except Exception:
             print(output.decode("utf-8", "replace"))
             server_log.flush()

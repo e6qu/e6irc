@@ -106,6 +106,10 @@ impl Buffer {
         self.scroll > 0
     }
 
+    pub fn lines_behind_latest(&self) -> usize {
+        self.scroll
+    }
+
     pub fn unread(&self) -> usize {
         self.unread
     }
@@ -135,7 +139,8 @@ pub struct App {
     pub nick: String,
     pub buffers: Vec<Buffer>,
     pub current: usize,
-    pub input: String,
+    input: String,
+    input_cursor: usize,
     pub should_quit: bool,
     connected: bool,
     pending_read_marker: Option<String>,
@@ -183,6 +188,7 @@ impl App {
             buffers: vec![Buffer::new(channel)],
             current: 0,
             input: String::new(),
+            input_cursor: 0,
             should_quit: false,
             connected: true,
             pending_read_marker: None,
@@ -198,6 +204,22 @@ impl App {
     /// never rendered as sent and queued for surprise delivery later.
     pub fn set_connected(&mut self, connected: bool) {
         self.connected = connected;
+    }
+
+    pub fn connected(&self) -> bool {
+        self.connected
+    }
+
+    pub fn total_unread(&self) -> usize {
+        self.buffers.iter().map(Buffer::unread).sum()
+    }
+
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+
+    pub fn input_cursor(&self) -> usize {
+        self.input_cursor
     }
 
     pub fn current(&self) -> &Buffer {
@@ -253,7 +275,15 @@ impl App {
     }
 
     pub fn scroll_down(&mut self, n: usize) {
+        let was_scrolled_back = self.current().scrolled_back();
         self.current_mut().scroll_down(n);
+        if was_scrolled_back && !self.current().scrolled_back() {
+            self.focus_current();
+        }
+    }
+
+    pub fn jump_latest(&mut self) {
+        self.scroll_down(usize::MAX);
     }
 
     /// Fold an incoming server message into the right buffer.
@@ -296,7 +326,8 @@ impl App {
                         );
                     }
                 }
-                if idx == self.current {
+                if idx == self.current && !self.buffers[idx].scrolled_back() {
+                    self.buffers[idx].unread = 0;
                     self.queue_current_marker();
                 } else {
                     self.buffers[idx].unread = self.buffers[idx].unread.saturating_add(1);
@@ -359,6 +390,9 @@ impl App {
     }
 
     fn focus_current(&mut self) {
+        if self.buffers[self.current].scrolled_back() {
+            return;
+        }
         self.buffers[self.current].unread = 0;
         self.queue_current_marker();
     }
@@ -408,7 +442,7 @@ impl App {
     /// visible refusal into data loss.
     pub fn outbound_refused(&mut self, outbound: &Outbound) {
         if self.input.is_empty() {
-            self.input = outbound.input.clone();
+            self.restore_input(outbound.input.clone());
         }
     }
 
@@ -453,83 +487,227 @@ impl App {
             }
             return;
         }
-        self.input.push(c);
+        self.input.insert(self.input_cursor, c);
+        self.input_cursor += c.len_utf8();
     }
 
     pub fn on_backspace(&mut self) {
-        self.input.pop();
+        let Some((previous, _)) = self.input[..self.input_cursor].char_indices().next_back() else {
+            return;
+        };
+        self.input.drain(previous..self.input_cursor);
+        self.input_cursor = previous;
         self.input_limit_reported = false;
     }
 
-    /// Handle Enter: produce an Action and clear the input.
-    /// `/quit` exits; `/join #c` opens+joins a channel; `/win N` (or a
-    /// buffer name) switches; anything else is sent to the current buffer.
+    pub fn on_delete(&mut self) {
+        let Some(next) = self.input[self.input_cursor..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+        else {
+            return;
+        };
+        self.input
+            .drain(self.input_cursor..self.input_cursor + next);
+        self.input_limit_reported = false;
+    }
+
+    pub fn move_input_left(&mut self) {
+        if let Some((previous, _)) = self.input[..self.input_cursor].char_indices().next_back() {
+            self.input_cursor = previous;
+        }
+    }
+
+    pub fn move_input_right(&mut self) {
+        if let Some(next) = self.input[self.input_cursor..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+        {
+            self.input_cursor += next;
+        }
+    }
+
+    pub fn move_input_home(&mut self) {
+        self.input_cursor = 0;
+    }
+
+    pub fn move_input_end(&mut self) {
+        self.input_cursor = self.input.len();
+    }
+
+    pub fn clear_input(&mut self) {
+        self.input.clear();
+        self.input_cursor = 0;
+        self.input_limit_reported = false;
+    }
+
+    /// Handle Enter: produce an action and clear accepted input. Commands are
+    /// closed and explicit; a misspelled command is retained for correction
+    /// instead of leaking into the active conversation as message text.
     pub fn on_enter(&mut self) -> Action {
         let line = std::mem::take(&mut self.input);
+        self.input_cursor = 0;
         self.input_limit_reported = false;
         if line.is_empty() {
             return Action::None;
         }
-        if line == "/quit" {
-            self.should_quit = true;
-            return Action::Quit;
+
+        if let Some(text) = line.strip_prefix("//") {
+            return self.message_outbound(line.clone(), format!("/{text}"));
         }
-        if let Some(chan) = line.strip_prefix("/join ").map(str::trim) {
-            if !chan.is_empty() {
-                if !self.connected {
-                    self.input = line;
-                    self.status("not connected — JOIN not sent");
-                    return Action::None;
-                }
-                let wire = format!("JOIN {chan}");
-                if wire.len() > MAX_WIRE_LINE_BYTES {
-                    self.input = line;
-                    self.status(format!(
-                        "message is too long for the IRC wire limit ({}/{MAX_WIRE_LINE_BYTES} bytes)",
-                        wire.len()
-                    ));
-                    return Action::None;
-                }
-                // The user's own /join is refused the same way as a
-                // server-driven one, but it is worth saying so: silently not
-                // switching would look like the command did nothing.
-                let Some(idx) = self.open_buffer(chan.to_string()) else {
-                    self.note_buffer_limit();
-                    return Action::None;
-                };
-                self.current = idx;
-                self.focus_current();
-                return Action::Send(Outbound {
-                    line: wire,
-                    input: line,
-                    local_echo: None,
+
+        if let Some(command_line) = line.strip_prefix('/') {
+            let (command, arguments) = command_line
+                .split_once(' ')
+                .map_or((command_line, ""), |(command, arguments)| {
+                    (command, arguments.trim())
                 });
-            }
-            return Action::None;
+            let command = command.to_ascii_lowercase();
+            let arguments = arguments.to_owned();
+            return match command.as_str() {
+                "help" if arguments.is_empty() => {
+                    self.status(
+                        "commands: /join #channel · /msg nick text · /win name|number · /raw LINE · /quit · //text sends /text",
+                    );
+                    Action::None
+                }
+                "quit" if arguments.is_empty() => {
+                    self.should_quit = true;
+                    Action::Quit
+                }
+                "join" => self.join_command(line, &arguments),
+                "win" => self.window_command(line, &arguments),
+                "msg" => self.direct_message_command(line, &arguments),
+                "raw" => self.raw_command(line, &arguments),
+                "help" => self.refuse_command(line, "usage: /help"),
+                "quit" => self.refuse_command(line, "usage: /quit"),
+                "" => self.refuse_command(line, "enter /help to list commands"),
+                _ => self.refuse_command(
+                    line,
+                    format!(
+                        "unknown command /{command} — use /help; use // to send a literal slash"
+                    ),
+                ),
+            };
         }
-        if let Some(rest) = line.strip_prefix("/win ").map(str::trim) {
-            let target = rest
-                .parse::<usize>()
-                .ok()
-                .and_then(|number| number.checked_sub(1))
-                .filter(|index| *index < self.buffers.len())
-                .or_else(|| self.buffer_index(rest));
-            if let Some(index) = target {
-                self.current = index;
-                self.focus_current();
-            } else {
-                self.status(format!("no buffer named or numbered {rest}"));
-            }
-            return Action::None;
+
+        self.message_outbound(line.clone(), line)
+    }
+
+    fn join_command(&mut self, input: String, channel: &str) -> Action {
+        if channel.is_empty() || channel.contains(char::is_whitespace) {
+            return self.refuse_command(input, "usage: /join #channel");
         }
         if !self.connected {
-            self.input = line;
-            self.status("not connected — message not sent");
+            return self.refuse_command(input, "not connected — JOIN not sent");
+        }
+        let wire = format!("JOIN {channel}");
+        if wire.len() > MAX_WIRE_LINE_BYTES {
+            return self.refuse_command(
+                input,
+                format!(
+                    "message is too long for the IRC wire limit ({}/{MAX_WIRE_LINE_BYTES} bytes)",
+                    wire.len()
+                ),
+            );
+        }
+        let Some(index) = self.open_buffer(channel.to_owned()) else {
+            self.restore_input(input);
+            self.note_buffer_limit();
             return Action::None;
+        };
+        self.current = index;
+        self.focus_current();
+        Action::Send(Outbound {
+            line: wire,
+            input,
+            local_echo: None,
+        })
+    }
+
+    fn window_command(&mut self, input: String, target: &str) -> Action {
+        if target.is_empty() || target.contains(char::is_whitespace) {
+            return self.refuse_command(input, "usage: /win name|number");
+        }
+        let index = target
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+            .filter(|index| *index < self.buffers.len())
+            .or_else(|| self.buffer_index(target));
+        if let Some(index) = index {
+            self.current = index;
+            self.focus_current();
+        } else {
+            self.restore_input(input);
+            self.status(format!("no buffer named or numbered {target}"));
+        }
+        Action::None
+    }
+
+    fn direct_message_command(&mut self, input: String, arguments: &str) -> Action {
+        let Some((target, text)) = arguments.split_once(' ') else {
+            return self.refuse_command(input, "usage: /msg nick text");
+        };
+        let text = text.trim_start();
+        if target.is_empty() || text.is_empty() {
+            return self.refuse_command(input, "usage: /msg nick text");
+        }
+        if !self.connected {
+            return self.refuse_command(input, "not connected — message not sent");
+        }
+        let wire = format!("PRIVMSG {target} :{text}");
+        if wire.len() > MAX_WIRE_LINE_BYTES {
+            return self.refuse_command(
+                input,
+                format!(
+                    "message is too long for the IRC wire limit ({}/{MAX_WIRE_LINE_BYTES} bytes)",
+                    wire.len()
+                ),
+            );
+        }
+        let Some(index) = self.open_buffer(target.to_owned()) else {
+            self.restore_input(input);
+            self.note_buffer_limit();
+            return Action::None;
+        };
+        self.current = index;
+        self.focus_current();
+        self.outbound_or_restore(
+            input,
+            wire,
+            Some(LocalEcho {
+                target: target.to_owned(),
+                text: text.to_owned(),
+            }),
+        )
+    }
+
+    fn raw_command(&mut self, input: String, line: &str) -> Action {
+        if line.is_empty() {
+            return self.refuse_command(input, "usage: /raw LINE");
+        }
+        if !self.connected {
+            return self.refuse_command(input, "not connected — raw line not sent");
+        }
+        self.outbound_or_restore(input, line.to_owned(), None)
+    }
+
+    fn refuse_command(&mut self, input: String, message: impl Into<String>) -> Action {
+        self.restore_input(input);
+        self.status(message);
+        Action::None
+    }
+
+    fn message_outbound(&mut self, input: String, text: String) -> Action {
+        if !self.connected {
+            return self.refuse_command(input, "not connected — message not sent");
         }
         let target = self.current().name.clone();
-        let wire = format!("PRIVMSG {target} :{line}");
-        self.outbound_or_restore(line.clone(), wire, Some(LocalEcho { target, text: line }))
+        let wire = format!("PRIVMSG {target} :{text}");
+        self.outbound_or_restore(input, wire, Some(LocalEcho { target, text }))
     }
 
     fn outbound_or_restore(
@@ -539,7 +717,7 @@ impl App {
         local_echo: Option<LocalEcho>,
     ) -> Action {
         if line.len() > MAX_WIRE_LINE_BYTES {
-            self.input = input;
+            self.restore_input(input);
             self.status(format!(
                 "message is too long for the IRC wire limit ({}/{MAX_WIRE_LINE_BYTES} bytes)",
                 line.len()
@@ -551,6 +729,11 @@ impl App {
             input,
             local_echo,
         })
+    }
+
+    fn restore_input(&mut self, input: String) {
+        self.input_cursor = input.len();
+        self.input = input;
     }
 }
 
@@ -705,7 +888,7 @@ mod tests {
         );
         assert_eq!(app.input, "unsent");
 
-        app.input.clear();
+        app.clear_input();
         for character in "/join #lost".chars() {
             app.on_char(character);
         }
@@ -727,6 +910,64 @@ mod tests {
         assert_eq!(outbound.line(), "JOIN #rust");
         assert_eq!(app.current().name, "#rust");
         assert_eq!(app.buffers.len(), 2);
+    }
+
+    #[test]
+    fn slash_commands_are_explicit_and_mistakes_are_retained() {
+        for input in [
+            "/join",
+            "/win",
+            "/msg alice",
+            "/raw",
+            "/quit later",
+            "/bogus",
+        ] {
+            let mut app = App::new("#c".into(), "me".into());
+            app.input = input.into();
+            assert_eq!(app.on_enter(), Action::None, "{input}");
+            assert_eq!(app.input, input, "{input}");
+            assert_eq!(app.current().log.len(), 1, "{input}");
+        }
+    }
+
+    #[test]
+    fn help_literal_slash_direct_message_and_raw_are_first_class() {
+        let mut app = App::new("#c".into(), "me".into());
+        app.input = "/help".into();
+        assert_eq!(app.on_enter(), Action::None);
+        assert!(app.input.is_empty());
+        assert!(
+            app.current()
+                .log
+                .last()
+                .is_some_and(|line| line.text.as_str().contains("/msg nick text"))
+        );
+
+        app.input = "//join is message text".into();
+        let Action::Send(literal) = app.on_enter() else {
+            panic!("escaped slash should be queued as message text");
+        };
+        assert_eq!(literal.line(), "PRIVMSG #c :/join is message text");
+        app.outbound_accepted(&literal);
+        assert_eq!(
+            app.current().log.last().unwrap().text,
+            "/join is message text"
+        );
+
+        app.input = "/msg Alice hello there".into();
+        let Action::Send(direct) = app.on_enter() else {
+            panic!("direct message should be queued");
+        };
+        assert_eq!(direct.line(), "PRIVMSG Alice :hello there");
+        assert_eq!(app.current().name, "Alice");
+        app.outbound_accepted(&direct);
+        assert_eq!(app.current().log.last().unwrap().text, "hello there");
+
+        app.input = "/raw WHOIS Alice".into();
+        let Action::Send(raw) = app.on_enter() else {
+            panic!("raw line should be queued");
+        };
+        assert_eq!(raw.line(), "WHOIS Alice");
     }
 
     #[test]
@@ -753,6 +994,38 @@ mod tests {
                 .last()
                 .is_some_and(|line| line.text.as_str().contains("message is too long"))
         );
+
+        let mut direct = App::new("#channel".into(), "me".into());
+        direct.input = format!("/msg Alice {}", "x".repeat(MAX_WIRE_LINE_BYTES - 11));
+        let retained = direct.input.clone();
+        assert_eq!(direct.on_enter(), Action::None);
+        assert_eq!(direct.input, retained);
+        assert_eq!(direct.buffers.len(), 1);
+    }
+
+    #[test]
+    fn composer_cursor_edits_on_character_boundaries() {
+        let mut app = App::new("#channel".into(), "me".into());
+        for character in "a界c".chars() {
+            app.on_char(character);
+        }
+        assert_eq!(app.input_cursor(), app.input().len());
+
+        app.move_input_left();
+        app.move_input_left();
+        app.on_char('b');
+        assert_eq!(app.input(), "ab界c");
+        assert_eq!(app.input_cursor(), 2);
+
+        app.on_delete();
+        assert_eq!(app.input(), "abc");
+        app.move_input_end();
+        app.on_backspace();
+        app.move_input_home();
+        app.on_delete();
+        app.on_backspace();
+        assert_eq!(app.input(), "b");
+        assert_eq!(app.input_cursor(), 0);
     }
 
     #[test]
@@ -846,6 +1119,39 @@ mod tests {
         assert_eq!(app.current().visible(3).last().unwrap().text, "line7");
         app.scroll_down(1000);
         assert_eq!(app.current().visible(3).last().unwrap().text, "fresh");
+    }
+
+    #[test]
+    fn messages_seen_only_after_scrollback_do_not_advance_the_read_marker() {
+        let mut app = App::new("#a".into(), "me".into());
+        app.on_message(&msg(
+            "@time=2026-07-30T12:00:00.000Z :alice!u@h PRIVMSG #a :one",
+        ));
+        app.on_message(&msg(
+            "@time=2026-07-30T12:00:01.000Z :alice!u@h PRIVMSG #a :two",
+        ));
+        assert_eq!(
+            app.take_read_marker_command().as_deref(),
+            Some("MARKREAD #a timestamp=2026-07-30T12:00:01.000Z")
+        );
+
+        app.scroll_up(1);
+        app.on_message(&msg(
+            "@time=2026-07-30T12:00:02.000Z :alice!u@h PRIVMSG #a :unseen",
+        ));
+        assert!(app.current().scrolled_back());
+        assert_eq!(app.current().unread(), 1);
+        assert!(app.take_read_marker_command().is_none());
+
+        app.jump_latest();
+        assert!(!app.current().scrolled_back());
+        assert_eq!(app.current().unread(), 0);
+        assert_eq!(
+            app.take_read_marker_command().as_deref(),
+            Some("MARKREAD #a timestamp=2026-07-30T12:00:02.000Z")
+        );
+        app.jump_latest();
+        assert!(app.take_read_marker_command().is_none());
     }
 
     #[test]

@@ -135,19 +135,26 @@ private to the current user.
    owned network.
 3. Require the history/read-marker capabilities in use, join the initial
    channel, load bounded history after its shared marker (or the latest bounded
-   window), and advance the marker as the current buffer is read.
-4. Receive into bounded buffers, see background unread counts, switch buffers
-   with Alt-Left/Right, scroll with Page Up/Down, and use `/join`, one-based or
-   named `/win`, and `/quit`.
+   window), and advance the marker only while the current buffer is at its live
+   edge. New traffic encountered during scrollback remains unread until the
+   person returns to the latest message.
+4. Use the route/status strip and active-first conversation rail to see the
+   current destination, connection state, and unread work. Receive into bounded
+   buffers, switch with Alt-Left/Right, scroll with Page Up/Down, return live
+   with Ctrl-End, edit the composer with character-safe cursor movement, and
+   use `/help`, `/join`, `/msg`, one-based or named `/win`, `/raw`, `//` for a
+   literal leading slash, and `/quit`. Malformed or unknown commands remain
+   editable and explain their refusal.
 5. Channel/direct messages create and update RFC1459-casefolded buffers;
    history/live overlap with the same message ID is represented once;
    server-originated text
    is represented by terminal-safe types.
 6. A live disconnect starts bounded-delay reconnect attempts with the same
    explicit transport/authentication request, rejoins every channel whose
-   self-JOIN was confirmed, and reloads marker-relative history. Input is
-   disabled while disconnected, and anything racing the disconnect is counted
-   and reported rather than replayed late or shown as a false successful send.
+   self-JOIN was confirmed, and reloads marker-relative history. The composer
+   visibly marks itself offline and retains editable input, while submission is
+   refused. Anything racing the disconnect is counted and reported rather than
+   replayed late or shown as a false successful send.
 7. The composer and outbound writer queue are bounded. A complete over-limit
    line or full queue retains/refuses input without local echo; accepted input
    is echoed only after queue admission, and a read-marker write remains
@@ -168,9 +175,10 @@ fuzzed with arbitrary server messages; authentication/transport argument
 shapes, disconnect refusal, transport failure, and bounded queue/scrollback
 behavior are tested. Duplex protocol tests prove capability refusal,
 marker-relative CHATHISTORY, and batch completion. A pseudo-terminal test
-drives the real full-screen binary against a real e6ircd, proves inbound
-rendering and outbound delivery, enters `/quit`, and requires clean alternate-
-screen restoration.
+drives the real full-screen binary against a real e6ircd, proves the relay-desk
+route/status/conversation framing, command help, inbound rendering, and
+outbound delivery, enters `/quit`, and requires clean alternate-screen
+restoration.
 Shared-client tests also prove that anonymous, PLAIN, and OAUTHBEARER
 registration request the same metadata capabilities and that malformed or
 over-limit steady-state input is a typed, visible rejection rather than a

@@ -33,7 +33,12 @@ accessible light, dark, and forced-colors palettes. Browser snapshots cover all
 three shells; interaction tests cover WCAG AA contrast, keyboard focus, Escape
 dismissal, reduced motion, responsive controls, and non-interactive unavailable
 network routes. Dynamically rendered console logs share one keyboard-focusable
-log-region constructor.
+log-region constructor. The terminal UI carries the same relay-desk hierarchy
+through an explicit route/status strip, active-first conversation rail,
+scrollback and unread state, and a visible horizontally-following composer.
+Its closed slash-command grammar retains malformed input, supports direct and
+raw messages, and advances read markers only when the user reaches the live
+edge.
 External qualification has one manual GitHub workflow. It selects one closed
 campaign, refuses local provider oracles, and uploads only evidence accepted by
 the runner verifier. Its Discord, Slack, and OpenID Connect boundaries use
