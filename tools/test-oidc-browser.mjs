@@ -1081,9 +1081,10 @@ try {
   const componentLogPage = await page.goto(`${applicationOrigin}/console/networks/journey/logs`);
   assert.equal(componentLogPage.status(), 200);
   assert.equal((await componentLogBuffer).status(), 200);
-  await page.getByRole("log", { name: "Component log", exact: true })
-    .getByText("browser replays through the real stack", { exact: false })
+  const componentLog = page.getByRole("log", { name: "Component log", exact: true });
+  await componentLog.getByText("browser replays through the real stack", { exact: false })
     .waitFor();
+  assert.equal(await componentLog.getAttribute("tabindex"), "0");
   await page.getByRole("heading", { name: "journey log", exact: true }).waitFor();
 
   const serverLogRead = page.waitForResponse(
@@ -1094,6 +1095,10 @@ try {
   assert.equal(serverLogPage.status(), 200);
   assert.equal((await serverLogRead).status(), 200);
   await page.getByRole("heading", { name: "Live logs", exact: true }).waitFor();
+  assert.equal(
+    await page.getByRole("log", { name: "Live server logs", exact: true }).getAttribute("tabindex"),
+    "0",
+  );
   await page.getByText("This feed never includes request data, IRC traffic, or secrets.", { exact: false }).waitFor();
 
   const initialBuffer = page.waitForResponse(

@@ -260,6 +260,13 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     region.append(child);
     return region;
   };
+  const logRegion = (label) => {
+    const region = element("div", "backlog");
+    region.tabIndex = 0;
+    region.setAttribute("role", "log");
+    region.setAttribute("aria-label", label);
+    return region;
+  };
 
   const retryButton = (retry) => {
     const button = element("button", "secondary-link", "Retry");
@@ -598,9 +605,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     if (view.recent_lines.length === 0) {
       backlog.append(element("p", "empty", "No upstream lines have been stored for this network."));
     } else {
-      const lines = element("div", "backlog");
-      lines.setAttribute("role", "log");
-      lines.setAttribute("aria-label", "Recent raw IRC backlog");
+      const lines = logRegion("Recent raw IRC backlog");
       for (const line of view.recent_lines) lines.append(element("code", "", line));
       backlog.append(lines);
     }
@@ -649,9 +654,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   }
 
   const renderNetworkLog = (panel, lines) => {
-    const log = element("div", "backlog");
-    log.setAttribute("role", "log");
-    log.setAttribute("aria-label", "Component log");
+    const log = logRegion("Component log");
     if (lines.length === 0) {
       log.append(element("p", "empty", "No component lines have been stored yet."));
     } else {
@@ -706,9 +709,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   }
 
   const renderServerLog = (panel, entries) => {
-    const log = element("div", "backlog");
-    log.setAttribute("role", "log");
-    log.setAttribute("aria-label", "Live server logs");
+    const log = logRegion("Live server logs");
     if (entries.length === 0) {
       log.append(element("p", "empty", "No operational events have been recorded yet."));
     } else {

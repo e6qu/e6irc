@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta name="viewport" content="width=device-width" />
+    <style>/* TEST_STYLES */</style>
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <span class="brand">e6irc console</span>
+        <span><span class="who">visual-test</span> · <a href="#sign-out">Sign out</a></span>
+      </header>
+      <div class="layout">
+        <nav aria-label="Console">
+          <div class="section">Server</div>
+          <a class="active" aria-current="page" href="#main">Overview</a>
+          <a href="#accounts">Accounts</a>
+          <a href="#monitoring">Monitoring</a>
+          <a href="#logs">Live logs</a>
+          <div class="section">You</div>
+          <a href="#networks">BNC networks</a>
+          <a href="#access">Account &amp; access</a>
+        </nav>
+        <main id="main">
+          <div class="page-head">
+            <div>
+              <p class="eyebrow">Control plane</p>
+              <h1>Server overview</h1>
+              <p class="lede">Live posture from the relay core and its configured network routes.</p>
+            </div>
+            <span class="live-pill"><span class="dot on"></span>Live</span>
+          </div>
+          <div class="metric-grid overview-metrics">
+            <div class="metric-card"><span class="metric-label">Connections</span><strong>128</strong><small>across 14 accounts</small></div>
+            <div class="metric-card"><span class="metric-label">Networks</span><strong>23</strong><small>21 connected</small></div>
+            <div class="metric-card"><span class="metric-label">Queue depth</span><strong>4</strong><small>within budget</small></div>
+            <div class="metric-card"><span class="metric-label">Uptime</span><strong>18d</strong><small>stable release</small></div>
+          </div>
+          <section class="panel">
+            <div class="panel-head">
+              <div><h2>Network routes</h2><p>Always-on upstream state and attached clients.</p></div>
+              <span class="count">3 routes</span>
+            </div>
+            <div class="scroll" tabindex="0" aria-label="Network routes">
+              <table>
+                <thead><tr><th>Status</th><th>Network</th><th>Upstream</th><th>Clients</th></tr></thead>
+                <tbody>
+                  <tr><td><span class="dot on"></span>Connected</td><td>Libera</td><td>irc.libera.chat</td><td>3</td></tr>
+                  <tr><td><span class="dot warn"></span>Reconnecting</td><td>Work</td><td>irc.example.net</td><td>1</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+  </body>
+</html>

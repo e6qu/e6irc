@@ -55,6 +55,7 @@ const buffersEl = el("buffers");
 const messagesEl = el("messages");
 const bufnameEl = el("bufname");
 const buftopicEl = el("buftopic");
+const routeNetworkEl = el("route-network");
 const bufferActionEl = el("buffer-action");
 const nicklistEl = el("nicklist");
 const nicksEl = el("nicks");
@@ -468,6 +469,7 @@ function messageRow(line) {
 
 function renderActive({ atLatest = true } = {}) {
   const b = buffers.get(active);
+  routeNetworkEl.textContent = network || "No network";
   bufnameEl.textContent = !b || b.key === SERVER ? "server" : b.display;
   buftopicEl.textContent = b ? b.topic : "";
   if (!b || b.kind === "server") {
@@ -1275,6 +1277,7 @@ function populateNetworkSelector(networks, failure = null) {
     option.value = item.name;
     option.textContent = `${item.name} · ${networkStateLabel(item)}`;
     option.selected = network !== null && fold(item.name) === fold(network);
+    option.disabled = item.enabled === false || item.runtime == null;
     networkSelect.appendChild(option);
   }
   if (network && !networks.some((item) => fold(item.name) === fold(network))) {
@@ -1296,6 +1299,7 @@ networkSelect.addEventListener("change", () => {
 });
 
 function renderNetworkPicker(networks, failure = null) {
+  routeNetworkEl.textContent = "Network catalog";
   setStatus(failure ? "network list unavailable" : "choose a network", failure ? "error" : "connecting");
   bufnameEl.textContent = "Select a network";
   buftopicEl.textContent = "";
@@ -1321,16 +1325,19 @@ function renderNetworkPicker(networks, failure = null) {
   if (!failure && networks.length) messagesEl.appendChild(intro);
   for (const item of networks) {
     const li = document.createElement("li");
-    li.className = "line";
-    const a = document.createElement("a");
-    a.className = "picker-net";
-    a.href = `/?network=${encodeURIComponent(item.name)}`;
+    li.className = "line picker-row";
+    const available = item.enabled !== false && item.runtime != null;
+    const control = document.createElement(available ? "a" : "div");
+    control.className = `picker-net${available ? "" : " picker-net-unavailable"}`;
+    if (available) control.href = `/?network=${encodeURIComponent(item.name)}`;
+    const stateLabel = networkStateLabel(item);
+    control.dataset.state = stateLabel;
     const name = document.createElement("span");
     name.textContent = item.name;
     const state = document.createElement("small");
-    state.textContent = networkStateLabel(item);
-    a.append(name, state);
-    li.appendChild(a);
+    state.textContent = stateLabel;
+    control.append(name, state);
+    li.appendChild(control);
     messagesEl.appendChild(li);
   }
   const manageLi = document.createElement("li");
