@@ -228,7 +228,7 @@ jobs:
       matrix:
         browser: [firefox, webkit]
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:18-alpine
@@ -256,25 +256,20 @@ jobs:
             [ "$i" = 30 ] && { echo "dex did not become ready"; docker logs dex; exit 1; }
             sleep 1
           done
-      - id: playwright
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ matrix.browser }}-${{ hashFiles('web/pnpm-lock.yaml') }}
-      - name: Install ${{ matrix.browser }} for Playwright
-        if: steps.playwright.outputs.cache-hit != 'true'
-        timeout-minutes: 25
-        run: pnpm -C web exec playwright install --with-deps "${{ matrix.browser }}"
       - run: cargo build -p e6ircd --features embed-web
       - name: Exercise the complete browser journey in ${{ matrix.browser }}
         timeout-minutes: 8
-        run: pnpm -C web test:oidc-browser
-        env:
-          E6IRC_TEST_BROWSER: ${{ matrix.browser }}
-          E6IRC_TEST_SERVER_BINARY: target/debug/e6ircd
-          E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
-          E6IRC_TEST_DEX_URL: http://127.0.0.1:15556/dex
-          E6IRC_BROWSER_ARTIFACTS_DIR: test-results/browser
+        run: |
+          docker run --rm --network host \
+            -v "$PWD:/work" --workdir /work \
+            -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+            -e E6IRC_TEST_BROWSER="${{ matrix.browser }}" \
+            -e E6IRC_TEST_SERVER_BINARY=target/debug/e6ircd \
+            -e E6IRC_TEST_DATABASE_URL=postgres://postgres:test@127.0.0.1:5432/e6irc_test \
+            -e E6IRC_TEST_DEX_URL=http://127.0.0.1:15556/dex \
+            -e E6IRC_BROWSER_ARTIFACTS_DIR=test-results/browser \
+            mcr.microsoft.com/playwright:v1.61.1-noble \
+            node tools/test-oidc-browser.mjs
       - name: Retain failed browser diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
