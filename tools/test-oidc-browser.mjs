@@ -1056,6 +1056,7 @@ try {
   assert.equal(page.url(), `${applicationOrigin}/console/networks`);
   assert.equal(await page.getByRole("link", { name: "journey", exact: true }).count(), 0);
   assert.equal(await page.locator('input[name="addr"]').inputValue(), upstream.address);
+  upstream.resetJoin("#journey");
   const networkDocument = await page.evaluate(() => performance.timeOrigin);
   const refreshedNetworks = page.waitForResponse(
     (response) => response.url() === `${applicationOrigin}/api/v1/me/networks`
@@ -2101,6 +2102,9 @@ async function startIrcUpstream() {
     address: `127.0.0.1:${address.port}`,
     async waitForJoin(channel) {
       activeConnection = await joinedConnection(channel);
+    },
+    resetJoin(channel) {
+      joined.delete(channel);
     },
     async sendPeerMessage(target, text) {
       assert.ok(activeConnection, "select an upstream connection before sending a peer message");
