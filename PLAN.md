@@ -32,10 +32,14 @@ Chat, console, and identity pages share the relay-desk visual system and
 accessible light, dark, and forced-colors palettes. Browser snapshots cover all
 three shells; interaction tests cover WCAG AA contrast, keyboard focus, Escape
 dismissal, reduced motion, responsive controls, and non-interactive unavailable
-network routes. Dynamically rendered console logs share one keyboard-focusable
-log-region constructor. The terminal UI carries the same relay-desk hierarchy
-through an explicit route/status strip, active-first conversation rail,
-scrollback and unread state, and a visible horizontally-following composer.
+network routes. On phones, the console brings its active route into the
+horizontal navigation viewport. Confirmations repeat the initiating action,
+preserve its submitted name and value, and reset cancellation state on every
+opening. Dynamically rendered console tables and logs use shared constructors
+for named keyboard-focusable regions. The terminal UI carries the same
+relay-desk hierarchy through an explicit route/status strip, active-first
+conversation rail, scrollback and unread state, and a visible
+horizontally-following composer.
 Its closed slash-command grammar retains malformed input, supports direct and
 raw messages, and advances read markers only when the user reaches the live
 edge.

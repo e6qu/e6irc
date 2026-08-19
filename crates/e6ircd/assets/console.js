@@ -8,8 +8,10 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   const consoleThemeResult = document.querySelector("[data-console-theme-result]");
   const confirmationDialog = document.querySelector("[data-console-confirm]");
   const confirmationMessage = document.querySelector("[data-console-confirm-message]");
+  const confirmationAction = document.querySelector("[data-console-confirm-action]");
   const panelRefreshers = new WeakMap();
   let pendingConfirmation = null;
+  let pendingConfirmationSubmitter = null;
   let confirmationTrigger = null;
   const showConsoleThemeResult = (message) => {
     if (consoleThemeResult) consoleThemeResult.textContent = message;
@@ -49,6 +51,14 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     });
   }
 
+  const activeConsoleDestination = document.querySelector('nav[aria-label="Console"] [aria-current="page"]');
+  if (
+    activeConsoleDestination instanceof HTMLElement
+    && window.matchMedia("(max-width: 40rem)").matches
+  ) {
+    activeConsoleDestination.scrollIntoView({ block: "nearest", inline: "center" });
+  }
+
   document.addEventListener("submit", (event) => {
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;
@@ -59,38 +69,49 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     }
     event.preventDefault();
     event.stopPropagation();
+    const submitter = event.submitter instanceof HTMLElement ? event.submitter : null;
     if (
       confirmationDialog instanceof HTMLDialogElement
       && confirmationMessage instanceof HTMLElement
     ) {
       pendingConfirmation = form;
-      confirmationTrigger = event.submitter instanceof HTMLElement
-        ? event.submitter
-        : document.activeElement instanceof HTMLElement
+      pendingConfirmationSubmitter = submitter;
+      confirmationTrigger = submitter
+        ?? (document.activeElement instanceof HTMLElement
           ? document.activeElement
-          : null;
+          : null);
       confirmationMessage.textContent = message;
+      confirmationDialog.returnValue = "cancel";
+      if (confirmationAction instanceof HTMLButtonElement) {
+        const actionLabel = submitter instanceof HTMLInputElement
+          ? submitter.value.trim()
+          : submitter?.textContent?.trim();
+        confirmationAction.textContent = actionLabel || "Continue";
+        confirmationAction.className = submitter?.classList.contains("danger") ? "danger" : "primary";
+      }
       confirmationDialog.showModal();
       return;
     }
     if (window.confirm(message)) {
       form.dataset.confirmed = "true";
-      queueMicrotask(() => form.requestSubmit());
+      queueMicrotask(() => form.requestSubmit(submitter?.isConnected ? submitter : undefined));
     }
   }, true);
 
   if (confirmationDialog instanceof HTMLDialogElement) {
     confirmationDialog.addEventListener("close", () => {
       const form = pendingConfirmation;
+      const submitter = pendingConfirmationSubmitter;
       const trigger = confirmationTrigger;
       pendingConfirmation = null;
+      pendingConfirmationSubmitter = null;
       confirmationTrigger = null;
       if (!form || confirmationDialog.returnValue !== "confirm") {
         trigger?.focus();
         return;
       }
       form.dataset.confirmed = "true";
-      form.requestSubmit();
+      form.requestSubmit(submitter?.isConnected ? submitter : undefined);
     });
   }
 
@@ -256,6 +277,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   const scrollRegion = (label, child) => {
     const region = element("div", "scroll");
     region.tabIndex = 0;
+    region.setAttribute("role", "region");
     region.setAttribute("aria-label", label);
     region.append(child);
     return region;
@@ -2192,9 +2214,9 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     const renderAccounts = (data) => {
       if (!(accountHost instanceof HTMLElement)) return; accountHost.replaceChildren(); const rows = apiCollection(data, "accounts", "account directory");
       const section = append(element("div", "panel-head"), append(element("div"), element("h2", "", "Accounts"), element("p", "", "Only active browser sessions and unexpired personal access tokens are counted.")), element("span", "count", rows.length)); accountHost.append(section);
-      if (!rows.length) accountHost.append(element("p", "empty", "No account matches this exact name.")); else { const table = document.createElement("table"); table.append(element("caption", "sr-only", "Account directory")); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "ID"), element("th", "", "Account"), element("th", "", "Created (UTC)"), element("th", "", "Login methods"), element("th", "", "Status"), element("th", "", "Active access"), element("th", "", "Resources"), element("th"))); const body = document.createElement("tbody"); for (const account of rows) { const auth = account.authentication; const resources = account.resources; const sources = account.administrator_sources; const actions = element("td"); if (account.current) actions.append(element("span", "meta", "Current account")); else { for (const [key, value, label, confirmation] of [["suspension", !account.suspended, account.suspended ? "Reactivate" : "Suspend", account.suspended ? `Reactivate ${account.name} and restart its enabled networks?` : `Suspend ${account.name}, revoke its sessions and tokens, disconnect its clients, and stop its networks?`], ["administrator", !sources.durable, sources.durable ? "Revoke durable admin" : "Grant durable admin", sources.durable ? `Remove durable administrator authority from ${account.name}?` : `Grant durable administrator authority to ${account.name}?`]]) { const form = document.createElement("form"); form.className = "cell-form"; form.dataset.apiAdminAccountState = key; form.dataset.confirm = confirmation; form.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const state = document.createElement("input"); state.type = "hidden"; state.name = key === "suspension" ? "suspended" : "administrator"; state.value = String(value); form.append(capability(), state, button(label, value ? "" : "danger")); actions.append(form); } const deletion = document.createElement("form"); deletion.className = "cell-form account-delete-form"; deletion.dataset.apiAdminAccountDelete = ""; deletion.dataset.confirm = `Permanently delete ${account.name}, revoke every credential and session, erase its private history, stop its networks, and retire the account name? This cannot be undone.`; deletion.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const confirmation = document.createElement("input"); confirmation.name = "confirmation"; confirmation.autocomplete = "off"; confirmation.required = true; const deletionLabel = append(element("label", "field"), element("span", "", `Type ${account.name} to delete`), confirmation); deletion.append(capability(), deletionLabel, button("Delete permanently", "danger")); actions.append(deletion); } const created = element("time", "", account.created_at); created.dateTime = account.created_at; const loginMethods = `${auth.local_password ? "local password · " : ""}${auth.oidc_identities} OIDC · ${auth.app_passwords} app passwords`; const status = `${account.suspended ? "suspended" : "active"}${account.administrator ? " · administrator" : ""}${sources.durable ? " · durable grant" : ""}${sources.configuration ? " · configuration grant" : ""}`; body.append(append(element("tr"), element("td", "meta", account.id), append(element("td"), append(element("strong"), element("code", "", account.name))), append(element("td", "meta"), created), element("td", "", loginMethods), element("td", "", status), element("td", "", `${auth.browser_sessions} browsers · ${auth.api_tokens} API tokens`), element("td", "", `${resources.networks} networks · ${resources.founded_channels} channels`), actions)); } table.append(head, body); accountHost.append(append(element("div", "scroll"), table)); } accountHost.append(pager("Older accounts", data.next_before_id, "before_id")); accountHost.append(element("p", "section-note", "An account that founded registered channels cannot be deleted. Transfer or drop those channels first. Deleted account names remain permanently retired so old credentials and identity links can never resolve to a different person."));
+      if (!rows.length) accountHost.append(element("p", "empty", "No account matches this exact name.")); else { const table = document.createElement("table"); table.append(element("caption", "sr-only", "Account directory")); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "ID"), element("th", "", "Account"), element("th", "", "Created (UTC)"), element("th", "", "Login methods"), element("th", "", "Status"), element("th", "", "Active access"), element("th", "", "Resources"), element("th"))); const body = document.createElement("tbody"); for (const account of rows) { const auth = account.authentication; const resources = account.resources; const sources = account.administrator_sources; const actions = element("td"); if (account.current) actions.append(element("span", "meta", "Current account")); else { for (const [key, value, label, confirmation] of [["suspension", !account.suspended, account.suspended ? "Reactivate" : "Suspend", account.suspended ? `Reactivate ${account.name} and restart its enabled networks?` : `Suspend ${account.name}, revoke its sessions and tokens, disconnect its clients, and stop its networks?`], ["administrator", !sources.durable, sources.durable ? "Revoke durable admin" : "Grant durable admin", sources.durable ? `Remove durable administrator authority from ${account.name}?` : `Grant durable administrator authority to ${account.name}?`]]) { const form = document.createElement("form"); form.className = "cell-form"; form.dataset.apiAdminAccountState = key; form.dataset.confirm = confirmation; form.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const state = document.createElement("input"); state.type = "hidden"; state.name = key === "suspension" ? "suspended" : "administrator"; state.value = String(value); form.append(capability(), state, button(label, value ? "" : "danger")); actions.append(form); } const deletion = document.createElement("form"); deletion.className = "cell-form account-delete-form"; deletion.dataset.apiAdminAccountDelete = ""; deletion.dataset.confirm = `Permanently delete ${account.name}, revoke every credential and session, erase its private history, stop its networks, and retire the account name? This cannot be undone.`; deletion.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const confirmation = document.createElement("input"); confirmation.name = "confirmation"; confirmation.autocomplete = "off"; confirmation.required = true; const deletionLabel = append(element("label", "field"), element("span", "", `Type ${account.name} to delete`), confirmation); deletion.append(capability(), deletionLabel, button("Delete permanently", "danger")); actions.append(deletion); } const created = element("time", "", account.created_at); created.dateTime = account.created_at; const loginMethods = `${auth.local_password ? "local password · " : ""}${auth.oidc_identities} OIDC · ${auth.app_passwords} app passwords`; const status = `${account.suspended ? "suspended" : "active"}${account.administrator ? " · administrator" : ""}${sources.durable ? " · durable grant" : ""}${sources.configuration ? " · configuration grant" : ""}`; body.append(append(element("tr"), element("td", "meta", account.id), append(element("td"), append(element("strong"), element("code", "", account.name))), append(element("td", "meta"), created), element("td", "", loginMethods), element("td", "", status), element("td", "", `${auth.browser_sessions} browsers · ${auth.api_tokens} API tokens`), element("td", "", `${resources.networks} networks · ${resources.founded_channels} channels`), actions)); } table.append(head, body); accountHost.append(scrollRegion("Account directory", table)); } accountHost.append(pager("Older accounts", data.next_before_id, "before_id")); accountHost.append(element("p", "section-note", "An account that founded registered channels cannot be deleted. Transfer or drop those channels first. Deleted account names remain permanently retired so old credentials and identity links can never resolve to a different person."));
     };
-    refreshAdminAccounts = async () => { const params = query(); const invitations = new URLSearchParams(); invitations.set("limit", params.get("limit") || "50"); if (params.get("invitation_before_id")) invitations.set("before_id", params.get("invitation_before_id")); const [accounts, invitationData] = await Promise.all([apiRead(`/api/v1/admin/accounts?${params}`), apiRead(`/api/v1/admin/invitations?${invitations}`)]); renderAccounts(accounts); renderInvitations(invitationData); for (const region of adminAccountsPage.querySelectorAll(".scroll")) { region.tabIndex = 0; region.setAttribute("aria-label", "Account directory table"); } };
+    refreshAdminAccounts = async () => { const params = query(); const invitations = new URLSearchParams(); invitations.set("limit", params.get("limit") || "50"); if (params.get("invitation_before_id")) invitations.set("before_id", params.get("invitation_before_id")); const [accounts, invitationData] = await Promise.all([apiRead(`/api/v1/admin/accounts?${params}`), apiRead(`/api/v1/admin/invitations?${invitations}`)]); renderAccounts(accounts); renderInvitations(invitationData); };
     if (filters instanceof HTMLFormElement) for (const input of filters.elements) if ((input instanceof HTMLInputElement || input instanceof HTMLSelectElement) && input.name) input.value = new URLSearchParams(window.location.search).get(input.name) || (input.name === "limit" ? "50" : "");
     void refreshAdminAccounts().catch((error) => setAdminAccountResult(error instanceof Error ? error.message : "Account directory failed to load.", false));
   }

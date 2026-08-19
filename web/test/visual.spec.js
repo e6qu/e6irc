@@ -75,6 +75,32 @@ async function setStyledFixture(page, fixture, styles) {
   await page.setContent(html.replace("/* TEST_STYLES */", styles));
 }
 
+async function mountConsoleRuntime(page, body, styles = "", apiResponses = {}) {
+  const runtime = await readFile(new URL("../../crates/e6ircd/assets/console.js", import.meta.url), "utf8");
+  await page.route("**/console.js", (route) => route.fulfill({
+    contentType: "text/javascript",
+    body: runtime,
+  }));
+  await page.route("**/console-contract.js", (route) => route.fulfill({
+    contentType: "text/javascript",
+    body: `const responses = ${JSON.stringify(apiResponses)};
+      export const apiContractLoader = () => async () => ({});
+      export const getOperationJson = async (_fetch, _contract, _method, url) => {
+        const match = Object.entries(responses).find(([prefix]) => url.startsWith(prefix));
+        return match ? match[1] : {};
+      };`,
+  }));
+  await page.route("**/console-settings.js", (route) => route.fulfill({
+    contentType: "text/javascript",
+    body: "export const loadSettings = () => ({ settings: { theme: 'auto' }, warning: null }); export const saveSettings = () => null;",
+  }));
+  await page.route("**/console-runtime-test", (route) => route.fulfill({
+    contentType: "text/html",
+    body: `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>${styles}</style></head><body><div id="app">${body}</div><script type="module" src="/console.js"></script></body></html>`,
+  }));
+  await page.goto("/console-runtime-test");
+}
+
 test("identity entry uses the shared relay-desk system", async ({ page }) => {
   await page.emulateMedia({ colorScheme: "light", reducedMotion: "reduce" });
   await page.setViewportSize({ width: 1280, height: 800 });
@@ -104,6 +130,131 @@ test("console shell keeps operations dense and legible", async ({ page }) => {
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   await expectAccessible(page);
   await page.emulateMedia({ forcedColors: "active" });
+  await expectAccessible(page);
+});
+
+test("console confirmations preserve the named action and cancel safely", async ({ page }) => {
+  await mountConsoleRuntime(page, `
+    <main>
+      <form data-confirm="Delete the route permanently?">
+        <button class="danger" name="operation" value="delete">Delete route</button>
+      </form>
+      <form data-confirm="Restart the route now?">
+        <button name="operation" value="restart">Restart route</button>
+      </form>
+    </main>
+    <dialog data-console-confirm aria-labelledby="confirm-title" aria-describedby="confirm-message">
+      <form method="dialog">
+        <h2 id="confirm-title">Confirm action</h2>
+        <p id="confirm-message" data-console-confirm-message></p>
+        <button type="submit" value="cancel">Cancel</button>
+        <button class="danger" type="submit" value="confirm" data-console-confirm-action>Continue</button>
+      </form>
+    </dialog>
+    <script>
+      window.confirmedOperations = [];
+      document.addEventListener("submit", (event) => {
+        if (!event.target.matches("form[data-confirm]")) return;
+        event.preventDefault();
+        window.confirmedOperations.push(event.submitter?.value ?? null);
+      });
+    </script>
+  `);
+
+  const dialog = page.getByRole("dialog", { name: "Confirm action" });
+  const deleteRoute = page.getByRole("button", { name: "Delete route" });
+  await deleteRoute.click();
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Delete route" })).toHaveClass("danger");
+  await expectAccessible(page);
+  await dialog.getByRole("button", { name: "Delete route" }).click();
+  await expect(dialog).toBeHidden();
+  await expect.poll(() => page.evaluate(() => window.confirmedOperations)).toEqual(["delete"]);
+
+  const restartRoute = page.getByRole("button", { name: "Restart route" });
+  await restartRoute.click();
+  await expect(dialog.getByRole("button", { name: "Restart route" })).toHaveClass("primary");
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(restartRoute).toBeFocused();
+  await expect.poll(() => page.evaluate(() => window.confirmedOperations)).toEqual(["delete"]);
+});
+
+test("console phone navigation reveals the active destination", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const links = Array.from({ length: 11 }, (_, index) => `<a href="/console/route-${index}">Route ${index}</a>`).join("");
+  await mountConsoleRuntime(page, `
+    <nav aria-label="Console">${links}<a href="/console/account" aria-current="page">Account &amp; access</a></nav>
+    <main>Account</main>
+  `, `
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    nav { display: flex; gap: 8px; width: 100%; overflow-x: auto; padding: 8px; }
+    nav a { flex: 0 0 132px; }
+  `);
+
+  const navigation = page.getByRole("navigation", { name: "Console" });
+  const active = navigation.getByRole("link", { name: "Account & access" });
+  await expect.poll(() => navigation.evaluate((node) => node.scrollLeft)).toBeGreaterThan(0);
+  await expect.poll(async () => {
+    const navigationBox = await navigation.boundingBox();
+    const activeBox = await active.boundingBox();
+    return Boolean(
+      navigationBox
+      && activeBox
+      && activeBox.x >= navigationBox.x
+      && activeBox.x + activeBox.width <= navigationBox.x + navigationBox.width,
+    );
+  }).toBe(true);
+  await expectAccessible(page);
+});
+
+test("dynamic console tables retain distinct named scroll regions", async ({ page }) => {
+  await mountConsoleRuntime(page, `
+    <main data-api-admin-accounts-page data-csrf="test-csrf">
+      <section data-api-admin-invitations>Loading invitations…</section>
+      <section data-api-admin-accounts>Loading accounts…</section>
+    </main>
+  `, "", {
+    "/api/v1/admin/accounts": {
+      accounts: [{
+        id: 7,
+        name: "operator",
+        created_at: "2026-08-19T12:00:00Z",
+        current: true,
+        suspended: false,
+        administrator: true,
+        administrator_sources: { durable: true, configuration: false },
+        authentication: {
+          local_password: true,
+          oidc_identities: 0,
+          app_passwords: 0,
+          browser_sessions: 1,
+          api_tokens: 0,
+        },
+        resources: { networks: 2, founded_channels: 1 },
+      }],
+      next_before_id: null,
+    },
+    "/api/v1/admin/invitations": {
+      invitations: [{
+        id: 9,
+        account: "guest",
+        contact_email: null,
+        administrator: false,
+        created_by: "operator",
+        expires_at: "2026-08-26T12:00:00Z",
+      }],
+      next_before_id: null,
+    },
+  });
+
+  const invitations = page.getByRole("region", { name: "Pending account invitations" });
+  const accounts = page.getByRole("region", { name: "Account directory" });
+  await expect(invitations).toHaveAttribute("tabindex", "0");
+  await expect(accounts).toHaveAttribute("tabindex", "0");
+  await expect(invitations.getByRole("table", { name: "Pending account invitations" })).toBeVisible();
+  await expect(accounts.getByRole("table", { name: "Account directory" })).toBeVisible();
   await expectAccessible(page);
 });
 
