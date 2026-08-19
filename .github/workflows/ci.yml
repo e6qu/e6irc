@@ -263,7 +263,7 @@ jobs:
         timeout-minutes: 8
         run: |
           docker run --rm --add-host host.docker.internal:host-gateway \
-            -v "$PWD:/work" --workdir /work \
+            -v "$PWD:$PWD" --workdir "$PWD" \
             -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
             -e E6IRC_TEST_BROWSER="${{ matrix.browser }}" \
             -e E6IRC_TEST_SERVER_BINARY=target/debug/e6ircd \
