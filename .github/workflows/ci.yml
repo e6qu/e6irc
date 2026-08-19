@@ -197,14 +197,14 @@ jobs:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
           E6IRC_TEST_DEX_URL: http://127.0.0.1:15556/dex
       - name: Exercise OIDC in a real browser
-        # Bounded so a wedged chromium install/launch fails this step in minutes
-        # rather than silently consuming the whole job's timeout budget.
         timeout-minutes: 8
         run: |
-          pnpm -C web exec playwright install --with-deps chromium
+          browser="$(command -v google-chrome)"
           cargo build -p e6ircd --features embed-web
-          pnpm -C web test:oidc-browser
+          PLAYWRIGHT_EXECUTABLE_PATH="$browser" pnpm -C web test:oidc-browser
         env:
+          E6IRC_TEST_BROWSER: chromium
+          E6IRC_TEST_SERVER_BINARY: target/debug/e6ircd
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
           E6IRC_TEST_DEX_URL: http://127.0.0.1:15556/dex
           E6IRC_BROWSER_ARTIFACTS_DIR: test-results/browser
@@ -267,6 +267,7 @@ jobs:
         run: pnpm -C web test:oidc-browser
         env:
           E6IRC_TEST_BROWSER: ${{ matrix.browser }}
+          E6IRC_TEST_SERVER_BINARY: target/debug/e6ircd
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
           E6IRC_TEST_DEX_URL: http://127.0.0.1:15556/dex
           E6IRC_BROWSER_ARTIFACTS_DIR: test-results/browser
