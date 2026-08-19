@@ -86,6 +86,8 @@
         background: transparent; color: inherit; cursor: pointer; }
       :is(a, button, input, select, textarea, summary, .scroll, .backlog):focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
       button:disabled, input:disabled, select:disabled, textarea:disabled { cursor: not-allowed; opacity: 0.62; }
+      button[data-submitting="true"] { cursor: progress; }
+      button[data-submitting="true"]::after { content: "\2026"; padding-left: 0.18em; }
       button:hover, .button-link:hover { border-color: var(--accent); }
       button.primary, .button-link { background: var(--accent); color: var(--accent-text); border-color: var(--accent);
         font-weight: 650; text-decoration: none; }
