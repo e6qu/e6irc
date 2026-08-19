@@ -449,7 +449,7 @@ pub(crate) enum SessionOutcome {
     /// in a row, so a mistyped or revoked upstream password can't hammer the
     /// upstream forever every ~30s.
     AuthRejected,
-    RegistrationRejected(e6irc_client::RegistrationRefusal),
+    RegistrationRejected(e6irc_client::RegistrationRejection),
 }
 
 /// Consecutive upstream credential or registration rejections before a driver
@@ -587,18 +587,27 @@ pub(crate) async fn run_with_backoff<C>(
         match session(&config, ends).await {
             SessionOutcome::Stopped => return,
             outcome @ (SessionOutcome::AuthRejected | SessionOutcome::RegistrationRejected(_)) => {
-                let (failure, event) = match outcome {
+                let (failure, event, diagnostic) = match outcome {
                     SessionOutcome::AuthRejected => (
                         NetworkFailure::AuthenticationRejected,
                         ConnectionEvent::AuthenticationFailed,
+                        None,
                     ),
-                    SessionOutcome::RegistrationRejected(refusal) => (
-                        registration_failure(refusal),
-                        ConnectionEvent::RegistrationFailed(refusal),
-                    ),
+                    SessionOutcome::RegistrationRejected(rejection) => {
+                        let failure = registration_failure(rejection.refusal());
+                        let diagnostic = Some(rejection.diagnostic().to_string());
+                        (
+                            failure,
+                            ConnectionEvent::RegistrationFailed(rejection),
+                            diagnostic,
+                        )
+                    }
                     _ => unreachable!("matched only terminal rejections"),
                 };
                 consecutive_rejections += 1;
+                if let Some(diagnostic) = diagnostic {
+                    ends.emit_notice(lifecycle_notice("rejected", failure, Some(&diagnostic)));
+                }
                 if consecutive_rejections >= MAX_CONSECUTIVE_REGISTRATION_REJECTIONS {
                     ends.emit(event);
                     // Stop hammering an upstream that keeps rejecting unchanged
@@ -1228,7 +1237,7 @@ pub struct ClientCommand {
 /// `emit` instead would skip both, injecting into attached clients and leaving
 /// detached ones with a gap. `NetworkDriver` is a public SPI, so that has to be
 /// impossible to write rather than merely documented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEvent {
     Connected,
     /// A classified transient failure ended the current attempt; another
@@ -1238,7 +1247,7 @@ pub enum ConnectionEvent {
     /// Repeated credential rejection parked the driver until it is reconfigured.
     AuthenticationFailed,
     /// Repeated IRC registration rejection parked the driver until reconfigured.
-    RegistrationFailed(e6irc_client::RegistrationRefusal),
+    RegistrationFailed(e6irc_client::RegistrationRejection),
 }
 
 /// A handle to a running, always-on network driver. Events are
@@ -2300,11 +2309,12 @@ impl DriverEnds {
                 )
             }
             failure_event => {
-                let (status, disposition, failure) = match failure_event {
+                let (status, disposition, failure, diagnostic) = match failure_event {
                     ConnectionEvent::Reconnecting(failure) => (
                         DriverConnectionStatus::Reconnecting(failure),
                         FailureDisposition::Retry,
                         failure,
+                        None,
                     ),
                     ConnectionEvent::AuthenticationFailed => (
                         DriverConnectionStatus::AuthenticationFailed,
@@ -2312,15 +2322,17 @@ impl DriverEnds {
                             TerminalNetworkLifecycle::AuthenticationFailed,
                         ),
                         NetworkFailure::AuthenticationRejected,
+                        None,
                     ),
-                    ConnectionEvent::RegistrationFailed(refusal) => {
-                        let failure = registration_failure(refusal);
+                    ConnectionEvent::RegistrationFailed(ref rejection) => {
+                        let failure = registration_failure(rejection.refusal());
                         (
                             DriverConnectionStatus::RegistrationFailed(failure),
                             FailureDisposition::Terminal(
                                 TerminalNetworkLifecycle::RegistrationFailed,
                             ),
                             failure,
+                            Some(rejection.diagnostic()),
                         )
                     }
                     ConnectionEvent::Connected => {
@@ -2352,11 +2364,7 @@ impl DriverEnds {
                 let state = status.lifecycle().as_str();
                 (
                     DriverEvent::Status(status),
-                    format!(
-                        ":*bnc* NOTICE * :component {state}: {} ({})",
-                        failure.summary(),
-                        failure.code(),
-                    ),
+                    lifecycle_notice(state, failure, diagnostic),
                 )
             }
         };
@@ -2414,6 +2422,15 @@ impl DriverEnds {
             }
         }
     }
+}
+
+fn lifecycle_notice(state: &str, failure: NetworkFailure, diagnostic: Option<&str>) -> String {
+    let detail = diagnostic.map_or_else(String::new, |value| format!("; upstream: {value}"));
+    format!(
+        ":*bnc* NOTICE * :component {state}: {} ({}){detail}",
+        failure.summary(),
+        failure.code()
+    )
 }
 
 const fn registration_failure(refusal: e6irc_client::RegistrationRefusal) -> NetworkFailure {
@@ -2931,7 +2948,9 @@ mod tests {
         );
 
         ends.emit(ConnectionEvent::RegistrationFailed(
-            e6irc_client::RegistrationRefusal::InvalidNickname,
+            e6irc_client::RegistrationRejection::without_diagnostic(
+                e6irc_client::RegistrationRefusal::InvalidNickname,
+            ),
         ));
         let rejected = handle.runtime_snapshot();
         assert_eq!(rejected.lifecycle, NetworkLifecycle::RegistrationFailed);
@@ -2945,7 +2964,7 @@ mod tests {
                 ":upstream PRIVMSG #room :hello".to_string(),
                 ":*bnc* NOTICE * :component reconnecting: The established upstream connection was lost. (connection_lost)".to_string(),
                 ":*bnc* NOTICE * :component authentication_failed: The upstream rejected the configured credentials. (authentication_rejected)".to_string(),
-                ":*bnc* NOTICE * :component registration_failed: The upstream rejected the configured nickname. (invalid_nickname)".to_string(),
+                ":*bnc* NOTICE * :component registration_failed: The upstream rejected the configured nickname. (invalid_nickname); upstream: no detail from upstream".to_string(),
             ]
         );
     }
@@ -2974,13 +2993,27 @@ mod tests {
         );
 
         ends.emit(ConnectionEvent::RegistrationFailed(
-            e6irc_client::RegistrationRefusal::InvalidNickname,
+            e6irc_client::RegistrationRejection::without_diagnostic(
+                e6irc_client::RegistrationRefusal::InvalidNickname,
+            ),
         ));
         assert_eq!(
             events.try_recv(),
             Ok(DriverEvent::Status(
                 DriverConnectionStatus::RegistrationFailed(NetworkFailure::InvalidNickname)
             ))
+        );
+    }
+
+    #[test]
+    fn lifecycle_notice_keeps_the_safe_upstream_diagnostic() {
+        assert_eq!(
+            lifecycle_notice(
+                "rejected",
+                NetworkFailure::RegistrationRejected,
+                Some("Too many connections from your IP"),
+            ),
+            ":*bnc* NOTICE * :component rejected: The upstream rejected IRC registration; check the nickname and network policy. (registration_rejected); upstream: Too many connections from your IP"
         );
     }
 

@@ -958,6 +958,42 @@ pub enum RegistrationRefusal {
     NotRegistered,
 }
 
+/// A server-supplied registration refusal whose detail is bounded and safe to
+/// show to the account owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistrationRejection {
+    refusal: RegistrationRefusal,
+    diagnostic: String,
+}
+
+impl RegistrationRejection {
+    /// Classify a refusal for which the upstream did not supply a message.
+    pub fn without_diagnostic(refusal: RegistrationRefusal) -> Self {
+        Self {
+            refusal,
+            diagnostic: "no detail from upstream".to_string(),
+        }
+    }
+
+    pub fn from_error(error: &io::Error) -> Option<Self> {
+        error
+            .get_ref()?
+            .downcast_ref::<RegistrationRefusalError>()
+            .map(|error| Self {
+                refusal: error.refusal,
+                diagnostic: error.diagnostic.clone(),
+            })
+    }
+
+    pub const fn refusal(&self) -> RegistrationRefusal {
+        self.refusal
+    }
+
+    pub fn diagnostic(&self) -> &str {
+        &self.diagnostic
+    }
+}
+
 #[derive(Debug)]
 struct RegistrationRefusalError {
     refusal: RegistrationRefusal,
@@ -978,10 +1014,7 @@ impl std::error::Error for RegistrationRefusalError {}
 
 impl RegistrationRefusal {
     pub fn from_error(error: &io::Error) -> Option<Self> {
-        error
-            .get_ref()?
-            .downcast_ref::<RegistrationRefusalError>()
-            .map(|error| error.refusal)
+        RegistrationRejection::from_error(error).map(|rejection| rejection.refusal())
     }
 
     fn error(self, message: &OwnedMessage) -> io::Error {
@@ -1071,6 +1104,9 @@ mod tests {
             );
             let error = registration_refused(&message).expect("known refusal numeric");
             assert_eq!(RegistrationRefusal::from_error(&error), Some(expected));
+            let rejection = RegistrationRejection::from_error(&error).expect("typed rejection");
+            assert_eq!(rejection.refusal(), expected);
+            assert_eq!(rejection.diagnostic(), "refused");
         }
     }
 

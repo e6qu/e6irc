@@ -2439,9 +2439,8 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     return refreshOwnerNetworks;
   };
 
-  const mutateOwnerNetwork = async (form, url, method, body, mode) => {
-    const submit = form.querySelector('button[type="submit"]');
-    if (submit) submit.disabled = true;
+  const mutateOwnerNetwork = async (form, url, method, body, mode, trigger = form.querySelector('button[type="submit"]')) => {
+    if (trigger instanceof HTMLButtonElement) trigger.disabled = true;
     try {
       const result = await apiRequest(form, apiMutation(method, url), body);
       if (mode === ownerNetworkPreflight) {
@@ -2453,10 +2452,10 @@ import { loadSettings, saveSettings } from "/console-settings.js";
         await refreshAfterMutation(ownerNetworkRefresher(form));
         setOwnerNetworkResult("Updated.", true);
       }
-      if (submit) submit.disabled = false;
     } catch (error) {
       setOwnerNetworkResult(error instanceof Error ? error.message : "Network request failed.", false);
-      if (submit) submit.disabled = false;
+    } finally {
+      if (trigger instanceof HTMLButtonElement) trigger.disabled = false;
     }
   };
 
@@ -2475,16 +2474,15 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     if (preflightButton) {
       preflightButton.addEventListener("click", () => {
         const fields = new FormData(form);
-        const name = fieldValue(fields, "name");
         const connection = ownerNetworkConnection(fields);
-        if (!name || !connection.addr || !connection.nick || !connection.realname) {
-          setOwnerNetworkResult("Enter a network ID, server, nickname, and real name.", false);
+        if (!connection.addr || !connection.nick || !connection.realname) {
+          setOwnerNetworkResult("Enter a server, nickname, and real name.", false);
           return;
         }
         const { addr, tls, nick, realname, sasl_account, sasl_password } = connection;
         void mutateOwnerNetwork(form, "/api/v1/me/networks/preflight", "POST", {
           addr, tls, nick, realname, sasl_account, sasl_password,
-        }, ownerNetworkPreflight);
+        }, ownerNetworkPreflight, preflightButton);
       });
     }
     form.addEventListener("submit", (event) => {
