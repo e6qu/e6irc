@@ -6,6 +6,8 @@ import test from "node:test";
 import {
   asMessage,
   fold,
+  kickPairs,
+  membershipTargets,
   mergeTimeline,
   messageIdentity,
   nickPrefix,
@@ -13,6 +15,7 @@ import {
   reconcileChannelSnapshot,
   splitSigil,
   tagValue,
+  topicReply,
 } from "../src/irc-state.js";
 
 test("IRC parsing preserves tags, prefix, trailing text, and RFC1459 identity", () => {
@@ -41,6 +44,35 @@ test("IRC tag values use the protocol escape rules", () => {
   assert.equal(tagValue(tags, "missing"), null);
   assert.equal(messageIdentity(tags), "stable");
   assert.equal(messageIdentity("msgid="), null);
+});
+
+test("duplicate IRC tags use the final value like e6irc-proto", () => {
+  assert.equal(tagValue("time=old;time=new", "time"), "new");
+  assert.equal(messageIdentity("msgid=stale;msgid=current"), "current");
+  assert.equal(tagValue(String.raw`example=old;example=new\svalue`, "example"), "new value");
+});
+
+test("membership target lists use the BNC session tracker's pairing rules", () => {
+  assert.deepEqual(membershipTargets("#one,#two"), ["#one", "#two"]);
+  assert.deepEqual(kickPairs("#one,#two", "alice,bob"), [
+    ["#one", "alice"],
+    ["#two", "bob"],
+  ]);
+  assert.deepEqual(kickPairs("#one", "alice,bob"), [
+    ["#one", "alice"],
+    ["#one", "bob"],
+  ]);
+  assert.deepEqual(kickPairs("#one,#two", "alice"), []);
+});
+
+test("topic numerics require a channel before mutating browser state", () => {
+  assert.deepEqual(topicReply(["me", "#room", "hello"]), {
+    channel: "#room",
+    topic: "hello",
+  });
+  assert.equal(topicReply(["me"]), null);
+  assert.equal(topicReply(["me", "#room"]), null);
+  assert.equal(topicReply(null), null);
 });
 
 test("membership sigils retain every mode and render the highest rank", () => {

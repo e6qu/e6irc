@@ -62,6 +62,9 @@ The BNC and browser attach paths now reconcile a typed authoritative IRC
 session snapshot after bounded replay. Their subscription and buffer snapshot
 form one atomic replay/live boundary, and a client that overruns bounded live
 delivery is visibly detached instead of retaining stale session state. Browser
+attach status uses monotonic driver revisions, so a sticky current state cannot
+be overwritten by an older queued transition, and a recovered connection does
+not serialize its historical failure into an invalid connected event. Browser
 startup consumes that socket replay once; later history merges only stable
 message identifiers and exact ordered wire overlap, and retains the requested
 page ahead of a full live window under an expanded finite bound. Raw attach registration
@@ -74,6 +77,16 @@ metadata, and implements the complete LATEST/BEFORE/AFTER/AROUND/BETWEEN plus
 two-bound TARGETS surface through one tested window resolver. The browser
 removes stale channel buffers from the session snapshot and routes server
 notices to the server buffer rather than creating phantom direct messages.
+Its IRC state applies the protocol's last-duplicate-tag rule and handles every
+comma-separated JOIN/PART and paired or single-channel KICK target; incomplete
+topic numerics remain visible without crashing the socket handler. IRC wire
+limits now share one independent tag/body predicate across the server, BNC,
+WebSocket, TUI, and shared client. Valid long server tags survive live replay
+and persistence, oversized bodies fail loudly, and IRC-over-WebSocket enforces
+one unterminated IRC line per message instead of executing embedded CRLF as a
+second command.
+Bridge-backed networks now refuse every unsupported or malformed downstream
+command with a bounded notice instead of accepting it into a quiet no-op.
 
 ## Remaining qualification
 

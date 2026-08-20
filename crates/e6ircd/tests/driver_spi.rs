@@ -41,7 +41,7 @@ async fn assert_echo_driver_contract(driver: Box<dyn NetworkDriver>) {
     // which is exactly the race that made this test flaky on loaded CI.
     let connected = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if handle.is_connected() {
+            if handle.runtime_snapshot().lifecycle == e6ircd::bouncer::NetworkLifecycle::Connected {
                 return true;
             }
             tokio::task::yield_now().await;

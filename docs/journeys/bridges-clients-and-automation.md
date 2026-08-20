@@ -35,6 +35,9 @@ use bounded backoff and visible error categories. A failed bridge-inventory
 read is announced in each affected platform list and offers an in-place retry.
 Inbound identities/channel names are sanitized and validated before entering
 IRC state.
+Reverse delivery supports `PRIVMSG`; malformed messages, unsupported commands,
+unmapped targets, and provider send failures each produce an explicit bounded
+`*bnc*` notice rather than disappearing after queue admission.
 
 **Security and observability.** Integration forms are administrator-only and
 CSRF-protected; platform credentials are sealed, write-only, and excluded from

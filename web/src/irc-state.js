@@ -108,7 +108,10 @@ function unescapeTagValue(value) {
 
 export function tagValue(tags, name) {
   if (!tags) return null;
-  for (const tag of tags.split(";")) {
+  const entries = tags.split(";");
+  // Match e6irc-proto's duplicate-tag rule: the last occurrence wins.
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const tag = entries[index];
     const equals = tag.indexOf("=");
     const key = equals === -1 ? tag : tag.slice(0, equals);
     if (key !== name) continue;
@@ -122,6 +125,36 @@ export function tagValue(tags, name) {
 // body, and timestamp, and merging them would silently erase one.
 export function messageIdentity(tags) {
   return tagValue(tags, "msgid") || null;
+}
+
+// IRC permits a comma-separated target list in membership commands. Parse it
+// once here so replayed/live JOIN, PART, and KICK update browser state with the
+// same semantics as the BNC's authoritative session tracker.
+export function membershipTargets(value) {
+  if (typeof value !== "string") return [];
+  return value.split(",").filter((target) => target.length > 0);
+}
+
+export function kickPairs(channelsValue, targetsValue) {
+  const channels = membershipTargets(channelsValue);
+  const targets = membershipTargets(targetsValue);
+  if (channels.length === targets.length) {
+    return channels.map((channel, index) => [channel, targets[index]]);
+  }
+  if (channels.length === 1) {
+    return targets.map((target) => [channels[0], target]);
+  }
+  return [];
+}
+
+export function topicReply(params) {
+  if (
+    !Array.isArray(params)
+    || typeof params[1] !== "string"
+    || !params[1]
+    || typeof params[2] !== "string"
+  ) return null;
+  return { channel: params[1], topic: params[2] };
 }
 
 // A CTCP ACTION (`\x01ACTION text\x01`) renders as "* nick text".

@@ -129,11 +129,11 @@ const SCROLLBACK_LINES: usize = 5_000;
 /// what a remote party can make the client allocate.
 const MAX_BUFFERS: usize = 256;
 
-/// A client line excludes its trailing CRLF from the traditional 512-byte IRC
-/// limit. The composer is bounded at the same protocol edge so a pasted line
-/// cannot grow without limit or be rendered locally and then rejected only
-/// after it reaches the socket.
-const MAX_WIRE_LINE_BYTES: usize = e6irc_proto::message::MAX_LINE_LEN - 2;
+/// The composer admits the full client message-tag plus traditional-body
+/// allowance. The derived line is then checked against each independent wire
+/// budget, so `/raw @tags ...` works without letting an untagged body borrow
+/// the tag allowance.
+const MAX_COMPOSER_BYTES: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN;
 
 pub struct App {
     pub nick: String,
@@ -478,11 +478,11 @@ impl App {
         if c.is_control() {
             return;
         }
-        if self.input.len() + c.len_utf8() > MAX_WIRE_LINE_BYTES {
+        if self.input.len() + c.len_utf8() > MAX_COMPOSER_BYTES {
             if !self.input_limit_reported {
                 self.input_limit_reported = true;
                 self.status(format!(
-                    "input is limited to {MAX_WIRE_LINE_BYTES} bytes by the IRC wire limit"
+                    "input is limited to {MAX_COMPOSER_BYTES} bytes by the IRC wire limit"
                 ));
             }
             return;
@@ -604,13 +604,10 @@ impl App {
             return self.refuse_command(input, "not connected — JOIN not sent");
         }
         let wire = format!("JOIN {channel}");
-        if wire.len() > MAX_WIRE_LINE_BYTES {
+        if !e6irc_proto::message::client_frame_fits(wire.as_bytes()) {
             return self.refuse_command(
                 input,
-                format!(
-                    "message is too long for the IRC wire limit ({}/{MAX_WIRE_LINE_BYTES} bytes)",
-                    wire.len()
-                ),
+                format!("message exceeds an IRC wire budget ({} bytes)", wire.len()),
             );
         }
         let Some(index) = self.open_buffer(channel.to_owned()) else {
@@ -659,13 +656,10 @@ impl App {
             return self.refuse_command(input, "not connected — message not sent");
         }
         let wire = format!("PRIVMSG {target} :{text}");
-        if wire.len() > MAX_WIRE_LINE_BYTES {
+        if !e6irc_proto::message::client_frame_fits(wire.as_bytes()) {
             return self.refuse_command(
                 input,
-                format!(
-                    "message is too long for the IRC wire limit ({}/{MAX_WIRE_LINE_BYTES} bytes)",
-                    wire.len()
-                ),
+                format!("message exceeds an IRC wire budget ({} bytes)", wire.len()),
             );
         }
         let Some(index) = self.open_buffer(target.to_owned()) else {
@@ -716,10 +710,10 @@ impl App {
         line: String,
         local_echo: Option<LocalEcho>,
     ) -> Action {
-        if line.len() > MAX_WIRE_LINE_BYTES {
+        if !e6irc_proto::message::client_frame_fits(line.as_bytes()) {
             self.restore_input(input);
             self.status(format!(
-                "message is too long for the IRC wire limit ({}/{MAX_WIRE_LINE_BYTES} bytes)",
+                "message exceeds an IRC wire budget ({} bytes)",
                 line.len()
             ));
             return Action::None;
@@ -968,15 +962,21 @@ mod tests {
             panic!("raw line should be queued");
         };
         assert_eq!(raw.line(), "WHOIS Alice");
+
+        app.input = format!("/raw @example={} PING", "a".repeat(600));
+        let Action::Send(tagged) = app.on_enter() else {
+            panic!("the client tag allowance should be usable by raw commands");
+        };
+        assert!(tagged.line().starts_with("@example="));
     }
 
     #[test]
     fn composer_and_wire_line_are_bounded_without_truncating() {
         let mut app = App::new("#channel".into(), "me".into());
-        for _ in 0..MAX_WIRE_LINE_BYTES + 20 {
+        for _ in 0..MAX_COMPOSER_BYTES + 20 {
             app.on_char('x');
         }
-        assert_eq!(app.input.len(), MAX_WIRE_LINE_BYTES);
+        assert_eq!(app.input.len(), MAX_COMPOSER_BYTES);
         assert_eq!(
             app.current()
                 .log
@@ -987,16 +987,16 @@ mod tests {
         );
 
         assert_eq!(app.on_enter(), Action::None);
-        assert_eq!(app.input.len(), MAX_WIRE_LINE_BYTES);
+        assert_eq!(app.input.len(), MAX_COMPOSER_BYTES);
         assert!(
             app.current()
                 .log
                 .last()
-                .is_some_and(|line| line.text.as_str().contains("message is too long"))
+                .is_some_and(|line| line.text.as_str().contains("exceeds an IRC wire budget"))
         );
 
         let mut direct = App::new("#channel".into(), "me".into());
-        direct.input = format!("/msg Alice {}", "x".repeat(MAX_WIRE_LINE_BYTES - 11));
+        direct.input = format!("/msg Alice {}", "x".repeat(MAX_COMPOSER_BYTES - 11));
         let retained = direct.input.clone();
         assert_eq!(direct.on_enter(), Action::None);
         assert_eq!(direct.input, retained);

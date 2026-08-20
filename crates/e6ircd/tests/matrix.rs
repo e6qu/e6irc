@@ -93,7 +93,10 @@ async fn matrix_bridge_relays_both_ways() {
     let connected = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match events.recv().await {
-                Ok(DriverEvent::Status(DriverConnectionStatus::Connected)) => return true,
+                Ok(DriverEvent::Status {
+                    status: DriverConnectionStatus::Connected,
+                    ..
+                }) => return true,
                 Ok(_) => {}
                 Err(_) => return false,
             }

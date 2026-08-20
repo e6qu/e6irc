@@ -349,15 +349,23 @@ impl Connection {
     /// session. A legitimate single line never contains these bytes, so removing
     /// them is lossless in practice and makes the injection unrepresentable here.
     pub async fn send_line(&mut self, line: &str) -> io::Result<()> {
-        if line.bytes().any(|b| b == b'\r' || b == b'\n' || b == b'\0') {
-            let cleaned: String = line
+        let cleaned: String;
+        let line = if line.bytes().any(|b| b == b'\r' || b == b'\n' || b == b'\0') {
+            cleaned = line
                 .chars()
                 .filter(|&c| c != '\r' && c != '\n' && c != '\0')
                 .collect();
-            self.writer.write_all(cleaned.as_bytes()).await?;
+            cleaned.as_str()
         } else {
-            self.writer.write_all(line.as_bytes()).await?;
+            line
+        };
+        if !e6irc_proto::message::client_frame_fits(line.as_bytes()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "client line exceeds an IRC wire budget",
+            ));
         }
+        self.writer.write_all(line.as_bytes()).await?;
         self.writer.write_all(b"\r\n").await?;
         self.writer.flush().await
     }
@@ -400,6 +408,12 @@ impl Connection {
             if let Some(event) = self.pending.pop_front() {
                 match event {
                     LineEvent::Line(line) => {
+                        if !e6irc_proto::message::server_frame_fits(&line) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "server sent an over-long line",
+                            ));
+                        }
                         let text = std::str::from_utf8(&line).map_err(|_| {
                             io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -449,6 +463,9 @@ impl Connection {
             if let Some(event) = self.pending.pop_front() {
                 match event {
                     LineEvent::Line(line) => {
+                        if !e6irc_proto::message::server_frame_fits(&line) {
+                            return Ok(Some(RelayEvent::Rejected(RejectedLine::TooLong)));
+                        }
                         // Lossy: an invalid byte sequence becomes U+FFFD
                         // instead of failing the whole read (mirrors the
                         // in-process local driver).
@@ -1349,6 +1366,56 @@ mod tests {
         assert_eq!(got, "PRIVMSG #c :hiJOIN #eviltail\r\n");
         assert_eq!(got.matches("\r\n").count(), 1);
         assert!(!got[..got.len() - 2].contains(['\r', '\n', '\0']));
+    }
+
+    #[tokio::test]
+    async fn send_line_rejects_each_wire_budget_before_writing() {
+        use tokio::io::AsyncReadExt;
+
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (cr, cw) = tokio::io::split(client_io);
+        let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
+        let error = conn
+            .send_line(&"x".repeat(e6irc_proto::message::MAX_LINE_LEN - 1))
+            .await
+            .expect_err("overlong traditional body");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        drop(conn);
+
+        let (mut reader, _writer) = tokio::io::split(server_io);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert!(
+            bytes.is_empty(),
+            "a rejected line must not be partially written"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_preserves_the_server_tag_allowance_but_rejects_an_overlong_body() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let (cr, cw) = tokio::io::split(client_io);
+        let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
+        let (_reader, mut writer) = tokio::io::split(server_io);
+        let tagged = format!("@example={} :srv NOTICE nick :ok", "a".repeat(600));
+        writer.write_all(tagged.as_bytes()).await.unwrap();
+        writer.write_all(b"\r\n").await.unwrap();
+        writer
+            .write_all(&vec![b'x'; e6irc_proto::message::MAX_LINE_LEN - 1])
+            .await
+            .unwrap();
+        writer.write_all(b"\r\n").await.unwrap();
+
+        let Some(RelayEvent::Line { raw, .. }) = conn.next_line_relayable().await.unwrap() else {
+            panic!("tagged server line was not relayed");
+        };
+        assert_eq!(raw, tagged);
+        assert!(matches!(
+            conn.next_line_relayable().await.unwrap(),
+            Some(RelayEvent::Rejected(RejectedLine::TooLong))
+        ));
     }
 
     #[tokio::test]

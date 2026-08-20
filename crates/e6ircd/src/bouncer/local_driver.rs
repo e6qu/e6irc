@@ -305,9 +305,10 @@ mod tests {
         ));
         assert!(matches!(
             events.recv().await,
-            Ok(super::super::DriverEvent::Status(
-                super::super::DriverConnectionStatus::Connected
-            ))
+            Ok(super::super::DriverEvent::Status {
+                status: super::super::DriverConnectionStatus::Connected,
+                ..
+            })
         ));
         (core_rx, handle, events, task, out_tx)
     }

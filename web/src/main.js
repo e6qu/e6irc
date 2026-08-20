@@ -29,6 +29,8 @@ import {
   asMessage,
   fold,
   isChannel,
+  kickPairs,
+  membershipTargets,
   mergeTimeline,
   messageIdentity,
   nickPrefix,
@@ -37,6 +39,7 @@ import {
   splitSigil,
   stripSigil,
   tagValue,
+  topicReply,
 } from "./irc-state.js";
 
 const params = new URLSearchParams(window.location.search);
@@ -837,11 +840,19 @@ function handleLine(raw) {
   const m = parseIrc(raw);
   switch (m.command) {
     case "001":
-      if (m.params[0]) myNick = m.params[0];
-      addServer(`connected as ${myNick}`);
+      if (m.params[0]) {
+        myNick = m.params[0];
+        addServer(`connected as ${myNick}`);
+      } else {
+        addServer(raw);
+      }
       break;
     case "PRIVMSG":
     case "NOTICE": {
+      if (!m.params[0] || m.params[1] === undefined) {
+        addServer(raw);
+        break;
+      }
       const target = m.params[0] || "";
       const text = m.params[1] ?? "";
       const kind = m.command === "NOTICE" ? "notice" : "msg";
@@ -865,49 +876,67 @@ function handleLine(raw) {
       break;
     }
     case "JOIN": {
-      const chan = m.params[0];
-      if (!chan) break;
-      if (isMe(m.nick)) {
-        ensureBuffer(chan, "channel");
-        setActive(chan);
-      } else if (m.nick) {
-        addNick(chan, m.nick);
-        addEvent(chan, `${m.nick} joined`);
+      const channels = membershipTargets(m.params[0]);
+      if (!channels.length) {
+        addServer(raw);
+        break;
+      }
+      for (const channel of channels) {
+        if (isMe(m.nick)) {
+          ensureBuffer(channel, "channel");
+          setActive(channel);
+        } else if (m.nick) {
+          addNick(channel, m.nick);
+          addEvent(channel, `${m.nick} joined`);
+        } else {
+          addServer(raw);
+          break;
+        }
       }
       break;
     }
-    case "PART":
-      if (m.params[0]) {
-        const reason = m.params[1] ? ` (${m.params[1]})` : "";
+    case "PART": {
+      const channels = membershipTargets(m.params[0]);
+      if (!channels.length || !m.nick) {
+        addServer(raw);
+        break;
+      }
+      const reason = m.params[1] ? ` (${m.params[1]})` : "";
+      for (const channel of channels) {
         if (isMe(m.nick)) {
-          const channel = m.params[0];
           closeBuffer(channel);
           addServer(`You left ${channel}${reason}.`);
         } else {
-          removeNick(m.params[0], m.nick);
-          addEvent(m.params[0], `${m.nick || "?"} left${reason}`);
+          removeNick(channel, m.nick);
+          addEvent(channel, `${m.nick} left${reason}`);
         }
       }
       break;
-    case "KICK":
-      if (m.params[0] && m.params[1]) {
-        const reason = m.params[2] ? ` (${m.params[2]})` : "";
-        const by = m.nick ? ` by ${m.nick}` : "";
-        if (isMe(m.params[1])) {
-          const channel = m.params[0];
+    }
+    case "KICK": {
+      const pairs = kickPairs(m.params[0], m.params[1]);
+      if (!pairs.length) {
+        addServer(raw);
+        break;
+      }
+      const reason = m.params[2] ? ` (${m.params[2]})` : "";
+      const by = m.nick ? ` by ${m.nick}` : "";
+      for (const [channel, target] of pairs) {
+        if (isMe(target)) {
           closeBuffer(channel);
           addServer(`You were kicked from ${channel}${by}${reason}.`);
         } else {
-          removeNick(m.params[0], m.params[1]);
-          addEvent(m.params[0], `${m.params[1]} was kicked${by}${reason}`);
+          removeNick(channel, target);
+          addEvent(channel, `${target} was kicked${by}${reason}`);
         }
       }
       break;
+    }
     case "QUIT":
       if (m.nick) {
         const reason = m.params[0] ? ` (${m.params[0]})` : "";
         removeNickEverywhere(m.nick, `${stripSigil(m.nick)} quit${reason}`);
-      }
+      } else addServer(raw);
       break;
     case "MODE": {
       // Channel MODE: track membership sigil changes for the member list.
@@ -935,21 +964,27 @@ function handleLine(raw) {
       if (m.nick && m.params[0]) {
         renameNick(m.nick, m.params[0]);
         if (isMe(m.nick)) myNick = m.params[0];
-      }
+      } else addServer(raw);
       break;
     case "TOPIC":
-      if (m.params[0]) {
+      if (m.params[0] && m.params[1] !== undefined) {
         setTopic(m.params[0], m.params[1]);
         addEvent(m.params[0], `${m.nick || "?"} set the topic`);
-      }
+      } else addServer(raw);
       break;
-    case "332": // RPL_TOPIC: <me> <chan> :topic
-      setTopic(m.params[1], m.params[2]);
+    case "332": { // RPL_TOPIC: <me> <chan> :topic
+      const reply = topicReply(m.params);
+      if (reply) setTopic(reply.channel, reply.topic);
+      else addServer(raw);
       break;
+    }
     case "353": {
       // RPL_NAMREPLY: <me> <sym> <chan> :n1 n2 ...
       const chan = m.params[2];
-      if (!chan) break;
+      if (!chan) {
+        addServer(raw);
+        break;
+      }
       const buffer = ensureBuffer(chan, "channel");
       if (buffer.kind !== "channel") break;
       if (!namesSnapshots.has(buffer.key)) {
@@ -971,7 +1006,7 @@ function handleLine(raw) {
         buffer.membershipKnown = true;
         namesSnapshots.delete(buffer.key);
         if (buffer.key === active) renderNickList();
-      }
+      } else addServer(raw);
       break;
     }
     default:

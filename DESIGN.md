@@ -557,7 +557,10 @@ strip = "symbols"
 - Limits: 512-byte traditional message body; tags budget per spec (8191
   bytes total for tags on server→client, 4096 client→server as advertised
   by us); oversized input is rejected with `FAIL`/`ERR_INPUTTOOLONG`, never
-  truncated silently. On *output*, a relayed PRIVMSG/NOTICE carries a source
+  truncated silently. One shared predicate checks the tag and traditional
+  budgets independently at server, BNC, WebSocket, and shared-client ingress;
+  checking only their combined maximum would let an untagged line borrow the
+  entire tag allowance. On *output*, a relayed PRIVMSG/NOTICE carries a source
   prefix the sender did not, so a within-limit message can overflow 512 once
   relayed; the text is trimmed to fit at delivery — once, so live delivery, the
   echo and CHATHISTORY agree — since a single message cannot be split the way a
@@ -1489,6 +1492,10 @@ Design constraints recorded now:
 - Driver-specific transports: Matrix client-server API (long-poll /sync),
   Discord gateway WebSocket + REST, Slack Socket Mode. Each stays inside its
   feature flag including its HTTP client code.
+- Reverse bridge delivery accepts `PRIVMSG` only. Unmapped targets, malformed
+  messages, unsupported commands, and per-target provider failures each emit a
+  bounded `*bnc*` refusal notice; queue admission can never become a silent
+  bridge no-op.
 
 ---
 
@@ -1669,7 +1676,8 @@ The chat page opens one WS (`/ws/ui`, cookie-authenticated). The server pushes
 typed line, status, authoritative `session` (nick + joined channels), and
 `{"t":"snapshot","v":"complete"}` replay-boundary events. Raw line events preserve IRCv3 `time` and `msgid` tags so live and
 persisted timelines use the same clock and have stable overlap identity. The
-client parses each line, routes it to the right buffer (channel / DM / server),
+client applies the protocol parser's last-duplicate-tag rule, parses each line,
+routes it to the right buffer (channel / DM / server),
 maintains the per-channel member list, reconciles stale replay buffers against
 the session event, and renders the active buffer (all via
 DOM APIs, never `innerHTML` on server text, so a hostile upstream line can't
@@ -1696,8 +1704,16 @@ bounded capacity by one API page, so loading older context remains effective
 even when the normal live window is full. Self PART/KICK closes the
 channel buffer, direct-message buffers have an explicit local Close action,
 and channel buffers have a Leave action whose confirmed self PART closes them.
+Comma-separated JOIN/PART targets and the supported multi-target KICK forms
+update every affected buffer using the same pairing rules as the BNC session
+tracker. Malformed membership commands and incomplete topic numerics are shown
+in the server buffer rather than ignored or allowed to throw in the socket
+handler.
 Status values are the closed set `connected`, `disconnected`, and
 `unavailable`. The first two describe a live driver's upstream lifecycle;
+each driver transition has a monotonic revision, so an initial sticky status
+suppresses every older status already queued at the attach boundary. A
+connected sticky event never carries a historical failure reason.
 `unavailable` is terminal for that socket because the network was removed,
 disabled, or replaced. The client reconciles the REST inventory and attaches a
 live replacement under the same name; if none exists, it stops its transport
@@ -1729,6 +1745,10 @@ which fixes the outbound frame type for the connection (binary → raw bytes;
 text → text frames, non-UTF-8 lossily replaced with U+FFFD as a text frame
 requires valid UTF-8). A client offering neither gets per-line auto framing
 (text when valid UTF-8, else binary) — the original behavior.
+Each WebSocket message is exactly one IRC line without a CR/LF terminator, as
+required by IRCv3. An embedded delimiter rejects that whole message as
+malformed and can never be interpreted as a second command; the transport cap
+is the complete client tag-plus-body allowance.
 
 A dedicated **WS-IRC listener** is also available: a `[[listeners]]` entry
 with `websocket = true` serves this same endpoint at the root path
