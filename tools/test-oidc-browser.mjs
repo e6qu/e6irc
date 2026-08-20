@@ -1678,12 +1678,16 @@ try {
     }),
   );
   const mentionsBuffer = page.getByRole("button", {
-    name: "Open #mentions, 1 unread message, 1 mention",
+    name: "Open #mentions, past channel, not currently joined, 1 unread message, 1 mention",
   });
   await mentionsBuffer.waitFor();
   assert.equal(await mentionsBuffer.locator(".mention-badge").textContent(), "@1");
   await mentionsBuffer.click();
-  await page.getByRole("button", { name: "Open #mentions" }).waitFor();
+  await page
+    .getByRole("button", {
+      name: "Open #mentions, past channel, not currently joined",
+    })
+    .waitFor();
   assert.equal(await page.locator(".mention-badge").count(), 0);
   // The following authoritative NAMES snapshot updates #room's member list,
   // so return to its rendered conversation after proving the mention reset.
