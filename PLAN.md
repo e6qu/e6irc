@@ -35,7 +35,10 @@ dismissal, reduced motion, responsive controls, and non-interactive unavailable
 network routes. On phones, the console brings its active route into the
 horizontal navigation viewport. Confirmations repeat the initiating action,
 preserve its submitted name and value, and reset cancellation state on every
-opening. Dynamically rendered console tables and logs use shared constructors
+opening. API-backed forms expose the exact initiating action as in progress and
+share one per-form guard that disables every submit route until the mutation and
+view refresh finish, preventing duplicate keyboard, pointer, or scripted
+submissions. Dynamically rendered console tables and logs use shared constructors
 for named keyboard-focusable regions. The terminal UI carries the same
 relay-desk hierarchy through an explicit route/status strip, active-first
 conversation rail, scrollback and unread state, and a visible

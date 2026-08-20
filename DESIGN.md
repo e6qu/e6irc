@@ -1570,7 +1570,11 @@ always-served, same-origin `/console.js` hydrates those API-backed controls,
 including explicit confirmation, retry, and failure states. The shared
 confirmation dialog repeats the initiating action label and severity, preserves
 the submitter's name/value semantics, and resets its return state before every
-opening so Escape can never inherit an earlier confirmation. On phone layouts,
+opening so Escape can never inherit an earlier confirmation. Every API-backed
+form also crosses one shared in-flight submission guard: the initiating action
+gains a visible and accessible progress state, every submit control in that form
+is disabled, and keyboard, pointer, or synthetic resubmission cannot issue a
+second mutation until the first operation and its view refresh finish. On phone layouts,
 the active route is brought into the horizontal console-navigation viewport on
 load. The console works
 in the default build and `embed-web`; its private pages permit only that

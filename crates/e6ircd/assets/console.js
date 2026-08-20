@@ -10,6 +10,8 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   const confirmationMessage = document.querySelector("[data-console-confirm-message]");
   const confirmationAction = document.querySelector("[data-console-confirm-action]");
   const panelRefreshers = new WeakMap();
+  const formSubmissionTriggers = new WeakMap();
+  const activeFormSubmissions = new WeakSet();
   let pendingConfirmation = null;
   let pendingConfirmationSubmitter = null;
   let confirmationTrigger = null;
@@ -63,13 +65,14 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;
     const message = form.dataset.confirm;
+    const submitter = event.submitter instanceof HTMLElement ? event.submitter : null;
     if (!message || form.dataset.confirmed === "true") {
       delete form.dataset.confirmed;
+      formSubmissionTriggers.set(form, submitter);
       return;
     }
     event.preventDefault();
     event.stopPropagation();
-    const submitter = event.submitter instanceof HTMLElement ? event.submitter : null;
     if (
       confirmationDialog instanceof HTMLDialogElement
       && confirmationMessage instanceof HTMLElement
@@ -222,6 +225,46 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       },
       json: body,
     });
+  };
+
+  const runFormSubmission = async (form, operation, explicitTrigger) => {
+    if (activeFormSubmissions.has(form)) return undefined;
+    activeFormSubmissions.add(form);
+
+    const submittedBy = explicitTrigger ?? formSubmissionTriggers.get(form);
+    formSubmissionTriggers.delete(form);
+    const submitControls = Array.from(form.querySelectorAll('button[type="submit"], input[type="submit"], input[type="image"]'));
+    if (submittedBy instanceof HTMLButtonElement && !submitControls.includes(submittedBy)) {
+      submitControls.push(submittedBy);
+    }
+    const disabledStates = submitControls.map((control) => control.disabled);
+    const previousBusy = form.getAttribute("aria-busy");
+    const trigger = submittedBy instanceof HTMLButtonElement
+      ? submittedBy
+      : submitControls.find((control) => control instanceof HTMLButtonElement);
+    const previousTriggerLabel = trigger?.getAttribute("aria-label") ?? null;
+
+    form.setAttribute("aria-busy", "true");
+    for (const control of submitControls) control.disabled = true;
+    if (trigger instanceof HTMLButtonElement) {
+      const label = trigger.getAttribute("aria-label") || trigger.textContent?.trim() || "Action";
+      trigger.dataset.submitting = "true";
+      trigger.setAttribute("aria-label", `${label} — in progress`);
+    }
+
+    try {
+      return await operation();
+    } finally {
+      activeFormSubmissions.delete(form);
+      if (previousBusy === null) form.removeAttribute("aria-busy");
+      else form.setAttribute("aria-busy", previousBusy);
+      submitControls.forEach((control, index) => { control.disabled = disabledStates[index]; });
+      if (trigger instanceof HTMLButtonElement) {
+        delete trigger.dataset.submitting;
+        if (previousTriggerLabel === null) trigger.removeAttribute("aria-label");
+        else trigger.setAttribute("aria-label", previousTriggerLabel);
+      }
+    }
   };
 
   const apiRead = async (url) => {
@@ -1048,19 +1091,16 @@ import { loadSettings, saveSettings } from "/console-settings.js";
 
   let refreshConfiguration;
 
-  const mutateConfiguration = async (form, url, method, body, success = "Configuration saved.") => {
-    const submit = form.querySelector('button[type="submit"]');
-    if (submit) submit.disabled = true;
-    try {
-      await apiRequest(form, apiMutation(method, url), body);
-      await refreshAfterMutation(refreshConfiguration);
-      setConfigurationResult(success, true);
-      if (submit) submit.disabled = false;
-    } catch (error) {
-      setConfigurationResult(error instanceof Error ? error.message : "Configuration request failed.", false);
-      if (submit) submit.disabled = false;
-    }
-  };
+  const mutateConfiguration = (form, url, method, body, success = "Configuration saved.") =>
+    runFormSubmission(form, async () => {
+      try {
+        await apiRequest(form, apiMutation(method, url), body);
+        await refreshAfterMutation(refreshConfiguration);
+        setConfigurationResult(success, true);
+      } catch (error) {
+        setConfigurationResult(error instanceof Error ? error.message : "Configuration request failed.", false);
+      }
+    });
 
   for (const form of document.querySelectorAll("[data-api-configuration-patch]")) {
     form.addEventListener("submit", (event) => {
@@ -1461,19 +1501,15 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     banResult.className = success ? "banner-success" : "banner-error";
   };
 
-  const mutateBan = async (form, url, method, body) => {
-    const submit = form.querySelector('button[type="submit"]');
-    if (submit) submit.disabled = true;
+  const mutateBan = (form, url, method, body) => runFormSubmission(form, async () => {
     try {
       await apiRequest(form, apiMutation(method, url), body);
       await refreshAfterMutation(refreshBanDirectory);
       setBanResult("Updated.", true);
-      if (submit) submit.disabled = false;
     } catch (error) {
       setBanResult(error instanceof Error ? error.message : "Server-ban request failed.", false);
-      if (submit) submit.disabled = false;
     }
-  };
+  });
 
   for (const form of document.querySelectorAll("[data-api-ban-create]")) {
     form.addEventListener("submit", (event) => {
@@ -1514,17 +1550,14 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     sessionResult.className = success ? "banner-success" : "banner-error";
   };
 
-  const mutateSession = async (form, url, message, refresh) => {
-    const submit = form.querySelector('button[type="submit"]');
-    if (submit) submit.disabled = true;
+  const mutateSession = (form, url, message, refresh) => runFormSubmission(form, async () => {
     try {
       await apiRequest(form, apiMutation("DELETE", url));
       await refresh();
     } catch (error) {
       setSessionResult(error instanceof Error ? error.message : message, false);
-      if (submit) submit.disabled = false;
     }
-  };
+  });
 
   const sessionPage = document.querySelector("[data-api-session-page]");
   if (sessionPage instanceof HTMLElement) {
@@ -1731,19 +1764,15 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     accountSecret.append(section);
   };
 
-  const mutateAccount = async (form, method, body, failure) => {
-    const submit = form.querySelector('button[type="submit"]');
-    if (submit) submit.disabled = true;
+  const mutateAccount = (form, method, body, failure) => runFormSubmission(form, async () => {
     try {
       const result = await apiRequest(form, apiMutation(method, form.action), body);
-      if (submit) submit.disabled = false;
       return result === undefined ? true : result;
     } catch (error) {
       setAccountResult(error instanceof Error ? error.message : failure, false);
-      if (submit) submit.disabled = false;
       return undefined;
     }
-  };
+  });
 
   let refreshAccountAccess;
   let refreshContactEmail;
@@ -2154,19 +2183,14 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     adminAccountResult.textContent = message;
     adminAccountResult.className = success ? "banner-success" : "banner-error";
   };
-  const mutateAdminAccount = async (form, method, body, failure) => {
-    const submit = form.querySelector('button[type="submit"]');
-    if (submit) submit.disabled = true;
+  const mutateAdminAccount = (form, method, body, failure) => runFormSubmission(form, async () => {
     try {
-      const result = await apiRequest(form, apiMutation(method, form.action), body);
-      if (submit) submit.disabled = false;
-      return result;
+      return await apiRequest(form, apiMutation(method, form.action), body);
     } catch (error) {
       setAdminAccountResult(error instanceof Error ? error.message : failure, false);
-      if (submit) submit.disabled = false;
       return undefined;
     }
-  };
+  });
   const showInvitationSecret = (value) => {
     if (!adminAccountSecret) return;
     adminAccountSecret.replaceChildren();
@@ -2285,18 +2309,19 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       }
       return;
     }
-    void apiRequest(form, apiMutation("PATCH", form.action), { enabled: enabled === "true" })
-      .then(() => refreshAfterMutation(refreshAdminNetworks))
-      .then(() => {
+    void runFormSubmission(form, async () => {
+      try {
+        await apiRequest(form, apiMutation("PATCH", form.action), { enabled: enabled === "true" });
+        await refreshAfterMutation(refreshAdminNetworks);
         if (!adminNetworkResult) return;
         adminNetworkResult.textContent = "Network state updated.";
         adminNetworkResult.className = "banner-success";
-      })
-      .catch((error) => {
+      } catch (error) {
         if (!adminNetworkResult) return;
         adminNetworkResult.textContent = error instanceof Error ? error.message : "Network lifecycle change failed.";
         adminNetworkResult.className = "banner-error";
-      });
+      }
+    });
   });
 
   const ownerNetworkResult = document.getElementById("network-api-result");
@@ -2462,8 +2487,14 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     return refreshOwnerNetworks;
   };
 
-  const mutateOwnerNetwork = async (form, url, method, body, mode, trigger = form.querySelector('button[type="submit"]')) => {
-    if (trigger instanceof HTMLButtonElement) trigger.disabled = true;
+  const mutateOwnerNetwork = (
+    form,
+    url,
+    method,
+    body,
+    mode,
+    trigger = form.querySelector('button[type="submit"]'),
+  ) => runFormSubmission(form, async () => {
     try {
       const result = await apiRequest(form, apiMutation(method, url), body);
       if (mode === ownerNetworkPreflight) {
@@ -2477,10 +2508,8 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       }
     } catch (error) {
       setOwnerNetworkResult(error instanceof Error ? error.message : "Network request failed.", false);
-    } finally {
-      if (trigger instanceof HTMLButtonElement) trigger.disabled = false;
     }
-  };
+  }, trigger);
 
   const ownerNetworkConnection = (fields) => ({
     addr: fieldValue(fields, "addr"),
@@ -2828,19 +2857,15 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   const channelRefresher = () => ownedChannelList instanceof HTMLElement
     ? refreshOwnedChannels
     : refreshAdminChannelDirectory;
-  const mutateChannel = async (form, url, method, body) => {
-    const submit = form.querySelector('button[type="submit"]');
-    if (submit) submit.disabled = true;
+  const mutateChannel = (form, url, method, body) => runFormSubmission(form, async () => {
     try {
       await apiRequest(form, apiMutation(method, url), body);
       await refreshAfterMutation(channelRefresher());
       setChannelResult("Updated.", true);
-      if (submit) submit.disabled = false;
     } catch (error) {
       setChannelResult(error instanceof Error ? error.message : "Channel request failed.", false);
-      if (submit) submit.disabled = false;
     }
-  };
+  });
 
   const ownedChannelList = document.querySelector("[data-api-owned-channel-list]");
   if (ownedChannelList instanceof HTMLElement) {

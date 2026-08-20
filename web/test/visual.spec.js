@@ -86,6 +86,9 @@ async function mountConsoleRuntime(page, body, styles = "", apiResponses = {}) {
     body: `const responses = ${JSON.stringify(apiResponses)};
       export const apiContractLoader = () => async () => ({});
       export const getOperationJson = async (_fetch, _contract, _method, url) => {
+        window.consoleApiRequests ??= [];
+        window.consoleApiRequests.push(url);
+        if (window.consoleApiGate) await window.consoleApiGate;
         const match = Object.entries(responses).find(([prefix]) => url.startsWith(prefix));
         return match ? match[1] : {};
       };`,
@@ -178,6 +181,58 @@ test("console confirmations preserve the named action and cancel safely", async 
   await expect(dialog).toBeHidden();
   await expect(restartRoute).toBeFocused();
   await expect.poll(() => page.evaluate(() => window.confirmedOperations)).toEqual(["delete"]);
+});
+
+test("console mutations expose progress and reject duplicate submissions", async ({ page }) => {
+  await mountConsoleRuntime(page, `
+    <main>
+      <p id="ban-api-result" role="status" aria-live="polite"></p>
+      <form action="/api/v1/admin/bans" data-api-ban-create>
+        <input type="hidden" name="csrf" value="test-csrf">
+        <label>Policy kind <input name="kind" value="kline"></label>
+        <label>Mask <input name="mask" value="*@bad.example"></label>
+        <label>Reason <input name="reason" value="abuse"></label>
+        <button type="submit">Add ban</button>
+        <button type="submit">Add and enforce ban</button>
+      </form>
+      <span id="admin-ban-count"></span>
+      <div id="admin-ban-pager"></div>
+      <table><tbody data-api-admin-ban-list data-csrf="test-csrf"></tbody></table>
+    </main>
+  `, "button[data-submitting='true']::after { content: '\u2026'; }", {
+    "/api/v1/admin/bans": { bans: [] },
+  });
+  await expect.poll(() => page.evaluate(() => window.consoleApiRequests.length)).toBe(1);
+  await page.evaluate(() => {
+    window.consoleApiRequests = [];
+    window.consoleApiGate = new Promise((resolve) => { window.releaseConsoleApi = resolve; });
+  });
+
+  const form = page.locator("form[data-api-ban-create]");
+  const firstAction = form.getByRole("button", { name: "Add ban" });
+  const chosenAction = form.getByRole("button", { name: "Add and enforce ban" });
+  await chosenAction.click();
+
+  await expect(form).toHaveAttribute("aria-busy", "true");
+  await expect(firstAction).toBeDisabled();
+  await expect(chosenAction).toBeDisabled();
+  await expect(chosenAction).toHaveAttribute("data-submitting", "true");
+  await expect(chosenAction).toHaveAttribute("aria-label", "Add and enforce ban — in progress");
+  await expect.poll(() => page.evaluate(() => window.consoleApiRequests.length)).toBe(1);
+  await form.evaluate((node) => {
+    node.dispatchEvent(new SubmitEvent("submit", { bubbles: true, cancelable: true }));
+  });
+  await expect.poll(() => page.evaluate(() => window.consoleApiRequests.length)).toBe(1);
+  await expectAccessible(page);
+
+  await page.evaluate(() => window.releaseConsoleApi());
+  await expect(form).not.toHaveAttribute("aria-busy");
+  await expect(firstAction).toBeEnabled();
+  await expect(chosenAction).toBeEnabled();
+  await expect(chosenAction).not.toHaveAttribute("data-submitting");
+  await expect(chosenAction).not.toHaveAttribute("aria-label");
+  await expect(page.getByRole("status")).toHaveText("Updated.");
+  await expect.poll(() => page.evaluate(() => window.consoleApiRequests.length)).toBe(2);
 });
 
 test("console phone navigation reveals the active destination", async ({ page }) => {
