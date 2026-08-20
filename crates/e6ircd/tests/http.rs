@@ -655,7 +655,9 @@ async fn bnc_network_management_lifecycle() {
         .register_sasl("alice/work", "Me", "alice", "s3cr3t")
         .await
         .expect("attach to the just-created network");
-    assert!(confirmed.starts_with("alice/work"), "{confirmed}");
+    // The slash-bearing registration nick is only a BNC routing selector.
+    // Once attached, RPL_WELCOME must name the authoritative upstream nick.
+    assert_eq!(confirmed, "alice_");
     drop(client);
 
     // the live driver reached the upstream, so the listing reports it up
