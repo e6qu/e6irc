@@ -1694,8 +1694,22 @@ async fn bnc_listener_serves_chathistory_and_markread() {
     assert_eq!(ack.command, "MARKREAD", "{ack:?}");
     assert_eq!(
         ack.params.get(1).map(String::as_str),
-        Some("2024-01-01T00:00:00.000Z"),
+        Some("timestamp=2024-01-01T00:00:00.000Z"),
         "{ack:?}"
+    );
+    client
+        .send_line("MARKREAD #lobby timestamp=2020-01-01T00:00:00.000Z")
+        .await
+        .unwrap();
+    let older = client
+        .next_message()
+        .await
+        .unwrap()
+        .expect("older MARKREAD ack");
+    assert_eq!(
+        older.params.get(1).map(String::as_str),
+        Some("timestamp=2024-01-01T00:00:00.000Z"),
+        "a read marker must never move backwards: {older:?}"
     );
     client.send_line("MARKREAD #lobby").await.unwrap();
     let query = client
@@ -1706,7 +1720,7 @@ async fn bnc_listener_serves_chathistory_and_markread() {
     assert_eq!(query.command, "MARKREAD", "{query:?}");
     assert_eq!(
         query.params.get(1).map(String::as_str),
-        Some("2024-01-01T00:00:00.000Z"),
+        Some("timestamp=2024-01-01T00:00:00.000Z"),
         "{query:?}"
     );
 

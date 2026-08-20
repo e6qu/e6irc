@@ -127,8 +127,10 @@ read markers.
 
 **Flow.**
 
-1. Negotiate `chathistory`, `batch`, `server-time`, and
-   `draft/read-marker` as applicable.
+1. Negotiate `chathistory` and any independently useful metadata/framing
+   capabilities (`batch`, `server-time`, message tags), plus
+   `draft/read-marker` as applicable. CHATHISTORY remains usable without
+   `batch`; when `batch` is active, the page uses its specified envelope.
 2. Query `CHATHISTORY LATEST`, `BEFORE`, `AFTER`, `AROUND`, or `BETWEEN`, or
    enumerate `TARGETS`.
 3. The hot in-memory ring answers recent ranges; PostgreSQL answers older or

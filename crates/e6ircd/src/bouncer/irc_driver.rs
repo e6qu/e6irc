@@ -639,7 +639,7 @@ fn dropped(failure: super::NetworkFailure) -> super::SessionOutcome {
 /// valid client-only tags ride along exactly as a real echo-message would
 /// return them, and a fresh authoritative `time=` tag stamps when the bouncer
 /// accepted the line so backlog playback orders it against upstream traffic.
-fn self_echo(line: &str, nick: &str, ident: &str, host: &str) -> Option<String> {
+pub(super) fn self_echo(line: &str, nick: &str, ident: &str, host: &str) -> Option<String> {
     let parsed = e6irc_proto::message::Message::parse(line).ok()?;
     let prefix = format!(":{nick}!~{ident}@{host}");
     let body = match parsed.command.to_ascii_uppercase().as_str() {

@@ -604,6 +604,9 @@ pub enum Input {
         conn: ConnId,
         display: String,
         batch_ref: String,
+        /// Capabilities that affect history rendering, captured at request
+        /// time so a later CAP change cannot alter a deferred reply.
+        caps: HistoryResponseCaps,
         rows: Result<Vec<HistoryRow>, ()>,
         /// Labeled-response label to place on the batch, if the command that
         /// triggered this deferred page was labeled.
@@ -615,6 +618,8 @@ pub enum Input {
     TargetsPage {
         conn: ConnId,
         batch_ref: String,
+        /// Request-time capabilities for deferred framing.
+        caps: HistoryResponseCaps,
         targets: Result<Vec<(String, e6irc_proto::time::Millis)>, ()>,
         /// Labeled-response label to place on the batch, if the command that
         /// triggered this deferred page was labeled.
@@ -1262,6 +1267,8 @@ pub enum DbRequest {
         targets: HistoryTargets,
         display: String,
         batch_ref: String,
+        /// Request-time capabilities that affect history rendering.
+        caps: HistoryResponseCaps,
         query: HistoryQuery,
         /// Escaped labeled-response label to carry onto the deferred batch, if
         /// the originating command was labeled.
@@ -1282,6 +1289,8 @@ pub enum DbRequest {
         max_ts: e6irc_proto::time::Millis,
         limit: usize,
         batch_ref: String,
+        /// Request-time capabilities that affect history rendering.
+        caps: HistoryResponseCaps,
         /// Escaped labeled-response label to carry onto the deferred batch, if
         /// the originating command was labeled.
         label: Option<String>,
@@ -1583,6 +1592,32 @@ pub struct HistoryRow {
     /// for a single-line message. Reconstructed into a multiline batch (or
     /// flattened) on replay, reusing this row's single msgid.
     pub multiline: Option<String>,
+}
+
+/// Capability state that determines the wire shape of a CHATHISTORY reply.
+///
+/// Database-backed replies are asynchronous, so this is captured when the
+/// command is accepted rather than re-reading mutable session capabilities
+/// when the rows eventually arrive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HistoryResponseCaps {
+    pub batch: bool,
+    pub message_tags: bool,
+    pub server_time: bool,
+    pub account_tag: bool,
+    pub multiline: bool,
+}
+
+impl From<state::Caps> for HistoryResponseCaps {
+    fn from(caps: state::Caps) -> Self {
+        Self {
+            batch: caps.batch,
+            message_tags: caps.message_tags,
+            server_time: caps.server_time,
+            account_tag: caps.account_tag,
+            multiline: caps.multiline,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2300,6 +2335,7 @@ impl Core {
                 conn,
                 display,
                 batch_ref,
+                caps,
                 rows,
                 label,
             } => {
@@ -2312,6 +2348,7 @@ impl Core {
                         conn,
                         &display,
                         &batch_ref,
+                        caps,
                         rows,
                         label.as_deref(),
                     );
@@ -2320,11 +2357,12 @@ impl Core {
             Input::TargetsPage {
                 conn,
                 batch_ref,
+                caps,
                 targets,
                 label,
             } => {
                 self.state.emit_deferred(conn, |state| {
-                    handler::targets_page(state, conn, &batch_ref, targets, label.as_deref());
+                    handler::targets_page(state, conn, &batch_ref, caps, targets, label.as_deref());
                 });
             }
             // Notify clients; the worker loop breaks right after this event
@@ -2789,12 +2827,10 @@ mod ingress_tests {
     }
 
     async fn next_output(rx: &mut Receiver<super::Output>) -> Envelope<super::Output> {
-        loop {
-            if let Some(output) = rx.try_pop() {
-                return output;
-            }
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.pop())
+            .await
+            .expect("core test timed out waiting for output")
+            .expect("core output queue closed")
     }
 
     #[tokio::test]

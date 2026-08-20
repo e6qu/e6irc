@@ -117,6 +117,13 @@ fuzz_target!(|data: &[u8]| {
                 conn: pick(rest),
                 display: rest.get(1..).unwrap_or("#c").to_string(),
                 batch_ref: "b".into(),
+                caps: e6ircd::core::HistoryResponseCaps {
+                    batch: true,
+                    message_tags: true,
+                    server_time: true,
+                    account_tag: true,
+                    multiline: true,
+                },
                 rows: Ok(vec![HistoryRow {
                     msgid: "m".into(),
                     ts: e6irc_proto::time::Millis::from_millis(tick),
@@ -132,6 +139,10 @@ fuzz_target!(|data: &[u8]| {
             b'G' => core.handle(Input::TargetsPage {
                 conn: pick(rest),
                 batch_ref: "b".into(),
+                caps: e6ircd::core::HistoryResponseCaps {
+                    batch: true,
+                    ..Default::default()
+                },
                 targets: Ok(vec![(
                     rest.get(1..).unwrap_or("#c").to_string(),
                     e6irc_proto::time::Millis::from_millis(tick),

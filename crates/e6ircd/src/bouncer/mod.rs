@@ -1124,19 +1124,25 @@ pub struct AttachCaps {
     pub read_marker: bool,
 }
 
-/// Strip from a serialized line any message tags the recipient did not
-/// negotiate. `time=` needs server-time, `account=` needs account-tag, and
-/// everything else (msgid, client-only tags) needs message-tags. A line with
-/// no tag section (no leading `@`) is returned unchanged.
-pub(crate) fn filter_tags(line: &str, caps: AttachCaps) -> String {
+/// Filter one serialized line to what the recipient negotiated. `TAGMSG` is
+/// absent without `message-tags`; for every other command, `time=` needs
+/// server-time, `account=` needs account-tag, and remaining tags need
+/// message-tags. `None` is a capability-gated omission, not malformed input.
+pub(crate) fn filter_tags(line: &str, caps: AttachCaps) -> Option<String> {
+    if !caps.message_tags
+        && e6irc_proto::message::Message::parse(line)
+            .is_ok_and(|message| message.command.eq_ignore_ascii_case("TAGMSG"))
+    {
+        return None;
+    }
     let Some(rest) = line.strip_prefix('@') else {
-        return line.to_string();
+        return Some(line.to_string());
     };
     // A leading `@` with no following space is a tag section with no message
     // body. Do not turn it into a blank IRC line: surface the whole-line loss
     // with a bounded valid NOTICE, independent of hostile input.
     let Some((tags, body)) = rest.split_once(' ') else {
-        return ":*bnc* NOTICE * :upstream line omitted: malformed IRC message".to_string();
+        return Some(":*bnc* NOTICE * :upstream line omitted: malformed IRC message".to_string());
     };
     let kept: Vec<&str> = tags
         .split(';')
@@ -1150,9 +1156,9 @@ pub(crate) fn filter_tags(line: &str, caps: AttachCaps) -> String {
         })
         .collect();
     if kept.is_empty() {
-        body.to_string()
+        Some(body.to_string())
     } else {
-        format!("@{} {}", kept.join(";"), body)
+        Some(format!("@{} {}", kept.join(";"), body))
     }
 }
 
@@ -1227,13 +1233,25 @@ pub enum DriverEvent {
     /// the relevant NICK/JOIN may have aged out while a stale PART remains.
     /// Attach transports reconcile this snapshot after playback.
     Session(IrcSessionSnapshot),
+    /// One account's read position advanced on an attached client. This event
+    /// is never buffered or persisted as conversation history; raw attaches
+    /// filter it by authenticated account and negotiated capability.
+    ReadMarker {
+        account: String,
+        target: String,
+        timestamp: String,
+        origin: u64,
+    },
 }
 
 impl DriverEvent {
     pub(crate) fn display_line(&self) -> Option<&str> {
         match self {
             Self::Line(line) | Self::Notice(line) => Some(line),
-            Self::Status { .. } | Self::Echo { .. } | Self::Session(_) => None,
+            Self::Status { .. }
+            | Self::Echo { .. }
+            | Self::Session(_)
+            | Self::ReadMarker { .. } => None,
         }
     }
 }
@@ -2427,6 +2445,21 @@ impl NetworkHandle {
         record_network_error(&self.runtime, &self.telemetry, failure);
         self.emit_notice(failure);
     }
+
+    pub(crate) fn publish_read_marker(
+        &self,
+        account: &str,
+        target: &str,
+        timestamp: &str,
+        origin: u64,
+    ) {
+        drop(self.events.send(DriverEvent::ReadMarker {
+            account: account.to_string(),
+            target: target.to_string(),
+            timestamp: timestamp.to_string(),
+            origin,
+        }));
+    }
 }
 
 /// The driver-side endpoints of a [`NetworkHandle`]. A [`NetworkDriver`]
@@ -2770,7 +2803,7 @@ impl NetworkDriver for LoopbackDriver {
 pub async fn attach<S>(
     stream: S,
     handle: &NetworkHandle,
-    caps: AttachCaps,
+    mut caps: AttachCaps,
     account: &str,
     downstream_nick: &str,
 ) -> std::io::Result<()>
@@ -2831,11 +2864,21 @@ where
     downstream_session.begin(downstream_nick.to_string());
     for line in buffer_snapshot {
         downstream_session.observe(&line);
-        write.write_all(filter_tags(&line, caps).as_bytes()).await?;
-        write.write_all(b"\r\n").await?;
+        if let Some(line) = filter_tags(&line, caps) {
+            write.write_all(line.as_bytes()).await?;
+            write.write_all(b"\r\n").await?;
+        }
     }
     if let Some(snapshot) = session_snapshot {
-        write_irc_session_snapshot(&mut write, &mut downstream_session, &snapshot).await?;
+        write_irc_session_snapshot(
+            &mut write,
+            &mut downstream_session,
+            &snapshot,
+            handle,
+            caps,
+            account,
+        )
+        .await?;
     }
     write.flush().await?;
 
@@ -2859,18 +2902,14 @@ where
                 Ok(event @ (DriverEvent::Line(_) | DriverEvent::Notice(_))) => {
                     let line = event.display_line().expect("display event carries a line");
                     downstream_session.observe(line);
-                    write.write_all(filter_tags(line, caps).as_bytes()).await?;
-                    write.write_all(b"\r\n").await?;
-                    write.flush().await?;
+                    write_filtered_line(&mut write, line, caps).await?;
                 }
                 Ok(DriverEvent::Echo { line, origin }) => {
                     // The originator's own echo reaches it only when it
                     // negotiated echo-message — the same contract a real
                     // server has. Every other attached client always gets it.
                     if origin != attach_id || caps.echo_message {
-                        write.write_all(filter_tags(&line, caps).as_bytes()).await?;
-                        write.write_all(b"\r\n").await?;
-                        write.flush().await?;
+                        write_filtered_line(&mut write, &line, caps).await?;
                     }
                 }
                 Ok(DriverEvent::Status { status, revision }) => {
@@ -2882,8 +2921,37 @@ where
                     write.flush().await?;
                 }
                 Ok(DriverEvent::Session(snapshot)) => {
-                    write_irc_session_snapshot(&mut write, &mut downstream_session, &snapshot).await?;
+                    write_irc_session_snapshot(
+                        &mut write,
+                        &mut downstream_session,
+                        &snapshot,
+                        handle,
+                        caps,
+                        account,
+                    )
+                    .await?;
                     write.flush().await?;
+                }
+                Ok(DriverEvent::ReadMarker {
+                    account: marker_account,
+                    target,
+                    timestamp,
+                    origin,
+                }) => {
+                    if caps.read_marker
+                        && origin != attach_id
+                        && e6irc_proto::casemap::CaseMapping::Rfc1459.eq(&marker_account, account)
+                    {
+                        write
+                            .write_all(
+                                format!(
+                                    ":*bnc* MARKREAD {target} timestamp={timestamp}\r\n"
+                                )
+                                .as_bytes(),
+                            )
+                            .await?;
+                        write.flush().await?;
+                    }
                 }
                 // A retained live-event gap cannot be repaired without risking
                 // stale NICK/channel state. Surface it and detach; a reconnect
@@ -2917,29 +2985,74 @@ where
                                             continue;
                                         }
                                     };
-                                    // BNC-local commands never reach the
-                                    // upstream: CHATHISTORY and MARKREAD are
-                                    // served from the PG backlog, and only
-                                    // when the client negotiated the cap (a
-                                    // non-negotiated CHATHISTORY is not ours
-                                    // to intercept).
-                                    let mut handled = false;
-                                    if caps.chathistory || caps.read_marker {
-                                        let cmd = msg.command.to_ascii_uppercase();
-                                        let params: Vec<&str> = msg.params.to_vec();
-                                        if cmd == "CHATHISTORY" && caps.chathistory {
+                                    // Attach-local protocol state must never be
+                                    // forwarded onto the account's shared
+                                    // upstream connection. CAP mutates only
+                                    // this downstream's view; SASL is already
+                                    // complete; history and markers belong to
+                                    // the BNC store.
+                                    let mut handled = true;
+                                    let cmd = msg.command.to_ascii_uppercase();
+                                    let params: Vec<&str> = msg.params.to_vec();
+                                    match cmd.as_str() {
+                                        "CAP" => {
+                                            let target = downstream_session
+                                                .snapshot()
+                                                .map(|session| session.nick)
+                                                .unwrap_or_else(|| downstream_nick.to_string());
+                                            let mut cap_open = false;
+                                            serve::handle_cap(
+                                                &mut write,
+                                                "*bnc*",
+                                                &target,
+                                                &msg,
+                                                true,
+                                                &mut cap_open,
+                                                &mut caps,
+                                            )
+                                            .await?;
+                                        }
+                                        "AUTHENTICATE" => {
+                                            write_attach_numeric(
+                                                &mut write,
+                                                downstream_nick,
+                                                907,
+                                                None,
+                                                "You have already authenticated",
+                                            )
+                                            .await?;
+                                        }
+                                        "CHATHISTORY" if caps.chathistory => {
                                             chathistory::handle_chathistory(
                                                 handle, &mut write, caps, &params,
                                             )
                                             .await?;
-                                            handled = true;
-                                        } else if cmd == "MARKREAD" && caps.read_marker {
+                                        }
+                                        "CHATHISTORY" => {
+                                            write
+                                                .write_all(
+                                                    b":*bnc* FAIL CHATHISTORY NEED_CAPS :draft/chathistory required\r\n",
+                                                )
+                                                .await?;
+                                            write.flush().await?;
+                                        }
+                                        "MARKREAD" if caps.read_marker => {
                                             chathistory::handle_markread(
-                                                handle, &mut write, account, &params,
+                                                handle, &mut write, account, attach_id, &params,
                                             )
                                             .await?;
-                                            handled = true;
                                         }
+                                        "MARKREAD" => {
+                                            write_attach_numeric(
+                                                &mut write,
+                                                downstream_nick,
+                                                421,
+                                                Some("MARKREAD"),
+                                                "Unknown command",
+                                            )
+                                            .await?;
+                                        }
+                                        _ => handled = false,
                                     }
                                     if !handled {
                                         match handle.send_from(attach_id, &text) {
@@ -2998,6 +3111,38 @@ where
     Ok(())
 }
 
+async fn write_filtered_line<W>(write: &mut W, line: &str, caps: AttachCaps) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    if let Some(line) = filter_tags(line, caps) {
+        write.write_all(line.as_bytes()).await?;
+        write.write_all(b"\r\n").await?;
+        write.flush().await?;
+    }
+    Ok(())
+}
+
+async fn write_attach_numeric<W>(
+    write: &mut W,
+    nick: &str,
+    numeric: u16,
+    middle: Option<&str>,
+    trailing: &str,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    let nick = e6irc_proto::message::truncate_on_char_boundary(nick, 64);
+    let middle = middle.map_or_else(String::new, |value| format!(" {value}"));
+    write
+        .write_all(format!(":*bnc* {numeric:03} {nick}{middle} :{trailing}\r\n").as_bytes())
+        .await?;
+    write.flush().await
+}
+
 /// Fuzzing-only re-exports of the internal line-processing functions.
 ///
 /// Compiled *only* under cargo-fuzz's `--cfg fuzzing` (never in a normal build,
@@ -3011,7 +3156,7 @@ pub mod fuzz {
 
     /// Wrapper over the crate-private [`super::filter_tags`]; a thin `pub fn`
     /// leaves the original's visibility unchanged (it is not re-exported).
-    pub fn filter_tags(line: &str, caps: AttachCaps) -> String {
+    pub fn filter_tags(line: &str, caps: AttachCaps) -> Option<String> {
         super::filter_tags(line, caps)
     }
 
@@ -3025,6 +3170,9 @@ async fn write_irc_session_snapshot<W>(
     write: &mut W,
     downstream: &mut IrcSessionState,
     snapshot: &IrcSessionSnapshot,
+    handle: &NetworkHandle,
+    caps: AttachCaps,
+    account: &str,
 ) -> std::io::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -3062,6 +3210,72 @@ where
         if !downstream.channels.contains_key(&casemap.casefold(channel)) {
             write
                 .write_all(format!(":{}!~bnc@e6irc JOIN {channel}\r\n", snapshot.nick).as_bytes())
+                .await?;
+            // This JOIN is synthesized because the real one aged out of the
+            // bounded replay. Complete the same registration shape a server
+            // sends for a real JOIN: optional MARKREAD before end-of-NAMES,
+            // then a minimal authoritative member list containing ourselves.
+            if caps.read_marker {
+                match handle.history() {
+                    Some(history) => match crate::db::get_bnc_read_marker(
+                        &history.pool,
+                        account,
+                        &history.network,
+                        channel,
+                    )
+                    .await
+                    {
+                        Ok(Some(timestamp)) => {
+                            write
+                                .write_all(
+                                    format!(":*bnc* MARKREAD {channel} timestamp={timestamp}\r\n")
+                                        .as_bytes(),
+                                )
+                                .await?;
+                        }
+                        Ok(None) => {
+                            write
+                                .write_all(format!(":*bnc* MARKREAD {channel} *\r\n").as_bytes())
+                                .await?;
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "bnc: read marker query failed for {account}/{}/{channel}: {error}",
+                                history.network
+                            );
+                            write
+                                .write_all(
+                                    b":*bnc* FAIL MARKREAD TEMPORARY_FAILURE :read markers unavailable\r\n",
+                                )
+                                .await?;
+                        }
+                    },
+                    None => {
+                        write
+                            .write_all(
+                                b":*bnc* FAIL MARKREAD UNAVAILABLE :read markers are not configured\r\n",
+                            )
+                            .await?;
+                    }
+                }
+            }
+            write
+                .write_all(
+                    format!(
+                        ":*bnc* 353 {} = {channel} :{}\r\n",
+                        snapshot.nick, snapshot.nick
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            write
+                .write_all(
+                    format!(
+                        ":*bnc* 366 {} {channel} :End of /NAMES list\r\n",
+                        snapshot.nick
+                    )
+                    .as_bytes(),
+                )
                 .await?;
         }
     }
@@ -3880,6 +4094,14 @@ mod tests {
             output.contains(":upstreamNick!~bnc@e6irc JOIN #current\r\n"),
             "{output}"
         );
+        assert!(
+            output.contains(":*bnc* 353 upstreamNick = #current :upstreamNick\r\n"),
+            "synthetic JOIN must include a usable NAMES snapshot: {output}"
+        );
+        assert!(
+            output.contains(":*bnc* 366 upstreamNick #current :End of /NAMES list\r\n"),
+            "synthetic JOIN must terminate NAMES: {output}"
+        );
         ends.begin_irc_session("upstreamNick2".to_string());
         let count =
             tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut bytes))
@@ -3899,6 +4121,58 @@ mod tests {
         attach.await.expect("attach task").expect("attach result");
     }
 
+    #[tokio::test]
+    async fn registered_attach_keeps_cap_and_sasl_off_the_shared_upstream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let (handle, mut ends) = NetworkHandle::channels(4);
+        ends.begin_irc_session("alice".to_string());
+        let attach = tokio::spawn(async move {
+            attach(server, &handle, AttachCaps::default(), "alice", "alice").await
+        });
+
+        let mut bytes = vec![0; 4096];
+        tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut bytes))
+            .await
+            .expect("initial attach output")
+            .expect("read initial attach output");
+
+        client
+            .write_all(b"CAP REQ :message-tags\r\n")
+            .await
+            .expect("write CAP request");
+        let count =
+            tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut bytes))
+                .await
+                .expect("CAP reply")
+                .expect("read CAP reply");
+        let output = String::from_utf8_lossy(&bytes[..count]);
+        assert!(
+            output.contains(":*bnc* CAP alice ACK :message-tags\r\n"),
+            "{output}"
+        );
+
+        client
+            .write_all(b"AUTHENTICATE PLAIN\r\n")
+            .await
+            .expect("write repeated SASL");
+        let count =
+            tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut bytes))
+                .await
+                .expect("SASL reply")
+                .expect("read SASL reply");
+        let output = String::from_utf8_lossy(&bytes[..count]);
+        assert!(output.contains(" 907 alice :"), "{output}");
+        assert!(matches!(
+            ends.commands.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        drop(client);
+        attach.await.expect("attach task").expect("attach result");
+    }
+
     #[test]
     fn filter_tags_surfaces_a_malformed_tag_only_line() {
         // A hostile upstream can store a line that is a leading `@` with no
@@ -3909,7 +4183,7 @@ mod tests {
         let notice = ":*bnc* NOTICE * :upstream line omitted: malformed IRC message";
         assert_eq!(
             filter_tags("@time=x;msgid=1", AttachCaps::default()),
-            notice
+            Some(notice.into())
         );
         assert_eq!(
             filter_tags(
@@ -3919,12 +4193,12 @@ mod tests {
                     ..AttachCaps::default()
                 }
             ),
-            notice
+            Some(notice.into())
         );
         // A well-formed line (tags then a space then a body) is unaffected.
         assert_eq!(
             filter_tags("@time=x PRIVMSG #c :hi", AttachCaps::default()),
-            "PRIVMSG #c :hi"
+            Some("PRIVMSG #c :hi".into())
         );
     }
 
@@ -3963,7 +4237,7 @@ mod tests {
         let line = "@time=2020-01-01T00:00:00.000Z;account=alice;msgid=abc :n!u@h PRIVMSG #c :hi";
         // No caps: every tag is stripped, the tag section disappears entirely.
         let none = filter_tags(line, AttachCaps::default());
-        assert_eq!(none, ":n!u@h PRIVMSG #c :hi");
+        assert_eq!(none.as_deref(), Some(":n!u@h PRIVMSG #c :hi"));
         // server-time only keeps `time=`, drops account/msgid.
         let st = filter_tags(
             line,
@@ -3972,7 +4246,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(st, "@time=2020-01-01T00:00:00.000Z :n!u@h PRIVMSG #c :hi");
+        assert_eq!(
+            st.as_deref(),
+            Some("@time=2020-01-01T00:00:00.000Z :n!u@h PRIVMSG #c :hi")
+        );
         // account-tag only keeps `account=`.
         let at = filter_tags(
             line,
@@ -3981,7 +4258,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(at, "@account=alice :n!u@h PRIVMSG #c :hi");
+        assert_eq!(at.as_deref(), Some("@account=alice :n!u@h PRIVMSG #c :hi"));
         // message-tags gates everything else (msgid) but not time/account.
         let mt = filter_tags(
             line,
@@ -3990,7 +4267,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(mt, "@msgid=abc :n!u@h PRIVMSG #c :hi");
+        assert_eq!(mt.as_deref(), Some("@msgid=abc :n!u@h PRIVMSG #c :hi"));
         // All three: full line preserved in original tag order.
         let all = filter_tags(
             line,
@@ -4001,10 +4278,18 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(all, line);
+        assert_eq!(all.as_deref(), Some(line));
         // A line without a tag section is returned unchanged.
         let bare = ":n!u@h PRIVMSG #c :hi";
-        assert_eq!(filter_tags(bare, AttachCaps::default()), bare);
+        assert_eq!(
+            filter_tags(bare, AttachCaps::default()).as_deref(),
+            Some(bare)
+        );
+        assert_eq!(
+            filter_tags("@+typing=active :n!u@h TAGMSG #c", AttachCaps::default()),
+            None,
+            "TAGMSG itself is gated by message-tags"
+        );
     }
 
     #[test]

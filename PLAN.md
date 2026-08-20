@@ -67,10 +67,11 @@ be overwritten by an older queued transition, and a recovered connection does
 not serialize its historical failure into an invalid connected event. Browser
 startup consumes that socket replay once; later history merges only stable
 message identifiers and exact ordered wire overlap, and retains the requested
-page ahead of a full live window under an expanded finite bound. Raw attach registration
-uses the actual upstream nick, malformed downstream/browser composer lines fail
-loudly, CHATHISTORY requires batching, and SASL PLAIN cannot request a different
-authorization identity. Synthesized echoes preserve validated client-only tags
+page ahead of a full live window under an expanded finite bound. Raw attach
+registration uses the actual upstream nick, malformed downstream/browser
+composer lines fail loudly, and SASL PLAIN cannot request a different
+authorization identity. CHATHISTORY works with or without negotiated batching;
+every replay tag remains independently capability-gated. Synthesized echoes preserve validated client-only tags
 but mint their own timestamp provenance and fit the added identity prefix into
 the traditional IRC wire allowance. The shared driver-command boundary rejects
 malformed, injected, and over-budget lines regardless of which attach frontend
@@ -79,12 +80,15 @@ payload constants; overlong chunks reset cleanly for retry, exact chunks require
 the terminating `+`, and malformed completed exchanges spend the same permanent
 per-connection authentication budget as valid-shaped attempts. A successful
 exchange fixes the connection's account; a second receives 907 rather than
-replacing it. External-network history stores
+replacing it. Database-unavailable verification is reported as retryable rather
+than as bad credentials. External-network history stores
 both direct-message directions under one RFC1459-folded peer, validates its
 metadata, and implements the complete LATEST/BEFORE/AFTER/AROUND/BETWEEN plus
-two-bound TARGETS surface through one tested window resolver. The browser
-removes stale channel buffers from the session snapshot and routes server
-notices to the server buffer rather than creating phantom direct messages.
+two-bound TARGETS surface through one tested window resolver. Raw snapshot
+reconciliation completes synthetic JOINs with NAMES and places a negotiated
+read marker before end-of-NAMES. The browser marks stale snapshot channels as
+past while retaining their transcript, and routes server notices to the server
+buffer rather than creating phantom direct messages.
 One live/history routing policy maps STATUSMSG `@#channel` and `+#channel`
 traffic to the underlying channel. Composer commands with missing targets or
 required operands fail as correlated, retryable errors instead of becoming a

@@ -951,7 +951,12 @@ Principal tables (columns abridged):
 - `bnc_read_markers` (account_id, network, target, timestamp) — per-account,
   per-BNC-network read position, the source for `draft/read-marker` on the
   attach listener. Distinct from `read_markers` below, which tracks the
-  core's local-server targets.
+  core's local-server targets. Writes take an account-scoped transaction lock,
+  increase monotonically, and admit at most 256 targets per account even under
+  concurrent inserts. The committed value is acknowledged and fanned out only
+  to other read-marker-capable attachments of the same account. Deleting a BNC
+  network deletes its markers, so recreating the same name cannot inherit stale
+  read state.
 - `read_markers` (account_id, target, marker_ts) — per-account read
   position, the source for `draft/read-marker`. Updates are monotonic
   (`GREATEST`) and the returned committed value drives the core mirror and
@@ -1400,13 +1405,18 @@ above the trait, provides for every network kind:
   the newest rows *after* its selector; reverse BETWEEN limits from its first
   endpoint; TARGETS uses the dedicated `draft/chathistory-targets` batch.
   Stored timestamps are validated and canonicalized before they become sort
-  keys, and replay emits that same canonical `time=` value. CHATHISTORY refuses
-  service without the required `batch` capability instead of emitting an
-  unbatched success.
+  keys, and replay emits that same canonical `time=` value. `batch` is optional:
+  a client that negotiated it receives the applicable batch envelope and tags;
+  otherwise the same bounded page is emitted directly. `message-tags`,
+  `server-time`, and `account-tag` independently gate their own replay metadata.
 - **Authoritative attach state**: replay is followed by an
   `IrcSessionSnapshot` containing the current upstream nick and confirmed
   memberships. Raw clients receive the NICK/JOIN/PART reconciliation needed to
-  reach it; `/ws/ui` sends the typed snapshot before its replay boundary.
+  reach it. A synthesized JOIN includes a minimal NAMES reply, with the
+  account's MARKREAD position before end-of-NAMES when negotiated. `/ws/ui`
+  sends the typed snapshot before its replay boundary; the browser separates
+  current membership from transcript retention, so reconnect reconciliation
+  marks a past channel instead of erasing its visible messages.
 - **Operations**: `NetworkHandle` owns a typed lifecycle snapshot plus
   connection attempts/errors, connect latency, attached-client count,
   line/byte traffic, last-activity times, and buffer occupancy. Driver endpoints

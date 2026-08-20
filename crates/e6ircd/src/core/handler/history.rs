@@ -130,15 +130,11 @@ pub(super) fn chathistory_fail(
 /// been evicted, a request that reaches older than the ring is resolved
 /// against the `messages` table by composite `(ts, id)` position.
 pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    let caps = state.reply_caps(conn);
-    if !caps.batch || !caps.chathistory {
-        chathistory_fail(
-            state,
-            conn,
-            "NEED_CAPS",
-            &[],
-            "batch and draft/chathistory required",
-        );
+    let Some(caps) = state.reply_caps(conn) else {
+        return;
+    };
+    if !caps.chathistory {
+        chathistory_fail(state, conn, "NEED_CAPS", &[], "draft/chathistory required");
         return;
     }
     // TARGETS enumerates buffers, not a single channel — handle it before
@@ -350,6 +346,7 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
         .and_then(|k| state.channels.get(&k).map(|c| c.name.clone()))
         .unwrap_or_else(|| crate::core::handler::clip_echo(target).to_string());
     let batch_ref = state.next_msgid();
+    let response_caps = crate::core::HistoryResponseCaps::from(caps);
 
     // Ring miss with a database available: page from PostgreSQL instead,
     // preserving one code path for rendering (history_page).
@@ -422,6 +419,7 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
             targets: history_targets,
             display: display.clone(),
             batch_ref,
+            caps: response_caps,
             query,
             label,
         };
@@ -466,7 +464,15 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
     // Ring path runs under labeled-response capture; frame_labeled applies the
     // label, so history_page must not (pass None). The ring read cannot fail,
     // so the page is always `Ok`.
-    history_page(state, conn, &display, &batch_ref, Ok(rows), None);
+    history_page(
+        state,
+        conn,
+        &display,
+        &batch_ref,
+        response_caps,
+        Ok(rows),
+        None,
+    );
 }
 
 pub(super) fn history_on_owner(
@@ -480,20 +486,9 @@ pub(super) fn history_on_owner(
     };
     let key = state.chan_key(&target);
     assert_eq!(owner.key(), &key, "CHATHISTORY owner does not match target");
-    debug_assert!(
-        state.capture.is_none(),
-        "channel owner must not have a capture"
-    );
-    state.capture = Some(crate::core::state::Capture {
-        conn: actor.recipient.conn(),
-        lines: Vec::new(),
-        reply_target: Some(actor.identity.nick),
-        reply_caps: Some(actor.recipient.caps()),
-        label,
-        deferred: false,
-    });
+    let conn = super::begin_channel_capture(state, &actor, label);
     let parameters: Vec<&str> = request.parameters.iter().map(String::as_str).collect();
-    cmd_chathistory(state, actor.recipient.conn(), &parameters);
+    cmd_chathistory(state, conn, &parameters);
     let capture = state.capture.take().expect("CHATHISTORY capture installed");
     if capture.lines.is_empty() {
         crate::core::state::ChannelHistoryResult::Deferred
@@ -533,6 +528,9 @@ pub(super) fn dm_correspondent(key: &crate::core::state::HistoryKey, me: &str) -
 /// source is PostgreSQL, with the hot rings answering when no database is
 /// configured. Ordered oldest-activity-first, so a limit keeps the oldest.
 pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    let Some(caps) = state.reply_caps(conn) else {
+        return;
+    };
     if p.len() != 4 {
         chathistory_fail(
             state,
@@ -580,6 +578,7 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
         state.sessions[&conn].channels.iter().cloned().collect();
     let me = state.conn_identity(conn);
     let batch_ref = state.next_msgid();
+    let response_caps = crate::core::HistoryResponseCaps::from(caps);
 
     if state.config.sasl_enabled {
         let channels = keys.iter().map(|k| k.as_str().to_string()).collect();
@@ -593,6 +592,7 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
             max_ts,
             limit,
             batch_ref,
+            caps: response_caps,
             label,
         };
         if state.db_tx.try_push(request).is_err() {
@@ -657,7 +657,7 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
     targets.truncate(limit);
     // No-DB path runs under labeled-response capture; frame_labeled applies it.
     // The ring enumeration cannot fail, so the page is always `Ok`.
-    targets_page(state, conn, &batch_ref, Ok(targets), None);
+    targets_page(state, conn, &batch_ref, response_caps, Ok(targets), None);
 }
 
 /// Prefix a line with the `@label` tag when a label is in flight on the async
@@ -666,6 +666,46 @@ fn with_label(label: Option<&str>, line: String) -> String {
     match label {
         Some(label) => format!("@label={label} {line}"),
         None => line,
+    }
+}
+
+/// Build the message-tag prefix for one history row from the capabilities the
+/// requester actually negotiated. Every tag family, including `batch`, is
+/// independently gated by its own capability.
+fn history_tag_prefix(
+    batch_ref: Option<&str>,
+    msgid: Option<&str>,
+    time: Option<&str>,
+    account: Option<&str>,
+    bot: bool,
+    extra: Option<&str>,
+) -> String {
+    let mut tags = Vec::new();
+    if let Some(batch_ref) = batch_ref {
+        tags.push(format!("batch={batch_ref}"));
+    }
+    if let Some(msgid) = msgid {
+        tags.push(format!("msgid={msgid}"));
+    }
+    if let Some(time) = time {
+        tags.push(format!("time={time}"));
+    }
+    if let Some(account) = account {
+        tags.push(format!(
+            "account={}",
+            e6irc_proto::message::escape_tag_value(account)
+        ));
+    }
+    if bot {
+        tags.push("bot".to_string());
+    }
+    if let Some(extra) = extra {
+        tags.push(extra.to_string());
+    }
+    if tags.is_empty() {
+        String::new()
+    } else {
+        format!("@{} ", tags.join(";"))
     }
 }
 
@@ -696,6 +736,7 @@ pub(crate) fn targets_page(
     state: &mut ServerState,
     conn: ConnId,
     batch_ref: &str,
+    caps: crate::core::HistoryResponseCaps,
     targets: Result<Vec<(String, e6irc_proto::time::Millis)>, ()>,
     label: Option<&str>,
 ) {
@@ -710,11 +751,13 @@ pub(crate) fn targets_page(
     // synchronous labeled-response capture), so it labels its own BATCH open;
     // the in-memory path runs under capture with `None` and is framed by
     // frame_labeled instead — mirroring history_page.
-    let open = with_label(
-        label,
-        format!(":{server} BATCH +{batch_ref} draft/chathistory-targets"),
-    );
-    state.send(conn, &open);
+    if caps.batch {
+        let open = with_label(
+            label,
+            format!(":{server} BATCH +{batch_ref} draft/chathistory-targets"),
+        );
+        state.send(conn, &open);
+    }
     for (target, ts) in targets {
         // A channel target: prefer its live display name. Anything else is a DM
         // correspondent stored as an *identity* (`~nick` or a folded account) —
@@ -733,12 +776,19 @@ pub(crate) fn targets_page(
         // conversation key derived from identities, so clip it to keep this
         // line inside the wire limit regardless of how it was produced.
         let display = crate::core::handler::clip_echo(&display);
+        let prefix = if caps.batch {
+            format!("@batch={batch_ref} ")
+        } else {
+            String::new()
+        };
         state.send(
             conn,
-            &format!("@batch={batch_ref} :{server} CHATHISTORY TARGETS {display} {time}"),
+            &format!("{prefix}:{server} CHATHISTORY TARGETS {display} {time}"),
         );
     }
-    state.send(conn, &format!(":{server} BATCH -{batch_ref}"));
+    if caps.batch {
+        state.send(conn, &format!(":{server} BATCH -{batch_ref}"));
+    }
 }
 
 /// Resolve a CHATHISTORY request against the in-memory ring, purely.
@@ -912,9 +962,21 @@ pub(crate) fn history_page(
     conn: ConnId,
     display: &str,
     batch_ref: &str,
+    caps: crate::core::HistoryResponseCaps,
     rows: Result<Vec<crate::core::HistoryRow>, ()>,
     label: Option<&str>,
 ) {
+    // A disconnected client can leave a DB reply in flight. A synchronous
+    // cross-shard render has no local session either, but it does have the
+    // channel-owner capture that carries its reply destination.
+    if !state.sessions.contains_key(&conn)
+        && !state
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.conn == conn)
+    {
+        return;
+    }
     // The normal command path clips the requested display before it reaches
     // this renderer, but the asynchronous reply is also an input boundary:
     // database recovery and the core fuzzer can supply it directly. Keep the
@@ -939,11 +1001,13 @@ pub(crate) fn history_page(
         }
     };
     let server = state.config.server_name.clone();
-    let open = with_label(
-        label,
-        format!(":{server} BATCH +{batch_ref} chathistory {display}"),
-    );
-    state.send(conn, &open);
+    if caps.batch {
+        let open = with_label(
+            label,
+            format!(":{server} BATCH +{batch_ref} chathistory {display}"),
+        );
+        state.send(conn, &open);
+    }
     // A channel message was addressed to the channel, so every replayed row
     // carries the same target. A direct message was addressed to a *person*,
     // and a conversation holds both directions — so each row is re-addressed
@@ -971,56 +1035,31 @@ pub(crate) fn history_page(
             let peer = state.display_nick(&state.casemap.casefold(display));
             (me, my_identity, peer)
         });
-    // `time=` and `msgid=` are emitted on every replayed line UNCONDITIONALLY,
-    // unlike `account`/`bot` below which are gated on the requester's caps. This
-    // is deliberate, not an oversight: a CHATHISTORY reply is meaningless without
-    // per-message timestamps and ids (a client pages and de-duplicates by them),
-    // the `batch`+`draft/chathistory` caps this command requires are defined on
-    // top of the message-tags framework, and other servers do the same. `account`
-    // and `bot` are attribution a capless client simply wouldn't have negotiated
-    // to see live, so replay mirrors that per-cap gating for them specifically.
-    //
     // account-tag: live delivery stamps `account=` on a message from an
     // identified sender for a recipient that negotiated the cap, so a replay
     // must too — otherwise the replayed line loses the sender-account
     // attribution the live one carried, breaking this function's own
     // byte-identical-to-live invariant. The requester's cap is constant across
     // rows; the per-row account comes from the stored `sender_account`.
-    let want_account_tag = state
-        .sessions
-        .get(&conn)
-        .is_some_and(|s| s.caps.account_tag);
+    let want_account_tag = caps.account_tag;
+    let want_message_tags = caps.message_tags;
+    let want_server_time = caps.server_time;
     // `bot`: live delivery stamps it for message-tags recipients when the sender
     // was a bot, so replay must too (same byte-identical invariant).
-    let want_bot_tag = state
-        .sessions
-        .get(&conn)
-        .is_some_and(|s| s.caps.message_tags);
+    let want_bot_tag = want_message_tags;
     // A multiline row is reconstructed as the whole message it was: a nested
     // draft/multiline batch for a requester that negotiated the capability (as
     // live delivery would send it), or the same flattened lines otherwise. The
     // concat tag rides only when message-tags was negotiated, exactly as live.
-    let want_multiline_batch = state
-        .sessions
-        .get(&conn)
-        .is_some_and(|s| s.caps.multiline && s.caps.batch);
-    let want_message_tags = want_bot_tag;
+    let want_multiline_batch = caps.multiline && caps.batch;
     for row in rows {
         let time = e6irc_proto::time::server_time(row.ts);
-        let bot_tag = if want_bot_tag && row.sender_is_bot {
-            ";bot"
-        } else {
-            ""
-        };
-        let account_tag = match (want_account_tag, &row.sender_account) {
-            (true, Some(account)) => {
-                format!(
-                    ";account={}",
-                    e6irc_proto::message::escape_tag_value(account)
-                )
-            }
-            _ => String::new(),
-        };
+        let tagged_time = want_server_time.then_some(time.as_str());
+        let tagged_msgid = want_message_tags.then_some(row.msgid.as_str());
+        let tagged_account = want_account_tag
+            .then_some(row.sender_account.as_deref())
+            .flatten();
+        let tagged_bot = want_bot_tag && row.sender_is_bot;
         let target = match &dm {
             Some((me, my_identity, peer)) => {
                 // Derive the row sender's identity the same way `conn_identity`
@@ -1066,24 +1105,34 @@ pub(crate) fn history_page(
                 state.send(
                     conn,
                     &format!(
-                        "@batch={batch_ref};msgid={};time={time}{account_tag}{bot_tag} \
-                         :{} BATCH +{inner_ref} {} {target}",
-                        row.msgid,
+                        "{}:{} BATCH +{inner_ref} {} {target}",
+                        history_tag_prefix(
+                            Some(batch_ref),
+                            tagged_msgid,
+                            tagged_time,
+                            tagged_account,
+                            tagged_bot,
+                            None,
+                        ),
                         row.sender_prefix,
                         super::message::MULTILINE_CAP,
                     ),
                 );
                 for (text, concat) in &lines {
-                    let concat_tag = if *concat && want_message_tags {
-                        format!(";{}", super::message::MULTILINE_CONCAT_TAG)
-                    } else {
-                        String::new()
-                    };
+                    let concat_tag = (*concat && want_message_tags)
+                        .then_some(super::message::MULTILINE_CONCAT_TAG);
                     state.send(
                         conn,
                         &format!(
-                            "@batch={inner_ref}{concat_tag};time={time}{account_tag}{bot_tag} \
-                             :{} {verb} {target} :{text}",
+                            "{}:{} {verb} {target} :{text}",
+                            history_tag_prefix(
+                                Some(&inner_ref),
+                                None,
+                                tagged_time,
+                                tagged_account,
+                                tagged_bot,
+                                concat_tag,
+                            ),
                             row.sender_prefix,
                         ),
                     );
@@ -1100,14 +1149,20 @@ pub(crate) fn history_page(
                 for (text, _) in lines.iter().filter(|(t, _)| !t.is_empty()) {
                     let head = format!(":{} {verb} {target} :", row.sender_prefix);
                     let body = crate::core::handler::fit_trailing(&head, text);
-                    let msgid_tag = if first {
-                        format!(";msgid={}", row.msgid)
-                    } else {
-                        String::new()
-                    };
+                    let msgid = (first && want_message_tags).then_some(row.msgid.as_str());
                     state.send(
                         conn,
-                        &format!("@batch={batch_ref}{msgid_tag};time={time}{account_tag}{bot_tag} {head}{body}"),
+                        &format!(
+                            "{}{head}{body}",
+                            history_tag_prefix(
+                                caps.batch.then_some(batch_ref),
+                                msgid,
+                                tagged_time,
+                                tagged_account,
+                                tagged_bot,
+                                None,
+                            )
+                        ),
                     );
                     first = false;
                 }
@@ -1117,12 +1172,21 @@ pub(crate) fn history_page(
         let head = format!(":{} {verb} {target} :", row.sender_prefix);
         let body = crate::core::handler::fit_trailing(&head, &row.body);
         let line = format!(
-            "@batch={batch_ref};msgid={};time={time}{account_tag}{bot_tag} {head}{body}",
-            row.msgid,
+            "{}{head}{body}",
+            history_tag_prefix(
+                caps.batch.then_some(batch_ref),
+                tagged_msgid,
+                tagged_time,
+                tagged_account,
+                tagged_bot,
+                None,
+            )
         );
         state.send(conn, &line);
     }
-    state.send(conn, &format!(":{server} BATCH -{batch_ref}"));
+    if caps.batch {
+        state.send(conn, &format!(":{server} BATCH -{batch_ref}"));
+    }
 }
 
 #[cfg(test)]

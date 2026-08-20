@@ -395,6 +395,10 @@ pub(super) async fn ws_ui_conn(
                         break;
                     }
                 }
+                // Browser chat does not negotiate the raw IRC read-marker
+                // capability; account-scoped marker fanout belongs only to
+                // authenticated raw attaches that opted into it.
+                Ok(DriverEvent::ReadMarker { .. }) => {}
                 Err(RecvError::Lagged(n)) => {
                     let notice = format!(":*bnc* NOTICE * :{n} line(s) skipped (slow connection)");
                     if socket

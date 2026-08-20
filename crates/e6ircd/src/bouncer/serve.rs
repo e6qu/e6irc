@@ -465,7 +465,16 @@ where
         })) => (account, network, requested_nick, caps),
         Ok(Ok(Registered::Closed)) => return Ok(()),
         Ok(Err(e)) => return Err(e),
-        Err(_) => return Ok(()), // handshake timed out
+        Err(_) => {
+            write
+                .write_all(
+                    format!(":{server_name} ERROR :Closing Link: BNC registration timed out\r\n")
+                        .as_bytes(),
+                )
+                .await?;
+            write.flush().await?;
+            return Ok(());
+        }
     };
 
     // Resolve the target network without silently substituting one for another:
@@ -535,6 +544,12 @@ where
     for line in [
         format!(
             ":{server_name} 001 {downstream_nick} :Welcome to e6irc BNC, attached to '{network}'"
+        ),
+        format!(
+            ":{server_name} 005 {downstream_nick} CASEMAPPING=rfc1459 CHANTYPES=#& \
+             CHANNELLEN=64 NICKLEN=30 PREFIX=(qaohv)~&@%+ CHATHISTORY={} \
+             MSGREFTYPES=timestamp,msgid :are supported by this server",
+            super::chathistory::CHATHISTORY_LIMIT_MAX,
         ),
         format!(":{server_name} 422 {downstream_nick} :MOTD is on the upstream network"),
     ] {
@@ -650,7 +665,16 @@ where
                 }
                 "CAP" => {
                     cap_open = true;
-                    handle_cap(write, server_name, &msg, &mut cap_open, &mut caps).await?;
+                    handle_cap(
+                        write,
+                        server_name,
+                        "*",
+                        &msg,
+                        false,
+                        &mut cap_open,
+                        &mut caps,
+                    )
+                    .await?;
                 }
                 "AUTHENTICATE" => {
                     if msg.params.len() != 1 {
@@ -734,6 +758,16 @@ where
                                             "bnc: SASL authentication failed on the attach listener"
                                         );
                                         reject_sasl(write, server_name).await?;
+                                    }
+                                    PlainVerification::Unavailable => {
+                                        write
+                                            .write_all(
+                                                format!(
+                                                    ":{server_name} 904 * :SASL authentication temporarily unavailable\r\n"
+                                                )
+                                                .as_bytes(),
+                                            )
+                                            .await?;
                                     }
                                     PlainVerification::Accepted(acct) => {
                                         write
@@ -955,8 +989,8 @@ fn cap_names(caps: Option<super::AttachCaps>) -> String {
         .join(" ")
 }
 
-fn cap_reply(server_name: &str, verb: &str, request: &str) -> (bool, String) {
-    let head = format!(":{server_name} CAP * {verb} :");
+fn cap_reply(server_name: &str, target: &str, verb: &str, request: &str) -> (bool, String) {
+    let head = format!(":{server_name} CAP {target} {verb} :");
     let budget = e6irc_proto::message::MAX_LINE_LEN - 2 - head.len();
     let fitted = request
         .char_indices()
@@ -967,10 +1001,12 @@ fn cap_reply(server_name: &str, verb: &str, request: &str) -> (bool, String) {
 }
 
 /// Answer a CAP command during BNC attach negotiation.
-async fn handle_cap<W>(
+pub(super) async fn handle_cap<W>(
     write: &mut W,
     server_name: &str,
+    target: &str,
     msg: &Message<'_>,
+    registered: bool,
     cap_open: &mut bool,
     caps: &mut super::AttachCaps,
 ) -> std::io::Result<()>
@@ -985,13 +1021,19 @@ where
     {
         Some("LS") => {
             write
-                .write_all(format!(":{server_name} CAP * LS :{}\r\n", cap_names(None)).as_bytes())
+                .write_all(
+                    format!(":{server_name} CAP {target} LS :{}\r\n", cap_names(None)).as_bytes(),
+                )
                 .await?;
         }
         Some("LIST") => {
             write
                 .write_all(
-                    format!(":{server_name} CAP * LIST :{}\r\n", cap_names(Some(*caps))).as_bytes(),
+                    format!(
+                        ":{server_name} CAP {target} LIST :{}\r\n",
+                        cap_names(Some(*caps))
+                    )
+                    .as_bytes(),
                 )
                 .await?;
         }
@@ -1008,23 +1050,24 @@ where
                         }
                         None => false,
                     });
-            let (fits, ack) = cap_reply(server_name, "ACK", req);
+            let (fits, ack) = cap_reply(server_name, target, "ACK", req);
             if all_known && fits {
                 *caps = requested;
             }
             let reply = if all_known && fits {
                 ack
             } else {
-                cap_reply(server_name, "NAK", req).1
+                cap_reply(server_name, target, "NAK", req).1
             };
             write.write_all(reply.as_bytes()).await?;
         }
-        Some("END") => *cap_open = false,
+        Some("END") if !registered => *cap_open = false,
+        Some("END") => {}
         invalid => {
             let subcommand = invalid.map(attach_reply_token).unwrap_or("*");
             write
                 .write_all(
-                    format!(":{server_name} 410 * {subcommand} :Invalid CAP subcommand\r\n")
+                    format!(":{server_name} 410 {target} {subcommand} :Invalid CAP subcommand\r\n")
                         .as_bytes(),
                 )
                 .await?;
@@ -1047,6 +1090,7 @@ where
 enum PlainVerification {
     Accepted(String),
     Rejected,
+    Unavailable,
     AttemptsExhausted,
 }
 
@@ -1058,38 +1102,20 @@ async fn verify_plain(
     if !attempts.consume() {
         return PlainVerification::AttemptsExhausted;
     }
-    let Some(raw) = e6irc_proto::base64::decode(payload) else {
-        return PlainVerification::Rejected;
-    };
-    let Some((authcid, passwd)) = plain_credentials(&raw) else {
+    let Some(credentials) = e6irc_proto::sasl::parse_plain_payload(payload) else {
         return PlainVerification::Rejected;
     };
     // A DB failure is not an auth rejection (verify_credentials' contract):
     // fail closed, but surface the error instead of silently masking it as a
     // bad password.
-    match crate::db::verify_credentials(pool, authcid, passwd).await {
+    match crate::db::verify_credentials(pool, &credentials.account, &credentials.password).await {
         Ok(Some(name)) => PlainVerification::Accepted(name),
         Ok(None) => PlainVerification::Rejected,
         Err(e) => {
             eprintln!("bnc: credential check failed (database error): {e}");
-            PlainVerification::Rejected
+            PlainVerification::Unavailable
         }
     }
-}
-
-fn plain_credentials(raw: &[u8]) -> Option<(&str, &str)> {
-    let mut parts = raw.split(|&byte| byte == 0);
-    let authzid = std::str::from_utf8(parts.next()?).ok()?;
-    let authcid = std::str::from_utf8(parts.next()?).ok()?;
-    let passwd = std::str::from_utf8(parts.next()?).ok()?;
-    if parts.next().is_some()
-        || authcid.is_empty()
-        || passwd.is_empty()
-        || (!authzid.is_empty() && !e6irc_proto::casemap::CaseMapping::Rfc1459.eq(authzid, authcid))
-    {
-        return None;
-    }
-    Some((authcid, passwd))
 }
 
 #[cfg(test)]
@@ -1113,32 +1139,11 @@ mod cap_tests {
     }
 
     #[test]
-    fn sasl_plain_cannot_authorize_as_a_different_identity() {
-        assert_eq!(
-            plain_credentials(b"\0alice\0secret"),
-            Some(("alice", "secret"))
-        );
-        assert_eq!(
-            plain_credentials(b"ALICE\0alice\0secret"),
-            Some(("alice", "secret")),
-            "the same RFC1459 identity is permitted in authzid"
-        );
-        for invalid in [
-            b"bob\0alice\0secret".as_slice(),
-            b"\0\0secret".as_slice(),
-            b"\0alice\0".as_slice(),
-            b"\0alice\0secret\0extra".as_slice(),
-        ] {
-            assert_eq!(plain_credentials(invalid), None, "{invalid:?}");
-        }
-    }
-
-    #[test]
     fn cap_reply_never_exceeds_the_wire_limit() {
         let request = std::iter::repeat_n("server-time", 80)
             .collect::<Vec<_>>()
             .join(" ");
-        let (fits, reply) = cap_reply("bnc.example", "ACK", &request);
+        let (fits, reply) = cap_reply("bnc.example", "*", "ACK", &request);
         assert!(!fits);
         assert!(reply.len() <= e6irc_proto::message::MAX_LINE_LEN);
     }
@@ -1152,16 +1157,26 @@ mod cap_tests {
         handle_cap(
             &mut server,
             "bnc.example",
+            "*",
             &request,
+            false,
             &mut cap_open,
             &mut caps,
         )
         .await
         .expect("CAP request reply");
         let list = Message::parse("CAP LIST").expect("CAP list");
-        handle_cap(&mut server, "bnc.example", &list, &mut cap_open, &mut caps)
-            .await
-            .expect("CAP list reply");
+        handle_cap(
+            &mut server,
+            "bnc.example",
+            "*",
+            &list,
+            false,
+            &mut cap_open,
+            &mut caps,
+        )
+        .await
+        .expect("CAP list reply");
         server.shutdown().await.expect("close server half");
 
         let mut replies = String::new();
@@ -1182,7 +1197,9 @@ mod cap_tests {
         handle_cap(
             &mut server,
             "bnc.example",
+            "*",
             &request,
+            false,
             &mut cap_open,
             &mut caps,
         )

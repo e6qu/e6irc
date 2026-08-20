@@ -12,7 +12,7 @@ use super::{AttachCaps, NetworkHandle, NetworkHistory};
 
 /// The largest page a client may ask for in one CHATHISTORY reply. Bounded so
 /// a hostile client cannot demand the whole 5000-line backlog in one write.
-const CHATHISTORY_LIMIT_MAX: i64 = 500;
+pub(super) const CHATHISTORY_LIMIT_MAX: i64 = 500;
 
 /// Serve a `CHATHISTORY` command from an attached client. `params` are the
 /// words after the command verb, case-preserved.
@@ -22,9 +22,6 @@ pub(crate) async fn handle_chathistory(
     caps: AttachCaps,
     params: &[&str],
 ) -> std::io::Result<()> {
-    if !caps.batch {
-        return fail(write, "NEED_CAPS", "batch and draft/chathistory required").await;
-    }
     let Some(sub) = params.first() else {
         return fail(write, "INVALID_PARAMS", "missing subcommand").await;
     };
@@ -46,6 +43,7 @@ pub(crate) async fn handle_markread(
     handle: &NetworkHandle,
     write: &mut (impl AsyncWrite + Unpin),
     account: &str,
+    origin: u64,
     params: &[&str],
 ) -> std::io::Result<()> {
     if params.len() > 2 {
@@ -60,7 +58,7 @@ pub(crate) async fn handle_markread(
     let Some(&target) = params.first() else {
         return fail_command(write, "MARKREAD", "INVALID_PARAMS", "missing target").await;
     };
-    if target != "*" && !valid_target(target) {
+    if !valid_target(target) {
         return fail_command(write, "MARKREAD", "INVALID_PARAMS", "invalid target").await;
     }
     let history = match handle.history() {
@@ -76,24 +74,11 @@ pub(crate) async fn handle_markread(
         }
     };
     let (network, pool) = (&history.network, &history.pool);
-    match (target, params.get(1)) {
-        // `MARKREAD *` queries every marker for this account/network.
-        ("*", None) => match crate::db::list_bnc_read_markers(pool, account, network).await {
-            Ok(rows) => {
-                for (t, ts) in rows {
-                    if !valid_target(&t) {
-                        eprintln!("bnc: invalid stored read marker target for {account}/{network}");
-                        return fail_command(
-                            write,
-                            "MARKREAD",
-                            "TEMPORARY_FAILURE",
-                            "stored read marker is invalid",
-                        )
-                        .await;
-                    }
-                    write_marker(write, &t, &ts).await?;
-                }
-            }
+    match params.get(1) {
+        // `MARKREAD <target>` queries one marker.
+        None => match crate::db::get_bnc_read_marker(pool, account, network, target).await {
+            Ok(Some(ts)) => write_marker(write, target, &ts).await?,
+            Ok(None) => write_marker(write, target, "*").await?,
             Err(e) => {
                 eprintln!("bnc: read marker query failed for {account}/{network}: {e}");
                 return fail_command(
@@ -105,35 +90,8 @@ pub(crate) async fn handle_markread(
                 .await;
             }
         },
-        // The spec forbids setting a position on the `*` query form.
-        ("*", Some(_)) => {
-            return fail_command(
-                write,
-                "MARKREAD",
-                "INVALID_PARAMS",
-                "target * does not take a timestamp",
-            )
-            .await;
-        }
-        // `MARKREAD <target>` queries one marker.
-        (target, None) => {
-            match crate::db::get_bnc_read_marker(pool, account, network, target).await {
-                Ok(Some(ts)) => write_marker(write, target, &ts).await?,
-                Ok(None) => write_marker(write, target, "*").await?,
-                Err(e) => {
-                    eprintln!("bnc: read marker query failed for {account}/{network}: {e}");
-                    return fail_command(
-                        write,
-                        "MARKREAD",
-                        "TEMPORARY_FAILURE",
-                        "read markers unavailable",
-                    )
-                    .await;
-                }
-            }
-        }
         // `MARKREAD <target> <timestamp>` sets the position and acknowledges.
-        (target, Some(raw)) => {
+        Some(raw) => {
             let timestamp = match normalize_timestamp(raw) {
                 Some(ts) => ts,
                 None => {
@@ -146,19 +104,33 @@ pub(crate) async fn handle_markread(
                     .await;
                 }
             };
-            if let Err(e) =
-                crate::db::set_bnc_read_marker(pool, account, network, target, &timestamp).await
-            {
-                eprintln!("bnc: read marker write failed for {account}/{network}: {e}");
-                return fail_command(
-                    write,
-                    "MARKREAD",
-                    "TEMPORARY_FAILURE",
-                    "read markers unavailable",
-                )
-                .await;
-            }
-            write_marker(write, target, &timestamp).await?;
+            let stored =
+                match crate::db::set_bnc_read_marker(pool, account, network, target, &timestamp)
+                    .await
+                {
+                    Ok(crate::db::BncReadMarkerWrite::Stored(stored)) => stored,
+                    Ok(crate::db::BncReadMarkerWrite::LimitReached) => {
+                        return fail_command(
+                            write,
+                            "MARKREAD",
+                            "INVALID_PARAMS",
+                            "too many read marker targets",
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        eprintln!("bnc: read marker write failed for {account}/{network}: {e}");
+                        return fail_command(
+                            write,
+                            "MARKREAD",
+                            "TEMPORARY_FAILURE",
+                            "read markers unavailable",
+                        )
+                        .await;
+                    }
+                };
+            write_marker(write, target, &stored).await?;
+            handle.publish_read_marker(account, target, &stored, origin);
         }
     }
     write.flush().await?;
@@ -406,10 +378,9 @@ async fn targets(
         Err(e) => return db_error(write, e).await,
     };
 
-    // TARGETS is itself batched; the inner lines carry the per-target newest
-    // timestamp so a client can resume each conversation from its end. A
-    // handler rejects a missing batch capability above, so this reply is always
-    // wrapped.
+    // The inner lines carry the per-target newest timestamp so a client can
+    // resume each conversation from its end. Clients that negotiated `batch`
+    // receive the specified wrapper; limited clients receive the lines directly.
     let inner: Vec<String> = rows
         .iter()
         .map(|(t, newest)| format!(":*bnc* CHATHISTORY TARGETS {t} {newest}\r\n"))
@@ -467,9 +438,9 @@ async fn reply_lines(
 ) -> std::io::Result<()> {
     let inner: Vec<String> = rows
         .iter()
-        .map(|row| {
-            let line = history_replay_line(row, caps);
-            format!("{line}\r\n")
+        .filter_map(|row| {
+            let line = history_replay_line(row, caps)?;
+            format!("{line}\r\n").into()
         })
         .collect();
     write_batch(write, caps.batch, HistoryBatch::Messages(target), &inner).await
@@ -480,16 +451,17 @@ async fn reply_lines(
 /// database used to order it. The upstream `time` tag is replaced, not
 /// duplicated; duplicate tag keys are forbidden and would make clients choose
 /// inconsistent values.
-fn history_replay_line(row: &crate::db::BncHistoryLine, caps: AttachCaps) -> String {
-    let filtered = super::filter_tags(&row.line, caps);
+fn history_replay_line(row: &crate::db::BncHistoryLine, caps: AttachCaps) -> Option<String> {
+    let filtered = super::filter_tags(&row.line, caps)?;
     if !caps.server_time {
-        return filtered;
+        return Some(filtered);
     }
     let without_time = remove_tag(&filtered, "time");
     match without_time.strip_prefix('@') {
         Some(rest) => format!("@time={};{rest}", row.sent_at),
         None => format!("@time={} {without_time}", row.sent_at),
     }
+    .into()
 }
 
 fn remove_tag(line: &str, key_to_remove: &str) -> String {
@@ -516,8 +488,13 @@ async fn write_marker(
     target: &str,
     timestamp: &str,
 ) -> std::io::Result<()> {
+    let marker = if timestamp == "*" {
+        "*".to_string()
+    } else {
+        format!("timestamp={timestamp}")
+    };
     write
-        .write_all(format!(":*bnc* MARKREAD {target} {timestamp}\r\n").as_bytes())
+        .write_all(format!(":*bnc* MARKREAD {target} {marker}\r\n").as_bytes())
         .await
 }
 
@@ -562,21 +539,20 @@ fn parse_limit(raw: &str) -> Option<i64> {
 }
 
 fn valid_target(target: &str) -> bool {
-    !target.is_empty()
-        && target.len() <= 64
-        && !target.starts_with(':')
-        && !target
-            .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'\0' | b','))
+    if target.starts_with(['#', '&']) {
+        return target.len() > 1
+            && target.len() <= 64
+            && !target.bytes().any(|byte| {
+                byte.is_ascii_whitespace() || matches!(byte, b'\0' | b',' | b':' | 0x07)
+            });
+    }
+    crate::sanitize::valid_nick(target, 30)
 }
 
-/// Normalize a MARKREAD timestamp: either a bare ISO-8601 instant or the
-/// `timestamp=`-prefixed form, validated before it is stored.
+/// Normalize a required `timestamp=` MARKREAD position before storage.
 fn normalize_timestamp(raw: &str) -> Option<String> {
-    let ts = raw.strip_prefix("timestamp=").unwrap_or(raw);
-    e6irc_proto::time::parse_server_time_millis(ts)
-        .is_some()
-        .then(|| ts.to_string())
+    let ts = raw.strip_prefix("timestamp=")?;
+    e6irc_proto::time::parse_server_time_millis(ts).map(e6irc_proto::time::server_time)
 }
 
 /// A process-wide counter minting distinct BATCH tags (the tag just has to be
@@ -602,10 +578,13 @@ mod tests {
             assert_eq!(parse_limit(invalid), None, "{invalid}");
         }
         assert!(valid_target("#room"));
+        assert!(valid_target("&local"));
         assert!(valid_target("SomeNick"));
         assert!(!valid_target(""));
         assert!(!valid_target(&"x".repeat(65)));
         assert!(!valid_target("bad,target"));
+        assert!(!valid_target("!!!"));
+        assert!(!valid_target("*"));
         assert!(matches!(
             HistorySelector::parse("msgid=opaque"),
             Ok(HistorySelector::Msgid(_))
@@ -621,7 +600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chathistory_refuses_an_unbatched_success() {
+    async fn chathistory_does_not_require_the_optional_batch_capability() {
         let (mut client, mut server) = tokio::io::duplex(1024);
         let (handle, _ends) = NetworkHandle::channels(4);
         handle_chathistory(
@@ -634,15 +613,12 @@ mod tests {
             &["LATEST", "#room", "*", "10"],
         )
         .await
-        .expect("write capability failure");
+        .expect("write history response");
         server.shutdown().await.expect("close server half");
         let mut reply = String::new();
         client.read_to_string(&mut reply).await.expect("read reply");
-        assert!(reply.contains("FAIL CHATHISTORY NEED_CAPS"), "{reply}");
-        assert!(
-            reply.contains("batch and draft/chathistory required"),
-            "{reply}"
-        );
+        assert!(reply.contains("FAIL CHATHISTORY UNAVAILABLE"), "{reply}");
+        assert!(!reply.contains("NEED_CAPS"), "{reply}");
     }
 
     #[test]
@@ -738,7 +714,8 @@ mod tests {
                 message_tags: true,
                 ..AttachCaps::default()
             },
-        );
+        )
+        .expect("PRIVMSG is visible with these caps");
         assert_eq!(
             line,
             "@time=2026-01-01T00:00:00.123Z;msgid=m1 :n PRIVMSG #room :message"
@@ -776,6 +753,7 @@ mod tests {
             &handle,
             &mut server,
             "alice",
+            0,
             &["#room", "timestamp=2026-01-01T00:00:00.000Z", "extra"],
         )
         .await
@@ -794,6 +772,17 @@ mod tests {
         assert!(
             !replies.contains("UNAVAILABLE"),
             "validation must precede storage"
+        );
+    }
+
+    #[test]
+    fn markread_requires_a_real_target_and_timestamp_selector() {
+        assert!(!valid_target("*"));
+        assert_eq!(normalize_timestamp("2026-01-01T00:00:00.000Z"), None);
+        assert_eq!(normalize_timestamp("timestamp=not-a-time"), None);
+        assert_eq!(
+            normalize_timestamp("timestamp=2026-01-01T00:00:00.1Z"),
+            Some("2026-01-01T00:00:00.100Z".into())
         );
     }
 }
