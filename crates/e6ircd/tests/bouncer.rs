@@ -1587,6 +1587,22 @@ async fn bnc_attach_with_history(
     client.send_line("CAP END").await.expect("CAP END");
     let welcome = client.next_message().await.unwrap().expect("001");
     assert_eq!(welcome.command, "001", "{welcome:?}");
+    let isupport = client.next_message().await.unwrap().expect("005");
+    assert_eq!(isupport.command, "005", "{isupport:?}");
+    assert!(
+        isupport
+            .params
+            .iter()
+            .any(|param| param == "CASEMAPPING=rfc1459"),
+        "{isupport:?}"
+    );
+    assert!(
+        isupport
+            .params
+            .iter()
+            .any(|param| param == "CHATHISTORY=500"),
+        "{isupport:?}"
+    );
     // End-of-MOTD numeric closes the registration burst.
     let motd = client.next_message().await.unwrap().expect("422");
     assert_eq!(motd.command, "422", "{motd:?}");

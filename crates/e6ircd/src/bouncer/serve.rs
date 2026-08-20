@@ -533,8 +533,8 @@ where
         }
     };
 
-    // Complete the client's registration burst (001 + end-of-MOTD) so it
-    // considers itself registered, then attach.
+    // Complete the client's registration burst (welcome, ISUPPORT, and
+    // end-of-MOTD) so it considers itself registered, then attach.
     // The attach selector is registration input, not the client's IRC
     // identity. Once the upstream session exists, 001 must name its actual nick
     // so clients classify the following JOIN/NICK traffic as their own.
