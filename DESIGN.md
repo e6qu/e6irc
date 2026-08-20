@@ -948,15 +948,15 @@ Principal tables (columns abridged):
   `BNC_TRIM_INTERVAL`. The count belongs to that task, not to the table's `id`
   sequence — one sequence is shared by every network, so triggering off it
   makes retention depend on the interleaving between them
-- `bnc_read_markers` (account_id, network, target, timestamp) — per-account,
-  per-BNC-network read position, the source for `draft/read-marker` on the
-  attach listener. Distinct from `read_markers` below, which tracks the
-  core's local-server targets. Writes take an account-scoped transaction lock,
-  increase monotonically, and admit at most 256 targets per account even under
-  concurrent inserts. The committed value is acknowledged and fanned out only
-  to other read-marker-capable attachments of the same account. Deleting a BNC
-  network deletes its markers, so recreating the same name cannot inherit stale
-  read state.
+- `bnc_read_markers` (BIGINT account_id, network, target, timestamp) —
+  per-account, per-BNC-network read position, the source for
+  `draft/read-marker` on the attach listener. Distinct from `read_markers`
+  below, which tracks the core's local-server targets. Writes lock the durable
+  account row in their transaction, increase monotonically, and admit at most
+  256 targets per account even under concurrent inserts. The committed value
+  is acknowledged and fanned out only to other read-marker-capable attachments
+  of the same account. Deleting a BNC network deletes its markers, so
+  recreating the same name cannot inherit stale read state.
 - `read_markers` (account_id, target, marker_ts) — per-account read
   position, the source for `draft/read-marker`. Updates are monotonic
   (`GREATEST`) and the returned committed value drives the core mirror and

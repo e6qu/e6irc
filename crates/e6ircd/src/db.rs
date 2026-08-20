@@ -5694,8 +5694,11 @@ pub async fn set_bnc_read_marker(
     let net_folded = CaseMapping::Rfc1459.casefold(network);
     let target_folded = CaseMapping::Rfc1459.casefold(target);
     let mut tx = pool.begin().await.map_err(DbError::Query)?;
-    let account_id: Option<i32> =
-        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1")
+    // Lock the durable account row while checking and consuming marker
+    // capacity. This both serializes concurrent writers for the same account
+    // and keeps the identifier at its schema-native BIGINT width.
+    let account_id: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR UPDATE")
             .bind(&folded)
             .fetch_optional(&mut *tx)
             .await
@@ -5703,14 +5706,8 @@ pub async fn set_bnc_read_marker(
     let Some(account_id) = account_id else {
         return Err(DbError::UnknownAccount(account.to_string()));
     };
-    // One transaction at a time may decide whether this account has room for
-    // a new target. Without the account-scoped lock, two attaches can both see
-    // 255 rows and commit the 256th/257th concurrently.
-    sqlx::query("SELECT pg_advisory_xact_lock(1698067053, $1)")
-        .bind(account_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(DbError::Query)?;
+    // Without the account row lock above, two attaches can both see 255 rows
+    // and commit the 256th/257th concurrently.
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1 FROM bnc_read_markers

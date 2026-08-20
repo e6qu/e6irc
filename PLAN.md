@@ -89,6 +89,8 @@ reconciliation completes synthetic JOINs with NAMES and places a negotiated
 read marker before end-of-NAMES. The browser marks stale snapshot channels as
 past while retaining their transcript, and routes server notices to the server
 buffer rather than creating phantom direct messages.
+The BNC marker schema retains the account table's full BIGINT identity width,
+and capacity checks serialize on the durable account row.
 One live/history routing policy maps STATUSMSG `@#channel` and `+#channel`
 traffic to the underlying channel. Composer commands with missing targets or
 required operands fail as correlated, retryable errors instead of becoming a
