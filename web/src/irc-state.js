@@ -23,6 +23,40 @@ export function isChannel(target) {
   return target.startsWith("#") || target.startsWith("&");
 }
 
+// Route chat-bearing commands through one policy for both live delivery and
+// persisted history. IRC STATUSMSG prefixes such as `@#ops` address a subset
+// of a channel but still belong in that channel's buffer.
+export function chatMessageRoute(message, ownNick, isKnownChannel = () => false) {
+  if (
+    (message.command !== "PRIVMSG" && message.command !== "NOTICE")
+    || typeof message.params?.[0] !== "string"
+    || typeof message.params?.[1] !== "string"
+  ) return null;
+
+  const wireTarget = message.params[0];
+  let target = wireTarget;
+  let statusLength = 0;
+  while (statusLength < target.length && "@+".includes(target[statusLength])) {
+    statusLength += 1;
+  }
+  if (statusLength > 0) {
+    const candidate = target.slice(statusLength);
+    if (isChannel(candidate) || isKnownChannel(candidate)) target = candidate;
+  }
+
+  if (isChannel(target) || isKnownChannel(target)) return { kind: "channel", target };
+  if (
+    wireTarget === "*"
+    || wireTarget === ""
+    || (message.command === "NOTICE" && !message.sourceIsUser)
+  ) return { kind: "server", target: null };
+
+  const sentByUs = Boolean(
+    message.nick && ownNick && fold(message.nick) === fold(ownNick),
+  );
+  return { kind: "dm", target: sentByUs ? wireTarget : (message.nick || wireTarget) };
+}
+
 // Channel membership sigils and their underlying modes, highest rank first.
 export const MEMBER_RANKS = [
   ["q", "~"],

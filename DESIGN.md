@@ -139,6 +139,16 @@ These are project-wide rules, enforced in review and (where possible) CI:
     asserted against.
   - `ComposerResult` — a web-composer response is either `Sent` or `Rejected`;
     success cannot carry an error and rejection always has one.
+  - `CredentialAttemptBudget` — IRC registration, services, and BNC attach
+    consume the same closed per-connection authentication budget. Valid and
+    malformed completed SASL payloads spend a slot, exhaustion is permanent,
+    and no ninth attempt can reach password verification. An authenticated
+    session cannot replace its account through a second SASL exchange; it gets
+    the protocol's 907 refusal.
+  - `SendOutcome::Rejected(ClientLineError)` — the BNC's public driver queue
+    boundary admits only one syntactically valid IRC client frame within the
+    independent tag/body budgets. Raw attach and browser validation improve
+    their own error reporting, but cannot bypass this final admission rule.
   - `PendingServiceReply` — a deferred NickServ reply is a value, so no pending
     request cannot be confused with an unlabeled one.
   - `CredentialRow` / `OidcIdentityRow` / `WebSessionIdentity` — named SQL
@@ -1419,6 +1429,10 @@ one implementation shared with the external-network path.
   from upstream when available (Libera: yes). It deliberately does not
   request `echo-message`: the driver synthesizes self-echoes itself
   (§10.1), and requesting it would produce every echo twice.
+  Synthesized message echoes rebuild their prefixed traditional body within
+  the 512-byte wire allowance, preserving valid client-only tags and cutting
+  trailing UTF-8 only at a character boundary; malformed message commands do
+  not manufacture an echo the upstream would never send.
 - Auto-reconnect with exponential backoff + jitter, bounded so repeatedly
   rejected credentials or IRC registration settings stop re-dialing rather
   than hammering the upstream forever; authentication and registration
@@ -1677,7 +1691,8 @@ typed line, status, authoritative `session` (nick + joined channels), and
 `{"t":"snapshot","v":"complete"}` replay-boundary events. Raw line events preserve IRCv3 `time` and `msgid` tags so live and
 persisted timelines use the same clock and have stable overlap identity. The
 client applies the protocol parser's last-duplicate-tag rule, parses each line,
-routes it to the right buffer (channel / DM / server),
+routes it to the right buffer (channel / DM / server), with STATUSMSG targets
+such as `@#ops` routed to the underlying channel,
 maintains the per-channel member list, reconciles stale replay buffers against
 the session event, and renders the active buffer (all via
 DOM APIs, never `innerHTML` on server text, so a hostile upstream line can't
@@ -1701,7 +1716,9 @@ echoes that arrived while the request was in flight. Matching non-empty
 are deduplicated; content equality elsewhere is not identity because distinct
 IRC messages can have identical bodies. Explicit history expands the buffer's
 bounded capacity by one API page, so loading older context remains effective
-even when the normal live window is full. Self PART/KICK closes the
+even when the normal live window is full. Live and persisted PRIVMSG/NOTICE
+rows use the same routing function, so a status-target or server notice cannot
+change buffer class when older history is loaded. Self PART/KICK closes the
 channel buffer, direct-message buffers have an explicit local Close action,
 and channel buffers have a Leave action whose confirmed self PART closes them.
 Comma-separated JOIN/PART targets and the supported multi-target KICK forms

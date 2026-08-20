@@ -569,10 +569,10 @@ where
     let mut cap_open = false;
     let mut awaiting_payload = false;
     // Accumulates 400-byte AUTHENTICATE continuation chunks until a short line
-    // completes the payload (SASL spec), mirroring the main IRC path. Bounded so
-    // a client cannot grow it without end (matches the core's SASL_MAX).
+    // completes the payload (SASL spec), mirroring the main IRC path. Both use
+    // the protocol crate's shared bound so a client cannot grow it without end.
     let mut sasl_buf = String::new();
-    const SASL_MAX: usize = 8192;
+    let mut credential_attempts = crate::identity::CredentialAttemptBudget::default();
     let mut account: Option<String> = None;
     let mut caps = super::AttachCaps::default();
 
@@ -662,6 +662,32 @@ where
                         reject_sasl(write, server_name).await?;
                         continue;
                     }
+                    if account.is_some() {
+                        handshake_numeric(
+                            write,
+                            server_name,
+                            nick.as_deref(),
+                            907,
+                            None,
+                            "You have already authenticated",
+                        )
+                        .await?;
+                        continue;
+                    }
+                    if arg.len() > e6irc_proto::sasl::MAX_AUTHENTICATE_CHUNK_LEN {
+                        awaiting_payload = false;
+                        sasl_buf.clear();
+                        handshake_numeric(
+                            write,
+                            server_name,
+                            nick.as_deref(),
+                            905,
+                            None,
+                            "SASL message too long",
+                        )
+                        .await?;
+                        continue;
+                    }
                     if !awaiting_payload {
                         // Mechanism selection. Only PLAIN is offered.
                         if arg.eq_ignore_ascii_case("PLAIN") {
@@ -674,23 +700,33 @@ where
                         // Client abort.
                         awaiting_payload = false;
                         sasl_buf.clear();
-                        reject_sasl(write, server_name).await?;
+                        handshake_numeric(
+                            write,
+                            server_name,
+                            nick.as_deref(),
+                            906,
+                            None,
+                            "SASL authentication aborted",
+                        )
+                        .await?;
                     } else {
                         // Continuation: a full 400-char line means more follows;
                         // a shorter line (or "+", the empty final chunk)
                         // completes the payload.
                         let piece = if arg == "+" { "" } else { arg };
-                        if sasl_buf.len() + piece.len() > SASL_MAX {
+                        if sasl_buf.len() + piece.len()
+                            > e6irc_proto::sasl::MAX_AUTHENTICATE_PAYLOAD_LEN
+                        {
                             awaiting_payload = false;
                             sasl_buf.clear();
                             reject_sasl(write, server_name).await?;
                         } else {
                             sasl_buf.push_str(piece);
-                            if arg.len() != 400 {
+                            if arg.len() != e6irc_proto::sasl::MAX_AUTHENTICATE_CHUNK_LEN {
                                 awaiting_payload = false;
                                 let payload = std::mem::take(&mut sasl_buf);
-                                match verify_plain(pool, &payload).await {
-                                    None => {
+                                match verify_plain(pool, &payload, &mut credential_attempts).await {
+                                    PlainVerification::Rejected => {
                                         // A failed attach authentication is a
                                         // security event; one bounded line per
                                         // rejection, without the credential.
@@ -699,7 +735,7 @@ where
                                         );
                                         reject_sasl(write, server_name).await?;
                                     }
-                                    Some(acct) => {
+                                    PlainVerification::Accepted(acct) => {
                                         write
                                             .write_all(
                                                 format!(
@@ -710,6 +746,17 @@ where
                                             )
                                             .await?;
                                         account = Some(acct);
+                                    }
+                                    PlainVerification::AttemptsExhausted => {
+                                        write
+                                            .write_all(
+                                                format!(
+                                                    ":{server_name} ERROR :Closing Link: too many authentication attempts\r\n"
+                                                )
+                                                .as_bytes(),
+                                            )
+                                            .await?;
+                                        return Ok(Registered::Closed);
                                     }
                                 }
                             }
@@ -997,17 +1044,35 @@ where
 
 /// Verify a SASL PLAIN payload (`base64(authzid \0 authcid \0 passwd)`)
 /// against the account store. Returns the canonical account name.
-async fn verify_plain(pool: &PgPool, payload: &str) -> Option<String> {
-    let raw = e6irc_proto::base64::decode(payload)?;
-    let (authcid, passwd) = plain_credentials(&raw)?;
+enum PlainVerification {
+    Accepted(String),
+    Rejected,
+    AttemptsExhausted,
+}
+
+async fn verify_plain(
+    pool: &PgPool,
+    payload: &str,
+    attempts: &mut crate::identity::CredentialAttemptBudget,
+) -> PlainVerification {
+    if !attempts.consume() {
+        return PlainVerification::AttemptsExhausted;
+    }
+    let Some(raw) = e6irc_proto::base64::decode(payload) else {
+        return PlainVerification::Rejected;
+    };
+    let Some((authcid, passwd)) = plain_credentials(&raw) else {
+        return PlainVerification::Rejected;
+    };
     // A DB failure is not an auth rejection (verify_credentials' contract):
     // fail closed, but surface the error instead of silently masking it as a
     // bad password.
     match crate::db::verify_credentials(pool, authcid, passwd).await {
-        Ok(name) => name,
+        Ok(Some(name)) => PlainVerification::Accepted(name),
+        Ok(None) => PlainVerification::Rejected,
         Err(e) => {
             eprintln!("bnc: credential check failed (database error): {e}");
-            None
+            PlainVerification::Rejected
         }
     }
 }
@@ -1145,6 +1210,73 @@ mod handshake_tests {
         assert!(!attach_selector_ok("alice/"));
         assert!(!attach_selector_ok("alice/bad/name"));
         assert!(!attach_selector_ok(&format!("alice/{}", "x".repeat(65))));
+    }
+
+    #[tokio::test]
+    async fn attach_sasl_rejects_an_oversized_chunk_and_resets_the_attempt() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+            .expect("lazy pool");
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (mut server_read, mut server_write) = tokio::io::split(server);
+        let task = tokio::spawn(async move {
+            handshake(&mut server_read, &mut server_write, &pool, "bnc.example").await
+        });
+        client_write
+            .write_all(
+                format!(
+                    "CAP REQ :sasl\r\nAUTHENTICATE PLAIN\r\nAUTHENTICATE {}\r\nAUTHENTICATE PLAIN\r\nAUTHENTICATE *\r\nQUIT :done\r\n",
+                    "x".repeat(e6irc_proto::sasl::MAX_AUTHENTICATE_CHUNK_LEN + 1)
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write handshake");
+        client_write.shutdown().await.expect("close input");
+
+        let mut replies = String::new();
+        client_read
+            .read_to_string(&mut replies)
+            .await
+            .expect("read replies");
+        assert!(
+            replies.contains(" 905 * :SASL message too long\r\n"),
+            "{replies}"
+        );
+        assert_eq!(
+            replies.matches("AUTHENTICATE +\r\n").count(),
+            2,
+            "{replies}"
+        );
+        assert!(
+            replies.contains(" 906 * :SASL authentication aborted\r\n"),
+            "{replies}"
+        );
+        assert!(matches!(
+            task.await
+                .expect("handshake task")
+                .expect("handshake result"),
+            Registered::Closed
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_attach_sasl_attempts_cannot_bypass_the_budget() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+            .expect("lazy pool");
+        let mut attempts = crate::identity::CredentialAttemptBudget::default();
+        for _ in 0..8 {
+            assert!(matches!(
+                verify_plain(&pool, "not-base64!", &mut attempts).await,
+                PlainVerification::Rejected
+            ));
+        }
+        assert!(matches!(
+            verify_plain(&pool, "not-base64!", &mut attempts).await,
+            PlainVerification::AttemptsExhausted
+        ));
     }
 
     #[tokio::test]

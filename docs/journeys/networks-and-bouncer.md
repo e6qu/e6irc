@@ -183,7 +183,8 @@ PLAIN.
    messages into the stream (the upstream is never asked for
    `echo-message`): the account's other attached sessions and the detached
    buffer always see them, and the sender itself sees its echo exactly when
-   it negotiated `echo-message` on attach.
+   it negotiated `echo-message` on attach. Adding the upstream identity prefix
+   never creates an over-limit echo; trailing text is fitted on a UTF-8 boundary.
 6. Disconnecting the client decrements attachments but leaves the driver and
    upstream session running.
 
@@ -191,7 +192,11 @@ PLAIN.
 errors, bad credentials, absent/disabled network, registry failure, and
 cross-account selection are refused before attachment. An unavailable
 upstream may still allow stored backlog replay, but it is not described as a
-live connection.
+live connection. A 401-byte authentication chunk resets the exchange and 905
+allows a clean retry; malformed completed payloads cannot evade the permanent
+per-connection attempt budget, and a second exchange after success receives
+907 instead of replacing the authenticated account. Every attach frontend reaches the same final
+driver-queue line validator before a command can be accepted.
 
 **Security and observability.** Authentication precedes case-insensitive
 owner-scoped lookup; the network name cannot select another account’s driver.

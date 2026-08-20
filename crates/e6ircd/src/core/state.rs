@@ -660,7 +660,7 @@ pub(crate) struct Session {
     /// Credential-verification attempts made on this connection, capped so a
     /// single socket can't drive unbounded argon2 work (unauth CPU DoS / online
     /// brute-force). Never reset — the budget is per connection lifetime.
-    pub credential_attempts: u32,
+    pub credential_attempts: crate::identity::CredentialAttemptBudget,
     /// Deferred NickServ IDENTIFY reply.
     pub pending_identify: Option<PendingServiceReply>,
     /// Deferred NickServ REGISTER reply.
@@ -3659,7 +3659,7 @@ impl ServerState {
                 sasl: SaslState::default(),
                 sasl_verify_pending: false,
                 sasl_buf: String::new(),
-                credential_attempts: 0,
+                credential_attempts: crate::identity::CredentialAttemptBudget::default(),
                 pending_identify: None,
                 pending_register: None,
                 away: None,

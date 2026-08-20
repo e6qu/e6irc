@@ -12,6 +12,7 @@ mod handler;
 mod state;
 mod timer;
 
+pub(crate) use handler::fit_trailing;
 pub(crate) use timer::TimerWheel;
 
 pub use state::{ChannelOwner, ConnId, CoreConfig, dm_conversation_key};

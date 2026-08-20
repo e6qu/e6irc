@@ -27,6 +27,7 @@ import { parseUiEvent } from "./ui-event.js";
 import {
   MEMBER_RANKS,
   asMessage,
+  chatMessageRoute,
   fold,
   isChannel,
   kickPairs,
@@ -849,29 +850,26 @@ function handleLine(raw) {
       break;
     case "PRIVMSG":
     case "NOTICE": {
-      if (!m.params[0] || m.params[1] === undefined) {
+      const route = chatMessageRoute(
+        m,
+        myNick,
+        (candidate) => buffers.get(fold(candidate))?.kind === "channel",
+      );
+      if (!route) {
         addServer(raw);
         break;
       }
-      const target = m.params[0] || "";
       const text = m.params[1] ?? "";
       const kind = m.command === "NOTICE" ? "notice" : "msg";
       const r = asMessage(kind, m.nick, text);
-      if (isChannel(target) || buffers.get(fold(target))?.kind === "channel") {
-        addLine(target, r.kind, "channel", r.from, r.text, m.tags, raw);
-      } else if (
-        target === "*" ||
-        target === "" ||
-        (m.command === "NOTICE" && !m.sourceIsUser)
-      ) {
+      if (route.kind === "channel") {
+        addLine(route.target, r.kind, "channel", r.from, r.text, m.tags, raw);
+      } else if (route.kind === "server") {
         // A server / global notice (e.g. the bouncer's *bnc* control messages):
         // show it in the server buffer, not a phantom DM keyed on the sender.
         addLine(SERVER, r.kind, "server", r.from, r.text, m.tags, raw);
       } else {
-        // A direct message: key the buffer by the other party — the sender,
-        // unless the sender is us (a message we sent to `target`).
-        const buf = isMe(m.nick) ? target : m.nick || target;
-        addLine(buf, r.kind, "dm", r.from, r.text, m.tags, raw);
+        addLine(route.target, r.kind, "dm", r.from, r.text, m.tags, raw);
       }
       break;
     }
@@ -1456,13 +1454,12 @@ async function loadEarlier() {
   const rebuilt = [];
   for (const raw of lines) {
     const m = parseIrc(raw);
-    if (m.command !== "PRIVMSG" && m.command !== "NOTICE") continue;
-    const target = m.params[0] || "";
-    const belongs =
-      b.kind === "channel"
-        ? fold(target) === b.key
-        : (isMe(m.nick) ? fold(target) : fold(m.nick || "")) === b.key;
-    if (!belongs) continue;
+    const route = chatMessageRoute(
+      m,
+      myNick,
+      (candidate) => b.kind === "channel" && fold(candidate) === b.key,
+    );
+    if (!route || route.kind !== b.kind || fold(route.target || "") !== b.key) continue;
     const kind = m.command === "NOTICE" ? "notice" : "msg";
     const rendered = asMessage(kind, m.nick, m.params[1] ?? "");
     rebuilt.push({

@@ -1157,9 +1157,19 @@ pub(crate) fn filter_tags(line: &str, caps: AttachCaps) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClientLineError {
+pub enum ClientLineError {
     TooLong,
     Malformed,
+}
+
+impl ClientLineError {
+    /// Stable human-readable explanation for interactive clients.
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::TooLong => "message exceeds the IRC wire limit; nothing was sent",
+            Self::Malformed => "message is not a complete IRC command; nothing was sent",
+        }
+    }
 }
 
 /// Validate one downstream IRC line under the same message-tags and
@@ -2080,6 +2090,8 @@ pub enum SendOutcome {
     Full,
     /// The driver is gone; the caller should detach.
     Closed,
+    /// The input was not a valid, bounded IRC client line and was not queued.
+    Rejected(ClientLineError),
 }
 
 impl NetworkHandle {
@@ -2101,8 +2113,13 @@ impl NetworkHandle {
     }
 
     /// As [`NetworkHandle::send`], but the command carries the sending
-    /// attachment's id so its synthesized echo can be routed correctly.
+    /// attachment's id so its synthesized echo can be routed correctly. The
+    /// shared boundary rejects malformed or over-budget IRC lines before they
+    /// can enter any driver implementation.
     pub fn send_from(&self, origin: u64, line: &str) -> SendOutcome {
+        if let Err(error) = parse_client_line(line) {
+            return SendOutcome::Rejected(error);
+        }
         match self.commands.try_send(ClientCommand {
             origin,
             line: line.to_string(),
@@ -2941,6 +2958,13 @@ where
                                             }
                                             SendOutcome::Closed => {
                                                 return Ok(()); // driver gone
+                                            }
+                                            SendOutcome::Rejected(error) => {
+                                                // The attach path validates before handling
+                                                // local commands. Keep the shared queue
+                                                // boundary authoritative as well, so future
+                                                // callers cannot bypass the same contract.
+                                                write_client_line_error(&mut write, error).await?;
                                             }
                                         }
                                     }
@@ -3914,6 +3938,23 @@ mod tests {
         assert!(matches!(
             parse_client_line("PRIVMSG #c :bad\0line"),
             Err(ClientLineError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn network_handle_never_queues_invalid_client_lines() {
+        let (handle, mut ends) = NetworkHandle::channels(16);
+        assert_eq!(
+            handle.send("PRIVMSG #c :bad\nJOIN #other"),
+            SendOutcome::Rejected(ClientLineError::Malformed)
+        );
+        assert_eq!(
+            handle.send(&format!("PRIVMSG #c :{}", "x".repeat(500))),
+            SendOutcome::Rejected(ClientLineError::TooLong)
+        );
+        assert!(matches!(
+            ends.commands.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
     }
 

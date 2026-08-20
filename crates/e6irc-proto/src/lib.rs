@@ -8,4 +8,5 @@ pub mod isupport;
 pub mod mask;
 pub mod message;
 pub mod numerics;
+pub mod sasl;
 pub mod time;

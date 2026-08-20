@@ -456,6 +456,15 @@ pub(super) async fn ws_ui_conn(
                             send_unavailable(&mut socket).await;
                             break;
                         }
+                        crate::bouncer::SendOutcome::Rejected(error) => {
+                            let event = composer_result_event(ComposerResult::Rejected {
+                                request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
+                                message: error.message(),
+                            });
+                            if socket.send(WsMessage::text(event)).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
                 Some(Ok(WsMessage::Binary(_))) => {
@@ -585,7 +594,15 @@ fn composer_request(frame: &str) -> Result<ComposerRequest, ComposerRequestError
         request_id: None,
         message: "invalid composer request",
     })?;
-    let line = slash_to_irc(&frame.message, &frame.target);
+    let line = match slash_to_irc(&frame.message, &frame.target) {
+        Ok(line) => line,
+        Err(message) => {
+            return Err(ComposerRequestError {
+                request_id: frame.id,
+                message,
+            });
+        }
+    };
     if line.contains(['\r', '\n', '\0']) {
         return Err(ComposerRequestError {
             request_id: frame.id,
@@ -663,34 +680,61 @@ fn composer_result_event(result: ComposerResult<'_>) -> String {
     }
 }
 
-/// Map a composer message to IRC.
-pub(super) fn slash_to_irc(message: &str, target: &str) -> String {
+/// Map a composer message to one complete IRC command.
+pub(super) fn slash_to_irc(message: &str, target: &str) -> Result<String, &'static str> {
     let (cmd, rest) = match message.strip_prefix('/') {
         Some(body) => match body.split_once(' ') {
             Some((c, r)) => (c.to_ascii_lowercase(), r),
             None => (body.to_ascii_lowercase(), ""),
         },
         None => {
-            return if target.is_empty() {
-                message.to_string()
-            } else {
-                format!("PRIVMSG {target} :{message}")
-            };
+            if target.is_empty() {
+                return Err("select a channel or direct message before sending; nothing was sent");
+            }
+            if message.is_empty() {
+                return Err("message is empty; nothing was sent");
+            }
+            return Ok(format!("PRIVMSG {target} :{message}"));
         }
     };
-    match cmd.as_str() {
+    let rest = rest.trim_start();
+    let line = match cmd.as_str() {
+        "" => return Err("slash command is empty; nothing was sent"),
+        "raw" if rest.is_empty() => return Err("/raw requires an IRC command; nothing was sent"),
         "raw" => rest.to_string(),
+        "me" if target.is_empty() => {
+            return Err("/me requires an active conversation; nothing was sent");
+        }
+        "me" if rest.is_empty() => return Err("/me requires action text; nothing was sent"),
         "me" => format!("PRIVMSG {target} :\u{1}ACTION {rest}\u{1}"),
-        "join" | "part" | "nick" => format!("{} {rest}", cmd.to_ascii_uppercase()),
+        "join" if rest.is_empty() => return Err("/join requires a channel; nothing was sent"),
+        "join" => format!("JOIN {rest}"),
+        "part" if rest.is_empty() && target.is_empty() => {
+            return Err("/part requires an active channel or channel name; nothing was sent");
+        }
+        "part" if rest.is_empty() => format!("PART {target}"),
+        "part" => format!("PART {rest}"),
+        "nick" if rest.is_empty() => return Err("/nick requires a nickname; nothing was sent"),
+        "nick" => format!("NICK {rest}"),
+        "topic" if target.is_empty() => {
+            return Err("/topic requires an active channel; nothing was sent");
+        }
         "topic" => format!("TOPIC {target} :{rest}"),
         // `/msg <target> <text>`
-        "msg" => match rest.split_once(' ') {
-            Some((to, text)) => format!("PRIVMSG {to} :{text}"),
-            None => rest.to_string(),
-        },
+        "msg" => {
+            let Some((to, text)) = rest.split_once(char::is_whitespace) else {
+                return Err("/msg requires a target and message; nothing was sent");
+            };
+            let text = text.trim_start();
+            if to.is_empty() || text.is_empty() {
+                return Err("/msg requires a target and message; nothing was sent");
+            }
+            format!("PRIVMSG {to} :{text}")
+        }
         // Unknown slash-command: pass it through raw (server answers 421).
         _ => format!("{} {rest}", cmd.to_ascii_uppercase()),
-    }
+    };
+    Ok(line)
 }
 
 /// One upstream line as a JSON event for the web client:
@@ -922,6 +966,9 @@ mod tests {
         for malformed in [
             r##"{"id":"send-4","target":"","message":"/raw"}"##,
             r##"{"id":"send-5","target":"","message":""}"##,
+            r##"{"id":"send-6","target":"#rust","message":"/msg bob"}"##,
+            r##"{"id":"send-7","target":"","message":"hello"}"##,
+            r##"{"id":"send-8","target":"","message":"/me waves"}"##,
         ] {
             let error = composer_request(malformed)
                 .expect_err("an empty IRC command must not be acknowledged as sent");

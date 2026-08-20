@@ -3174,22 +3174,38 @@ mod composer_tests {
     #[test]
     fn slash_commands_map_to_irc() {
         use super::slash_to_irc;
-        assert_eq!(slash_to_irc("hello", "#c"), "PRIVMSG #c :hello");
+        assert_eq!(slash_to_irc("hello", "#c").unwrap(), "PRIVMSG #c :hello");
         assert_eq!(
-            slash_to_irc("/me waves", "#c"),
+            slash_to_irc("/me waves", "#c").unwrap(),
             "PRIVMSG #c :\u{1}ACTION waves\u{1}"
         );
-        assert_eq!(slash_to_irc("/join #other", "#c"), "JOIN #other");
-        assert_eq!(slash_to_irc("/part", "#c"), "PART ");
-        assert_eq!(slash_to_irc("/nick bob", "#c"), "NICK bob");
+        assert_eq!(slash_to_irc("/join #other", "#c").unwrap(), "JOIN #other");
+        assert_eq!(slash_to_irc("/part", "#c").unwrap(), "PART #c");
+        assert_eq!(slash_to_irc("/nick bob", "#c").unwrap(), "NICK bob");
         assert_eq!(
-            slash_to_irc("/topic new topic", "#c"),
+            slash_to_irc("/topic new topic", "#c").unwrap(),
             "TOPIC #c :new topic"
         );
-        assert_eq!(slash_to_irc("/msg bob hi bob", "#c"), "PRIVMSG bob :hi bob");
-        assert_eq!(slash_to_irc("/raw WHOIS bob", "#c"), "WHOIS bob");
+        assert_eq!(
+            slash_to_irc("/msg bob hi bob", "#c").unwrap(),
+            "PRIVMSG bob :hi bob"
+        );
+        assert_eq!(slash_to_irc("/raw WHOIS bob", "#c").unwrap(), "WHOIS bob");
         // unknown slash-command passes through (server answers 421)
-        assert_eq!(slash_to_irc("/frobnicate x", "#c"), "FROBNICATE x");
+        assert_eq!(slash_to_irc("/frobnicate x", "#c").unwrap(), "FROBNICATE x");
+        for invalid in [
+            ("hello", ""),
+            ("/", "#c"),
+            ("/raw", "#c"),
+            ("/me", "#c"),
+            ("/me waves", ""),
+            ("/join", "#c"),
+            ("/nick", "#c"),
+            ("/topic hello", ""),
+            ("/msg bob", "#c"),
+        ] {
+            assert!(slash_to_irc(invalid.0, invalid.1).is_err(), "{invalid:?}");
+        }
     }
 }
 

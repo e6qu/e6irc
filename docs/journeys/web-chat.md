@@ -139,7 +139,8 @@ current network and conversation selection.
    requests one complete IRC line instead.
 2. The server validates the whole derived line, admits it to the selected
    driver's bounded queue, and returns a correlated `sent` or `send-error`
-   event.
+   event. Missing `/raw`, `/me`, `/join`, `/nick`, or `/msg` operands and text
+   entered without a channel/direct-message target are explicit rejections.
 3. Only `sent` creates local echo and sent-history. A rejection keeps the text
    available for retry, so displayed success means server-side queue
    admission—not merely a browser socket write.
@@ -147,6 +148,8 @@ current network and conversation selection.
    labels, including comma-separated membership targets and multi-target KICK.
 5. Direct messages create query buffers. Closing a query removes only the
    local view; leaving a channel sends PART and waits for the resulting state.
+   STATUSMSG targets such as `@#ops` and `+#ops` route to `#ops`; persisted
+   history uses this same routing policy, including the server-notice rule.
 6. Inactive conversations retain both unread traffic and unread direct-mention
    counts, so attention-worthy traffic is distinguishable before switching.
 7. Errors from the driver or IRC server appear in the relevant status path.
