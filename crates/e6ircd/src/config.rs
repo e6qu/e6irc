@@ -623,8 +623,11 @@ impl NetworkEntry {
 
     /// Validate fields shared by every configuration ingress.
     pub(crate) fn validate_connection_intent(&self) -> Result<(), String> {
-        if self.name.trim().is_empty() {
-            return Err("network name must be non-blank".into());
+        if !crate::sanitize::valid_network_name(&self.name) {
+            return Err(
+                "network name must be a 1-64 byte path-safe token (letters, digits, '-', '_' or '.')"
+                    .into(),
+            );
         }
         if self
             .owner

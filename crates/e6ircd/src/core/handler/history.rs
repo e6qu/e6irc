@@ -5,7 +5,7 @@ use super::*;
 // ---- CHATHISTORY (draft/chathistory, hot ring) --------------------------
 
 /// Most messages one CHATHISTORY request may return. The single source for
-/// both the request clamps below and the `CHATHISTORY=` ISUPPORT token, so
+/// both the request validation below and the `CHATHISTORY=` ISUPPORT token, so
 /// what is advertised can never drift from what is enforced.
 pub(super) const CHATHISTORY_MAX: usize = 500;
 
@@ -37,6 +37,9 @@ pub(super) enum SelectorError {
     UnknownRefType,
     /// A `timestamp=` whose value is not a valid server-time (→ INVALID_PARAMS).
     MalformedTimestamp,
+    /// A `msgid=` without a value, or whose value cannot be reused as an IRC
+    /// command parameter (→ INVALID_PARAMS).
+    MalformedMessageId,
 }
 
 impl Selector {
@@ -47,7 +50,9 @@ impl Selector {
         if sel == "*" {
             Ok(Selector::Star)
         } else if let Some(id) = sel.strip_prefix("msgid=") {
-            Ok(Selector::Msgid(id.to_string()))
+            e6irc_proto::message::valid_message_id(id)
+                .then(|| Selector::Msgid(id.to_string()))
+                .ok_or(SelectorError::MalformedMessageId)
         } else if let Some(ts) = sel.strip_prefix("timestamp=") {
             e6irc_proto::time::parse_server_time_millis(ts)
                 .map(Selector::Timestamp)
@@ -233,6 +238,21 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
     };
     // BETWEEN takes two selectors then the limit; the others take one.
     let is_between = parsed_sub.takes_two_selectors();
+    let expected_params = if is_between { 5 } else { 4 };
+    if p.len() != expected_params {
+        chathistory_fail(
+            state,
+            conn,
+            "INVALID_PARAMS",
+            &[sub, target],
+            if is_between {
+                "Expected exactly <target> <selector> <selector> <limit>"
+            } else {
+                "Expected exactly <target> <selector> <limit>"
+            },
+        );
+        return;
+    }
     let sel1_raw = p.get(2).copied().unwrap_or("*");
     let sel2_raw = p.get(3).copied().unwrap_or("*");
     // Parse each selector *once* (parse, don't validate). The parsed `Selector`
@@ -240,7 +260,8 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
     // re-parses it or silently defaults a malformed one to epoch 0 (the trap the
     // old string-threaded `selector_bound` guarded only with a comment). Error
     // priority is preserved: unknown reference type (INVALID_MSGREFTYPE) first,
-    // then `*` misuse, then a malformed timestamp (both INVALID_PARAMS).
+    // then `*` misuse, then a malformed supported reference value (both
+    // INVALID_PARAMS).
     let r1 = Selector::parse(sel1_raw);
     let r2 = if is_between {
         Selector::parse(sel2_raw)
@@ -280,14 +301,14 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
         );
         return;
     }
-    // Anything still an error is a malformed `timestamp=` value.
+    // Anything still an error is a malformed supported reference value.
     let (Ok(selector), Ok(selector2)) = (r1, r2) else {
         chathistory_fail(
             state,
             conn,
             "INVALID_PARAMS",
             &[sub, target],
-            "Malformed timestamp= selector",
+            "Malformed message reference selector",
         );
         return;
     };
@@ -296,14 +317,14 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
         .get(if is_between { 4 } else { 3 })
         .map(|l| l.parse::<usize>())
     {
-        Some(Ok(n)) if n > 0 => n.min(CHATHISTORY_MAX),
+        Some(Ok(n)) if n > 0 && n <= CHATHISTORY_MAX => n,
         _ => {
             chathistory_fail(
                 state,
                 conn,
                 "INVALID_PARAMS",
                 &[sub, target],
-                "limit must be a positive integer",
+                "limit must be between 1 and 500",
             );
             return;
         }
@@ -512,6 +533,16 @@ pub(super) fn dm_correspondent(key: &crate::core::state::HistoryKey, me: &str) -
 /// source is PostgreSQL, with the hot rings answering when no database is
 /// configured. Ordered oldest-activity-first, so a limit keeps the oldest.
 pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    if p.len() != 4 {
+        chathistory_fail(
+            state,
+            conn,
+            "INVALID_PARAMS",
+            &["TARGETS"],
+            "Expected exactly two timestamp= bounds and a limit",
+        );
+        return;
+    }
     let parse = |i: usize| {
         p.get(i)
             .and_then(|s| s.strip_prefix("timestamp="))
@@ -528,11 +559,19 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
         return;
     };
     let (min_ts, max_ts) = if a <= b { (a, b) } else { (b, a) };
-    let limit = p
-        .get(3)
-        .and_then(|l| l.parse::<usize>().ok())
-        .unwrap_or(100)
-        .clamp(1, CHATHISTORY_MAX);
+    let limit = match p[3].parse::<usize>() {
+        Ok(limit) if limit > 0 && limit <= CHATHISTORY_MAX => limit,
+        _ => {
+            chathistory_fail(
+                state,
+                conn,
+                "INVALID_PARAMS",
+                &["TARGETS"],
+                "limit must be between 1 and 500",
+            );
+            return;
+        }
+    };
 
     // Visible targets are the channels the requester is on, plus every
     // conversation they take part in. (No early return on "no channels": a

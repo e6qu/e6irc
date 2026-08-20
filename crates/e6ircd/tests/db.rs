@@ -2418,7 +2418,7 @@ async fn bnc_network_name_selection_is_case_insensitive() {
     }
     // Buffer APIs share that same composite-key fold. A producer using display
     // casing and a reader using a different selector spelling must still meet.
-    db::persist_bnc_line(&pool, "ALICE", "LiBeRa", ":s NOTICE * :backlog")
+    db::persist_bnc_line(&pool, "ALICE", "LiBeRa", None, ":s NOTICE * :backlog")
         .await
         .expect("persist case variant");
     assert_eq!(
@@ -2506,9 +2506,15 @@ async fn deleting_a_bnc_network_purges_its_casefolded_buffer() {
     // The live persistence path writes under the folded owner.
     let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold("MixedCase");
     for i in 0..3 {
-        db::persist_bnc_line(&pool, &folded, "libera", &format!(":s PRIVMSG #x :m{i}"))
-            .await
-            .expect("persist");
+        db::persist_bnc_line(
+            &pool,
+            &folded,
+            "libera",
+            Some("mc"),
+            &format!(":s PRIVMSG #x :m{i}"),
+        )
+        .await
+        .expect("persist");
     }
     // Delete by the raw (display-cased) account name, as the HTTP handler does.
     assert!(
@@ -2523,6 +2529,70 @@ async fn deleting_a_bnc_network_purges_its_casefolded_buffer() {
     assert_eq!(
         remaining, 0,
         "the folded-owner buffer rows must be purged on delete, not orphaned"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn bnc_history_queries_are_target_scoped_and_merge_direct_messages() {
+    let pool =
+        db::connect_and_migrate(&support::test_db("bnc_history_queries_are_target_scoped").await)
+            .await
+            .expect("connect");
+    db::persist_bnc_line(
+        &pool,
+        "alice",
+        "libera",
+        Some("alice"),
+        "@msgid=shared :a!u@h PRIVMSG #one :first",
+    )
+    .await
+    .expect("persist first target");
+    db::persist_bnc_line(
+        &pool,
+        "alice",
+        "libera",
+        Some("alice"),
+        "@msgid=shared :a!u@h PRIVMSG #two :second",
+    )
+    .await
+    .expect("persist second target");
+
+    let one = db::bnc_history_lines(&pool, "alice", "libera", "#ONE")
+        .await
+        .expect("first target history");
+    let two = db::bnc_history_lines(&pool, "alice", "libera", "#two")
+        .await
+        .expect("second target history");
+    assert_eq!(one.len(), 1);
+    assert_eq!(two.len(), 1);
+    assert_ne!(one[0].id, two[0].id, "each target resolves its own row");
+    assert!(
+        db::bnc_history_lines(&pool, "alice", "libera", "#three")
+            .await
+            .expect("missing target history")
+            .is_empty(),
+        "a msgid in another target cannot position this page"
+    );
+
+    for line in [
+        "@msgid=out :alice!u@h PRIVMSG Bob :outbound",
+        "@msgid=in :Bob!u@h PRIVMSG alice :inbound",
+    ] {
+        db::persist_bnc_line(&pool, "alice", "libera", Some("alice"), line)
+            .await
+            .expect("persist direct message");
+    }
+    let direct = db::bnc_history_lines(&pool, "alice", "libera", "bOB")
+        .await
+        .expect("direct-message history");
+    assert_eq!(
+        direct
+            .iter()
+            .map(|row| row.msgid.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("out"), Some("in")],
+        "both directions must share the correspondent's target"
     );
 }
 
@@ -5107,7 +5177,7 @@ async fn bnc_buffer_trim_is_scoped_to_one_network() {
 
     for i in 0..6_000 {
         for network in ["alpha", "beta"] {
-            db::persist_bnc_line(&pool, "owner", network, &format!("line {i}"))
+            db::persist_bnc_line(&pool, "owner", network, None, &format!("line {i}"))
                 .await
                 .expect("persist");
         }

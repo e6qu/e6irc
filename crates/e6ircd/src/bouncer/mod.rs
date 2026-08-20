@@ -1140,6 +1140,43 @@ pub(crate) fn filter_tags(line: &str, caps: AttachCaps) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientLineError {
+    TooLong,
+    Malformed,
+}
+
+/// Validate one downstream IRC line under the same message-tags and
+/// traditional-body budgets as the main IRC server before it reaches a driver.
+pub(crate) fn parse_client_line(
+    text: &str,
+) -> Result<e6irc_proto::message::Message<'_>, ClientLineError> {
+    let (tag_len, body_len) = match text.strip_prefix('@').and_then(|rest| rest.split_once(' ')) {
+        Some((tags, body)) => (tags.len() + 2, body.len()),
+        None => (0, text.len()),
+    };
+    if tag_len > e6irc_proto::message::MAX_CLIENT_TAGS_LEN
+        || body_len > e6irc_proto::message::MAX_LINE_LEN - 2
+    {
+        return Err(ClientLineError::TooLong);
+    }
+    e6irc_proto::message::Message::parse(text).map_err(|_| ClientLineError::Malformed)
+}
+
+async fn write_client_line_error<W>(write: &mut W, error: ClientLineError) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let line: &[u8] = match error {
+        ClientLineError::TooLong => b":*bnc* 417 * :Input line was too long\r\n",
+        ClientLineError::Malformed => b":*bnc* FAIL * INVALID_MESSAGE :Malformed line\r\n",
+    };
+    write.write_all(line).await?;
+    write.flush().await
+}
+
 /// An event a driver emits upward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverEvent {
@@ -1159,14 +1196,122 @@ pub enum DriverEvent {
     /// the originator itself is excluded unless it negotiated echo-message on
     /// attach, mirroring how a real server treats that capability.
     Echo { line: String, origin: u64 },
+    /// Authoritative state for a newly registered IRC upstream session. A
+    /// bounded event backlog cannot establish the current nick or memberships:
+    /// the relevant NICK/JOIN may have aged out while a stale PART remains.
+    /// Attach transports reconcile this snapshot after playback.
+    Session(IrcSessionSnapshot),
 }
 
 impl DriverEvent {
     pub(crate) fn display_line(&self) -> Option<&str> {
         match self {
             Self::Line(line) | Self::Notice(line) => Some(line),
-            Self::Status(_) | Self::Echo { .. } => None,
+            Self::Status(_) | Self::Echo { .. } | Self::Session(_) => None,
         }
+    }
+}
+
+/// Current identity and confirmed channel memberships of an IRC network.
+///
+/// This is deliberately separate from the detached line buffer: the buffer is
+/// bounded history, while this value is authoritative current state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrcSessionSnapshot {
+    pub nick: String,
+    pub channels: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct IrcSessionState {
+    nick: Option<String>,
+    channels: std::collections::HashMap<String, String>,
+}
+
+impl IrcSessionState {
+    fn begin(&mut self, nick: String) -> IrcSessionSnapshot {
+        self.nick = Some(nick);
+        self.channels.clear();
+        self.snapshot().expect("a begun IRC session has a nick")
+    }
+
+    fn observe(&mut self, line: &str) {
+        let Some(current_nick) = self.nick.as_ref() else {
+            return;
+        };
+        let Ok(message) = e6irc_proto::message::Message::parse(line) else {
+            return;
+        };
+        let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
+        let source_nick = message.source.as_ref().map(|source| source.name);
+        let is_us = |candidate: Option<&str>| {
+            candidate.is_some_and(|candidate| casemap.eq(candidate, current_nick))
+        };
+        match message.command.to_ascii_uppercase().as_str() {
+            "NICK" if is_us(source_nick) => {
+                if let Some(nick) = message.params.first() {
+                    self.nick = Some((*nick).to_string());
+                }
+            }
+            "JOIN" if is_us(source_nick) => {
+                if let Some(channels) = message.params.first() {
+                    for channel in channels.split(',') {
+                        self.channels
+                            .insert(casemap.casefold(channel), channel.to_string());
+                    }
+                }
+            }
+            "PART" if is_us(source_nick) => {
+                if let Some(channels) = message.params.first() {
+                    for channel in channels.split(',') {
+                        self.channels.remove(&casemap.casefold(channel));
+                    }
+                }
+            }
+            "KICK" => {
+                let channels: Vec<&str> = message
+                    .params
+                    .first()
+                    .map(|value| value.split(',').collect())
+                    .unwrap_or_default();
+                let targets: Vec<&str> = message
+                    .params
+                    .get(1)
+                    .map(|value| value.split(',').collect())
+                    .unwrap_or_default();
+                if channels.len() == targets.len() {
+                    for (channel, target) in channels.into_iter().zip(targets) {
+                        if is_us(Some(target)) {
+                            self.channels.remove(&casemap.casefold(channel));
+                        }
+                    }
+                } else if channels.len() == 1
+                    && targets.into_iter().any(|target| is_us(Some(target)))
+                {
+                    self.channels.remove(&casemap.casefold(channels[0]));
+                }
+            }
+            "QUIT" if is_us(source_nick) => self.channels.clear(),
+            _ => {}
+        }
+    }
+
+    fn replace(&mut self, snapshot: &IrcSessionSnapshot) {
+        let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
+        self.nick = Some(snapshot.nick.clone());
+        self.channels = snapshot
+            .channels
+            .iter()
+            .map(|channel| (casemap.casefold(channel), channel.clone()))
+            .collect();
+    }
+
+    fn snapshot(&self) -> Option<IrcSessionSnapshot> {
+        let nick = self.nick.clone()?;
+        let mut channels: Vec<String> = self.channels.values().cloned().collect();
+        channels
+            .sort_by_key(|channel| e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(channel));
+        Some(IrcSessionSnapshot { nick, channels })
     }
 }
 
@@ -1273,6 +1418,7 @@ pub struct NetworkHandle {
     buffer: std::sync::Arc<std::sync::Mutex<Buffer>>,
     /// Runtime state and per-network counters, shared with the driver endpoint.
     runtime: std::sync::Arc<NetworkRuntime>,
+    irc_session: std::sync::Arc<std::sync::Mutex<IrcSessionState>>,
     /// PG-backed history context for CHATHISTORY/MARKREAD on the attach
     /// listener, set when the network is registered with a database.
     history: std::sync::Arc<std::sync::Mutex<Option<NetworkHistory>>>,
@@ -1947,6 +2093,16 @@ impl NetworkHandle {
         self.buffer.lock().expect("buffer poisoned").snapshot()
     }
 
+    /// Authoritative IRC identity/membership state, when this driver represents
+    /// an IRC session. Bridge drivers that do not model an IRC identity return
+    /// `None` rather than inventing one.
+    pub fn irc_session_snapshot(&self) -> Option<IrcSessionSnapshot> {
+        self.irc_session
+            .lock()
+            .expect("IRC session state poisoned")
+            .snapshot()
+    }
+
     /// Prepend older (oldest-first) lines to the front of the buffer,
     /// used once at start to restore persisted backlog. Never evicts
     /// lines already present (they are newer); only the remaining
@@ -2082,6 +2238,7 @@ impl NetworkHandle {
         let (stopped_tx, stopped_rx) = tokio::sync::watch::channel(false);
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Buffer::new(buffer_cap)));
         let runtime = std::sync::Arc::new(NetworkRuntime::new());
+        let irc_session = std::sync::Arc::new(std::sync::Mutex::new(IrcSessionState::default()));
         let telemetry = std::sync::Arc::new(std::sync::Mutex::new(None));
         let history = std::sync::Arc::new(std::sync::Mutex::new(None));
         let (history_ready, _) = tokio::sync::watch::channel(true);
@@ -2095,6 +2252,7 @@ impl NetworkHandle {
             history_ready,
             buffer: buffer.clone(),
             runtime: runtime.clone(),
+            irc_session: irc_session.clone(),
             telemetry: telemetry.clone(),
         };
         // A process-wide counter gives each driver a distinct, stable jitter
@@ -2108,6 +2266,7 @@ impl NetworkHandle {
             stopped: Some(stopped_tx),
             buffer,
             runtime,
+            irc_session,
             telemetry,
             reconnect_seed,
         };
@@ -2210,6 +2369,7 @@ pub struct DriverEnds {
     stopped: Option<tokio::sync::watch::Sender<bool>>,
     buffer: std::sync::Arc<std::sync::Mutex<Buffer>>,
     runtime: std::sync::Arc<NetworkRuntime>,
+    irc_session: std::sync::Arc<std::sync::Mutex<IrcSessionState>>,
     telemetry:
         std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<crate::observability::Telemetry>>>>,
     /// Stable per-driver value seeding this driver's reconnect jitter, so
@@ -2227,6 +2387,25 @@ impl Drop for DriverEnds {
 }
 
 impl DriverEnds {
+    /// Start a newly registered IRC session and publish its authoritative
+    /// identity. This clears memberships from the previous transport; JOIN
+    /// confirmations repopulate them through [`DriverEnds::emit_line`].
+    pub fn begin_irc_session(&self, nick: String) {
+        let snapshot = self
+            .irc_session
+            .lock()
+            .expect("IRC session state poisoned")
+            .begin(nick);
+        drop(self.events.send(DriverEvent::Session(snapshot)));
+    }
+
+    fn irc_session_snapshot(&self) -> Option<IrcSessionSnapshot> {
+        self.irc_session
+            .lock()
+            .expect("IRC session state poisoned")
+            .snapshot()
+    }
+
     /// Record a recoverable failure that does not end the driver session, such
     /// as one rejected outbound bridge message. Reconnect outcomes are counted
     /// by their lifecycle event instead; this path owns both classification and
@@ -2251,6 +2430,10 @@ impl DriverEnds {
 
     fn emit_buffered_line(&self, line: String, count_as_input: bool) {
         let line = crate::sanitize::upstream_line(line);
+        self.irc_session
+            .lock()
+            .expect("IRC session state poisoned")
+            .observe(&line);
         if count_as_input {
             self.runtime.record_input(line.len());
             if let Some(telemetry) = self
@@ -2520,6 +2703,7 @@ pub async fn attach<S>(
     handle: &NetworkHandle,
     caps: AttachCaps,
     account: &str,
+    downstream_nick: &str,
 ) -> std::io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -2576,9 +2760,15 @@ where
 
     // Playback: everything buffered while detached, in order, with tags the
     // client didn't negotiate stripped.
+    let mut downstream_session = IrcSessionState::default();
+    downstream_session.begin(downstream_nick.to_string());
     for line in handle.buffer_snapshot() {
+        downstream_session.observe(&line);
         write.write_all(filter_tags(&line, caps).as_bytes()).await?;
         write.write_all(b"\r\n").await?;
+    }
+    if let Some(snapshot) = handle.irc_session_snapshot() {
+        write_irc_session_snapshot(&mut write, &mut downstream_session, &snapshot).await?;
     }
     write.flush().await?;
 
@@ -2601,6 +2791,7 @@ where
             ev = events.recv() => match ev {
                 Ok(event @ (DriverEvent::Line(_) | DriverEvent::Notice(_))) => {
                     let line = event.display_line().expect("display event carries a line");
+                    downstream_session.observe(line);
                     write.write_all(filter_tags(line, caps).as_bytes()).await?;
                     write.write_all(b"\r\n").await?;
                     write.flush().await?;
@@ -2618,6 +2809,10 @@ where
                 Ok(DriverEvent::Status(status)) => {
                     write.write_all(status_notice(status).as_bytes()).await?;
                     write.write_all(b"\r\n").await?;
+                    write.flush().await?;
+                }
+                Ok(DriverEvent::Session(snapshot)) => {
+                    write_irc_session_snapshot(&mut write, &mut downstream_session, &snapshot).await?;
                     write.flush().await?;
                 }
                 // Lagged (slow client): the gap is unrecoverable, but surface
@@ -2642,6 +2837,13 @@ where
                         match event {
                             LineEvent::Line(line) => match String::from_utf8(line) {
                                 Ok(text) => {
+                                    let msg = match parse_client_line(&text) {
+                                        Ok(msg) => msg,
+                                        Err(error) => {
+                                            write_client_line_error(&mut write, error).await?;
+                                            continue;
+                                        }
+                                    };
                                     // BNC-local commands never reach the
                                     // upstream: CHATHISTORY and MARKREAD are
                                     // served from the PG backlog, and only
@@ -2649,10 +2851,7 @@ where
                                     // non-negotiated CHATHISTORY is not ours
                                     // to intercept).
                                     let mut handled = false;
-                                    if (caps.chathistory || caps.read_marker)
-                                        && let Ok(msg) =
-                                            e6irc_proto::message::Message::parse(&text)
-                                    {
+                                    if caps.chathistory || caps.read_marker {
                                         let cmd = msg.command.to_ascii_uppercase();
                                         let params: Vec<&str> = msg.params.to_vec();
                                         if cmd == "CHATHISTORY" && caps.chathistory {
@@ -2706,12 +2905,8 @@ where
                             // over-long line; tell the client its line was not
                             // relayed rather than swallowing it.
                             LineEvent::TooLong => {
-                                write
-                                    .write_all(
-                                        b":*bnc* NOTICE * :input line too long; not sent upstream\r\n",
-                                    )
+                                write_client_line_error(&mut write, ClientLineError::TooLong)
                                     .await?;
-                                write.flush().await?;
                             }
                         }
                     }
@@ -2744,6 +2939,54 @@ pub mod fuzz {
     pub fn upstream_line(line: String) -> String {
         crate::sanitize::upstream_line(line)
     }
+}
+
+async fn write_irc_session_snapshot<W>(
+    write: &mut W,
+    downstream: &mut IrcSessionState,
+    snapshot: &IrcSessionSnapshot,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
+    let current = downstream
+        .snapshot()
+        .expect("downstream IRC state is initialized before reconciliation");
+    if !casemap.eq(&current.nick, &snapshot.nick) {
+        write
+            .write_all(format!(":{} NICK :{}\r\n", current.nick, snapshot.nick).as_bytes())
+            .await?;
+    }
+    let wanted: std::collections::HashMap<String, &str> = snapshot
+        .channels
+        .iter()
+        .map(|channel| (casemap.casefold(channel), channel.as_str()))
+        .collect();
+    for channel in &current.channels {
+        if !wanted.contains_key(&casemap.casefold(channel)) {
+            write
+                .write_all(
+                    format!(
+                        ":{}!~bnc@e6irc PART {channel} :upstream session reset\r\n",
+                        snapshot.nick
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+        }
+    }
+    for channel in &snapshot.channels {
+        if !downstream.channels.contains_key(&casemap.casefold(channel)) {
+            write
+                .write_all(format!(":{}!~bnc@e6irc JOIN {channel}\r\n", snapshot.nick).as_bytes())
+                .await?;
+        }
+    }
+    downstream.replace(snapshot);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3109,7 +3352,13 @@ mod tests {
         // attach must RETURN (not hang) even though the broadcast never closes.
         let attached = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            attach(server_side, &handle, AttachCaps::default(), "testuser"),
+            attach(
+                server_side,
+                &handle,
+                AttachCaps::default(),
+                "testuser",
+                "testuser",
+            ),
         )
         .await;
         assert!(
@@ -3372,6 +3621,90 @@ mod tests {
     }
 
     #[test]
+    fn irc_session_snapshot_is_authoritative_beyond_the_bounded_buffer() {
+        let (handle, ends) = NetworkHandle::channels(1);
+        assert_eq!(handle.irc_session_snapshot(), None);
+
+        ends.begin_irc_session("Alice".to_string());
+        ends.emit_line(":Alice!u@h JOIN #One".to_string());
+        ends.emit_line(":Alice!u@h JOIN #Two".to_string());
+        // The first JOIN has aged out of the one-line detached buffer, but it
+        // remains current session state.
+        assert_eq!(handle.buffer_snapshot(), vec![":Alice!u@h JOIN #Two"]);
+        assert_eq!(
+            handle.irc_session_snapshot(),
+            Some(IrcSessionSnapshot {
+                nick: "Alice".to_string(),
+                channels: vec!["#One".to_string(), "#Two".to_string()],
+            })
+        );
+
+        ends.emit_line(":Alice!u@h NICK :Alicia".to_string());
+        ends.emit_line(":op!u@h KICK #one Alicia :gone".to_string());
+        assert_eq!(
+            handle.irc_session_snapshot(),
+            Some(IrcSessionSnapshot {
+                nick: "Alicia".to_string(),
+                channels: vec!["#Two".to_string()],
+            })
+        );
+
+        // A new transport starts from no confirmed memberships; old JOINs are
+        // history, not authority over the replacement connection.
+        ends.begin_irc_session("Alicia_".to_string());
+        assert_eq!(
+            handle.irc_session_snapshot(),
+            Some(IrcSessionSnapshot {
+                nick: "Alicia_".to_string(),
+                channels: vec![],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_attach_snapshot_renames_and_rejoins_the_downstream_client() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let (handle, ends) = NetworkHandle::channels(4);
+        ends.begin_irc_session("upstreamNick".to_string());
+        ends.emit_line(":upstreamNick!u@h JOIN #current".to_string());
+        let attach = tokio::spawn(async move {
+            attach(server, &handle, AttachCaps::default(), "alice", "alice").await
+        });
+
+        let mut bytes = vec![0; 4096];
+        let count =
+            tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut bytes))
+                .await
+                .expect("attach output timed out")
+                .expect("read attach output");
+        let output = String::from_utf8_lossy(&bytes[..count]);
+        assert!(output.contains(":alice NICK :upstreamNick\r\n"), "{output}");
+        assert!(
+            output.contains(":upstreamNick!~bnc@e6irc JOIN #current\r\n"),
+            "{output}"
+        );
+        ends.begin_irc_session("upstreamNick2".to_string());
+        let count =
+            tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut bytes))
+                .await
+                .expect("session reset output timed out")
+                .expect("read session reset output");
+        let output = String::from_utf8_lossy(&bytes[..count]);
+        assert!(
+            output.contains(":upstreamNick NICK :upstreamNick2\r\n"),
+            "{output}"
+        );
+        assert!(
+            output.contains(":upstreamNick2!~bnc@e6irc PART #current :upstream session reset\r\n"),
+            "{output}"
+        );
+        drop(client);
+        attach.await.expect("attach task").expect("attach result");
+    }
+
+    #[test]
     fn filter_tags_drops_a_malformed_tag_only_line() {
         // A hostile upstream can store a line that is a leading `@` with no
         // space — a tag section and no message. It must not reach a no-tags
@@ -3393,6 +3726,19 @@ mod tests {
             filter_tags("@time=x PRIVMSG #c :hi", AttachCaps::default()),
             "PRIVMSG #c :hi"
         );
+    }
+
+    #[test]
+    fn downstream_parser_enforces_each_irc_wire_budget_before_relay() {
+        assert!(parse_client_line("PRIVMSG #c :hello").is_ok());
+        assert!(matches!(
+            parse_client_line(&format!("PRIVMSG #c :{}", "x".repeat(500))),
+            Err(ClientLineError::TooLong)
+        ));
+        assert!(matches!(
+            parse_client_line("PRIVMSG #c :bad\0line"),
+            Err(ClientLineError::Malformed)
+        ));
     }
 
     #[test]

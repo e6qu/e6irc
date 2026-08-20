@@ -197,6 +197,13 @@ These are project-wide rules, enforced in review and (where possible) CI:
   - `ConnectionEvent` — the bouncer SPI's connection-state event *cannot
     carry a line*, so a driver can't route text past the line sanitizer and
     detached-buffer append; the bypass is a compile error, not a lint.
+  - `IrcSessionSnapshot` — a BNC's current nick and confirmed channel set live
+    outside its bounded replay ring. Raw IRC and browser attaches reconcile
+    that authoritative snapshot after playback, so an aged-out JOIN, a stale
+    PART, or a reconnect cannot manufacture current membership from history.
+    The IRC driver also derives reconnect-intent deltas from this one tracker;
+    attach state and the next rejoin set cannot parse the same upstream line
+    with two subtly different membership rules.
   - `AttachCapability` — BNC attach capability names, state changes, `CAP LS`,
     and `CAP LIST` derive from one closed set. An attach cannot use SASL without
     negotiating it, and a new capability cannot be accepted but omitted from
@@ -1359,9 +1366,18 @@ above the trait, provides for every network kind:
 - **Playback**: attaching clients receive the full detached ring,
   tag-filtered by their negotiated caps. `CHATHISTORY` paging is served by
   the ircd core (§11) for the local network; on the BNC attach listener it
-  pages the persisted `bnc_buffer` ring directly (LATEST/BEFORE/AFTER by
-  `msgid=` or `timestamp=` selector, plus TARGETS), intercepted on attach
-  and never forwarded upstream.
+  pages the persisted `bnc_buffer` ring directly (LATEST/BEFORE/AFTER/AROUND/
+  BETWEEN by `msgid=` or `timestamp=` selector, plus the two-timestamp TARGETS
+  window), intercepted on attach and never forwarded upstream. One pure
+  oldest-first resolver owns every boundary and direction. Bounded LATEST keeps
+  the newest rows *after* its selector; reverse BETWEEN limits from its first
+  endpoint; TARGETS uses the dedicated `draft/chathistory-targets` batch.
+  Stored timestamps are validated and canonicalized before they become sort
+  keys, and replay emits that same canonical `time=` value.
+- **Authoritative attach state**: replay is followed by an
+  `IrcSessionSnapshot` containing the current upstream nick and confirmed
+  memberships. Raw clients receive the NICK/JOIN/PART reconciliation needed to
+  reach it; `/ws/ui` sends the typed snapshot before its replay boundary.
 - **Operations**: `NetworkHandle` owns a typed lifecycle snapshot plus
   connection attempts/errors, connect latency, attached-client count,
   line/byte traffic, last-activity times, and buffer occupancy. Driver endpoints
@@ -1413,7 +1429,14 @@ one implementation shared with the external-network path.
 
 Downstream clients select a network with the ZNC/soju username convention:
 `alice/libera` (default network configurable; bare `alice` = `local`).
-The web client and REST API address networks explicitly by id.
+The selector's nick and network components are independently validated; the
+slash-bearing selector is routing input, never the downstream IRC identity.
+Registration and later session reconciliation use the actual upstream nick (or
+the validated nick component while no upstream session exists). Attach SASL
+PLAIN accepts an empty authorization identity or the same RFC1459-folded
+identity as its authentication identity; it cannot authenticate one account
+while requesting authorization as another. The web client and REST API address
+networks explicitly by id.
 
 ### 10.5 Bridges: `matrix` / `discord` / `slack` drivers
 
@@ -1485,6 +1508,11 @@ Design constraints recorded now:
   unauthenticated nick. The PostgreSQL read therefore prefers the account-form
   conversation when it exists and otherwise tries the `~nick` form; online
   peers and channels always resolve to one exact target.
+  The BNC persistence path applies the same symmetry to raw external-network
+  lines: an inbound direct message is keyed by its source and a synthesized
+  outbound echo by its recipient, both RFC1459-folded. TARGETS and paging
+  therefore expose one peer buffer containing both directions, including after
+  restart or a nick change between emission and persistence.
 - **11.2 Query surface**: IRCv3 `CHATHISTORY` (BEFORE/AFTER/AROUND/BETWEEN/
   LATEST/TARGETS) for IRC clients; `GET /api/v1/history/...` for the web
   client and API consumers — both hit the same query layer, including direct
@@ -1622,11 +1650,12 @@ client offers a join-channel input and click-to-query on nicks.
 ### 13.2 Live chat over WebSocket
 
 The chat page opens one WS (`/ws/ui`, cookie-authenticated). The server pushes
-typed line, status, and `{"t":"snapshot","v":"complete"}` replay-boundary
-events. Raw line events preserve IRCv3 `time` and `msgid` tags so live and
+typed line, status, authoritative `session` (nick + joined channels), and
+`{"t":"snapshot","v":"complete"}` replay-boundary events. Raw line events preserve IRCv3 `time` and `msgid` tags so live and
 persisted timelines use the same clock and have stable overlap identity. The
 client parses each line, routes it to the right buffer (channel / DM / server),
-maintains the per-channel member list, and renders the active buffer (all via
+maintains the per-channel member list, reconciles stale replay buffers against
+the session event, and renders the active buffer (all via
 DOM APIs, never `innerHTML` on server text, so a hostile upstream line can't
 inject markup). The replay boundary precedes live traffic; only after it does
 the client request authoritative NAMES snapshots, preventing stale detached

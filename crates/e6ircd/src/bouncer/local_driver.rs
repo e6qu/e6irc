@@ -142,6 +142,7 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
             return Stopped;
         }
     }
+    ends.begin_irc_session(session.nick.clone());
     ends.emit(ConnectionEvent::Connected);
 
     loop {
@@ -296,6 +297,12 @@ mod tests {
         let (core_tx, mut core_rx) = core_queue(8);
         let (handle, mut events, task) = spawn_session(core_tx, Vec::new());
         let out_tx = finish_registration(&mut core_rx).await;
+        assert!(matches!(
+            events.recv().await,
+            Ok(super::super::DriverEvent::Session(
+                super::super::IrcSessionSnapshot { ref nick, ref channels }
+            )) if nick == "alice" && channels.is_empty()
+        ));
         assert!(matches!(
             events.recv().await,
             Ok(super::super::DriverEvent::Status(

@@ -5428,10 +5428,12 @@ pub async fn persist_bnc_line(
     pool: &PgPool,
     owner: &str,
     network: &str,
+    own_nick: Option<&str>,
     line: &str,
 ) -> Result<(), DbError> {
     let key = BncBufferKey::new(owner, network);
-    let target = bnc_line_target(line);
+    let target =
+        bnc_line_target(line, own_nick).map(|target| CaseMapping::Rfc1459.casefold(&target));
     let msgid = bnc_line_msgid(line);
     let sent_at = bnc_line_sent_at(line);
     sqlx::query(
@@ -5454,10 +5456,24 @@ pub async fn persist_bnc_line(
 /// the channel or nick a PRIVMSG/NOTICE/TAGMSG was addressed to. Non-message
 /// lines (JOIN, NICK, numerics) return `None` so they are excluded from
 /// target-filtered history without an extra predicate.
-fn bnc_line_target(line: &str) -> Option<String> {
+fn bnc_line_target(line: &str, own_nick: Option<&str>) -> Option<String> {
     let msg = e6irc_proto::message::Message::parse(line).ok()?;
     match msg.command.to_ascii_uppercase().as_str() {
-        "PRIVMSG" | "NOTICE" | "TAGMSG" => msg.params.first().map(|s| s.to_string()),
+        "PRIVMSG" | "NOTICE" | "TAGMSG" => {
+            let addressed = *msg.params.first()?;
+            if addressed.starts_with(['#', '&']) {
+                return Some(addressed.to_string());
+            }
+            let source = msg.source.as_ref()?;
+            let own_nick = own_nick?;
+            if CaseMapping::Rfc1459.eq(source.name, own_nick) {
+                Some(addressed.to_string())
+            } else if source.user.is_some() || source.host.is_some() {
+                Some(source.name.to_string())
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -5467,27 +5483,29 @@ fn bnc_line_target(line: &str) -> Option<String> {
 /// have one, and then only if the upstream sent it; lines without one return
 /// `None` so they store NULL.
 fn bnc_line_msgid(line: &str) -> Option<String> {
-    let rest = line.strip_prefix('@')?;
-    let (tags, _body) = rest.split_once(' ')?;
-    tags.split(';')
-        .find_map(|t| t.strip_prefix("msgid="))
-        .map(String::from)
+    let message = e6irc_proto::message::Message::parse(line).ok()?;
+    let value = message
+        .tags
+        .into_iter()
+        .find(|tag| tag.key == "msgid")?
+        .value?;
+    e6irc_proto::message::valid_message_id(&value).then(|| value.into_owned())
 }
 
-/// The effective message timestamp of a stored raw IRC line: the `time=` tag
-/// verbatim when the upstream sent one, else the bouncer's arrival time as
-/// ISO-8601 UTC. Both forms are `YYYY-MM-DDThh:mm:ss.sssZ`, so they compare
-/// lexically — which is exactly how CHATHISTORY timestamp selectors and
-/// MARKREAD positions use them.
+/// The effective message timestamp of a stored raw IRC line: a valid `time=`
+/// tag canonicalized to millisecond precision, else the bouncer's arrival
+/// time. Stored values therefore share one lexically sortable representation,
+/// which CHATHISTORY timestamp selectors and MARKREAD positions rely on.
 fn bnc_line_sent_at(line: &str) -> String {
-    if let Some(rest) = line.strip_prefix('@')
-        && let Some((tags, _body)) = rest.split_once(' ')
+    if let Ok(message) = e6irc_proto::message::Message::parse(line)
+        && let Some(timestamp) = message
+            .tags
+            .into_iter()
+            .find(|tag| tag.key == "time")
+            .and_then(|tag| tag.value)
+        && let Some(millis) = e6irc_proto::time::parse_server_time_millis(&timestamp)
     {
-        for t in tags.split(';') {
-            if let Some(ts) = t.strip_prefix("time=") {
-                return ts.to_string();
-            }
-        }
+        return e6irc_proto::time::server_time(millis);
     }
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5546,195 +5564,67 @@ pub async fn recent_bnc_lines(
 
 // ---- BNC CHATHISTORY queries ---------------------------------------------
 
-/// The `SELECT id, line FROM bnc_buffer ` prefix shared by every CHATHISTORY
-/// paging query; the argument is the WHERE/ORDER/LIMIT tail (history_select!
-/// precedent above).
-macro_rules! bnc_history_select {
-    ($rest:literal) => {
-        concat!("SELECT id, line FROM bnc_buffer ", $rest)
-    };
-}
-
-/// Normalize a newest-first DESC fetch into oldest-first [`BncHistoryLine`]s.
-fn into_history_rows_desc(mut rows: Vec<(i64, String)>) -> Vec<BncHistoryLine> {
-    rows.reverse();
-    into_history_rows(rows)
-}
-
-/// Map raw `(id, line)` rows to [`BncHistoryLine`]s.
-fn into_history_rows(rows: Vec<(i64, String)>) -> Vec<BncHistoryLine> {
-    rows.into_iter()
-        .map(|(id, line)| BncHistoryLine { id, line })
-        .collect()
-}
-
-/// One stored backlog line with its row id, for CHATHISTORY paging.
+/// One stored backlog line and its ordering metadata, for CHATHISTORY paging.
+#[derive(sqlx::FromRow)]
 pub struct BncHistoryLine {
     pub id: i64,
     pub line: String,
+    pub msgid: Option<String>,
+    pub sent_at: String,
 }
 
-/// The newest `limit` lines for one target in one network, oldest-first.
-/// `at_id` bounds the window inclusively (id ≤ at_id): the `*` selector passes
-/// `None`, a `timestamp=` selector the newest id at or before that instant,
-/// and a `msgid=` selector the id of that exact message.
-pub async fn bnc_history_latest(
+/// Every retained line for one target in protocol order. The per-network
+/// buffer is independently capped, so resolving a CHATHISTORY window over this
+/// closed set cannot produce an unbounded database read. Returning the stored
+/// message id and canonical timestamp lets one pure resolver implement every
+/// selector/subcommand without subtly different SQL boundary semantics.
+pub async fn bnc_history_lines(
     pool: &PgPool,
     owner: &str,
     network: &str,
     target: &str,
-    at_id: Option<i64>,
-    limit: i64,
 ) -> Result<Vec<BncHistoryLine>, DbError> {
     let key = BncBufferKey::new(owner, network);
     let folded = CaseMapping::Rfc1459.casefold(target);
-    // A NULL bound means "no upper bound" (the `*` selector); the shared
-    // predicate below folds both cases into one statement.
-    let rows: Vec<(i64, String)> = sqlx::query_as(bnc_history_select!(
-        "WHERE owner = $1 AND network = $2 AND lower(target) = lower($3) \
-         AND ($4 IS NULL OR id <= $4) ORDER BY id DESC LIMIT $5"
-    ))
-    .bind(&key.owner)
-    .bind(&key.network)
-    .bind(&folded)
-    .bind(at_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .map_err(DbError::Query)?;
-    Ok(into_history_rows_desc(rows))
-}
-
-/// `limit` lines for one target with id strictly less than `before_id`,
-/// oldest-first (CHATHISTORY BEFORE).
-pub async fn bnc_history_before(
-    pool: &PgPool,
-    owner: &str,
-    network: &str,
-    target: &str,
-    before_id: i64,
-    limit: i64,
-) -> Result<Vec<BncHistoryLine>, DbError> {
-    let key = BncBufferKey::new(owner, network);
-    let folded = CaseMapping::Rfc1459.casefold(target);
-    let rows: Vec<(i64, String)> = sqlx::query_as(bnc_history_select!(
-        "WHERE owner = $1 AND network = $2 AND lower(target) = lower($3) AND id < $4 \
-         ORDER BY id DESC LIMIT $5"
-    ))
-    .bind(&key.owner)
-    .bind(&key.network)
-    .bind(&folded)
-    .bind(before_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .map_err(DbError::Query)?;
-    Ok(into_history_rows_desc(rows))
-}
-
-/// `limit` lines for one target with id strictly greater than `after_id`,
-/// oldest-first (CHATHISTORY AFTER).
-pub async fn bnc_history_after(
-    pool: &PgPool,
-    owner: &str,
-    network: &str,
-    target: &str,
-    after_id: i64,
-    limit: i64,
-) -> Result<Vec<BncHistoryLine>, DbError> {
-    let key = BncBufferKey::new(owner, network);
-    let folded = CaseMapping::Rfc1459.casefold(target);
-    let rows: Vec<(i64, String)> = sqlx::query_as(bnc_history_select!(
-        "WHERE owner = $1 AND network = $2 AND lower(target) = lower($3) AND id > $4 \
-         ORDER BY id ASC LIMIT $5"
-    ))
-    .bind(&key.owner)
-    .bind(&key.network)
-    .bind(&folded)
-    .bind(after_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .map_err(DbError::Query)?;
-    Ok(into_history_rows(rows))
-}
-
-/// Resolve a `msgid=X` CHATHISTORY selector to the row id of that message in
-/// one owner/network, if it is still in the backlog.
-pub async fn bnc_history_msgid_row(
-    pool: &PgPool,
-    owner: &str,
-    network: &str,
-    msgid: &str,
-) -> Result<Option<i64>, DbError> {
-    let key = BncBufferKey::new(owner, network);
-    sqlx::query_scalar(
-        "SELECT id FROM bnc_buffer
-         WHERE owner = $1 AND network = $2 AND msgid = $3
-         ORDER BY id DESC LIMIT 1",
-    )
-    .bind(&key.owner)
-    .bind(&key.network)
-    .bind(msgid)
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::Query)
-}
-
-/// Resolve a `timestamp=X` CHATHISTORY selector to the newest row id whose
-/// `sent_at` is at or before that instant, if the backlog reaches that far.
-/// ISO-8601 UTC compares lexically, so no instant parsing is needed.
-pub async fn bnc_history_timestamp_row(
-    pool: &PgPool,
-    owner: &str,
-    network: &str,
-    target: &str,
-    timestamp: &str,
-) -> Result<Option<i64>, DbError> {
-    let key = BncBufferKey::new(owner, network);
-    let folded = CaseMapping::Rfc1459.casefold(target);
-    sqlx::query_scalar(
-        "SELECT id FROM bnc_buffer
-         WHERE owner = $1 AND network = $2 AND lower(target) = lower($3)
-           AND sent_at <= $4
-         ORDER BY id DESC LIMIT 1",
+    sqlx::query_as(
+        "SELECT id, line, msgid, sent_at FROM bnc_buffer
+         WHERE owner = $1 AND network = $2 AND target = $3
+         ORDER BY sent_at ASC, id ASC",
     )
     .bind(&key.owner)
     .bind(&key.network)
     .bind(&folded)
-    .bind(timestamp)
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await
     .map_err(DbError::Query)
 }
 
 /// The distinct conversation targets that still have backlog for one network,
-/// newest-active first, with each target's newest `sent_at` (CHATHISTORY
+/// oldest-active first, with each target's newest `sent_at` (CHATHISTORY
 /// TARGETS; the timestamp lets a client resume each target from its end).
-/// `cutoff` limits the result to targets with activity at or after that
-/// ISO-8601 instant; `None` lists everything.
+/// Both bounds are exclusive, matching draft/chathistory's BETWEEN semantics.
 pub async fn bnc_history_targets(
     pool: &PgPool,
     owner: &str,
     network: &str,
-    cutoff: Option<&str>,
+    min_timestamp: &str,
+    max_timestamp: &str,
     limit: i64,
 ) -> Result<Vec<(String, String)>, DbError> {
     let key = BncBufferKey::new(owner, network);
-    // A NULL cutoff means "no cutoff": `HAVING ($3::text IS NULL OR ...)`
-    // folds both arms into one statement.
     sqlx::query_as(
         "SELECT target, max(sent_at)
          FROM bnc_buffer
          WHERE owner = $1 AND network = $2 AND target IS NOT NULL
          GROUP BY target
-         HAVING ($3::text IS NULL OR max(sent_at) >= $3)
-         ORDER BY max(id) DESC
-         LIMIT $4",
+         HAVING max(sent_at) > $3 AND max(sent_at) < $4
+         ORDER BY max(sent_at) ASC, max(id) ASC
+         LIMIT $5",
     )
     .bind(&key.owner)
     .bind(&key.network)
-    .bind(cutoff)
+    .bind(min_timestamp)
+    .bind(max_timestamp)
     .bind(limit)
     .fetch_all(pool)
     .await
@@ -6766,8 +6656,8 @@ pub async fn revoke_credential(pool: &PgPool, account: &str, id: i64) -> Result<
 #[cfg(test)]
 mod history_sql_tests {
     use super::{
-        DbError, MAX_DATABASE_MILLIS, millis_for_database, millis_from_database,
-        stored_network_kind,
+        DbError, MAX_DATABASE_MILLIS, bnc_line_msgid, bnc_line_sent_at, bnc_line_target,
+        millis_for_database, millis_from_database, stored_network_kind,
     };
     use e6irc_proto::time::Millis;
 
@@ -6809,6 +6699,50 @@ mod history_sql_tests {
                 Err(DbError::InvalidNetworkKind(kind)) if kind == invalid
             ));
         }
+    }
+
+    #[test]
+    fn bnc_direct_messages_share_the_peer_target_in_both_directions() {
+        assert_eq!(
+            bnc_line_target(":alice!u@h PRIVMSG Bob :outbound", Some("ALICE"),),
+            Some("Bob".to_string())
+        );
+        assert_eq!(
+            bnc_line_target(":Bob!u@h PRIVMSG alice :inbound", Some("Alice")),
+            Some("Bob".to_string())
+        );
+        assert_eq!(
+            bnc_line_target(":server.example NOTICE alice :maintenance", Some("alice")),
+            None,
+            "server notices are not direct-message conversations"
+        );
+        assert_eq!(
+            bnc_line_target(":Bob!u@h PRIVMSG #Room :channel", Some("alice")),
+            Some("#Room".to_string())
+        );
+    }
+
+    #[test]
+    fn bnc_history_metadata_is_validated_and_canonicalized() {
+        assert_eq!(
+            bnc_line_msgid("@msgid=abc :s PRIVMSG #x :message"),
+            Some("abc".into())
+        );
+        assert_eq!(
+            bnc_line_msgid("@msgid=abc\\sdef :s PRIVMSG #x :message"),
+            None
+        );
+        assert_eq!(bnc_line_msgid("@msgid= :s PRIVMSG #x :message"), None);
+        assert_eq!(bnc_line_msgid("@msgid :s PRIVMSG #x :message"), None);
+        assert_eq!(
+            bnc_line_sent_at("@time=2026-01-02T03:04:05.6Z :s PRIVMSG #x :message"),
+            "2026-01-02T03:04:05.600Z"
+        );
+        let fallback = bnc_line_sent_at("@time=not-a-timestamp :s PRIVMSG #x :message");
+        assert!(
+            e6irc_proto::time::parse_server_time_millis(&fallback).is_some(),
+            "invalid upstream time must be replaced by a sortable arrival timestamp: {fallback}"
+        );
     }
 
     /// The macro must produce exactly the statement the queries used to spell
