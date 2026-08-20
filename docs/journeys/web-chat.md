@@ -71,14 +71,18 @@ survive process restart.
 
 **Flow.**
 
-1. Attachment subscribes to the network before or as replay boundaries are
-   established, so a message arriving during history load is not lost.
+1. Attachment subscribes and snapshots under the same lock held through line
+   publication, so every message is on exactly one side of the replay/live
+   boundary: neither lost nor duplicated.
 2. Persisted backlog and current driver replay are normalized into line events.
-3. The client uses message identifiers and event identity to deduplicate the
-   history/live overlap.
-4. Server-time determines presentation ordering where supplied; arrival order
+3. The client uses message identifiers and the exact ordered wire overlap at
+   the page boundary to deduplicate history/live overlap without conflating
+   distinct identical messages.
+4. Loading history expands the active buffer by one bounded page, so older
+   context remains visible even when the normal live window was already full.
+5. Server-time determines presentation ordering where supplied; arrival order
    remains the fallback.
-5. Channel and direct-message buffers are created on demand and remain bounded.
+6. Channel and direct-message buffers are created on demand and remain bounded.
 6. When live traffic arrives below a reader's current scroll position, an
    exact-count **jump to latest** control keeps it discoverable without
    interrupting the reader or switching conversations.

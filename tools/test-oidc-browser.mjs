@@ -1111,11 +1111,11 @@ try {
   );
   await page.getByText("This feed never includes request data, IRC traffic, or secrets.", { exact: false }).waitFor();
 
-  const initialBuffer = page.waitForResponse(
-    (response) => response.url() === `${applicationOrigin}/api/v1/me/networks/journey/buffer?limit=1000`,
-  );
+  // Startup replay comes only from the atomic /ws/ui attach boundary. Waiting
+  // for the old duplicate REST snapshot would both encode the race we removed
+  // and make this journey hang when the browser correctly opens only its
+  // socket.
   await page.goto(`${applicationOrigin}/?network=journey`);
-  assert.equal((await initialBuffer).status(), 200);
   const replayedMessage = page.getByText("browser replays through the real stack", { exact: true });
   await replayedMessage.waitFor();
   assert.equal(await replayedMessage.count(), 1);

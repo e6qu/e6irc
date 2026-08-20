@@ -98,6 +98,33 @@ test("history merge deduplicates duplicate stable ids and applies the cap last",
   ]);
 });
 
+test("history merge removes only an ordered unidentified wire overlap", () => {
+  const first = { identity: null, text: "same body", wire: ":n PRIVMSG #c :same body" };
+  const second = { identity: null, text: "same body", wire: ":n PRIVMSG #c :same body" };
+  const boundary = { identity: null, text: "boundary", wire: ":n PRIVMSG #c :boundary" };
+  const liveOnly = { identity: null, text: "live", wire: ":n PRIVMSG #c :live" };
+
+  assert.deepEqual(
+    mergeTimeline([first, second, boundary], [second, boundary, liveOnly], 20),
+    [first, second, boundary, liveOnly],
+    "the largest suffix/prefix overlap is removed while an earlier identical message remains",
+  );
+});
+
+test("history merge retains requested context in front of a full live window", () => {
+  const older = { identity: "old", text: "older" };
+  const live = [
+    { identity: "live-1", text: "live one" },
+    { identity: "live-2", text: "live two" },
+  ];
+
+  assert.deepEqual(
+    mergeTimeline([older], live, 3),
+    [older, ...live],
+    "the expanded explicit-history bound must not discard the row just loaded",
+  );
+});
+
 test("authoritative session channels replace stale replay membership by casefold", () => {
   assert.deepEqual(
     reconcileChannelSnapshot(["#Keep", "#stale"], ["#keep", "#New", "#new"]),

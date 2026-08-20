@@ -177,6 +177,8 @@ pub(super) async fn ws_irc_conn(
                 let data: Vec<u8> = match frame {
                     Some(Ok(WsMessage::Text(t))) => t.as_bytes().to_vec(),
                     Some(Ok(WsMessage::Binary(b))) => b.to_vec(),
+                    // Tungstenite queues matching Pong and Close replies while
+                    // reading control frames; the next read flushes them.
                     Some(Ok(_)) => continue,
                     Some(Err(_)) => {
                         state
@@ -266,11 +268,6 @@ pub(super) async fn ws_ui_conn(
     use crate::bouncer::DriverEvent;
     use tokio::sync::broadcast::error::RecvError;
 
-    // Subscribe BEFORE snapshotting the buffer, so a line the driver emits
-    // during playback is caught by the subscription instead of falling into the
-    // gap between the two (a duplicated backlog line is harmless; a lost one is
-    // not). This mirrors attach()'s ordering — the same invariant over WS.
-    let mut events = handle.subscribe();
     // Watch the stop signal too. The event broadcast never closes while this
     // task holds an `Arc<NetworkHandle>` (the handle keeps a sender), so
     // `RecvError::Closed` alone can never fire — without this, removing or
@@ -294,6 +291,7 @@ pub(super) async fn ws_ui_conn(
     }
     let _attachment = handle.track_attachment();
     let attach_id = handle.next_attachment_id();
+    let (mut events, buffer_snapshot, session_snapshot) = handle.subscribe_with_replay_snapshot();
 
     // Send the current connection status up front: a driver is always-on, so a
     // client attaching to an already-connected network would otherwise see no
@@ -309,7 +307,7 @@ pub(super) async fn ws_ui_conn(
     }
 
     // Playback: everything buffered while detached, as JSON line events.
-    for line in handle.buffer_snapshot() {
+    for line in buffer_snapshot {
         if socket
             .send(WsMessage::text(line_event(&line)))
             .await
@@ -321,7 +319,7 @@ pub(super) async fn ws_ui_conn(
     // A bounded replay is history, not current state. Reconcile the driver's
     // authoritative identity and memberships after it so an aged-out JOIN or a
     // stale PART cannot leave the browser attached to the wrong conversations.
-    if let Some(session) = handle.irc_session_snapshot()
+    if let Some(session) = session_snapshot
         && socket
             .send(WsMessage::text(session_event(&session)))
             .await
@@ -402,6 +400,11 @@ pub(super) async fn ws_ui_conn(
                     {
                         break;
                     }
+                    // Continuing after a lost state-changing line could leave
+                    // the browser on a stale nick or channel set. Detach so its
+                    // ordinary reconnect establishes a fresh atomic replay and
+                    // authoritative session snapshot.
+                    break;
                 }
                 Err(RecvError::Closed) => {
                     send_unavailable(&mut socket).await;
@@ -583,6 +586,12 @@ fn composer_request(frame: &str) -> Result<ComposerRequest, ComposerRequestError
         return Err(ComposerRequestError {
             request_id: frame.id,
             message: "message exceeds the IRC wire limit; nothing was sent",
+        });
+    }
+    if e6irc_proto::message::Message::parse(&line).is_err() {
+        return Err(ComposerRequestError {
+            request_id: frame.id,
+            message: "message is not a complete IRC command; nothing was sent",
         });
     }
     Ok(ComposerRequest {
@@ -858,6 +867,15 @@ mod tests {
             Some("send-3")
         );
         assert!(overlong.message.contains("wire limit"));
+
+        for malformed in [
+            r##"{"id":"send-4","target":"","message":"/raw"}"##,
+            r##"{"id":"send-5","target":"","message":""}"##,
+        ] {
+            let error = composer_request(malformed)
+                .expect_err("an empty IRC command must not be acknowledged as sent");
+            assert!(error.message.contains("nothing was sent"), "{error:?}");
+        }
     }
 
     #[test]

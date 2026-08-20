@@ -636,21 +636,21 @@ fn dropped(failure: super::NetworkFailure) -> super::SessionOutcome {
 /// Build the self-echo line for a client command, or `None` when the command
 /// is not a message an upstream would echo. The prefix is our current
 /// upstream identity (`nick!~ident@host`; `~` because no identd answered),
-/// the client's own tags ride along exactly as a real echo-message would
-/// return them, and a fresh `time=` tag stamps when the bouncer accepted the
-/// line so backlog playback orders it against upstream traffic.
+/// valid client-only tags ride along exactly as a real echo-message would
+/// return them, and a fresh authoritative `time=` tag stamps when the bouncer
+/// accepted the line so backlog playback orders it against upstream traffic.
 fn self_echo(line: &str, nick: &str, ident: &str, host: &str) -> Option<String> {
-    let (tags, body) = match line.strip_prefix('@') {
+    let body = match line.strip_prefix('@') {
         Some(rest) => match rest.split_once(' ') {
-            Some((t, b)) => (Some(t), b),
+            Some((_, body)) => body,
             None => return None,
         },
-        None => (None, line),
+        None => line,
     };
-    let command = body.split(' ').next()?;
-    if !command.eq_ignore_ascii_case("PRIVMSG")
-        && !command.eq_ignore_ascii_case("NOTICE")
-        && !command.eq_ignore_ascii_case("TAGMSG")
+    let parsed = e6irc_proto::message::Message::parse(line).ok()?;
+    if !parsed.command.eq_ignore_ascii_case("PRIVMSG")
+        && !parsed.command.eq_ignore_ascii_case("NOTICE")
+        && !parsed.command.eq_ignore_ascii_case("TAGMSG")
     {
         return None;
     }
@@ -659,9 +659,11 @@ fn self_echo(line: &str, nick: &str, ident: &str, host: &str) -> Option<String> 
         .expect("system clock before 1970")
         .as_millis() as u64;
     let time = e6irc_proto::time::server_time(e6irc_proto::time::Millis::from_millis(now));
-    let all_tags = match tags {
-        Some(t) if !t.is_empty() => format!("time={time};{t}"),
-        _ => format!("time={time}"),
+    let client_tags = crate::sanitize::client_tag_string(&parsed);
+    let all_tags = if client_tags.is_empty() {
+        format!("time={time}")
+    } else {
+        format!("time={time};{client_tags}")
     };
     Some(format!("@{all_tags} :{nick}!~{ident}@{host} {body}"))
 }
@@ -871,6 +873,33 @@ mod tests {
             classify_registration(Ok(Err(error))),
             RegistrationResult::Failed
         ));
+    }
+
+    #[test]
+    fn self_echo_mints_provenance_and_keeps_only_valid_client_tags() {
+        let echo = self_echo(
+            "@time=forged;msgid=forged;+typing=old;+typing=active;+bad.foo=x PRIVMSG #room :hello",
+            "alice",
+            "alice",
+            "irc.example",
+        )
+        .expect("message has an echo");
+        let parsed = e6irc_proto::message::Message::parse(&echo).expect("valid echo");
+        assert_eq!(
+            parsed.tags.iter().filter(|tag| tag.key == "time").count(),
+            1
+        );
+        assert_ne!(
+            parsed.tag("time").and_then(|tag| tag.value.as_deref()),
+            Some("forged")
+        );
+        assert_eq!(parsed.tag("msgid"), None);
+        assert_eq!(
+            parsed.tag("+typing").and_then(|tag| tag.value.as_deref()),
+            Some("active")
+        );
+        assert_eq!(parsed.tag("+bad.foo"), None);
+        assert!(echo.ends_with(" PRIVMSG #room :hello"), "{echo}");
     }
 
     async fn assert_live_driver(network: &str, addr: &str, autojoin: &[&str]) {
