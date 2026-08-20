@@ -646,8 +646,15 @@ pub(crate) enum RouteResult {
     Deliver(String, String),
     /// A PRIVMSG to `target` that maps to no bridged channel — surface loss.
     Unmapped(String),
-    /// Not a deliverable message command (control/other) — ignore quietly.
-    Ignore,
+    /// The bridge cannot execute this command; surface a fixed safe reason.
+    Rejected(BridgeCommandRejection),
+}
+
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BridgeCommandRejection {
+    MalformedMessage,
+    UnsupportedCommand,
 }
 
 /// Classify a downstream client line for a bridge: the single choke point all
@@ -660,20 +667,26 @@ pub(crate) enum RouteResult {
 /// server splits — so this splits it and routes each independently. A single
 /// STATUSMSG prefix (`@#chan`/`+#chan`) is stripped before the lookup: a bridge
 /// has no op/voice-only concept, so it delivers to the channel itself. An empty
-/// or non-PRIVMSG line yields a single `Ignore`.
+/// or non-PRIVMSG line yields one explicit rejection.
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 pub(crate) fn route_privmsg(
     line: &str,
     targets: &std::collections::HashMap<String, String>,
 ) -> Vec<RouteResult> {
     let Ok(msg) = e6irc_proto::message::Message::parse(line) else {
-        return vec![RouteResult::Ignore];
+        return vec![RouteResult::Rejected(
+            BridgeCommandRejection::MalformedMessage,
+        )];
     };
     if !msg.command.eq_ignore_ascii_case("PRIVMSG") {
-        return vec![RouteResult::Ignore];
+        return vec![RouteResult::Rejected(
+            BridgeCommandRejection::UnsupportedCommand,
+        )];
     }
     let (Some(target), Some(text)) = (msg.params.first(), msg.params.get(1)) else {
-        return vec![RouteResult::Ignore];
+        return vec![RouteResult::Rejected(
+            BridgeCommandRejection::MalformedMessage,
+        )];
     };
     let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
     let mut out: Vec<RouteResult> = target
@@ -692,7 +705,9 @@ pub(crate) fn route_privmsg(
         })
         .collect();
     if out.is_empty() {
-        out.push(RouteResult::Ignore);
+        out.push(RouteResult::Rejected(
+            BridgeCommandRejection::MalformedMessage,
+        ));
     }
     out
 }
@@ -733,7 +748,9 @@ pub(crate) async fn relay_routed<F, Fut>(
             RouteResult::Unmapped(target) => {
                 ends.emit_line(unmapped_target_notice(platform, kind, &target));
             }
-            RouteResult::Ignore => {}
+            RouteResult::Rejected(rejection) => {
+                ends.emit_line(rejected_bridge_command_notice(platform, rejection));
+            }
         }
     }
 }
@@ -1150,13 +1167,7 @@ pub(crate) enum ClientLineError {
 pub(crate) fn parse_client_line(
     text: &str,
 ) -> Result<e6irc_proto::message::Message<'_>, ClientLineError> {
-    let (tag_len, body_len) = match text.strip_prefix('@').and_then(|rest| rest.split_once(' ')) {
-        Some((tags, body)) => (tags.len() + 2, body.len()),
-        None => (0, text.len()),
-    };
-    if tag_len > e6irc_proto::message::MAX_CLIENT_TAGS_LEN
-        || body_len > e6irc_proto::message::MAX_LINE_LEN - 2
-    {
+    if !e6irc_proto::message::client_frame_fits(text.as_bytes()) {
         return Err(ClientLineError::TooLong);
     }
     e6irc_proto::message::Message::parse(text).map_err(|_| ClientLineError::Malformed)
@@ -1180,7 +1191,13 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverEvent {
     /// A classified upstream connection state change.
-    Status(DriverConnectionStatus),
+    Status {
+        status: DriverConnectionStatus,
+        /// Monotonic within this driver instance. An attacher uses the sticky
+        /// runtime revision to discard status events that were queued before
+        /// its initial status snapshot.
+        revision: u64,
+    },
     /// One line received from upstream (CRLF stripped).
     Line(String),
     /// A safe component notice for attached clients. It intentionally does not
@@ -1206,7 +1223,7 @@ impl DriverEvent {
     pub(crate) fn display_line(&self) -> Option<&str> {
         match self {
             Self::Line(line) | Self::Notice(line) => Some(line),
-            Self::Status(_) | Self::Echo { .. } | Self::Session(_) => None,
+            Self::Status { .. } | Self::Echo { .. } | Self::Session(_) => None,
         }
     }
 }
@@ -1254,7 +1271,7 @@ impl IrcSessionState {
             }
             "JOIN" if is_us(source_nick) => {
                 if let Some(channels) = message.params.first() {
-                    for channel in channels.split(',') {
+                    for channel in channels.split(',').filter(|channel| !channel.is_empty()) {
                         self.channels
                             .insert(casemap.casefold(channel), channel.to_string());
                     }
@@ -1262,7 +1279,7 @@ impl IrcSessionState {
             }
             "PART" if is_us(source_nick) => {
                 if let Some(channels) = message.params.first() {
-                    for channel in channels.split(',') {
+                    for channel in channels.split(',').filter(|channel| !channel.is_empty()) {
                         self.channels.remove(&casemap.casefold(channel));
                     }
                 }
@@ -1271,12 +1288,12 @@ impl IrcSessionState {
                 let channels: Vec<&str> = message
                     .params
                     .first()
-                    .map(|value| value.split(',').collect())
+                    .map(|value| value.split(',').filter(|item| !item.is_empty()).collect())
                     .unwrap_or_default();
                 let targets: Vec<&str> = message
                     .params
                     .get(1)
-                    .map(|value| value.split(',').collect())
+                    .map(|value| value.split(',').filter(|item| !item.is_empty()).collect())
                     .unwrap_or_default();
                 if channels.len() == targets.len() {
                     for (channel, target) in channels.into_iter().zip(targets) {
@@ -1362,6 +1379,14 @@ fn status_notice(status: DriverConnectionStatus) -> String {
             failure.code()
         ),
     }
+}
+
+pub(crate) fn accept_status_revision(last_seen: &mut u64, candidate: u64) -> bool {
+    if candidate <= *last_seen {
+        return false;
+    }
+    *last_seen = candidate;
+    true
 }
 
 /// A downstream line queued for the upstream, tagged with the attachment
@@ -1613,6 +1638,7 @@ impl FailureRecord {
 #[derive(Debug, Clone)]
 pub struct NetworkRuntimeSnapshot {
     pub lifecycle: NetworkLifecycle,
+    pub(crate) status_revision: u64,
     pub state_changed_at: e6irc_proto::time::Millis,
     /// When the next reconnect attempt fires, while the driver is waiting
     /// to retry; `None` when connected or parked.
@@ -1638,6 +1664,7 @@ pub struct NetworkRuntimeSnapshot {
 
 struct NetworkRuntimeState {
     phase: NetworkRuntimePhase,
+    status_revision: u64,
     /// The last few classified failures, newest last — a flap pattern is a
     /// sequence, and "last error" alone hides it. Bounded; runtime state is
     /// restart-ephemeral by design.
@@ -1738,6 +1765,7 @@ impl NetworkRuntime {
         Self {
             state: std::sync::Mutex::new(NetworkRuntimeState {
                 phase: NetworkRuntimePhase::Connecting,
+                status_revision: 0,
                 recent_failures: std::collections::VecDeque::new(),
                 state_changed_at: epoch_millis(),
                 attempt_started: std::time::Instant::now(),
@@ -1783,7 +1811,7 @@ impl NetworkRuntime {
         state.attempt_started = std::time::Instant::now();
     }
 
-    fn connected(&self) {
+    fn connected(&self) -> u64 {
         let mut state = self.state.lock().expect("network runtime poisoned");
         if state.connection_attempts == 0 {
             state.connection_attempts = 1;
@@ -1798,9 +1826,14 @@ impl NetworkRuntime {
                 .as_millis()
                 .min(u64::MAX as u128) as u64,
         );
+        state.status_revision = state
+            .status_revision
+            .checked_add(1)
+            .expect("network status revision exhausted");
+        state.status_revision
     }
 
-    fn failed(&self, disposition: FailureDisposition, failure: NetworkFailure) {
+    fn failed(&self, disposition: FailureDisposition, failure: NetworkFailure) -> u64 {
         let now = epoch_millis();
         let mut state = self.state.lock().expect("network runtime poisoned");
         state.phase = match disposition {
@@ -1811,6 +1844,11 @@ impl NetworkRuntime {
         };
         state.state_changed_at = now;
         Self::set_error(&mut state, now, failure);
+        state.status_revision = state
+            .status_revision
+            .checked_add(1)
+            .expect("network status revision exhausted");
+        state.status_revision
     }
 
     fn operational_error(&self, failure: NetworkFailure) {
@@ -1948,6 +1986,15 @@ pub(crate) fn unmapped_target_notice(platform: &str, kind: &str, target: &str) -
 pub(crate) fn undelivered_notice(platform: &str, kind: &str, target: &str) -> String {
     let shown = truncate_on_char_boundary(target, 64);
     format!(":*bnc* NOTICE * :not delivered: {platform} send to {kind} {shown} failed")
+}
+
+#[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+fn rejected_bridge_command_notice(platform: &str, rejection: BridgeCommandRejection) -> String {
+    let reason = match rejection {
+        BridgeCommandRejection::MalformedMessage => "malformed PRIVMSG",
+        BridgeCommandRejection::UnsupportedCommand => "the bridge supports PRIVMSG only",
+    };
+    format!(":*bnc* NOTICE * :not delivered to {platform}: {reason}")
 }
 
 /// `s` cut to at most `max` bytes, never inside a character.
@@ -2156,18 +2203,6 @@ impl NetworkHandle {
         self.shutdown.subscribe()
     }
 
-    /// The current upstream connection state. Unlike the `Connected` event
-    /// this is not lost to subscribe timing — safe to poll after `start`.
-    pub fn is_connected(&self) -> bool {
-        self.runtime
-            .state
-            .lock()
-            .expect("network runtime poisoned")
-            .phase
-            .lifecycle()
-            == NetworkLifecycle::Connected
-    }
-
     /// Count one attached client until the returned guard is dropped.
     pub fn track_attachment(&self) -> NetworkAttachment {
         let telemetry = self
@@ -2191,6 +2226,7 @@ impl NetworkHandle {
         let buffer = self.buffer.lock().expect("buffer poisoned");
         NetworkRuntimeSnapshot {
             lifecycle: state.phase.lifecycle(),
+            status_revision: state.status_revision,
             state_changed_at: state.state_changed_at,
             next_retry_at: state.phase.next_retry_at(),
             recent_failures: state.recent_failures.iter().copied().collect(),
@@ -2231,6 +2267,7 @@ impl NetworkHandle {
         let state = self.runtime.state.lock().expect("network runtime poisoned");
         NetworkRuntimeState {
             phase: state.phase,
+            status_revision: state.status_revision,
             recent_failures: state.recent_failures.clone(),
             state_changed_at: state.state_changed_at,
             attempt_started: state.attempt_started,
@@ -2493,10 +2530,13 @@ impl DriverEnds {
     pub fn emit(&self, event: ConnectionEvent) {
         let (broadcast, notice) = match event {
             ConnectionEvent::Connected => {
-                self.runtime.connected();
+                let revision = self.runtime.connected();
                 eprintln!("bnc: {} connected", self.runtime.label());
                 (
-                    DriverEvent::Status(DriverConnectionStatus::Connected),
+                    DriverEvent::Status {
+                        status: DriverConnectionStatus::Connected,
+                        revision,
+                    },
                     format!(
                         ":*bnc* NOTICE * :component connected: {}",
                         self.runtime.label()
@@ -2534,7 +2574,7 @@ impl DriverEnds {
                         unreachable!("connected handled before failure transition")
                     }
                 };
-                self.runtime.failed(disposition, failure);
+                let revision = self.runtime.failed(disposition, failure);
                 if let Some(telemetry) = self
                     .telemetry
                     .lock()
@@ -2558,7 +2598,7 @@ impl DriverEnds {
                 }
                 let state = status.lifecycle().as_str();
                 (
-                    DriverEvent::Status(status),
+                    DriverEvent::Status { status, revision },
                     lifecycle_notice(state, failure, diagnostic),
                 )
             }
@@ -2759,7 +2799,9 @@ where
     // state now rather than only at the next connect/disconnect transition — the
     // same up-front status `/ws/ui` sends over WebSocket. Live status events
     // below include the classified failure when the upstream is not connected.
-    let status: &[u8] = if handle.is_connected() {
+    let runtime = handle.runtime_snapshot();
+    let mut status_revision = runtime.status_revision;
+    let status: &[u8] = if runtime.lifecycle == NetworkLifecycle::Connected {
         b":*bnc* NOTICE * :upstream connected\r\n"
     } else {
         b":*bnc* NOTICE * :upstream disconnected\r\n"
@@ -2814,7 +2856,10 @@ where
                         write.flush().await?;
                     }
                 }
-                Ok(DriverEvent::Status(status)) => {
+                Ok(DriverEvent::Status { status, revision }) => {
+                    if !accept_status_revision(&mut status_revision, revision) {
+                        continue;
+                    }
                     write.write_all(status_notice(status).as_bytes()).await?;
                     write.write_all(b"\r\n").await?;
                     write.flush().await?;
@@ -3275,7 +3320,10 @@ mod tests {
         ends.emit(ConnectionEvent::Connected);
         assert_eq!(
             events.try_recv(),
-            Ok(DriverEvent::Status(DriverConnectionStatus::Connected))
+            Ok(DriverEvent::Status {
+                status: DriverConnectionStatus::Connected,
+                revision: 1,
+            })
         );
         assert!(matches!(events.try_recv(), Ok(DriverEvent::Line(_))));
 
@@ -3283,7 +3331,13 @@ mod tests {
             NetworkFailure::ConnectionLost,
         ));
         let reconnecting = DriverConnectionStatus::Reconnecting(NetworkFailure::ConnectionLost);
-        assert_eq!(events.try_recv(), Ok(DriverEvent::Status(reconnecting)));
+        assert_eq!(
+            events.try_recv(),
+            Ok(DriverEvent::Status {
+                status: reconnecting,
+                revision: 2,
+            })
+        );
         assert!(matches!(events.try_recv(), Ok(DriverEvent::Line(_))));
         assert_eq!(
             status_notice(reconnecting),
@@ -3297,10 +3351,49 @@ mod tests {
         ));
         assert_eq!(
             events.try_recv(),
-            Ok(DriverEvent::Status(
-                DriverConnectionStatus::RegistrationFailed(NetworkFailure::InvalidNickname)
-            ))
+            Ok(DriverEvent::Status {
+                status: DriverConnectionStatus::RegistrationFailed(NetworkFailure::InvalidNickname),
+                revision: 3,
+            })
         );
+    }
+
+    #[test]
+    fn sticky_status_revision_rejects_every_pre_snapshot_transition() {
+        let (handle, ends) = NetworkHandle::channels(8);
+        let mut events = handle.subscribe();
+
+        ends.emit(ConnectionEvent::Connected);
+        ends.emit(ConnectionEvent::Reconnecting(
+            NetworkFailure::ConnectionLost,
+        ));
+        let snapshot = handle.runtime_snapshot();
+        assert_eq!(snapshot.lifecycle, NetworkLifecycle::Reconnecting);
+        assert_eq!(snapshot.status_revision, 2);
+
+        let mut last_seen = snapshot.status_revision;
+        let queued_revisions: Vec<u64> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                DriverEvent::Status { revision, .. } => Some(revision),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(queued_revisions, vec![1, 2]);
+        assert!(
+            queued_revisions
+                .into_iter()
+                .all(|revision| !accept_status_revision(&mut last_seen, revision))
+        );
+
+        ends.emit(ConnectionEvent::Connected);
+        let revision = std::iter::from_fn(|| events.try_recv().ok())
+            .find_map(|event| match event {
+                DriverEvent::Status { revision, .. } => Some(revision),
+                _ => None,
+            })
+            .expect("new status event");
+        assert!(accept_status_revision(&mut last_seen, revision));
+        assert_eq!(last_seen, 3);
     }
 
     #[test]
@@ -3530,6 +3623,19 @@ mod tests {
                 .any(|line| line == &failure_notice(NetworkFailure::UpstreamWriteFailed)),
             "the component diagnostic is retained: {lines:#?}"
         );
+
+        let routed = route_privmsg("JOIN #a", &map);
+        relay_routed(&ends, routed, "Test", "channel", |_id, _text| async {
+            Ok(())
+        })
+        .await;
+        assert!(
+            handle
+                .buffer_snapshot()
+                .iter()
+                .any(|line| line.contains("bridge supports PRIVMSG only")),
+            "an unsupported bridge command must fail visibly"
+        );
     }
 
     #[test]
@@ -3656,6 +3762,18 @@ mod tests {
     }
 
     #[test]
+    fn bouncer_buffer_and_live_event_preserve_the_server_tag_allowance() {
+        let (handle, ends) = NetworkHandle::channels(4);
+        let mut events = handle.subscribe();
+        let tagged = format!("@example={} :srv NOTICE nick :ok", "a".repeat(600));
+        assert!(tagged.len() > e6irc_proto::message::MAX_LINE_LEN - 2);
+
+        ends.emit_line(tagged.clone());
+        assert_eq!(handle.buffer_snapshot(), vec![tagged.clone()]);
+        assert_eq!(events.try_recv(), Ok(DriverEvent::Line(tagged)));
+    }
+
+    #[test]
     fn restored_backlog_is_neutralized_like_live_lines() {
         // Backlog comes back from storage, which outlives the code that wrote
         // it. A row containing an embedded line break must not be replayed to
@@ -3681,11 +3799,9 @@ mod tests {
         assert_eq!(handle.irc_session_snapshot(), None);
 
         ends.begin_irc_session("Alice".to_string());
-        ends.emit_line(":Alice!u@h JOIN #One".to_string());
-        ends.emit_line(":Alice!u@h JOIN #Two".to_string());
-        // The first JOIN has aged out of the one-line detached buffer, but it
-        // remains current session state.
-        assert_eq!(handle.buffer_snapshot(), vec![":Alice!u@h JOIN #Two"]);
+        ends.emit_line(":Alice!u@h JOIN #One,,#Two".to_string());
+        ends.emit_line(":srv NOTICE Alice :joined".to_string());
+        assert_eq!(handle.buffer_snapshot(), vec![":srv NOTICE Alice :joined"]);
         assert_eq!(
             handle.irc_session_snapshot(),
             Some(IrcSessionSnapshot {
@@ -3695,7 +3811,7 @@ mod tests {
         );
 
         ends.emit_line(":Alice!u@h NICK :Alicia".to_string());
-        ends.emit_line(":op!u@h KICK #one Alicia :gone".to_string());
+        ends.emit_line(":op!u@h KICK #one,#two Alicia,Other :gone".to_string());
         assert_eq!(
             handle.irc_session_snapshot(),
             Some(IrcSessionSnapshot {

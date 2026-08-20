@@ -144,7 +144,7 @@ current network and conversation selection.
    available for retry, so displayed success means server-side queue
    admission—not merely a browser socket write.
 4. JOIN/NAMES/NICK/PART/KICK/QUIT events maintain member state and buffer
-   labels.
+   labels, including comma-separated membership targets and multi-target KICK.
 5. Direct messages create query buffers. Closing a query removes only the
    local view; leaving a channel sends PART and waits for the resulting state.
 6. Inactive conversations retain both unread traffic and unread direct-mention
@@ -160,7 +160,8 @@ close are different actions and remain different in both UI and wire behavior.
 
 **Security and observability.** The browser serializes and the server parses a
 closed composer shape before deriving the complete IRC line, then the driver
-and core validate it again. Pending sends, buffers, members, and sent-history
+and core validate its independent tag/body budgets again. Pending sends,
+buffers, members, and sent-history
 are bounded; acceptance/refusal is correlated by opaque request identifier and
 message bodies stay out of metrics.
 

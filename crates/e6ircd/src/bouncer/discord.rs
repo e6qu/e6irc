@@ -626,10 +626,12 @@ mod tests {
             route_privmsg("PRIVMSG #other :x", &map),
             vec![RouteResult::Unmapped("#other".to_string())]
         );
-        // A non-message command is ignored quietly.
+        // A non-message command is refused explicitly.
         assert_eq!(
             route_privmsg("JOIN #general", &map),
-            vec![RouteResult::Ignore]
+            vec![RouteResult::Rejected(
+                crate::bouncer::BridgeCommandRejection::UnsupportedCommand
+            )]
         );
     }
 

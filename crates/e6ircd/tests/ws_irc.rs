@@ -142,18 +142,16 @@ async fn dedicated_ws_listener_serves_irc_at_root() {
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
         .await
         .expect("ws connect at root");
-    ws.send(Tung::text("NICK wsroot\r\nUSER w 0 * :W"))
-        .await
-        .unwrap();
+    ws.send(Tung::text("NICK wsroot")).await.unwrap();
+    ws.send(Tung::text("USER w 0 * :W")).await.unwrap();
     let welcome = read_until(&mut ws, " 001 ").await;
     assert!(welcome.contains("wsroot"), "{welcome}");
 }
 
-/// The ircv3 WebSocket transport allows several complete IRC messages in one
-/// frame (CRLF-separated); the server must parse each. Both registration lines
-/// in a single frame must still register the client.
+/// IRCv3 WebSocket requires exactly one unterminated IRC line per message. An
+/// embedded CRLF must reject the whole frame, never execute its second command.
 #[tokio::test]
-async fn ws_multiple_messages_in_one_frame() {
+async fn ws_embedded_line_delimiter_cannot_forge_a_second_command() {
     let running = net::start(config()).await.expect("start");
     let http = running.http_addr.expect("http");
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{http}/ws/irc"))
@@ -162,6 +160,10 @@ async fn ws_multiple_messages_in_one_frame() {
     ws.send(Tung::text("NICK multi\r\nUSER m 0 * :M"))
         .await
         .unwrap();
+    let failure = read_until(&mut ws, "INVALID_MESSAGE").await;
+    assert!(failure.contains("Malformed line"), "{failure}");
+    ws.send(Tung::text("NICK multi")).await.unwrap();
+    ws.send(Tung::text("USER m 0 * :M")).await.unwrap();
     let welcome = read_until(&mut ws, " 001 ").await;
     assert!(welcome.contains("multi"), "{welcome}");
 }
@@ -175,7 +177,10 @@ async fn ws_binary_frame_is_accepted() {
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{http}/ws/irc"))
         .await
         .expect("ws connect");
-    ws.send(Tung::binary(b"NICK binclient\r\nUSER b 0 * :B".to_vec()))
+    ws.send(Tung::binary(b"NICK binclient".to_vec()))
+        .await
+        .unwrap();
+    ws.send(Tung::binary(b"USER b 0 * :B".to_vec()))
         .await
         .unwrap();
     let welcome = read_until(&mut ws, " 001 ").await;

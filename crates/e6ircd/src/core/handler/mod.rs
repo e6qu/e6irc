@@ -321,13 +321,7 @@ pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {
         );
         return;
     };
-    // Length limits per message-tags: 4096 bytes of client tag section
-    // (including '@' and the separating space), 510 for the rest.
-    let (tag_len, body_len) = match text.strip_prefix('@').and_then(|t| t.split_once(' ')) {
-        Some((tags, rest)) => (tags.len() + 2, rest.len()),
-        None => (0, text.len()),
-    };
-    if tag_len > 4096 || body_len > 510 {
+    if !e6irc_proto::message::client_frame_fits(text.as_bytes()) {
         state.numeric(conn, ERR_INPUTTOOLONG, &[], Some("Input line was too long"));
         return;
     }

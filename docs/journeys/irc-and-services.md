@@ -16,8 +16,10 @@ trusts the configured TLS endpoint when TLS is used.
 
 1. Open a configured plaintext or TLS listener. A trusted load balancer may
    supply PROXY protocol v2 only where that listener explicitly permits it.
-2. Frame input at the IRC line limit; invalid or overlong input receives a
-   protocol error or disconnect instead of truncation.
+2. Frame input at the IRC line limit and check the message-tag and traditional
+   body allowances independently; invalid or overlong input receives a
+   protocol error or disconnect instead of truncation. IRC-over-WebSocket
+   accepts exactly one unterminated IRC line per WebSocket message.
 3. Negotiate `CAP LS 302`, request supported capabilities, and complete SASL
    where required.
 4. Submit NICK and USER. Nick, user, host/IP, real name, registration rate,

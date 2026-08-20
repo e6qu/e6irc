@@ -8,13 +8,12 @@ use super::*;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 
-/// Inbound WebSocket frame cap. The tungstenite default (64 MiB message /
-/// 16 MiB frame) is buffered whole *before* the LineBuffer can enforce the
-/// IRC frame limit — an ingress asymmetry the raw-TCP path doesn't have (it
-/// emits TooLong while streaming, never buffering megabytes). 64 KiB is
-/// generous for pipelined IRC lines or a UI command while bounding what one
-/// unauthenticated socket can pin.
-const MAX_WS_FRAME: usize = 64 * 1024;
+/// IRCv3 WebSocket carries exactly one CRLF-stripped IRC line per message, so
+/// the protocol's full client frame allowance is also the transport cap.
+const MAX_IRC_WS_FRAME: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN;
+/// JSON can escape one input byte as six ASCII bytes. Bound the UI envelope
+/// before deserialization while admitting every wire-sized composer command.
+const MAX_UI_WS_FRAME: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN * 6 + 512;
 
 /// Outbound WebSocket frame discipline, fixed for the connection by ircv3
 /// subprotocol negotiation (<https://ircv3.net/specs/extensions/websocket>).
@@ -70,8 +69,8 @@ pub(super) async fn ws_irc(
         _ => WsFrameMode::Auto,
     };
     let mut upgrade = ws
-        .max_message_size(MAX_WS_FRAME)
-        .max_frame_size(MAX_WS_FRAME);
+        .max_message_size(MAX_IRC_WS_FRAME)
+        .max_frame_size(MAX_IRC_WS_FRAME);
     if let Some(proto) = chosen {
         upgrade = upgrade.protocols([proto]);
     }
@@ -106,8 +105,6 @@ pub(super) async fn ws_irc_conn(
     conn: crate::core::ConnId,
 ) {
     use crate::core::{Input, Output};
-    use e6irc_proto::framing::LineBuffer;
-
     // Held for the whole connection; its Drop releases the per-IP slot.
     let (out_tx, mut out_rx) = e6irc_queue::queue::<Output>(e6irc_queue::Config {
         name: "ws-sendq",
@@ -132,9 +129,6 @@ pub(super) async fn ws_irc_conn(
         return;
     }
     let core_tx = state.core_tx.clone();
-    let mut framing = LineBuffer::new(e6irc_proto::message::MAX_CLIENT_FRAME_LEN);
-    let mut events = Vec::new();
-
     'conn: loop {
         tokio::select! {
             // Outbound: a core Output line becomes one text frame.
@@ -188,10 +182,16 @@ pub(super) async fn ws_irc_conn(
                     }
                     None => break,
                 };
-                let mut with_nl = data;
-                with_nl.push(b'\n');
-                framing.feed(&with_nl, &mut events);
-                if !crate::core::push_framed(&core_tx, conn, &mut events).await {
+                // IRCv3 WebSocket messages are already framed: one message is
+                // one IRC line, with no CR/LF terminator. Feed the whole value
+                // to the parser so an embedded delimiter is rejected as one
+                // malformed command rather than forged into a second command.
+                let input = if e6irc_proto::message::client_frame_fits(&data) {
+                    Input::Line { conn, line: data }
+                } else {
+                    Input::OverlongLine { conn }
+                };
+                if core_tx.push(input).await.is_err() {
                     break 'conn; // core gone: stop the connection directly
                 }
             }
@@ -256,8 +256,8 @@ pub(super) async fn ws_ui(
     let Some(handle) = registry.get_owned(&account, &params.network) else {
         return problem(StatusCode::NOT_FOUND, "No such network", None);
     };
-    ws.max_message_size(MAX_WS_FRAME)
-        .max_frame_size(MAX_WS_FRAME)
+    ws.max_message_size(MAX_UI_WS_FRAME)
+        .max_frame_size(MAX_UI_WS_FRAME)
         .on_upgrade(move |socket| ws_ui_conn(handle, socket))
 }
 
@@ -298,6 +298,7 @@ pub(super) async fn ws_ui_conn(
     // status until the next connect/disconnect transition. The sticky flag
     // exists precisely to close this subscribe-timing gap.
     let runtime = handle.runtime_snapshot();
+    let mut status_revision = runtime.status_revision;
     if socket
         .send(WsMessage::text(runtime_status_event(&runtime)))
         .await
@@ -373,7 +374,10 @@ pub(super) async fn ws_ui_conn(
                         break;
                     }
                 }
-                Ok(DriverEvent::Status(status)) => {
+                Ok(DriverEvent::Status { status, revision }) => {
+                    if !crate::bouncer::accept_status_revision(&mut status_revision, revision) {
+                        continue;
+                    }
                     if socket
                         .send(WsMessage::text(driver_status_event(status)))
                         .await
@@ -571,6 +575,12 @@ struct ComposerRequestError {
 
 /// Parse and bound one browser composer frame.
 fn composer_request(frame: &str) -> Result<ComposerRequest, ComposerRequestError> {
+    if frame.len() > MAX_UI_WS_FRAME {
+        return Err(ComposerRequestError {
+            request_id: None,
+            message: "composer request exceeds the bounded envelope",
+        });
+    }
     let frame = serde_json::from_str::<ComposerFrame>(frame).map_err(|_| ComposerRequestError {
         request_id: None,
         message: "invalid composer request",
@@ -582,7 +592,7 @@ fn composer_request(frame: &str) -> Result<ComposerRequest, ComposerRequestError
             message: "message contains an invalid line delimiter; nothing was sent",
         });
     }
-    if line.len() > e6irc_proto::message::MAX_LINE_LEN - 2 {
+    if !e6irc_proto::message::client_frame_fits(line.as_bytes()) {
         return Err(ComposerRequestError {
             request_id: frame.id,
             message: "message exceeds the IRC wire limit; nothing was sent",
@@ -716,12 +726,15 @@ pub(super) enum ConnStatus {
 }
 
 fn runtime_status_event(runtime: &crate::bouncer::NetworkRuntimeSnapshot) -> String {
-    let status = if runtime.lifecycle == crate::bouncer::NetworkLifecycle::Connected {
-        ConnStatus::Connected
+    let (status, reason) = if runtime.lifecycle == crate::bouncer::NetworkLifecycle::Connected {
+        (ConnStatus::Connected, None)
     } else {
-        ConnStatus::Disconnected
+        (
+            ConnStatus::Disconnected,
+            runtime.last_error.map(|failure| failure.summary()),
+        )
     };
-    status_event(status, runtime.last_error.map(|failure| failure.summary()))
+    status_event(status, reason)
 }
 
 fn driver_status_event(status: crate::bouncer::DriverConnectionStatus) -> String {
@@ -744,6 +757,23 @@ pub(super) fn status_event(status: ConnStatus, reason: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connected_sticky_status_does_not_serialize_a_historical_failure() {
+        let (handle, ends) = crate::bouncer::NetworkHandle::channels(8);
+        ends.emit(crate::bouncer::ConnectionEvent::Reconnecting(
+            crate::bouncer::NetworkFailure::ConnectionLost,
+        ));
+        ends.emit(crate::bouncer::ConnectionEvent::Connected);
+
+        let event: serde_json::Value =
+            serde_json::from_str(&runtime_status_event(&handle.runtime_snapshot()))
+                .expect("status event JSON");
+        assert_eq!(
+            event,
+            serde_json::json!({ "t": "status", "v": "connected" })
+        );
+    }
 
     #[test]
     fn ui_line_event_preserves_message_identity_and_server_time() {
@@ -867,6 +897,27 @@ mod tests {
             Some("send-3")
         );
         assert!(overlong.message.contains("wire limit"));
+
+        let tagged = serde_json::json!({
+            "id": "send-tags",
+            "target": "",
+            "message": format!("/raw @example={} PING", "a".repeat(600)),
+        })
+        .to_string();
+        assert!(
+            composer_request(&tagged)
+                .expect("the independent client-tag allowance")
+                .line
+                .starts_with("@example=")
+        );
+
+        let oversized_envelope = "x".repeat(MAX_UI_WS_FRAME + 1);
+        assert!(
+            composer_request(&oversized_envelope)
+                .expect_err("oversized JSON envelope")
+                .message
+                .contains("bounded envelope")
+        );
 
         for malformed in [
             r##"{"id":"send-4","target":"","message":"/raw"}"##,

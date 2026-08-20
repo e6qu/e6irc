@@ -26,15 +26,16 @@ async fn upstream() -> std::net::SocketAddr {
 /// checking the authoritative state closes both sides of that race.
 async fn wait_connected(handle: &NetworkHandle) {
     let mut events = handle.subscribe();
-    if handle.is_connected() {
+    if handle.runtime_snapshot().lifecycle == e6ircd::bouncer::NetworkLifecycle::Connected {
         return;
     }
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match events.recv().await {
-                Ok(e6ircd::bouncer::DriverEvent::Status(
-                    e6ircd::bouncer::DriverConnectionStatus::Connected,
-                )) => return,
+                Ok(e6ircd::bouncer::DriverEvent::Status {
+                    status: e6ircd::bouncer::DriverConnectionStatus::Connected,
+                    ..
+                }) => return,
                 Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     panic!("driver event stream closed before connecting");

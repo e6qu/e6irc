@@ -228,7 +228,7 @@ fn document() -> serde_json::Value {
         "200": { "description": "buffered lines", "content": { "application/json": {
             "schema": { "type": "object", "required": ["lines"], "additionalProperties": false,
                 "properties": { "lines": { "type": "array", "maxItems": 1000,
-                    "items": { "type": "string", "maxLength": 510 } } }
+                    "items": { "type": "string", "maxLength": e6irc_proto::message::MAX_SERVER_FRAME_LEN } } }
             }
         } } }
     });
@@ -269,7 +269,7 @@ fn document() -> serde_json::Value {
                     }
                 },
                 "recent_lines": { "type": "array", "maxItems": 100,
-                    "items": { "type": "string", "maxLength": 510 } }
+                    "items": { "type": "string", "maxLength": e6irc_proto::message::MAX_SERVER_FRAME_LEN } }
             }
         }),
     );

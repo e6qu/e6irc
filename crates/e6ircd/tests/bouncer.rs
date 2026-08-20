@@ -3,8 +3,8 @@
 //! buffers upstream traffic.
 
 use e6ircd::bouncer::{
-    DriverConnectionStatus, DriverEvent, IrcNetwork, NetworkConfig, NetworkHandle, SendOutcome,
-    preflight_irc,
+    DriverConnectionStatus, DriverEvent, IrcNetwork, NetworkConfig, NetworkHandle,
+    NetworkLifecycle, SendOutcome, preflight_irc,
 };
 use e6ircd::config::{Config, ListenerConfig, NetworkKind};
 use e6ircd::net;
@@ -32,20 +32,23 @@ async fn wait_connected(
     handle: &NetworkHandle,
     events: &mut tokio::sync::broadcast::Receiver<DriverEvent>,
 ) {
-    if handle.is_connected() {
+    if handle.runtime_snapshot().lifecycle == NetworkLifecycle::Connected {
         return;
     }
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match events.recv().await {
-                Ok(DriverEvent::Status(DriverConnectionStatus::Connected)) => return,
-                Ok(DriverEvent::Status(status))
+                Ok(DriverEvent::Status {
+                    status: DriverConnectionStatus::Connected,
+                    ..
+                }) => return,
+                Ok(DriverEvent::Status { status, .. })
                     if !matches!(status, DriverConnectionStatus::Reconnecting(_)) =>
                 {
                     panic!("driver disconnected before connecting");
                 }
                 Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    if handle.is_connected() {
+                    if handle.runtime_snapshot().lifecycle == NetworkLifecycle::Connected {
                         return;
                     }
                 }
@@ -184,7 +187,10 @@ async fn driver_reconnects_after_upstream_drop() {
     let disconnected = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match events.recv().await {
-                Ok(DriverEvent::Status(DriverConnectionStatus::Reconnecting(_))) => return true,
+                Ok(DriverEvent::Status {
+                    status: DriverConnectionStatus::Reconnecting(_),
+                    ..
+                }) => return true,
                 Ok(_) => {}
                 Err(_) => return false,
             }
@@ -303,9 +309,10 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
                 Ok(DriverEvent::Line(l)) if l.contains("after the bad line") => {
                     return (saw_bad_line, saw_rejection, disconnected_before_after);
                 }
-                Ok(DriverEvent::Status(DriverConnectionStatus::Reconnecting(_))) => {
-                    disconnected_before_after = true
-                }
+                Ok(DriverEvent::Status {
+                    status: DriverConnectionStatus::Reconnecting(_),
+                    ..
+                }) => disconnected_before_after = true,
                 Ok(_) => {}
                 Err(_) => panic!("driver stopped"),
             }
@@ -1333,7 +1340,10 @@ async fn silent_upstream_trips_keepalive_and_reconnects() {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             match events.recv().await {
-                Ok(DriverEvent::Status(DriverConnectionStatus::Reconnecting(_))) => break,
+                Ok(DriverEvent::Status {
+                    status: DriverConnectionStatus::Reconnecting(_),
+                    ..
+                }) => break,
                 Ok(_) => {}
                 Err(_) => panic!("event stream ended before the keepalive trip"),
             }

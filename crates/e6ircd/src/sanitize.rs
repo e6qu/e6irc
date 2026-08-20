@@ -14,8 +14,8 @@
 //!
 //! Client input has already had CR/LF/NUL rejected by the parser, so for it only
 //! the position-specific rules remain. **Upstream** bytes (bridge relays) have
-//! not, so [`upstream_line`] neutralizes those first. Length bounding and
-//! wire-limit fitting are a separate concern and live with delivery
+//! not, so [`upstream_line`] neutralizes those first. Generated-field length
+//! bounding and wire-limit fitting are a separate concern and live with delivery
 //! (`truncate_chars`, `fit_trailing`, `fit_relayed_text`) over
 //! `e6irc_proto::message::truncate_on_char_boundary`.
 
@@ -87,8 +87,12 @@ pub(crate) fn upstream_line(line: String) -> String {
     } else {
         line
     };
-    e6irc_proto::message::truncate_on_char_boundary(&line, e6irc_proto::message::MAX_LINE_LEN - 2)
-        .to_string()
+    if e6irc_proto::message::server_frame_fits(line.as_bytes()) {
+        line
+    } else {
+        ":e6irc NOTICE * :upstream input rejected: server line exceeds an IRC wire budget"
+            .to_string()
+    }
 }
 
 /// Longest client-only tag key relayed. The whole tag section is bounded, but
@@ -357,10 +361,14 @@ mod tests {
     }
 
     #[test]
-    fn upstream_line_fits_one_irc_frame_on_a_character_boundary() {
-        let safe = upstream_line("𝄞".repeat(200));
-        assert!(safe.len() <= e6irc_proto::message::MAX_LINE_LEN - 2);
-        assert!(std::str::from_utf8(safe.as_bytes()).is_ok());
+    fn upstream_line_preserves_server_tags_and_rejects_an_overlong_body_loudly() {
+        let tagged = format!("@example={} :srv NOTICE nick :ok", "𝄞".repeat(200));
+        assert!(tagged.len() > e6irc_proto::message::MAX_LINE_LEN - 2);
+        assert_eq!(upstream_line(tagged.clone()), tagged);
+
+        let rejected = upstream_line("𝄞".repeat(200));
+        assert!(rejected.contains("upstream input rejected"));
+        assert!(e6irc_proto::message::server_frame_fits(rejected.as_bytes()));
     }
 
     #[test]

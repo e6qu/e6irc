@@ -1218,7 +1218,10 @@ async fn openapi_spec_is_served() {
     let buffer = &v["paths"]["/api/v1/me/networks/{name}/buffer"]["get"]["responses"]["200"]["content"]
         ["application/json"]["schema"]["properties"]["lines"];
     assert_eq!(buffer["maxItems"], 1_000);
-    assert_eq!(buffer["items"]["maxLength"], 510);
+    assert_eq!(
+        buffer["items"]["maxLength"],
+        e6irc_proto::message::MAX_SERVER_FRAME_LEN
+    );
     let runtime_failures = &v["paths"]["/api/v1/me/networks/{name}"]["get"]["responses"]["200"]["content"]
         ["application/json"]["schema"]["properties"]["runtime"]["oneOf"][1]["properties"]["recent_failures"];
     assert_eq!(

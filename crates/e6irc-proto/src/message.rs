@@ -29,6 +29,33 @@ pub const MAX_CLIENT_FRAME_LEN: usize = MAX_CLIENT_TAGS_LEN + MAX_LINE_LEN - 2;
 /// larger server tag budget (server-time, msgid, account, batch, …).
 pub const MAX_SERVER_FRAME_LEN: usize = MAX_SERVER_TAGS_LEN + MAX_LINE_LEN - 2;
 
+fn frame_fits(line: &[u8], tags_budget: usize) -> bool {
+    let body_budget = MAX_LINE_LEN - 2;
+    if !line.starts_with(b"@") {
+        return line.len() <= body_budget;
+    }
+    let Some(space) = line.iter().position(|byte| *byte == b' ') else {
+        // Syntactically malformed tag-only input is left for the parser to
+        // classify, but it still cannot consume more than the tag allowance.
+        return line.len() <= tags_budget;
+    };
+    let tags_len = space + 1;
+    tags_len <= tags_budget && line.len() - tags_len <= body_budget
+}
+
+/// Whether one CRLF-stripped client→server line fits both independent IRC
+/// budgets. Checking only their sum lets an untagged message borrow the whole
+/// tag allowance and exceed the traditional 512-byte line limit.
+pub fn client_frame_fits(line: &[u8]) -> bool {
+    frame_fits(line, MAX_CLIENT_TAGS_LEN)
+}
+
+/// Whether one CRLF-stripped server→client line fits both independent IRC
+/// budgets, including the larger server message-tag allowance.
+pub fn server_frame_fits(line: &[u8]) -> bool {
+    frame_fits(line, MAX_SERVER_TAGS_LEN)
+}
+
 /// Whether a value is a usable IRCv3 message identifier. Message IDs are
 /// required values and are later reused as command parameters, so a leading
 /// `:` or wire whitespace would change their meaning outside the tag section.
@@ -452,6 +479,22 @@ mod tests {
 
     fn msg(line: &str) -> Message<'_> {
         Message::parse(line).expect(line)
+    }
+
+    #[test]
+    fn frame_budgets_are_independent_and_directional() {
+        assert!(server_frame_fits(&vec![b'x'; MAX_LINE_LEN - 2]));
+        assert!(!server_frame_fits(&vec![b'x'; MAX_LINE_LEN - 1]));
+
+        let server_tags = format!("@{} PING", "a".repeat(MAX_SERVER_TAGS_LEN - 2));
+        assert!(server_frame_fits(server_tags.as_bytes()));
+        assert!(!client_frame_fits(server_tags.as_bytes()));
+
+        let client_tags = format!("@{} PING", "a".repeat(MAX_CLIENT_TAGS_LEN - 2));
+        assert!(client_frame_fits(client_tags.as_bytes()));
+        let oversized_body = format!("@a {}", "x".repeat(MAX_LINE_LEN - 1));
+        assert!(!server_frame_fits(oversized_body.as_bytes()));
+        assert!(!client_frame_fits(oversized_body.as_bytes()));
     }
 
     #[test]
