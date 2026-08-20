@@ -74,6 +74,10 @@ const joinInput = el("join-input");
 const joinButton = el("join-form")?.querySelector("button[type=submit]");
 
 const MAX_LINES = 500;
+// Explicit history loading may add one full API page in front of the live
+// window. Keep both sides bounded without immediately throwing the requested
+// older context away just because the live window already reached MAX_LINES.
+const MAX_LOADED_LINES = 1500;
 // Bounds against a hostile upstream that streams distinct channels/senders or a
 // giant NAMES list: buffers and per-channel members can't grow without limit.
 const MAX_BUFFERS = 200;
@@ -163,7 +167,6 @@ let myNick = null;
 let socket = null;
 let upstreamConnected = false;
 let snapshotComplete = false;
-let initialReplay = new Map();
 let memberTracking = true;
 let nextSendId = 0;
 const pendingSends = new Map();
@@ -668,7 +671,7 @@ function lineTime(tags, useCurrentTime = true) {
   };
 }
 
-function addLine(bufName, kind, bufKind, from, text, tags = null) {
+function addLine(bufName, kind, bufKind, from, text, tags = null, wire = null) {
   const b = ensureBuffer(bufName, bufKind);
   // A highlight: someone else's channel/DM message that names us.
   const mention = kind === "msg" && from != null && !isMe(from) && mentionsMe(text);
@@ -679,10 +682,12 @@ function addLine(bufName, kind, bufKind, from, text, tags = null) {
     kind,
     mention,
     identity: messageIdentity(tags),
+    wire,
   };
   maybeNotify(b, line);
   b.lines.push(line);
-  if (b.lines.length > MAX_LINES) b.lines.shift();
+  const lineLimit = b.historyLoaded ? MAX_LOADED_LINES : MAX_LINES;
+  if (b.lines.length > lineLimit) b.lines.shift();
   if (b.key === active) {
     const atLatest = isAtLatest();
     messagesEl.appendChild(messageRow(line));
@@ -842,7 +847,7 @@ function handleLine(raw) {
       const kind = m.command === "NOTICE" ? "notice" : "msg";
       const r = asMessage(kind, m.nick, text);
       if (isChannel(target) || buffers.get(fold(target))?.kind === "channel") {
-        addLine(target, r.kind, "channel", r.from, r.text, m.tags);
+        addLine(target, r.kind, "channel", r.from, r.text, m.tags, raw);
       } else if (
         target === "*" ||
         target === "" ||
@@ -850,12 +855,12 @@ function handleLine(raw) {
       ) {
         // A server / global notice (e.g. the bouncer's *bnc* control messages):
         // show it in the server buffer, not a phantom DM keyed on the sender.
-        addLine(SERVER, r.kind, "server", r.from, r.text, m.tags);
+        addLine(SERVER, r.kind, "server", r.from, r.text, m.tags, raw);
       } else {
         // A direct message: key the buffer by the other party — the sender,
         // unless the sender is us (a message we sent to `target`).
         const buf = isMe(m.nick) ? target : m.nick || target;
-        addLine(buf, r.kind, "dm", r.from, r.text, m.tags);
+        addLine(buf, r.kind, "dm", r.from, r.text, m.tags, raw);
       }
       break;
     }
@@ -974,21 +979,6 @@ function handleLine(raw) {
       // part (the trailing) when there is one, else the whole line.
       addServer(m.params.length ? m.params[m.params.length - 1] : raw);
   }
-}
-
-function rememberInitialReplay(lines) {
-  initialReplay = new Map();
-  for (const line of lines) {
-    initialReplay.set(line, (initialReplay.get(line) ?? 0) + 1);
-  }
-}
-
-function isInitialReplay(line) {
-  const count = initialReplay.get(line) ?? 0;
-  if (count === 0) return false;
-  if (count === 1) initialReplay.delete(line);
-  else initialReplay.set(line, count - 1);
-  return true;
 }
 
 // ---- socket + composer --------------------------------------------------
@@ -1144,7 +1134,7 @@ function connect() {
       return;
     }
     if (event.type === "line") {
-      if (snapshotComplete || !isInitialReplay(event.value)) handleLine(event.value);
+      handleLine(event.value);
     }
     else if (event.type === "sent") {
       if (!acceptPendingSend(event.value)) {
@@ -1167,7 +1157,6 @@ function connect() {
       setStatus(`${network}: upstream reconnecting${why}`, "error");
     } else if (event.type === "snapshot") {
       snapshotComplete = true;
-      initialReplay.clear();
       if (upstreamConnected) resyncMemberships();
     } else if (event.type === "session") {
       applySessionSnapshot(event.nick, event.channels);
@@ -1400,9 +1389,9 @@ function renderNetworkPicker(networks, failure = null) {
 // ---- load earlier history ----------------------------------------------
 
 // Pull the network's persisted backlog and prepend the active buffer's older
-// messages. Both persisted and live raw lines retain server-time and msgid
-// tags, so overlap has a stable identity and a consistent clock. One-shot per
-// buffer.
+// messages. Persisted and live raw lines retain any upstream identity tags;
+// exact ordered wire overlap handles servers that do not send msgids. One-shot
+// per buffer.
 async function loadEarlier() {
   const b = buffers.get(active);
   if (!network || !b || b.kind === "server" || b.historyLoaded) return;
@@ -1448,34 +1437,18 @@ async function loadEarlier() {
       kind: rendered.kind,
       mention: false,
       identity: messageIdentity(m.tags),
+      wire: raw,
     });
   }
   // History is older context, never authority over the live buffer. Messages
   // can arrive while this request is in flight, and local echoes may not exist
   // in persisted input at all, so replacing `b.lines` loses user-visible data.
   // Stable msgids suppress true overlap; unidentified rows are retained.
-  b.lines = mergeTimeline(rebuilt, b.lines, MAX_LINES);
+  b.lines = mergeTimeline(rebuilt, b.lines, MAX_LOADED_LINES);
   b.historyLoaded = true;
   // Loading older context is an explicit reader action. Keep that context in
   // view instead of snapping back to the live edge where it cannot be seen.
   if (b.key === active) renderActive({ atLatest: false });
-}
-
-async function loadInitialBacklog() {
-  try {
-    const lines = backlogFrom(
-      await apiGet(
-        `/api/v1/me/networks/${encodeURIComponent(network)}/buffer?limit=1000`,
-      ),
-    );
-    rememberInitialReplay(lines);
-    for (const line of lines) handleLine(line);
-    clearAlert("history");
-  } catch (error) {
-    const message = errorMessage("load initial messages", error);
-    addServer(message);
-    showAlert("history", message, "error");
-  }
 }
 
 const loadEarlierBtn = el("load-earlier");
@@ -1612,7 +1585,6 @@ async function boot() {
       selected.kind === "local";
   }
 
-  await loadInitialBacklog();
   connect();
 }
 

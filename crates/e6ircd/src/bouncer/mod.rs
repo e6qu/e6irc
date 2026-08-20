@@ -1116,11 +1116,10 @@ pub(crate) fn filter_tags(line: &str, caps: AttachCaps) -> String {
         return line.to_string();
     };
     // A leading `@` with no following space is a tag section with no message
-    // body — a malformed line no well-formed upstream produces, but a hostile
-    // one can, and it must not reach a client as an un-negotiated `@`-prefixed
-    // line. There is nothing deliverable in it, so it is dropped entirely.
+    // body. Do not turn it into a blank IRC line: surface the whole-line loss
+    // with a bounded valid NOTICE, independent of hostile input.
     let Some((tags, body)) = rest.split_once(' ') else {
-        return String::new();
+        return ":*bnc* NOTICE * :upstream line omitted: malformed IRC message".to_string();
     };
     let kept: Vec<&str> = tags
         .split(';')
@@ -1574,7 +1573,8 @@ fn emit_failure_notice(
     failure: NetworkFailure,
 ) {
     let line = crate::sanitize::upstream_line(failure_notice(failure));
-    buffer.lock().expect("buffer poisoned").push(line.clone());
+    let mut buffer = buffer.lock().expect("buffer poisoned");
+    buffer.push(line.clone());
     let event = if matches!(
         failure,
         NetworkFailure::BacklogStorageFailed | NetworkFailure::BacklogStorageLagged
@@ -1583,6 +1583,7 @@ fn emit_failure_notice(
     } else {
         DriverEvent::Line(line)
     };
+    // Keep the replay boundary atomic for failure lines too.
     drop(events.send(event));
 }
 
@@ -2093,6 +2094,24 @@ impl NetworkHandle {
         self.buffer.lock().expect("buffer poisoned").snapshot()
     }
 
+    /// Establish one exact boundary between detached-buffer/session replay and
+    /// live delivery. Buffered emitters hold these same locks until their event
+    /// has been published, so every line and its state effect are either in the
+    /// snapshots or receivable from `events`, never both and never neither.
+    pub(crate) fn subscribe_with_replay_snapshot(
+        &self,
+    ) -> (
+        tokio::sync::broadcast::Receiver<DriverEvent>,
+        Vec<String>,
+        Option<IrcSessionSnapshot>,
+    ) {
+        let irc_session = self.irc_session.lock().expect("IRC session state poisoned");
+        let buffer = self.buffer.lock().expect("buffer poisoned");
+        let events = self.events.subscribe();
+        let snapshot = buffer.snapshot();
+        (events, snapshot, irc_session.snapshot())
+    }
+
     /// Authoritative IRC identity/membership state, when this driver represents
     /// an IRC session. Bridge drivers that do not model an IRC identity return
     /// `None` rather than inventing one.
@@ -2391,11 +2410,8 @@ impl DriverEnds {
     /// identity. This clears memberships from the previous transport; JOIN
     /// confirmations repopulate them through [`DriverEnds::emit_line`].
     pub fn begin_irc_session(&self, nick: String) {
-        let snapshot = self
-            .irc_session
-            .lock()
-            .expect("IRC session state poisoned")
-            .begin(nick);
+        let mut irc_session = self.irc_session.lock().expect("IRC session state poisoned");
+        let snapshot = irc_session.begin(nick);
         drop(self.events.send(DriverEvent::Session(snapshot)));
     }
 
@@ -2430,10 +2446,8 @@ impl DriverEnds {
 
     fn emit_buffered_line(&self, line: String, count_as_input: bool) {
         let line = crate::sanitize::upstream_line(line);
-        self.irc_session
-            .lock()
-            .expect("IRC session state poisoned")
-            .observe(&line);
+        let mut irc_session = self.irc_session.lock().expect("IRC session state poisoned");
+        irc_session.observe(&line);
         if count_as_input {
             self.runtime.record_input(line.len());
             if let Some(telemetry) = self
@@ -2445,12 +2459,12 @@ impl DriverEnds {
                 telemetry.record_bnc_input(line.len());
             }
         }
-        self.buffer
-            .lock()
-            .expect("buffer poisoned")
-            .push(line.clone());
+        let mut buffer = self.buffer.lock().expect("buffer poisoned");
+        buffer.push(line.clone());
         // A detached network legitimately has no live subscribers; the line is
-        // still retained in the buffer above.
+        // still retained in the buffer above. Keep the buffer lock through the
+        // publish: attach takes that lock before subscribing and snapshotting,
+        // which makes the replay/live boundary atomic.
         drop(self.events.send(DriverEvent::Line(line)));
     }
 
@@ -2467,10 +2481,8 @@ impl DriverEnds {
     pub fn emit_echo(&self, line: String, origin: u64) {
         let line = crate::sanitize::upstream_line(line);
         self.runtime.record_input(line.len());
-        self.buffer
-            .lock()
-            .expect("buffer poisoned")
-            .push(line.clone());
+        let mut buffer = self.buffer.lock().expect("buffer poisoned");
+        buffer.push(line.clone());
         drop(self.events.send(DriverEvent::Echo { line, origin }));
     }
 
@@ -2713,11 +2725,6 @@ where
 
     let (mut read, mut write) = tokio::io::split(stream);
 
-    // Subscribe BEFORE snapshotting the buffer, so a line the driver emits
-    // during playback is caught by the subscription instead of falling into
-    // the gap between the two (a duplicated backlog line is harmless; a lost
-    // one is not). This mirrors the persistence task's ordering.
-    let mut events = handle.events.subscribe();
     // Detach the client if the network is removed. The broadcast does not close
     // on its own (the registry's `NetworkHandle` keeps an events sender), so
     // without this an attached client would linger on a stopped network — its
@@ -2745,6 +2752,7 @@ where
     }
     let _attachment = handle.track_attachment();
     let attach_id = handle.next_attachment_id();
+    let (mut events, buffer_snapshot, session_snapshot) = handle.subscribe_with_replay_snapshot();
 
     // Send the current upstream connection status up front, so a client that
     // attaches to an already-connected (or still-reconnecting) network learns the
@@ -2762,12 +2770,12 @@ where
     // client didn't negotiate stripped.
     let mut downstream_session = IrcSessionState::default();
     downstream_session.begin(downstream_nick.to_string());
-    for line in handle.buffer_snapshot() {
+    for line in buffer_snapshot {
         downstream_session.observe(&line);
         write.write_all(filter_tags(&line, caps).as_bytes()).await?;
         write.write_all(b"\r\n").await?;
     }
-    if let Some(snapshot) = handle.irc_session_snapshot() {
+    if let Some(snapshot) = session_snapshot {
         write_irc_session_snapshot(&mut write, &mut downstream_session, &snapshot).await?;
     }
     write.flush().await?;
@@ -2815,8 +2823,10 @@ where
                     write_irc_session_snapshot(&mut write, &mut downstream_session, &snapshot).await?;
                     write.flush().await?;
                 }
-                // Lagged (slow client): the gap is unrecoverable, but surface
-                // it rather than dropping upstream lines silently.
+                // A retained live-event gap cannot be repaired without risking
+                // stale NICK/channel state. Surface it and detach; a reconnect
+                // establishes a fresh atomic replay and authoritative session
+                // snapshot instead of continuing a corrupted IRC session.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     write
                         .write_all(
@@ -2825,6 +2835,7 @@ where
                         )
                         .await?;
                     write.flush().await?;
+                    return Ok(());
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
@@ -3209,6 +3220,50 @@ mod tests {
                 ":*bnc* NOTICE * :component authentication_failed: The upstream rejected the configured credentials. (authentication_rejected)".to_string(),
                 ":*bnc* NOTICE * :component registration_failed: The upstream rejected the configured nickname. (invalid_nickname); upstream: no detail from upstream".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn replay_boundary_delivers_every_buffered_line_exactly_once() {
+        let (handle, ends) = NetworkHandle::channels(8);
+        ends.emit_line(":upstream PRIVMSG #room :before boundary".into());
+
+        ends.begin_irc_session("upstream".into());
+        let (mut events, snapshot, session) = handle.subscribe_with_replay_snapshot();
+        assert_eq!(snapshot, vec![":upstream PRIVMSG #room :before boundary"]);
+        assert_eq!(
+            session,
+            Some(IrcSessionSnapshot {
+                nick: "upstream".into(),
+                channels: vec![],
+            })
+        );
+        assert_eq!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty),
+            "a replayed line must not also be queued as live traffic"
+        );
+
+        ends.emit_line(":upstream PRIVMSG #room :after boundary".into());
+        assert_eq!(
+            events.try_recv(),
+            Ok(DriverEvent::Line(
+                ":upstream PRIVMSG #room :after boundary".into()
+            )),
+            "a post-boundary line must be delivered live"
+        );
+        assert_eq!(
+            snapshot,
+            vec![":upstream PRIVMSG #room :before boundary"],
+            "the immutable replay side cannot acquire a live line"
+        );
+
+        ends.emit_line(":upstream!u@h JOIN #after".into());
+        assert!(
+            session
+                .as_ref()
+                .is_some_and(|session| session.channels.is_empty()),
+            "post-boundary membership must arrive only through the event stream"
         );
     }
 
@@ -3705,12 +3760,17 @@ mod tests {
     }
 
     #[test]
-    fn filter_tags_drops_a_malformed_tag_only_line() {
+    fn filter_tags_surfaces_a_malformed_tag_only_line() {
         // A hostile upstream can store a line that is a leading `@` with no
         // space — a tag section and no message. It must not reach a no-tags
         // client as a `@`-prefixed line; there is nothing deliverable, so it is
-        // dropped. (Found by the bouncer fuzz target.)
-        assert_eq!(filter_tags("@time=x;msgid=1", AttachCaps::default()), "");
+        // replaced with a safe, visible notice. (Found by the bouncer fuzz
+        // target.)
+        let notice = ":*bnc* NOTICE * :upstream line omitted: malformed IRC message";
+        assert_eq!(
+            filter_tags("@time=x;msgid=1", AttachCaps::default()),
+            notice
+        );
         assert_eq!(
             filter_tags(
                 "@time=x",
@@ -3719,7 +3779,7 @@ mod tests {
                     ..AttachCaps::default()
                 }
             ),
-            ""
+            notice
         );
         // A well-formed line (tags then a space then a body) is unaffected.
         assert_eq!(

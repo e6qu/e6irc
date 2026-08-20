@@ -22,6 +22,9 @@ pub(crate) async fn handle_chathistory(
     caps: AttachCaps,
     params: &[&str],
 ) -> std::io::Result<()> {
+    if !caps.batch {
+        return fail(write, "NEED_CAPS", "batch and draft/chathistory required").await;
+    }
     let Some(sub) = params.first() else {
         return fail(write, "INVALID_PARAMS", "missing subcommand").await;
     };
@@ -405,8 +408,8 @@ async fn targets(
 
     // TARGETS is itself batched; the inner lines carry the per-target newest
     // timestamp so a client can resume each conversation from its end. A
-    // client that negotiated draft/chathistory has batch too (the spec
-    // requires it), so the reply is always wrapped.
+    // handler rejects a missing batch capability above, so this reply is always
+    // wrapped.
     let inner: Vec<String> = rows
         .iter()
         .map(|(t, newest)| format!(":*bnc* CHATHISTORY TARGETS {t} {newest}\r\n"))
@@ -615,6 +618,31 @@ mod tests {
         ] {
             assert!(HistorySelector::parse(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[tokio::test]
+    async fn chathistory_refuses_an_unbatched_success() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let (handle, _ends) = NetworkHandle::channels(4);
+        handle_chathistory(
+            &handle,
+            &mut server,
+            AttachCaps {
+                chathistory: true,
+                ..AttachCaps::default()
+            },
+            &["LATEST", "#room", "*", "10"],
+        )
+        .await
+        .expect("write capability failure");
+        server.shutdown().await.expect("close server half");
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.expect("read reply");
+        assert!(reply.contains("FAIL CHATHISTORY NEED_CAPS"), "{reply}");
+        assert!(
+            reply.contains("batch and draft/chathistory required"),
+            "{reply}"
+        );
     }
 
     #[test]

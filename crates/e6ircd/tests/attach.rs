@@ -5,7 +5,7 @@
 use e6ircd::bouncer::{IrcNetwork, NetworkConfig, NetworkHandle, attach};
 use e6ircd::config::{Config, ListenerConfig};
 use e6ircd::net;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 async fn upstream() -> std::net::SocketAddr {
     let config = Config {
@@ -210,6 +210,57 @@ async fn two_clients_attach_to_one_always_on_network() {
         .expect("a client missed the broadcast");
         assert!(got.contains("PRIVMSG #multi"), "{got}");
     }
+}
+
+/// Once a downstream falls behind the bounded broadcast, continuing would
+/// leave its nick/channel model dependent on whichever state-changing lines
+/// happened to be dropped. The BNC surfaces the gap and closes so reconnect
+/// starts from an authoritative replay instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn lagged_attach_is_not_left_open_with_stale_session_state() {
+    let (handle, ends) = NetworkHandle::channels(8);
+    let handle = std::sync::Arc::new(handle);
+    let (client, server) = tokio::io::duplex(64);
+    let attach_handle = handle.clone();
+    let task = tokio::spawn(async move {
+        attach(
+            server,
+            &attach_handle,
+            Default::default(),
+            "attacher",
+            "attacher",
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while handle.runtime_snapshot().attached_clients == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("attach did not establish its replay boundary");
+
+    // The tiny duplex blocks the attach writer while this burst overruns its
+    // 1024-event receiver. A PART is included so silently continuing would be
+    // observably unsafe, not merely a missing chat line.
+    for sequence in 0..1_500 {
+        ends.emit_line(format!(":peer PRIVMSG #room :burst {sequence}"));
+    }
+    ends.emit_line(":attacher!u@h PART #room :gone".into());
+
+    let mut reader = BufReader::new(client);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut output = String::new();
+        reader.read_to_string(&mut output).await.unwrap();
+        output
+    })
+    .await
+    .expect("lagged attach did not close");
+    assert!(output.contains("client too slow"), "{output}");
+    task.await
+        .expect("attach task panicked")
+        .expect("attach returned an I/O error");
 }
 
 /// Attach one downstream client over an in-memory duplex; returns the read

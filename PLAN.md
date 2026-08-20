@@ -59,9 +59,16 @@ retry through the failed writer. Administrators also have a bounded live server
 log for fixed operational error classes. It excludes request data, IRC traffic,
 and secrets; the durable audit log remains the source for privileged actions.
 The BNC and browser attach paths now reconcile a typed authoritative IRC
-session snapshot after bounded replay. Raw attach registration uses the actual
-upstream nick, malformed downstream lines fail loudly, and SASL PLAIN cannot
-request a different authorization identity. External-network history stores
+session snapshot after bounded replay. Their subscription and buffer snapshot
+form one atomic replay/live boundary, and a client that overruns bounded live
+delivery is visibly detached instead of retaining stale session state. Browser
+startup consumes that socket replay once; later history merges only stable
+message identifiers and exact ordered wire overlap, and retains the requested
+page ahead of a full live window under an expanded finite bound. Raw attach registration
+uses the actual upstream nick, malformed downstream/browser composer lines fail
+loudly, CHATHISTORY requires batching, and SASL PLAIN cannot request a different
+authorization identity. Synthesized echoes preserve validated client-only tags
+but mint their own timestamp provenance. External-network history stores
 both direct-message directions under one RFC1459-folded peer, validates its
 metadata, and implements the complete LATEST/BEFORE/AFTER/AROUND/BETWEEN plus
 two-bound TARGETS surface through one tested window resolver. The browser

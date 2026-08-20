@@ -20,34 +20,6 @@ fn is_ctcp_action(text: &str) -> bool {
         || text.starts_with("\u{1}ACTION\u{1}")
 }
 
-pub(super) fn client_tag_string(msg: &Message) -> String {
-    // De-duplicate on key, last occurrence winning — the parser's own `tag()`
-    // accessor resolves a repeated key that way, so relaying `+x=a;+x=b`
-    // verbatim would emit a duplicate-key (technically-malformed) tag section
-    // that clients could disagree about. Keep insertion order of first
-    // appearance for a stable, greppable line.
-    let mut order: Vec<&str> = Vec::new();
-    let mut value: std::collections::HashMap<&str, Option<&str>> = std::collections::HashMap::new();
-    for t in msg
-        .tags
-        .iter()
-        .filter(|t| crate::sanitize::valid_client_tag_key(t.key))
-    {
-        if !value.contains_key(t.key) {
-            order.push(t.key);
-        }
-        value.insert(t.key, t.value.as_deref());
-    }
-    order
-        .iter()
-        .map(|&k| match value[k] {
-            Some(v) => format!("{k}={}", e6irc_proto::message::escape_tag_value(v)),
-            None => k.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(";")
-}
-
 /// Yield the unique, non-empty targets of a comma-separated target list,
 /// deduplicated by casefold so `#a,#A` (or `nick,NICK`) collapse to one.
 ///
@@ -73,7 +45,7 @@ pub(super) fn cmd_message(
     p: &[&str],
     kind: crate::core::MessageKind,
 ) {
-    let client_tags = client_tag_string(msg);
+    let client_tags = crate::sanitize::client_tag_string(msg);
     // Per Modern IRC, NOTICE must never trigger automatic replies —
     // including error numerics. The silence below is spec-mandated.
     let loud = kind.is_loud();
@@ -606,7 +578,7 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
         return;
     };
     // Only client-only tags (`+` prefix) are relayed.
-    let client_tags = client_tag_string(msg);
+    let client_tags = crate::sanitize::client_tag_string(msg);
     // A comma-separated target list delivers to each recipient, deduped (by the
     // shared `unique_targets`) and bounded by TARGMAX — exactly as PRIVMSG/NOTICE
     // do. TAGMSG previously took only the first target, so `TAGMSG #a,#b` failed
@@ -948,7 +920,7 @@ pub(super) fn cmd_batch(state: &mut ServerState, conn: ConnId, msg: &Message, p:
                 );
                 return;
             }
-            let client_tags = client_tag_string(msg);
+            let client_tags = crate::sanitize::client_tag_string(msg);
             // The response to this command is the batch itself, emitted when
             // the client closes it — so the label travels with the batch and
             // the framer must not ACK this as an empty response.

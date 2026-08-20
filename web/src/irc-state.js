@@ -132,16 +132,33 @@ export function asMessage(kind, from, text) {
 }
 
 // Prepend persisted history without replacing lines already present in the
-// live buffer. Rows sharing a stable msgid are included once; rows without an
-// identity are all retained because content-based deduplication loses valid
-// repeated messages.
+// live buffer. The API page and socket replay can share an ordered suffix /
+// prefix even when an upstream supplies no msgid; remove only that exact wire
+// sequence, never arbitrary equal bodies. Stable msgids cover non-contiguous
+// overlap. Unidentified rows outside the ordered overlap remain distinct.
 export function mergeTimeline(history, live, limit) {
+  let overlap = 0;
+  const maximum = Math.min(history.length, live.length);
+  for (let size = 1; size <= maximum; size += 1) {
+    const historyStart = history.length - size;
+    let matches = true;
+    for (let index = 0; index < size; index += 1) {
+      const olderWire = history[historyStart + index].wire;
+      const liveWire = live[index].wire;
+      if (typeof olderWire !== "string" || olderWire.length === 0 || olderWire !== liveWire) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) overlap = size;
+  }
+
   const seen = new Set();
   for (const line of live) {
     if (line.identity) seen.add(line.identity);
   }
   const prependReversed = [];
-  for (let index = history.length - 1; index >= 0; index -= 1) {
+  for (let index = history.length - overlap - 1; index >= 0; index -= 1) {
     const line = history[index];
     if (line.identity && seen.has(line.identity)) continue;
     if (line.identity) seen.add(line.identity);

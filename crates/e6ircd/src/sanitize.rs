@@ -127,6 +127,30 @@ pub(crate) fn valid_client_tag_key(key: &str) -> bool {
     name_ok && vendor_ok
 }
 
+/// Serialize the unique valid client-only tags from one parsed message.
+/// Duplicate keys resolve exactly like [`e6irc_proto::message::Message::tag`]:
+/// the last value wins while the first occurrence fixes stable output order.
+/// Server-provenance tags such as `time` and `msgid` never cross this boundary.
+pub(crate) fn client_tag_string(msg: &e6irc_proto::message::Message<'_>) -> String {
+    let mut order: Vec<&str> = Vec::new();
+    let mut values: std::collections::HashMap<&str, Option<&str>> =
+        std::collections::HashMap::new();
+    for tag in msg.tags.iter().filter(|tag| valid_client_tag_key(tag.key)) {
+        if !values.contains_key(tag.key) {
+            order.push(tag.key);
+        }
+        values.insert(tag.key, tag.value.as_deref());
+    }
+    order
+        .iter()
+        .map(|&key| match values[key] {
+            Some(value) => format!("{key}={}", e6irc_proto::message::escape_tag_value(value)),
+            None => key.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 /// Whether `nick` is a legal nickname: it starts with a letter or one of the
 /// RFC1459 "special" characters and continues with those plus digits and `-`,
 /// within `nicklen`. A NickServ-registered account name inherits exactly this

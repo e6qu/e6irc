@@ -204,6 +204,14 @@ These are project-wide rules, enforced in review and (where possible) CI:
     The IRC driver also derives reconnect-intent deltas from this one tracker;
     attach state and the next rejoin set cannot parse the same upstream line
     with two subtly different membership rules.
+  - `subscribe_with_replay_snapshot` — buffered emitters retain the IRC-session
+    and buffer locks through broadcast publication, while each raw/browser
+    attach subscribes and snapshots both under those same locks. The
+    replay/live boundary therefore places every buffered line and its resulting
+    nick/membership state on exactly one side: no timing window can lose it or
+    deliver it twice. A client that overruns the bounded live broadcast is
+    detached after a visible gap notice, because continuing could preserve
+    stale nick or membership state.
   - `AttachCapability` — BNC attach capability names, state changes, `CAP LS`,
     and `CAP LIST` derive from one closed set. An attach cannot use SASL without
     negotiating it, and a new capability cannot be accepted but omitted from
@@ -1357,14 +1365,20 @@ above the trait, provides for every network kind:
   synthesized into the stream by the driver (the upstream is never asked
   for `echo-message`, so there is exactly one echo, never two); the
   originator receives its echo only when it negotiated `echo-message` on
-  attach, the same contract a real server has.
+  attach, the same contract a real server has. Synthesized echoes retain only
+  validated client-only tags and mint their own `time` provenance; a downstream
+  cannot forge or duplicate server `time`/`msgid` tags in persisted history.
 - **Detached buffering**: events accumulate in a per-network ring persisted
   to PostgreSQL. The BNC attach listener also keeps per-account, per-target
   read markers (`bnc_read_markers`, served over `MARKREAD`); they are
   separate from the ircd core's per-account markers (§11) because a BNC
   target lives on an external network the core knows nothing about.
 - **Playback**: attaching clients receive the full detached ring,
-  tag-filtered by their negotiated caps. `CHATHISTORY` paging is served by
+  tag-filtered by their negotiated caps. Subscription plus buffer snapshot is
+  one mutex-ordered boundary with publication, so a line is replayed or live,
+  never both. A retained-event overrun is visible and terminal; reconnecting
+  establishes a new authoritative boundary instead of continuing with possibly
+  stale IRC state. `CHATHISTORY` paging is served by
   the ircd core (§11) for the local network; on the BNC attach listener it
   pages the persisted `bnc_buffer` ring directly (LATEST/BEFORE/AFTER/AROUND/
   BETWEEN by `msgid=` or `timestamp=` selector, plus the two-timestamp TARGETS
@@ -1373,7 +1387,9 @@ above the trait, provides for every network kind:
   the newest rows *after* its selector; reverse BETWEEN limits from its first
   endpoint; TARGETS uses the dedicated `draft/chathistory-targets` batch.
   Stored timestamps are validated and canonicalized before they become sort
-  keys, and replay emits that same canonical `time=` value.
+  keys, and replay emits that same canonical `time=` value. CHATHISTORY refuses
+  service without the required `batch` capability instead of emitting an
+  unbatched success.
 - **Authoritative attach state**: replay is followed by an
   `IrcSessionSnapshot` containing the current upstream nick and confirmed
   memberships. Raw clients receive the NICK/JOIN/PART reconciliation needed to
@@ -1657,7 +1673,9 @@ client parses each line, routes it to the right buffer (channel / DM / server),
 maintains the per-channel member list, reconciles stale replay buffers against
 the session event, and renders the active buffer (all via
 DOM APIs, never `innerHTML` on server text, so a hostile upstream line can't
-inject markup). The replay boundary precedes live traffic; only after it does
+inject markup). Startup uses this atomic socket replay as its single initial
+backlog source rather than racing it against a duplicate REST snapshot. The
+replay boundary precedes live traffic; only after it does
 the client request authoritative NAMES snapshots, preventing stale detached
 replay from overwriting current membership. The composer sends
 `{id, target, message}` (with slash-commands) up the same socket, which the
@@ -1670,9 +1688,12 @@ and socket closure retain retryable text and cannot produce a false successful
 echo. This keeps the web client on the exact same multiplexer attach path as an
 IRC client — the web client *is* an attached client of the user's networks.
 Fetching persisted history prepends it without replacing live lines or local
-echoes that arrived while the request was in flight. Only matching non-empty
-`msgid` values are deduplicated; content equality is not identity because
-distinct IRC messages can have identical bodies. Self PART/KICK closes the
+echoes that arrived while the request was in flight. Matching non-empty
+`msgid` values and the exact ordered wire overlap at the history/live boundary
+are deduplicated; content equality elsewhere is not identity because distinct
+IRC messages can have identical bodies. Explicit history expands the buffer's
+bounded capacity by one API page, so loading older context remains effective
+even when the normal live window is full. Self PART/KICK closes the
 channel buffer, direct-message buffers have an explicit local Close action,
 and channel buffers have a Leave action whose confirmed self PART closes them.
 Status values are the closed set `connected`, `disconnected`, and
