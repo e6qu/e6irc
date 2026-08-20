@@ -29,6 +29,17 @@ pub const MAX_CLIENT_FRAME_LEN: usize = MAX_CLIENT_TAGS_LEN + MAX_LINE_LEN - 2;
 /// larger server tag budget (server-time, msgid, account, batch, …).
 pub const MAX_SERVER_FRAME_LEN: usize = MAX_SERVER_TAGS_LEN + MAX_LINE_LEN - 2;
 
+/// Whether a value is a usable IRCv3 message identifier. Message IDs are
+/// required values and are later reused as command parameters, so a leading
+/// `:` or wire whitespace would change their meaning outside the tag section.
+pub fn valid_message_id(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with(':')
+        && !value
+            .bytes()
+            .any(|byte| matches!(byte, b' ' | b'\r' | b'\n'))
+}
+
 /// The largest byte index `≤ index` that lies on a UTF-8 character boundary
 /// (both ends of the string count). Clamps to `s.len()` when `index` is past
 /// the end.
@@ -782,6 +793,16 @@ mod tests {
         ] {
             let parsed = Message::parse(line).unwrap();
             assert_eq!(parsed.to_line().unwrap(), line, "roundtrip of {line:?}");
+        }
+    }
+
+    #[test]
+    fn message_ids_are_nonempty_wire_parameters() {
+        for valid in ["opaque", "Mixed-._/value"] {
+            assert!(valid_message_id(valid), "{valid}");
+        }
+        for invalid in ["", ":trailing", "has space", "has\rreturn", "has\nline"] {
+            assert!(!valid_message_id(invalid), "{invalid:?}");
         }
     }
 }

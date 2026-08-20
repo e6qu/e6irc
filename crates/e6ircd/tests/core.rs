@@ -4457,7 +4457,7 @@ fn chathistory_star_selector_is_rejected_except_for_latest() {
 }
 
 #[test]
-fn chathistory_malformed_timestamp_is_rejected() {
+fn chathistory_malformed_reference_values_are_rejected() {
     // A `timestamp=` selector that doesn't parse must FAIL INVALID_PARAMS, not
     // silently default the window bound (which would return the latest N or an
     // empty window as if the client had asked for them).
@@ -4475,6 +4475,15 @@ fn chathistory_malformed_timestamp_is_rejected() {
             .any(|l| l.contains("FAIL CHATHISTORY INVALID_PARAMS")),
         "a malformed timestamp= must FAIL INVALID_PARAMS: {out:#?}"
     );
+    for selector in ["msgid=", "msgid=:invalid"] {
+        s.line(bob, &format!("CHATHISTORY LATEST #ht {selector} 5"));
+        let out = s.drain(bob);
+        assert!(
+            out.iter()
+                .any(|line| line.contains("FAIL CHATHISTORY INVALID_PARAMS")),
+            "a malformed {selector} must FAIL INVALID_PARAMS: {out:#?}"
+        );
+    }
     // A well-formed timestamp is still accepted (no FAIL).
     s.line(
         bob,
@@ -9665,6 +9674,12 @@ fn chathistory_rejects_bad_limit() {
     for bad in [
         "CHATHISTORY LATEST #h * notanumber",
         "CHATHISTORY LATEST #h * 0",
+        "CHATHISTORY LATEST #h * 501",
+        "CHATHISTORY LATEST #h *",
+        "CHATHISTORY LATEST #h * 10 extra",
+        "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:00.000Z timestamp=2262-01-01T00:00:00.000Z",
+        "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:00.000Z timestamp=2262-01-01T00:00:00.000Z 501",
+        "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:00.000Z timestamp=2262-01-01T00:00:00.000Z 10 extra",
     ] {
         s.line(a, bad);
         let out = s.drain(a);

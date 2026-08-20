@@ -107,14 +107,18 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
     // Initial status and detached-buffer playback end at an explicit typed
     // boundary. The browser waits for this before asking for current NAMES, so
     // a replayed stale NAMES reply can never win an ordering race.
-    let boundary = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let (boundary, session) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut session = None;
         loop {
             match ws.next().await {
                 Some(Ok(Tung::Text(t))) => {
                     let event: serde_json::Value =
                         serde_json::from_str(&t).expect("initial ws/ui event");
+                    if event["t"] == "session" {
+                        session = Some(event.clone());
+                    }
                     if event == serde_json::json!({ "t": "snapshot", "v": "complete" }) {
-                        return event;
+                        return (event, session);
                     }
                 }
                 Some(Ok(_)) => {}
@@ -127,6 +131,15 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
     assert_eq!(
         boundary,
         serde_json::json!({ "t": "snapshot", "v": "complete" })
+    );
+    assert_eq!(
+        session,
+        Some(serde_json::json!({
+            "t": "session",
+            "nick": "alicebnc",
+            "channels": ["#lobby"]
+        })),
+        "the replay boundary must be preceded by authoritative IRC session state"
     );
 
     // upstream -> UI: the peer posts, the UI receives a JSON line event

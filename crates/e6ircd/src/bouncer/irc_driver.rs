@@ -61,6 +61,39 @@ pub struct IrcNetwork;
 #[derive(Debug, Default)]
 pub struct JoinedChannels(std::sync::Mutex<std::collections::HashMap<String, String>>);
 
+impl JoinedChannels {
+    fn apply_session_delta(
+        &self,
+        before: &super::IrcSessionSnapshot,
+        after: &super::IrcSessionSnapshot,
+        retain_departures: bool,
+    ) {
+        let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
+        let before_keys: std::collections::HashSet<String> = before
+            .channels
+            .iter()
+            .map(|channel| casemap.casefold(channel))
+            .collect();
+        let after_by_key: std::collections::HashMap<String, String> = after
+            .channels
+            .iter()
+            .map(|channel| (casemap.casefold(channel), channel.clone()))
+            .collect();
+        let after_keys: std::collections::HashSet<String> = after_by_key.keys().cloned().collect();
+        let mut desired = self.0.lock().expect("joined set poisoned");
+        if !retain_departures {
+            for removed in before_keys.difference(&after_keys) {
+                desired.remove(removed);
+            }
+        }
+        for (key, display) in after_by_key {
+            if !before_keys.contains(&key) {
+                desired.insert(key, display);
+            }
+        }
+    }
+}
+
 impl IrcNetwork {
     /// Start the driver task and return a handle to it.
     pub fn start(config: NetworkConfig) -> NetworkHandle {
@@ -477,6 +510,7 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
             return dropped(super::NetworkFailure::AutojoinFailed);
         }
     }
+    ends.begin_irc_session(current_nick.clone());
     ends.emit(ConnectionEvent::Connected);
 
     // Keepalive: `connect_once` bounds connect + registration, but the
@@ -522,7 +556,6 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                         {
                             continue;
                         }
-                        track_membership(m, &mut current_nick, &shared.joined);
                     }
                     // The upstream's own line: attached clients and the detached
                     // buffer get what the network sent, tags and all. `attach`
@@ -530,7 +563,24 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                     //
                     // A send with zero subscribers is fine — the driver
                     // is always-on regardless of attach.
+                    let before = ends.irc_session_snapshot();
                     ends.emit_line(raw);
+                    if let (Some(before), Some(session)) =
+                        (before, ends.irc_session_snapshot())
+                    {
+                        // QUIT clears live membership for attached-client state,
+                        // but the reconnect intent survives a transport drop.
+                        // JOIN/PART/KICK deltas update that intent without an
+                        // unrelated numeric erasing channels still awaiting
+                        // confirmation on this new session.
+                        let quit = parsed
+                            .as_ref()
+                            .is_some_and(|message| message.command == "QUIT");
+                        shared
+                            .joined
+                            .apply_session_delta(&before, &session, quit);
+                        current_nick = session.nick;
+                    }
                 }
                 Ok(Ok(Some(RelayEvent::Rejected(rejected)))) => {
                     awaiting_keepalive = false;
@@ -581,60 +631,6 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
 
 fn dropped(failure: super::NetworkFailure) -> super::SessionOutcome {
     super::SessionOutcome::Dropped(failure)
-}
-
-/// Follow our own identity and channel membership as the upstream reports
-/// it: a forced NICK (collision resolution, oper SETHOST-style renames,
-/// services GHOST/REGAIN) changes who we are; our JOIN/PART and being KICKed
-/// change what a reconnect must restore. Comparisons fold with RFC1459
-/// casemapping, the same rule the upstream applies.
-fn track_membership(
-    m: &e6irc_client::OwnedMessage,
-    current_nick: &mut String,
-    joined: &JoinedChannels,
-) {
-    let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
-    let prefix_nick = m
-        .source
-        .as_deref()
-        .and_then(|source| source.split(['!', '@']).next());
-    let is_us =
-        |candidate: Option<&str>| candidate.is_some_and(|nick| casemap.eq(nick, current_nick));
-    let untrack = |chan: &String| {
-        joined
-            .0
-            .lock()
-            .expect("joined set poisoned")
-            .remove(&casemap.casefold(chan));
-    };
-    match m.command.as_str() {
-        "NICK" if is_us(prefix_nick) => {
-            if let Some(new_nick) = m.params.first() {
-                *current_nick = new_nick.clone();
-            }
-        }
-        "JOIN" if is_us(prefix_nick) => {
-            if let Some(chan) = m.params.first() {
-                joined
-                    .0
-                    .lock()
-                    .expect("joined set poisoned")
-                    .insert(casemap.casefold(chan), chan.clone());
-            }
-        }
-        "PART" if is_us(prefix_nick) => {
-            if let Some(chan) = m.params.first() {
-                untrack(chan);
-            }
-        }
-        // Being kicked from a channel ends membership exactly like a PART.
-        "KICK" if is_us(m.params.get(1).map(String::as_str)) => {
-            if let Some(chan) = m.params.first() {
-                untrack(chan);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Build the self-echo line for a client command, or `None` when the command

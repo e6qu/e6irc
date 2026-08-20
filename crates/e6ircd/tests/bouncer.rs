@@ -430,7 +430,7 @@ async fn bnc_listener_authenticates_and_routes_client_to_network() {
         .register_sasl("alice/up", "Me", "alice", "s3cr3t")
         .await
         .expect("bnc SASL auth");
-    assert!(confirmed.starts_with("alice/up"), "{confirmed}");
+    assert_eq!(confirmed, "bncnick", "{confirmed}");
 
     // client -> upstream: peer receives it as coming from the driver nick
     client
@@ -1614,7 +1614,7 @@ async fn bnc_listener_serves_chathistory_and_markread() {
         }
     }
 
-    // CHATHISTORY LATEST, batched, newest first on the wire.
+    // CHATHISTORY LATEST, batched and ordered oldest-to-newest on the wire.
     client
         .send_line("CHATHISTORY LATEST #lobby * 10")
         .await
@@ -1712,14 +1712,25 @@ async fn bnc_listener_serves_chathistory_and_markread() {
         .expect("empty batch body");
     assert_eq!(empty.command, "BATCH", "{empty:?}");
 
-    // TARGETS lists #lobby with a timestamp.
-    client.send_line("CHATHISTORY TARGETS * 50").await.unwrap();
+    // TARGETS lists #lobby with a timestamp inside the requested open window.
+    client
+        .send_line(
+            "CHATHISTORY TARGETS timestamp=2020-01-01T00:00:00.000Z \
+             timestamp=2030-01-01T00:00:00.000Z 50",
+        )
+        .await
+        .unwrap();
     let open = client
         .next_message()
         .await
         .unwrap()
         .expect("targets batch open");
     assert_eq!(open.command, "BATCH", "{open:?}");
+    assert_eq!(
+        open.params.get(1).map(String::as_str),
+        Some("draft/chathistory-targets"),
+        "{open:?}"
+    );
     let target_line = client.next_message().await.unwrap().expect("targets body");
     assert_eq!(target_line.command, "CHATHISTORY", "{target_line:?}");
     assert_eq!(

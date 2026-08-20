@@ -1577,6 +1577,7 @@ async fn console_networks_page_lists_the_callers_networks() {
         &pool,
         "alice",
         "libera",
+        Some("alice"),
         ":mallory PRIVMSG #e6irc :<script>alert('escaped')</script>",
     )
     .await
@@ -6394,7 +6395,7 @@ async fn network_buffer_read() {
         ":a!u@h PRIVMSG #x :one",
         ":a!u@h PRIVMSG #x :two",
     ] {
-        e6ircd::db::persist_bnc_line(&pool, "alice", "work", line)
+        e6ircd::db::persist_bnc_line(&pool, "alice", "work", Some("alice"), line)
             .await
             .expect("seed");
     }

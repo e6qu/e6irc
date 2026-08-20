@@ -352,30 +352,26 @@ fn spawn_persistence(
         // `db::BNC_TRIM_INTERVAL`.
         let mut since_trim = 0u64;
         loop {
-            match events.recv().await {
+            let (line, own_nick) = match events.recv().await {
                 // A synthesized self-echo is part of the conversation record:
                 // persist it like an upstream line so a reattached client sees
                 // both sides after a restart.
-                Ok(DriverEvent::Line(line)) | Ok(DriverEvent::Echo { line, .. }) => {
-                    if let Err(e) =
-                        crate::db::persist_bnc_line(&pool, &owner_key, &network, &line).await
-                    {
-                        handle.record_error(super::NetworkFailure::BacklogStorageFailed);
-                        eprintln!("bnc: buffer persist failed for {owner_key}/{network}: {e}");
-                        continue;
-                    }
-                    since_trim += 1;
-                    if since_trim >= crate::db::BNC_TRIM_INTERVAL {
-                        since_trim = 0;
-                        if let Err(e) =
-                            crate::db::trim_bnc_buffer(&pool, &owner_key, &network).await
-                        {
-                            handle.record_error(super::NetworkFailure::BacklogStorageFailed);
-                            eprintln!("bnc: buffer trim failed for {owner_key}/{network}: {e}");
-                        }
-                    }
+                Ok(DriverEvent::Line(line)) => {
+                    let own_nick = handle.irc_session_snapshot().map(|session| session.nick);
+                    (line, own_nick)
                 }
-                Ok(_) => {}
+                Ok(DriverEvent::Echo { line, .. }) => {
+                    // The echo carries the exact identity used when it was
+                    // synthesized. Derive ownership from that line instead of
+                    // a later sticky snapshot: the persistence task may lag
+                    // behind a subsequent NICK and must not split the two
+                    // halves of a direct-message conversation.
+                    let own_nick = e6irc_proto::message::Message::parse(&line)
+                        .ok()
+                        .and_then(|message| message.source.map(|source| source.name.to_string()));
+                    (line, own_nick)
+                }
+                Ok(_) => continue,
                 // A persistence lag means upstream lines were never written:
                 // the stored backlog now has a gap. Surface it rather than
                 // dropping it silently.
@@ -385,11 +381,42 @@ fn spawn_persistence(
                         "bnc: persistence lagged for {owner_key}/{network}; {n} upstream \
                          line(s) missing from stored backlog"
                     );
+                    continue;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            if let Err(e) = persist_and_trim(
+                &pool,
+                &owner_key,
+                &network,
+                own_nick.as_deref(),
+                &line,
+                &mut since_trim,
+            )
+            .await
+            {
+                handle.record_error(super::NetworkFailure::BacklogStorageFailed);
+                eprintln!("bnc: buffer persist or trim failed for {owner_key}/{network}: {e}");
             }
         }
     })
+}
+
+async fn persist_and_trim(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+    own_nick: Option<&str>,
+    line: &str,
+    since_trim: &mut u64,
+) -> Result<(), crate::db::DbError> {
+    crate::db::persist_bnc_line(pool, owner, network, own_nick, line).await?;
+    *since_trim += 1;
+    if *since_trim >= crate::db::BNC_TRIM_INTERVAL {
+        *since_trim = 0;
+        crate::db::trim_bnc_buffer(pool, owner, network).await?;
+    }
+    Ok(())
 }
 
 /// Outcome of the BNC registration handshake.
@@ -399,6 +426,7 @@ enum Registered {
     Ok {
         account: String,
         network: String,
+        requested_nick: String,
         caps: super::AttachCaps,
     },
     /// The client hung up or violated the handshake; the loop returns.
@@ -423,7 +451,7 @@ where
     // Bound the pre-attach handshake: a client that connects and never
     // completes registration (sends nothing, or authenticates but never ends
     // CAP negotiation) must not hold a task + socket indefinitely.
-    let (account, network, caps) = match tokio::time::timeout(
+    let (account, network, requested_nick, caps) = match tokio::time::timeout(
         std::time::Duration::from_secs(30),
         handshake(&mut read, &mut write, pool, server_name),
     )
@@ -432,8 +460,9 @@ where
         Ok(Ok(Registered::Ok {
             account,
             network,
+            requested_nick,
             caps,
-        })) => (account, network, caps),
+        })) => (account, network, requested_nick, caps),
         Ok(Ok(Registered::Closed)) => return Ok(()),
         Ok(Err(e)) => return Err(e),
         Err(_) => return Ok(()), // handshake timed out
@@ -497,10 +526,17 @@ where
 
     // Complete the client's registration burst (001 + end-of-MOTD) so it
     // considers itself registered, then attach.
-    let ident = format!("{account}/{network}");
+    // The attach selector is registration input, not the client's IRC
+    // identity. Once the upstream session exists, 001 must name its actual nick
+    // so clients classify the following JOIN/NICK traffic as their own.
+    let downstream_nick = handle
+        .irc_session_snapshot()
+        .map_or(requested_nick, |session| session.nick);
     for line in [
-        format!(":{server_name} 001 {ident} :Welcome to e6irc BNC, attached to '{network}'"),
-        format!(":{server_name} 422 {ident} :MOTD is on the upstream network"),
+        format!(
+            ":{server_name} 001 {downstream_nick} :Welcome to e6irc BNC, attached to '{network}'"
+        ),
+        format!(":{server_name} 422 {downstream_nick} :MOTD is on the upstream network"),
     ] {
         write.write_all(line.as_bytes()).await?;
         write.write_all(b"\r\n").await?;
@@ -508,7 +544,7 @@ where
     write.flush().await?;
 
     let joined = read.unsplit(write);
-    attach(joined, &handle, caps, &account).await
+    attach(joined, &handle, caps, &account, &downstream_nick).await
 }
 
 /// Drive registration to a `Registered` verdict. Requires a successful
@@ -552,21 +588,75 @@ where
         }
         framing.feed(&buf[..n], &mut events);
         for ev in events.drain(..) {
-            let LineEvent::Line(line) = ev else { continue };
-            let Ok(text) = std::str::from_utf8(&line) else {
+            let LineEvent::Line(line) = ev else {
+                super::write_client_line_error(write, super::ClientLineError::TooLong).await?;
                 continue;
             };
-            let Ok(msg) = Message::parse(text) else {
+            let Ok(text) = std::str::from_utf8(&line) else {
+                write
+                    .write_all(b":*bnc* FAIL * INVALID_UTF8 :Message rejected, not valid UTF-8\r\n")
+                    .await?;
                 continue;
+            };
+            let msg = match super::parse_client_line(text) {
+                Ok(msg) => msg,
+                Err(error) => {
+                    super::write_client_line_error(write, error).await?;
+                    continue;
+                }
             };
             match msg.command.to_ascii_uppercase().as_str() {
-                "NICK" => nick = msg.params.first().map(|s| s.to_string()),
-                "USER" => have_user = true,
+                "NICK" => match msg.params.as_slice() {
+                    [candidate] if attach_selector_ok(candidate) => {
+                        nick = Some(candidate.to_string());
+                    }
+                    [candidate, ..] => {
+                        handshake_numeric(
+                            write,
+                            server_name,
+                            nick.as_deref(),
+                            432,
+                            Some(candidate),
+                            "Erroneous nickname/network selector",
+                        )
+                        .await?;
+                    }
+                    [] => {
+                        handshake_numeric(
+                            write,
+                            server_name,
+                            nick.as_deref(),
+                            431,
+                            None,
+                            "No nickname given",
+                        )
+                        .await?;
+                    }
+                },
+                "USER" => {
+                    if msg.params.len() != 4 {
+                        handshake_numeric(
+                            write,
+                            server_name,
+                            nick.as_deref(),
+                            461,
+                            Some("USER"),
+                            "Not enough parameters",
+                        )
+                        .await?;
+                    } else {
+                        have_user = true;
+                    }
+                }
                 "CAP" => {
                     cap_open = true;
                     handle_cap(write, server_name, &msg, &mut cap_open, &mut caps).await?;
                 }
                 "AUTHENTICATE" => {
+                    if msg.params.len() != 1 {
+                        reject_sasl(write, server_name).await?;
+                        continue;
+                    }
                     let arg = msg.params.first().copied().unwrap_or("");
                     if !caps.sasl {
                         reject_sasl(write, server_name).await?;
@@ -627,7 +717,36 @@ where
                         }
                     }
                 }
-                _ => {}
+                "PING" => {
+                    if let Some(token) = msg.params.first() {
+                        write
+                            .write_all(format!("PONG :{token}\r\n").as_bytes())
+                            .await?;
+                    } else {
+                        handshake_numeric(
+                            write,
+                            server_name,
+                            nick.as_deref(),
+                            409,
+                            None,
+                            "No origin specified",
+                        )
+                        .await?;
+                    }
+                }
+                "PONG" => {}
+                "QUIT" => return Ok(Registered::Closed),
+                command => {
+                    handshake_numeric(
+                        write,
+                        server_name,
+                        nick.as_deref(),
+                        421,
+                        Some(command),
+                        "Unknown command",
+                    )
+                    .await?;
+                }
             }
         }
 
@@ -654,16 +773,55 @@ where
     // in-process `local` network (DESIGN §10.4: bare `alice` = `local`), so a
     // client that doesn't know the convention still reaches a working network
     // rather than being turned away.
-    let network = raw
-        .split_once('/')
-        .map_or(super::local_driver::LOCAL_NETWORK, |(_user, network)| {
-            network
-        });
+    let (requested_nick, network) = raw.split_once('/').map_or(
+        (raw.as_str(), super::local_driver::LOCAL_NETWORK),
+        |(nick, network)| (nick, network),
+    );
     Ok(Registered::Ok {
         account,
         network: network.to_string(),
+        requested_nick: requested_nick.to_string(),
         caps,
     })
+}
+
+fn attach_selector_ok(selector: &str) -> bool {
+    match selector.split_once('/') {
+        Some((nick, network)) => {
+            crate::sanitize::valid_nick(nick, 30) && crate::sanitize::valid_network_name(network)
+        }
+        None => crate::sanitize::valid_nick(selector, 30),
+    }
+}
+
+async fn handshake_numeric<W>(
+    write: &mut W,
+    server_name: &str,
+    nick: Option<&str>,
+    numeric: u16,
+    middle: Option<&str>,
+    trailing: &str,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let target = nick.map(attach_reply_token).unwrap_or("*");
+    let middle = middle
+        .map(|value| format!(" {}", attach_reply_token(value)))
+        .unwrap_or_default();
+    write
+        .write_all(
+            format!(":{server_name} {numeric:03} {target}{middle} :{trailing}\r\n").as_bytes(),
+        )
+        .await
+}
+
+fn attach_reply_token(token: &str) -> &str {
+    if token.is_empty() || token.starts_with(':') {
+        "*"
+    } else {
+        e6irc_proto::message::truncate_on_char_boundary(token, 64)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -815,7 +973,15 @@ where
             write.write_all(reply.as_bytes()).await?;
         }
         Some("END") => *cap_open = false,
-        _ => {}
+        invalid => {
+            let subcommand = invalid.map(attach_reply_token).unwrap_or("*");
+            write
+                .write_all(
+                    format!(":{server_name} 410 * {subcommand} :Invalid CAP subcommand\r\n")
+                        .as_bytes(),
+                )
+                .await?;
+        }
     }
     Ok(())
 }
@@ -833,10 +999,7 @@ where
 /// against the account store. Returns the canonical account name.
 async fn verify_plain(pool: &PgPool, payload: &str) -> Option<String> {
     let raw = e6irc_proto::base64::decode(payload)?;
-    let mut parts = raw.splitn(3, |&b| b == 0);
-    let _authzid = parts.next()?;
-    let authcid = std::str::from_utf8(parts.next()?).ok()?;
-    let passwd = std::str::from_utf8(parts.next()?).ok()?;
+    let (authcid, passwd) = plain_credentials(&raw)?;
     // A DB failure is not an auth rejection (verify_credentials' contract):
     // fail closed, but surface the error instead of silently masking it as a
     // bad password.
@@ -847,6 +1010,21 @@ async fn verify_plain(pool: &PgPool, payload: &str) -> Option<String> {
             None
         }
     }
+}
+
+fn plain_credentials(raw: &[u8]) -> Option<(&str, &str)> {
+    let mut parts = raw.split(|&byte| byte == 0);
+    let authzid = std::str::from_utf8(parts.next()?).ok()?;
+    let authcid = std::str::from_utf8(parts.next()?).ok()?;
+    let passwd = std::str::from_utf8(parts.next()?).ok()?;
+    if parts.next().is_some()
+        || authcid.is_empty()
+        || passwd.is_empty()
+        || (!authzid.is_empty() && !e6irc_proto::casemap::CaseMapping::Rfc1459.eq(authzid, authcid))
+    {
+        return None;
+    }
+    Some((authcid, passwd))
 }
 
 #[cfg(test)]
@@ -867,6 +1045,27 @@ mod cap_tests {
         capability.set(&mut caps, enabled);
         assert!(!cap_names(Some(caps)).contains("echo-message"));
         assert!(AttachCapability::parse("unknown").is_none());
+    }
+
+    #[test]
+    fn sasl_plain_cannot_authorize_as_a_different_identity() {
+        assert_eq!(
+            plain_credentials(b"\0alice\0secret"),
+            Some(("alice", "secret"))
+        );
+        assert_eq!(
+            plain_credentials(b"ALICE\0alice\0secret"),
+            Some(("alice", "secret")),
+            "the same RFC1459 identity is permitted in authzid"
+        );
+        for invalid in [
+            b"bob\0alice\0secret".as_slice(),
+            b"\0\0secret".as_slice(),
+            b"\0alice\0".as_slice(),
+            b"\0alice\0secret\0extra".as_slice(),
+        ] {
+            assert_eq!(plain_credentials(invalid), None, "{invalid:?}");
+        }
     }
 
     #[test]
@@ -907,6 +1106,81 @@ mod cap_tests {
             .expect("read replies");
         assert!(replies.contains(" CAP * ACK :sasl echo-message\r\n"));
         assert!(replies.contains(" CAP * LIST :sasl echo-message\r\n"));
+    }
+
+    #[tokio::test]
+    async fn invalid_cap_subcommand_fails_loudly() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let mut caps = super::super::AttachCaps::default();
+        let mut cap_open = false;
+        let request = Message::parse("CAP SURPRISE").expect("CAP request");
+        handle_cap(
+            &mut server,
+            "bnc.example",
+            &request,
+            &mut cap_open,
+            &mut caps,
+        )
+        .await
+        .expect("CAP rejection");
+        server.shutdown().await.expect("close server half");
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.expect("read reply");
+        assert_eq!(
+            reply,
+            ":bnc.example 410 * SURPRISE :Invalid CAP subcommand\r\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn attach_selector_uses_the_shared_bounded_network_name_language() {
+        assert!(attach_selector_ok("alice/libera"));
+        assert!(attach_selector_ok("alice"));
+        assert!(!attach_selector_ok("alice/"));
+        assert!(!attach_selector_ok("alice/bad/name"));
+        assert!(!attach_selector_ok(&format!("alice/{}", "x".repeat(65))));
+    }
+
+    #[tokio::test]
+    async fn malformed_and_unknown_handshake_input_fails_loudly() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+            .expect("lazy pool");
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (mut server_read, mut server_write) = tokio::io::split(server);
+        let task = tokio::spawn(async move {
+            handshake(&mut server_read, &mut server_write, &pool, "bnc.example").await
+        });
+        client_write
+            .write_all(
+                b"NICK alice/libera\r\nUSER only-one-param\r\nWAT value\r\nBAD\0LINE\r\nCAP SURPRISE\r\nPING :token\r\nQUIT :done\r\n",
+            )
+            .await
+            .expect("write handshake");
+        client_write.shutdown().await.expect("close input");
+        let mut replies = String::new();
+        client_read
+            .read_to_string(&mut replies)
+            .await
+            .expect("read replies");
+        assert!(replies.contains(" 461 alice/libera USER :Not enough parameters\r\n"));
+        assert!(replies.contains(" 421 alice/libera WAT :Unknown command\r\n"));
+        assert!(replies.contains(" FAIL * INVALID_MESSAGE :Malformed line\r\n"));
+        assert!(replies.contains(" 410 * SURPRISE :Invalid CAP subcommand\r\n"));
+        assert!(replies.contains("PONG :token\r\n"));
+        assert!(matches!(
+            task.await
+                .expect("handshake task")
+                .expect("handshake result"),
+            Registered::Closed
+        ));
     }
 }
 

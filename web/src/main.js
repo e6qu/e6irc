@@ -33,6 +33,7 @@ import {
   messageIdentity,
   nickPrefix,
   parseIrc,
+  reconcileChannelSnapshot,
   splitSigil,
   stripSigil,
   tagValue,
@@ -312,6 +313,26 @@ function resyncMemberships() {
     requestNames(buffer);
   }
   renderNickList();
+}
+
+function applySessionSnapshot(nick, channels) {
+  myNick = nick;
+  const current = [...buffers.values()]
+    .filter((buffer) => buffer.kind === "channel")
+    .map((buffer) => buffer.display);
+  const reconciliation = reconcileChannelSnapshot(current, channels);
+  let activeRemoved = false;
+  for (const channel of reconciliation.removed) {
+    const key = fold(channel);
+    buffers.delete(key);
+    namesSnapshots.delete(key);
+    namesRequested.delete(key);
+    if (active === key) activeRemoved = true;
+  }
+  for (const channel of reconciliation.joined) ensureBuffer(channel, "channel");
+  if (activeRemoved) active = SERVER;
+  renderBufferList();
+  renderActive();
 }
 
 // Buffers and nicks are keyed by their casefold; the original casing is kept in
@@ -820,9 +841,13 @@ function handleLine(raw) {
       const text = m.params[1] ?? "";
       const kind = m.command === "NOTICE" ? "notice" : "msg";
       const r = asMessage(kind, m.nick, text);
-      if (isChannel(target)) {
+      if (isChannel(target) || buffers.get(fold(target))?.kind === "channel") {
         addLine(target, r.kind, "channel", r.from, r.text, m.tags);
-      } else if (target === "*" || target === "") {
+      } else if (
+        target === "*" ||
+        target === "" ||
+        (m.command === "NOTICE" && !m.sourceIsUser)
+      ) {
         // A server / global notice (e.g. the bouncer's *bnc* control messages):
         // show it in the server buffer, not a phantom DM keyed on the sender.
         addLine(SERVER, r.kind, "server", r.from, r.text, m.tags);
@@ -1144,6 +1169,8 @@ function connect() {
       snapshotComplete = true;
       initialReplay.clear();
       if (upstreamConnected) resyncMemberships();
+    } else if (event.type === "session") {
+      applySessionSnapshot(event.nick, event.channels);
     } else if (event.type === "status" && event.value === "unavailable") {
       terminalSocket = true;
       upstreamConnected = false;

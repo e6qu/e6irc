@@ -17,6 +17,10 @@ test("live event parser accepts the closed server event contract", () => {
     message: "not sent",
   });
   assert.deepEqual(parseUiEvent('{"t":"snapshot","v":"complete"}'), { type: "snapshot" });
+  assert.deepEqual(
+    parseUiEvent('{"t":"session","nick":"alice","channels":["#one","#Two"]}'),
+    { type: "session", nick: "alice", channels: ["#one", "#Two"] },
+  );
   assert.deepEqual(parseUiEvent('{"t":"status","v":"connected"}'), {
     type: "status",
     value: "connected",
@@ -46,6 +50,10 @@ test("live event parser rejects every malformed or unsupported shape", () => {
     '{"t":"line","v":1}',
     '{"t":"line","v":"ok","extra":true}',
     '{"t":"snapshot","v":"partial"}',
+    '{"t":"session","nick":"","channels":[]}',
+    '{"t":"session","nick":"alice","channels":"#one"}',
+    '{"t":"session","nick":"alice","channels":[1]}',
+    '{"t":"session","nick":"alice","channels":[],"extra":true}',
     '{"t":"status","v":"connected","reason":"unexpected"}',
     '{"t":"status","v":"disconnected","reason":1}',
     '{"t":"status","v":"unknown"}',

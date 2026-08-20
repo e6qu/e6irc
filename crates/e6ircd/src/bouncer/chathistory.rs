@@ -8,8 +8,6 @@
 
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use e6irc_proto::casemap::CaseMapping;
-
 use super::{AttachCaps, NetworkHandle, NetworkHistory};
 
 /// The largest page a client may ask for in one CHATHISTORY reply. Bounded so
@@ -31,15 +29,9 @@ pub(crate) async fn handle_chathistory(
         "LATEST" => paged(handle, write, caps, Paging::Latest, params).await,
         "BEFORE" => paged(handle, write, caps, Paging::Before, params).await,
         "AFTER" => paged(handle, write, caps, Paging::After, params).await,
-        "TARGETS" => targets(handle, write, params).await,
-        "AROUND" | "BETWEEN" => {
-            fail(
-                write,
-                "UNSUPPORTED_SUBCOMMAND",
-                "that subcommand is not supported",
-            )
-            .await
-        }
+        "AROUND" => paged(handle, write, caps, Paging::Around, params).await,
+        "BETWEEN" => paged(handle, write, caps, Paging::Between, params).await,
+        "TARGETS" => targets(handle, write, caps, params).await,
         _ => fail(write, "INVALID_PARAMS", "unknown subcommand").await,
     }
 }
@@ -53,9 +45,21 @@ pub(crate) async fn handle_markread(
     account: &str,
     params: &[&str],
 ) -> std::io::Result<()> {
+    if params.len() > 2 {
+        return fail_command(
+            write,
+            "MARKREAD",
+            "INVALID_PARAMS",
+            "expected <target> [timestamp]",
+        )
+        .await;
+    }
     let Some(&target) = params.first() else {
         return fail_command(write, "MARKREAD", "INVALID_PARAMS", "missing target").await;
     };
+    if target != "*" && !valid_target(target) {
+        return fail_command(write, "MARKREAD", "INVALID_PARAMS", "invalid target").await;
+    }
     let history = match handle.history() {
         Some(h) => h,
         None => {
@@ -74,6 +78,16 @@ pub(crate) async fn handle_markread(
         ("*", None) => match crate::db::list_bnc_read_markers(pool, account, network).await {
             Ok(rows) => {
                 for (t, ts) in rows {
+                    if !valid_target(&t) {
+                        eprintln!("bnc: invalid stored read marker target for {account}/{network}");
+                        return fail_command(
+                            write,
+                            "MARKREAD",
+                            "TEMPORARY_FAILURE",
+                            "stored read marker is invalid",
+                        )
+                        .await;
+                    }
                     write_marker(write, &t, &ts).await?;
                 }
             }
@@ -102,7 +116,7 @@ pub(crate) async fn handle_markread(
         (target, None) => {
             match crate::db::get_bnc_read_marker(pool, account, network, target).await {
                 Ok(Some(ts)) => write_marker(write, target, &ts).await?,
-                Ok(None) => {}
+                Ok(None) => write_marker(write, target, "*").await?,
                 Err(e) => {
                     eprintln!("bnc: read marker query failed for {account}/{network}: {e}");
                     return fail_command(
@@ -169,6 +183,8 @@ enum Paging {
     Latest,
     Before,
     After,
+    Around,
+    Between,
 }
 
 /// `CHATHISTORY (LATEST|BEFORE|AFTER) <target> <selector> <limit>`.
@@ -179,210 +195,206 @@ async fn paged(
     paging: Paging,
     params: &[&str],
 ) -> std::io::Result<()> {
-    let (Some(target), Some(selector), Some(limit_raw)) =
-        (params.get(1), params.get(2), params.get(3))
-    else {
+    let between = matches!(paging, Paging::Between);
+    let expected = if between { 5 } else { 4 };
+    if params.len() != expected {
         return fail(
             write,
             "INVALID_PARAMS",
-            "expected <target> <selector> <limit>",
+            if between {
+                "expected exactly <target> <selector> <selector> <limit>"
+            } else {
+                "expected exactly <target> <selector> <limit>"
+            },
         )
         .await;
+    }
+    let target = params[1];
+    if !valid_target(target) {
+        return fail(write, "INVALID_PARAMS", "invalid target").await;
+    }
+    let selector = match HistorySelector::parse(params[2]) {
+        Ok(selector) => selector,
+        Err(reason) => return fail(write, "INVALID_PARAMS", reason).await,
     };
+    let selector2 = if between {
+        match HistorySelector::parse(params[3]) {
+            Ok(selector) => selector,
+            Err(reason) => return fail(write, "INVALID_PARAMS", reason).await,
+        }
+    } else {
+        HistorySelector::Star
+    };
+    if !matches!(paging, Paging::Latest)
+        && (matches!(selector, HistorySelector::Star)
+            || matches!(selector2, HistorySelector::Star) && between)
+    {
+        return fail(
+            write,
+            "INVALID_PARAMS",
+            "* is only a valid selector for LATEST",
+        )
+        .await;
+    }
+    let limit_raw = params[if between { 4 } else { 3 }];
     let Some(limit) = parse_limit(limit_raw) else {
-        return fail(write, "INVALID_PARAMS", "limit must be a positive integer").await;
+        return fail(write, "INVALID_PARAMS", "limit must be between 1 and 500").await;
     };
-    let limit = limit.min(CHATHISTORY_LIMIT_MAX);
     let Some(history) = require_history(handle, write).await? else {
         return Ok(());
     };
-
-    let boundary = match resolve_selector(&history, target, selector, &paging).await {
-        Ok(b) => b,
-        Err(reason) => return fail(write, "INVALID_PARAMS", reason).await,
-    };
-
-    let folded = CaseMapping::Rfc1459.casefold(target);
-    let result = match (paging, boundary) {
-        (Paging::Latest, Boundary::Unbounded) => {
-            crate::db::bnc_history_latest(
-                &history.pool,
-                &history.owner,
-                &history.network,
-                &folded,
-                None,
-                limit,
-            )
+    let rows =
+        match crate::db::bnc_history_lines(&history.pool, &history.owner, &history.network, target)
             .await
-        }
-        (Paging::Latest, Boundary::Id(at)) => {
-            crate::db::bnc_history_latest(
-                &history.pool,
-                &history.owner,
-                &history.network,
-                &folded,
-                Some(at),
-                limit,
-            )
-            .await
-        }
-        (Paging::Before, Boundary::Id(before)) => {
-            crate::db::bnc_history_before(
-                &history.pool,
-                &history.owner,
-                &history.network,
-                &folded,
-                before,
-                limit,
-            )
-            .await
-        }
-        (Paging::After, Boundary::Id(after)) => {
-            crate::db::bnc_history_after(
-                &history.pool,
-                &history.owner,
-                &history.network,
-                &folded,
-                after,
-                limit,
-            )
-            .await
-        }
-        (Paging::After, Boundary::Unbounded) => {
-            // A timestamp older than the backlog: everything is after it, so
-            // page from the very start of the target's stored history.
-            crate::db::bnc_history_after(
-                &history.pool,
-                &history.owner,
-                &history.network,
-                &folded,
-                0,
-                limit,
-            )
-            .await
-        }
-        // BEFORE with `*` was rejected during resolution; an Empty boundary
-        // (unknown msgid, timestamp before the backlog) is an empty page.
-        // Before+Unbounded is unreachable by construction (the selector
-        // resolver rejects `*` for BEFORE) but kept exhaustive.
-        (Paging::Before, Boundary::Unbounded) | (_, Boundary::Empty) => Ok(Vec::new()),
-    };
-    let rows = match result {
-        Ok(rows) => rows,
-        Err(e) => return db_error(write, e).await,
-    };
-
-    reply_lines(write, caps, target, &rows).await
-}
-
-/// A resolved CHATHISTORY selector: either an inclusive row-id boundary
-/// (id ≤ this for LATEST, id < this for BEFORE, id > this for AFTER), an
-/// unbounded page (the `*` selector), or nothing to page at all.
-enum Boundary {
-    Unbounded,
-    Id(i64),
-    Empty,
-}
-
-/// Map a CHATHISTORY `<selector>` to its boundary id.
-async fn resolve_selector(
-    history: &NetworkHistory,
-    target: &str,
-    selector: &str,
-    paging: &Paging,
-) -> Result<Boundary, &'static str> {
-    let folded = CaseMapping::Rfc1459.casefold(target);
-    if selector == "*" {
-        return match paging {
-            // `*` means "the newest" — valid only for LATEST; BEFORE/AFTER
-            // need a concrete reference to page from.
-            Paging::Latest => Ok(Boundary::Unbounded),
-            Paging::Before | Paging::After => Err("BEFORE/AFTER need a msgid or timestamp"),
+        {
+            Ok(rows) => rows,
+            Err(e) => return db_error(write, e).await,
         };
-    }
-    // A bare ISO-8601 value is accepted as a timestamp too (clients differ on
-    // whether they send the `timestamp=` prefix).
-    let timestamp = selector
-        .strip_prefix("timestamp=")
-        .or_else(|| e6irc_proto::time::parse_server_time_millis(selector).map(|_| selector));
-    let row = if let Some(msgid) = selector.strip_prefix("msgid=") {
-        match crate::db::bnc_history_msgid_row(
-            &history.pool,
-            &history.owner,
-            &history.network,
-            msgid,
-        )
-        .await
-        {
-            Ok(row) => row,
-            Err(_) => return Err("history store unavailable"),
-        }
-    } else if let Some(ts) = timestamp {
-        match crate::db::bnc_history_timestamp_row(
-            &history.pool,
-            &history.owner,
-            &history.network,
-            &folded,
-            ts,
-        )
-        .await
-        {
-            Ok(row) => row,
-            Err(_) => return Err("history store unavailable"),
-        }
-    } else {
-        return Err("selector must be *, msgid=..., or timestamp=...");
-    };
-    Ok(match row {
-        Some(id) => Boundary::Id(id),
-        // An unknown msgid is an empty page. So is a timestamp with nothing at
-        // or before it — except AFTER such a timestamp, where "everything is
-        // after it" means page from the very start of the target's history.
-        None if matches!(paging, Paging::After) && timestamp.is_some() => Boundary::Unbounded,
-        None => Boundary::Empty,
-    })
+    let selected = resolve_window(&rows, paging, &selector, &selector2, limit as usize);
+    reply_lines(write, caps, target, &selected).await
 }
 
-/// `CHATHISTORY TARGETS <timestamp> <target-count>`: list the conversation
-/// targets that still have backlog, newest-active first.
+#[derive(Debug, PartialEq, Eq)]
+enum HistorySelector {
+    Star,
+    Msgid(String),
+    Timestamp(String),
+}
+
+impl HistorySelector {
+    fn parse(raw: &str) -> Result<Self, &'static str> {
+        if raw == "*" {
+            return Ok(Self::Star);
+        }
+        if let Some(msgid) = raw.strip_prefix("msgid=") {
+            return e6irc_proto::message::valid_message_id(msgid)
+                .then(|| Self::Msgid(msgid.to_string()))
+                .ok_or("invalid msgid selector");
+        }
+        if let Some(timestamp) = raw.strip_prefix("timestamp=") {
+            return e6irc_proto::time::parse_server_time_millis(timestamp)
+                .map(e6irc_proto::time::server_time)
+                .map(Self::Timestamp)
+                .ok_or("invalid timestamp selector");
+        }
+        Err("selector must be *, msgid=..., or timestamp=...")
+    }
+}
+
+fn resolve_window<'a>(
+    rows: &'a [crate::db::BncHistoryLine],
+    paging: Paging,
+    selector: &HistorySelector,
+    selector2: &HistorySelector,
+    limit: usize,
+) -> Vec<&'a crate::db::BncHistoryLine> {
+    let n = rows.len();
+    let lower_start = |selector: &HistorySelector| match selector {
+        HistorySelector::Msgid(msgid) => rows
+            .iter()
+            .position(|row| row.msgid.as_deref() == Some(msgid))
+            .map(|position| position + 1),
+        HistorySelector::Timestamp(timestamp) => {
+            Some(rows.partition_point(|row| row.sent_at.as_str() <= timestamp.as_str()))
+        }
+        HistorySelector::Star => None,
+    };
+    let upper_end = |selector: &HistorySelector| match selector {
+        HistorySelector::Msgid(msgid) => rows
+            .iter()
+            .position(|row| row.msgid.as_deref() == Some(msgid)),
+        HistorySelector::Timestamp(timestamp) => {
+            Some(rows.partition_point(|row| row.sent_at.as_str() < timestamp.as_str()))
+        }
+        HistorySelector::Star => None,
+    };
+    let newest = |start: usize, end: usize| {
+        let end = end.min(n);
+        let start = end.saturating_sub(limit).max(start.min(end));
+        rows[start..end].iter().collect()
+    };
+    let oldest = |start: usize, end: usize| {
+        let end = end.min(n);
+        let start = start.min(end);
+        rows[start..(start + limit).min(end)].iter().collect()
+    };
+    match paging {
+        Paging::Latest if matches!(selector, HistorySelector::Star) => newest(0, n),
+        Paging::Latest => lower_start(selector).map_or_else(Vec::new, |start| newest(start, n)),
+        Paging::Before => upper_end(selector).map_or_else(Vec::new, |end| newest(0, end)),
+        Paging::After => lower_start(selector).map_or_else(Vec::new, |start| oldest(start, n)),
+        Paging::Around => upper_end(selector).map_or_else(Vec::new, |pivot| {
+            let before = limit / 2;
+            let start = pivot.saturating_sub(before);
+            let end = (pivot + (limit - before)).min(n);
+            rows[start..end].iter().collect()
+        }),
+        Paging::Between => match (upper_end(selector), upper_end(selector2)) {
+            (Some(first), Some(second)) => {
+                let newest_first = first > second;
+                let older = if first <= second { selector } else { selector2 };
+                match lower_start(older) {
+                    Some(start) if newest_first => newest(start, first.max(second)),
+                    Some(start) => oldest(start, first.max(second)),
+                    None => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        },
+    }
+}
+
+/// `CHATHISTORY TARGETS <timestamp> <timestamp> <target-count>`: list the
+/// conversation targets whose newest activity is strictly between the bounds.
 async fn targets(
     handle: &NetworkHandle,
     write: &mut (impl AsyncWrite + Unpin),
+    caps: AttachCaps,
     params: &[&str],
 ) -> std::io::Result<()> {
+    if params.len() != 4 {
+        return fail(
+            write,
+            "INVALID_PARAMS",
+            "expected exactly <timestamp> <timestamp> <target-count>",
+        )
+        .await;
+    }
     let Some(history) = require_history(handle, write).await? else {
         return Ok(());
     };
-    let ts = params.get(1).copied().unwrap_or("*");
-    let count_raw = params.get(2).copied().unwrap_or("50");
+    let parse_timestamp = |raw: &str| {
+        raw.strip_prefix("timestamp=")
+            .and_then(e6irc_proto::time::parse_server_time_millis)
+            .map(e6irc_proto::time::server_time)
+    };
+    let (Some(first), Some(second)) = (parse_timestamp(params[1]), parse_timestamp(params[2]))
+    else {
+        return fail(write, "INVALID_PARAMS", "expected two timestamp= bounds").await;
+    };
+    let (minimum, maximum) = if first <= second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let count_raw = params[3];
     let count = match parse_limit(count_raw) {
-        Some(n) => n.min(CHATHISTORY_LIMIT_MAX),
+        Some(n) => n,
         None => {
             return fail(
                 write,
                 "INVALID_PARAMS",
-                "target count must be a positive integer",
+                "target count must be between 1 and 500",
             )
             .await;
         }
-    };
-    let cutoff = if ts == "*" {
-        None
-    } else if e6irc_proto::time::parse_server_time_millis(ts).is_some() {
-        Some(ts)
-    } else {
-        return fail(
-            write,
-            "INVALID_PARAMS",
-            "timestamp must be * or an ISO-8601 instant",
-        )
-        .await;
     };
     let rows = match crate::db::bnc_history_targets(
         &history.pool,
         &history.owner,
         &history.network,
-        cutoff,
+        &minimum,
+        &maximum,
         count,
     )
     .await
@@ -399,24 +411,31 @@ async fn targets(
         .iter()
         .map(|(t, newest)| format!(":*bnc* CHATHISTORY TARGETS {t} {newest}\r\n"))
         .collect();
-    write_batch(write, true, None, &inner).await
+    write_batch(write, caps.batch, HistoryBatch::Targets, &inner).await
 }
 
-/// `reply_lines` and `targets` differ only in the batch target and in how each
-/// line is produced, so the wrapper is shared: `BATCH +tag chathistory
-/// [target]`, the lines, then `BATCH -tag`. `target` is `None` for TARGETS
-/// (whose inner lines carry their own target).
+enum HistoryBatch<'a> {
+    Messages(&'a str),
+    Targets,
+}
+
+/// `reply_lines` and `targets` differ only in the batch kind and in how each
+/// line is produced, so the wrapper is shared.
 async fn write_batch(
     write: &mut (impl AsyncWrite + Unpin),
     batch: bool,
-    target: Option<&str>,
+    kind: HistoryBatch<'_>,
     inner: &[String],
 ) -> std::io::Result<()> {
     if batch {
         let tag = next_batch_tag();
-        let head = match target {
-            Some(t) => format!(":*bnc* BATCH +{tag} chathistory {t}\r\n"),
-            None => format!(":*bnc* BATCH +{tag} chathistory\r\n"),
+        let head = match kind {
+            HistoryBatch::Messages(target) => {
+                format!(":*bnc* BATCH +{tag} chathistory {target}\r\n")
+            }
+            HistoryBatch::Targets => {
+                format!(":*bnc* BATCH +{tag} draft/chathistory-targets\r\n")
+            }
         };
         write.write_all(head.as_bytes()).await?;
         for line in inner {
@@ -441,16 +460,51 @@ async fn reply_lines(
     write: &mut (impl AsyncWrite + Unpin),
     caps: AttachCaps,
     target: &str,
-    rows: &[crate::db::BncHistoryLine],
+    rows: &[&crate::db::BncHistoryLine],
 ) -> std::io::Result<()> {
     let inner: Vec<String> = rows
         .iter()
         .map(|row| {
-            let line = super::filter_tags(&row.line, caps);
+            let line = history_replay_line(row, caps);
             format!("{line}\r\n")
         })
         .collect();
-    write_batch(write, caps.batch, Some(target), &inner).await
+    write_batch(write, caps.batch, HistoryBatch::Messages(target), &inner).await
+}
+
+/// Filter a stored line to the client's negotiated tags and ensure a
+/// server-time-capable CHATHISTORY client receives the canonical timestamp the
+/// database used to order it. The upstream `time` tag is replaced, not
+/// duplicated; duplicate tag keys are forbidden and would make clients choose
+/// inconsistent values.
+fn history_replay_line(row: &crate::db::BncHistoryLine, caps: AttachCaps) -> String {
+    let filtered = super::filter_tags(&row.line, caps);
+    if !caps.server_time {
+        return filtered;
+    }
+    let without_time = remove_tag(&filtered, "time");
+    match without_time.strip_prefix('@') {
+        Some(rest) => format!("@time={};{rest}", row.sent_at),
+        None => format!("@time={} {without_time}", row.sent_at),
+    }
+}
+
+fn remove_tag(line: &str, key_to_remove: &str) -> String {
+    let Some(rest) = line.strip_prefix('@') else {
+        return line.to_string();
+    };
+    let Some((tags, body)) = rest.split_once(' ') else {
+        return String::new();
+    };
+    let kept: Vec<&str> = tags
+        .split(';')
+        .filter(|tag| tag.split('=').next() != Some(key_to_remove))
+        .collect();
+    if kept.is_empty() {
+        body.to_string()
+    } else {
+        format!("@{} {body}", kept.join(";"))
+    }
 }
 
 /// `MARKREAD <target> <timestamp>` reply line.
@@ -501,7 +555,16 @@ async fn db_error(
 /// Parse a positive page limit.
 fn parse_limit(raw: &str) -> Option<i64> {
     let n = raw.parse::<i64>().ok()?;
-    (n > 0).then_some(n)
+    (n > 0 && n <= CHATHISTORY_LIMIT_MAX).then_some(n)
+}
+
+fn valid_target(target: &str) -> bool {
+    !target.is_empty()
+        && target.len() <= 64
+        && !target.starts_with(':')
+        && !target
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'\0' | b','))
 }
 
 /// Normalize a MARKREAD timestamp: either a bare ISO-8601 instant or the
@@ -521,4 +584,188 @@ fn next_batch_tag() -> String {
         "e6b{}",
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn limits_and_targets_are_closed_bounded_values() {
+        assert_eq!(parse_limit("1"), Some(1));
+        assert_eq!(parse_limit("500"), Some(500));
+        for invalid in ["0", "501", "-1", "not-a-number"] {
+            assert_eq!(parse_limit(invalid), None, "{invalid}");
+        }
+        assert!(valid_target("#room"));
+        assert!(valid_target("SomeNick"));
+        assert!(!valid_target(""));
+        assert!(!valid_target(&"x".repeat(65)));
+        assert!(!valid_target("bad,target"));
+        assert!(matches!(
+            HistorySelector::parse("msgid=opaque"),
+            Ok(HistorySelector::Msgid(_))
+        ));
+        for invalid in [
+            "msgid=",
+            "msgid=:invalid",
+            "2026-01-01T00:00:00.000Z",
+            "timestamp=invalid",
+        ] {
+            assert!(HistorySelector::parse(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn every_history_window_has_the_specified_boundary_and_direction() {
+        fn row(id: i64) -> crate::db::BncHistoryLine {
+            crate::db::BncHistoryLine {
+                id,
+                line: format!(":n PRIVMSG #room :{id}"),
+                msgid: Some(format!("m{id}")),
+                sent_at: format!("2026-01-01T00:00:0{id}.000Z"),
+            }
+        }
+        let rows: Vec<_> = (1..=6).map(row).collect();
+        let ids = |selected: Vec<&crate::db::BncHistoryLine>| {
+            selected.into_iter().map(|row| row.id).collect::<Vec<_>>()
+        };
+        let star = HistorySelector::Star;
+        let msgid = |id| HistorySelector::Msgid(format!("m{id}"));
+        assert_eq!(
+            ids(resolve_window(&rows, Paging::Latest, &star, &star, 2)),
+            vec![5, 6]
+        );
+        assert_eq!(
+            ids(resolve_window(&rows, Paging::Latest, &msgid(2), &star, 2)),
+            vec![5, 6],
+            "bounded LATEST keeps the newest messages after its pivot"
+        );
+        assert_eq!(
+            ids(resolve_window(&rows, Paging::Before, &msgid(5), &star, 2)),
+            vec![3, 4]
+        );
+        assert_eq!(
+            ids(resolve_window(&rows, Paging::After, &msgid(2), &star, 2)),
+            vec![3, 4]
+        );
+        assert_eq!(
+            ids(resolve_window(&rows, Paging::Around, &msgid(4), &star, 4)),
+            vec![2, 3, 4, 5]
+        );
+        assert_eq!(
+            ids(resolve_window(
+                &rows,
+                Paging::Between,
+                &msgid(2),
+                &msgid(6),
+                2
+            )),
+            vec![3, 4]
+        );
+        assert_eq!(
+            ids(resolve_window(
+                &rows,
+                Paging::Between,
+                &msgid(6),
+                &msgid(2),
+                2
+            )),
+            vec![4, 5],
+            "a reverse BETWEEN window limits from its first, newer endpoint"
+        );
+        assert!(resolve_window(&rows, Paging::Before, &msgid(99), &star, 2).is_empty());
+    }
+
+    #[tokio::test]
+    async fn targets_use_the_dedicated_batch_type() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        write_batch(
+            &mut server,
+            true,
+            HistoryBatch::Targets,
+            &[":*bnc* CHATHISTORY TARGETS #room 2026-01-01T00:00:00.000Z\r\n".into()],
+        )
+        .await
+        .expect("write target batch");
+        server.shutdown().await.expect("close server half");
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.expect("read batch");
+        assert!(reply.contains(" draft/chathistory-targets\r\n"));
+    }
+
+    #[test]
+    fn replay_uses_the_same_canonical_time_as_history_ordering() {
+        let row = crate::db::BncHistoryLine {
+            id: 1,
+            line: "@time=invalid;msgid=m1 :n PRIVMSG #room :message".into(),
+            msgid: Some("m1".into()),
+            sent_at: "2026-01-01T00:00:00.123Z".into(),
+        };
+        let line = history_replay_line(
+            &row,
+            AttachCaps {
+                server_time: true,
+                message_tags: true,
+                ..AttachCaps::default()
+            },
+        );
+        assert_eq!(
+            line,
+            "@time=2026-01-01T00:00:00.123Z;msgid=m1 :n PRIVMSG #room :message"
+        );
+        assert_eq!(
+            line.matches("time=").count(),
+            1,
+            "history must never emit duplicate time tags"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_history_commands_fail_before_storage() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let (handle, _ends) = NetworkHandle::channels(4);
+        for params in [
+            vec!["LATEST", "#room", "*", "501"],
+            vec!["LATEST", "#room", "*", "10", "extra"],
+            vec!["TARGETS", "*"],
+        ] {
+            handle_chathistory(
+                &handle,
+                &mut server,
+                AttachCaps {
+                    batch: true,
+                    chathistory: true,
+                    ..AttachCaps::default()
+                },
+                &params,
+            )
+            .await
+            .expect("history rejection");
+        }
+        handle_markread(
+            &handle,
+            &mut server,
+            "alice",
+            &["#room", "timestamp=2026-01-01T00:00:00.000Z", "extra"],
+        )
+        .await
+        .expect("MARKREAD rejection");
+        server.shutdown().await.expect("close server half");
+        let mut replies = String::new();
+        client
+            .read_to_string(&mut replies)
+            .await
+            .expect("read replies");
+        assert_eq!(
+            replies.matches("FAIL CHATHISTORY INVALID_PARAMS").count(),
+            3
+        );
+        assert!(replies.contains("FAIL MARKREAD INVALID_PARAMS"));
+        assert!(
+            !replies.contains("UNAVAILABLE"),
+            "validation must precede storage"
+        );
+    }
 }

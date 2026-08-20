@@ -318,6 +318,17 @@ pub(super) async fn ws_ui_conn(
             return;
         }
     }
+    // A bounded replay is history, not current state. Reconcile the driver's
+    // authoritative identity and memberships after it so an aged-out JOIN or a
+    // stale PART cannot leave the browser attached to the wrong conversations.
+    if let Some(session) = handle.irc_session_snapshot()
+        && socket
+            .send(WsMessage::text(session_event(&session)))
+            .await
+            .is_err()
+    {
+        return;
+    }
     // Delimit replay from live traffic. The browser waits for this typed
     // boundary before requesting authoritative NAMES snapshots, so old NAMES
     // rows in the detached buffer cannot race and overwrite the fresh result.
@@ -367,6 +378,15 @@ pub(super) async fn ws_ui_conn(
                 Ok(DriverEvent::Status(status)) => {
                     if socket
                         .send(WsMessage::text(driver_status_event(status)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(DriverEvent::Session(session)) => {
+                    if socket
+                        .send(WsMessage::text(session_event(&session)))
                         .await
                         .is_err()
                     {
@@ -590,6 +610,11 @@ enum UiEvent<'a> {
     SendError { v: &'a str, message: &'a str },
     #[serde(rename = "snapshot")]
     Snapshot { v: &'static str },
+    #[serde(rename = "session")]
+    Session {
+        nick: &'a str,
+        channels: &'a [String],
+    },
     #[serde(rename = "status")]
     Status {
         v: ConnStatus,
@@ -662,6 +687,13 @@ pub(super) fn line_event(line: &str) -> String {
 /// Marks the point after detached-buffer replay and before live traffic.
 pub(super) fn snapshot_event() -> String {
     ui_event(UiEvent::Snapshot { v: "complete" })
+}
+
+fn session_event(session: &crate::bouncer::IrcSessionSnapshot) -> String {
+    ui_event(UiEvent::Session {
+        nick: &session.nick,
+        channels: &session.channels,
+    })
 }
 
 /// Connection state sent to the web client. An enum (not a free `&str`) so the
@@ -752,6 +784,17 @@ mod tests {
             (
                 status_event(ConnStatus::Unavailable, None),
                 serde_json::json!({ "t": "status", "v": "unavailable" }),
+            ),
+            (
+                session_event(&crate::bouncer::IrcSessionSnapshot {
+                    nick: "alice".to_string(),
+                    channels: vec!["#one".to_string(), "#two".to_string()],
+                }),
+                serde_json::json!({
+                    "t": "session",
+                    "nick": "alice",
+                    "channels": ["#one", "#two"]
+                }),
             ),
         ];
         for (wire, expected) in cases {

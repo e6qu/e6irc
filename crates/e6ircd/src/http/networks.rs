@@ -769,12 +769,7 @@ pub(crate) fn is_blocked_upstream_ip(ip: std::net::IpAddr) -> bool {
 /// at every render site (DESIGN §2). `.`/`..` are excluded so a name can never
 /// resolve to a path-traversal segment.
 pub(super) fn network_name_ok(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    crate::sanitize::valid_network_name(name)
 }
 
 /// Bounds/injection/SSRF checks on the connection/identity fields, shared by
@@ -1212,14 +1207,6 @@ async fn create_network_core(
     // Fields that are create-only (the name) or SASL-specific (bounds + the NUL
     // check that matters because PLAIN uses NUL as its field separator, and the
     // sealed-secret size cap) are checked here rather than in the shared helper.
-    if req.name.len() > 64 {
-        return Err(network_error(
-            StatusCode::BAD_REQUEST,
-            "Field too long",
-            Some("network names are limited to 64 bytes"),
-        )
-        .with_field("name"));
-    }
     if let Some(account) = req.sasl_account.as_deref() {
         validate_credential_field(account, 255).map_err(|e| e.with_field("sasl_account"))?;
     }
@@ -1760,6 +1747,7 @@ mod tests {
         assert!(!network_name_ok(""));
         assert!(!network_name_ok("a b"));
         assert!(!network_name_ok("a\nb"));
+        assert!(!network_name_ok(&"x".repeat(65)));
         // Path-traversal segments.
         assert!(!network_name_ok("."));
         assert!(!network_name_ok(".."));

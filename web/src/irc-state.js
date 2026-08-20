@@ -82,8 +82,9 @@ export function parseIrc(line) {
   const params = rest.split(" ").filter((part) => part.length);
   const command = (params.shift() || "").toUpperCase();
   if (trailing !== null) params.push(trailing);
-  const nick = prefix ? prefix.split("!")[0] : null;
-  return { tags, nick, command, params };
+  const nick = prefix ? prefix.split(/[!@]/, 1)[0] : null;
+  const sourceIsUser = prefix != null && (prefix.includes("!") || prefix.includes("@"));
+  return { tags, nick, sourceIsUser, command, params };
 }
 
 function unescapeTagValue(value) {
@@ -148,4 +149,22 @@ export function mergeTimeline(history, live, limit) {
   }
   prependReversed.reverse();
   return [...prependReversed, ...live].slice(-limit);
+}
+
+// Reconcile channel buffers against an authoritative BNC session snapshot.
+// Detached replay is bounded history and cannot answer current membership.
+export function reconcileChannelSnapshot(current, joined) {
+  const joinedByKey = new Map();
+  for (const channel of joined) {
+    const key = fold(channel);
+    if (!joinedByKey.has(key)) joinedByKey.set(key, channel);
+  }
+  const currentKeys = new Set(current.map(fold));
+  return Object.freeze({
+    removed: Object.freeze(current.filter((channel) => !joinedByKey.has(fold(channel)))),
+    added: Object.freeze(
+      [...joinedByKey.values()].filter((channel) => !currentKeys.has(fold(channel))),
+    ),
+    joined: Object.freeze([...joinedByKey.values()]),
+  });
 }

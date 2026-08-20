@@ -58,6 +58,15 @@ and operational failures are safe notices, and storage-failure notices cannot
 retry through the failed writer. Administrators also have a bounded live server
 log for fixed operational error classes. It excludes request data, IRC traffic,
 and secrets; the durable audit log remains the source for privileged actions.
+The BNC and browser attach paths now reconcile a typed authoritative IRC
+session snapshot after bounded replay. Raw attach registration uses the actual
+upstream nick, malformed downstream lines fail loudly, and SASL PLAIN cannot
+request a different authorization identity. External-network history stores
+both direct-message directions under one RFC1459-folded peer, validates its
+metadata, and implements the complete LATEST/BEFORE/AFTER/AROUND/BETWEEN plus
+two-bound TARGETS surface through one tested window resolver. The browser
+removes stale channel buffers from the session snapshot and routes server
+notices to the server buffer rather than creating phantom direct messages.
 
 ## Remaining qualification
 

@@ -10,6 +10,7 @@ import {
   messageIdentity,
   nickPrefix,
   parseIrc,
+  reconcileChannelSnapshot,
   splitSigil,
   tagValue,
 } from "../src/irc-state.js";
@@ -21,10 +22,16 @@ test("IRC parsing preserves tags, prefix, trailing text, and RFC1459 identity", 
   assert.deepEqual(parsed, {
     tags: "time=2026-07-28T20:00:00.000Z;msgid=m1",
     nick: "Alice",
+    sourceIsUser: true,
     command: "PRIVMSG",
     params: ["#Chat", "hello there"],
   });
   assert.equal(fold("[Alice]~"), "{alice}^");
+});
+
+test("IRC parsing distinguishes server and user notice sources", () => {
+  assert.equal(parseIrc(":irc.example NOTICE alice :maintenance").sourceIsUser, false);
+  assert.equal(parseIrc(":NickServ!service@irc.example NOTICE alice :identified").sourceIsUser, true);
 });
 
 test("IRC tag values use the protocol escape rules", () => {
@@ -89,4 +96,15 @@ test("history merge deduplicates duplicate stable ids and applies the cap last",
     { identity: "two", text: "newest copy" },
     { identity: "three", text: "live" },
   ]);
+});
+
+test("authoritative session channels replace stale replay membership by casefold", () => {
+  assert.deepEqual(
+    reconcileChannelSnapshot(["#Keep", "#stale"], ["#keep", "#New", "#new"]),
+    {
+      removed: ["#stale"],
+      added: ["#New"],
+      joined: ["#keep", "#New"],
+    },
+  );
 });

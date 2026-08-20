@@ -153,6 +153,19 @@ pub(crate) fn valid_nick(nick: &str, nicklen: usize) -> bool {
     nick.len() <= nicklen && bytes.all(|b| b.is_ascii_alphanumeric() || special(b) || b == b'-')
 }
 
+/// A client-facing BNC network selector. The same value appears in config,
+/// REST paths, HTML, and the raw attach `nick/network` address, so every ingress
+/// admits one bounded, path-safe token language.
+pub(crate) fn valid_network_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// Maximum channel-name length in bytes. Enforced by [`valid_channel_name`] and
 /// advertised as ISUPPORT `CHANNELLEN`; the advertisement reads this const so the
 /// two can never drift (the class the ISUPPORT builder is written to prevent).
