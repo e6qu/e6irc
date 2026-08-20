@@ -1587,6 +1587,22 @@ async fn bnc_attach_with_history(
     client.send_line("CAP END").await.expect("CAP END");
     let welcome = client.next_message().await.unwrap().expect("001");
     assert_eq!(welcome.command, "001", "{welcome:?}");
+    let isupport = client.next_message().await.unwrap().expect("005");
+    assert_eq!(isupport.command, "005", "{isupport:?}");
+    assert!(
+        isupport
+            .params
+            .iter()
+            .any(|param| param == "CASEMAPPING=rfc1459"),
+        "{isupport:?}"
+    );
+    assert!(
+        isupport
+            .params
+            .iter()
+            .any(|param| param == "CHATHISTORY=500"),
+        "{isupport:?}"
+    );
     // End-of-MOTD numeric closes the registration burst.
     let motd = client.next_message().await.unwrap().expect("422");
     assert_eq!(motd.command, "422", "{motd:?}");
@@ -1694,8 +1710,22 @@ async fn bnc_listener_serves_chathistory_and_markread() {
     assert_eq!(ack.command, "MARKREAD", "{ack:?}");
     assert_eq!(
         ack.params.get(1).map(String::as_str),
-        Some("2024-01-01T00:00:00.000Z"),
+        Some("timestamp=2024-01-01T00:00:00.000Z"),
         "{ack:?}"
+    );
+    client
+        .send_line("MARKREAD #lobby timestamp=2020-01-01T00:00:00.000Z")
+        .await
+        .unwrap();
+    let older = client
+        .next_message()
+        .await
+        .unwrap()
+        .expect("older MARKREAD ack");
+    assert_eq!(
+        older.params.get(1).map(String::as_str),
+        Some("timestamp=2024-01-01T00:00:00.000Z"),
+        "a read marker must never move backwards: {older:?}"
     );
     client.send_line("MARKREAD #lobby").await.unwrap();
     let query = client
@@ -1706,7 +1736,7 @@ async fn bnc_listener_serves_chathistory_and_markread() {
     assert_eq!(query.command, "MARKREAD", "{query:?}");
     assert_eq!(
         query.params.get(1).map(String::as_str),
-        Some("2024-01-01T00:00:00.000Z"),
+        Some("timestamp=2024-01-01T00:00:00.000Z"),
         "{query:?}"
     );
 

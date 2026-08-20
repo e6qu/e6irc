@@ -2161,6 +2161,7 @@ async fn handle_request(
             targets,
             display,
             batch_ref,
+            caps,
             query,
             label,
         } => {
@@ -2183,6 +2184,7 @@ async fn handle_request(
                     conn,
                     display,
                     batch_ref,
+                    caps,
                     rows,
                     label,
                 })
@@ -2197,6 +2199,7 @@ async fn handle_request(
             max_ts,
             limit,
             batch_ref,
+            caps,
             label,
         } => {
             let targets = query_targets(pool, &channels, &me, min_ts, max_ts, limit)
@@ -2209,6 +2212,7 @@ async fn handle_request(
                 .push(Input::TargetsPage {
                     conn,
                     batch_ref,
+                    caps,
                     targets,
                     label,
                 })
@@ -5354,7 +5358,7 @@ pub async fn list_channel_mlock(pool: &PgPool) -> Result<Vec<(String, String)>, 
 
 /// Delete `account`'s network `name`. Returns whether a row was removed.
 ///
-/// The network row and its buffer rows are removed in one transaction: they
+/// The network row, buffer rows, and read markers are removed in one transaction: they
 /// commit or roll back together. Done as two standalone statements, a failure
 /// (or a crash) after the network delete committed would orphan the buffer
 /// rows — and because a later same-named network for the same owner replays
@@ -5383,6 +5387,16 @@ pub async fn delete_bnc_network(pool: &PgPool, account: &str, name: &str) -> Res
         .execute(&mut *tx)
         .await
         .map_err(DbError::Query)?;
+    sqlx::query(
+        "DELETE FROM bnc_read_markers
+         WHERE account_id = (SELECT id FROM accounts WHERE name_folded = $1)
+           AND network = $2",
+    )
+    .bind(&key.owner)
+    .bind(&key.network)
+    .execute(&mut *tx)
+    .await
+    .map_err(DbError::Query)?;
     tx.commit().await.map_err(DbError::Query)?;
     Ok(res.rows_affected() > 0)
 }
@@ -5487,6 +5501,7 @@ fn bnc_line_msgid(line: &str) -> Option<String> {
     let value = message
         .tags
         .into_iter()
+        .rev()
         .find(|tag| tag.key == "msgid")?
         .value?;
     e6irc_proto::message::valid_message_id(&value).then(|| value.into_owned())
@@ -5501,6 +5516,7 @@ fn bnc_line_sent_at(line: &str) -> String {
         && let Some(timestamp) = message
             .tags
             .into_iter()
+            .rev()
             .find(|tag| tag.key == "time")
             .and_then(|tag| tag.value)
         && let Some(millis) = e6irc_proto::time::parse_server_time_millis(&timestamp)
@@ -5657,50 +5673,80 @@ pub async fn get_bnc_read_marker(
 }
 
 /// Set (upsert) one per-network, per-target read marker.
+pub enum BncReadMarkerWrite {
+    Stored(String),
+    LimitReached,
+}
+
+/// Maximum durable BNC marker targets one account may retain across networks.
+/// Markers outlive attachments and memberships, so the database boundary must
+/// enforce the cap atomically across concurrent clients.
+pub const BNC_READ_MARKER_LIMIT: i64 = 256;
+
 pub async fn set_bnc_read_marker(
     pool: &PgPool,
     account: &str,
     network: &str,
     target: &str,
     timestamp: &str,
-) -> Result<(), DbError> {
+) -> Result<BncReadMarkerWrite, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let net_folded = CaseMapping::Rfc1459.casefold(network);
     let target_folded = CaseMapping::Rfc1459.casefold(target);
-    sqlx::query(
-        "INSERT INTO bnc_read_markers (account_id, network, target, timestamp)
-         VALUES ((SELECT id FROM accounts WHERE name_folded = $1), $2, $3, $4)
-         ON CONFLICT (account_id, network, target)
-         DO UPDATE SET timestamp = EXCLUDED.timestamp",
+    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    // Lock the durable account row while checking and consuming marker
+    // capacity. This both serializes concurrent writers for the same account
+    // and keeps the identifier at its schema-native BIGINT width.
+    let account_id: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR UPDATE")
+            .bind(&folded)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(DbError::Query)?;
+    let Some(account_id) = account_id else {
+        return Err(DbError::UnknownAccount(account.to_string()));
+    };
+    // Without the account row lock above, two attaches can both see 255 rows
+    // and commit the 256th/257th concurrently.
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM bnc_read_markers
+             WHERE account_id = $1 AND network = $2 AND target = $3
+         )",
     )
-    .bind(&folded)
+    .bind(account_id)
+    .bind(&net_folded)
+    .bind(&target_folded)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(DbError::Query)?;
+    if !exists {
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM bnc_read_markers WHERE account_id = $1")
+                .bind(account_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(DbError::Query)?;
+        if count >= BNC_READ_MARKER_LIMIT {
+            return Ok(BncReadMarkerWrite::LimitReached);
+        }
+    }
+    let stored: String = sqlx::query_scalar(
+        "INSERT INTO bnc_read_markers (account_id, network, target, timestamp)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (account_id, network, target)
+         DO UPDATE SET timestamp = GREATEST(bnc_read_markers.timestamp, EXCLUDED.timestamp)
+         RETURNING timestamp",
+    )
+    .bind(account_id)
     .bind(&net_folded)
     .bind(&target_folded)
     .bind(timestamp)
-    .execute(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(DbError::Query)?;
-    Ok(())
-}
-
-/// All read markers for one account/network, as `(target, timestamp)`.
-pub async fn list_bnc_read_markers(
-    pool: &PgPool,
-    account: &str,
-    network: &str,
-) -> Result<Vec<(String, String)>, DbError> {
-    let folded = CaseMapping::Rfc1459.casefold(account);
-    let net_folded = CaseMapping::Rfc1459.casefold(network);
-    sqlx::query_as(
-        "SELECT target, timestamp FROM bnc_read_markers
-         WHERE account_id = (SELECT id FROM accounts WHERE name_folded = $1)
-           AND network = $2",
-    )
-    .bind(&folded)
-    .bind(&net_folded)
-    .fetch_all(pool)
-    .await
-    .map_err(DbError::Query)
+    tx.commit().await.map_err(DbError::Query)?;
+    Ok(BncReadMarkerWrite::Stored(stored))
 }
 pub struct BncBufferSummary {
     pub lines: i64,
@@ -6735,8 +6781,20 @@ mod history_sql_tests {
         assert_eq!(bnc_line_msgid("@msgid= :s PRIVMSG #x :message"), None);
         assert_eq!(bnc_line_msgid("@msgid :s PRIVMSG #x :message"), None);
         assert_eq!(
+            bnc_line_msgid("@msgid=old;msgid=new :s PRIVMSG #x :message"),
+            Some("new".into()),
+            "IRC duplicate tags use the final occurrence"
+        );
+        assert_eq!(
             bnc_line_sent_at("@time=2026-01-02T03:04:05.6Z :s PRIVMSG #x :message"),
             "2026-01-02T03:04:05.600Z"
+        );
+        assert_eq!(
+            bnc_line_sent_at(
+                "@time=2020-01-01T00:00:00.000Z;time=2026-01-02T03:04:05.6Z :s PRIVMSG #x :message"
+            ),
+            "2026-01-02T03:04:05.600Z",
+            "history ordering must use the same final duplicate tag clients see"
         );
         let fallback = bnc_line_sent_at("@time=not-a-timestamp :s PRIVMSG #x :message");
         assert!(

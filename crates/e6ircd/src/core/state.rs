@@ -3951,12 +3951,12 @@ impl ServerState {
             .unwrap_or_else(|| "*".into())
     }
 
-    pub fn reply_caps(&self, conn: ConnId) -> Caps {
+    pub fn reply_caps(&self, conn: ConnId) -> Option<Caps> {
         self.capture
             .as_ref()
             .filter(|capture| capture.conn == conn)
             .and_then(|capture| capture.reply_caps)
-            .unwrap_or_else(|| self.sessions[&conn].caps)
+            .or_else(|| self.sessions.get(&conn).map(|session| session.caps))
     }
 
     pub fn numeric(&mut self, conn: ConnId, code: u16, middle: &[&str], trailing: Option<&str>) {

@@ -555,30 +555,13 @@ impl Connection {
     /// acknowledges it. The shared prologue of every SASL path.
     async fn negotiate_sasl_cap(&mut self) -> io::Result<()> {
         self.begin_cap().await?;
-        self.send_line("CAP REQ :sasl").await?;
-        loop {
-            let msg = self.recv("closed during CAP").await?;
-            match msg.params.get(1).map(String::as_str) {
-                Some("ACK") if msg.command == "CAP" => return Ok(()),
-                Some("NAK") if msg.command == "CAP" => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "server refused SASL",
-                    ));
-                }
-                // A server that refuses via an `ERROR` line (rather than CAP NAK)
-                // while holding the socket open would otherwise hang this loop.
-                _ if msg.command == "ERROR" => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionRefused,
-                        "server refused the connection during CAP",
-                    ));
-                }
-                // Answer PINGs so a strict server doesn't ping-timeout us mid-CAP.
-                _ => {
-                    self.answer_ping(&msg).await?;
-                }
-            }
+        if self.request_capability("sasl").await? {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "server refused SASL",
+            ))
         }
     }
 
@@ -586,24 +569,49 @@ impl Connection {
     /// harmless, but its reply must be consumed before registration continues.
     async fn request_metadata_capabilities(&mut self) -> io::Result<()> {
         for capability in METADATA_CAPABILITIES {
-            self.send_line(&format!("CAP REQ :{capability}")).await?;
-            loop {
-                let msg = self.recv("closed during capability negotiation").await?;
-                if msg.command == "ERROR" {
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionRefused,
-                        "server refused the connection during capability negotiation",
-                    ));
-                }
-                if msg.command == "CAP"
-                    && matches!(msg.params.get(1).map(String::as_str), Some("ACK" | "NAK"))
-                {
-                    break;
-                }
-                self.answer_ping(&msg).await?;
-            }
+            // Optional metadata may be NAKed, but an ACK/NAK for some other
+            // capability cannot complete this outstanding request.
+            let _enabled = self.request_capability(capability).await?;
         }
         Ok(())
+    }
+
+    /// Request one capability and consume exactly its ACK/NAK. Registration
+    /// sends these requests serially, so a CAP verdict that omits the sole
+    /// outstanding name is a malformed peer response, not permission to
+    /// advance the state machine with an unknown capability state.
+    async fn request_capability(&mut self, capability: &str) -> io::Result<bool> {
+        self.send_line(&format!("CAP REQ :{capability}")).await?;
+        loop {
+            let msg = self.recv("closed during capability negotiation").await?;
+            if msg.command == "ERROR" {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "server refused the connection during capability negotiation",
+                ));
+            }
+            if msg.command == "410" {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "server rejected capability negotiation",
+                ));
+            }
+            if msg.command == "CAP"
+                && let Some(verdict @ ("ACK" | "NAK")) = msg.params.get(1).map(String::as_str)
+            {
+                let names = msg.params.last().map(String::as_str).unwrap_or("");
+                if !names.split_whitespace().any(|name| name == capability) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "server capability {verdict} omitted requested capability {capability}"
+                        ),
+                    ));
+                }
+                return Ok(verdict == "ACK");
+            }
+            self.answer_ping(&msg).await?;
+        }
     }
 
     /// Wait for the server's empty `AUTHENTICATE +` challenge after a mechanism
@@ -827,6 +835,21 @@ impl Connection {
                         )));
                     }
                     Some("NAK") => {
+                        let rejected = msg.params.last().map(String::as_str).unwrap_or("");
+                        let all_rejected = capabilities.iter().all(|required| {
+                            rejected
+                                .split_whitespace()
+                                .any(|capability| capability == *required)
+                        });
+                        if !all_rejected {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "server capability NAK omitted a requested capability: {}",
+                                    capabilities.join(" ")
+                                ),
+                            ));
+                        }
                         return Err(io::Error::new(
                             io::ErrorKind::Unsupported,
                             format!(
@@ -1277,6 +1300,33 @@ mod tests {
             Connection::from_halves(Box::new(reader), Box::new(writer)),
             server_io,
         )
+    }
+
+    #[tokio::test]
+    async fn capability_request_requires_a_correlated_verdict() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (mut connection, server_io) = duplex_connection(4096);
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server_io);
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            assert_eq!(
+                lines.next_line().await.unwrap().unwrap(),
+                "CAP REQ :server-time"
+            );
+            writer
+                .write_all(b":srv CAP * ACK :message-tags\r\n")
+                .await
+                .unwrap();
+        });
+
+        let error = connection
+            .request_capability("server-time")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("server-time"));
+        server.await.unwrap();
     }
 
     #[tokio::test]

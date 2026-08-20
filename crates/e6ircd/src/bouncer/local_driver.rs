@@ -189,6 +189,14 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
             // Downstream command -> core.
             cmd = ends.next_command() => match cmd {
                 Some(cmd) => {
+                    let echo = ends.irc_session_snapshot().and_then(|snapshot| {
+                        super::irc_driver::self_echo(
+                            &cmd.line,
+                            &snapshot.nick,
+                            &session.nick,
+                            LOCAL_NETWORK,
+                        )
+                    });
                     if session
                         .core
                         .core_tx
@@ -197,6 +205,9 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
                         .is_err()
                     {
                         return Stopped;
+                    }
+                    if let Some(echo) = echo {
+                        ends.emit_echo(echo, cmd.origin);
                     }
                 }
                 None => {

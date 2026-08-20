@@ -253,7 +253,15 @@ body {
 }
 .buf:hover { background: var(--chrome-raised); }
 .buf.active { border-left-color: var(--route); background: var(--chrome-raised); color: #ffffff; font-weight: 650; }
+.buf.archived:not(.active) { color: var(--chrome-muted); }
 .buf-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.buffer-state {
+  flex: 0 0 auto;
+  color: var(--chrome-muted);
+  font: 0.62rem/1 var(--font-mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
 .badge {
   flex: 0 0 auto;
   font-size: 0.68rem;

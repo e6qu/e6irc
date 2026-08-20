@@ -289,6 +289,7 @@ function requestNames(buffer) {
   if (
     !memberTracking ||
     buffer.kind !== "channel" ||
+    !buffer.joined ||
     !upstreamConnected ||
     !snapshotComplete ||
     !socket ||
@@ -313,7 +314,7 @@ function resyncMemberships() {
   namesRequested.clear();
   namesSnapshots.clear();
   for (const buffer of buffers.values()) {
-    if (buffer.kind !== "channel") continue;
+    if (buffer.kind !== "channel" || !buffer.joined) continue;
     buffer.nicks.clear();
     buffer.membershipKnown = false;
     buffer.membersTruncated = false;
@@ -328,16 +329,24 @@ function applySessionSnapshot(nick, channels) {
     .filter((buffer) => buffer.kind === "channel")
     .map((buffer) => buffer.display);
   const reconciliation = reconcileChannelSnapshot(current, channels);
-  let activeRemoved = false;
   for (const channel of reconciliation.removed) {
     const key = fold(channel);
-    buffers.delete(key);
+    const buffer = buffers.get(key);
+    if (!buffer) continue;
+    // A reconnect begins with an empty authoritative membership set and fills
+    // it as upstream JOINs are confirmed. Keep the transcript as an archived
+    // buffer during that transition; only an explicit PART/KICK closes it.
+    buffer.joined = false;
+    buffer.nicks.clear();
+    buffer.membershipKnown = false;
+    buffer.membersTruncated = false;
     namesSnapshots.delete(key);
     namesRequested.delete(key);
-    if (active === key) activeRemoved = true;
   }
-  for (const channel of reconciliation.joined) ensureBuffer(channel, "channel");
-  if (activeRemoved) active = SERVER;
+  for (const channel of reconciliation.joined) {
+    const buffer = ensureBuffer(channel, "channel");
+    if (buffer.kind === "channel") buffer.joined = true;
+  }
   renderBufferList();
   renderActive();
 }
@@ -368,6 +377,7 @@ function ensureBuffer(name, kind) {
     mentions: 0,
     pendingVisibleMessages: 0,
     historyLoaded: false,
+    joined: kind === "channel" ? false : null,
     membershipKnown: false,
     membersTruncated: false,
   };
@@ -406,7 +416,8 @@ function renderBufferList() {
     const li = document.createElement("li");
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "buf" + (b.key === active ? " active" : "");
+    const archived = b.kind === "channel" && !b.joined;
+    button.className = "buf" + (b.key === active ? " active" : "") + (archived ? " archived" : "");
     if (b.key === active) button.setAttribute("aria-current", "true");
     const bufferName = b.key === SERVER ? "server" : b.display;
     const inactive = b.key !== active;
@@ -416,11 +427,22 @@ function renderBufferList() {
     const mentionLabel = b.mentions > 0 && inactive
       ? `, ${b.mentions} mention${b.mentions === 1 ? "" : "s"}`
       : "";
-    button.setAttribute("aria-label", `Open ${bufferName}${unreadLabel}${mentionLabel}`);
+    const archivedLabel = archived ? ", past channel, not currently joined" : "";
+    button.setAttribute(
+      "aria-label",
+      `Open ${bufferName}${archivedLabel}${unreadLabel}${mentionLabel}`,
+    );
     const label = document.createElement("span");
     label.className = "buf-name";
     label.textContent = bufferName;
     button.appendChild(label);
+    if (archived) {
+      const state = document.createElement("span");
+      state.className = "buffer-state";
+      state.textContent = "past";
+      state.setAttribute("aria-hidden", "true");
+      button.appendChild(state);
+    }
     if (b.unread > 0 && inactive) {
       const badge = document.createElement("span");
       badge.className = "badge";
@@ -504,8 +526,9 @@ function renderActive({ atLatest = true } = {}) {
     bufferActionEl.hidden = true;
   } else {
     bufferActionEl.hidden = false;
-    bufferActionEl.textContent = b.kind === "channel" ? "Leave" : "Close";
-    const action = b.kind === "channel" ? `Leave ${b.display}` : `Close conversation with ${b.display}`;
+    const canLeave = b.kind === "channel" && b.joined;
+    bufferActionEl.textContent = canLeave ? "Leave" : "Close";
+    const action = canLeave ? `Leave ${b.display}` : `Close conversation with ${b.display}`;
     bufferActionEl.title = action;
     bufferActionEl.setAttribute("aria-label", action);
   }
@@ -635,7 +658,7 @@ function closeBuffer(name) {
 bufferActionEl.addEventListener("click", () => {
   const buffer = buffers.get(active);
   if (!buffer || buffer.kind === "server") return;
-  if (buffer.kind === "dm") {
+  if (buffer.kind === "dm" || !buffer.joined) {
     closeBuffer(buffer.key);
     return;
   }
@@ -881,7 +904,8 @@ function handleLine(raw) {
       }
       for (const channel of channels) {
         if (isMe(m.nick)) {
-          ensureBuffer(channel, "channel");
+          const buffer = ensureBuffer(channel, "channel");
+          if (buffer.kind === "channel") buffer.joined = true;
           setActive(channel);
         } else if (m.nick) {
           addNick(channel, m.nick);

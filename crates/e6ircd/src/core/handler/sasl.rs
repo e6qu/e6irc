@@ -21,6 +21,16 @@ pub(super) fn sasl_fail(state: &mut ServerState, conn: ConnId) {
     state.numeric(conn, ERR_SASLFAIL, &[], Some("SASL authentication failed"));
 }
 
+fn sasl_unavailable(state: &mut ServerState, conn: ConnId) {
+    state.sessions.get_mut(&conn).expect("checked").sasl = crate::core::state::SaslState::Idle;
+    state.numeric(
+        conn,
+        ERR_SASLFAIL,
+        &[],
+        Some("SASL authentication temporarily unavailable"),
+    );
+}
+
 /// A credential verification was denied — either a definitive rejection
 /// (`unavailable == false`) or a store fault (`unavailable == true`). Routed by
 /// the verdict's own `origin` so a SASL denial fails the SASL attempt and a
@@ -36,7 +46,11 @@ fn verify_denied(
     match origin {
         crate::core::CredentialOrigin::Sasl => {
             if state.sessions[&conn].sasl == crate::core::state::SaslState::Verifying {
-                sasl_fail(state, conn);
+                if unavailable {
+                    sasl_unavailable(state, conn);
+                } else {
+                    sasl_fail(state, conn);
+                }
             }
             // else: stale reply for an aborted SASL attempt — drop it.
         }
@@ -242,25 +256,15 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
                 return;
             }
             if mechanism == SaslState::PlainPending {
-                // payload: base64(authzid \0 authcid \0 password)
-                let parsed = e6irc_proto::base64::decode(&payload).and_then(|raw| {
-                    let mut parts = raw.split(|&b| b == 0);
-                    let _authzid = parts.next()?;
-                    let authcid = String::from_utf8(parts.next()?.to_vec()).ok()?;
-                    let password = String::from_utf8(parts.next()?.to_vec()).ok()?;
-                    if parts.next().is_some() || authcid.is_empty() || password.is_empty() {
-                        return None;
-                    }
-                    Some((authcid, password))
-                });
-                let Some((account, password)) = require_cred_payload(parsed, state, conn) else {
+                let parsed = e6irc_proto::sasl::parse_plain_payload(&payload);
+                let Some(credentials) = require_cred_payload(parsed, state, conn) else {
                     return;
                 };
                 state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Verifying;
                 let request = crate::core::DbRequest::VerifyPassword {
                     conn,
-                    account,
-                    password,
+                    account: credentials.account,
+                    password: credentials.password,
                     origin: crate::core::CredentialOrigin::Sasl,
                 };
                 if state.db_tx.try_push(request).is_err() {

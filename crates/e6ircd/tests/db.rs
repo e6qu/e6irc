@@ -727,6 +727,10 @@ async fn history_worker_resolves_offline_direct_message_candidates() {
                 targets,
                 display: "peer".into(),
                 batch_ref: "batch".into(),
+                caps: e6ircd::core::HistoryResponseCaps {
+                    batch: true,
+                    ..Default::default()
+                },
                 query: e6ircd::core::HistoryQuery::Latest { limit: 10 },
                 label: None,
             })
@@ -2516,6 +2520,15 @@ async fn deleting_a_bnc_network_purges_its_casefolded_buffer() {
         .await
         .expect("persist");
     }
+    db::set_bnc_read_marker(
+        &pool,
+        "MixedCase",
+        "libera",
+        "#x",
+        "2026-01-01T00:00:00.000Z",
+    )
+    .await
+    .expect("persist read marker");
     // Delete by the raw (display-cased) account name, as the HTTP handler does.
     assert!(
         db::delete_bnc_network(&pool, "MixedCase", "libera")
@@ -2530,6 +2543,68 @@ async fn deleting_a_bnc_network_purges_its_casefolded_buffer() {
         remaining, 0,
         "the folded-owner buffer rows must be purged on delete, not orphaned"
     );
+    let markers: i64 = sqlx::query_scalar("SELECT count(*) FROM bnc_read_markers")
+        .fetch_one(&pool)
+        .await
+        .expect("marker count");
+    assert_eq!(
+        markers, 0,
+        "a deleted network must not leave markers for a later same-named network"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn concurrent_bnc_read_markers_cannot_exceed_the_account_cap() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("concurrent_bnc_read_markers_cannot_exceed_the_account_cap").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("account");
+    for index in 0..250 {
+        sqlx::query(
+            "INSERT INTO bnc_read_markers (account_id, network, target, timestamp)
+             SELECT id, 'net', $1, '2026-01-01T00:00:00.000Z'
+             FROM accounts WHERE name_folded = 'alice'",
+        )
+        .bind(format!("#existing{index}"))
+        .execute(&pool)
+        .await
+        .expect("seed marker");
+    }
+
+    let mut writes = tokio::task::JoinSet::new();
+    for index in 0..16 {
+        let pool = pool.clone();
+        writes.spawn(async move {
+            db::set_bnc_read_marker(
+                &pool,
+                "alice",
+                "net",
+                &format!("#new{index}"),
+                "2026-01-02T00:00:00.000Z",
+            )
+            .await
+        });
+    }
+    let mut stored = 0;
+    let mut limited = 0;
+    while let Some(result) = writes.join_next().await {
+        match result.expect("marker task").expect("marker write") {
+            db::BncReadMarkerWrite::Stored(_) => stored += 1,
+            db::BncReadMarkerWrite::LimitReached => limited += 1,
+        }
+    }
+    assert_eq!(stored, 6);
+    assert_eq!(limited, 10);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM bnc_read_markers")
+        .fetch_one(&pool)
+        .await
+        .expect("marker count");
+    assert_eq!(count, db::BNC_READ_MARKER_LIMIT);
 }
 
 #[tokio::test]

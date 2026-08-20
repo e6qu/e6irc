@@ -185,11 +185,14 @@ PLAIN.
    buffer always see them, and the sender itself sees its echo exactly when
    it negotiated `echo-message` on attach. Adding the upstream identity prefix
    never creates an over-limit echo; trailing text is fitted on a UTF-8 boundary.
-6. Disconnecting the client decrements attachments but leaves the driver and
+6. When the bounded replay no longer contains a current JOIN, the authoritative
+   session snapshot synthesizes it with a minimal NAMES reply. If the client
+   negotiated read markers, its stored channel position arrives before 366.
+7. Disconnecting the client decrements attachments but leaves the driver and
    upstream session running.
 
 **Visible failures and recovery.** Missing SASL, malformed/chunked payload
-errors, bad credentials, absent/disabled network, registry failure, and
+errors, bad credentials, credential-store unavailability, absent/disabled network, registry failure, and
 cross-account selection are refused before attachment. An unavailable
 upstream may still allow stored backlog replay, but it is not described as a
 live connection. A 401-byte authentication chunk resets the exchange and 905

@@ -145,7 +145,7 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         _ => (false, arg),
     };
     let whox = parse_whox(whox_part);
-    let requester_multi_prefix = state.reply_caps(conn).multi_prefix;
+    let requester_multi_prefix = state.reply_caps(conn).is_some_and(|caps| caps.multi_prefix);
     let server = state.config.server_name.clone();
     // Monotonic: idle is elapsed time since `last_active` (also monotonic).
     let now = (state.config.mono_clock)();
@@ -311,23 +311,8 @@ pub(super) fn who_on_owner(
     };
     let key = state.chan_key(&target);
     assert_eq!(owner.key(), &key, "WHO owner does not match target");
-    debug_assert!(
-        state.capture.is_none(),
-        "channel owner must not have a capture"
-    );
-    state.capture = Some(crate::core::state::Capture {
-        conn: actor.recipient.conn(),
-        lines: Vec::new(),
-        reply_target: Some(actor.identity.nick),
-        reply_caps: Some(actor.recipient.caps()),
-        label: None,
-        deferred: false,
-    });
-    cmd_who(
-        state,
-        actor.recipient.conn(),
-        &[target.as_str(), query.argument.as_str()],
-    );
+    let conn = super::begin_channel_capture(state, &actor, None);
+    cmd_who(state, conn, &[target.as_str(), query.argument.as_str()]);
     let lines = state.capture.take().expect("WHO capture installed").lines;
     crate::core::state::ChannelCommandReplies { lines }
 }

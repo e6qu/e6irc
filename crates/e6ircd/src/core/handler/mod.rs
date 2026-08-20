@@ -345,7 +345,13 @@ pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {
     let label = msg
         .tag("label")
         .and_then(|t| t.value.as_deref())
-        .filter(|_| state.sessions[&conn].caps.labeled_response)
+        // labeled-response depends on batch. Capability negotiation order is
+        // unrestricted, so accepting the capability alone is fine; a label is
+        // actionable only once both capabilities are active.
+        .filter(|_| {
+            let caps = &state.sessions[&conn].caps;
+            caps.labeled_response && caps.batch
+        })
         .map(e6irc_proto::message::escape_tag_value);
     if let Some(label) = label {
         state.capture = Some(super::state::Capture {
@@ -526,6 +532,27 @@ pub(crate) fn frame_labeled(
             state.send(conn, &format!(":{server} BATCH -{batch_ref}"));
         }
     }
+}
+
+fn begin_channel_capture(
+    state: &mut ServerState,
+    actor: &crate::core::state::ChannelActor,
+    label: Option<String>,
+) -> ConnId {
+    debug_assert!(
+        state.capture.is_none(),
+        "channel owner must not have a capture"
+    );
+    let conn = actor.recipient.conn();
+    state.capture = Some(crate::core::state::Capture {
+        conn,
+        lines: Vec::new(),
+        reply_target: Some(actor.identity.nick.clone()),
+        reply_caps: Some(actor.recipient.caps()),
+        label,
+        deferred: false,
+    });
+    conn
 }
 
 /// Whether `lines` is a single self-contained batch: the first line opens a

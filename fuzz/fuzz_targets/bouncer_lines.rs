@@ -46,15 +46,17 @@ fuzz_target!(|data: &[u8]| {
     );
 
     let delivered = filter_tags(&sanitized, caps);
-    assert!(
-        !injects(&delivered),
-        "filtered line carries an injectable byte: {delivered:?}"
-    );
+    if let Some(delivered) = &delivered {
+        assert!(
+            !injects(delivered),
+            "filtered line carries an injectable byte: {delivered:?}"
+        );
+    }
     // The security invariant is injection-prevention above: whatever tags a
     // client did or did not negotiate, the pipeline never hands it a line that
     // splits into two on its wire. (filter_tags is only ever fed parse-validated
     // or daemon-constructed lines in production, so its behaviour on the
     // malformed lines this fuzzer also reaches — e.g. a body that itself begins
     // with `@` — is out of the reachable domain and not asserted here.)
-    let _ = filter_tags(&sanitized, AttachCaps::default());
+    drop(filter_tags(&sanitized, AttachCaps::default()));
 });

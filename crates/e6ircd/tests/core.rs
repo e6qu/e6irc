@@ -1780,6 +1780,31 @@ fn sasl_rejected_password_is_904() {
 }
 
 #[test]
+fn sasl_store_failure_is_not_reported_as_bad_credentials() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "CAP LS 302");
+    s.line(c, "CAP REQ :sasl");
+    s.line(c, "AUTHENTICATE PLAIN");
+    s.drain(c);
+    s.line(c, &format!("AUTHENTICATE {}", b64("\0alice\0secret")));
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: c,
+        reply: e6ircd::core::DbReply::Unavailable {
+            origin: e6ircd::core::CredentialOrigin::Sasl,
+        },
+    });
+    let out = s.drain(c);
+    assert!(has_numeric(&out, "904"), "{out:#?}");
+    assert!(
+        out.iter()
+            .any(|line| line.contains("temporarily unavailable")),
+        "the client must be told this is retryable, not a bad password: {out:#?}"
+    );
+}
+
+#[test]
 fn sasl_verification_attempts_are_capped_per_connection() {
     let mut s = TestServer::new();
     let c = s.connect(1);
@@ -2204,6 +2229,17 @@ fn sasl_bad_base64_and_malformed_payload_fail() {
     s.drain(c);
     s.line(c, &format!("AUTHENTICATE {}", b64("no-separators")));
     assert!(has_numeric(&s.drain(c), "904"));
+    // e6irc has no impersonation/authorization layer: a client may omit
+    // authzid or spell the same account under RFC1459 folding, but it cannot
+    // request a different authorization identity than the one authenticated.
+    s.line(c, "AUTHENTICATE PLAIN");
+    s.drain(c);
+    s.line(c, &format!("AUTHENTICATE {}", b64("bob\0alice\0secret")));
+    assert!(has_numeric(&s.drain(c), "904"));
+    assert!(
+        s.db_requests().is_empty(),
+        "a mismatched authorization identity must not reach credential verification"
+    );
 }
 
 #[test]
@@ -2751,7 +2787,7 @@ fn labeled_register_reply_carries_the_label() {
         &mut s,
         1,
         "alice",
-        "labeled-response draft/account-registration",
+        "batch labeled-response draft/account-registration",
     );
     s.drain(alice);
 
@@ -2786,7 +2822,7 @@ fn labeled_register_reply_carries_the_label() {
         &mut s,
         2,
         "bob",
-        "labeled-response draft/account-registration",
+        "batch labeled-response draft/account-registration",
     );
     s.drain(bob);
     s.line(bob, "@label=reg2 REGISTER * * hunter2");
@@ -2815,7 +2851,7 @@ fn labeled_register_reply_carries_the_label() {
 #[test]
 fn labeled_identify_verdict_carries_the_label() {
     let mut s = TestServer::new();
-    let alice = register_with_caps(&mut s, 1, "alice", "labeled-response");
+    let alice = register_with_caps(&mut s, 1, "alice", "batch labeled-response");
     s.drain(alice);
     s.db_requests();
 
@@ -2846,7 +2882,7 @@ fn labeled_identify_verdict_carries_the_label() {
 #[test]
 fn labeled_identify_failure_carries_the_label() {
     let mut s = TestServer::new();
-    let alice = register_with_caps(&mut s, 1, "alice", "labeled-response");
+    let alice = register_with_caps(&mut s, 1, "alice", "batch labeled-response");
     s.drain(alice);
     s.db_requests();
     s.line(alice, "@label=id8 PRIVMSG NickServ :IDENTIFY wrong");
@@ -4304,6 +4340,30 @@ fn chathistory_latest_replays_from_ring() {
     }
 }
 
+#[test]
+fn chathistory_without_batch_replays_direct_messages() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = register_with_caps(&mut s, 2, "bob", "draft/chathistory");
+    for conn in [alice, bob] {
+        s.line(conn, "JOIN #hist");
+        s.drain(conn);
+    }
+    s.drain(alice);
+    s.line(alice, "PRIVMSG #hist :available without batch");
+    s.drain(bob);
+
+    s.line(bob, "CHATHISTORY LATEST #hist * 1");
+    let out = s.drain(bob);
+    assert_eq!(out.len(), 1, "history is delivered directly: {out:#?}");
+    assert!(
+        out[0].ends_with("PRIVMSG #hist :available without batch"),
+        "{out:#?}"
+    );
+    assert!(!out[0].contains("BATCH"), "{out:#?}");
+    assert!(!out[0].starts_with('@'), "no unnegotiated tags: {out:#?}");
+}
+
 /// account-tag: a replayed message from an identified sender must carry
 /// `account=` for a requester that negotiated account-tag, exactly as live
 /// delivery does — otherwise the replay loses the sender attribution the live
@@ -4410,6 +4470,12 @@ fn chathistory_dm_replay_survives_a_requester_rename() {
     assert!(
         !replayed.iter().any(|l| l.contains("PRIVMSG alice2 :")),
         "must not re-address the requester's own line to their new nick: {replayed:#?}"
+    );
+    assert!(
+        replayed
+            .iter()
+            .all(|line| !line.contains(";msgid=") && !line.contains(";time=")),
+        "history metadata must not bypass unnegotiated message-tags/server-time caps: {replayed:#?}"
     );
 }
 
@@ -4931,7 +4997,12 @@ fn markread_query_rejects_and_bounds_invalid_targets() {
 #[test]
 fn markread_store_failure_is_loud_labeled_and_non_mutating() {
     let mut s = TestServer::new();
-    let alice = register_with_caps(&mut s, 1, "alice", "draft/read-marker labeled-response");
+    let alice = register_with_caps(
+        &mut s,
+        1,
+        "alice",
+        "batch draft/read-marker labeled-response",
+    );
     identify(&mut s, alice, "alice");
 
     s.line(
@@ -5331,6 +5402,25 @@ fn labeled_response_framing() {
         out[0].contains("@label=xyz") && out[0].contains("ACK"),
         "{out:#?}"
     );
+}
+
+#[test]
+fn labeled_response_is_inactive_until_batch_is_negotiated() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "labeled-response");
+
+    s.line(alice, "@label=early USERHOST alice");
+    let out = s.drain(alice);
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(!out[0].contains("label="), "{out:#?}");
+    assert!(!out[0].contains("BATCH"), "{out:#?}");
+
+    s.line(alice, "CAP REQ :batch");
+    s.drain(alice);
+    s.line(alice, "@label=ready USERHOST alice");
+    let out = s.drain(alice);
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].starts_with("@label=ready "), "{out:#?}");
 }
 
 #[test]
@@ -6171,6 +6261,10 @@ fn chathistory_db_error_fails_rather_than_empty_batch() {
         conn: alice,
         display: "#h".into(),
         batch_ref: "b1".into(),
+        caps: e6ircd::core::HistoryResponseCaps {
+            batch: true,
+            ..Default::default()
+        },
         rows: Err(()),
         label: None,
     });
@@ -6199,6 +6293,10 @@ fn chathistory_reply_clips_an_untrusted_display_before_opening_its_batch() {
         conn: alice,
         display: format!("#{}", "x".repeat(600)),
         batch_ref: "b1".into(),
+        caps: e6ircd::core::HistoryResponseCaps {
+            batch: true,
+            ..Default::default()
+        },
         rows: Ok(Vec::new()),
         label: None,
     });
@@ -6210,6 +6308,70 @@ fn chathistory_reply_clips_an_untrusted_display_before_opening_its_batch() {
     assert!(
         open.len() <= 512,
         "history batch open exceeds the wire limit: {open:?}"
+    );
+}
+
+/// A database-backed history request is rendered from the capabilities that
+/// shaped the request, even if the client changes its CAP set while the query
+/// is in flight. Re-reading the mutable session here used to make one reply
+/// change wire shape halfway through its request lifecycle.
+#[test]
+fn chathistory_deferred_reply_uses_request_time_capabilities() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(
+        &mut s,
+        1,
+        "alice",
+        "batch draft/chathistory message-tags server-time",
+    );
+    s.line(alice, "JOIN #h");
+    s.drain(alice);
+
+    s.line(alice, "CHATHISTORY LATEST #h * 10");
+    let (batch_ref, caps) = s
+        .db_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            e6ircd::core::DbRequest::QueryHistory {
+                batch_ref, caps, ..
+            } => Some((batch_ref, caps)),
+            _ => None,
+        })
+        .expect("deferred history query");
+    assert!(caps.batch && caps.message_tags && caps.server_time);
+
+    // This is processed immediately, although its ACK waits behind the held
+    // history response. The eventual page must retain its request-time tags.
+    s.line(alice, "CAP REQ :-message-tags -server-time");
+    s.core.handle(Input::HistoryPage {
+        conn: alice,
+        display: "#h".into(),
+        batch_ref,
+        caps,
+        rows: Ok(vec![e6ircd::core::HistoryRow {
+            msgid: "m1".into(),
+            ts: Millis::from_millis(1_000),
+            sender_prefix: "bob!u@h".into(),
+            sender_account: None,
+            kind: e6ircd::core::MessageKind::Privmsg,
+            body: "before cap change".into(),
+            sender_is_bot: false,
+            multiline: None,
+        }]),
+        label: None,
+    });
+    let out = s.drain(alice);
+    let replay = out
+        .iter()
+        .find(|line| line.contains("PRIVMSG #h :before cap change"))
+        .expect("history row");
+    assert!(
+        replay.contains("msgid=m1"),
+        "request-time msgid lost: {out:#?}"
+    );
+    assert!(
+        replay.contains("time=1970-01-01T00:00:01.000Z"),
+        "request-time server-time lost: {out:#?}"
     );
 }
 
@@ -6255,6 +6417,10 @@ fn chathistory_targets_enumerates_buffers() {
     s.core.handle(Input::TargetsPage {
         conn: alice,
         batch_ref: batch_ref.clone(),
+        caps: e6ircd::core::HistoryResponseCaps {
+            batch: true,
+            ..Default::default()
+        },
         // Epoch milliseconds, as CHATHISTORY TARGETS carries them.
         targets: Ok(vec![
             ("#a".into(), Millis::from_millis(1_000_000_000)),
@@ -6706,7 +6872,7 @@ fn registered_topic_failed_verdicts_are_loud_labeled_and_non_mutating() {
         "old!setter@host".to_string(),
         1,
     )]);
-    let boss = register_with_caps(&mut s, 1, "boss", "labeled-response");
+    let boss = register_with_caps(&mut s, 1, "boss", "batch labeled-response");
     s.line(boss, "JOIN #reg");
     s.drain(boss);
     s.db_requests();
@@ -7172,7 +7338,7 @@ fn chanserv_metadata_store_failures_are_loud_labeled_and_non_mutating() {
     s.core
         .preload_mlock(vec![("#reg".to_string(), "+m".to_string())])
         .expect("valid MLOCK");
-    let boss = register_with_caps(&mut s, 1, "boss", "labeled-response");
+    let boss = register_with_caps(&mut s, 1, "boss", "batch labeled-response");
     identify(&mut s, boss, "boss");
     s.line(boss, "JOIN #reg");
     s.drain(boss);
@@ -7734,6 +7900,10 @@ fn output_held_behind_a_deferred_reply_is_bounded_like_the_sendq() {
         conn: alice,
         display: "#room".into(),
         batch_ref: "b1".into(),
+        caps: e6ircd::core::HistoryResponseCaps {
+            batch: true,
+            ..Default::default()
+        },
         rows: Ok(Vec::new()),
         label: None,
     });
@@ -7973,7 +8143,7 @@ fn chanserv_drop_store_failure_is_loud_labeled_and_non_mutating() {
     let mut s = TestServer::new();
     s.core
         .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
-    let boss = register_with_caps(&mut s, 1, "boss", "labeled-response");
+    let boss = register_with_caps(&mut s, 1, "boss", "batch labeled-response");
     identify(&mut s, boss, "boss");
     s.db_requests();
 
@@ -8999,7 +9169,7 @@ fn oper_ban_matching_everyone_is_refused() {
 #[test]
 fn server_ban_store_failure_is_loud_labeled_and_non_mutating() {
     let mut s = TestServer::new();
-    let op = register_with_caps(&mut s, 1, "god", "labeled-response");
+    let op = register_with_caps(&mut s, 1, "god", "batch labeled-response");
     s.line(op, "OPER god letmein");
     s.drain(op);
     s.db_requests();
@@ -9759,7 +9929,7 @@ fn topic_is_truncated_to_topiclen() {
 #[test]
 fn labeled_response_reescapes_label() {
     let mut s = TestServer::new();
-    let a = register_with_caps(&mut s, 1, "alice", "labeled-response");
+    let a = register_with_caps(&mut s, 1, "alice", "batch labeled-response");
     // Wire label `a\s\nb`: the parser unescapes it to a space+newline; the
     // reply must re-escape it, never emit a raw newline into the stream.
     s.line(a, r"@label=a\s\nb USERHOST alice");

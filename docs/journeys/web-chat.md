@@ -83,10 +83,14 @@ survive process restart.
 5. Server-time determines presentation ordering where supplied; arrival order
    remains the fallback.
 6. Channel and direct-message buffers are created on demand and remain bounded.
-6. When live traffic arrives below a reader's current scroll position, an
+7. An authoritative reconnect snapshot updates which channels are currently
+   joined without deleting their transcript. A channel no longer present is
+   visibly marked **past** and can be closed locally; a later confirmed JOIN
+   restores its live membership state.
+8. When live traffic arrives below a reader's current scroll position, an
    exact-count **jump to latest** control keeps it discoverable without
    interrupting the reader or switching conversations.
-7. Choosing **Load earlier messages** moves the reader to the newly loaded
+9. Choosing **Load earlier messages** moves the reader to the newly loaded
    older context rather than snapping them back to the live edge.
 
 **Visible failures and recovery.** History failure is shown without discarding
