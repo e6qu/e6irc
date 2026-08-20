@@ -640,20 +640,30 @@ fn dropped(failure: super::NetworkFailure) -> super::SessionOutcome {
 /// return them, and a fresh authoritative `time=` tag stamps when the bouncer
 /// accepted the line so backlog playback orders it against upstream traffic.
 fn self_echo(line: &str, nick: &str, ident: &str, host: &str) -> Option<String> {
-    let body = match line.strip_prefix('@') {
-        Some(rest) => match rest.split_once(' ') {
-            Some((_, body)) => body,
-            None => return None,
-        },
-        None => line,
-    };
     let parsed = e6irc_proto::message::Message::parse(line).ok()?;
-    if !parsed.command.eq_ignore_ascii_case("PRIVMSG")
-        && !parsed.command.eq_ignore_ascii_case("NOTICE")
-        && !parsed.command.eq_ignore_ascii_case("TAGMSG")
-    {
-        return None;
-    }
+    let prefix = format!(":{nick}!~{ident}@{host}");
+    let body = match parsed.command.to_ascii_uppercase().as_str() {
+        command @ ("PRIVMSG" | "NOTICE") => {
+            let [target, text] = parsed.params.as_slice() else {
+                return None;
+            };
+            if target.is_empty() || text.is_empty() {
+                return None;
+            }
+            let head = format!("{prefix} {command} {target} :");
+            format!("{head}{}", crate::core::fit_trailing(&head, text))
+        }
+        "TAGMSG" => {
+            let [target] = parsed.params.as_slice() else {
+                return None;
+            };
+            if target.is_empty() {
+                return None;
+            }
+            format!("{prefix} TAGMSG {target}")
+        }
+        _ => return None,
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before 1970")
@@ -665,7 +675,8 @@ fn self_echo(line: &str, nick: &str, ident: &str, host: &str) -> Option<String> 
     } else {
         format!("time={time};{client_tags}")
     };
-    Some(format!("@{all_tags} :{nick}!~{ident}@{host} {body}"))
+    let echo = format!("@{all_tags} {body}");
+    e6irc_proto::message::server_frame_fits(echo.as_bytes()).then_some(echo)
 }
 
 /// Idle gap before the driver sends a keepalive PING (and again before it
@@ -900,6 +911,29 @@ mod tests {
         );
         assert_eq!(parsed.tag("+bad.foo"), None);
         assert!(echo.ends_with(" PRIVMSG #room :hello"), "{echo}");
+    }
+
+    #[test]
+    fn self_echo_adds_a_prefix_without_exceeding_the_wire_budget() {
+        let line = format!("privmsg #room :{}é", "x".repeat(490));
+        assert!(e6irc_proto::message::client_frame_fits(line.as_bytes()));
+        let echo = self_echo(&line, "alice", "alice", "irc.example")
+            .expect("a valid message has a bounded echo");
+        assert!(e6irc_proto::message::server_frame_fits(echo.as_bytes()));
+        assert!(echo.contains(" PRIVMSG #room :"));
+        assert!(
+            !echo.ends_with('é'),
+            "the multi-byte boundary is not split: {echo}"
+        );
+        e6irc_proto::message::Message::parse(&echo).expect("echo remains valid IRC");
+    }
+
+    #[test]
+    fn self_echo_rejects_commands_the_upstream_would_not_echo() {
+        assert!(self_echo("PRIVMSG #room", "a", "a", "irc.example").is_none());
+        assert!(self_echo("PRIVMSG #room :", "a", "a", "irc.example").is_none());
+        assert!(self_echo("TAGMSG", "a", "a", "irc.example").is_none());
+        assert!(self_echo("PING :token", "a", "a", "irc.example").is_none());
     }
 
     async fn assert_live_driver(network: &str, addr: &str, autojoin: &[&str]) {

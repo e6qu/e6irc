@@ -1746,6 +1746,14 @@ fn sasl_plain_success_flow() {
     assert!(has_numeric(&out, "900"), "{out:#?}");
     assert!(has_numeric(&out, "903"), "{out:#?}");
 
+    s.line(c, "AUTHENTICATE PLAIN");
+    let already = s.drain(c);
+    assert!(has_numeric(&already, "907"), "{already:#?}");
+    assert!(
+        s.db_requests().is_empty(),
+        "an authenticated session cannot replace its identity"
+    );
+
     s.line(c, "NICK alice");
     s.line(c, "USER a 0 * :A");
     s.line(c, "CAP END");
@@ -1807,6 +1815,31 @@ fn sasl_verification_attempts_are_capped_per_connection() {
             .any(|l| l.contains("too many authentication attempts")),
         "connection must be closed after too many attempts"
     );
+}
+
+#[test]
+fn malformed_sasl_attempts_spend_the_same_connection_budget() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "CAP LS 302");
+    s.line(c, "CAP REQ :sasl");
+    s.drain(c);
+    for _ in 0..8 {
+        s.line(c, "AUTHENTICATE PLAIN");
+        s.drain(c);
+        s.line(c, "AUTHENTICATE not-base64!");
+        assert!(has_numeric(&s.drain(c), "904"));
+    }
+    s.line(c, "AUTHENTICATE PLAIN");
+    s.drain(c);
+    s.line(c, "AUTHENTICATE not-base64!");
+    let out = s.drain(c);
+    assert!(
+        out.iter().any(|line| line.contains("ERROR")
+            && line.contains("too many authentication attempts")),
+        "the malformed path must not bypass the connection budget: {out:?}"
+    );
+    assert!(s.db_requests().is_empty());
 }
 
 #[test]
@@ -2193,7 +2226,11 @@ fn sasl_chunk_overflow_fails_without_growing_the_buffer() {
 
     // Now drip full 400-byte chunks until the buffer cap is exceeded.
     s.line(c, "AUTHENTICATE PLAIN");
-    s.drain(c);
+    let retry = s.drain(c);
+    assert!(
+        retry.iter().any(|line| line == "AUTHENTICATE +"),
+        "905 must reset the exchange so the client can retry: {retry:?}"
+    );
     let chunk = "x".repeat(400);
     let mut failed = false;
     for _ in 0..64 {
@@ -2516,6 +2553,13 @@ fn sasl_and_identify_verifies_are_mutually_exclusive() {
     s.line(alice, &format!("AUTHENTICATE {}", b64("\0alice\0pw")));
     assert_eq!(s.db_requests().len(), 1, "SASL dispatched one verify");
     s.drain(alice);
+    s.line(alice, "AUTHENTICATE PLAIN");
+    let overlapping = s.drain(alice);
+    assert!(has_numeric(&overlapping, "904"), "{overlapping:?}");
+    assert!(
+        !has_numeric(&overlapping, "907"),
+        "907 is reserved for a connection whose authentication already succeeded"
+    );
     // An IDENTIFY while the SASL verify is pending is refused and enqueues
     // nothing — no concurrent second verify to cross-attribute.
     s.line(alice, "PRIVMSG NickServ :IDENTIFY pw");

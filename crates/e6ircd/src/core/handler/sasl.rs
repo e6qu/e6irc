@@ -62,10 +62,6 @@ fn verify_denied(
     }
 }
 
-/// Max credential-verification attempts per connection before the socket is
-/// closed — a single connection can't drive unbounded argon2 work.
-pub(super) const MAX_CREDENTIAL_ATTEMPTS_PER_CONN: u32 = 8;
-
 /// Charge one credential-verification attempt against the connection's budget
 /// before an (expensive) argon2 verify is dispatched. Returns false — and closes
 /// the connection — once the budget is exceeded, bounding the online
@@ -75,12 +71,13 @@ pub(super) const MAX_CREDENTIAL_ATTEMPTS_PER_CONN: u32 = 8;
 /// SASL AUTHENTICATE, NickServ IDENTIFY, and NickServ REGISTER — so no single
 /// path can be looped to bypass the cap the others enforce.
 pub(super) fn credential_attempt_ok(state: &mut ServerState, conn: ConnId) -> bool {
-    let attempts = {
-        let s = state.sessions.get_mut(&conn).expect("checked");
-        s.credential_attempts += 1;
-        s.credential_attempts
-    };
-    if attempts > MAX_CREDENTIAL_ATTEMPTS_PER_CONN {
+    if !state
+        .sessions
+        .get_mut(&conn)
+        .expect("checked")
+        .credential_attempts
+        .consume()
+    {
         let server = state.config.server_name.clone();
         state.send(
             conn,
@@ -114,14 +111,15 @@ fn take_register_label(state: &mut ServerState, conn: ConnId) -> Option<String> 
         .and_then(crate::core::state::PendingServiceReply::into_label)
 }
 
-/// Upper bound on a reassembled SASL response (across 400-byte continuation
-/// chunks). Generous for a bearer JWT, but bounds client-driven buffering.
-pub(super) const SASL_MAX: usize = 8192;
-
-/// Take a parsed SASL credential payload: fail the attempt when it is
-/// malformed, and charge the credential-attempt budget either way. Shared by
-/// the PLAIN and OAUTHBEARER arms, which differ only in how they parse.
+/// Take a parsed SASL credential payload after charging the connection's
+/// attempt budget. Shared by the PLAIN and OAUTHBEARER arms, which differ only
+/// in how they parse. Malformed payloads spend a slot too: otherwise an
+/// attacker can produce an unbounded stream of failure events without ever
+/// reaching the supposedly per-connection limit.
 fn require_cred_payload<T>(parsed: Option<T>, state: &mut ServerState, conn: ConnId) -> Option<T> {
+    if !credential_attempt_ok(state, conn) {
+        return None;
+    }
     let parsed = match parsed {
         Some(p) => p,
         None => {
@@ -129,7 +127,7 @@ fn require_cred_payload<T>(parsed: Option<T>, state: &mut ServerState, conn: Con
             return None;
         }
     };
-    credential_attempt_ok(state, conn).then_some(parsed)
+    Some(parsed)
 }
 
 pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]) {
@@ -142,6 +140,15 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
         state.err_needmoreparams(conn, "AUTHENTICATE");
         return;
     };
+    if state.sessions[&conn].account.is_some() {
+        state.numeric(
+            conn,
+            ERR_SASLALREADY,
+            &[],
+            Some("You have already authenticated"),
+        );
+        return;
+    }
     if arg == "*" {
         let session = state.sessions.get_mut(&conn).expect("checked");
         session.sasl = SaslState::Idle;
@@ -156,13 +163,10 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
     }
     // A line longer than 400 bytes is malformed; the client must chunk the
     // base64 response at 400 bytes (SASL spec).
-    if arg.len() > 400 {
-        state
-            .sessions
-            .get_mut(&conn)
-            .expect("checked")
-            .sasl_buf
-            .clear();
+    if arg.len() > e6irc_proto::sasl::MAX_AUTHENTICATE_CHUNK_LEN {
+        let session = state.sessions.get_mut(&conn).expect("checked");
+        session.sasl = SaslState::Idle;
+        session.sasl_buf.clear();
         state.numeric(conn, ERR_SASLTOOLONG, &[], Some("SASL message too long"));
         return;
     }
@@ -187,12 +191,14 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
         mechanism @ (SaslState::PlainPending | SaslState::BearerPending) => {
             // Accumulate 400-byte continuation chunks. A full 400-byte line
             // means "more follows"; a shorter line (or "+", the empty final
-            // chunk) completes the payload. SASL_MAX bounds the buffer so a
-            // client cannot grow it without end.
+            // chunk) completes the payload. The shared payload bound prevents
+            // a client from growing it without end.
             let piece = if arg == "+" { "" } else { arg };
             let over = {
                 let session = state.sessions.get_mut(&conn).expect("checked");
-                if session.sasl_buf.len() + piece.len() > SASL_MAX {
+                if session.sasl_buf.len() + piece.len()
+                    > e6irc_proto::sasl::MAX_AUTHENTICATE_PAYLOAD_LEN
+                {
                     true
                 } else {
                     session.sasl_buf.push_str(piece);
@@ -204,6 +210,9 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
                 // AUTHENTICATE line (handled above); an accumulated payload
                 // that outgrows the buffer is just a failed authentication, so
                 // it ends with the generic ERR_SASLFAIL and a cleared buffer.
+                if !credential_attempt_ok(state, conn) {
+                    return;
+                }
                 state
                     .sessions
                     .get_mut(&conn)
@@ -213,7 +222,7 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
                 sasl_fail(state, conn);
                 return;
             }
-            if arg.len() == 400 {
+            if arg.len() == e6irc_proto::sasl::MAX_AUTHENTICATE_CHUNK_LEN {
                 return; // more chunks to come
             }
             let payload =
@@ -309,7 +318,7 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
         SaslState::Verifying => {
             state.numeric(
                 conn,
-                ERR_SASLALREADY,
+                ERR_SASLFAIL,
                 &[],
                 Some("SASL authentication in progress"),
             );

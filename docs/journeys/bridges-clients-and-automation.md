@@ -135,7 +135,9 @@ private to the current user.
    or public-CA TLS with an optional certificate-name override.
 2. Register anonymously, with SASL PLAIN, or with direct/cached SASL
    OAUTHBEARER. For a BNC attachment, `--account account/network` selects the
-   owned network.
+   owned network. The shared client chunks encoded SASL responses at 400 bytes,
+   emits the required empty terminator after an exact chunk, and treats every
+   terminal SASL numeric as a visible registration failure.
 3. Require the history/read-marker capabilities in use, join the initial
    channel, load bounded history after its shared marker (or the latest bounded
    window), and advance the marker only while the current buffer is at its live

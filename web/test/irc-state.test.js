@@ -5,6 +5,7 @@ import test from "node:test";
 
 import {
   asMessage,
+  chatMessageRoute,
   fold,
   kickPairs,
   membershipTargets,
@@ -35,6 +36,35 @@ test("IRC parsing preserves tags, prefix, trailing text, and RFC1459 identity", 
 test("IRC parsing distinguishes server and user notice sources", () => {
   assert.equal(parseIrc(":irc.example NOTICE alice :maintenance").sourceIsUser, false);
   assert.equal(parseIrc(":NickServ!service@irc.example NOTICE alice :identified").sourceIsUser, true);
+});
+
+test("live and history chat routing understands STATUSMSG and server notices", () => {
+  const route = (line) => chatMessageRoute(parseIrc(line), "Alice");
+  assert.deepEqual(route(":bob!u@h PRIVMSG @#Ops :operators only"), {
+    kind: "channel",
+    target: "#Ops",
+  });
+  assert.deepEqual(route(":bob!u@h NOTICE +#Ops :voiced users"), {
+    kind: "channel",
+    target: "#Ops",
+  });
+  assert.deepEqual(route(":bob!u@h PRIVMSG #room :hello"), {
+    kind: "channel",
+    target: "#room",
+  });
+  assert.deepEqual(route(":Alice!u@h PRIVMSG Bob :outgoing"), {
+    kind: "dm",
+    target: "Bob",
+  });
+  assert.deepEqual(route(":Bob!u@h PRIVMSG Alice :incoming"), {
+    kind: "dm",
+    target: "Bob",
+  });
+  assert.deepEqual(route(":irc.example NOTICE Alice :maintenance"), {
+    kind: "server",
+    target: null,
+  });
+  assert.equal(route(":bob!u@h PRIVMSG #room"), null);
 });
 
 test("IRC tag values use the protocol escape rules", () => {

@@ -21,7 +21,9 @@ trusts the configured TLS endpoint when TLS is used.
    protocol error or disconnect instead of truncation. IRC-over-WebSocket
    accepts exactly one unterminated IRC line per WebSocket message.
 3. Negotiate `CAP LS 302`, request supported capabilities, and complete SASL
-   where required.
+   where required. SASL responses use at most 400 bytes per chunk, an exact
+   400-byte final chunk is followed by `AUTHENTICATE +`, and a 905 resets the
+   exchange for a fresh mechanism attempt.
 4. Submit NICK and USER. Nick, user, host/IP, real name, registration rate,
    connection limits, and K/D/X-line policy are validated before registration.
 5. Receive 001–005, LUSERS, and MOTD; the connection becomes visible in the
@@ -32,7 +34,10 @@ trusts the configured TLS endpoint when TLS is used.
 **Visible failures and recovery.** Unsupported capabilities are rejected explicitly.
 Nickname collision, bad registration sequence, authentication failure, ban,
 flooding, timeout, and SendQ overflow produce the appropriate numeric/ERROR and
-close when required. Input and output queues remain bounded.
+close when required. Valid and malformed completed authentication exchanges
+share one permanent per-connection attempt budget. Input and output queues
+remain bounded. A second SASL exchange after success receives 907 and cannot
+replace the connection's authenticated account.
 
 **Security and observability.** PROXY metadata is accepted only from configured
 trusted peers, credentials are never logged, and registration policy is

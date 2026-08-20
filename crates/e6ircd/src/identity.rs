@@ -2,6 +2,29 @@
 
 use std::fmt;
 
+/// Lifetime authentication budget for one IRC or BNC connection.
+///
+/// Keeping the counter and limit together prevents a new authentication edge
+/// from incrementing a bare integer with different exhaustion semantics.
+#[derive(Debug, Default)]
+pub(crate) struct CredentialAttemptBudget {
+    used: u8,
+}
+
+impl CredentialAttemptBudget {
+    /// Maximum expensive credential verifications one connection may request.
+    const LIMIT: u8 = 8;
+
+    /// Consume one verification slot. Once exhausted, it stays exhausted.
+    pub(crate) fn consume(&mut self) -> bool {
+        if self.used >= Self::LIMIT {
+            return false;
+        }
+        self.used += 1;
+        true
+    }
+}
+
 /// Maximum stored contact-email length, following the conventional mailbox
 /// limit used by registration systems.
 pub const MAX_CONTACT_EMAIL_LEN: usize = 254;
@@ -384,5 +407,15 @@ mod tests {
             ApiTokenLifetimeDays::MAX
         );
         assert!(ApiTokenLifetimeDays::new(ApiTokenLifetimeDays::MAX + 1).is_none());
+    }
+
+    #[test]
+    fn credential_attempt_budget_stays_exhausted() {
+        let mut budget = CredentialAttemptBudget::default();
+        for _ in 0..CredentialAttemptBudget::LIMIT {
+            assert!(budget.consume());
+        }
+        assert!(!budget.consume());
+        assert!(!budget.consume(), "exhaustion must not wrap or reset");
     }
 }

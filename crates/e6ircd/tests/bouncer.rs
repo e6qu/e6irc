@@ -602,6 +602,27 @@ async fn bnc_listener_accepts_chunked_sasl_plain() {
     .await
     .expect("timed out waiting for SASL verdict");
     assert!(ok, "chunked SASL PLAIN should succeed: {acc}");
+
+    sock.write_all(b"AUTHENTICATE PLAIN\r\n").await.unwrap();
+    let mut already = String::new();
+    let refused = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let n = sock.read(&mut b).await.unwrap();
+            if n == 0 {
+                return false;
+            }
+            already.push_str(&String::from_utf8_lossy(&b[..n]));
+            if already.contains(" 907 ") {
+                return true;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for already-authenticated refusal");
+    assert!(
+        refused,
+        "a second SASL exchange must receive 907: {already}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

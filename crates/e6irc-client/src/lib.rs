@@ -144,6 +144,7 @@ impl OwnedMessage {
     pub fn tag(&self, key: &str) -> Option<&str> {
         self.tags
             .iter()
+            .rev()
             .find(|(candidate, _)| candidate == key)
             .and_then(|(_, value)| value.as_deref())
     }
@@ -275,7 +276,10 @@ impl From<&Message<'_>> for OwnedMessage {
                 }
                 out
             }),
-            command: msg.command.to_string(),
+            // IRC command names are case-insensitive. Canonicalize at the
+            // borrowed-to-owned boundary so every client state machine sees
+            // one representation and cannot forget a per-comparison fold.
+            command: msg.command.to_ascii_uppercase(),
             params: msg.params.iter().map(|p| p.to_string()).collect(),
         }
     }
@@ -341,24 +345,20 @@ impl Connection {
     }
 
     /// Send one line (CRLF appended). This is the sole outbound funnel, so it
-    /// neutralizes any embedded CR/LF/NUL before writing — the client-side
+    /// rejects any embedded CR/LF/NUL before writing — the client-side
     /// analogue of the server's `WireLine` sanitization. Callers build commands
     /// with `format!` from values that may carry untrusted input (a scripted
     /// `PRIVMSG` body, a `--nick`, a channel name); without this, a value like
     /// `"hi\r\nJOIN #evil"` would forge a second command in the authenticated
-    /// session. A legitimate single line never contains these bytes, so removing
-    /// them is lossless in practice and makes the injection unrepresentable here.
+    /// session. A legitimate single line never contains these bytes, so reject
+    /// the whole value before writing rather than silently changing its meaning.
     pub async fn send_line(&mut self, line: &str) -> io::Result<()> {
-        let cleaned: String;
-        let line = if line.bytes().any(|b| b == b'\r' || b == b'\n' || b == b'\0') {
-            cleaned = line
-                .chars()
-                .filter(|&c| c != '\r' && c != '\n' && c != '\0')
-                .collect();
-            cleaned.as_str()
-        } else {
-            line
-        };
+        if line.bytes().any(|b| b == b'\r' || b == b'\n' || b == b'\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "client line contains an IRC delimiter",
+            ));
+        }
         if !e6irc_proto::message::client_frame_fits(line.as_bytes()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -612,7 +612,13 @@ impl Connection {
         loop {
             let msg = self.recv_sasl_message().await?;
             if msg.command == "AUTHENTICATE" {
-                return Ok(());
+                if msg.params.as_slice() == ["+"] {
+                    return Ok(());
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "server sent an unexpected SASL challenge",
+                ));
             }
         }
     }
@@ -633,7 +639,10 @@ impl Connection {
         if let Some(err) = registration_refused(msg) {
             return Ok(Some(err));
         }
-        if matches!(msg.command.as_str(), "902" | "904" | "905" | "906" | "908") {
+        if matches!(
+            msg.command.as_str(),
+            "902" | "904" | "905" | "906" | "907" | "908"
+        ) {
             return Ok(Some(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "SASL authentication failed",
@@ -720,8 +729,27 @@ impl Connection {
         payload: String,
     ) -> io::Result<String> {
         self.send_registration_identity(nick, realname).await?;
-        self.send_line(&format!("AUTHENTICATE {payload}")).await?;
+        self.send_sasl_payload(&payload).await?;
         self.finish_sasl_then_welcome(nick).await
+    }
+
+    async fn send_sasl_payload(&mut self, payload: &str) -> io::Result<()> {
+        use e6irc_proto::sasl::{MAX_AUTHENTICATE_CHUNK_LEN, MAX_AUTHENTICATE_PAYLOAD_LEN};
+
+        if payload.len() > MAX_AUTHENTICATE_PAYLOAD_LEN || !payload.is_ascii() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "encoded SASL response exceeds the supported payload limit",
+            ));
+        }
+        for chunk in payload.as_bytes().chunks(MAX_AUTHENTICATE_CHUNK_LEN) {
+            let chunk = std::str::from_utf8(chunk).expect("an ASCII SASL payload has ASCII chunks");
+            self.send_line(&format!("AUTHENTICATE {chunk}")).await?;
+        }
+        if payload.is_empty() || payload.len().is_multiple_of(MAX_AUTHENTICATE_CHUNK_LEN) {
+            self.send_line("AUTHENTICATE +").await?;
+        }
+        Ok(())
     }
 
     /// Register with SASL OAUTHBEARER: authenticate with `token` (an
@@ -1135,6 +1163,15 @@ mod tests {
     }
 
     #[test]
+    fn owned_messages_canonicalize_commands_and_use_the_final_duplicate_tag() {
+        let message = OwnedMessage::from(
+            &Message::parse("@example=old;example=new :srv pInG :token").expect("message"),
+        );
+        assert_eq!(message.command, "PING");
+        assert_eq!(message.tag("example"), Some("new"));
+    }
+
+    #[test]
     fn registration_diagnostic_is_bounded_and_control_safe() {
         let message = OwnedMessage {
             tags: Vec::new(),
@@ -1205,7 +1242,7 @@ mod tests {
         tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
         tokio::io::WriteHalf<tokio::io::DuplexStream>,
     ) {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::io::AsyncBufReadExt;
 
         let (reader, mut writer) = tokio::io::split(server_io);
         let mut lines = tokio::io::BufReader::new(reader).lines();
@@ -1231,6 +1268,15 @@ mod tests {
             format!("AUTHENTICATE {mechanism}")
         );
         (lines, writer)
+    }
+
+    fn duplex_connection(capacity: usize) -> (Connection, tokio::io::DuplexStream) {
+        let (client_io, server_io) = tokio::io::duplex(capacity);
+        let (reader, writer) = tokio::io::split(client_io);
+        (
+            Connection::from_halves(Box::new(reader), Box::new(writer)),
+            server_io,
+        )
     }
 
     #[tokio::test]
@@ -1305,9 +1351,7 @@ mod tests {
     async fn oauth_registration_requests_the_same_metadata_as_other_modes() {
         use tokio::io::AsyncWriteExt;
 
-        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
-        let (cr, cw) = tokio::io::split(client_io);
-        let mut connection = Connection::from_halves(Box::new(cr), Box::new(cw));
+        let (mut connection, server_io) = duplex_connection(16 * 1024);
         let server = tokio::spawn(async move {
             let (mut lines, mut sw) = negotiate_sasl(server_io, "OAUTHBEARER").await;
             sw.write_all(b"AUTHENTICATE +\r\n").await.unwrap();
@@ -1342,39 +1386,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_line_neutralizes_injected_crlf_and_nul() {
-        use tokio::io::AsyncReadExt;
-        // A value carrying embedded CR/LF/NUL — the classic command-injection
-        // payload — must be flattened to a single wire frame, never split into a
-        // second forged command in the authenticated session.
-        let (client_io, server_io) = tokio::io::duplex(8192);
-        let (cr, cw) = tokio::io::split(client_io);
-        let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
+    async fn sasl_payloads_are_chunked_and_exact_boundaries_get_an_empty_final_chunk() {
+        use tokio::io::AsyncBufReadExt;
 
-        conn.send_line("PRIVMSG #c :hi\r\nJOIN #evil\0tail")
+        let (mut connection, server_io) = duplex_connection(16 * 1024);
+        connection
+            .send_sasl_payload(&"a".repeat(801))
             .await
-            .unwrap();
-        drop(conn); // flush + close so the server read sees EOF
+            .expect("chunked response");
+        connection
+            .send_sasl_payload(&"b".repeat(800))
+            .await
+            .expect("exact response");
+        drop(connection);
+
+        let (reader, _writer) = tokio::io::split(server_io);
+        let mut reader = tokio::io::BufReader::new(reader).lines();
+        let mut lines = Vec::new();
+        while let Some(line) = reader.next_line().await.expect("wire line") {
+            lines.push(line);
+        }
+        assert_eq!(lines[0], format!("AUTHENTICATE {}", "a".repeat(400)));
+        assert_eq!(lines[1], format!("AUTHENTICATE {}", "a".repeat(400)));
+        assert_eq!(lines[2], "AUTHENTICATE a");
+        assert_eq!(lines[3], format!("AUTHENTICATE {}", "b".repeat(400)));
+        assert_eq!(lines[4], format!("AUTHENTICATE {}", "b".repeat(400)));
+        assert_eq!(lines[5], "AUTHENTICATE +");
+        assert_eq!(lines.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn send_line_rejects_injected_crlf_and_nul_without_writing() {
+        use tokio::io::AsyncReadExt;
+        let (mut conn, server_io) = duplex_connection(8192);
+
+        let error = conn
+            .send_line("PRIVMSG #c :hi\r\nJOIN #evil\0tail")
+            .await
+            .expect_err("an injected line is invalid as a whole");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        drop(conn);
 
         let (mut sr, _sw) = tokio::io::split(server_io);
         let mut got = Vec::new();
         sr.read_to_end(&mut got).await.unwrap();
-        let got = String::from_utf8(got).unwrap();
-
-        // Exactly one CRLF (the appended terminator), and no interior control
-        // bytes survived — the injected JOIN is now inert text on the one line.
-        assert_eq!(got, "PRIVMSG #c :hiJOIN #eviltail\r\n");
-        assert_eq!(got.matches("\r\n").count(), 1);
-        assert!(!got[..got.len() - 2].contains(['\r', '\n', '\0']));
+        assert!(
+            got.is_empty(),
+            "a rejected line must not be partially written"
+        );
     }
 
     #[tokio::test]
     async fn send_line_rejects_each_wire_budget_before_writing() {
         use tokio::io::AsyncReadExt;
 
-        let (client_io, server_io) = tokio::io::duplex(8192);
-        let (cr, cw) = tokio::io::split(client_io);
-        let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
+        let (mut conn, server_io) = duplex_connection(8192);
         let error = conn
             .send_line(&"x".repeat(e6irc_proto::message::MAX_LINE_LEN - 1))
             .await
