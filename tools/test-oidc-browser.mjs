@@ -326,7 +326,7 @@ try {
   await page.waitForFunction(() => document.documentElement.dataset.theme === "light");
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
-    { theme: "light", notifications: false },
+    { theme: "light", notifications: false, rawOutput: false },
   );
   await page.reload();
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
@@ -340,7 +340,7 @@ try {
   await page.waitForFunction(() => !document.documentElement.hasAttribute("data-theme"));
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
-    { theme: "auto", notifications: false },
+    { theme: "auto", notifications: false, rawOutput: false },
   );
   assert.equal(
     await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()),
@@ -498,7 +498,7 @@ try {
   );
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
-    { theme: "dark", notifications: true },
+    { theme: "dark", notifications: true, rawOutput: false },
   );
   await page.reload();
   assert.equal(await page.locator("html").getAttribute("data-theme"), "dark");
@@ -1130,6 +1130,25 @@ try {
   const peerMember = page.getByRole("button", { name: "Open conversation with peer", exact: true });
   await peerMember.waitFor();
   assert.equal(await peerMember.evaluate((button) => button.tagName), "BUTTON");
+  await page.locator("#settings summary").click();
+  await page.getByRole("button", { name: "Raw IRC output: off", exact: true }).click();
+  await page.locator("#raw-output-lines .raw-wire").filter({ hasText: "browser replays through the real stack" }).waitFor();
+  assert.match(
+    await page.locator("#raw-output-lines .raw-wire").filter({ hasText: "browser replays through the real stack" }).innerText(),
+    /PRIVMSG #journey :browser replays through the real stack/,
+  );
+  await page.getByRole("button", { name: "Raw IRC output: on", exact: true }).click();
+  await page.locator("#settings summary").click();
+  await page.locator("#message").fill("/help");
+  await page.locator("#composer button[type=submit]").click();
+  await page.getByText(/Commands: \/join #channel/).waitFor();
+  await page.locator("#message").fill("/query peer browser query through normal IRC command");
+  await page.locator("#composer button[type=submit]").click();
+  await upstream.waitForLine(
+    (line) => line === "PRIVMSG peer :browser query through normal IRC command",
+  );
+  await page.getByRole("heading", { name: "peer", exact: true }).waitFor();
+  await page.getByRole("button", { name: "Open #journey", exact: true }).click();
   await upstream.sendPeerMessage("#journey", "browser receives through the real stack");
   await page.getByText("browser receives through the real stack", { exact: true }).waitFor();
 
@@ -1176,6 +1195,11 @@ try {
     await sentMessage.count(),
     1,
     "a server-admitted composer send must render exactly one local echo",
+  );
+  await page.locator("#message").fill("/notice peer browser notice through normal IRC command");
+  await page.locator("#composer button[type=submit]").click();
+  await upstream.waitForLine(
+    (line) => line === "NOTICE peer :browser notice through normal IRC command",
   );
 
   // The owner-facing configuration and diagnostics must reflect that same live
@@ -1239,6 +1263,35 @@ try {
     .getByText("browser receives through the real stack")
     .waitFor();
   assert.match(await page.locator("#network-operations").innerText(), /browser receives through the real stack/);
+  const accountRegister = page.locator("[data-api-network-account-register]");
+  await accountRegister.getByLabel("Email address").fill("webjourney@example.test");
+  await accountRegister.getByLabel("New NickServ password").fill("journey-secret");
+  await accountRegister.getByRole("button", { name: "Request verification email" }).click();
+  await upstream.waitForLine(
+    (line) => line === "PRIVMSG NickServ :REGISTER journey-secret webjourney@example.test",
+  );
+  await page.locator("#network-operations").getByText("Verification email requested", { exact: false }).waitFor();
+  assert.doesNotMatch(await page.locator("#network-operations").innerText(), /journey-secret/);
+  const accountVerify = page.locator("[data-api-network-account-verify]");
+  await accountVerify.getByLabel("Code from the email").fill("mail-code-123");
+  await accountVerify.getByRole("button", { name: "Send verification code" }).click();
+  await upstream.waitForLine(
+    (line) => line === "PRIVMSG NickServ :VERIFY REGISTER webjourney mail-code-123",
+  );
+  await page.locator("#network-operations").getByText("Email address verified", { exact: false }).waitFor();
+  assert.doesNotMatch(await page.locator("#network-operations").innerText(), /mail-code-123/);
+  await page.locator("[data-api-owner-network-toggle]").getByRole("button", { name: "Disable", exact: true }).click();
+  await page.locator('[data-network-field="enabled"]', { hasText: "Disabled" }).waitFor();
+  upstream.resetJoin("#journey");
+  const accountSave = page.locator("[data-api-network-account-save]");
+  await accountSave.getByRole("button", { name: "Save SASL and reconnect", exact: true }).click();
+  await upstream.waitForLine((line) => line === "AUTHENTICATE PLAIN");
+  await upstream.waitForJoin("#journey");
+  await page.locator('[data-network-field="enabled"]', { hasText: "Enabled" }).waitFor();
+  await page.locator('[data-network-field="account-credential"]', { hasText: "Stored" }).waitFor();
+  await page.locator('[data-network-field="secret-credential"]', { hasText: "Stored encrypted" }).waitFor();
+  assert.equal(await accountSave.getByLabel("NickServ password").inputValue(), "");
+  assert.equal(await accountRegister.getByLabel("New NickServ password").inputValue(), "");
   assert.ok(
     !applicationRequests.slice(operationsReadStart).includes(
       `GET ${applicationOrigin}/console/networks/journey/operations`,
@@ -1774,7 +1827,7 @@ try {
     .waitFor();
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
-    { theme: "dark", notifications: false },
+    { theme: "dark", notifications: false, rawOutput: false },
   );
   assert.equal(
     await page.locator("#notify-toggle").getAttribute("aria-pressed"),
@@ -1800,7 +1853,7 @@ try {
   await page.getByText("Notification permission was not granted.", { exact: true }).waitFor();
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
-    { theme: "dark", notifications: false },
+    { theme: "dark", notifications: false, rawOutput: false },
   );
   await page.evaluate(() => {
     delete globalThis.Notification;
@@ -1811,7 +1864,7 @@ try {
     .waitFor();
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
-    { theme: "dark", notifications: false },
+    { theme: "dark", notifications: false, rawOutput: false },
   );
 
   // Restoring a working browser API lets the user opt in again and then turn
@@ -1832,7 +1885,7 @@ try {
   await page.getByRole("button", { name: "Desktop notifications: on" }).click();
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
-    { theme: "dark", notifications: false },
+    { theme: "dark", notifications: false, rawOutput: false },
   );
 
   // On a narrow screen, the conversation rail is a focused, dismissible
@@ -2054,6 +2107,7 @@ async function startIrcUpstream() {
     let sawUser = false;
     let capEnded = false;
     let welcomed = false;
+    let awaitingSaslPayload = false;
     const send = (line) => socket.write(`${line}\r\n`);
     const welcome = () => {
       if (welcomed || !sawUser || !capEnded) return;
@@ -2070,9 +2124,15 @@ async function startIrcUpstream() {
       const [commandRaw, ...params] = line.split(" ");
       const command = commandRaw.toUpperCase();
       if (command === "CAP" && params[0] === "LS") {
-        send(":journey.example CAP * LS :server-time message-tags account-tag");
+        send(":journey.example CAP * LS :server-time message-tags account-tag sasl");
       } else if (command === "CAP" && params[0] === "REQ") {
         send(`:journey.example CAP * ACK :${params.slice(1).join(" ").replace(/^:/, "")}`);
+      } else if (command === "AUTHENTICATE" && params[0]?.toUpperCase() === "PLAIN") {
+        awaitingSaslPayload = true;
+        send("AUTHENTICATE +");
+      } else if (command === "AUTHENTICATE" && awaitingSaslPayload) {
+        awaitingSaslPayload = false;
+        send(`:journey.example 903 ${nick} :SASL authentication successful`);
       } else if (command === "CAP" && params[0] === "END") {
         capEnded = true;
         welcome();
@@ -2099,6 +2159,13 @@ async function startIrcUpstream() {
         names(params[0]);
       } else if (command === "PING") {
         send(`PONG ${params.join(" ")}`);
+      } else if (command === "PRIVMSG" && params[0]?.toLowerCase() === "nickserv") {
+        const serviceCommand = params.slice(1).join(" ").replace(/^:/, "");
+        if (serviceCommand.toUpperCase().startsWith("REGISTER ")) {
+          send(`:NickServ!service@journey NOTICE ${nick} :Verification email requested; check your inbox`);
+        } else if (serviceCommand.toUpperCase().startsWith("VERIFY REGISTER ")) {
+          send(`:NickServ!service@journey NOTICE ${nick} :Email address verified; account registration complete`);
+        }
       }
     };
     socket.on("data", (chunk) => {

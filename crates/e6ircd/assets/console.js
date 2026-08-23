@@ -652,7 +652,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
         ["Last received", operationTime(runtime.last_input_at, "Never")],
         ["Last sent", operationTime(runtime.last_output_at, "Never")],
         ["Last error", operationTime(runtime.last_error_at, "Never")],
-        ["Last error reason", runtime.last_error === null ? "No classified runtime failure." : `${runtime.last_error.code}: ${runtime.last_error.summary}`],
+        ["Last error reason", runtime.last_error === null ? "No classified runtime failure." : `${runtime.last_error.code}: ${runtime.last_error.summary}${runtime.last_error.diagnostic ? ` Upstream: ${runtime.last_error.diagnostic}` : ""}`],
       ];
     details.push(["Oldest stored line", operationTime(view.storage.oldest_at, "Never")], ["Newest stored line", operationTime(view.storage.newest_at, "Never")]);
     for (const [label, value] of details) summary.append(append(element("div"), element("span", "", label), element("strong", "", value)));
@@ -666,9 +666,9 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     }
     fragment.append(timeline);
     const backlog = element("section", "panel");
-    backlog.append(append(element("div", "panel-head"), append(element("div"), element("h2", "", "Recent detached backlog"), element("p", "", "The newest 100 persisted upstream lines, shown oldest first. Client attachment replays the same stored stream.")), element("span", "count", `${view.storage.lines} stored`)));
+    backlog.append(append(element("div", "panel-head"), append(element("div"), element("h2", "", "IRC transcript"), element("p", "", "The newest 100 persisted upstream IRC lines, shown oldest first—including NickServ replies, server numerics, and connection diagnostics.")), element("span", "count", `${view.storage.lines} stored`)));
     if (view.recent_lines.length === 0) {
-      backlog.append(element("p", "empty", "No upstream lines have been stored for this network."));
+      backlog.append(element("p", "empty", "No IRC output has been stored for this network."));
     } else {
       const lines = logRegion("Recent raw IRC backlog");
       for (const line of view.recent_lines) lines.append(element("code", "", line));
@@ -2506,8 +2506,10 @@ import { loadSettings, saveSettings } from "/console-settings.js";
         await refreshAfterMutation(ownerNetworkRefresher(form));
         setOwnerNetworkResult("Updated.", true);
       }
+      return result;
     } catch (error) {
       setOwnerNetworkResult(error instanceof Error ? error.message : "Network request failed.", false);
+      return undefined;
     }
   }, trigger);
 
@@ -2523,6 +2525,15 @@ import { loadSettings, saveSettings } from "/console-settings.js";
 
   for (const form of document.querySelectorAll("[data-api-owner-network-create]")) {
     const preflightButton = form.querySelector("[data-api-network-preflight]");
+    const addButton = form.querySelector('[type="submit"]');
+    let qualifiedConnection = null;
+    const connectionFingerprint = () => JSON.stringify(ownerNetworkConnection(new FormData(form)));
+    if (addButton instanceof HTMLButtonElement) addButton.disabled = true;
+    form.addEventListener("input", (event) => {
+      if (event.target instanceof HTMLInputElement && event.target.name === "name") return;
+      qualifiedConnection = null;
+      if (addButton instanceof HTMLButtonElement) addButton.disabled = true;
+    });
     if (preflightButton) {
       preflightButton.addEventListener("click", () => {
         const fields = new FormData(form);
@@ -2532,9 +2543,14 @@ import { loadSettings, saveSettings } from "/console-settings.js";
           return;
         }
         const { addr, tls, nick, realname, autojoin, sasl_account, sasl_password } = connection;
+        const fingerprint = connectionFingerprint();
         void mutateOwnerNetwork(form, "/api/v1/me/networks/preflight", "POST", {
           addr, tls, nick, realname, autojoin, sasl_account, sasl_password,
-        }, ownerNetworkPreflight, preflightButton);
+        }, ownerNetworkPreflight, preflightButton).then((result) => {
+          if (!result || connectionFingerprint() !== fingerprint) return;
+          qualifiedConnection = fingerprint;
+          if (addButton instanceof HTMLButtonElement) addButton.disabled = false;
+        });
       });
     }
     form.addEventListener("submit", (event) => {
@@ -2544,6 +2560,10 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       const connection = ownerNetworkConnection(fields);
       if (!name || !connection.addr || !connection.nick || !connection.realname) {
         setOwnerNetworkResult("Enter a network ID, server, nickname, and real name.", false);
+        return;
+      }
+      if (qualifiedConnection !== connectionFingerprint()) {
+        setOwnerNetworkResult("Test this exact connection before adding it.", false);
         return;
       }
       void mutateOwnerNetwork(form, form.action, "POST", { kind: "irc", name, ...connection });
@@ -2732,6 +2752,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   const ownerNetworkDetail = document.querySelector("[data-api-owner-network-detail]");
   if (ownerNetworkDetail instanceof HTMLElement) {
     const name = ownerNetworkDetail.dataset.networkName || "";
+    let currentNetwork = null;
     const setField = (field, value) => { const node = ownerNetworkDetail.querySelector(`[data-network-field="${field}"]`); if (node) node.textContent = value; };
     const detailResult = document.getElementById("network-api-result");
     const showFailure = (error, retry) => {
@@ -2740,6 +2761,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       detailResult.className = "banner-error";
     };
     const render = (network) => {
+      currentNetwork = network;
       if (detailResult instanceof HTMLElement) { detailResult.replaceChildren(); detailResult.className = ""; }
       const title = ownerNetworkDetail.querySelector("[data-network-title]"); if (title) title.textContent = network.name;
       const kind = ownerNetworkDetail.querySelector("[data-network-kind]"); if (kind) kind.textContent = `${network.kind} network`;
@@ -2754,6 +2776,16 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       const deleteForm = ownerNetworkDetail.querySelector("[data-api-owner-network-delete]"); if (deleteForm instanceof HTMLFormElement) { deleteForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; deleteForm.dataset.confirm = `Remove network ${network.name}? Its live connection and stored backlog will be deleted.`; }
       const edit = ownerNetworkDetail.querySelector("[data-network-edit]"); if (edit instanceof HTMLAnchorElement) { if (network.kind === "irc") { edit.href = `/console/networks/${encodeURIComponent(network.name)}/edit`; edit.hidden = false; } else if (ownerNetworkDetail.dataset.isAdmin === "true") { edit.href = `/console/integrations/${encodeURIComponent(network.name)}/edit`; edit.textContent = "Edit integration"; edit.hidden = false; } }
       const logs = ownerNetworkDetail.querySelector("[data-network-logs]"); if (logs instanceof HTMLAnchorElement) logs.href = `/console/networks/${encodeURIComponent(network.name)}/logs`;
+      const accountSetup = ownerNetworkDetail.querySelector("[data-network-account-setup]");
+      if (accountSetup instanceof HTMLElement) {
+        accountSetup.hidden = network.kind !== "irc";
+        const chat = accountSetup.querySelector("[data-network-chat]");
+        if (chat instanceof HTMLAnchorElement) chat.href = `/?network=${encodeURIComponent(network.name)}`;
+        const account = accountSetup.querySelector('[name="sasl_account"]');
+        if (account instanceof HTMLInputElement && !account.value) account.value = network.sasl_account || network.nick;
+        const warning = accountSetup.querySelector("[data-network-registration-warning]");
+        if (warning instanceof HTMLElement) warning.hidden = !network.addr.toLowerCase().includes("libera.chat");
+      }
     };
     refreshOwnerNetworkDetail = async () => {
       try {
@@ -2764,6 +2796,72 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       }
       return true;
     };
+    const refreshTranscript = async () => {
+      const panel = ownerNetworkDetail.querySelector("[data-api-network-operations]");
+      const refresh = panel instanceof HTMLElement ? panelRefreshers.get(panel) : null;
+      if (refresh) await refresh(true);
+    };
+    const accountCommand = (form, body, success) => runFormSubmission(form, async () => {
+      try {
+        await apiRequest(form, apiMutation("POST", `/api/v1/me/networks/${encodeURIComponent(name)}/account-registration`), body);
+        await refreshTranscript();
+        setOwnerNetworkResult(success, true);
+      } catch (error) {
+        setOwnerNetworkResult(error instanceof Error ? error.message : "NickServ command failed.", false);
+      }
+    });
+    const register = ownerNetworkDetail.querySelector("[data-api-network-account-register]");
+    if (register instanceof HTMLFormElement) register.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const fields = new FormData(register);
+      const email = fieldValue(fields, "email");
+      const password = fieldValue(fields, "password");
+      if (!email || !password) { setOwnerNetworkResult("Enter an email address and NickServ password.", false); return; }
+      const savedPassword = ownerNetworkDetail.querySelector('[data-api-network-account-save] [name="sasl_password"]');
+      if (savedPassword instanceof HTMLInputElement) savedPassword.value = password;
+      void accountCommand(register, { action: "register", email, password }, "NickServ REGISTER queued. Read the IRC transcript for the network's response, then check your email.");
+    });
+    const verify = ownerNetworkDetail.querySelector("[data-api-network-account-verify]");
+    if (verify instanceof HTMLFormElement) verify.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const code = fieldValue(new FormData(verify), "code");
+      if (!code) { setOwnerNetworkResult("Enter the verification code from the email.", false); return; }
+      void accountCommand(verify, { action: "verify", code }, "NickServ VERIFY REGISTER queued. Confirm the result in the IRC transcript before saving SASL credentials.");
+    });
+    const save = ownerNetworkDetail.querySelector("[data-api-network-account-save]");
+    if (save instanceof HTMLFormElement) save.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (currentNetwork === null) { setOwnerNetworkResult("Network details are not loaded. Refresh and try again.", false); return; }
+      const fields = new FormData(save);
+      const account = fieldValue(fields, "sasl_account");
+      const password = fieldValue(fields, "sasl_password");
+      if (!account || !password) { setOwnerNetworkResult("Enter the verified NickServ account and password.", false); return; }
+      const body = {
+        addr: currentNetwork.addr,
+        tls: currentNetwork.tls,
+        nick: currentNetwork.nick,
+        realname: currentNetwork.realname,
+        autojoin: currentNetwork.autojoin,
+        credentials: { action: "set", account, password },
+      };
+      const url = `/api/v1/me/networks/${encodeURIComponent(name)}`;
+      void runFormSubmission(save, async () => {
+        try {
+          await apiRequest(save, apiMutation("PUT", url), body);
+          if (!currentNetwork.enabled) {
+            await apiRequest(save, apiMutation("PATCH", url), { enabled: true });
+          }
+          const registrationPassword = ownerNetworkDetail.querySelector('[data-api-network-account-register] [name="password"]');
+          if (registrationPassword instanceof HTMLInputElement) registrationPassword.value = "";
+          const savedPassword = save.querySelector('[name="sasl_password"]');
+          if (savedPassword instanceof HTMLInputElement) savedPassword.value = "";
+          await refreshOwnerNetworkDetail();
+          setOwnerNetworkResult("SASL credentials saved. The network is reconnecting with the verified account.", true);
+        } catch (error) {
+          setOwnerNetworkResult(error instanceof Error ? error.message : "SASL credential update failed.", false);
+        }
+      });
+    });
     if (!name) showFailure(new Error("This network page has no resource ID. Return to the network directory and try again."), () => void refreshOwnerNetworkDetail()); else void refreshOwnerNetworkDetail();
   }
 

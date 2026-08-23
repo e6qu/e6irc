@@ -460,6 +460,15 @@ pub(super) async fn ws_ui_conn(
                             send_unavailable(&mut socket).await;
                             break;
                         }
+                        crate::bouncer::SendOutcome::Unavailable => {
+                            let event = composer_result_event(ComposerResult::Rejected {
+                                request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
+                                message: "upstream registration is parked; reconfigure the network before sending",
+                            });
+                            if socket.send(WsMessage::text(event)).await.is_err() {
+                                break;
+                            }
+                        }
                         crate::bouncer::SendOutcome::Rejected(error) => {
                             let event = composer_result_event(ComposerResult::Rejected {
                                 request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
@@ -735,6 +744,20 @@ pub(super) fn slash_to_irc(message: &str, target: &str) -> Result<String, &'stat
             }
             format!("PRIVMSG {to} :{text}")
         }
+        "notice" => {
+            let Some((to, text)) = rest.split_once(char::is_whitespace) else {
+                return Err("/notice requires a target and message; nothing was sent");
+            };
+            let text = text.trim_start();
+            if to.is_empty() || text.is_empty() {
+                return Err("/notice requires a target and message; nothing was sent");
+            }
+            format!("NOTICE {to} :{text}")
+        }
+        "quote" if rest.is_empty() => {
+            return Err("/quote requires an IRC command; nothing was sent");
+        }
+        "quote" => rest.to_string(),
         // Unknown slash-command: pass it through raw (server answers 421).
         _ => format!("{} {rest}", cmd.to_ascii_uppercase()),
     };

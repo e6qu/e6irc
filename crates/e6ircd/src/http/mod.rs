@@ -211,6 +211,40 @@ pub(super) const MAX_LABEL_LEN: usize = 64;
 pub(super) const MAX_ACCOUNT_LEN: usize = 64;
 pub(super) const MAX_PASSWORD_LEN: usize = 512;
 
+/// A problem response carried through an internal fallible helper. Boxing the
+/// response keeps every `Result` small while preserving the exact status,
+/// headers, and body chosen at the failure site.
+#[derive(Debug)]
+pub(super) struct ResponseRejection(Box<Response>);
+
+impl From<Response> for ResponseRejection {
+    fn from(response: Response) -> Self {
+        Self(Box::new(response))
+    }
+}
+
+impl std::ops::Deref for ResponseRejection {
+    type Target = Response;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<ResponseRejection> for Response {
+    fn from(rejection: ResponseRejection) -> Self {
+        *rejection.0
+    }
+}
+
+impl IntoResponse for ResponseRejection {
+    fn into_response(self) -> Response {
+        self.into()
+    }
+}
+
+pub(super) type ResponseResult<T> = Result<T, ResponseRejection>;
+
 pub(super) fn label_validation_error(label: &str) -> Option<String> {
     if label.chars().count() > MAX_LABEL_LEN {
         return Some(format!("Labels are at most {MAX_LABEL_LEN} characters."));
@@ -250,13 +284,12 @@ pub(super) fn password_input_error(password: &str) -> Option<&'static str> {
 /// Resolve a bounded integer query parameter without silently changing the
 /// caller's requested window. HTTP collection endpoints share this boundary so
 /// a new `?limit=` cannot accidentally reintroduce clamp-and-pretend behavior.
-#[allow(clippy::result_large_err)] // Err is the standard full problem Response
 pub(super) fn bounded_query_limit(
     requested: Option<usize>,
     default: usize,
     maximum: usize,
     collection: &str,
-) -> Result<i64, Response> {
+) -> ResponseResult<i64> {
     let limit = requested.unwrap_or(default);
     if !(1..=maximum).contains(&limit) {
         return Err(problem(
@@ -265,32 +298,33 @@ pub(super) fn bounded_query_limit(
             Some(&format!(
                 "The {collection} limit must be between 1 and {maximum}."
             )),
-        ));
+        )
+        .into());
     }
     i64::try_from(limit).map_err(|_| {
-        problem(
+        ResponseRejection::from(problem(
             StatusCode::BAD_REQUEST,
             &format!("Invalid {collection} limit"),
             Some(&format!(
                 "The {collection} limit must be between 1 and {maximum}."
             )),
-        )
+        ))
     })
 }
 
 /// Unwrap a JSON request body, turning a rejection into a 400 problem response.
 /// Shared by the JSON POST handlers so the parse boilerplate isn't copied.
-#[allow(clippy::result_large_err)] // Err is a full problem Response, as throughout this module
 pub(super) fn parse_json<T>(
     body: Result<axum::Json<T>, axum::extract::rejection::JsonRejection>,
-) -> Result<T, Response> {
+) -> ResponseResult<T> {
     match body {
         Ok(axum::Json(b)) => Ok(b),
         Err(e) => Err(problem(
             StatusCode::BAD_REQUEST,
             "Invalid request body",
             Some(&e.to_string()),
-        )),
+        )
+        .into()),
     }
 }
 
@@ -785,6 +819,24 @@ mod query_limit_tests {
     }
 
     #[test]
+    fn response_rejection_is_pointer_sized_and_preserves_the_response() {
+        assert_eq!(
+            std::mem::size_of::<ResponseRejection>(),
+            std::mem::size_of::<usize>()
+        );
+        let mut response = problem(StatusCode::CONFLICT, "Conflict", None);
+        response.headers_mut().insert(
+            "x-test-provenance",
+            axum::http::HeaderValue::from_static("original"),
+        );
+
+        let response: Response = ResponseRejection::from(response).into();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.headers()["x-test-provenance"], "original");
+    }
+
+    #[test]
     fn bounded_limits_default_accept_and_reject_without_clamping() {
         assert_eq!(bounded_query_limit(None, 100, 1000, "audit").unwrap(), 100);
         assert_eq!(bounded_query_limit(Some(1), 100, 1000, "audit").unwrap(), 1);
@@ -1088,6 +1140,7 @@ documented_routes! {
         delete: delete_network,
     },
     "/api/v1/me/networks/{name}/operations" => { get: pages::owner_network_operations },
+    "/api/v1/me/networks/{name}/account-registration" => { post: network_account_command },
     "/api/v1/me/networks/{name}/buffer" => { get: network_buffer },
     "/api/v1/history" => { get: history },
     "/api/v1/admin/accounts" => { get: admin_accounts, post: admin_create_account },
@@ -1293,7 +1346,7 @@ mod web {
     ) -> Response {
         match authenticate(&state, &headers).await {
             Ok(_) => serve("index.html"),
-            Err(response) if response.status() != StatusCode::UNAUTHORIZED => response,
+            Err(response) if response.status() != StatusCode::UNAUTHORIZED => response.into(),
             Err(_) => match state
                 .oidc_providers
                 .iter()
@@ -1652,7 +1705,7 @@ mod pages {
         }
         let form = match parse_form(form) {
             Ok(form) => form,
-            Err(response) => return response,
+            Err(response) => return response.into(),
         };
         let bound = browser_state_matches(
             &headers,
@@ -1859,7 +1912,7 @@ mod pages {
         };
         let form = match parse_form(form) {
             Ok(form) => form,
-            Err(response) => return response,
+            Err(response) => return response.into(),
         };
         if !browser_state_matches(
             &headers,
@@ -1969,7 +2022,7 @@ mod pages {
         };
         let form = match parse_form(form) {
             Ok(form) => form,
-            Err(response) => return response,
+            Err(response) => return response.into(),
         };
         let bound = browser_state_matches(
             &headers,
@@ -2189,12 +2242,12 @@ mod pages {
         state: &AppState,
         headers: &axum::http::HeaderMap,
         admin_only: bool,
-    ) -> Result<(String, String), Response> {
+    ) -> ResponseResult<(String, String)> {
         let account = authenticate(state, headers)
             .await
             .map_err(|_| Redirect::to("/login").into_response())?;
         if admin_only && !is_admin_account(state, &account) {
-            return Err(problem(StatusCode::FORBIDDEN, "Admin only", None));
+            return Err(problem(StatusCode::FORBIDDEN, "Admin only", None).into());
         }
         let csrf = session_token(headers, state.secure_cookies)
             .map(|s| state.csrf_token(&s))
@@ -2229,7 +2282,7 @@ mod pages {
         headers: axum::http::HeaderMap,
     ) -> Response {
         if let Err(response) = page_actor(&state, &headers, false).await {
-            return response;
+            return response.into();
         }
         Redirect::to("/console/account").into_response()
     }
@@ -2240,7 +2293,7 @@ mod pages {
     ) -> Response {
         let (account, csrf) = match page_actor(&state, &headers, false).await {
             Ok(actor) => actor,
-            Err(response) => return response,
+            Err(response) => return response.into(),
         };
         render_private(ConsoleAccount {
             shell: console_shell(&state, account, csrf, "account"),
@@ -2259,7 +2312,7 @@ mod pages {
     ) -> Response {
         let (account, csrf) = match page_actor(&state, &headers, false).await {
             Ok(resolved) => resolved,
-            Err(response) => return response,
+            Err(response) => return response.into(),
         };
         render_private(ConsoleChannels {
             shell: console_shell(&state, account, csrf, "channels"),
@@ -2449,22 +2502,22 @@ mod pages {
         })
     }
 
-    async fn console_admin_channels_build(
+    fn console_admin_channels_build(
         state: &AppState,
         account: String,
         csrf: String,
         query: super::device::ValidatedRegisteredChannelDirectoryQuery,
-    ) -> Result<ConsoleAdminChannels, Response> {
+    ) -> ConsoleAdminChannels {
         let name = query.name.unwrap_or_default();
         let founder = query.founder.unwrap_or_default();
-        Ok(ConsoleAdminChannels {
+        ConsoleAdminChannels {
             shell: console_shell(state, account, csrf, "admin-channels"),
             has_filters: !name.is_empty() || !founder.is_empty(),
             has_cursor: query.before_id.is_some(),
             name,
             founder,
             limit: query.page_size.value(),
-        })
+        }
     }
 
     pub async fn console_admin_channels(
@@ -2474,12 +2527,9 @@ mod pages {
     ) -> Response {
         let query = match super::device::validate_registered_channel_directory_query(params, 50) {
             Ok(query) => query,
-            Err(response) => return response,
+            Err(response) => return response.into(),
         };
-        match console_admin_channels_build(&state, account, csrf, query).await {
-            Ok(view) => render_private(view),
-            Err(response) => response,
-        }
+        render_private(console_admin_channels_build(&state, account, csrf, query))
     }
 
     /// The fleet-wide BNC view: every account's networks with live driver
@@ -2494,22 +2544,22 @@ mod pages {
         })
     }
 
-    async fn console_server_bans_build(
+    fn console_server_bans_build(
         state: &AppState,
         account: String,
         csrf: String,
         query: super::device::ValidatedServerBanDirectoryQuery,
-    ) -> Result<ConsoleServerBans, Response> {
+    ) -> ConsoleServerBans {
         let kind = query.kind.unwrap_or_default();
         let mask = query.mask.unwrap_or_default();
-        Ok(ConsoleServerBans {
+        ConsoleServerBans {
             shell: console_shell(state, account, csrf, "bans"),
             has_filters: !kind.is_empty() || !mask.is_empty(),
             has_cursor: query.before_id.is_some(),
             kind,
             mask,
             limit: query.page_size.value(),
-        })
+        }
     }
 
     pub async fn console_server_bans(
@@ -2519,12 +2569,9 @@ mod pages {
     ) -> Response {
         let query = match super::device::validate_server_ban_directory_query(params, 50) {
             Ok(query) => query,
-            Err(response) => return response,
+            Err(response) => return response.into(),
         };
-        match console_server_bans_build(&state, account, csrf, query).await {
-            Ok(view) => render_private(view),
-            Err(response) => response,
-        }
+        render_private(console_server_bans_build(&state, account, csrf, query))
     }
 
     pub async fn console_audit(
@@ -2534,7 +2581,7 @@ mod pages {
     ) -> Response {
         let query = match super::device::validate_audit_query(params, 50) {
             Ok(query) => query,
-            Err(response) => return response,
+            Err(response) => return response.into(),
         };
         let actor = query.actor.unwrap_or_default();
         let action = query.action.unwrap_or_default();
@@ -2638,7 +2685,7 @@ mod pages {
     ) -> Response {
         let (account, csrf) = match page_actor(&state, &headers, true).await {
             Ok(resolved) => resolved,
-            Err(response) => return response,
+            Err(response) => return response.into(),
         };
         render_private(Console {
             shell: console_shell(&state, account, csrf, "overview"),
@@ -2659,7 +2706,7 @@ mod pages {
         account: &str,
         name: &str,
         enabled: bool,
-    ) -> Result<NetworkOperationsResponse, Response> {
+    ) -> ResponseResult<NetworkOperationsResponse> {
         let runtime = state
             .bnc_registry
             .as_ref()
@@ -2712,7 +2759,7 @@ mod pages {
     ) -> Response {
         let (account, csrf) = match page_actor(&state, &headers, false).await {
             Ok(result) => result,
-            Err(response) => return response,
+            Err(response) => return response.into(),
         };
         render_private(ConsoleNetworkDetail {
             shell: console_shell(&state, account, csrf, "networks"),
@@ -2729,7 +2776,7 @@ mod pages {
     ) -> Response {
         let (account, csrf) = match page_actor(&state, &headers, false).await {
             Ok(result) => result,
-            Err(response) => return response,
+            Err(response) => return response.into(),
         };
         render_private(ConsoleNetworkLogs {
             shell: console_shell(&state, account, csrf, "networks"),
@@ -2750,7 +2797,7 @@ mod pages {
         };
         match network_operations_response(&state, &account, &network.name, network.enabled).await {
             Ok(response) => super::json_no_store(response),
-            Err(response) => response,
+            Err(response) => response.into(),
         }
     }
 
@@ -2785,7 +2832,7 @@ mod pages {
     ) -> Response {
         let (account, csrf) = match page_actor(&state, &headers, false).await {
             Ok(resolved) => resolved,
-            Err(response) => return response,
+            Err(response) => return response.into(),
         };
         let attach_addr = match &state.bnc_listener {
             Some(listener) => listener.status().await.map(|(_, bound)| bound),
@@ -2809,7 +2856,7 @@ mod pages {
     ) -> Response {
         let (account, csrf) = match page_actor(&state, &headers, false).await {
             Ok(x) => x,
-            Err(r) => return r,
+            Err(r) => return r.into(),
         };
         render_private(ConsoleNetworkEdit {
             shell: console_shell(&state, account, csrf, "networks"),
@@ -2910,17 +2957,17 @@ mod pages {
     /// Unwrap an axum form, turning a rejection into a 400 problem response.
     /// Shared by the console's plain-form handlers so the parse boilerplate
     /// isn't copied into each.
-    #[allow(clippy::result_large_err)] // Err is a full problem Response, as throughout
     fn parse_form<T>(
         form: Result<axum::Form<T>, axum::extract::rejection::FormRejection>,
-    ) -> Result<T, Response> {
+    ) -> ResponseResult<T> {
         match form {
             Ok(axum::Form(f)) => Ok(f),
             Err(e) => Err(problem(
                 StatusCode::BAD_REQUEST,
                 "Invalid form",
                 Some(&e.to_string()),
-            )),
+            )
+            .into()),
         }
     }
 
@@ -2943,7 +2990,7 @@ mod pages {
     ) -> Response {
         let (account, csrf) = match page_actor(&state, &headers, false).await {
             Ok(resolved) => resolved,
-            Err(response) => return response,
+            Err(response) => return response.into(),
         };
         render_private(ConsoleSessions {
             shell: console_shell(&state, account, csrf, "my-sessions"),

@@ -1297,7 +1297,11 @@ Libera Chat preset and offers a small, provenance-dated catalog of published
 TLS endpoints (Libera, OFTC, EFnet, Snoonet) plus Custom. A preset's human label
 is never its client/URL identifier: `Libera Chat` maps to the safe stable id
 `libera`. Presets are applied server-side so they work without JavaScript;
-the script only mirrors their fields for editing. Invalid submissions re-render
+the script only mirrors their fields for editing. A preset is endpoint
+provenance, not a compatibility claim for the deployment's current egress.
+The console disables creation until the exact endpoint, TLS choice, identity,
+channels, and optional credentials have passed the production preflight; any
+change to those fields invalidates the qualification. Invalid submissions re-render
 the page with the precise shared validation problem and preserve non-secret
 input, including the resolved preset values. IRC addresses must be a syntactic
 `host:port` with a nonzero numeric port (and bracketed IPv6); configuration,
@@ -1312,7 +1316,10 @@ time, connection age and latency, attempts and errors, attached raw/web
 clients, per-network line/byte traffic, in-memory buffer use, stored backlog
 bounds, and the newest 100 stored lines. `/api/v1/me/networks/{name}` exposes
 the same counters and timestamps plus the last error as a closed,
-credential-safe code and summary—never raw provider text or credentials. The
+credential-safe code and summary. An IRC registration rejection may
+additionally carry the parser's bounded sanitized upstream diagnostic so an
+owner can act on provider requirements; arbitrary transport errors and
+credentials never enter that field. The
 runtime snapshot is held once on `NetworkHandle`, so IRC and every bridge
 driver enter the same measurement path; both raw-IRC and web attachments use
 the counted `send` funnel. A reconnecting session must return a
@@ -1442,7 +1449,10 @@ one implementation shared with the external-network path.
   Synthesized message echoes rebuild their prefixed traditional body within
   the 512-byte wire allowance, preserving valid client-only tags and cutting
   trailing UTF-8 only at a character boundary; malformed message commands do
-  not manufacture an echo the upstream would never send.
+  not manufacture an echo the upstream would never send. NickServ commands
+  that can contain a password, email address, verification code, recovery
+  token, or replacement credential synthesize only a redacted trailing field,
+  while the exact command is still sent upstream.
 - Auto-reconnect with exponential backoff + jitter, bounded so repeatedly
   rejected credentials or IRC registration settings stop re-dialing rather
   than hammering the upstream forever; authentication and registration
@@ -1456,6 +1466,9 @@ one implementation shared with the external-network path.
   identity). A process restart falls back to the configured autojoin, which
   is the operator-declared floor. Upstream SASL PLAIN uses credentials
   stored encrypted (§15).
+  Once authentication or registration failure parks the driver, its command
+  boundary returns terminal unavailability instead of accepting lines into a
+  queue that has no consumer.
 - Every registration, auto-join, command, heartbeat, and protocol PONG emission
   is part of the session outcome: a failed upstream transport write drops and
   reconnects, while a closed in-process core queue stops the `local` driver
@@ -1467,6 +1480,14 @@ one implementation shared with the external-network path.
   TCP/TLS attempt, and tries the remaining vetted addresses. TLS still validates
   the certificate against the configured hostname rather than the pinned IP.
 - Primary interop target: Libera (tested against the §7.7 docker stack).
+- Account registration remains ordinary IRC services traffic. The console's
+  guided email round trip emits `PRIVMSG NickServ :REGISTER password email`
+  and `PRIVMSG NickServ :VERIFY REGISTER nick code` only while the upstream is
+  connected, then stores the verified account/password through the existing
+  sealed write-only credential path. Owners may send the same commands from
+  any attached IRC client. A provider that blocks registration from the
+  deployment's address must be registered through an accepted connection;
+  e6irc cannot convert that provider policy into a successful local preflight.
 
 ### 10.4 Attach addressing
 
@@ -1736,6 +1757,12 @@ update every affected buffer using the same pairing rules as the BNC session
 tracker. Malformed membership commands and incomplete topic numerics are shown
 in the server buffer rather than ignored or allowed to throw in the socket
 handler.
+The browser has an optional raw-output receiver tape that retains and renders
+every exact safe inbound IRC wire line, including state-changing lines,
+numerics, and NickServ replies. `/help` documents the available composer
+grammar; `/query`, `/msg`, `/notice`, `/join`, `/part`, `/nick`, `/me`, `/raw`,
+and `/quote` preserve normal IRC workflows instead of requiring a
+configuration-only UI.
 Status values are the closed set `connected`, `disconnected`, and
 `unavailable`. The first two describe a live driver's upstream lifecycle;
 each driver transition has a monotonic revision, so an initial sticky status

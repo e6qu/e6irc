@@ -54,6 +54,17 @@ pub(super) fn oidc_http_client() -> openidconnect::reqwest::Client {
         .expect("reqwest client")
 }
 
+fn discovery_error(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
+}
+
 pub(super) async fn discover_client(
     state: &AppState,
     provider: &OidcProviderConfig,
@@ -92,10 +103,14 @@ pub(super) async fn discover_client(
 async fn discover_client_or_bad_gateway(
     state: &AppState,
     provider: &OidcProviderConfig,
-) -> Result<OidcClient, Response> {
+) -> ResponseResult<OidcClient> {
     discover_client(state, provider).await.map_err(|e| {
         eprintln!("oidc: {e}");
-        problem(StatusCode::BAD_GATEWAY, "OIDC provider unreachable", None)
+        ResponseRejection::from(problem(
+            StatusCode::BAD_GATEWAY,
+            "OIDC provider unreachable",
+            None,
+        ))
     })
 }
 
@@ -144,7 +159,7 @@ pub(super) async fn discover_metadata(
     let meta =
         openidconnect::core::CoreProviderMetadata::discover_async(issuer, &oidc_http_client())
             .await
-            .map_err(|e| format!("discovery failed: {e}"))?;
+            .map_err(|error| format!("discovery failed: {}", discovery_error(&error)))?;
     discovery_cache()
         .lock()
         .expect("poisoned")
@@ -217,7 +232,7 @@ pub(super) async fn oidc_authorize(
     };
     let client = match discover_client_or_bad_gateway(state, &provider).await {
         Ok(c) => c,
-        Err(resp) => return resp,
+        Err(resp) => return resp.into(),
     };
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     let mut request = client
@@ -428,7 +443,7 @@ pub(super) async fn oidc_callback(
         .expect("pending auth references a configured provider");
     let client = match discover_client_or_bad_gateway(&state, &provider).await {
         Ok(c) => c,
-        Err(resp) => return resp,
+        Err(resp) => return resp.into(),
     };
     let token_response = match client
         .exchange_code(AuthorizationCode::new(code))
@@ -1136,7 +1151,7 @@ pub(super) fn pool_of(state: &AppState) -> &sqlx::PgPool {
 pub(super) async fn authenticate(
     state: &AppState,
     headers: &axum::http::HeaderMap,
-) -> Result<String, Response> {
+) -> ResponseResult<String> {
     authenticate_principal(state, headers)
         .await
         .map(|principal| principal.account)
@@ -1167,13 +1182,14 @@ enum ApiAuthorizationDenial {
 async fn authenticate_principal(
     state: &AppState,
     headers: &axum::http::HeaderMap,
-) -> Result<RequestPrincipal, Response> {
+) -> ResponseResult<RequestPrincipal> {
     let Some(pool) = &state.pool else {
         return Err(problem(
             StatusCode::SERVICE_UNAVAILABLE,
             "No database configured",
             None,
-        ));
+        )
+        .into());
     };
     if let Some(bearer) = headers
         .get(header::AUTHORIZATION)
@@ -1189,14 +1205,15 @@ async fn authenticate_principal(
                         credential: RequestCredential::ApiToken(principal.scopes),
                     })
             }
-            Ok(None) => Err(problem(StatusCode::UNAUTHORIZED, "Invalid token", None)),
+            Ok(None) => Err(problem(StatusCode::UNAUTHORIZED, "Invalid token", None).into()),
             Err(e) => {
                 eprintln!("http: token lookup failed: {e}");
                 Err(problem(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Database unavailable",
                     None,
-                ))
+                )
+                .into())
             }
         };
     }
@@ -1210,18 +1227,19 @@ async fn authenticate_principal(
                         credential: RequestCredential::Session(token),
                     })
             }
-            Ok(None) => Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None)),
+            Ok(None) => Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None).into()),
             Err(e) => {
                 eprintln!("http: session lookup failed: {e}");
                 Err(problem(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Database unavailable",
                     None,
-                ))
+                )
+                .into())
             }
         };
     }
-    Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None))
+    Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None).into())
 }
 
 fn authorize_api_request(
@@ -1343,20 +1361,21 @@ fn rate_limit_response(retry_after: u64) -> Response {
     response
 }
 
-async fn require_active_account(pool: &sqlx::PgPool, account: String) -> Result<String, Response> {
+async fn require_active_account(pool: &sqlx::PgPool, account: String) -> ResponseResult<String> {
     match crate::db::account_flags(pool, &account).await {
         Ok(Some(flags)) if flags.is_suspended() => {
-            Err(problem(StatusCode::FORBIDDEN, "Account suspended", None))
+            Err(problem(StatusCode::FORBIDDEN, "Account suspended", None).into())
         }
         Ok(Some(_flags)) => Ok(account),
-        Ok(None) => Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None)),
+        Ok(None) => Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None).into()),
         Err(error) => {
             eprintln!("http: account posture lookup failed: {error}");
             Err(problem(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Database unavailable",
                 None,
-            ))
+            )
+            .into())
         }
     }
 }

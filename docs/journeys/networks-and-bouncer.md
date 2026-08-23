@@ -66,8 +66,11 @@ credentials are supplied.
    the same server-side preset and validation rules, then uses the production
    resolver, prohibited-address vetting, TCP/TLS connector, optional SASL, and
    IRC registration path. It renders DNS, connect, and registration timings,
-   the confirmed nickname, and vetted address count without inserting a row,
-   starting a reconnect loop, or joining channels.
+   the confirmed nickname, and vetted address count without inserting a row or
+   starting a reconnect loop. It temporarily joins every configured channel
+   and succeeds only after each join is confirmed. A successful result enables
+   **Add network** only for those exact connection fields; editing any of them
+   invalidates the result and disables creation again.
 5. Submit the CSRF-protected form. Creation names one driver and its complete
    fields; absent kind, TLS, or IRC identity is rejected. The server validates
    sizes and syntax, blocks prohibited IP literals, seals any password,
@@ -88,7 +91,7 @@ credentials are supplied.
 - Duplicate owner/network names conflict under IRC casemapping.
 - DNS/address policy, TCP/TLS failure, upstream SASL rejection, nickname
   collision, and registration timeout return a closed preflight failure code
-  before storage when **Test connection** is used. The same conditions can
+  before storage. The same conditions can
   still happen asynchronously after saving (or later during reconnect); they
   appear in live operations and leave the network configured for retry/edit.
   A stored row is not misreported as connected.
@@ -107,8 +110,9 @@ credentials are supplied.
 **Security and observability.** The mutation is owner-scoped and
 CSRF-protected. Endpoints pass syntax, prohibited-address, DNS-result, and TLS
 certificate checks; passwords are write-only and sealed. Runtime status,
-traffic, latency, attempts, and closed error codes identify the result without
-exposing the password or raw provider text.
+traffic, latency, attempts, closed error codes, and a bounded sanitized IRC
+registration diagnostic identify the result without exposing credentials or
+arbitrary transport errors.
 
 **Evidence.** Preset integrity and server-side application have unit tests.
 The production IRC-driver preflight has a real local registration oracle.
@@ -119,7 +123,57 @@ through the rendered controls and local live upstream;
 `bnc_network_management_lifecycle` proves the REST qualification contract,
 empty-registry invariant, mutation, live driver start, BNC attach,
 update/toggle/delete, and secret handling. The opt-in BNC-driver probes cover
-Libera, OFTC, and Ergo; public-server qualification remains outside CI.
+Libera, OFTC, and Ergo; public-server qualification remains outside CI and
+qualifies only the egress where it ran. A 2026-08-23 production-container run
+proved OFTC and Ergo Testnet registration plus configured-channel joins from
+Scaleway, while Libera returned its verified-account requirement on that
+container's IPv4 path.
+
+## Register and verify an upstream IRC account
+
+**Actor and goal.** An owner whose upstream requires a registered account
+wants to complete the email round trip and then reconnect with SASL.
+
+**Preconditions.** The network is an IRC driver and is currently connected
+without SASL from an address the provider permits to register. Some providers,
+including Libera for restricted address ranges, require the first account to be
+created from a different accepted connection.
+
+**Flow.**
+
+1. Open the network detail page. Its **NickServ account setup** section and IRC
+   transcript remain visible together.
+2. Enter an email address and new password. The closed owner-scoped endpoint
+   sends the ordinary IRC command `PRIVMSG NickServ :REGISTER password email`.
+3. Read NickServ's response in the transcript, check the email, and return with
+   its code. Submitting the code sends
+   `PRIVMSG NickServ :VERIFY REGISTER nick code`.
+4. Confirm NickServ's success in the transcript, then save the account and
+   password. The normal network replacement path seals the password and
+   reconnects with SASL PLAIN.
+5. An attached IRC client may perform the same exchange with normal
+   `/msg NickServ ...` commands; the guided forms are not a separate protocol.
+
+**Visible failures and recovery.** The guided endpoint refuses a non-IRC,
+absent, reconnecting, or terminally parked driver instead of queueing work that
+cannot drain. Invalid email addresses, multi-token/injected passwords or codes,
+oversized commands, and a full command queue fail explicitly. Provider replies,
+numerics, and notices remain visible in the transcript. If the provider blocks
+registration from the deployment address, its sanitized reason is visible and
+the owner must create the account from a provider-accepted connection before
+returning to save the verified credentials.
+
+**Security and observability.** Passwords and codes are write-only request
+fields and never appear in audit details. The exact command reaches NickServ,
+but the synthesized persisted self-echo redacts the trailing field for every
+sensitive NickServ credential and recovery command. Only the action kind is
+audited.
+
+**Evidence.** Unit tests close and bound both command shapes and prove sensitive
+self-echo redaction. The full-stack Chromium journey sends REGISTER and VERIFY
+through the real driver, observes mock NickServ replies in the owner transcript,
+proves the password and email code are absent, disables the network, then saves
+the verified credentials and proves re-enable, SASL PLAIN, and channel rejoin.
 
 ## Diagnose an upstream connection
 
@@ -141,16 +195,19 @@ monitoring; live runtime diagnosis remains tied to the registry.
    driver is waiting to retry, connection duration, latest connect latency,
    bytes/lines in and out, attached clients, backlog length, the bounded
    error ledger, and a bounded newest-last failure history so a flap pattern
-   is visible as a sequence, not just the last error.
-4. Recent persisted detached backlog is shown oldest-first and remains
-   available while the network is paused.
+   is visible as a sequence, not just the last error. The latest typed IRC
+   registration failure also carries its bounded sanitized upstream diagnostic.
+4. The recent persisted IRC transcript is shown oldest-first, including
+   NickServ replies, notices, and numerics, and remains available while the
+   network is paused.
 5. Global **Monitoring** aggregates upstream traffic, availability, error
    deltas, and latency across networks.
 
 **Visible failures and recovery.** Runtime snapshots say when a driver is
-absent, disabled, connecting, or failed. Runtime timestamps reset on a
-restart/reconfiguration and are labeled as such. Stored credentials are shown
-only as presence/posture.
+absent, disabled, connecting, or failed. A terminally parked driver refuses new
+commands instead of accepting them into an undrainable queue. Runtime
+timestamps reset on a restart/reconfiguration and are labeled as such. Stored
+credentials are shown only as presence/posture.
 
 **Security and observability.** Detail, operations, buffer, and runtime
 selection repeat owner authorization. Error reasons use a closed redacted

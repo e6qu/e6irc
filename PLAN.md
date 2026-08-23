@@ -50,8 +50,16 @@ External qualification has one manual GitHub workflow. It selects one closed
 campaign, refuses local provider oracles, and uploads only evidence accepted by
 the runner verifier. Its Discord, Slack, and OpenID Connect boundaries use
 closed request, response, and WebSocket-frame contracts.
-The current qualification runner passed live public IRC campaigns for
-Libera.Chat, OFTC, and Ergo on 2026-08-13. The console has a bounded,
+The qualification runner recorded live public IRC campaign evidence for
+Libera.Chat, OFTC, and Ergo on 2026-08-13; that evidence qualifies the runner's
+egress, not an arbitrary deployment. A 2026-08-23 qualification from the
+Scaleway production container proved registration and configured-channel joins
+against OFTC and Ergo Testnet. The same deployed IPv4 egress was explicitly
+rejected by Libera until it supplies an existing email-verified NickServ
+account through SASL, and the container has no routable IPv6 fallback. Libera
+therefore remains disabled there rather than being misreported as fixed. The
+console now requires the exact connection fields to pass the production
+preflight before a network can be saved. It has a bounded,
 owner-scoped component-log view for IRC and every bridge driver. Its API reads
 the live buffer while active and persisted history after stop; typed lifecycle
 and operational failures are safe notices, and storage-failure notices cannot

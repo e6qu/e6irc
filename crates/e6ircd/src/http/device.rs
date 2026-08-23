@@ -6,7 +6,7 @@ macro_rules! json_or_response {
     ($body:expr) => {
         match parse_json($body) {
             Ok(body) => body,
-            Err(response) => return response,
+            Err(response) => return response.into(),
         }
     };
 }
@@ -469,41 +469,34 @@ pub(super) async fn device_approve(
     }
 }
 
-#[allow(clippy::result_large_err)] // Err is the standard full problem Response
 pub(super) fn bounded_admin_page_size<T>(
     requested: Option<usize>,
     default_limit: usize,
     make: impl FnOnce(usize) -> Option<T>,
     invalid_title: &'static str,
     detail: &'static str,
-) -> Result<T, Response> {
+) -> ResponseResult<T> {
     make(requested.unwrap_or(default_limit))
-        .ok_or_else(|| problem(StatusCode::BAD_REQUEST, invalid_title, Some(detail)))
+        .ok_or_else(|| problem(StatusCode::BAD_REQUEST, invalid_title, Some(detail)).into())
 }
 
-#[allow(clippy::result_large_err)] // Err is the standard full problem Response
 pub(super) fn positive_admin_cursor(
     before_id: Option<i64>,
     invalid_title: &'static str,
     detail: &'static str,
-) -> Result<Option<i64>, Response> {
+) -> ResponseResult<Option<i64>> {
     if before_id.is_some_and(|id| id <= 0) {
-        return Err(problem(
-            StatusCode::BAD_REQUEST,
-            invalid_title,
-            Some(detail),
-        ));
+        return Err(problem(StatusCode::BAD_REQUEST, invalid_title, Some(detail)).into());
     }
     Ok(before_id)
 }
 
-#[allow(clippy::result_large_err)] // Err is the standard full problem Response
 pub(super) fn printable_exact_filter(
     value: Option<String>,
     maximum_bytes: usize,
     invalid_title: &'static str,
     detail: &'static str,
-) -> Result<Option<String>, Response> {
+) -> ResponseResult<Option<String>> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -512,11 +505,7 @@ pub(super) fn printable_exact_filter(
         return Ok(None);
     }
     if value.len() > maximum_bytes || value.chars().any(char::is_control) {
-        return Err(problem(
-            StatusCode::BAD_REQUEST,
-            invalid_title,
-            Some(detail),
-        ));
+        return Err(problem(StatusCode::BAD_REQUEST, invalid_title, Some(detail)).into());
     }
     Ok(Some(value.to_owned()))
 }
@@ -545,11 +534,10 @@ impl ValidatedAccountDirectoryQuery {
     }
 }
 
-#[allow(clippy::result_large_err)] // Err is the standard full problem Response
 pub(super) fn validate_account_directory_query(
     params: AccountDirectoryQuery,
     default_limit: usize,
-) -> Result<ValidatedAccountDirectoryQuery, Response> {
+) -> ResponseResult<ValidatedAccountDirectoryQuery> {
     let page_size = bounded_admin_page_size(
         params.limit,
         default_limit,
@@ -584,7 +572,7 @@ pub(super) async fn admin_accounts(
     let pool = pool_of(&state);
     let query = match validate_account_directory_query(params, 100) {
         Ok(query) => query,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     match crate::db::query_account_directory(pool, query.database_filter()).await {
         Ok(page) => admin_json(AccountDirectoryResponse {
@@ -730,11 +718,10 @@ pub(super) struct AccountInvitationDirectoryQuery {
     before_id: Option<i64>,
 }
 
-#[allow(clippy::result_large_err)] // Err is the standard full problem Response
 fn validate_account_invitation_directory_query(
     params: AccountInvitationDirectoryQuery,
     default_limit: usize,
-) -> Result<(crate::db::AccountInvitationPageSize, Option<i64>), Response> {
+) -> ResponseResult<(crate::db::AccountInvitationPageSize, Option<i64>)> {
     let page_size = bounded_admin_page_size(
         params.limit,
         default_limit,
@@ -757,7 +744,7 @@ pub(super) async fn admin_account_invitations(
 ) -> Response {
     let (page_size, before_id) = match validate_account_invitation_directory_query(params, 100) {
         Ok(query) => query,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     match crate::db::list_account_invitations(pool_of(&state), before_id, page_size).await {
         Ok(page) => admin_json(AccountInvitationsResponse {
@@ -1187,7 +1174,7 @@ pub(super) async fn admin_patch_configuration(
 ) -> Response {
     let body = match parse_json(body) {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     let Some(config) = &state.managed_config else {
         return problem(
@@ -1292,7 +1279,7 @@ pub(super) async fn admin_create_network(
 ) -> Response {
     let body = match parse_json(body) {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     let request = match admin_network_request(body) {
         Ok(request) => request,
@@ -1351,7 +1338,7 @@ pub(super) async fn admin_delete_network(
 ) -> Response {
     let body = match parse_json(body) {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     let owner = match body.owner.into_option() {
         Ok(owner) => owner,
@@ -1395,7 +1382,7 @@ pub(super) async fn admin_create_oidc_provider(
 ) -> Response {
     let body = match parse_json(body) {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     let Some(key) = configuration_secret_key(&state) else {
         return master_key_required("OIDC client secrets");
@@ -1480,7 +1467,7 @@ pub(super) async fn admin_create_oper(
 ) -> Response {
     let body = match parse_json(body) {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     let Some(key) = configuration_secret_key(&state) else {
         return master_key_required("Operator passwords");
@@ -1537,7 +1524,7 @@ async fn delete_managed_configuration_item_api<T>(
 ) -> Response {
     let body = match parse_json(body) {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     mutate_managed_configuration(&state, &actor, body.revision, |settings| {
         delete_managed_configuration_item(settings, &name, item)
@@ -1636,11 +1623,10 @@ impl ValidatedRegisteredChannelDirectoryQuery {
     }
 }
 
-#[allow(clippy::result_large_err)] // Err is the standard full problem Response
 pub(super) fn validate_registered_channel_directory_query(
     params: RegisteredChannelDirectoryQuery,
     default_limit: usize,
-) -> Result<ValidatedRegisteredChannelDirectoryQuery, Response> {
+) -> ResponseResult<ValidatedRegisteredChannelDirectoryQuery> {
     let page_size = bounded_admin_page_size(
         params.limit,
         default_limit,
@@ -1682,7 +1668,7 @@ pub(super) async fn admin_channels(
     let pool = pool_of(&state);
     let query = match validate_registered_channel_directory_query(params, 100) {
         Ok(query) => query,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     match crate::db::query_registered_channel_directory(pool, query.database_filter()).await {
         Ok(page) => admin_json(RegisteredChannelsResponse {
@@ -1735,11 +1721,10 @@ impl ValidatedServerBanDirectoryQuery {
     }
 }
 
-#[allow(clippy::result_large_err)] // Err is the standard full problem Response
 pub(super) fn validate_server_ban_directory_query(
     params: ServerBanDirectoryQuery,
     default_limit: usize,
-) -> Result<ValidatedServerBanDirectoryQuery, Response> {
+) -> ResponseResult<ValidatedServerBanDirectoryQuery> {
     let page_size = bounded_admin_page_size(
         params.limit,
         default_limit,
@@ -1760,7 +1745,8 @@ pub(super) fn validate_server_ban_directory_query(
                 StatusCode::BAD_REQUEST,
                 "Invalid server-ban filter",
                 Some("The kind filter must be kline, dline, or xline."),
-            ));
+            )
+            .into());
         }
     };
     let mask = printable_exact_filter(
@@ -1786,7 +1772,7 @@ pub(super) async fn admin_server_bans(
     let pool = pool_of(&state);
     let query = match validate_server_ban_directory_query(params, 100) {
         Ok(query) => query,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     match crate::db::query_server_ban_directory(pool, query.database_filter()).await {
         Ok(page) => admin_json(ServerBansResponse {
@@ -1824,7 +1810,7 @@ pub(super) async fn admin_create_server_ban(
 ) -> Response {
     let body = match parse_json(body) {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     server_ban_response(
         &state,
@@ -1937,12 +1923,11 @@ impl ValidatedAuditQuery {
     }
 }
 
-#[allow(clippy::result_large_err)] // Err is the standard full problem Response
 fn audit_filter(
     value: Option<String>,
     name: &str,
     maximum: usize,
-) -> Result<Option<String>, Response> {
+) -> ResponseResult<Option<String>> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -1957,16 +1942,16 @@ fn audit_filter(
             Some(&format!(
                 "The exact {name} filter must contain 1–{maximum} printable characters."
             )),
-        ));
+        )
+        .into());
     }
     Ok(Some(value.to_owned()))
 }
 
-#[allow(clippy::result_large_err)] // Err is the standard full problem Response
 pub(super) fn validate_audit_query(
     params: AuditQuery,
     default_limit: usize,
-) -> Result<ValidatedAuditQuery, Response> {
+) -> ResponseResult<ValidatedAuditQuery> {
     let page_size = bounded_admin_page_size(
         params.limit,
         default_limit,
@@ -1997,7 +1982,7 @@ pub(super) async fn admin_audit(
     let pool = pool_of(&state);
     let query = match validate_audit_query(params, 100) {
         Ok(query) => query,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     match crate::db::query_audit_log(pool, query.database_filter()).await {
         Ok(page) => admin_json(AuditResponse {
@@ -2388,7 +2373,7 @@ pub(super) async fn create_api_token(
 ) -> Response {
     let req = match super::parse_json(body) {
         Ok(b) => b,
-        Err(r) => return r,
+        Err(r) => return r.into(),
     };
     if let Some(resp) = validate_label(&req.label) {
         return resp;

@@ -4,6 +4,7 @@ export const SETTINGS_KEY = "e6irc.settings";
 export const DEFAULT_SETTINGS = Object.freeze({
   theme: "auto",
   notifications: false,
+  rawOutput: false,
 });
 
 const THEMES = new Set(["auto", "light", "dark"]);
@@ -21,11 +22,15 @@ function normalized(value) {
     return { settings: defaults(), repaired: true };
   }
   const settings = defaults();
-  let repaired = Object.keys(value).some((key) => key !== "theme" && key !== "notifications");
+  let repaired = Object.keys(value).some(
+    (key) => key !== "theme" && key !== "notifications" && key !== "rawOutput",
+  );
   if (THEMES.has(value.theme)) settings.theme = value.theme;
   else if (value.theme !== undefined) repaired = true;
   if (typeof value.notifications === "boolean") settings.notifications = value.notifications;
   else if (value.notifications !== undefined) repaired = true;
+  if (typeof value.rawOutput === "boolean") settings.rawOutput = value.rawOutput;
+  else if (value.rawOutput !== undefined) repaired = true;
   return { settings, repaired };
 }
 

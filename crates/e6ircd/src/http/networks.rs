@@ -315,6 +315,23 @@ pub(super) struct PreflightNetwork {
     pub(super) sasl_password: Option<String>,
 }
 
+/// One closed NickServ account-registration action. These are ordinary IRC
+/// service commands under the hood; the typed HTTP shape exists so the console
+/// can guide the email round trip without ever accepting an arbitrary raw line.
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum NetworkAccountCommand {
+    Register { email: String, password: String },
+    Verify { code: String },
+}
+
+#[derive(serde::Serialize)]
+struct NetworkAccountCommandResponse {
+    queued: bool,
+    command: &'static str,
+    transcript: String,
+}
+
 #[derive(serde::Serialize)]
 struct PreflightNetworkResponse {
     ok: bool,
@@ -347,6 +364,8 @@ struct NetworkFailureResponse {
     at: Option<String>,
     code: &'static str,
     summary: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -379,6 +398,7 @@ pub(super) fn runtime_response(
                 at: Some(e6irc_proto::time::server_time(record.at)),
                 code: record.code(),
                 summary: record.summary(),
+                diagnostic: None,
             })
             .collect(),
         connected_at: timestamp(runtime.connected_at),
@@ -389,6 +409,7 @@ pub(super) fn runtime_response(
             at: None,
             code: error.code(),
             summary: error.summary(),
+            diagnostic: runtime.last_error_diagnostic.clone(),
         }),
         connect_latency_ms: runtime.connect_latency_ms,
         connection_attempts: runtime.connection_attempts,
@@ -695,6 +716,147 @@ pub(super) async fn preflight_network_core(
                 }),
             )
         })
+}
+
+/// Queue a standard NickServ REGISTER or VERIFY REGISTER command on one live,
+/// caller-owned IRC network. Replies remain ordinary upstream IRC lines and
+/// are visible in the same live/persisted transcript as every other command.
+pub(super) async fn network_account_command(
+    State(state): State<Arc<AppState>>,
+    Authenticated(account): Authenticated,
+    Path(name): Path<String>,
+    JsonBody(request): JsonBody<NetworkAccountCommand>,
+) -> Response {
+    let network = match crate::db::get_bnc_network(pool_of(&state), &account, &name).await {
+        Ok(Some(network)) => network,
+        Ok(None) => return problem(StatusCode::NOT_FOUND, "No such network", None),
+        Err(error) => {
+            eprintln!("http: network account registration lookup: {error}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            );
+        }
+    };
+    if network.kind != crate::config::NetworkKind::Irc {
+        return problem(
+            StatusCode::CONFLICT,
+            "IRC account registration unavailable",
+            Some("NickServ registration applies only to IRC networks"),
+        );
+    }
+    let Some(handle) = state
+        .bnc_registry
+        .as_ref()
+        .and_then(|registry| registry.get_owned(&account, &network.name))
+    else {
+        return problem(
+            StatusCode::CONFLICT,
+            "IRC network is not running",
+            Some(
+                "enable the network and wait for a connected state before sending NickServ commands",
+            ),
+        );
+    };
+    let runtime = handle.runtime_snapshot();
+    if runtime.lifecycle != crate::bouncer::NetworkLifecycle::Connected {
+        let detail = match (runtime.last_error, runtime.last_error_diagnostic.as_deref()) {
+            (Some(failure), Some(diagnostic)) => {
+                format!("{} Upstream: {diagnostic}", failure.summary())
+            }
+            (Some(failure), None) => failure.summary().to_string(),
+            (None, _) => "wait for the network to reach connected state and try again".to_string(),
+        };
+        return problem(
+            StatusCode::CONFLICT,
+            "IRC network is not connected",
+            Some(&detail),
+        );
+    }
+    let (command, kind) = match request {
+        NetworkAccountCommand::Register { email, password } => {
+            let email = match crate::identity::ContactEmail::parse(&email) {
+                Ok(email) => email,
+                Err(error) => {
+                    return problem(
+                        StatusCode::BAD_REQUEST,
+                        "Invalid email address",
+                        Some(&error.to_string()),
+                    );
+                }
+            };
+            if let Err(detail) = validate_single_service_token(&password, 200, "password") {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid NickServ password",
+                    Some(&detail),
+                );
+            }
+            (
+                format!("PRIVMSG NickServ :REGISTER {password} {}", email.as_str()),
+                "register",
+            )
+        }
+        NetworkAccountCommand::Verify { code } => {
+            if let Err(detail) = validate_single_service_token(&code, 200, "verification code") {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid verification code",
+                    Some(&detail),
+                );
+            }
+            (
+                format!("PRIVMSG NickServ :VERIFY REGISTER {} {code}", network.nick),
+                "verify",
+            )
+        }
+    };
+    match handle.send(&command) {
+        crate::bouncer::SendOutcome::Sent => {
+            audit_network_mutation(
+                &state,
+                &account,
+                "network_account_command",
+                &account,
+                &network.name,
+                kind,
+            )
+            .await;
+            (
+                StatusCode::ACCEPTED,
+                axum::Json(NetworkAccountCommandResponse {
+                    queued: true,
+                    command: kind,
+                    transcript: format!("/console/networks/{}", network.name),
+                }),
+            )
+                .into_response()
+        }
+        crate::bouncer::SendOutcome::Full => problem(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Upstream command queue is full",
+            Some("nothing was sent; wait for the upstream to recover and try again"),
+        ),
+        crate::bouncer::SendOutcome::Closed | crate::bouncer::SendOutcome::Unavailable => problem(
+            StatusCode::CONFLICT,
+            "IRC network is not connected",
+            Some("nothing was sent; repair or enable the network before registering an account"),
+        ),
+        crate::bouncer::SendOutcome::Rejected(error) => problem(
+            StatusCode::BAD_REQUEST,
+            "NickServ command rejected",
+            Some(error.message()),
+        ),
+    }
+}
+
+fn validate_single_service_token(value: &str, maximum: usize, field: &str) -> Result<(), String> {
+    crate::bouncer::validate_network_credential(value, maximum)?;
+    if value.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err(format!("{field} must be one token without whitespace"));
+    }
+    Ok(())
 }
 
 /// Whether `addr` has an IP-literal host that points at a target that is never a
@@ -1381,7 +1543,7 @@ pub(super) async fn network_buffer(
     }
     let limit = match bounded_query_limit(params.limit, 200, 1000, "buffer") {
         Ok(limit) => limit,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     if let Some(handle) = state
         .bnc_registry
@@ -1632,8 +1794,9 @@ pub(super) async fn delete_network(
 #[cfg(test)]
 mod tests {
     use super::{
-        BufferQuery, CreateNetwork, IRC_NETWORK_PRESETS, PreflightNetwork, network_name_ok,
-        runtime_response, upstream_addr_is_internal, validate_irc_upstream,
+        BufferQuery, CreateNetwork, IRC_NETWORK_PRESETS, NetworkAccountCommand, PreflightNetwork,
+        network_name_ok, runtime_response, upstream_addr_is_internal, validate_irc_upstream,
+        validate_single_service_token,
     };
 
     #[test]
@@ -1691,6 +1854,48 @@ mod tests {
             json.get("raw_error").is_none(),
             "raw provider errors must never enter the owner API: {json}"
         );
+        assert!(json["last_error"].get("diagnostic").is_none(), "{json}");
+
+        ends.emit(crate::bouncer::ConnectionEvent::RegistrationFailed(
+            e6irc_client::RegistrationRejection::without_diagnostic(
+                e6irc_client::RegistrationRefusal::NotRegistered,
+            ),
+        ));
+        let rejected = serde_json::to_value(runtime_response(&handle.runtime_snapshot()))
+            .expect("runtime response is serializable");
+        assert_eq!(
+            rejected["last_error"]["diagnostic"], "no detail from upstream",
+            "the IRC parser's bounded owner-safe detail remains actionable: {rejected}"
+        );
+    }
+
+    #[test]
+    fn account_registration_commands_are_closed_and_single_token() {
+        assert!(
+            serde_json::from_str::<NetworkAccountCommand>(
+                r#"{"action":"register","email":"alice@example.test","password":"secret"}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_str::<NetworkAccountCommand>(
+                r#"{"action":"verify","code":"mail-code"}"#
+            )
+            .is_ok()
+        );
+        for malformed in [
+            r#"{"action":"register","email":"alice@example.test"}"#,
+            r#"{"action":"verify","code":"mail-code","extra":true}"#,
+            r#"{"action":"raw","line":"OPER root secret"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<NetworkAccountCommand>(malformed).is_err(),
+                "accepted {malformed}"
+            );
+        }
+        assert!(validate_single_service_token("one-token", 32, "code").is_ok());
+        assert!(validate_single_service_token("two tokens", 32, "code").is_err());
+        assert!(validate_single_service_token("x\nPRIVMSG #other :injected", 64, "code").is_err());
     }
 
     #[test]

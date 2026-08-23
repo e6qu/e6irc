@@ -321,6 +321,7 @@ body {
 .ts { color: var(--muted); font: 0.72rem/1.5 var(--font-mono); font-variant-numeric: tabular-nums; }
 .from { max-width: 12rem; overflow: hidden; color: color-mix(in srgb, var(--fg) 88%, var(--accent)); font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .text { min-width: 0; white-space: pre-wrap; }
+.raw-wire { display: block; min-width: 0; color: #bfdbfe; font: 0.72rem/1.45 var(--font-mono); overflow-wrap: anywhere; white-space: pre-wrap; }
 .msg-link { color: var(--accent); text-decoration: underline; word-break: break-all; }
 #load-earlier {
   flex: 0 0 auto; margin: 0.35rem auto 0; padding: 0.2rem 0.9rem; font: inherit;
@@ -350,6 +351,14 @@ body {
 .line-event .from, .line-server .from { display: none; }
 .line-event .text, .line-server .text { grid-column: 2 / -1; }
 .line-server { color: var(--muted); }
+#command-guide { flex: 0 0 auto; padding: 0.25rem clamp(0.65rem, 2vw, 1rem); border-top: 1px solid var(--border); background: var(--panel-subtle); color: var(--muted); font-size: 0.78rem; }
+#command-guide summary { width: max-content; cursor: pointer; color: var(--accent); font-weight: 650; }
+#command-guide p { margin: 0.35rem 0 0.25rem; }
+#raw-output-panel { flex: 0 0 min(15rem, 32vh); min-height: 8rem; border-top: 2px solid var(--accent); background: #080d19; color: #bfdbfe; }
+.raw-output-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; padding: 0.4rem 0.75rem; border-bottom: 1px solid #1e293b; color: #94a3b8; font-size: 0.72rem; }
+.raw-output-head strong { color: #f8fafc; font: 700 0.76rem/1.4 var(--font-mono); letter-spacing: 0.04em; text-transform: uppercase; }
+#raw-output-lines { height: calc(100% - 2.3rem); margin: 0; padding: 0.4rem 0.75rem 0.6rem 2.7rem; overflow: auto; }
+#raw-output-lines li { padding: 0.08rem 0; color: #64748b; font: 0.7rem/1.45 var(--font-mono); }
 /* A message that mentions our nick: tinted with an accent rule down the side. */
 .line-mention {
   background: color-mix(in srgb, var(--accent) 14%, transparent);

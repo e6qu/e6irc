@@ -180,7 +180,7 @@ fn document() -> serde_json::Value {
                         "last_error": { "oneOf": [
                             { "type": "null" },
                             { "type": "object", "additionalProperties": false, "required": ["code", "summary"],
-                                "properties": { "code": { "type": "string" }, "summary": { "type": "string" } } }
+                                "properties": { "code": { "type": "string" }, "summary": { "type": "string" }, "diagnostic": { "type": "string", "maxLength": 160 } } }
                         ] },
                         "connect_latency_ms": { "type": ["integer", "null"], "minimum": 0 },
                         "connection_attempts": { "type": "integer", "minimum": 0 }, "errors": { "type": "integer", "minimum": 0 },
@@ -1415,6 +1415,50 @@ fn document() -> serde_json::Value {
                         },
                         "400": { "description": "invalid address, identity, or incomplete credentials" },
                         "502": { "description": "typed upstream DNS, transport, TLS, authentication, or registration failure" }
+                    }
+                }
+            },
+            "/api/v1/me/networks/{name}/account-registration": {
+                "post": {
+                    "summary": "Send one guided NickServ account-registration command",
+                    "description": "Queues the same standard IRC service messages available through `/msg NickServ`: REGISTER requests an email and VERIFY REGISTER submits its code. The upstream must already be connected. Replies are ordinary IRC lines in the network transcript. Sensitive command self-echoes are redacted before persistence.",
+                    "security": authenticated,
+                    "parameters": network_name_parameter,
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": { "oneOf": [
+                            { "type": "object", "additionalProperties": false,
+                                "required": ["action", "email", "password"],
+                                "properties": {
+                                    "action": { "const": "register" },
+                                    "email": { "type": "string", "format": "email", "maxLength": 254 },
+                                    "password": { "type": "string", "minLength": 1, "maxLength": 200, "writeOnly": true }
+                                } },
+                            { "type": "object", "additionalProperties": false,
+                                "required": ["action", "code"],
+                                "properties": {
+                                    "action": { "const": "verify" },
+                                    "code": { "type": "string", "minLength": 1, "maxLength": 200, "writeOnly": true }
+                                } }
+                        ] } } } },
+                    "responses": {
+                        "202": {
+                            "description": "command accepted by the connected network queue",
+                            "content": { "application/json": { "schema": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["queued", "command", "transcript"],
+                                "properties": {
+                                    "queued": { "const": true },
+                                    "command": { "type": "string", "enum": ["register", "verify"] },
+                                    "transcript": { "type": "string", "minLength": 1 }
+                                }
+                            } } }
+                        },
+                        "400": { "description": "invalid email, password, code, or command size" },
+                        "409": { "description": "not an IRC network or no connected driver" },
+                        "429": { "description": "bounded upstream command queue is full" },
+                        "404": { "description": "no owner-scoped network with this name" },
+                        "503": { "description": "database unavailable" }
                     }
                 }
             },

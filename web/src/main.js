@@ -72,6 +72,9 @@ const networkSelect = el("network-select");
 const sidebarToggle = el("sidebar-toggle");
 const sidebarEl = el("sidebar");
 const settingsEl = el("settings");
+const rawOutputBtn = el("raw-output-toggle");
+const rawOutputPanel = el("raw-output-panel");
+const rawOutputLines = el("raw-output-lines");
 const jumpLatestButton = el("jump-latest");
 const sendButton = composer.querySelector("button[type=submit]");
 const joinInput = el("join-input");
@@ -87,7 +90,9 @@ const MAX_LOADED_LINES = 1500;
 const MAX_BUFFERS = 200;
 const MAX_NICKS = 5000;
 const MAX_PENDING_SENDS = 64;
+const MAX_RAW_LINES = 1000;
 const SERVER = "*server*";
+const rawTape = [];
 
 // ---- client settings (persisted in localStorage) -----------------------
 const loadedSettings = loadSettings(() => window.localStorage);
@@ -517,6 +522,35 @@ function messageRow(line) {
   return row;
 }
 
+function rawOutputRow(wire) {
+  const row = document.createElement("li");
+  const code = document.createElement("code");
+  code.className = "raw-wire";
+  code.textContent = wire;
+  row.append(code);
+  return row;
+}
+
+function renderRawOutput() {
+  if (!rawOutputPanel || !rawOutputLines) return;
+  rawOutputPanel.hidden = !settings.rawOutput;
+  rawOutputLines.replaceChildren();
+  if (!settings.rawOutput) return;
+  for (const wire of rawTape) rawOutputLines.append(rawOutputRow(wire));
+  rawOutputLines.scrollTop = rawOutputLines.scrollHeight;
+}
+
+function recordRawOutput(wire) {
+  rawTape.push(wire);
+  if (rawTape.length > MAX_RAW_LINES) rawTape.shift();
+  if (!settings.rawOutput || !rawOutputLines) return;
+  rawOutputLines.append(rawOutputRow(wire));
+  while (rawOutputLines.children.length > MAX_RAW_LINES && rawOutputLines.firstChild) {
+    rawOutputLines.removeChild(rawOutputLines.firstChild);
+  }
+  rawOutputLines.scrollTop = rawOutputLines.scrollHeight;
+}
+
 function renderActive({ atLatest = true } = {}) {
   const b = buffers.get(active);
   routeNetworkEl.textContent = network || "No network";
@@ -738,7 +772,7 @@ function addLine(bufName, kind, bufKind, from, text, tags = null, wire = null) {
   }
 }
 
-const addServer = (text) => addLine(SERVER, "server", "server", null, text);
+const addServer = (text, wire = null) => addLine(SERVER, "server", "server", null, text, null, wire);
 const addEvent = (chan, text) => addLine(chan, "event", "channel", null, text);
 
 function addNick(chan, nick, render = true) {
@@ -861,14 +895,15 @@ function maybeNotify(b, line) {
 }
 
 function handleLine(raw) {
+  recordRawOutput(raw);
   const m = parseIrc(raw);
   switch (m.command) {
     case "001":
       if (m.params[0]) {
         myNick = m.params[0];
-        addServer(`connected as ${myNick}`);
+        addServer(`connected as ${myNick}`, raw);
       } else {
-        addServer(raw);
+        addServer(raw, raw);
       }
       break;
     case "PRIVMSG":
@@ -879,7 +914,7 @@ function handleLine(raw) {
         (candidate) => buffers.get(fold(candidate))?.kind === "channel",
       );
       if (!route) {
-        addServer(raw);
+        addServer(raw, raw);
         break;
       }
       const text = m.params[1] ?? "";
@@ -899,7 +934,7 @@ function handleLine(raw) {
     case "JOIN": {
       const channels = membershipTargets(m.params[0]);
       if (!channels.length) {
-        addServer(raw);
+        addServer(raw, raw);
         break;
       }
       for (const channel of channels) {
@@ -911,7 +946,7 @@ function handleLine(raw) {
           addNick(channel, m.nick);
           addEvent(channel, `${m.nick} joined`);
         } else {
-          addServer(raw);
+          addServer(raw, raw);
           break;
         }
       }
@@ -920,14 +955,14 @@ function handleLine(raw) {
     case "PART": {
       const channels = membershipTargets(m.params[0]);
       if (!channels.length || !m.nick) {
-        addServer(raw);
+        addServer(raw, raw);
         break;
       }
       const reason = m.params[1] ? ` (${m.params[1]})` : "";
       for (const channel of channels) {
         if (isMe(m.nick)) {
           closeBuffer(channel);
-          addServer(`You left ${channel}${reason}.`);
+          addServer(`You left ${channel}${reason}.`, raw);
         } else {
           removeNick(channel, m.nick);
           addEvent(channel, `${m.nick} left${reason}`);
@@ -938,7 +973,7 @@ function handleLine(raw) {
     case "KICK": {
       const pairs = kickPairs(m.params[0], m.params[1]);
       if (!pairs.length) {
-        addServer(raw);
+        addServer(raw, raw);
         break;
       }
       const reason = m.params[2] ? ` (${m.params[2]})` : "";
@@ -946,7 +981,7 @@ function handleLine(raw) {
       for (const [channel, target] of pairs) {
         if (isMe(target)) {
           closeBuffer(channel);
-          addServer(`You were kicked from ${channel}${by}${reason}.`);
+          addServer(`You were kicked from ${channel}${by}${reason}.`, raw);
         } else {
           removeNick(channel, target);
           addEvent(channel, `${target} was kicked${by}${reason}`);
@@ -958,7 +993,7 @@ function handleLine(raw) {
       if (m.nick) {
         const reason = m.params[0] ? ` (${m.params[0]})` : "";
         removeNickEverywhere(m.nick, `${stripSigil(m.nick)} quit${reason}`);
-      } else addServer(raw);
+      } else addServer(raw, raw);
       break;
     case "MODE": {
       // Channel MODE: track membership sigil changes for the member list.
@@ -978,7 +1013,7 @@ function handleLine(raw) {
           }
         }
       } else {
-        addServer(m.params.length ? m.params[m.params.length - 1] : raw);
+        addServer(m.params.length ? m.params[m.params.length - 1] : raw, raw);
       }
       break;
     }
@@ -986,25 +1021,25 @@ function handleLine(raw) {
       if (m.nick && m.params[0]) {
         renameNick(m.nick, m.params[0]);
         if (isMe(m.nick)) myNick = m.params[0];
-      } else addServer(raw);
+      } else addServer(raw, raw);
       break;
     case "TOPIC":
       if (m.params[0] && m.params[1] !== undefined) {
         setTopic(m.params[0], m.params[1]);
         addEvent(m.params[0], `${m.nick || "?"} set the topic`);
-      } else addServer(raw);
+      } else addServer(raw, raw);
       break;
     case "332": { // RPL_TOPIC: <me> <chan> :topic
       const reply = topicReply(m.params);
       if (reply) setTopic(reply.channel, reply.topic);
-      else addServer(raw);
+      else addServer(raw, raw);
       break;
     }
     case "353": {
       // RPL_NAMREPLY: <me> <sym> <chan> :n1 n2 ...
       const chan = m.params[2];
       if (!chan) {
-        addServer(raw);
+        addServer(raw, raw);
         break;
       }
       const buffer = ensureBuffer(chan, "channel");
@@ -1028,13 +1063,13 @@ function handleLine(raw) {
         buffer.membershipKnown = true;
         namesSnapshots.delete(buffer.key);
         if (buffer.key === active) renderNickList();
-      } else addServer(raw);
+      } else addServer(raw, raw);
       break;
     }
     default:
       // Numerics and everything else land in the server buffer. Show the human
       // part (the trailing) when there is one, else the whole line.
-      addServer(m.params.length ? m.params[m.params.length - 1] : raw);
+      addServer(m.params.length ? m.params[m.params.length - 1] : raw, raw);
   }
 }
 
@@ -1266,8 +1301,29 @@ messageInput.addEventListener("keydown", (e) => {
 
 composer.addEventListener("submit", (e) => {
   e.preventDefault();
-  const text = messageInput.value;
+  let text = messageInput.value;
   if (!text) return;
+  if (/^\/help\s*$/i.test(text)) {
+    addServer("Commands: /join #channel · /part [#channel] · /query nick [message] · /msg nick text · /notice nick text · /nick name · /topic [text] · /me action · /raw COMMAND. Other slash commands pass through as IRC commands.");
+    setActive(SERVER);
+    messageInput.value = "";
+    return;
+  }
+  const query = text.match(/^\/query(?:\s+(\S+))?(?:\s+([\s\S]+))?$/i);
+  if (query) {
+    const [, nick, message] = query;
+    if (!nick) {
+      addServer("/query requires a nickname; nothing was sent.");
+      setActive(SERVER);
+      return;
+    }
+    setActive(ensureBuffer(nick, "dm").display);
+    if (!message) {
+      messageInput.value = "";
+      return;
+    }
+    text = message;
+  }
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     addServer("Not connected — your message was not sent.");
     return;
@@ -1523,6 +1579,11 @@ function updateSettingsUI() {
       : "Desktop notifications: off";
     notifyBtn.setAttribute("aria-pressed", String(settings.notifications));
   }
+  if (rawOutputBtn) {
+    rawOutputBtn.textContent = settings.rawOutput ? "Raw IRC output: on" : "Raw IRC output: off";
+    rawOutputBtn.setAttribute("aria-pressed", String(settings.rawOutput));
+  }
+  renderRawOutput();
 }
 if (themeSelect) {
   themeSelect.addEventListener("change", () => {
@@ -1557,6 +1618,14 @@ if (notifyBtn) {
     }
     persistSettings();
     updateSettingsUI();
+  });
+}
+if (rawOutputBtn) {
+  rawOutputBtn.addEventListener("click", () => {
+    settings.rawOutput = !settings.rawOutput;
+    persistSettings();
+    updateSettingsUI();
+    renderActive();
   });
 }
 updateSettingsUI();
