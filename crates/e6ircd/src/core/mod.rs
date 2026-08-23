@@ -160,7 +160,7 @@ impl CoreIngress {
         }
     }
 
-    pub async fn push(&self, input: Input) -> Result<u64, Input> {
+    pub async fn push(&self, input: Input) -> Result<u64, Box<Input>> {
         let shard = match &input {
             Input::Open { conn, .. }
             | Input::Line { conn, .. }
@@ -222,7 +222,7 @@ impl CoreIngress {
             Input::ChannelControlResult { owner, .. }
             | Input::OwnedChannelRegistrationResult { owner, .. } => owner.shard(),
         };
-        self.shards[shard.0].push(input).await
+        self.shards[shard.0].push(input).await.map_err(Box::new)
     }
 
     pub fn monitor(&self) -> QueueMonitor {
@@ -3020,6 +3020,31 @@ mod ingress_tests {
                 .expect("wire output")
                 .contains("temporarily unavailable")
         );
+    }
+
+    #[tokio::test]
+    async fn ingress_returns_the_rejected_event_when_its_owner_queue_is_closed() {
+        let config = Config {
+            name: "closed-ingress",
+            capacity: 1,
+            policy: Policy::Fifo,
+        };
+        let (sender, receiver) = queue(config);
+        drop(receiver);
+        let ingress = CoreIngress::single(sender);
+
+        let rejected = ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"PING :preserved".to_vec(),
+            })
+            .await
+            .expect_err("closed ingress must return the event");
+
+        assert!(matches!(
+            *rejected,
+            Input::Line { conn: ConnId(1), line } if line == b"PING :preserved"
+        ));
     }
 
     #[tokio::test]

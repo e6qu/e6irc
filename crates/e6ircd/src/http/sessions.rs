@@ -203,11 +203,10 @@ impl ValidatedLiveConnectionQuery {
     }
 }
 
-#[allow(clippy::result_large_err)] // Err is the standard full problem Response
 pub(super) fn validate_live_connection_query(
     params: LiveConnectionQueryParams,
     default_limit: usize,
-) -> Result<ValidatedLiveConnectionQuery, Response> {
+) -> ResponseResult<ValidatedLiveConnectionQuery> {
     let page_size = super::device::bounded_admin_page_size(
         params.limit,
         default_limit,
@@ -244,7 +243,8 @@ pub(super) fn validate_live_connection_query(
                 StatusCode::BAD_REQUEST,
                 "Invalid live-connection filter",
                 Some("The transport filter must be tcp, tls, websocket, or local."),
-            ));
+            )
+            .into());
         }
     };
     let oper = match params.oper.as_deref().map(str::trim) {
@@ -256,7 +256,8 @@ pub(super) fn validate_live_connection_query(
                 StatusCode::BAD_REQUEST,
                 "Invalid live-connection filter",
                 Some("The oper filter must be true or false."),
-            ));
+            )
+            .into());
         }
     };
     Ok(ValidatedLiveConnectionQuery {
@@ -307,7 +308,7 @@ fn live_connection_response(entry: crate::core::LiveConnectionInfo) -> LiveConne
 async fn connection_page(
     state: &AppState,
     query: crate::core::LiveConnectionQuery,
-) -> Result<crate::core::LiveConnectionPage, Response> {
+) -> ResponseResult<crate::core::LiveConnectionPage> {
     match core_reply(state, crate::core::AdminRequest::ListConnections { query }).await {
         Ok(crate::core::AdminReply::Connections(page)) => Ok(page),
         Ok(_) => {
@@ -316,7 +317,8 @@ async fn connection_page(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Live connection directory unavailable",
                 None,
-            ))
+            )
+            .into())
         }
         Err(error) => {
             eprintln!("http: live-connection query failed: {error}");
@@ -324,7 +326,8 @@ async fn connection_page(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Live connection directory unavailable",
                 None,
-            ))
+            )
+            .into())
         }
     }
 }
@@ -347,11 +350,11 @@ pub(super) async fn admin_connections(
 ) -> Response {
     let query = match validate_live_connection_query(params, 100) {
         Ok(query) => query,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     match connection_page(&state, query.core_query(None)).await {
         Ok(page) => live_connection_page_response(page),
-        Err(response) => response,
+        Err(response) => response.into(),
     }
 }
 
@@ -362,11 +365,11 @@ pub(super) async fn me_connections(
 ) -> Response {
     let query = match validate_live_connection_query(params.into(), 100) {
         Ok(query) => query,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     match connection_page(&state, query.core_query(Some(&account))).await {
         Ok(page) => live_connection_page_response(page),
-        Err(response) => response,
+        Err(response) => response.into(),
     }
 }
 
@@ -376,15 +379,15 @@ pub(super) struct DisconnectConnectionQuery {
     reason: Option<String>,
 }
 
-#[allow(clippy::result_large_err)] // Err is the standard full problem Response
-pub(super) fn validate_disconnect_reason(reason: String) -> Result<String, Response> {
+pub(super) fn validate_disconnect_reason(reason: String) -> ResponseResult<String> {
     let reason = reason.trim();
     if reason.len() > 300 || reason.chars().any(char::is_control) {
         return Err(problem(
             StatusCode::BAD_REQUEST,
             "Invalid disconnect reason",
             Some("The disconnect reason must contain at most 300 printable bytes."),
-        ));
+        )
+        .into());
     }
     Ok(reason.to_owned())
 }
@@ -438,7 +441,7 @@ async fn validated_disconnect(
     }
     let reason = match validate_disconnect_reason(params.reason.unwrap_or_default()) {
         Ok(reason) => reason,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     disconnect_response(state, make_request(connection_id, reason)).await
 }

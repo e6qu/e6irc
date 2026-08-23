@@ -1543,7 +1543,7 @@ pub(super) async fn network_buffer(
     }
     let limit = match bounded_query_limit(params.limit, 200, 1000, "buffer") {
         Ok(limit) => limit,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     if let Some(handle) = state
         .bnc_registry

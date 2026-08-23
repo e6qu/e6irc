@@ -336,7 +336,7 @@ pub(super) async fn create_app_password(
     };
     let req = match super::parse_json(body) {
         Ok(b) => b,
-        Err(r) => return r,
+        Err(r) => return r.into(),
     };
     if let Some(detail) = credential_input_error(&req.account, &req.password) {
         return problem(
@@ -424,7 +424,7 @@ pub(super) async fn change_password(
 ) -> Response {
     let req = match super::parse_json(body) {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return response.into(),
     };
     if let Some(detail) = req
         .current_password
