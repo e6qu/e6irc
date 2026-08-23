@@ -320,6 +320,13 @@
         padding: 0.7rem 0.85rem; background: var(--panel); }
       .network-summary span { color: var(--muted); font-size: 0.72rem; }
       .network-summary code, .network-summary strong { overflow-wrap: anywhere; }
+      .account-setup { border-top: 3px solid var(--accent); }
+      .account-setup-steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); }
+      .account-setup-steps form { position: relative; display: flex; flex-direction: column; gap: 0.75rem; min-width: 0; padding: 1rem; background: var(--panel); }
+      .account-setup-steps h3, .account-setup-steps p { margin: 0; }
+      .account-setup-steps p { min-height: 3.1rem; color: var(--muted); font-size: 0.82rem; }
+      .account-setup-steps button { margin-top: auto; align-self: flex-start; }
+      .step-mark { display: grid; place-items: center; width: 1.7rem; height: 1.7rem; border: 1px solid var(--accent); border-radius: 50%; color: var(--accent); font: 700 0.78rem/1 var(--font-mono); }
       .backlog { max-height: 28rem; overflow: auto; margin-top: 1rem; border: 1px solid var(--border);
         border-radius: 0.55rem; background: #0b1020; color: #dbeafe; }
       .backlog code { display: block; padding: 0.35rem 0.6rem; border-bottom: 1px solid #1e293b;
@@ -371,6 +378,7 @@
         .error-grid { grid-template-columns: 1fr; }
         .inline-create, .marker-grid { grid-template-columns: minmax(0, 1fr); }
         .network-summary { grid-template-columns: 1fr; }
+        .account-setup-steps { grid-template-columns: 1fr; }
         .identity-list article, .secret-value { align-items: stretch; flex-direction: column; }
         .danger-actions, .danger-actions form { align-items: stretch; flex-direction: column; }
         .field-wide { grid-column: auto; }

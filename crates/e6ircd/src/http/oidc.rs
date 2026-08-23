@@ -54,6 +54,17 @@ pub(super) fn oidc_http_client() -> openidconnect::reqwest::Client {
         .expect("reqwest client")
 }
 
+fn discovery_error(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
+}
+
 pub(super) async fn discover_client(
     state: &AppState,
     provider: &OidcProviderConfig,
@@ -144,7 +155,7 @@ pub(super) async fn discover_metadata(
     let meta =
         openidconnect::core::CoreProviderMetadata::discover_async(issuer, &oidc_http_client())
             .await
-            .map_err(|e| format!("discovery failed: {e}"))?;
+            .map_err(|error| format!("discovery failed: {}", discovery_error(&error)))?;
     discovery_cache()
         .lock()
         .expect("poisoned")

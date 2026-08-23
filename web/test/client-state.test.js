@@ -37,8 +37,8 @@ test("settings use typed defaults and preserve valid preferences", () => {
     settings: DEFAULT_SETTINGS,
     warning: null,
   });
-  assert.deepEqual(loadSettings(storage('{"theme":"dark","notifications":true}')), {
-    settings: { theme: "dark", notifications: true },
+  assert.deepEqual(loadSettings(storage('{"theme":"dark","notifications":true,"rawOutput":true}')), {
+    settings: { theme: "dark", notifications: true, rawOutput: true },
     warning: null,
   });
 });
@@ -53,7 +53,7 @@ test("settings corruption and unsupported values are surfaced and repaired", () 
   assert.match(unsupported.warning, /unsupported/);
 
   const unknown = loadSettings(storage('{"theme":"light","surprise":true}'));
-  assert.deepEqual(unknown.settings, { theme: "light", notifications: false });
+  assert.deepEqual(unknown.settings, { theme: "light", notifications: false, rawOutput: false });
   assert.match(unknown.warning, /unsupported/);
 });
 
@@ -66,9 +66,9 @@ test("console and chat share the same preference boundary", () => {
     getItem() { return stored; },
     setItem(_key, value) { stored = value; },
   };
-  assert.equal(saveSharedSettings(sharedStorage, { theme: "dark", notifications: true }), null);
+  assert.equal(saveSharedSettings(sharedStorage, { theme: "dark", notifications: true, rawOutput: true }), null);
   assert.deepEqual(loadSettings(sharedStorage), {
-    settings: { theme: "dark", notifications: true },
+    settings: { theme: "dark", notifications: true, rawOutput: true },
     warning: null,
   });
 });

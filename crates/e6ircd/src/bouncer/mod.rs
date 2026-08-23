@@ -1678,6 +1678,9 @@ pub struct NetworkRuntimeSnapshot {
     pub last_output_at: Option<e6irc_proto::time::Millis>,
     pub last_error_at: Option<e6irc_proto::time::Millis>,
     pub last_error: Option<NetworkFailure>,
+    /// Bounded, control-safe text supplied by an IRC server for the latest
+    /// registration refusal. Arbitrary bridge/provider errors never enter it.
+    pub last_error_diagnostic: Option<String>,
     pub connect_latency_ms: Option<u64>,
     pub connection_attempts: u64,
     pub errors: u64,
@@ -1703,6 +1706,7 @@ struct NetworkRuntimeState {
     connection_attempts: u64,
     errors: u64,
     last_error: Option<FailureRecord>,
+    last_error_diagnostic: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1801,6 +1805,7 @@ impl NetworkRuntime {
                 connection_attempts: 0,
                 errors: 0,
                 last_error: None,
+                last_error_diagnostic: None,
             }),
             label: std::sync::Mutex::new(None),
             attached_clients: std::sync::atomic::AtomicU64::new(0),
@@ -1861,7 +1866,12 @@ impl NetworkRuntime {
         state.status_revision
     }
 
-    fn failed(&self, disposition: FailureDisposition, failure: NetworkFailure) -> u64 {
+    fn failed(
+        &self,
+        disposition: FailureDisposition,
+        failure: NetworkFailure,
+        diagnostic: Option<&str>,
+    ) -> u64 {
         let now = epoch_millis();
         let mut state = self.state.lock().expect("network runtime poisoned");
         state.phase = match disposition {
@@ -1871,7 +1881,7 @@ impl NetworkRuntime {
             FailureDisposition::Terminal(lifecycle) => NetworkRuntimePhase::Terminal(lifecycle),
         };
         state.state_changed_at = now;
-        Self::set_error(&mut state, now, failure);
+        Self::set_error(&mut state, now, failure, diagnostic);
         state.status_revision = state
             .status_revision
             .checked_add(1)
@@ -1882,17 +1892,19 @@ impl NetworkRuntime {
     fn operational_error(&self, failure: NetworkFailure) {
         let now = epoch_millis();
         let mut state = self.state.lock().expect("network runtime poisoned");
-        Self::set_error(&mut state, now, failure);
+        Self::set_error(&mut state, now, failure, None);
     }
 
     fn set_error(
         state: &mut NetworkRuntimeState,
         now: e6irc_proto::time::Millis,
         failure: NetworkFailure,
+        diagnostic: Option<&str>,
     ) {
         state.errors = state.errors.saturating_add(1);
         let record = FailureRecord { at: now, failure };
         state.last_error = Some(record);
+        state.last_error_diagnostic = diagnostic.map(str::to_string);
         state.recent_failures.push_back(record);
         while state.recent_failures.len() > NETWORK_FAILURE_HISTORY_LIMIT {
             state.recent_failures.pop_front();
@@ -2108,6 +2120,9 @@ pub enum SendOutcome {
     Full,
     /// The driver is gone; the caller should detach.
     Closed,
+    /// Registration or authentication is terminally parked. No driver loop
+    /// can drain a queued line until the network is reconfigured.
+    Unavailable,
     /// The input was not a valid, bounded IRC client line and was not queued.
     Rejected(ClientLineError),
 }
@@ -2137,6 +2152,12 @@ impl NetworkHandle {
     pub fn send_from(&self, origin: u64, line: &str) -> SendOutcome {
         if let Err(error) = parse_client_line(line) {
             return SendOutcome::Rejected(error);
+        }
+        if matches!(
+            self.runtime_snapshot().lifecycle,
+            NetworkLifecycle::AuthenticationFailed | NetworkLifecycle::RegistrationFailed
+        ) {
+            return SendOutcome::Unavailable;
         }
         match self.commands.try_send(ClientCommand {
             origin,
@@ -2270,6 +2291,7 @@ impl NetworkHandle {
             last_output_at: atomic_millis(&self.runtime.last_output_at),
             last_error_at: state.last_error.map(|record| record.at),
             last_error: state.last_error.map(|record| record.failure),
+            last_error_diagnostic: state.last_error_diagnostic.clone(),
             connect_latency_ms: state.connect_latency_ms,
             connection_attempts: state.connection_attempts,
             errors: state.errors,
@@ -2310,6 +2332,7 @@ impl NetworkHandle {
             connection_attempts: state.connection_attempts,
             errors: state.errors,
             last_error: state.last_error,
+            last_error_diagnostic: state.last_error_diagnostic.clone(),
         }
     }
 
@@ -2624,7 +2647,7 @@ impl DriverEnds {
                         unreachable!("connected handled before failure transition")
                     }
                 };
-                let revision = self.runtime.failed(disposition, failure);
+                let revision = self.runtime.failed(disposition, failure, diagnostic);
                 if let Some(telemetry) = self
                     .telemetry
                     .lock()
@@ -3072,6 +3095,14 @@ where
                                             SendOutcome::Closed => {
                                                 return Ok(()); // driver gone
                                             }
+                                            SendOutcome::Unavailable => {
+                                                write
+                                                    .write_all(
+                                                        b":*bnc* NOTICE * :upstream registration is parked; reconfigure the network before sending\r\n",
+                                                    )
+                                                    .await?;
+                                                write.flush().await?;
+                                            }
                                             SendOutcome::Rejected(error) => {
                                                 // The attach path validates before handling
                                                 // local commands. Keep the shared queue
@@ -3492,6 +3523,10 @@ mod tests {
         let rejected = handle.runtime_snapshot();
         assert_eq!(rejected.lifecycle, NetworkLifecycle::RegistrationFailed);
         assert_eq!(rejected.last_error, Some(NetworkFailure::InvalidNickname));
+        assert_eq!(
+            rejected.last_error_diagnostic.as_deref(),
+            Some("no detail from upstream")
+        );
         assert_eq!(failed.errors, 2);
         assert_eq!(rejected.buffer_lines, 5);
         assert_eq!(
@@ -3504,6 +3539,18 @@ mod tests {
                 ":*bnc* NOTICE * :component registration_failed: The upstream rejected the configured nickname. (invalid_nickname); upstream: no detail from upstream".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn terminally_parked_driver_cannot_accept_an_undeliverable_command() {
+        let (handle, mut ends) = NetworkHandle::channels(8);
+        ends.emit(ConnectionEvent::AuthenticationFailed);
+        assert_eq!(
+            handle.send("PRIVMSG #room :this cannot drain"),
+            SendOutcome::Unavailable
+        );
+        assert!(ends.commands.try_recv().is_err());
+        assert_eq!(handle.runtime_snapshot().lines_out, 0);
     }
 
     #[test]

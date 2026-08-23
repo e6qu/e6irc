@@ -1088,6 +1088,7 @@ documented_routes! {
         delete: delete_network,
     },
     "/api/v1/me/networks/{name}/operations" => { get: pages::owner_network_operations },
+    "/api/v1/me/networks/{name}/account-registration" => { post: network_account_command },
     "/api/v1/me/networks/{name}/buffer" => { get: network_buffer },
     "/api/v1/history" => { get: history },
     "/api/v1/admin/accounts" => { get: admin_accounts, post: admin_create_account },

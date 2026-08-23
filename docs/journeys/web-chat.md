@@ -141,22 +141,30 @@ current network and conversation selection.
 1. The interactive composer sends the closed `{id, target, message}` shape.
    Internal commands use the same shape without `id`; `/raw ` deliberately
    requests one complete IRC line instead.
-2. The server validates the whole derived line, admits it to the selected
+2. `/help` shows the supported ordinary IRC grammar. `/query` opens a direct
+   conversation, `/msg` and `/notice` address explicit targets, and `/quote`
+   is the conventional alias for `/raw`; none requires a configuration-only
+   action.
+3. The server validates the whole derived line, admits it to the selected
    driver's bounded queue, and returns a correlated `sent` or `send-error`
-   event. Missing `/raw`, `/me`, `/join`, `/nick`, or `/msg` operands and text
-   entered without a channel/direct-message target are explicit rejections.
-3. Only `sent` creates local echo and sent-history. A rejection keeps the text
+   event. Missing `/raw`, `/quote`, `/me`, `/join`, `/nick`, `/msg`, `/notice`,
+   or `/query` operands and text entered without a channel/direct-message target
+   are explicit rejections.
+4. Only `sent` creates local echo and sent-history. A rejection keeps the text
    available for retry, so displayed success means server-side queue
    admission—not merely a browser socket write.
-4. JOIN/NAMES/NICK/PART/KICK/QUIT events maintain member state and buffer
+5. JOIN/NAMES/NICK/PART/KICK/QUIT events maintain member state and buffer
    labels, including comma-separated membership targets and multi-target KICK.
-5. Direct messages create query buffers. Closing a query removes only the
+6. Direct messages create query buffers. Closing a query removes only the
    local view; leaving a channel sends PART and waits for the resulting state.
    STATUSMSG targets such as `@#ops` and `+#ops` route to `#ops`; persisted
    history uses this same routing policy, including the server-notice rule.
-6. Inactive conversations retain both unread traffic and unread direct-mention
+7. Inactive conversations retain both unread traffic and unread direct-mention
    counts, so attention-worthy traffic is distinguishable before switching.
-7. Errors from the driver or IRC server appear in the relevant status path.
+8. Errors from the driver or IRC server appear in the relevant status path.
+   Enabling **Raw IRC output** opens a bounded receiver tape containing every
+   exact safe inbound wire line, so state changes, numerics, service replies,
+   and parser presentation can be compared without leaving the browser.
 
 **Visible failures and recovery.** A disconnected composer cannot display a
 false successful send. CR/LF/NUL input, an over-limit complete line, more than
@@ -198,16 +206,18 @@ chat.
 2. Reloading the application restores the selected theme. System mode follows
    the browser/operating-system color preference rather than freezing the
    color observed when it was selected.
-3. Desktop notifications are off by default. Enabling them is an explicit
+3. Raw IRC output is off by default. Enabling it exposes the wire form already
+   present in the bounded transcript and persists that typed preference.
+4. Desktop notifications are off by default. Enabling them is an explicit
    action that requests browser permission at that moment, never on page load.
-4. With permission granted and notifications enabled, a hidden tab asks the
+5. With permission granted and notifications enabled, a hidden tab asks the
    browser to present a notification for a direct message or a message that
    mentions the current nickname. Ordinary channel traffic and messages
    received while the page is visible remain in the application only.
-5. The notification identifies the sender/conversation and contains the
+6. The notification identifies the sender/conversation and contains the
    bounded message preview. Its stable conversation tag lets the browser
    coalesce repeated updates according to platform policy.
-6. Turning notifications off takes effect immediately and persists across
+7. Turning notifications off takes effect immediately and persists across
    reloads without revoking the browser-wide permission.
 
 **Visible failures and recovery.** An unsupported Notifications API, denied

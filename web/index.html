@@ -38,6 +38,7 @@
               </select>
             </label>
             <button id="notify-toggle" type="button">Desktop notifications: off</button>
+            <button id="raw-output-toggle" type="button">Raw IRC output: off</button>
             <span id="storage-state" class="settings-note" hidden></span>
           </div>
         </details>
@@ -74,11 +75,22 @@
           <button id="load-earlier" type="button" hidden>Load earlier messages</button>
           <ol id="messages" tabindex="0" aria-live="polite" aria-relevant="additions text" aria-label="Messages"></ol>
           <button id="jump-latest" type="button" hidden>Jump to latest messages</button>
+          <section id="raw-output-panel" aria-labelledby="raw-output-title" hidden>
+            <div class="raw-output-head">
+              <strong id="raw-output-title">Raw IRC receiver tape</strong>
+              <span>Exact inbound wire lines, newest at the bottom</span>
+            </div>
+            <ol id="raw-output-lines" tabindex="0" aria-label="Raw IRC output"></ol>
+          </section>
+          <details id="command-guide">
+            <summary>IRC commands</summary>
+            <p><code>/join #channel</code> · <code>/part</code> · <code>/query nick</code> · <code>/msg nick text</code> · <code>/notice nick text</code> · <code>/nick name</code> · <code>/topic text</code> · <code>/me action</code> · <code>/raw COMMAND</code>. Other slash commands are sent as IRC commands; use <code>/help</code> to show this guide in the server buffer.</p>
+          </details>
           <form id="composer" autocomplete="off">
             <input
               type="text"
               id="message"
-              placeholder="message… (/join #chan, /msg nick text, /raw LINE)"
+              placeholder="message… (/help for IRC commands)"
               aria-label="Message"
               maxlength="4606"
               autocomplete="off"

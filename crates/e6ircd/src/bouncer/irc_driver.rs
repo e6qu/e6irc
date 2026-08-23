@@ -651,7 +651,12 @@ pub(super) fn self_echo(line: &str, nick: &str, ident: &str, host: &str) -> Opti
                 return None;
             }
             let head = format!("{prefix} {command} {target} :");
-            format!("{head}{}", crate::core::fit_trailing(&head, text))
+            let visible = if sensitive_nickserv_command(target, text) {
+                "[sensitive NickServ command redacted]"
+            } else {
+                text
+            };
+            format!("{head}{}", crate::core::fit_trailing(&head, visible))
         }
         "TAGMSG" => {
             let [target] = parsed.params.as_slice() else {
@@ -677,6 +682,39 @@ pub(super) fn self_echo(line: &str, nick: &str, ident: &str, host: &str) -> Opti
     };
     let echo = format!("@{all_tags} {body}");
     e6irc_proto::message::server_frame_fits(echo.as_bytes()).then_some(echo)
+}
+
+/// NickServ commands that can carry passwords, email addresses, recovery
+/// tokens, or verification codes. A downstream client still sends the exact
+/// command upstream, but the synthesized echo and persistent backlog must not
+/// retain it. The whole argument string is redacted because service dialects
+/// disagree about which position is secret.
+fn sensitive_nickserv_command(target: &str, text: &str) -> bool {
+    let service = target.split_once('@').map_or(target, |(name, _)| name);
+    if !service.eq_ignore_ascii_case("NickServ") && !service.eq_ignore_ascii_case("NS") {
+        return false;
+    }
+    let mut words = text.split_whitespace();
+    let command = words.next().unwrap_or_default();
+    if matches_ignore_ascii_case(
+        command,
+        &[
+            "REGISTER", "IDENTIFY", "GHOST", "RECOVER", "REGAIN", "RELEASE", "SENDPASS", "VERIFY",
+            "CONFIRM", "DROP", "GROUP",
+        ],
+    ) {
+        return true;
+    }
+    command.eq_ignore_ascii_case("SET")
+        && words.next().is_some_and(|setting| {
+            matches_ignore_ascii_case(setting, &["PASSWORD", "EMAIL", "PUBKEY"])
+        })
+}
+
+fn matches_ignore_ascii_case(candidate: &str, expected: &[&str]) -> bool {
+    expected
+        .iter()
+        .any(|value| candidate.eq_ignore_ascii_case(value))
 }
 
 /// Idle gap before the driver sends a keepalive PING (and again before it
@@ -926,6 +964,39 @@ mod tests {
             "the multi-byte boundary is not split: {echo}"
         );
         e6irc_proto::message::Message::parse(&echo).expect("echo remains valid IRC");
+    }
+
+    #[test]
+    fn self_echo_never_retains_nickserv_credentials_or_verification_tokens() {
+        for line in [
+            "PRIVMSG NickServ :REGISTER correct-horse alice@example.test",
+            "PRIVMSG nickserv@services.example :IDENTIFY alice correct-horse",
+            "NOTICE NS :VERIFY REGISTER alice mail-token",
+            "PRIVMSG NickServ :SET PASSWORD replacement-secret",
+        ] {
+            let echo = self_echo(line, "alice", "alice", "irc.example")
+                .expect("service message still has a visible redacted echo");
+            assert!(
+                echo.contains("[sensitive NickServ command redacted]"),
+                "{echo}"
+            );
+            for secret in [
+                "correct-horse",
+                "alice@example.test",
+                "mail-token",
+                "replacement-secret",
+            ] {
+                assert!(!echo.contains(secret), "{echo}");
+            }
+        }
+        let help = self_echo(
+            "PRIVMSG NickServ :HELP REGISTER",
+            "alice",
+            "alice",
+            "irc.example",
+        )
+        .expect("non-sensitive help is echoed");
+        assert!(help.ends_with("PRIVMSG NickServ :HELP REGISTER"), "{help}");
     }
 
     #[test]
