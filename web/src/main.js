@@ -17,6 +17,8 @@ import {
   errorMessage,
   identityFrom,
   loadSettings,
+  networkStateHelp,
+  networkStateIsFailure,
   networkStateLabel,
   networksFrom,
   saveSettings,
@@ -1490,6 +1492,22 @@ function renderNetworkList(networks, failure = null) {
     state.className = "network-state";
     state.textContent = networkStateLabel(item);
     open.append(label, state);
+
+    // A parked driver says why and what repairs it, rather than sitting on two
+    // words. Both failures it can park on are fixed in this network's settings,
+    // which is the control immediately beside this text.
+    const help = networkStateHelp(item);
+    if (networkStateIsFailure(item)) {
+      row.classList.add("is-failed");
+      state.classList.add("network-state-failed");
+    }
+    if (help) {
+      open.title = help;
+      const note = document.createElement("span");
+      note.className = "network-help";
+      note.textContent = help;
+      open.append(note);
+    }
 
     const cog = document.createElement("button");
     cog.type = "button";

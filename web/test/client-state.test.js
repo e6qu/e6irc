@@ -11,6 +11,8 @@ import {
   errorMessage,
   identityFrom,
   loadSettings,
+  networkStateHelp,
+  networkStateIsFailure,
   networksFrom,
   networkStateLabel,
   saveSettings,
@@ -146,4 +148,31 @@ test("API error messages distinguish expired sessions", () => {
     errorMessage("load your networks", new Error("offline")),
     "Could not load your networks. offline.",
   );
+});
+
+// A parked driver stops re-dialling on purpose, so whatever the sidebar says is
+// what the person sees indefinitely. "authentication rejected" names the event
+// and not the repair, and both parked states are repaired in the same place.
+test("rejected credentials explain the repair, not just the event", () => {
+  const help = networkStateHelp({ state: "authentication_rejected" });
+  assert.match(help, /NickServ account or password/);
+  assert.match(help, /settings/);
+  assert.equal(networkStateIsFailure({ state: "authentication_rejected" }), true);
+});
+
+test("a refused registration is a distinct parked state with its own repair", () => {
+  const help = networkStateHelp({ state: "registration_rejected" });
+  assert.match(help, /nickname/);
+  assert.equal(networkStateIsFailure({ state: "registration_rejected" }), true);
+});
+
+test("states that are merely progress carry no advice and are not failures", () => {
+  for (const state of ["connecting", "registering", null, undefined]) {
+    assert.equal(networkStateHelp({ state }), null, `${state} should not advise`);
+    assert.equal(networkStateIsFailure({ state }), false, `${state} is not a failure`);
+  }
+});
+
+test("a disabled network says so rather than reporting a driver state", () => {
+  assert.equal(networkStateHelp({ enabled: false, state: "authentication_rejected" }), "This network is turned off.");
 });
