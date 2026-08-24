@@ -54,6 +54,18 @@ const apiGet = async (url) => getOperationJson(
   { cache: "no-store", credentials: "same-origin" },
 );
 
+// Mutations take the same contract path as reads: the body is validated against
+// the OpenAPI request schema before it leaves the browser, so a field this
+// client renames or forgets fails here, with a message naming the field, rather
+// than as a 400 the person filling in the form has to interpret.
+const apiSend = async (method, url, json) => getOperationJson(
+  window.fetch.bind(window),
+  await currentApiContract(),
+  method,
+  url,
+  { cache: "no-store", credentials: "same-origin", json },
+);
+
 const el = (id) => document.getElementById(id);
 const statusEl = el("status");
 const buffersEl = el("buffers");
@@ -1123,6 +1135,7 @@ async function reconcileUnavailableNetwork() {
       await apiGet("/api/v1/me/networks"),
     );
     populateNetworkSelector(networks);
+    renderNetworkList(networks);
     const replacement = networks.find((item) => fold(item.name) === fold(network));
     if (replacement && replacement.enabled !== false && replacement.runtime != null) {
       terminalSocket = false;
@@ -1427,6 +1440,268 @@ networkSelect.addEventListener("change", () => {
   }
 });
 
+// ---- Networks in the sidebar -------------------------------------------
+//
+// Every network carries its own settings control, the way a hosted IRC client
+// does. Connecting an account already registered with NickServ is a property
+// of one network, so it is reachable from that network rather than from a
+// link named "Manage" that leaves the application entirely -- which is why
+// nobody found it.
+
+const networksEl = el("networks");
+const networkDialog = el("network-dialog");
+const networkForm = el("network-form");
+const helpDialog = el("help-dialog");
+
+function renderNetworkList(networks, failure = null) {
+  if (!networksEl) return;
+  networksEl.replaceChildren();
+  if (failure) {
+    const row = document.createElement("li");
+    row.className = "network-row network-row-empty";
+    row.textContent = "Networks unavailable.";
+    networksEl.append(row);
+    return;
+  }
+  if (!networks.length) {
+    const row = document.createElement("li");
+    row.className = "network-row network-row-empty";
+    row.textContent = "No networks yet — add one with +.";
+    networksEl.append(row);
+    return;
+  }
+  for (const item of networks) {
+    const row = document.createElement("li");
+    row.className = "network-row";
+    if (network !== null && fold(item.name) === fold(network)) row.classList.add("is-active");
+
+    const open = document.createElement("a");
+    open.className = "network-open";
+    open.href = `/?network=${encodeURIComponent(item.name)}`;
+    const label = document.createElement("span");
+    label.className = "network-name";
+    label.textContent = item.name;
+    const state = document.createElement("span");
+    state.className = "network-state";
+    state.textContent = networkStateLabel(item);
+    open.append(label, state);
+
+    const cog = document.createElement("button");
+    cog.type = "button";
+    cog.className = "network-cog";
+    cog.title = `Settings for ${item.name}`;
+    cog.setAttribute("aria-label", `Settings for ${item.name}`);
+    cog.textContent = "⚙";
+    cog.addEventListener("click", () => void openNetworkDialog(item.name));
+
+    row.append(open, cog);
+    networksEl.append(row);
+  }
+}
+
+function setDialogError(message) {
+  const box = el("nf-error");
+  if (!box) return;
+  box.textContent = message || "";
+  box.hidden = !message;
+}
+
+// Editing shows what is configured but never a stored password: the API does
+// not return one, and this deliberately does not ask it to. Leaving the field
+// empty keeps whatever is already sealed, which is why the note changes.
+async function openNetworkDialog(name = null) {
+  if (!networkDialog || !networkForm) return;
+  setDialogError("");
+  networkForm.reset();
+  networkForm.dataset.editing = name || "";
+  const editing = name !== null;
+  el("network-dialog-title").textContent = editing ? `Settings — ${name}` : "Add a network";
+  el("nf-name").disabled = editing;
+  el("nf-name-note").textContent = editing
+    ? "The name of a network cannot be changed."
+    : "A short label for this connection.";
+  el("nf-clear-row").hidden = !editing;
+  el("nf-sasl-password-note").textContent = editing
+    ? "Leave blank to keep the stored password. Stored encrypted; never shown again."
+    : "Stored encrypted; never shown again once saved.";
+  el("nf-tls").checked = true;
+
+  if (editing) {
+    try {
+      const detail = await apiGet(`/api/v1/me/networks/${encodeURIComponent(name)}`);
+      el("nf-name").value = detail.name ?? name;
+      el("nf-addr").value = detail.addr ?? "";
+      el("nf-tls").checked = detail.tls !== false;
+      el("nf-nick").value = detail.nick ?? "";
+      el("nf-realname").value = detail.realname ?? "";
+      el("nf-autojoin").value = Array.isArray(detail.autojoin) ? detail.autojoin.join(", ") : "";
+      el("nf-sasl-account").value = detail.sasl_account ?? "";
+    } catch (error) {
+      setDialogError(errorMessage(`load ${name}`, error));
+    }
+  } else {
+    // Libera is the interop target this server is tested against, so it is the
+    // default rather than a blank form the person has to research.
+    el("nf-addr").value = "irc.libera.chat:6697";
+  }
+
+  networkDialog.showModal();
+  (editing ? el("nf-sasl-account") : el("nf-name")).focus();
+}
+
+function autojoinList(value) {
+  return value
+    .split(/[\s,]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+// Create and update take deliberately different credential shapes, and the
+// contract check in apiSend enforces it: POST carries flat sasl_account /
+// sasl_password, while PUT carries a tagged action so an omitted field can
+// never silently mean either "keep" or "erase". This builds whichever the
+// endpoint declares rather than one shape for both.
+//
+// `set` requires an account for an IRC network -- a password on its own has
+// nothing to authenticate as -- so that is caught here, where the field is, and
+// not as a rejected request.
+function credentialUpdate(clearing, account, password) {
+  if (clearing) return { ok: true, value: { action: "remove" } };
+  if (!account && !password) return { ok: true, value: { action: "keep" } };
+  if (!account) {
+    return { ok: false, error: "Enter the NickServ account this password belongs to." };
+  }
+  return {
+    ok: true,
+    value: { action: "set", account, ...(password ? { password } : {}) },
+  };
+}
+
+if (networkForm) {
+  networkForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    setDialogError("");
+    const editing = networkForm.dataset.editing || "";
+    const save = el("nf-save");
+    const name = editing || el("nf-name").value.trim();
+    const nick = el("nf-nick").value.trim();
+    const account = el("nf-sasl-account").value.trim();
+    const password = el("nf-sasl-password").value;
+
+    const common = {
+      addr: el("nf-addr").value.trim(),
+      tls: el("nf-tls").checked,
+      nick,
+      autojoin: autojoinList(el("nf-autojoin").value),
+    };
+
+    let body;
+    if (editing) {
+      const credentials = credentialUpdate(el("nf-clear").checked, account, password);
+      if (!credentials.ok) {
+        setDialogError(credentials.error);
+        el("nf-sasl-account").focus();
+        return;
+      }
+      // realname is optional on replace; an empty box means "no real name",
+      // which the contract expresses as null rather than "".
+      body = {
+        ...common,
+        realname: el("nf-realname").value.trim() || null,
+        credentials: credentials.value,
+      };
+    } else {
+      if (password && !account) {
+        setDialogError("Enter the NickServ account this password belongs to.");
+        el("nf-sasl-account").focus();
+        return;
+      }
+      // Create declares realname required, and carries the credentials flat
+      // rather than as an action -- there is nothing yet to keep or remove.
+      body = {
+        kind: "irc",
+        name,
+        ...common,
+        realname: el("nf-realname").value.trim() || nick,
+        ...(account ? { sasl_account: account } : {}),
+        ...(password ? { sasl_password: password } : {}),
+      };
+    }
+
+    save.disabled = true;
+    try {
+      if (editing) {
+        await apiSend("PUT", `/api/v1/me/networks/${encodeURIComponent(editing)}`, body);
+      } else {
+        await apiSend("POST", "/api/v1/me/networks", body);
+      }
+      networkDialog.close();
+      // Saving restarts the driver, so the list is stale the moment it returns.
+      const refreshed = networksFrom(await apiGet("/api/v1/me/networks"));
+      renderNetworkList(refreshed);
+      populateNetworkSelector(refreshed);
+      addServer(
+        editing
+          ? `Saved ${editing}. The connection restarts with the new settings.`
+          : `Added ${name}. Select it in the sidebar to connect.`,
+      );
+    } catch (error) {
+      setDialogError(errorMessage(editing ? `save ${editing}` : "add the network", error));
+    } finally {
+      save.disabled = false;
+    }
+  });
+}
+
+el("nf-cancel")?.addEventListener("click", () => networkDialog?.close());
+el("network-add")?.addEventListener("click", () => void openNetworkDialog(null));
+
+// A pasted password cannot be verified any other way, and this is exactly
+// where a silent typo becomes a failed SASL exchange that reads as "wrong
+// credentials". The toggle never reveals a stored secret -- only what is
+// currently typed into the field.
+for (const button of document.querySelectorAll("[data-reveal]")) {
+  button.addEventListener("click", () => {
+    const field = el(button.dataset.reveal);
+    if (!field) return;
+    const shown = field.type === "text";
+    field.type = shown ? "password" : "text";
+    button.textContent = shown ? "Show" : "Hide";
+    button.setAttribute("aria-pressed", String(!shown));
+    button.setAttribute("aria-label", shown ? "Show password" : "Hide password");
+    field.focus();
+  });
+}
+
+el("help-toggle")?.addEventListener("click", () => helpDialog?.showModal());
+el("help-close")?.addEventListener("click", () => helpDialog?.close());
+
+// The wire log is recorded whether or not it is on screen, so this only decides
+// visibility. It lives in the sidebar because it is consulted precisely when a
+// connection is misbehaving, and that is not the moment anyone goes looking
+// through a preferences menu for a switch called "Raw IRC output".
+const serverLogLink = el("server-log-link");
+function syncServerLogLink() {
+  if (!serverLogLink) return;
+  serverLogLink.setAttribute("aria-pressed", String(Boolean(settings.rawOutput)));
+  serverLogLink.classList.toggle("is-active", Boolean(settings.rawOutput));
+}
+if (serverLogLink) {
+  serverLogLink.addEventListener("click", () => {
+    settings.rawOutput = !settings.rawOutput;
+    persistSettings();
+    renderRawOutput();
+    syncServerLogLink();
+    if (rawOutputBtn) {
+      rawOutputBtn.textContent = settings.rawOutput ? "Raw IRC output: on" : "Raw IRC output: off";
+      rawOutputBtn.setAttribute("aria-pressed", String(settings.rawOutput));
+    }
+    if (settings.rawOutput) {
+      rawOutputPanel?.scrollIntoView({ block: "nearest" });
+    }
+  });
+}
+
 function renderNetworkPicker(networks, failure = null) {
   routeNetworkEl.textContent = "Network catalog";
   setStatus(failure ? "network list unavailable" : "choose a network", failure ? "error" : "connecting");
@@ -1583,6 +1858,7 @@ function updateSettingsUI() {
     rawOutputBtn.textContent = settings.rawOutput ? "Raw IRC output: on" : "Raw IRC output: off";
     rawOutputBtn.setAttribute("aria-pressed", String(settings.rawOutput));
   }
+  syncServerLogLink();
   renderRawOutput();
 }
 if (themeSelect) {
@@ -1668,6 +1944,7 @@ async function boot() {
     networkFailure = error;
   }
   populateNetworkSelector(networks, networkFailure);
+  renderNetworkList(networks, networkFailure);
 
   if (!network) {
     renderNetworkPicker(networks, networkFailure);

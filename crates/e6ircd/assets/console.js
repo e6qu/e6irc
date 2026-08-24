@@ -3092,4 +3092,39 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       void mutateChannel(form, form.action, "DELETE");
     });
   }
+
+  // Every password field gets a reveal control, added here rather than in ten
+  // templates so a field added later is covered without anyone remembering to.
+  //
+  // A credential typed into this console is frequently pasted -- an upstream
+  // NickServ password, a bridge token -- and a masked field gives no way to
+  // check it before submitting. The failure that follows is a rejected
+  // authentication that reads as "wrong credentials" rather than "you typed it
+  // wrong", which is a long way to travel for a transposed character.
+  //
+  // This only ever reveals what is in the field right now. No stored secret is
+  // fetched: the API does not return one, and nothing here asks it to.
+  for (const field of document.querySelectorAll('input[type="password"]')) {
+    if (field.dataset.noReveal !== undefined) continue;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "reveal";
+    button.textContent = "Show";
+    button.setAttribute("aria-pressed", "false");
+    button.setAttribute("aria-label", "Show password");
+    button.addEventListener("click", () => {
+      const shown = field.type === "text";
+      field.type = shown ? "password" : "text";
+      button.textContent = shown ? "Show" : "Hide";
+      button.setAttribute("aria-pressed", String(!shown));
+      button.setAttribute("aria-label", shown ? "Show password" : "Hide password");
+      field.focus();
+    });
+    // Wrapped so the control sits with the input rather than after the label's
+    // hint text, which would put it in a different place on every form.
+    const wrap = document.createElement("span");
+    wrap.className = "secret-input";
+    field.parentNode.insertBefore(wrap, field);
+    wrap.append(field, button);
+  }
 })();
