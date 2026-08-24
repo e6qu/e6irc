@@ -54,6 +54,17 @@ credentials are supplied.
 
 **Flow.**
 
+There are two ways in, because the two do different jobs. The chat client
+carries the everyday one: each network in the sidebar has a settings control,
+and **+** adds one, defaulting to Libera. That dialog covers the connection and
+the account -- nickname, server, auto-join, and the NickServ account and
+password of an upstream account already held -- and never leaves the client,
+because an account on a network is a property of that network and belongs
+beside it. Signing in to Libera with existing credentials needs nothing else.
+
+The console at `/console/networks` remains the full form, with the presets,
+the preflight, and the bridge drivers.
+
 1. Open `/console/networks`. The form defaults to the Libera Chat preset and
    also offers OFTC, EFnet, Snoonet, and Custom server.
 2. Selecting a preset fills the stable network ID, published TLS endpoint, and
@@ -174,6 +185,31 @@ self-echo redaction. The full-stack Chromium journey sends REGISTER and VERIFY
 through the real driver, observes mock NickServ replies in the owner transcript,
 proves the password and email code are absent, disables the network, then saves
 the verified credentials and proves re-enable, SASL PLAIN, and channel rejoin.
+
+## Read the raw IRC protocol while it happens
+
+**Actor and goal.** An account holder wants to see the exact lines exchanged
+with the upstream -- a NickServ reply, a rejected registration, a numeric --
+while it is happening.
+
+**Preconditions.** A browser session on the chat client.
+
+**Flow.** Select **Server log** in the sidebar, beside the conversations. The
+receiver tape shows every inbound wire line, newest last, and keeps recording
+whether or not it is on screen, so switching it on after something has gone
+wrong still shows what happened.
+
+**Visible failures and recovery.** A network parked on rejected credentials or
+a refused registration says so on its own row, with the repair, next to the
+settings control that performs it -- rather than leaving a status word to be
+interpreted.
+
+**Security and observability.** Commands carrying a password, email, code, or
+recovery token are redacted in the synthesized echo while still being sent
+upstream verbatim, so the tape never becomes a place credentials accumulate.
+
+**Evidence.** The parked-state guidance and the redaction classifier both have
+unit tests.
 
 ## Diagnose an upstream connection
 

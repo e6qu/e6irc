@@ -483,6 +483,28 @@ body {
     background: Canvas;
     color: CanvasText;
   }
+  /* The network rows, their state and advice, and the server-log entry are
+     spans and <small> rather than links or buttons, so the rule above does not
+     reach them and they keep a muted custom colour against Canvas. In forced
+     colours that is exactly the contrast failure the system palette exists to
+     prevent. */
+  :is(#networks, .side-link) :is(span, small),
+  :is(.network-name, .network-state, .network-help, .network-row, .side-link) {
+    background: Canvas;
+    color: CanvasText;
+  }
+  .network-row.is-failed .network-help, .network-state-failed { color: CanvasText; }
+  .network-row:hover, .network-row.is-active, .side-link:hover, .side-link.is-active {
+    background: Canvas;
+    outline: 1px solid CanvasText;
+  }
+  :is(#network-dialog, #help-dialog) {
+    background: Canvas;
+    color: CanvasText;
+    border-color: CanvasText;
+  }
+  :is(#network-dialog, #help-dialog) :is(p, small, legend, span, li, code) { color: CanvasText; }
+  .secret-input .reveal { border-color: CanvasText; background: Canvas; color: CanvasText; }
   #brand span { background: Highlight; color: HighlightText; }
   :is(#topbar, #sidebar, #nicklist, #bufhead, #composer, .alert, .picker-net) {
     border-color: CanvasText;
@@ -533,3 +555,120 @@ body {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
 }
+
+/* ---- Networks, server log, help and secret fields ----------------------
+   The sidebar carries the three things that were previously reachable only
+   from a separate console, a preferences submenu, or a collapsed disclosure
+   next to the composer. */
+
+.side-head-row { display: flex; align-items: center; justify-content: space-between; gap: 0.4rem; }
+.side-actions { display: inline-flex; gap: 0.25rem; }
+.side-actions button {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  opacity: 0.85;
+  border-radius: 0.35rem;
+  cursor: pointer;
+  font: 0.8rem/1 var(--font-mono);
+  padding: 0.1rem 0.4rem;
+}
+.side-actions button:hover, .side-actions button:focus-visible { opacity: 1; }
+
+#networks { list-style: none; margin: 0; padding: 0 0.4rem 0.4rem; }
+.network-row { display: flex; align-items: center; gap: 0.25rem; border-radius: 0.35rem; }
+.network-row:hover { background: var(--chrome-raised); }
+.network-row.is-active { background: var(--chrome-raised); color: #ffffff; }
+.network-row.is-active .network-state, .network-row.is-active .network-help { color: #ffffff; }
+.network-row-empty { color: inherit; opacity: 0.75; padding: 0.3rem 0.45rem; font-size: 0.85rem; }
+.network-open {
+  flex: 1;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.3rem 0.45rem;
+  color: inherit;
+  text-decoration: none;
+  min-width: 0;
+}
+.network-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.network-state { color: inherit; opacity: 0.75; font: 0.65rem/1 var(--font-mono); }
+.network-cog {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  opacity: 0.8;
+  cursor: pointer;
+  padding: 0.3rem 0.4rem;
+  border-radius: 0.35rem;
+}
+.network-cog:hover, .network-cog:focus-visible { opacity: 1; }
+
+.side-link {
+  display: block;
+  width: calc(100% - 0.8rem);
+  margin: 0 0.4rem 0.4rem;
+  padding: 0.3rem 0.45rem;
+  border: 0;
+  border-radius: 0.35rem;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+.side-link small { display: block; color: inherit; opacity: 0.75; font-size: 0.7rem; }
+.side-link:hover { background: var(--chrome-raised); }
+.side-link.is-active { background: var(--chrome-raised); color: #ffffff; }
+.side-link.is-active small { color: #ffffff; }
+
+dialog#network-dialog, dialog#help-dialog {
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--panel);
+  color: var(--fg);
+  max-width: 34rem;
+  width: calc(100vw - 2rem);
+  padding: 1rem 1.1rem 1.1rem;
+}
+dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+dialog .field { display: block; margin: 0.6rem 0; }
+dialog .field > span { display: block; font-size: 0.85rem; margin-bottom: 0.2rem; }
+dialog .field input { width: 100%; box-sizing: border-box; }
+dialog .field small, dialog .field-note { display: block; color: var(--muted); font-size: 0.75rem; margin-top: 0.2rem; }
+dialog .check { display: flex; gap: 0.45rem; align-items: flex-start; margin: 0.6rem 0; }
+dialog .check small { display: block; color: var(--muted); font-size: 0.75rem; }
+dialog fieldset { border: 1px solid var(--border); border-radius: 0.4rem; padding: 0.5rem 0.7rem 0.7rem; margin: 0.9rem 0; }
+dialog legend { font-size: 0.8rem; padding: 0 0.3rem; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.9rem; }
+.dialog-error { color: var(--danger, #b00020); font-size: 0.85rem; }
+#help-commands { margin: 0.5rem 0; padding-left: 1.1rem; line-height: 1.7; }
+
+/* The reveal sits with the input, not after the label's hint, so it lands in
+   the same place on every form. */
+.secret-input { display: flex; gap: 0.35rem; align-items: stretch; }
+.secret-input input { flex: 1; min-width: 0; }
+.secret-input .reveal {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 0.35rem;
+  cursor: pointer;
+  font-size: 0.75rem;
+  padding: 0 0.55rem;
+  white-space: nowrap;
+}
+.secret-input .reveal:hover, .secret-input .reveal:focus-visible { color: var(--fg); }
+
+.network-open { flex-wrap: wrap; }
+.network-help {
+  flex-basis: 100%;
+  color: inherit;
+  opacity: 0.8;
+  font-size: 0.7rem;
+  line-height: 1.35;
+  padding-bottom: 0.15rem;
+}
+.network-row.is-failed .network-help { color: var(--danger, #b00020); }
+.network-state-failed { color: var(--danger, #b00020); }

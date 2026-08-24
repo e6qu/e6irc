@@ -400,9 +400,17 @@ test("network picker renders typed network states on tablets", async ({ page }) 
   ]);
   await page.goto("/");
 
-  await expect(page.getByRole("link", { name: /Libera.*reconnecting/ })).toHaveAttribute("data-state", "reconnecting");
-  await expect(page.getByText("Archive", { exact: true })).toBeVisible();
-  await expect(page.getByRole("link", { name: /Archive.*disabled/ })).toHaveCount(0);
+  // Networks now appear twice on purpose -- the picker in the message area and
+  // the sidebar list that carries each network's settings control -- so these
+  // assertions name which one they mean rather than matching whichever comes
+  // first.
+  const picker = page.getByLabel("Messages");
+  await expect(picker.getByRole("link", { name: /Libera.*reconnecting/ })).toHaveAttribute("data-state", "reconnecting");
+  await expect(picker.getByText("Archive", { exact: true })).toBeVisible();
+  await expect(picker.getByRole("link", { name: /Archive.*disabled/ })).toHaveCount(0);
+  // A disabled network is reachable in neither list.
+  await expect(page.getByRole("link", { name: "Open Archive" })).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Settings for Libera" })).toBeVisible();
   await expect(page.getByLabel("Active network").locator('option[value="Archive"]')).toHaveAttribute("disabled", "");
   await expectAccessible(page);
   await expect(page).toHaveScreenshot("network-picker-tablet.png", {

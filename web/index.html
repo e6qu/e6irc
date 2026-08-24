@@ -56,6 +56,36 @@
 
       <div id="workspace">
         <aside id="sidebar" aria-label="Conversations">
+          <!-- Networks first, each carrying its own settings control. Signing in
+               to Libera with an account you already hold is a property of the
+               network, so it belongs on the network -- not behind a link named
+               "Manage" pointing at a separate application. -->
+          <div class="side-head side-head-row">
+            <span>Networks</span>
+            <span class="side-actions">
+              <button id="network-add" type="button" title="Add a network" aria-label="Add a network">+</button>
+              <button
+                id="help-toggle"
+                type="button"
+                title="IRC commands"
+                aria-label="IRC commands"
+                aria-expanded="false"
+              >?</button>
+            </span>
+          </div>
+          <ul id="networks" aria-label="Networks"></ul>
+
+          <!-- The raw wire log belongs beside the conversations, not inside a
+               preferences menu: it is where you look when a connection or a
+               NickServ exchange misbehaves, which is exactly when nobody thinks
+               to open settings. -->
+          <button
+            id="server-log-link"
+            type="button"
+            class="side-link"
+            aria-pressed="false"
+          >Server log<small>Raw IRC lines</small></button>
+
           <div class="side-head">Conversations</div>
           <form id="join-form" autocomplete="off">
             <input type="text" id="join-input" placeholder="join #channel" aria-label="Join a channel" autocomplete="off" disabled />
@@ -106,6 +136,130 @@
           <ul id="nicks"></ul>
         </aside>
       </div>
+
+      <!-- Network settings, reachable from the cog on each network and from
+           "+". The credential fields are the point: an account already held on
+           Libera is entered here, in the client, rather than in a separate
+           console the chat UI only hinted at. -->
+      <dialog id="network-dialog" aria-labelledby="network-dialog-title">
+        <form id="network-form" autocomplete="off">
+          <h2 id="network-dialog-title">Add a network</h2>
+
+          <label class="field">
+            <span>Name</span>
+            <input id="nf-name" name="name" required maxlength="64" placeholder="libera" />
+            <small id="nf-name-note">A short label for this connection.</small>
+          </label>
+
+          <label class="field">
+            <span>Server</span>
+            <input id="nf-addr" name="addr" required maxlength="255" placeholder="irc.libera.chat:6697" />
+          </label>
+
+          <label class="check">
+            <input id="nf-tls" name="tls" type="checkbox" checked />
+            <span>Use TLS<small>Libera requires TLS on port 6697.</small></span>
+          </label>
+
+          <label class="field">
+            <span>Nickname</span>
+            <input id="nf-nick" name="nick" required maxlength="32" autocomplete="username" />
+            <small>Use the nickname your NickServ account is registered to.</small>
+          </label>
+
+          <label class="field">
+            <span>Real name <em>optional</em></span>
+            <input id="nf-realname" name="realname" maxlength="128" />
+          </label>
+
+          <label class="field">
+            <span>Auto-join channels <em>optional</em></span>
+            <input id="nf-autojoin" name="autojoin" maxlength="512" placeholder="#e6qu, #rust" />
+            <small>Comma or space separated. Re-joined automatically after a reconnect.</small>
+          </label>
+
+          <fieldset id="nf-credentials">
+            <legend>Account on this network</legend>
+            <p class="field-note">
+              Already registered with NickServ? Enter that account and password
+              and the connection authenticates with SASL on every reconnect.
+              Leave both blank to connect without an account.
+            </p>
+
+            <label class="field">
+              <span>NickServ account</span>
+              <input id="nf-sasl-account" name="sasl_account" maxlength="255" autocomplete="username" />
+            </label>
+
+            <label class="field">
+              <span>NickServ password</span>
+              <span class="secret-input">
+                <input
+                  id="nf-sasl-password"
+                  name="sasl_password"
+                  type="password"
+                  maxlength="512"
+                  autocomplete="current-password"
+                />
+                <!-- A pasted password cannot be checked any other way, and this
+                     is exactly where a silent typo costs a failed SASL round
+                     trip that reads as "wrong credentials". -->
+                <button
+                  type="button"
+                  class="reveal"
+                  data-reveal="nf-sasl-password"
+                  aria-pressed="false"
+                  aria-label="Show password"
+                >Show</button>
+              </span>
+              <small id="nf-sasl-password-note">Stored encrypted; never shown again once saved.</small>
+            </label>
+
+            <label class="check" id="nf-clear-row" hidden>
+              <input id="nf-clear" name="clear_credentials" type="checkbox" />
+              <span><strong>Remove the stored account and password</strong><small>The connection will stop authenticating.</small></span>
+            </label>
+          </fieldset>
+
+          <p id="nf-error" class="dialog-error" role="alert" hidden></p>
+
+          <div class="dialog-actions">
+            <button type="button" id="nf-cancel">Cancel</button>
+            <button type="submit" id="nf-save">Save</button>
+          </div>
+        </form>
+      </dialog>
+
+      <!-- Commands, reachable from the sidebar rather than only after a
+           mistyped line has already been rejected. -->
+      <dialog id="help-dialog" aria-labelledby="help-dialog-title">
+        <h2 id="help-dialog-title">IRC commands</h2>
+        <p>
+          Anything starting with <code>/</code> is sent to the server. These are
+          handled locally; every other slash command is forwarded to IRC as
+          typed, so the whole protocol is reachable from the message box.
+        </p>
+        <ul id="help-commands">
+          <li><code>/join #channel</code> — join a channel</li>
+          <li><code>/part [#channel]</code> — leave a channel</li>
+          <li><code>/query nick [message]</code> — open a private conversation</li>
+          <li><code>/msg nick text</code> — send without opening a buffer</li>
+          <li><code>/notice nick text</code> — send a notice</li>
+          <li><code>/nick name</code> — change nickname</li>
+          <li><code>/topic [text]</code> — read or set the topic</li>
+          <li><code>/me action</code> — send an action</li>
+          <li><code>/raw COMMAND</code> — send a literal IRC line</li>
+        </ul>
+        <p>
+          To talk to services directly, use <code>/msg NickServ IDENTIFY …</code>
+          or <code>/raw</code>. The <strong>Server log</strong> conversation shows
+          every raw line received, which is where to look when a connection or a
+          NickServ exchange does not behave.
+        </p>
+        <div class="dialog-actions">
+          <button type="button" id="help-close">Close</button>
+        </div>
+      </dialog>
     </main>
   </body>
 </html>
