@@ -1485,6 +1485,11 @@ function renderNetworkList(networks, failure = null) {
     const open = document.createElement("a");
     open.className = "network-open";
     open.href = `/?network=${encodeURIComponent(item.name)}`;
+    // The picker in the message area already offers a link per network, and
+    // its accessible name is built from the same name and state. Without an
+    // explicit label here the two are indistinguishable to anything selecting
+    // by role and name -- a screen reader reading the page, or a test.
+    open.setAttribute("aria-label", `Open ${item.name}`);
     const label = document.createElement("span");
     label.className = "network-name";
     label.textContent = item.name;
