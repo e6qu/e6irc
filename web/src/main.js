@@ -23,6 +23,11 @@ import {
 } from "./client-state.js";
 import { apiContractLoader, getOperationJson } from "./api-contract.js";
 import { serializeComposerRequest } from "./composer-request.js";
+import {
+  NetworkRequestError,
+  createNetworkBody,
+  updateNetworkBody,
+} from "./network-request.js";
 import { parseUiEvent } from "./ui-event.js";
 import {
   MEMBER_RANKS,
@@ -1549,34 +1554,6 @@ async function openNetworkDialog(name = null) {
   (editing ? el("nf-sasl-account") : el("nf-name")).focus();
 }
 
-function autojoinList(value) {
-  return value
-    .split(/[\s,]+/)
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-}
-
-// Create and update take deliberately different credential shapes, and the
-// contract check in apiSend enforces it: POST carries flat sasl_account /
-// sasl_password, while PUT carries a tagged action so an omitted field can
-// never silently mean either "keep" or "erase". This builds whichever the
-// endpoint declares rather than one shape for both.
-//
-// `set` requires an account for an IRC network -- a password on its own has
-// nothing to authenticate as -- so that is caught here, where the field is, and
-// not as a rejected request.
-function credentialUpdate(clearing, account, password) {
-  if (clearing) return { ok: true, value: { action: "remove" } };
-  if (!account && !password) return { ok: true, value: { action: "keep" } };
-  if (!account) {
-    return { ok: false, error: "Enter the NickServ account this password belongs to." };
-  }
-  return {
-    ok: true,
-    value: { action: "set", account, ...(password ? { password } : {}) },
-  };
-}
-
 if (networkForm) {
   networkForm.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -1588,44 +1565,27 @@ if (networkForm) {
     const account = el("nf-sasl-account").value.trim();
     const password = el("nf-sasl-password").value;
 
-    const common = {
-      addr: el("nf-addr").value.trim(),
+    const fields = {
+      name,
+      addr: el("nf-addr").value,
       tls: el("nf-tls").checked,
       nick,
-      autojoin: autojoinList(el("nf-autojoin").value),
+      realname: el("nf-realname").value,
+      autojoin: el("nf-autojoin").value,
+      account,
+      password,
+      clearing: editing ? el("nf-clear").checked : false,
     };
 
+    // network-request.js owns both shapes and is tested on the difference.
     let body;
-    if (editing) {
-      const credentials = credentialUpdate(el("nf-clear").checked, account, password);
-      if (!credentials.ok) {
-        setDialogError(credentials.error);
-        el("nf-sasl-account").focus();
-        return;
-      }
-      // realname is optional on replace; an empty box means "no real name",
-      // which the contract expresses as null rather than "".
-      body = {
-        ...common,
-        realname: el("nf-realname").value.trim() || null,
-        credentials: credentials.value,
-      };
-    } else {
-      if (password && !account) {
-        setDialogError("Enter the NickServ account this password belongs to.");
-        el("nf-sasl-account").focus();
-        return;
-      }
-      // Create declares realname required, and carries the credentials flat
-      // rather than as an action -- there is nothing yet to keep or remove.
-      body = {
-        kind: "irc",
-        name,
-        ...common,
-        realname: el("nf-realname").value.trim() || nick,
-        ...(account ? { sasl_account: account } : {}),
-        ...(password ? { sasl_password: password } : {}),
-      };
+    try {
+      body = editing ? updateNetworkBody(fields) : createNetworkBody(fields);
+    } catch (error) {
+      if (!(error instanceof NetworkRequestError)) throw error;
+      setDialogError(error.message);
+      (account || !password ? el("nf-addr") : el("nf-sasl-account")).focus();
+      return;
     }
 
     save.disabled = true;
