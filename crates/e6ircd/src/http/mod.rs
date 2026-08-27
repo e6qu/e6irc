@@ -22,6 +22,7 @@ mod credentials;
 mod device;
 mod history;
 pub(crate) mod networks;
+mod observation;
 mod oidc;
 mod openapi;
 mod sessions;
@@ -32,6 +33,7 @@ use credentials::*;
 use device::*;
 use history::*;
 use networks::*;
+use observation::*;
 use oidc::*;
 use openapi::*;
 use sessions::*;
@@ -101,6 +103,9 @@ pub struct AppState {
     pub secure_cookies: bool,
     pub oidc_providers: Vec<OidcProviderConfig>,
     pub application_release_revision: Option<String>,
+    /// SHA-256 of the deployment-owned token for the machine-readable
+    /// application observation endpoint. The plaintext is never retained.
+    pub(crate) monitoring_token_digest: Option<[u8; 32]>,
     pub pending_auth: Mutex<HashMap<String, PendingAuth>>,
     /// Inbound queue to the IRC core, for the ws-irc bridge.
     pub core_tx: crate::core::CoreIngress,
@@ -171,6 +176,30 @@ pub(crate) fn bootstrap_token_digest(token: &str) -> [u8; 32] {
         .as_ref()
         .try_into()
         .expect("SHA-256 output is always 32 bytes")
+}
+
+fn monitoring_token_digest(token: &str) -> Result<[u8; 32], String> {
+    if token.chars().count() < 32
+        || token
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(
+            "E6IRC_MONITORING_TOKEN must contain at least 32 non-whitespace characters".into(),
+        );
+    }
+    Ok(bootstrap_token_digest(token))
+}
+
+pub(crate) fn monitoring_token_digest_from_env() -> Result<Option<[u8; 32]>, String> {
+    let token = match std::env::var("E6IRC_MONITORING_TOKEN") {
+        Ok(token) => token,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("E6IRC_MONITORING_TOKEN is not valid UTF-8".into());
+        }
+    };
+    monitoring_token_digest(&token).map(Some)
 }
 
 impl AppState {
@@ -819,6 +848,14 @@ mod query_limit_tests {
     }
 
     #[test]
+    fn monitoring_token_requires_a_strong_header_safe_value() {
+        assert!(monitoring_token_digest("0123456789abcdef0123456789abcdef").is_ok());
+        assert!(monitoring_token_digest("short").is_err());
+        assert!(monitoring_token_digest("0123456789abcdef0123456789abcde ").is_err());
+        assert!(monitoring_token_digest("0123456789abcdef0123456789abcde\n").is_err());
+    }
+
+    #[test]
     fn response_rejection_is_pointer_sized_and_preserves_the_response() {
         assert_eq!(
             std::mem::size_of::<ResponseRejection>(),
@@ -1089,6 +1126,7 @@ documented_routes! {
     "/healthz" => { get: health },
     "/readyz" => { get: readiness },
     "/api/v1/server" => { get: server_info },
+    "/api/v1/monitoring/observation" => { get: application_observation },
     "/api/v1/openapi.json" => { get: openapi },
     "/api/v1/auth/app-passwords" => { post: create_app_password },
     "/api/v1/auth/oidc/{provider}/start" => { get: oidc_start },

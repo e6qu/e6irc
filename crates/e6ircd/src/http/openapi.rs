@@ -761,6 +761,35 @@ fn document() -> serde_json::Value {
             "properties": { "current": snapshot_schema, "history": { "type": "array", "items": snapshot_schema } }
         }),
     );
+    let application_metric_schema = serde_json::json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["name", "label", "value", "unit", "status"],
+        "properties": {
+            "name": { "type": "string" }, "label": { "type": "string" },
+            "value": { "type": "number", "minimum": 0 }, "unit": { "type": "string" },
+            "status": { "type": "string", "const": "available" }
+        }
+    });
+    let application_observation_response = json_response(
+        "current application observation",
+        serde_json::json!({
+            "type": "object", "additionalProperties": false,
+            "required": ["schema_version", "observed_at", "resources"],
+            "properties": {
+                "schema_version": { "type": "string", "const": "e6qu.monitoring/v2" },
+                "observed_at": { "type": "string", "format": "date-time" },
+                "resources": { "type": "array", "minItems": 1, "items": {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["id", "name", "kind", "health", "metrics"],
+                    "properties": {
+                        "id": { "type": "string" }, "name": { "type": "string" }, "kind": { "type": "string" },
+                        "health": { "type": "string", "enum": ["healthy", "degraded", "unhealthy", "unknown"] },
+                        "metrics": { "type": "array", "items": application_metric_schema }
+                    }
+                } }
+            }
+        }),
+    );
     let stats_response = json_response(
         "counts, server identity, and live totals",
         serde_json::json!({
@@ -797,6 +826,11 @@ fn document() -> serde_json::Value {
                     "in": "cookie",
                     "name": "__Host-e6irc_session",
                     "description": "The production Secure, host-bound opaque browser session. Unsafe REST methods also require the session-bound value from /api/v1/me in X-E6IRC-CSRF.",
+                },
+                "monitoringBearer": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "description": "The deployment-owned E6IRC_MONITORING_TOKEN. It grants read-only access only to the application observation endpoint.",
                 }
             }
         },
@@ -809,6 +843,17 @@ fn document() -> serde_json::Value {
                 "get": { "summary": "Core and PostgreSQL readiness probe", "responses": {
                     "200": { "description": "all configured dependencies are ready" },
                     "503": { "description": "the core heartbeat is stale or PostgreSQL is unavailable" } } }
+            },
+            "/api/v1/monitoring/observation": {
+                "get": {
+                    "summary": "Deployment-neutral application observation",
+                    "description": "Publishes real fixed-cardinality process, IRC, BNC, queue, error, and uptime metrics using e6qu.monitoring/v2. e6irc is not itself a priced resource, so the application contract deliberately omits cost_estimate.",
+                    "security": [{ "monitoringBearer": [] }],
+                    "responses": {
+                        "200": application_observation_response["200"],
+                        "401": { "description": "missing or invalid monitoring bearer token" }
+                    }
+                }
             },
             "/api/v1/server": {
                 "get": { "summary": "Server name, network name, version", "responses": ok_json }

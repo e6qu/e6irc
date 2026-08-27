@@ -92,6 +92,9 @@ axum = { version = "0.8.9", default-features = false, features = [
 serde_json = { version = "1.0.150", default-features = false, features = [
     "std",
 ] }
+# Already present transitively; used directly to publish the RFC 3339
+# observation timestamp required by the deployment-neutral monitoring contract.
+time = { version = "0.3.53", default-features = false, features = ["formatting"] }
 http = { version = "1.4.2", default-features = false, features = ["std"] }
 # Aggregate HTTP admission controls; account-keyed rate admission remains
 # application-owned because its key comes from authenticated identity.

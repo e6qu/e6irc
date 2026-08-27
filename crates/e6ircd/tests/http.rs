@@ -1237,6 +1237,17 @@ async fn openapi_spec_is_served() {
     );
     assert!(v["paths"]["/api/v1/admin/monitoring"].is_null());
     assert!(v["paths"]["/api/v1/admin/metrics"]["get"].is_object());
+    assert_eq!(
+        v["paths"]["/api/v1/monitoring/observation"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["properties"]["schema_version"]["const"],
+        "e6qu.monitoring/v2"
+    );
+    assert!(
+        v["paths"]["/api/v1/monitoring/observation"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["properties"]
+            .get("cost_estimate")
+            .is_none()
+    );
     let account_parameters = v["paths"]["/api/v1/admin/accounts"]["get"]["parameters"]
         .as_array()
         .expect("account-directory query parameters");
