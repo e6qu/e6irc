@@ -202,14 +202,17 @@ wrong still shows what happened.
 **Visible failures and recovery.** A network parked on rejected credentials or
 a refused registration says so on its own row, with the repair, next to the
 settings control that performs it -- rather than leaving a status word to be
-interpreted.
+interpreted. The lifecycle state and its latest typed failure code are projected
+separately: `authentication_failed` / `registration_failed` identify that the
+driver is parked, while `authentication_rejected` / `registration_rejected`
+identify the upstream cause used to choose the recovery text.
 
 **Security and observability.** Commands carrying a password, email, code, or
 recovery token are redacted in the synthesized echo while still being sent
 upstream verbatim, so the tape never becomes a place credentials accumulate.
 
-**Evidence.** The parked-state guidance and the redaction classifier both have
-unit tests.
+**Evidence.** The parked lifecycle/error-code pairings, generic parked-state
+recovery, and the redaction classifier have unit tests.
 
 ## Diagnose an upstream connection
 

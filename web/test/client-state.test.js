@@ -96,18 +96,22 @@ test("network projection preserves the closed API state", () => {
   assert.deepEqual(networksFrom({ networks: [] }), []);
   const offline = { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, runtime: null };
   assert.deepEqual(networksFrom({ networks: [offline] }), [
-    { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, state: null, runtime: null },
+    { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, state: null, failureCode: null, runtime: null },
   ]);
   assert.deepEqual(
-    networksFrom({ networks: [{ ...offline, connected: true, runtime: { state: "connected" } }] }),
+    networksFrom({ networks: [{ ...offline, connected: false, runtime: {
+      state: "registration_failed",
+      last_error: { code: "registration_rejected" },
+    } }] }),
     [{
       name: "Libera",
       kind: "irc",
       nick: "alice",
       enabled: true,
-      connected: true,
-      state: "connected",
-      runtime: { state: "connected" },
+      connected: false,
+      state: "registration_failed",
+      failureCode: "registration_rejected",
+      runtime: { state: "registration_failed", failureCode: "registration_rejected" },
     }],
   );
 });
@@ -151,19 +155,37 @@ test("API error messages distinguish expired sessions", () => {
 });
 
 // A parked driver stops re-dialling on purpose, so whatever the sidebar says is
-// what the person sees indefinitely. "authentication rejected" names the event
-// and not the repair, and both parked states are repaired in the same place.
-test("rejected credentials explain the repair, not just the event", () => {
-  const help = networkStateHelp({ state: "authentication_rejected" });
+// what the person sees indefinitely. The lifecycle says it stopped; the latest
+// typed error says why. Both are required to choose the useful repair.
+test("rejected credentials explain the repair from the real lifecycle and error pairing", () => {
+  const help = networkStateHelp({
+    state: "authentication_failed",
+    failureCode: "authentication_rejected",
+  });
   assert.match(help, /NickServ account or password/);
   assert.match(help, /settings/);
-  assert.equal(networkStateIsFailure({ state: "authentication_rejected" }), true);
+  assert.equal(networkStateIsFailure({ state: "authentication_failed" }), true);
 });
 
-test("a refused registration is a distinct parked state with its own repair", () => {
-  const help = networkStateHelp({ state: "registration_rejected" });
-  assert.match(help, /nickname/);
-  assert.equal(networkStateIsFailure({ state: "registration_rejected" }), true);
+test("a refused registration directs verified-account failures to log and settings", () => {
+  const help = networkStateHelp({
+    state: "registration_failed",
+    failureCode: "registration_rejected",
+  });
+  assert.match(help, /Server log/);
+  assert.match(help, /verified SASL/);
+  assert.equal(networkStateIsFailure({ state: "registration_failed" }), true);
+});
+
+test("parked lifecycle states remain actionable without a last-error detail", () => {
+  assert.match(
+    networkStateHelp({ state: "authentication_failed", failureCode: null }),
+    /replace or remove/,
+  );
+  assert.match(
+    networkStateHelp({ state: "registration_failed", failureCode: null }),
+    /upstream reason/,
+  );
 });
 
 test("states that are merely progress carry no advice and are not failures", () => {
@@ -174,5 +196,5 @@ test("states that are merely progress carry no advice and are not failures", () 
 });
 
 test("a disabled network says so rather than reporting a driver state", () => {
-  assert.equal(networkStateHelp({ enabled: false, state: "authentication_rejected" }), "This network is turned off.");
+  assert.equal(networkStateHelp({ enabled: false, state: "authentication_failed" }), "This network is turned off.");
 });
