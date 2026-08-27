@@ -113,6 +113,10 @@ one unterminated IRC line per message instead of executing embedded CRLF as a
 second command.
 Bridge-backed networks now refuse every unsupported or malformed downstream
 command with a bounded notice instead of accepting it into a quiet no-op.
+The browser network rail now distinguishes the driver's parked lifecycle from
+its latest failure code, so rejected Libera credentials and verified-account
+registration policy produce the promised Server log and settings recovery
+guidance instead of a bare failed-state label.
 
 ## Remaining qualification
 

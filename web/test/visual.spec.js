@@ -26,7 +26,15 @@ const apiContract = {
               name: { type: "string", minLength: 1 }, kind: { type: "string" }, nick: { type: "string" },
               enabled: { type: "boolean" }, connected: { type: ["boolean", "null"] }, runtime: { oneOf: [
                 { type: "null" },
-                { type: "object", additionalProperties: false, required: ["state"], properties: { state: { type: "string" } } },
+                { type: "object", additionalProperties: false, required: ["state"], properties: {
+                  state: { type: "string" },
+                  last_error: { oneOf: [
+                    { type: "null" },
+                    { type: "object", additionalProperties: false, required: ["code"], properties: {
+                      code: { type: "string" },
+                    } },
+                  ] },
+                } },
               ] },
             },
           } },
@@ -453,6 +461,26 @@ test("network picker distinguishes an unavailable API on narrow dark screens", a
     animations: "disabled",
     fullPage: true,
   });
+});
+
+test("parked Libera registration gives the recovery beside its settings control", async ({ page }) => {
+  await mockSession(page, [{
+    name: "Libera",
+    kind: "irc",
+    nick: "viewer",
+    enabled: true,
+    connected: false,
+    runtime: {
+      state: "registration_failed",
+      last_error: { code: "registration_rejected" },
+    },
+  }]);
+  await page.goto("/");
+
+  const networks = page.getByRole("list", { name: "Networks" });
+  await expect(networks.getByText(/verified SASL is required/)).toBeVisible();
+  await expect(networks.getByRole("button", { name: "Settings for Libera" })).toBeVisible();
+  await expectAccessible(page);
 });
 
 test("network picker directs an expired session to sign in", async ({ page }) => {

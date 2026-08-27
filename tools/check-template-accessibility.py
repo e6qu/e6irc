@@ -9,6 +9,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATES = ROOT / "crates" / "e6ircd" / "templates"
+WEB_ENTRY = ROOT / "web" / "index.html"
 
 
 class TemplateParser(HTMLParser):
@@ -18,12 +19,22 @@ class TemplateParser(HTMLParser):
         self.table_lines: list[int] = []
         self.table_has_caption: list[bool] = []
         self.label_depth = 0
+        self.ids: dict[str, int] = {}
         self.errors: list[str] = []
 
     def handle_starttag(
         self, tag: str, attrs: list[tuple[str, str | None]]
     ) -> None:
         attributes = dict(attrs)
+        element_id = attributes.get("id")
+        if element_id:
+            if element_id in self.ids:
+                self.errors.append(
+                    f"{self.path.relative_to(ROOT)}:{self.getpos()[0]}: "
+                    f'duplicate id "{element_id}" (first used on line {self.ids[element_id]})'
+                )
+            else:
+                self.ids[element_id] = self.getpos()[0]
         if tag == "table":
             self.table_lines.append(self.getpos()[0])
             self.table_has_caption.append(False)
@@ -102,7 +113,7 @@ class TemplateParser(HTMLParser):
 
 def main() -> int:
     errors: list[str] = []
-    files = sorted(TEMPLATES.glob("*.html"))
+    files = [WEB_ENTRY, *sorted(TEMPLATES.glob("*.html"))]
     for path in files:
         parser = TemplateParser(path)
         source = path.read_text(encoding="utf-8")
@@ -122,7 +133,7 @@ def main() -> int:
         return 1
     print(
         f"template accessibility guard: clean "
-        f"({len(files)} server-rendered templates)"
+        f"({len(files) - 1} server-rendered templates and the web application shell)"
     )
     return 0
 

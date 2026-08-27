@@ -37,6 +37,8 @@ test("shared relay-desk palette keeps text and actions above WCAG AA contrast", 
     ["#082f32", "#73d7d0"],
     ["#ffffff", "#a45d00"],
     ["#2b1b00", "#f2b84b"],
+    ["#ff9cab", "#14242b"],
+    ["#ff9cab", "#091114"],
   ]) {
     assert.ok(ratio(foreground, background) >= 4.5, `${foreground} on ${background} is below 4.5:1`);
   }

@@ -11,6 +11,10 @@
 #            E6IRC_SECURE_COOKIES (default true)
 #            E6IRC_ADMIN_ACCOUNTS (comma-separated)
 #            E6IRC_BOOTSTRAP_TOKEN (32+ byte one-time first-admin secret)
+#            E6IRC_SECRET_KEY (base64 32-byte key required to store BNC and
+#              managed-configuration credentials; read directly by e6ircd)
+#            E6IRC_PREVIOUS_SECRET_KEYS (comma-separated old keys during a
+#              credential-key rotation; read directly by e6ircd)
 #            Shauth OIDC (all required together to enable SSO):
 #              E6IRC_OIDC_ISSUER  E6IRC_OIDC_CLIENT_ID  E6IRC_OIDC_CLIENT_SECRET
 #              E6IRC_OIDC_END_SESSION
