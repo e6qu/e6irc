@@ -689,6 +689,8 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                     .map_err(io::Error::other)?,
             );
         }
+        let monitoring_token_digest =
+            crate::http::monitoring_token_digest_from_env().map_err(io::Error::other)?;
         Some(Arc::new(crate::http::AppState {
             server_name: config.server_name.clone(),
             network_name: config.network_name.clone(),
@@ -698,6 +700,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             secure_cookies,
             oidc_providers: config.oidc_providers.clone(),
             application_release_revision: config.application_release_revision.clone(),
+            monitoring_token_digest,
             pending_auth: crate::http::AppState::no_pending_auth(),
             core_tx: core_tx.clone(),
             next_conn: next_conn.clone(),

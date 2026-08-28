@@ -20,8 +20,10 @@ WebSocket events and composer requests. Immutable console mutation operations
 are checked against the router. Successful mutations refresh their API-backed
 view without a document reload. Bridge provider frames and REST bodies cross
 typed contracts. Server routes emit closed response models, including one
-current-schema observability snapshot/history contract; URL queries and forms
-reject unknown fields. Owner, administrator, and static network creation use
+current-schema observability snapshot/history contract and a bearer-protected
+deployment-neutral application observation derived from the same real counters;
+URL queries and forms reject unknown fields. Owner, administrator, and static
+network creation use
 the same explicit driver, transport, and identity fields; kind-specific
 requests reject incompatible fields.
 Container startup validates rendered TOML through the daemon parser. Managed

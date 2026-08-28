@@ -1975,6 +1975,13 @@ The snapshot is the sole source for:
   7-day range; invalid ranges fail with HTTP 400 rather than being clamped;
 - `/api/v1/admin/metrics`, authenticated Prometheus text exposition with only
   fixed `state`/`kind`/`queue`/`mode` labels;
+- `/api/v1/monitoring/observation`, a read-only `e6qu.monitoring/v2`
+  application observation protected by a deployment-owned
+  `E6IRC_MONITORING_TOKEN`. The process retains only its SHA-256 digest, checks
+  the bearer in constant time, and publishes the same real fixed-cardinality
+  IRC, BNC, queue, error, and uptime counters. It omits `cost_estimate` because
+  the application is not itself a priced resource; inventing one would violate
+  provenance;
 - `/console/logs` and `/api/v1/admin/logs`, administrator-only live views of
   at most 1,000 redacted server events; the durable audit log remains the
   source for privileged actions; and
