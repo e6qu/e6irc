@@ -17,7 +17,7 @@ tokio = { version = "1.53.0", default-features = false, features = [
     "time",
     "macros",
 ] }
-rustls = { version = "0.23.42", default-features = false, features = [
+rustls = { version = "0.23.45", default-features = false, features = [
     "aws_lc_rs",
     "tls12",
     "std",

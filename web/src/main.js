@@ -51,7 +51,9 @@ import {
 } from "./irc-state.js";
 
 const params = new URLSearchParams(window.location.search);
-const network = params.get("network");
+// Reassigned once, at boot, when the URL names no network and one is opened
+// for the person instead of making them pick their only one.
+let network = params.get("network");
 const currentApiContract = apiContractLoader(window.fetch.bind(window));
 const apiGet = async (url) => getOperationJson(
   window.fetch.bind(window),
@@ -65,12 +67,21 @@ const apiGet = async (url) => getOperationJson(
 // the OpenAPI request schema before it leaves the browser, so a field this
 // client renames or forgets fails here, with a message naming the field, rather
 // than as a 400 the person filling in the form has to interpret.
+//
+// The session's CSRF token comes from /api/v1/me, read fresh for each mutation
+// so a session replaced in another tab never leaves this one holding a stale
+// token. The contract layer refuses an unsafe method without it.
 const apiSend = async (method, url, json) => getOperationJson(
   window.fetch.bind(window),
   await currentApiContract(),
   method,
   url,
-  { cache: "no-store", credentials: "same-origin", json },
+  {
+    cache: "no-store",
+    credentials: "same-origin",
+    csrf: identityFrom(await apiGet("/api/v1/me")).csrfToken,
+    json,
+  },
 );
 
 const el = (id) => document.getElementById(id);
@@ -87,11 +98,9 @@ const nickcountEl = el("nickcount");
 const composer = el("composer");
 const messageInput = el("message");
 const alertsEl = el("alerts");
-const networkSelect = el("network-select");
 const sidebarToggle = el("sidebar-toggle");
 const sidebarEl = el("sidebar");
 const settingsEl = el("settings");
-const rawOutputBtn = el("raw-output-toggle");
 const rawOutputPanel = el("raw-output-panel");
 const rawOutputLines = el("raw-output-lines");
 const jumpLatestButton = el("jump-latest");
@@ -572,7 +581,7 @@ function recordRawOutput(wire) {
 
 function renderActive({ atLatest = true } = {}) {
   const b = buffers.get(active);
-  routeNetworkEl.textContent = network || "No network";
+  routeNetworkEl.textContent = network || "";
   bufnameEl.textContent = !b || b.key === SERVER ? "server" : b.display;
   buftopicEl.textContent = b ? b.topic : "";
   if (!b || b.kind === "server") {
@@ -1141,7 +1150,6 @@ async function reconcileUnavailableNetwork() {
     const networks = networksFrom(
       await apiGet("/api/v1/me/networks"),
     );
-    populateNetworkSelector(networks);
     renderNetworkList(networks);
     const replacement = networks.find((item) => fold(item.name) === fold(network));
     if (replacement && replacement.enabled !== false && replacement.runtime != null) {
@@ -1157,7 +1165,7 @@ async function reconcileUnavailableNetwork() {
       return;
     }
     const reason = replacement
-      ? `${replacement.name} is disabled or has no running driver.`
+      ? `${replacement.name} is disabled or cannot run on this server.`
       : `No network named ${network} belongs to this account.`;
     setStatus(`${network} unavailable`, "error");
     showAlert(
@@ -1324,7 +1332,9 @@ composer.addEventListener("submit", (e) => {
   let text = messageInput.value;
   if (!text) return;
   if (/^\/help\s*$/i.test(text)) {
-    addServer("Commands: /join #channel · /part [#channel] · /query nick [message] · /msg nick text · /notice nick text · /nick name · /topic [text] · /me action · /raw COMMAND. Other slash commands pass through as IRC commands.");
+    // The help dialog's list is the one copy of the command reference.
+    const commands = Array.from(document.querySelectorAll("#help-commands code"), (code) => code.textContent);
+    addServer(`Commands: ${commands.join(" · ")}. Other slash commands pass through as IRC commands.`);
     setActive(SERVER);
     messageInput.value = "";
     return;
@@ -1411,49 +1421,14 @@ if (joinForm) {
   });
 }
 
-function populateNetworkSelector(networks, failure = null) {
-  networkSelect.replaceChildren();
-  const choose = document.createElement("option");
-  choose.value = "";
-  choose.textContent = failure
-    ? "Networks unavailable"
-    : networks.length
-      ? "Choose a network"
-      : "No networks";
-  networkSelect.appendChild(choose);
-  for (const item of networks) {
-    const option = document.createElement("option");
-    option.value = item.name;
-    option.textContent = `${item.name} · ${networkStateLabel(item)}`;
-    option.selected = network !== null && fold(item.name) === fold(network);
-    option.disabled = item.enabled === false || item.runtime == null;
-    networkSelect.appendChild(option);
-  }
-  if (network && !networks.some((item) => fold(item.name) === fold(network))) {
-    const missing = document.createElement("option");
-    missing.value = network;
-    missing.textContent = `${network} · unavailable`;
-    missing.selected = true;
-    networkSelect.appendChild(missing);
-  }
-}
-
-networkSelect.addEventListener("change", () => {
-  const selected = networkSelect.value;
-  if (selected && selected !== network) {
-    window.location.assign(`/?network=${encodeURIComponent(selected)}`);
-  } else if (!selected && network) {
-    window.location.assign("/");
-  }
-});
-
 // ---- Networks in the sidebar -------------------------------------------
 //
-// Every network carries its own settings control, the way a hosted IRC client
-// does. Connecting an account already registered with NickServ is a property
-// of one network, so it is reachable from that network rather than from a
-// link named "Manage" that leaves the application entirely -- which is why
-// nobody found it.
+// The one list of networks. It opens a network, shows its state, and carries
+// its settings control, the way a hosted IRC client does. There used to be
+// three renderings of this list (a header select, this one, and rows in the
+// message area); they were fetched once and then disagreed with each other and
+// with the server, so a network parked on rejected credentials kept reading
+// "connected". One list, refreshed while the page is visible, cannot.
 
 const networksEl = el("networks");
 const networkDialog = el("network-dialog");
@@ -1484,12 +1459,11 @@ function renderNetworkList(networks, failure = null) {
 
     const open = document.createElement("a");
     open.className = "network-open";
+    // A disabled network still opens: its page says why chat is unavailable and
+    // links to where it can be enabled, which a dead row could not.
     open.href = `/?network=${encodeURIComponent(item.name)}`;
-    // The picker in the message area already offers a link per network, and
-    // its accessible name is built from the same name and state. Without an
-    // explicit label here the two are indistinguishable to anything selecting
-    // by role and name -- a screen reader reading the page, or a test.
-    open.setAttribute("aria-label", `Open ${item.name}`);
+    open.setAttribute("aria-label", `Open ${item.name}, ${networkStateLabel(item)}`);
+    open.dataset.state = networkStateLabel(item);
     const label = document.createElement("span");
     label.className = "network-name";
     label.textContent = item.name;
@@ -1507,10 +1481,13 @@ function renderNetworkList(networks, failure = null) {
       state.classList.add("network-state-failed");
     }
     if (help) {
-      open.title = help;
+      // The label above replaces the link's text for assistive technology, so
+      // the repair sentence is attached as its description instead of lost.
       const note = document.createElement("span");
       note.className = "network-help";
+      note.id = `network-help-${networksEl.children.length}`;
       note.textContent = help;
+      open.setAttribute("aria-describedby", note.id);
       open.append(note);
     }
 
@@ -1534,6 +1511,32 @@ function setDialogError(message) {
   box.hidden = !message;
 }
 
+// The curated networks come from the server's one catalog, so the chat client
+// and the console cannot disagree about an endpoint. "Custom" is the client's
+// own entry: it means "I will type the server myself".
+const CUSTOM_PRESET = "custom";
+let networkPresets = [];
+
+function applyPreset() {
+  const preset = networkPresets.find((item) => item.id === el("nf-preset").value);
+  if (preset) {
+    el("nf-name").value = preset.name;
+    el("nf-addr").value = preset.addr;
+    el("nf-tls").checked = preset.tls;
+    return;
+  }
+  // Custom: the name and server are now the person's to fill in, so show them.
+  el("nf-name").value = "";
+  el("nf-addr").value = "";
+  el("nf-advanced").open = true;
+  el("nf-name").focus();
+}
+
+// A required field inside a closed <details> would refuse the submit with no
+// visible reason. Open the section the moment the browser reports one.
+el("nf-advanced")?.addEventListener("invalid", () => { el("nf-advanced").open = true; }, true);
+el("nf-preset")?.addEventListener("change", applyPreset);
+
 // Editing shows what is configured but never a stored password: the API does
 // not return one, and this deliberately does not ask it to. Leaving the field
 // empty keeps whatever is already sealed, which is why the note changes.
@@ -1548,14 +1551,16 @@ async function openNetworkDialog(name = null) {
   el("nf-name-note").textContent = editing
     ? "The name of a network cannot be changed."
     : "A short label for this connection.";
+  el("nf-preset-row").hidden = editing;
   el("nf-clear-row").hidden = !editing;
+  el("nf-advanced").open = false;
   el("nf-sasl-password-note").textContent = editing
     ? "Leave blank to keep the stored password. Stored encrypted; never shown again."
     : "Stored encrypted; never shown again once saved.";
   el("nf-tls").checked = true;
 
-  if (editing) {
-    try {
+  try {
+    if (editing) {
       const detail = await apiGet(`/api/v1/me/networks/${encodeURIComponent(name)}`);
       el("nf-name").value = detail.name ?? name;
       el("nf-addr").value = detail.addr ?? "";
@@ -1564,17 +1569,27 @@ async function openNetworkDialog(name = null) {
       el("nf-realname").value = detail.realname ?? "";
       el("nf-autojoin").value = Array.isArray(detail.autojoin) ? detail.autojoin.join(", ") : "";
       el("nf-sasl-account").value = detail.sasl_account ?? "";
-    } catch (error) {
-      setDialogError(errorMessage(`load ${name}`, error));
+    } else {
+      networkPresets = (await apiGet("/api/v1/network-presets")).presets;
+      const options = [...networkPresets, { id: CUSTOM_PRESET, label: "Another network…" }];
+      el("nf-preset").replaceChildren(...options.map((preset) => {
+        const option = document.createElement("option");
+        option.value = preset.id;
+        option.textContent = preset.label;
+        return option;
+      }));
+      // The first curated network (Libera) is the interop target this server is
+      // tested against, so it is the default rather than a blank form.
+      applyPreset();
+      el("nf-nick").value = el("account-link").dataset.shauthUser ?? "";
     }
-  } else {
-    // Libera is the interop target this server is tested against, so it is the
-    // default rather than a blank form the person has to research.
-    el("nf-addr").value = "irc.libera.chat:6697";
+  } catch (error) {
+    setDialogError(errorMessage(editing ? `load ${name}` : "load the known networks", error));
+    el("nf-advanced").open = true;
   }
 
   networkDialog.showModal();
-  (editing ? el("nf-sasl-account") : el("nf-name")).focus();
+  (editing ? el("nf-sasl-account") : el("nf-nick")).focus();
 }
 
 if (networkForm) {
@@ -1607,6 +1622,7 @@ if (networkForm) {
     } catch (error) {
       if (!(error instanceof NetworkRequestError)) throw error;
       setDialogError(error.message);
+      el("nf-advanced").open = true;
       (account || !password ? el("nf-addr") : el("nf-sasl-account")).focus();
       return;
     }
@@ -1619,15 +1635,15 @@ if (networkForm) {
         await apiSend("POST", "/api/v1/me/networks", body);
       }
       networkDialog.close();
+      if (!editing) {
+        // A network was added to be used: open it rather than asking the
+        // person to find the row that just appeared.
+        window.location.assign(`/?network=${encodeURIComponent(name)}`);
+        return;
+      }
       // Saving restarts the driver, so the list is stale the moment it returns.
-      const refreshed = networksFrom(await apiGet("/api/v1/me/networks"));
-      renderNetworkList(refreshed);
-      populateNetworkSelector(refreshed);
-      addServer(
-        editing
-          ? `Saved ${editing}. The connection restarts with the new settings.`
-          : `Added ${name}. Select it in the sidebar to connect.`,
-      );
+      await refreshNetworkList();
+      addServer(`Saved ${editing}. The connection restarts with the new settings.`);
     } catch (error) {
       setDialogError(errorMessage(editing ? `save ${editing}` : "add the network", error));
     } finally {
@@ -1660,9 +1676,8 @@ el("help-toggle")?.addEventListener("click", () => helpDialog?.showModal());
 el("help-close")?.addEventListener("click", () => helpDialog?.close());
 
 // The wire log is recorded whether or not it is on screen, so this only decides
-// visibility. It lives in the sidebar because it is consulted precisely when a
-// connection is misbehaving, and that is not the moment anyone goes looking
-// through a preferences menu for a switch called "Raw IRC output".
+// visibility. Its one switch lives in the sidebar because it is consulted
+// precisely when a connection is misbehaving.
 const serverLogLink = el("server-log-link");
 function syncServerLogLink() {
   if (!serverLogLink) return;
@@ -1675,20 +1690,18 @@ if (serverLogLink) {
     persistSettings();
     renderRawOutput();
     syncServerLogLink();
-    if (rawOutputBtn) {
-      rawOutputBtn.textContent = settings.rawOutput ? "Raw IRC output: on" : "Raw IRC output: off";
-      rawOutputBtn.setAttribute("aria-pressed", String(settings.rawOutput));
-    }
     if (settings.rawOutput) {
       rawOutputPanel?.scrollIntoView({ block: "nearest" });
     }
   });
 }
 
-function renderNetworkPicker(networks, failure = null) {
-  routeNetworkEl.textContent = "Network catalog";
-  setStatus(failure ? "network list unavailable" : "choose a network", failure ? "error" : "connecting");
-  bufnameEl.textContent = "Select a network";
+// What the message area shows when no network is open: nothing to pick from
+// here -- the sidebar is the list -- only what to do next.
+function renderLanding(networks, failure = null) {
+  routeNetworkEl.textContent = "";
+  setStatus(failure ? "network list unavailable" : "no network open", failure ? "error" : "connecting");
+  bufnameEl.textContent = "Your networks";
   buftopicEl.textContent = "";
   nicklistEl.hidden = true;
   messagesEl.replaceChildren();
@@ -1704,57 +1717,61 @@ function renderNetworkPicker(networks, failure = null) {
   const copy = document.createElement("p");
   copy.textContent = failure
     ? `${errorMessage("load your networks", failure)} This is an API failure, not an empty account.`
-    : networks.length
-      ? "Choose an always-on network:"
-      : "No networks are configured for this account.";
-  panel.append(title, copy);
-  intro.appendChild(panel);
-  if (!failure && networks.length) messagesEl.appendChild(intro);
-  for (const item of networks) {
-    const li = document.createElement("li");
-    li.className = "line picker-row";
-    const available = item.enabled !== false && item.runtime != null;
-    const control = document.createElement(available ? "a" : "div");
-    control.className = `picker-net${available ? "" : " picker-net-unavailable"}`;
-    if (available) control.href = `/?network=${encodeURIComponent(item.name)}`;
-    const stateLabel = networkStateLabel(item);
-    control.dataset.state = stateLabel;
-    const name = document.createElement("span");
-    name.textContent = item.name;
-    const state = document.createElement("small");
-    state.textContent = stateLabel;
-    control.append(name, state);
-    li.appendChild(control);
-    messagesEl.appendChild(li);
-  }
-  const manageLi = document.createElement("li");
-  manageLi.className = "line picker-actions";
-  const manage = document.createElement("a");
+    : networks.some((item) => item.enabled !== false && item.runtime != null)
+      ? "Choose a network from your list to open it."
+      : networks.length
+        ? "None of your networks is running. Open one from the list to see why, or add another."
+        : "No networks are configured for this account.";
+  const actions = document.createElement("div");
+  actions.className = "picker-actions";
   const signInRequired = failure instanceof ApiError && failure.status === 401;
-  manage.href = signInRequired ? "/login" : "/console/networks";
-  manage.textContent = signInRequired
-    ? "Sign in"
-    : failure
-      ? "Open network console"
-    : networks.length
-      ? "Manage networks"
-      : "Add a network";
-  manageLi.appendChild(manage);
-  if (failure && !signInRequired) {
+  if (signInRequired) {
+    const signIn = document.createElement("a");
+    signIn.href = "/login";
+    signIn.textContent = "Sign in";
+    actions.append(signIn);
+  } else if (failure) {
     const retry = document.createElement("a");
     retry.href = "/";
     retry.textContent = "Retry";
-    manageLi.appendChild(retry);
-  }
-  if (failure || networks.length === 0) {
-    const actions = document.createElement("div");
-    actions.className = "picker-actions";
-    for (const control of Array.from(manageLi.children)) actions.appendChild(control);
-    panel.appendChild(actions);
+    actions.append(retry);
   } else {
-    messagesEl.appendChild(manageLi);
+    // On a phone the list lives in the conversation rail; say how to reach it
+    // rather than opening it unasked. Wider screens already show the list.
+    if (networks.length && sidebarToggle && sidebarToggle.offsetParent !== null) {
+      const show = document.createElement("button");
+      show.type = "button";
+      show.textContent = "Show my networks";
+      show.addEventListener("click", () => sidebarToggle.click());
+      actions.append(show);
+    }
+    const add = document.createElement("button");
+    add.type = "button";
+    add.textContent = "Add a network";
+    add.addEventListener("click", () => void openNetworkDialog(null));
+    actions.append(add);
   }
-  if (failure || networks.length === 0) messagesEl.appendChild(intro);
+  panel.append(title, copy, actions);
+  intro.appendChild(panel);
+  messagesEl.appendChild(intro);
+}
+
+// Network state changes on the server (a reconnect, a rejected password), so
+// the list is re-read while the page is visible. A failed refresh keeps the
+// last good list on screen and says so once, rather than blanking it.
+const NETWORK_REFRESH_MS = 10_000;
+async function refreshNetworkList() {
+  try {
+    renderNetworkList(networksFrom(await apiGet("/api/v1/me/networks")));
+    clearAlert("networks");
+  } catch (error) {
+    showAlert("networks", errorMessage("refresh your networks", error), "error");
+  }
+}
+function keepNetworkListCurrent() {
+  window.setInterval(() => {
+    if (document.visibilityState === "visible" && !networkDialog?.open) void refreshNetworkList();
+  }, NETWORK_REFRESH_MS);
 }
 
 // ---- load earlier history ----------------------------------------------
@@ -1837,10 +1854,6 @@ function updateSettingsUI() {
       : "Desktop notifications: off";
     notifyBtn.setAttribute("aria-pressed", String(settings.notifications));
   }
-  if (rawOutputBtn) {
-    rawOutputBtn.textContent = settings.rawOutput ? "Raw IRC output: on" : "Raw IRC output: off";
-    rawOutputBtn.setAttribute("aria-pressed", String(settings.rawOutput));
-  }
   syncServerLogLink();
   renderRawOutput();
 }
@@ -1877,14 +1890,6 @@ if (notifyBtn) {
     }
     persistSettings();
     updateSettingsUI();
-  });
-}
-if (rawOutputBtn) {
-  rawOutputBtn.addEventListener("click", () => {
-    settings.rawOutput = !settings.rawOutput;
-    persistSettings();
-    updateSettingsUI();
-    renderActive();
   });
 }
 updateSettingsUI();
@@ -1926,11 +1931,25 @@ async function boot() {
   } catch (error) {
     networkFailure = error;
   }
-  populateNetworkSelector(networks, networkFailure);
+  if (!network) {
+    // Opening a sole network is not a choice, so nobody is asked to make it.
+    // With several, which one to open is the person's decision: the client
+    // does not pick "the first" on their behalf.
+    const available = networks.filter((item) => item.enabled !== false && item.runtime != null);
+    if (available.length === 1) {
+      const [chosen] = available;
+      network = chosen.name;
+      window.history.replaceState(null, "", `/?network=${encodeURIComponent(network)}`);
+      renderActive();
+    }
+  }
   renderNetworkList(networks, networkFailure);
+  // A landing page that failed to load offers Retry instead; everywhere else
+  // the list keeps following the server, including after a failed first read.
+  if (network || !networkFailure) keepNetworkListCurrent();
 
   if (!network) {
-    renderNetworkPicker(networks, networkFailure);
+    renderLanding(networks, networkFailure);
     return;
   }
 
@@ -1944,14 +1963,14 @@ async function boot() {
         "error",
         { href: "/console/networks", label: "Manage networks" },
       );
-      renderNetworkPicker(networks);
+      renderLanding(networks);
       return;
     }
     if (selected.enabled === false || selected.runtime == null) {
       const reason =
         selected.enabled === false
           ? `${selected.name} is disabled.`
-          : `${selected.name} has no running driver in this build.`;
+          : `${selected.name} cannot run on this server.`;
       setStatus(`${selected.name} unavailable`, "error");
       showAlert(
         "network-unavailable",

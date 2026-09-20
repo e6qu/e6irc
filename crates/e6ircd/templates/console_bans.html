@@ -45,11 +45,11 @@
   <section class="panel">
     <div class="panel-head">
       <div>
-        <h2>Exact lookup</h2>
-        <p>Mask matching uses the same RFC1459-folded key as enforcement and removal.</p>
+        <h2>Find a ban</h2>
+        <p>Matches the whole mask, ignoring case.</p>
       </div>
       {% if has_filters || has_cursor %}
-        <a class="secondary-link" href="/console/bans">Clear filters and cursor</a>
+        <a class="secondary-link" href="/console/bans">Clear</a>
       {% endif %}
     </div>
     <form class="field-grid" method="get" action="/console/bans">
@@ -63,7 +63,7 @@
         </select>
       </label>
       <label class="field">
-        <span>Exact mask</span>
+        <span>Mask</span>
         <input name="mask" value="{{ mask }}" maxlength="512" autocomplete="off"
                placeholder="*@bad.example" />
       </label>
@@ -73,7 +73,7 @@
                inputmode="numeric" required />
       </label>
       <div class="form-actions field-wide">
-        <button class="primary" type="submit">Apply lookup</button>
+        <button class="primary" type="submit">Apply</button>
       </div>
     </form>
   </section>

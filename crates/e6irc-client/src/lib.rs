@@ -535,11 +535,8 @@ impl Connection {
         self.send_line("CAP LS 302").await?;
         loop {
             let msg = self.recv("closed during CAP discovery").await?;
-            if msg.command == "ERROR" {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    "server refused the connection during CAP discovery",
-                ));
+            if let Some(err) = registration_refused(&msg) {
+                return Err(err);
             }
             if msg.command == "CAP" && msg.params.get(1).map(String::as_str) == Some("LS") {
                 if msg.params.get(2).map(String::as_str) != Some("*") {
@@ -584,11 +581,8 @@ impl Connection {
         self.send_line(&format!("CAP REQ :{capability}")).await?;
         loop {
             let msg = self.recv("closed during capability negotiation").await?;
-            if msg.command == "ERROR" {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    "server refused the connection during capability negotiation",
-                ));
+            if let Some(err) = registration_refused(&msg) {
+                return Err(err);
             }
             if msg.command == "410" {
                 return Err(io::Error::new(
@@ -684,9 +678,6 @@ impl Connection {
             let msg = self.recv("closed before welcome").await?;
             if let Some(err) = registration_refused(&msg) {
                 return Err(err);
-            }
-            if msg.command == "ERROR" {
-                return Err(RegistrationRefusal::NotRegistered.error(&msg));
             }
             match msg.command.as_str() {
                 "001" => {
@@ -795,15 +786,6 @@ impl Connection {
             registration_username(nick)
         ))
         .await
-    }
-
-    /// Offer a replacement nick after the server refused the requested one
-    /// (433) during registration. The connection is still pre-registration —
-    /// the server holds it open after a 433 — so a fresh NICK is legal here;
-    /// the welcome is awaited exactly as in [`Connection::register`].
-    pub async fn retry_nick(&mut self, nick: &str) -> io::Result<String> {
-        self.send_line(&format!("NICK {nick}")).await?;
-        self.await_welcome(nick).await
     }
 
     /// Require an atomic set of capabilities on an already registered
@@ -1104,8 +1086,14 @@ impl RegistrationRefusal {
     }
 }
 
+/// The one refusal predicate for every pre-welcome wait loop (capability
+/// discovery, capability requests, SASL, and the welcome itself). `ERROR` is
+/// the server closing the link with its reason — a connection throttle, a ban,
+/// "SASL access only" — and it can arrive at any of those stages, so it is
+/// classified here rather than by whichever loop happens to be running.
 fn registration_refused(message: &OwnedMessage) -> Option<io::Error> {
     let refusal = match message.command.as_str() {
+        "ERROR" => RegistrationRefusal::NotRegistered,
         "432" => RegistrationRefusal::InvalidNickname,
         "468" => RegistrationRefusal::InvalidUsername,
         "433" => RegistrationRefusal::NicknameInUse,
@@ -1375,6 +1363,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_error_during_sasl_is_a_typed_refusal_with_its_reason() {
+        let (mut conn, server_io) = duplex_connection(16 * 1024);
+        let server = tokio::spawn(async move {
+            let (_lines, mut writer) = negotiate_sasl(server_io, "PLAIN").await;
+            writer
+                .write_all(b"ERROR :Closing Link: client (Trying to reconnect too fast.)\r\n")
+                .await
+                .unwrap();
+        });
+
+        let error = conn
+            .register_sasl("nick", "real", "acct", "pw")
+            .await
+            .unwrap_err();
+        let rejection = RegistrationRejection::from_error(&error)
+            .expect("a server ERROR during SASL is a typed refusal, not a lost connection");
+        assert_eq!(rejection.refusal(), RegistrationRefusal::NotRegistered);
+        assert!(
+            rejection.diagnostic().contains("reconnect too fast"),
+            "{rejection:?}"
+        );
+        server.await.expect("mock server task");
+    }
+
+    #[tokio::test]
     async fn register_fails_loudly_on_error_before_welcome() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1392,7 +1405,13 @@ mod tests {
         });
 
         let error = conn.register("nick", "real").await.unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        let rejection = RegistrationRejection::from_error(&error)
+            .expect("a server ERROR before CAP completes is a typed refusal");
+        assert_eq!(rejection.refusal(), RegistrationRefusal::NotRegistered);
+        assert_eq!(
+            rejection.diagnostic(),
+            "Closing Link: client [network policy]"
+        );
         drop(conn);
         server.await.expect("mock server task");
     }

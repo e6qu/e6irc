@@ -25,6 +25,22 @@ async fn upstream() -> std::net::SocketAddr {
     net::start(config).await.expect("start").addrs[0]
 }
 
+/// Poll the sticky lifecycle until the driver reaches `expected`.
+async fn wait_lifecycle(handle: &NetworkHandle, expected: NetworkLifecycle) {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while handle.runtime_snapshot().lifecycle != expected {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "driver never reached {expected:?}: {:?}",
+            handle.runtime_snapshot()
+        )
+    });
+}
+
 /// Subscribe first, then inspect the sticky state. The driver runs on another
 /// executor thread, so "no await since start" does not prevent `Connected`
 /// from being broadcast before this test subscribes.
@@ -1094,6 +1110,16 @@ impl FakeSession {
         }
     }
 
+    async fn negotiate_sasl_capabilities(&mut self) {
+        assert_eq!(self.read_line().await, "CAP LS 302");
+        self.send(":up CAP * LS :sasl=PLAIN server-time message-tags account-tag")
+            .await;
+        for capability in ["sasl", "server-time", "message-tags", "account-tag"] {
+            assert_eq!(self.read_line().await, format!("CAP REQ :{capability}"));
+            self.send(&format!(":up CAP * ACK :{capability}")).await;
+        }
+    }
+
     /// Read until the registration burst (NICK/USER) completes, then welcome
     /// the client. Returns nothing; the driver treats 001 as registered.
     async fn complete_registration(&mut self, nick: &str) {
@@ -1117,68 +1143,92 @@ async fn fake_accept(listener: &tokio::net::TcpListener) -> FakeSession {
     }
 }
 
-/// A ghost holding our configured nick draws a 433; the driver must offer
-/// one replacement nick on the same connection instead of giving up.
+/// A taken nickname is reported, never worked around. The driver does not
+/// invent `bncbot_` on the owner's behalf: it says what the upstream said, waits
+/// on the refusal schedule, and -- when the holder was only a ghost of its own
+/// previous session -- registers under the configured nickname once it is free.
 #[tokio::test(flavor = "multi_thread")]
-async fn nick_conflict_retries_with_alt_nick() {
+async fn a_taken_nickname_is_reported_and_never_replaced() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let (nick_tx, mut nick_rx) = tokio::sync::mpsc::channel(4);
+    let (nick_tx, mut nick_rx) = tokio::sync::mpsc::channel(8);
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
+        // First dial: the nickname is held. Record every NICK the driver
+        // offers on this connection; it must offer exactly the configured one.
         let mut session = fake_accept(&listener).await;
         session.negotiate_capabilities().await;
-        let mut refused = false;
-        // The registration burst is pipelined (NICK, USER, CAP END arrive
-        // together), so the 433 meets the client in await_welcome; the retry
-        // is a second NICK, which is what gets welcomed.
         loop {
             let line = session.read_line().await;
-            if line == "NICK bncbot" && !refused {
-                refused = true;
-                session
-                    .send(":up 433 * bncbot :Nickname is already in use")
-                    .await;
-            } else if let Some(nick) = line.strip_prefix("NICK ") {
+            if let Some(nick) = line.strip_prefix("NICK ") {
                 nick_tx.send(nick.to_string()).await.unwrap();
-                session.send(&format!(":up 001 {nick} :welcome")).await;
-                break;
+                session
+                    .send(&format!(":up 433 * {nick} :Nickname is already in use"))
+                    .await;
             }
-        }
-        // Hold the session open so the driver stays connected.
-        loop {
-            let line = session.read_line().await;
             if line.is_empty() {
                 break;
             }
         }
+        // The ghost times out; the next dial is welcomed under the same nick.
+        release_rx.await.expect("test released the nickname");
+        let mut session = fake_accept(&listener).await;
+        session.negotiate_capabilities().await;
+        loop {
+            let line = session.read_line().await;
+            if let Some(nick) = line.strip_prefix("NICK ") {
+                nick_tx.send(nick.to_string()).await.unwrap();
+            }
+            if line.starts_with("USER ") {
+                session.send(":up 001 bncbot :welcome").await;
+                break;
+            }
+        }
+        while !session.read_line().await.is_empty() {}
     });
 
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
         nick: "bncbot".into(),
+        rejection_retry_floor: std::time::Duration::from_millis(200),
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
-    wait_connected(&handle, &mut events).await;
-    let offered = tokio::time::timeout(std::time::Duration::from_secs(5), nick_rx.recv())
-        .await
-        .expect("no replacement nick")
-        .expect("channel closed");
-    assert_eq!(offered, "bncbot_");
 
-    // The synthesized self-echo uses the confirmed nick, while the ident
-    // stays the originally configured one.
-    assert_eq!(handle.send("PRIVMSG #room :who am i"), SendOutcome::Sent);
-    let echo = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let refused = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            if let Ok(DriverEvent::Echo { line, .. }) = events.recv().await {
-                return line;
+            let snapshot = handle.runtime_snapshot();
+            if snapshot.last_error.is_some() {
+                return snapshot;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("no echo");
-    assert!(echo.contains(":bncbot_!~bncbot@"), "{echo}");
+    .expect("the refusal was never reported");
+    assert_eq!(refused.lifecycle, NetworkLifecycle::Reconnecting);
+    assert_eq!(
+        refused.last_error,
+        Some(e6ircd::bouncer::NetworkFailure::NicknameInUse),
+        "{refused:?}"
+    );
+    assert_eq!(
+        refused.last_error_diagnostic.as_deref(),
+        Some("Nickname is already in use"),
+        "{refused:?}"
+    );
+
+    release_tx.send(()).expect("upstream script is waiting");
+    wait_connected(&handle, &mut events).await;
+    let mut offered = Vec::new();
+    while let Ok(nick) = nick_rx.try_recv() {
+        offered.push(nick);
+    }
+    assert_eq!(
+        offered,
+        ["bncbot", "bncbot"],
+        "only the configured nickname is ever offered"
+    );
 }
 
 /// A forced upstream NICK changes the driver's identity; later self-echoes
@@ -1391,6 +1441,7 @@ async fn repeated_registration_rejection_parks_the_driver() {
         addr: addr.to_string(),
         nick: "bncbot".into(),
         sasl: Some(("account".into(), "secret".into())),
+        rejection_retry_floor: std::time::Duration::from_millis(20),
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -1416,6 +1467,132 @@ async fn repeated_registration_rejection_parks_the_driver() {
         e6ircd::bouncer::NetworkLifecycle::RegistrationFailed
     );
     assert!(snapshot.connection_attempts >= 5, "{snapshot:?}");
+}
+
+/// Rejected credentials are never re-sent: a retry can only fail the same way,
+/// and every failure counts against the account on the upstream. The driver
+/// parks on the first rejection and dials exactly once.
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_credentials_park_without_a_second_dial() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (dial_tx, mut dial_rx) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        loop {
+            let mut session = fake_accept(&listener).await;
+            dial_tx.send(()).await.expect("test is still listening");
+            session.negotiate_sasl_capabilities().await;
+            assert_eq!(session.read_line().await, "AUTHENTICATE PLAIN");
+            session.send("AUTHENTICATE +").await;
+            loop {
+                if session.read_line().await.starts_with("AUTHENTICATE ") {
+                    break;
+                }
+            }
+            session.send(":up 904 * :SASL authentication failed").await;
+        }
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".into(),
+        sasl: Some(("account".into(), "wrong".into())),
+        rejection_retry_floor: std::time::Duration::from_millis(20),
+        ..NetworkConfig::default()
+    });
+    wait_lifecycle(&handle, NetworkLifecycle::AuthenticationFailed).await;
+    dial_rx.recv().await.expect("the first dial");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), dial_rx.recv())
+            .await
+            .is_err(),
+        "a parked driver must not dial the upstream again"
+    );
+    assert_eq!(handle.runtime_snapshot().connection_attempts, 1);
+}
+
+/// A refusing upstream's own connection throttle shows up as dials that die
+/// before registration. Such a drop must not forgive the refusals already
+/// counted, or the driver would never park and would re-dial forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_dial_between_refusals_does_not_reset_the_park_count() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        // Five refusals and the one dropped dial between them; the driver parks
+        // after the sixth and never dials again.
+        for dial in 1..=6 {
+            let mut session = fake_accept(&listener).await;
+            if dial == 3 {
+                // Closed before a single line: a transient drop, not a refusal.
+                continue;
+            }
+            session.negotiate_capabilities().await;
+            loop {
+                if session.read_line().await.starts_with("USER ") {
+                    break;
+                }
+            }
+            session
+                .send(":up 465 bncbot :You are banned from this server")
+                .await;
+        }
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".into(),
+        rejection_retry_floor: std::time::Duration::from_millis(20),
+        ..NetworkConfig::default()
+    });
+    wait_lifecycle(&handle, NetworkLifecycle::RegistrationFailed).await;
+    let snapshot = handle.runtime_snapshot();
+    // Five refusals plus the one dropped dial between them.
+    assert_eq!(snapshot.connection_attempts, 6, "{snapshot:?}");
+    assert_eq!(
+        snapshot.last_error_diagnostic.as_deref(),
+        Some("You are banned from this server"),
+        "{snapshot:?}"
+    );
+}
+
+/// While a refused registration waits for its slower retry, the upstream's
+/// own reason stays readable instead of appearing only once the driver parks.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_registration_keeps_its_reason_while_retrying() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session
+            .send("ERROR :Closing Link: client (Trying to reconnect too fast.)")
+            .await;
+        // Hold later dials open so the driver stays in its retry wait.
+        let _held = fake_accept(&listener).await;
+        std::future::pending::<()>().await;
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".into(),
+        rejection_retry_floor: std::time::Duration::from_secs(30),
+        ..NetworkConfig::default()
+    });
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let snapshot = handle.runtime_snapshot();
+            if snapshot.last_error.is_some() {
+                return snapshot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the refusal was never recorded");
+    assert_eq!(snapshot.lifecycle, NetworkLifecycle::Reconnecting);
+    assert_eq!(
+        snapshot.last_error_diagnostic.as_deref(),
+        Some("Closing Link: client (Trying to reconnect too fast.)"),
+        "{snapshot:?}"
+    );
+    assert!(snapshot.next_retry_at.is_some(), "{snapshot:?}");
 }
 
 /// A full buffer evicts the oldest line, keeping the newest `cap`.

@@ -590,7 +590,9 @@ pub(super) async fn mutate_account_suspension(
         })?;
         let started_networks = prepared_networks.len();
         for (name, driver) in prepared_networks {
-            registry.add(Some(&change.folded), &name, driver);
+            registry
+                .ensure_running(Some(&change.folded), &name, driver)
+                .await;
         }
         Ok(format!(
             "Reactivated {} and started {started_networks} owned network(s).",
@@ -1126,6 +1128,7 @@ documented_routes! {
     "/healthz" => { get: health },
     "/readyz" => { get: readiness },
     "/api/v1/server" => { get: server_info },
+    "/api/v1/network-presets" => { get: network_presets },
     "/api/v1/monitoring/observation" => { get: application_observation },
     "/api/v1/openapi.json" => { get: openapi },
     "/api/v1/auth/app-passwords" => { post: create_app_password },

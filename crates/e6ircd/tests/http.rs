@@ -386,6 +386,31 @@ async fn signed_out_page_is_public_reload_safe_and_accessible() {
 }
 
 #[tokio::test]
+async fn network_presets_endpoint_serves_the_curated_catalog() {
+    let running = net::start(test_config()).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    let (status, _, body) = request(http, &get("/api/v1/network-presets")).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let presets = v["presets"].as_array().expect("presets array");
+    assert_eq!(
+        presets[0],
+        serde_json::json!({
+            "id": "libera",
+            "label": "Libera Chat",
+            "name": "libera",
+            "addr": "irc.libera.chat:6697",
+            "tls": true,
+        }),
+        "{body}"
+    );
+    assert!(
+        presets.iter().all(|preset| preset["tls"] == true),
+        "every curated public network is TLS-only: {body}"
+    );
+}
+
+#[tokio::test]
 async fn server_info_endpoint() {
     let running = net::start(test_config()).await.expect("start");
     let http = running.http_addr.expect("http bound");
@@ -484,6 +509,14 @@ async fn patch_json(
     );
     let (status, _head, body) = request(addr, &req).await;
     (status, body)
+}
+
+/// `runtime.connection_attempts` of the first listed network.
+fn first_network_attempts(body: &str) -> u64 {
+    let v: serde_json::Value = serde_json::from_str(body).expect("json");
+    v["networks"][0]["runtime"]["connection_attempts"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no connection_attempts in {body}"))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -760,6 +793,17 @@ async fn bnc_network_management_lifecycle() {
         "re-enabled driver never reconnected: {latest_status}"
     );
 
+    // Enabling an already-enabled network is idempotent: it answers normally
+    // (it used to panic the handler on a registry assertion) and leaves the
+    // healthy upstream session alone instead of restarting it.
+    let attempts_before = first_network_attempts(&request(http, &list_req).await.2);
+    let (status, _, body) = request(http, &patch(true)).await;
+    assert_eq!(status, 200, "repeated enable: {body}");
+    let (_, _, body) = request(http, &list_req).await;
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["networks"][0]["connected"], true, "{body}");
+    assert_eq!(first_network_attempts(&body), attempts_before, "{body}");
+
     // delete it
     let del_req = format!(
         "DELETE /api/v1/me/networks/work HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
@@ -921,7 +965,9 @@ async fn console_runtime_is_served_in_every_build() {
     assert!(body.contains("/console-settings.js"), "{body}");
     assert!(body.contains("data-api-owner-network-create"), "{body}");
     assert!(body.contains("data-api-admin-account-create"), "{body}");
-    assert!(body.contains("X-E6IRC-CSRF"), "{body}");
+    // The console hands its session token to the shared contract module, which
+    // is the only place the header is built.
+    assert!(body.contains("csrf: form.querySelector"), "{body}");
     assert!(
         body.contains("/api/v1/admin/configuration/networks"),
         "{body}"
@@ -931,6 +977,7 @@ async fn console_runtime_is_served_in_every_build() {
     let (status, headers, body) = request(http, &get("/console-contract.js")).await;
     assert_eq!(status, 200, "{headers}");
     assert!(body.contains("readApiJson"), "{body}");
+    assert!(body.contains("X-E6IRC-CSRF"), "{body}");
 
     let (status, headers, body) = request(http, &get("/console-settings.js")).await;
     assert_eq!(status, 200, "{headers}");
@@ -1709,8 +1756,8 @@ async fn console_networks_page_lists_the_callers_networks() {
     for needle in [
         "data-api-network-log",
         "data-network-name=\"libera\"",
-        "Component log",
-        "Loading component log…",
+        "Network log",
+        "Loading network log…",
     ] {
         assert!(
             log.contains(needle),
@@ -2777,7 +2824,7 @@ async fn owned_channel_api_and_console_shell_are_scoped_and_csrf_protected() {
     let (status, _, page) = request(http, &page_request(&boss_session)).await;
     assert_eq!(status, 200, "{page}");
     for needle in [
-        "Registered channels",
+        "Your channels",
         "data-api-owned-channel-list",
         "Loading registered channels",
     ] {
@@ -4255,7 +4302,7 @@ async fn audit_explorer_filters_pages_and_escapes_for_admins_only() {
     let (status, _, page) = request(http, &cookie_get("/console/audit", &alice_session)).await;
     assert_eq!(status, 200, "{page}");
     assert!(page.contains("<h1>Audit log</h1>"), "{page}");
-    assert!(page.contains("Exact filters"), "{page}");
+    assert!(page.contains("Find audit entries"), "{page}");
     assert!(page.contains("data-api-admin-audit-list"), "{page}");
     assert!(!page.contains("<script>alert(1)</script>"), "{page}");
     let (status, _, short_page) =

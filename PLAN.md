@@ -31,7 +31,13 @@ configuration schema changes migrate persisted rows with their historic explicit
 behavior; new configuration never receives an implicit decode default.
 History accepts one typed cursor window and a bounded page size.
 Chat, console, and identity pages share the relay-desk visual system and
-accessible light, dark, and forced-colors palettes. Browser snapshots cover all
+accessible light, dark, and forced-colors palettes. Both network forms read one
+server-side preset catalog (`GET /api/v1/network-presets`), use one vocabulary,
+ask first for what a known network cannot supply, and keep the rest under an
+Advanced disclosure. The chat client opens an account's sole runnable network
+by itself (with several, the person chooses), opens a network it has just added, and has one control for each thing: one network
+list, one Server log switch, one command reference. The console navigation
+leads with the account holder's own pages and groups the administrator's. Browser snapshots cover all
 three shells; interaction tests cover WCAG AA contrast, keyboard focus, Escape
 dismissal, reduced motion, responsive controls, and non-interactive unavailable
 network routes. On phones, the console brings its active route into the
@@ -59,9 +65,42 @@ Scaleway production container proved registration and configured-channel joins
 against OFTC and Ergo Testnet. The same deployed IPv4 egress was explicitly
 rejected by Libera until it supplies an existing email-verified NickServ
 account through SASL, and the container has no routable IPv6 fallback. Libera
-therefore remains disabled there rather than being misreported as fixed. The
-console now requires the exact connection fields to pass the production
-preflight before a network can be saved. It has a bounded,
+therefore remains disabled there rather than being misreported as fixed.
+A 2026-09-20 run from a residential egress proved the whole product path against
+Libera without SASL: browser dialog, creation, driver registration, configured
+channel join, attach, and send. The same run found why supplying an existing
+account never worked from the chat client, and what a rejected account then did:
+
+- The chat client sent its network create and edit requests without the
+  session's `X-E6IRC-CSRF` value, so every save was refused with 403 and
+  credentials could never be stored from the dialog built for them. The shared
+  API contract module now owns that header and `Content-Type` and refuses an
+  unsafe method without the token before it reaches the network.
+- Rejected credentials were re-sent after 200ms, 400ms, 800ms, and 1.6s. They
+  now park on the first rejection. Other registration refusals retry after 30s,
+  1m, 2m, and 4m, keep the upstream's reason visible while they wait, and park
+  on the fifth in a row.
+- A server `ERROR` during capability discovery or SASL — Libera's throttle and
+  ban answer — was an untyped transient drop whose text was discarded, and any
+  transient drop reset the park count, so a refusing upstream's own throttle
+  kept the driver re-dialing forever. `ERROR` is now one typed refusal at every
+  pre-welcome stage, and only a session that registered resets the count.
+- `PATCH {"enabled": true}` on an enabled network panicked the handler on a
+  registry assertion. The registry now refuses an occupied key before a second
+  driver starts; create and edit supersede, enable means ensure-running.
+- The chat client read the network list once, rendered it in three places, and
+  let them contradict each other and the server: a network parked on rejected
+  credentials kept reading "connected". There is one list, re-read every ten
+  seconds, that quotes the upstream's own reason beside the settings control.
+
+The driver no longer answers a taken nickname by silently registering as
+`nick_` (and only when SASL was off). It offers the configured nickname only,
+reports the refusal with the upstream's text, retries on the refusal schedule
+so a ghost of its own session can time out, and parks if the nickname stays
+taken.
+
+Neither browser surface gates saving on a connection test: **Test connection**
+is an optional diagnostic that says `QUIT` when it is done. The console has a bounded,
 owner-scoped component-log view for IRC and every bridge driver. Its API reads
 the live buffer while active and persisted history after stop; typed lifecycle
 and operational failures are safe notices, and storage-failure notices cannot

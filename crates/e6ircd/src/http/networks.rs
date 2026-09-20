@@ -107,7 +107,7 @@ fn require_network_updated(
 /// A curated public IRC network whose connection defaults can be selected in
 /// the console. `name` is the stable e6irc selector, deliberately distinct from
 /// the human label so spaces cannot leak into URL/client addressing.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub(super) struct IrcNetworkPreset {
     pub(super) id: &'static str,
     pub(super) label: &'static str,
@@ -155,6 +155,20 @@ pub(super) const IRC_NETWORK_PRESETS: &[IrcNetworkPreset] = &[
         tls: true,
     },
 ];
+
+#[derive(serde::Serialize)]
+struct NetworkPresetsResponse {
+    presets: &'static [IrcNetworkPreset],
+}
+
+/// The curated catalog, for every client that offers "pick a known network":
+/// the chat client reads it here and the console renders the same constant, so
+/// an endpoint is corrected in one place.
+pub(super) async fn network_presets() -> Response {
+    json_response(NetworkPresetsResponse {
+        presets: IRC_NETWORK_PRESETS,
+    })
+}
 
 pub(super) fn irc_network_preset(id: &str) -> Option<IrcNetworkPreset> {
     IRC_NETWORK_PRESETS
@@ -703,6 +717,7 @@ pub(super) async fn preflight_network_core(
         buffer_cap: 1,
         sasl: req.sasl_account.zip(req.sasl_password),
         keepalive_idle: crate::bouncer::KEEPALIVE_IDLE,
+        rejection_retry_floor: crate::bouncer::REJECTION_RETRY_FLOOR,
     };
     crate::bouncer::preflight_irc(&config)
         .await
@@ -1482,7 +1497,9 @@ async fn create_network_core(
             ));
         }
     }
-    registry.add(Some(account), &req.name, driver);
+    // The row was just inserted under the uniqueness constraint, so anything
+    // already registered under this key has no durable definition: supersede it.
+    registry.replace(Some(account), &req.name, driver).await;
     audit_network_mutation(
         state,
         account,
@@ -1688,7 +1705,7 @@ pub(super) async fn set_network_enabled_core(
         "enable/disable failed",
     )?;
     if let Some(driver) = driver {
-        registry.add(Some(account), name, driver);
+        registry.ensure_running(Some(account), name, driver).await;
     } else {
         registry.remove(Some(account), name).await;
     }

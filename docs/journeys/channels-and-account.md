@@ -11,7 +11,7 @@ by the selected control plane.
 
 **Flow.**
 
-1. Register through ChanServ or **Registered channels**. The channel name is
+1. Register through ChanServ or **Your channels**. The channel name is
    validated and uniqueness follows IRC casemapping.
 2. The registering account becomes founder; the initial topic is stored in
    the same insert so a crash cannot create half-registered state.

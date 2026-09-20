@@ -54,6 +54,7 @@
       nav a.active { border-left-color: var(--route); background: var(--chrome-raised); font-weight: 650; }
       nav .section { color: var(--chrome-muted); font: 0.68rem/1 var(--font-mono); text-transform: uppercase;
         letter-spacing: 0.06em; margin: 1rem 0.7rem 0.35rem; }
+      nav .subsection { color: var(--chrome-muted); font-size: 0.74rem; line-height: 1; margin: 0.75rem 0.7rem 0.25rem; }
       main { flex: 1 1 auto; padding: 2rem clamp(1rem, 3vw, 3rem) 4rem; min-width: 0; max-width: 82rem; }
       h1 { font-size: clamp(1.8rem, 3vw, 2.45rem); line-height: 1.08; letter-spacing: -0.04em; margin: 0; }
       h2 { font-size: 1.1rem; line-height: 1.3; margin: 0; }
@@ -169,6 +170,9 @@
       .field-wide { grid-column: 1 / -1; }
       .check { display: flex; align-items: flex-start; gap: 0.65rem; color: var(--fg); }
       .check input { width: 1.05rem; height: 1.05rem; margin-top: 0.18rem; accent-color: var(--accent); }
+      .advanced { border: 1px solid var(--border); border-radius: 0.25rem; padding: 0.6rem 0.8rem; }
+      .advanced > summary { cursor: pointer; font-size: 0.83rem; font-weight: 650; }
+      .advanced > .field-grid { margin-top: 0.9rem; }
       .form-actions { display: flex; align-items: center; gap: 0.8rem; margin-top: 0.2rem; }
       .settings-form { display: grid; gap: 1rem; }
       .settings-section { display: grid; grid-template-columns: minmax(11rem, 0.38fr) minmax(0, 1fr);
@@ -320,9 +324,9 @@
         padding: 0.7rem 0.85rem; background: var(--panel); }
       .network-summary span { color: var(--muted); font-size: 0.72rem; }
       .network-summary code, .network-summary strong { overflow-wrap: anywhere; }
-      .account-setup { border-top: 3px solid var(--accent); }
-      .account-setup-steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); }
-      .account-setup-steps form { position: relative; display: flex; flex-direction: column; gap: 0.75rem; min-width: 0; padding: 1rem; background: var(--panel); }
+      .account-registration { margin-top: 1.25rem; }
+      .account-setup-steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; margin-top: 0.9rem; background: var(--border); border: 1px solid var(--border); }
+      .account-setup-steps > * { position: relative; display: flex; flex-direction: column; gap: 0.75rem; min-width: 0; padding: 1rem; background: var(--panel); }
       .account-setup-steps h3, .account-setup-steps p { margin: 0; }
       .account-setup-steps p { min-height: 3.1rem; color: var(--muted); font-size: 0.82rem; }
       .account-setup-steps button { margin-top: auto; align-self: flex-start; }
@@ -365,8 +369,8 @@
           border-right: none; border-bottom: 1px solid var(--border);
           display: flex; flex-wrap: nowrap; gap: 0.25rem; overflow-x: auto;
           overscroll-behavior-inline: contain; padding: 0.55rem 0.7rem; }
-        nav a, nav .section { flex: 0 0 auto; margin: 0; }
-        nav .section { align-self: center; }
+        nav a, nav .section, nav .subsection { flex: 0 0 auto; margin: 0; }
+        nav .section, nav .subsection { align-self: center; }
         main { padding: 1rem; }
         .page-head, .banner-info, .provenance { align-items: stretch; flex-direction: column; }
         .network-form, .field-grid, .settings-section, .connection-card,
@@ -385,7 +389,7 @@
       }
       @media (forced-colors: active) {
         header, nav { background: Canvas; color: CanvasText; border-color: CanvasText; }
-        :is(header, nav) :is(a, select, .brand, .who, .theme-picker, .section) { border-color: CanvasText; background: Canvas; color: CanvasText; }
+        :is(header, nav) :is(a, select, .brand, .who, .theme-picker, .section, .subsection) { border-color: CanvasText; background: Canvas; color: CanvasText; }
         header .brand, nav a.active { border-color: Highlight; }
         :is(.panel, .settings-section, .card, .metric-card, .scroll, .banner-error, .banner-success, .danger-panel, .confirm-dialog) { border: 1px solid CanvasText; box-shadow: none; }
         :is(button.primary, .button-link) { forced-color-adjust: none; background: Highlight; border-color: Highlight; color: HighlightText; }
@@ -414,25 +418,28 @@
     </header>
     <div class="layout">
       <nav aria-label="Console">
+        <div class="section">You</div>
+        <a href="/console/networks"{% if shell.active == "networks" %} class="active" aria-current="page"{% endif %}>Your networks</a>
+        <a href="/console/channels"{% if shell.active == "channels" %} class="active" aria-current="page"{% endif %}>Your channels</a>
+        <a href="/console/my-sessions"{% if shell.active == "my-sessions" %} class="active" aria-current="page"{% endif %}>Your sessions</a>
+        <a href="/console/account"{% if shell.active == "account" %} class="active" aria-current="page"{% endif %}>Account &amp; access</a>
         {% if shell.is_admin %}
           <div class="section">Server</div>
-          <a href="/console"{% if shell.active == "overview" %} class="active" aria-current="page"{% endif %}>Overview</a>
+          <div class="subsection">People</div>
           <a href="/console/accounts"{% if shell.active == "accounts" %} class="active" aria-current="page"{% endif %}>Accounts</a>
-          <a href="/console/admin/channels"{% if shell.active == "admin-channels" %} class="active" aria-current="page"{% endif %}>Channel registry</a>
-          <a href="/console/admin/networks"{% if shell.active == "admin-networks" %} class="active" aria-current="page"{% endif %}>Networks</a>
+          <a href="/console/sessions"{% if shell.active == "sessions" %} class="active" aria-current="page"{% endif %}>Live connections</a>
           <a href="/console/bans"{% if shell.active == "bans" %} class="active" aria-current="page"{% endif %}>Server bans</a>
+          <div class="subsection">Chat</div>
+          <a href="/console/admin/channels"{% if shell.active == "admin-channels" %} class="active" aria-current="page"{% endif %}>Channel registry</a>
+          <a href="/console/admin/networks"{% if shell.active == "admin-networks" %} class="active" aria-current="page"{% endif %}>All networks</a>
+          <a href="/console/integrations"{% if shell.active == "integrations" %} class="active" aria-current="page"{% endif %}>Integrations</a>
+          <div class="subsection">Operations</div>
+          <a href="/console"{% if shell.active == "overview" %} class="active" aria-current="page"{% endif %}>Overview</a>
           <a href="/console/monitoring"{% if shell.active == "monitoring" %} class="active" aria-current="page"{% endif %}>Monitoring</a>
           <a href="/console/logs"{% if shell.active == "logs" %} class="active" aria-current="page"{% endif %}>Live logs</a>
           <a href="/console/audit"{% if shell.active == "audit" %} class="active" aria-current="page"{% endif %}>Audit log</a>
           <a href="/console/configuration"{% if shell.active == "configuration" %} class="active" aria-current="page"{% endif %}>Configuration</a>
-          <a href="/console/sessions"{% if shell.active == "sessions" %} class="active" aria-current="page"{% endif %}>Live connections</a>
-          <a href="/console/integrations"{% if shell.active == "integrations" %} class="active" aria-current="page"{% endif %}>Integrations</a>
         {% endif %}
-        <div class="section">You</div>
-        <a href="/console/networks"{% if shell.active == "networks" %} class="active" aria-current="page"{% endif %}>BNC networks</a>
-        <a href="/console/channels"{% if shell.active == "channels" %} class="active" aria-current="page"{% endif %}>Registered channels</a>
-        <a href="/console/my-sessions"{% if shell.active == "my-sessions" %} class="active" aria-current="page"{% endif %}>Your sessions</a>
-        <a href="/console/account"{% if shell.active == "account" %} class="active" aria-current="page"{% endif %}>Account &amp; access</a>
       </nav>
       <main id="console-main" tabindex="-1">
         {% block main %}{% endblock %}

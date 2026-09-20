@@ -2,7 +2,7 @@
 {% block main %}
   <div id="channel-api-result" role="status" aria-live="polite"></div>
   <noscript><div class="banner-error">JavaScript is required to manage registered channels because these controls use the channel API directly.</div></noscript>
-  <div class="page-head"><div><p class="eyebrow">Founder controls</p><h1>Registered channels</h1><p class="lede">Manage durable topics, mode locks, access grants, ownership, and registration lifecycle. Every change is confirmed by storage before it reaches the live IRC core.</p></div><span class="count" id="owned-channel-count">…</span></div>
+  <div class="page-head"><div><p class="eyebrow">Founder controls</p><h1>Your channels</h1><p class="lede">Manage durable topics, mode locks, access grants, ownership, and registration lifecycle. Every change is confirmed by storage before it reaches the live IRC core.</p></div><span class="count" id="owned-channel-count">…</span></div>
   <section class="panel"><div class="panel-head"><div><p class="eyebrow">New registration</p><h2>Register a channel</h2><p>Join the channel from an identified client and become an operator, then register it here.</p></div></div><form class="inline-control" method="post" action="/api/v1/me/channels" data-api-channel-register><input type="hidden" name="csrf" value="{{ shell.csrf }}" /><label class="field"><span>Live channel</span><input name="channel" placeholder="#channel" required /></label><button class="primary" type="submit">Register channel</button></form></section>
   <div class="channel-list" data-api-owned-channel-list data-csrf="{{ shell.csrf }}"><section class="panel"><p class="empty">Loading registered channels…</p></section></div>
 {% endblock %}

@@ -12,14 +12,26 @@
       </header>
       <div class="layout">
         <nav aria-label="Console">
+          <div class="section">You</div>
+          <a href="#networks">Your networks</a>
+          <a href="#channels">Your channels</a>
+          <a href="#sessions">Your sessions</a>
+          <a href="#access">Account &amp; access</a>
           <div class="section">Server</div>
-          <a class="active" aria-current="page" href="#main">Overview</a>
+          <div class="subsection">People</div>
           <a href="#accounts">Accounts</a>
+          <a href="#connections">Live connections</a>
+          <a href="#bans">Server bans</a>
+          <div class="subsection">Chat</div>
+          <a href="#channel-registry">Channel registry</a>
+          <a href="#all-networks">All networks</a>
+          <a href="#integrations">Integrations</a>
+          <div class="subsection">Operations</div>
+          <a class="active" aria-current="page" href="#main">Overview</a>
           <a href="#monitoring">Monitoring</a>
           <a href="#logs">Live logs</a>
-          <div class="section">You</div>
-          <a href="#networks">BNC networks</a>
-          <a href="#access">Account &amp; access</a>
+          <a href="#audit">Audit log</a>
+          <a href="#configuration">Configuration</a>
         </nav>
         <main id="main">
           <div class="page-head">
@@ -38,12 +50,12 @@
           </div>
           <section class="panel">
             <div class="panel-head">
-              <div><h2>Network routes</h2><p>Always-on upstream state and attached clients.</p></div>
+              <div><h2>Network routes</h2><p>Always-on network state and attached clients.</p></div>
               <span class="count">3 routes</span>
             </div>
             <div class="scroll" tabindex="0" role="region" aria-label="Network routes">
               <table>
-                <thead><tr><th>Status</th><th>Network</th><th>Upstream</th><th>Clients</th></tr></thead>
+                <thead><tr><th>Status</th><th>Network</th><th>Server</th><th>Clients</th></tr></thead>
                 <tbody>
                   <tr><td><span class="dot on"></span>Connected</td><td>Libera</td><td>irc.libera.chat</td><td>3</td></tr>
                   <tr><td><span class="dot warn"></span>Reconnecting</td><td>Work</td><td>irc.example.net</td><td>1</td></tr>

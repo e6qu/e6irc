@@ -35,6 +35,10 @@ async function clickAndWaitForURL(page, locator, expectedURL) {
   assert.equal(page.url(), expectedURL);
 }
 
+// Once the account owns a runnable network, the application entry opens it and
+// rewrites its own address to say which, so arriving at "/" ends here.
+const applicationEntryOpening = (network) => `${applicationOrigin}/?network=${network}`;
+
 async function expectAccessible(page, selector) {
   const results = await new AxeBuilder({ page }).include(selector).analyze();
   assert.deepEqual(
@@ -234,13 +238,16 @@ try {
   // state: account navigation and preferences remain available, the picker
   // distinguishes an empty collection from an API failure, and the composer
   // cannot accept a message with no attached network.
-  await page.locator("#network-select").waitFor();
+  await page.locator("#networks").waitFor();
   // The zero-network state is rendered only after the boot-time networks fetch
   // resolves; reading #messages before then races the fetch (and loses on
   // slower runners), so wait for the render itself.
   await page.locator("#messages").getByText("No networks are configured").waitFor();
   await expectAccessible(page, "#app");
-  assert.equal(await page.locator("#network-select").inputValue(), "");
+  // The one network list says the account is empty, and the empty state's
+  // action adds a network here rather than sending the person elsewhere.
+  assert.match(await page.locator("#networks").innerText(), /No networks yet/);
+  assert.equal(await page.locator("#messages").getByRole("button", { name: "Add a network", exact: true }).count(), 1);
   assert.equal(await page.locator("#message").isDisabled(), true);
   assert.equal(await page.locator("#composer button").isDisabled(), true);
   assert.match(await page.locator("#messages").innerText(), /No networks are configured/);
@@ -250,11 +257,11 @@ try {
   // control plane. A new account has an explicit empty state and the complete
   // founder workflow remains discoverable in console navigation.
   await page.goto(`${applicationOrigin}/console/channels`);
-  await page.getByRole("heading", { name: "Registered channels", exact: true }).waitFor();
+  await page.getByRole("heading", { name: "Your channels", exact: true }).waitFor();
   await page.getByText("No channels registered to this account", { exact: true }).waitFor();
   await page.getByRole("button", { name: "Register channel", exact: true }).waitFor();
   assert.equal(
-    await page.getByRole("link", { name: "Registered channels", exact: true }).getAttribute("class"),
+    await page.getByRole("link", { name: "Your channels", exact: true }).getAttribute("class"),
     "active",
   );
 
@@ -387,8 +394,8 @@ try {
     await page.locator("nav").evaluate((nav) => getComputedStyle(nav).overflowX),
     "auto",
   );
-  await page.getByRole("link", { name: "Registered channels", exact: true }).click();
-  await page.getByRole("heading", { name: "Registered channels", exact: true }).waitFor();
+  await page.getByRole("link", { name: "Your channels", exact: true }).click();
+  await page.getByRole("heading", { name: "Your channels", exact: true }).waitFor();
   assert.equal(
     await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
     true,
@@ -598,7 +605,9 @@ try {
     has: page.getByRole("heading", { name: "Server networks", exact: true }),
   });
   const networkForm = serverNetworks.locator("form[data-api-network-create]");
-  const networkDriver = networkForm.getByLabel("Driver");
+  // Selected by name: a label that wraps a select takes the option text into
+  // its own, so no exact label match can name this control.
+  const networkDriver = networkForm.locator('select[name="kind"]');
   await networkDriver.selectOption("local");
   assert.equal(await networkForm.locator('[name="addr"]').isVisible(), true);
   assert.equal(await networkForm.locator('[name="nick"]').isVisible(), true);
@@ -610,14 +619,21 @@ try {
   assert.equal(await networkForm.locator('[name="nick"]').getAttribute("required"), "");
   assert.equal(await networkForm.locator('[name="realname"]').getAttribute("required"), "");
   assert.equal(await networkForm.locator('[name="sasl_password"]').getAttribute("required"), null);
-  await serverNetworks.getByLabel("Network name").fill("shared-browser");
-  await serverNetworks.getByLabel("Address").fill(upstream.address);
-  await serverNetworks.getByLabel("Nickname / user").fill("sharedbrowser");
-  await serverNetworks.getByLabel("Real name").fill("Shared Browser");
-  await serverNetworks.getByLabel("Autojoin").fill("#shared");
-  await serverNetworks.getByLabel("Use TLS").uncheck();
-  await serverNetworks.getByLabel("SASL account").fill("shared-account");
-  await serverNetworks.getByLabel("SASL password").fill(sharedNetworkSecret);
+  // The captions are the shared vocabulary; the fields are then addressed by
+  // name, because a password label also carries its reveal button's text.
+  assert.deepEqual(
+    await networkForm.locator("label:not([hidden]) > span:first-child").allInnerTexts(),
+    ["Name", "Owner blank for shared", "Type", "Server", "Nickname", "Real name", "Channels to join",
+      "Buffer capacity", "NickServ account", "NickServ password"],
+  );
+  await networkForm.locator('[name="name"]').fill("shared-browser");
+  await networkForm.locator('[name="addr"]').fill(upstream.address);
+  await networkForm.locator('[name="nick"]').fill("sharedbrowser");
+  await networkForm.locator('[name="realname"]').fill("Shared Browser");
+  await networkForm.locator('[name="autojoin"]').fill("#shared");
+  await networkForm.locator('[name="tls"]').uncheck();
+  await networkForm.locator('[name="sasl_account"]').fill("shared-account");
+  await networkForm.locator('[name="sasl_password"]').fill(sharedNetworkSecret);
   await serverNetworks.getByRole("button", { name: "Add server network" }).click();
   await expectStatus(page, /added server network shared-browser/);
   assert.equal((await page.content()).includes(sharedNetworkSecret), false);
@@ -726,7 +742,7 @@ try {
   for (const [path, heading] of [
     ["/console/accounts", "Account directory"],
     ["/console/admin/channels", "Registered-channel directory"],
-    ["/console/admin/networks", "All BNC networks"],
+    ["/console/admin/networks", "All networks"],
     ["/console/sessions", "Live connections"],
     ["/console/integrations", "Integrations"],
     ["/console/audit", "Audit log"],
@@ -1048,7 +1064,12 @@ try {
   assert.equal(await page.locator('select[name="preset"]').inputValue(), "libera");
   assert.equal(await page.locator('input[name="addr"]').inputValue(), "irc.libera.chat:6697");
   assert.equal(await page.locator('input[name="tls"]').isChecked(), true);
+  // Adding never depends on a prior test, and a known network needs none of
+  // the advanced fields; choosing a custom server reveals them.
+  assert.equal(await page.getByRole("button", { name: "Add network", exact: true }).isEnabled(), true);
+  assert.equal(await page.locator("[data-network-advanced]").getAttribute("open"), null);
   await page.locator('select[name="preset"]').selectOption("custom");
+  assert.equal(await page.locator("[data-network-advanced]").getAttribute("open"), "");
   await page.locator('input[name="name"]').fill("journey");
   await page.locator('input[name="addr"]').fill(upstream.address);
   await page.locator('input[name="nick"]').fill("webjourney");
@@ -1091,7 +1112,7 @@ try {
   const componentLogPage = await page.goto(`${applicationOrigin}/console/networks/journey/logs`);
   assert.equal(componentLogPage.status(), 200);
   assert.equal((await componentLogBuffer).status(), 200);
-  const componentLog = page.getByRole("log", { name: "Component log", exact: true });
+  const componentLog = page.getByRole("log", { name: "Network log", exact: true });
   await componentLog.getByText("browser replays through the real stack", { exact: false })
     .waitFor();
   assert.equal(await componentLog.getAttribute("tabindex"), "0");
@@ -1130,15 +1151,18 @@ try {
   const peerMember = page.getByRole("button", { name: "Open conversation with peer", exact: true });
   await peerMember.waitFor();
   assert.equal(await peerMember.evaluate((button) => button.tagName), "BUTTON");
-  await page.locator("#settings summary").click();
-  await page.getByRole("button", { name: "Raw IRC output: off", exact: true }).click();
+  // The wire log has one switch, beside the conversations.
+  const serverLog = page.getByRole("button", { name: /^Server log/ });
+  assert.equal(await serverLog.getAttribute("aria-pressed"), "false");
+  await serverLog.click();
+  assert.equal(await serverLog.getAttribute("aria-pressed"), "true");
   await page.locator("#raw-output-lines .raw-wire").filter({ hasText: "browser replays through the real stack" }).waitFor();
   assert.match(
     await page.locator("#raw-output-lines .raw-wire").filter({ hasText: "browser replays through the real stack" }).innerText(),
     /PRIVMSG #journey :browser replays through the real stack/,
   );
-  await page.getByRole("button", { name: "Raw IRC output: on", exact: true }).click();
-  await page.locator("#settings summary").click();
+  await serverLog.click();
+  assert.equal(await page.locator("#raw-output-panel").isHidden(), true);
   await page.locator("#message").fill("/help");
   await page.locator("#composer button[type=submit]").click();
   await page.getByText(/Commands: \/join #channel/).waitFor();
@@ -1248,7 +1272,7 @@ try {
   assert.equal((await operationsRead).status(), 200);
   await page.getByRole("heading", { name: "journey", exact: true }).waitFor();
   await page.locator('[data-network-field="addr"]', { hasText: upstream.address }).waitFor();
-  await page.getByText("Received from upstream", { exact: true }).waitFor();
+  await page.getByText("Received", { exact: true }).waitFor();
   await page.waitForFunction(
     () =>
       document
@@ -1264,6 +1288,11 @@ try {
     .waitFor();
   assert.match(await page.locator("#network-operations").innerText(), /browser receives through the real stack/);
   const accountRegister = page.locator("[data-api-network-account-register]");
+  // Registration is the uncommon path, so it is closed until asked for; the
+  // account and password pair it finishes with is always visible.
+  assert.equal(await accountRegister.isVisible(), false);
+  assert.equal(await page.locator("[data-api-network-account-save]").getByLabel("NickServ password").isVisible(), true);
+  await page.getByText("Register a new NickServ account", { exact: true }).click();
   await accountRegister.getByLabel("Email address").fill("webjourney@example.test");
   await accountRegister.getByLabel("New NickServ password").fill("journey-secret");
   await accountRegister.getByRole("button", { name: "Request verification email" }).click();
@@ -1284,7 +1313,7 @@ try {
   await page.locator('[data-network-field="enabled"]', { hasText: "Disabled" }).waitFor();
   upstream.resetJoin("#journey");
   const accountSave = page.locator("[data-api-network-account-save]");
-  await accountSave.getByRole("button", { name: "Save SASL and reconnect", exact: true }).click();
+  await accountSave.getByRole("button", { name: "Save and reconnect", exact: true }).click();
   await upstream.waitForLine((line) => line === "AUTHENTICATE PLAIN");
   await upstream.waitForJoin("#journey");
   await page.locator('[data-network-field="enabled"]', { hasText: "Enabled" }).waitFor();
@@ -1318,7 +1347,8 @@ try {
   await ownerNetworkEditorFailure.getByRole("button", { name: "Retry", exact: true }).waitFor();
   assert.match(await ownerNetworkEditorFailure.innerText(), /Network editor unavailable/);
   await ownerNetworkEditorFailure.getByRole("button", { name: "Retry", exact: true }).click();
-  await page.locator('input[name="addr"]').waitFor({ state: "visible" });
+  // The editor leads with what people change; the server sits under Advanced.
+  await page.locator('input[name="nick"]').waitFor({ state: "visible" });
   assert.equal(ownerNetworkEditorReads, 2, "Retry made exactly one replacement owner-network-editor request");
   assert.deepEqual(
     applicationErrors.splice(ownerNetworkEditorFailureErrorStart),
@@ -1334,6 +1364,9 @@ try {
   );
   await page.goto(`${applicationOrigin}/console/networks/journey/edit`);
   assert.equal((await editorRead).status(), 200);
+  await page.locator('input[name="nick"]').waitFor({ state: "visible" });
+  assert.equal(await page.locator('input[name="addr"]').isVisible(), false);
+  await page.getByText("Advanced", { exact: true }).click();
   await page.locator('input[name="addr"]').waitFor({ state: "visible" });
   assert.equal(await page.locator('input[name="addr"]').inputValue(), upstream.address);
   assert.equal(await page.locator('input[name="nick"]').inputValue(), "webjourney");
@@ -1348,7 +1381,7 @@ try {
   await waitForHealthyServer();
   await page.goto(`${applicationOrigin}/console/networks/journey`);
   await page.getByRole("heading", { name: "journey", exact: true }).waitFor();
-  await page.getByText("Received from upstream", { exact: true }).waitFor();
+  await page.getByText("Received", { exact: true }).waitFor();
   await page
     .locator(".backlog code")
     .filter({ hasText: "browser receives through the real stack" })
@@ -1365,8 +1398,6 @@ try {
   assert.equal(restartedObservability.status(), 200);
   assert.equal((await restartedObservability.json()).current.queues["core-0"].capacity, 32_768);
 
-  await page.goto(`${applicationOrigin}/`);
-  await page.locator("#network-select").waitFor();
   let deliberateFailureRequests = 0;
   await page.route(`${applicationOrigin}/api/v1/me/networks`, async (route) => {
     deliberateFailureRequests += 1;
@@ -1382,15 +1413,14 @@ try {
       response.url() === `${applicationOrigin}/api/v1/me/networks` &&
       response.status() === 503,
   );
-  await page.reload();
+  // With no network named in the URL the client would open one by itself, so a
+  // failed list is what decides that nothing can be opened.
+  await page.goto(`${applicationOrigin}/`);
   await deliberateFailureResponse;
   await page.locator('[data-alert="networks"]').waitFor();
   assert.match(await page.locator("#messages").innerText(), /API failure, not an empty account/);
   assert.match(await page.locator('[data-alert="networks"]').innerText(), /Database unavailable/);
-  assert.equal(
-    await page.locator("#network-select option").first().textContent(),
-    "Networks unavailable",
-  );
+  assert.match(await page.locator("#networks").innerText(), /Networks unavailable/);
   const deliberateFailureErrors = applicationErrors.splice(deliberateFailureErrorStart);
   // Every engine records the handled fetch 503 through the first-party
   // response diagnostic as method, status, and URL; the application contract
@@ -1565,7 +1595,7 @@ try {
   assert.equal(await page.locator("#nickcount").textContent(), "3");
   assert.equal(namesRequestedBeforeSnapshot, false, "NAMES was requested before replay completed");
   assert.match(
-    await page.locator("#network-select option:checked").textContent(),
+    await page.locator("#networks .network-row.is-active .network-state").textContent(),
     /reconnecting/,
   );
   const expectedTaggedTime = await page.evaluate(() => {
@@ -1942,7 +1972,7 @@ try {
   assert.equal(page.url(), `${applicationOrigin}/login`);
   const directTraceStart = navigationTrace.length;
   const directSignIn = page.getByRole("link", { name: "Sign in with dex" });
-  await clickAndWaitForURL(page, directSignIn, `${applicationOrigin}/`);
+  await clickAndWaitForURL(page, directSignIn, applicationEntryOpening("journey"));
   await page.locator("#account-name").waitFor();
   assert.ok(
     navigationTrace.slice(directTraceStart).includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/start`),
@@ -1961,7 +1991,7 @@ try {
   signIn = page.getByRole("link", { name: "Sign in with dex" });
   assert.equal(await signIn.getAttribute("href"), "/api/v1/auth/oidc/dex/start");
   const recoveryTraceStart = navigationTrace.length;
-  await clickAndWaitForURL(page, signIn, `${applicationOrigin}/`);
+  await clickAndWaitForURL(page, signIn, applicationEntryOpening("journey"));
   assert.ok(
     navigationTrace.slice(recoveryTraceStart).includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/start`),
     `signed-out recovery bypassed the e6irc OpenID Connect starter:\n${navigationTrace.slice(recoveryTraceStart).join("\n")}`,

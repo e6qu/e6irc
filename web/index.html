@@ -19,12 +19,6 @@
           aria-expanded="false"
           aria-controls="sidebar"
         >Conversations</button>
-        <label id="network-control">
-          <span>Route</span>
-          <select id="network-select" aria-label="Active network">
-            <option value="">Choose a network</option>
-          </select>
-        </label>
         <span id="status" class="status status-connecting" role="status" aria-live="polite">starting…</span>
         <details id="settings">
           <summary>Preferences</summary>
@@ -38,7 +32,6 @@
               </select>
             </label>
             <button id="notify-toggle" type="button">Desktop notifications: off</button>
-            <button id="raw-output-toggle" type="button">Raw IRC output: off</button>
             <span id="storage-state" class="settings-note" hidden></span>
           </div>
         </details>
@@ -56,10 +49,10 @@
 
       <div id="workspace">
         <aside id="sidebar" aria-label="Conversations">
-          <!-- Networks first, each carrying its own settings control. Signing in
-               to Libera with an account you already hold is a property of the
-               network, so it belongs on the network -- not behind a link named
-               "Manage" pointing at a separate application. -->
+          <!-- The one list of networks: it opens a network, shows its live
+               state, and carries its settings control. Signing in to Libera
+               with an account you already hold is a property of the network,
+               so it belongs on the network. -->
           <div class="side-head side-head-row">
             <span>Networks</span>
             <span class="side-actions">
@@ -75,16 +68,15 @@
           </div>
           <ul id="networks" aria-label="Networks"></ul>
 
-          <!-- The raw wire log belongs beside the conversations, not inside a
-               preferences menu: it is where you look when a connection or a
-               NickServ exchange misbehaves, which is exactly when nobody thinks
-               to open settings. -->
+          <!-- The raw wire log is where you look when a connection or a
+               NickServ exchange misbehaves, so its one switch sits beside the
+               conversations rather than in a preferences menu. -->
           <button
             id="server-log-link"
             type="button"
             class="side-link"
             aria-pressed="false"
-          >Server log<small>Raw IRC lines</small></button>
+          >Server log<small>Every line received</small></button>
 
           <div class="side-head">Conversations</div>
           <form id="join-form" autocomplete="off">
@@ -97,7 +89,7 @@
         <section id="chatpane" tabindex="-1">
           <div id="bufhead">
             <div class="buffer-identity">
-              <p class="route-kicker"><span id="route-network">No network</span><span aria-hidden="true">→</span><span>Conversation</span></p>
+              <p class="route-kicker" id="route-network"></p>
               <div class="buffer-title"><h1 id="bufname">—</h1><span id="buftopic" class="topic"></span></div>
             </div>
             <button id="buffer-action" type="button" hidden>Close</button>
@@ -107,15 +99,11 @@
           <button id="jump-latest" type="button" hidden>Jump to latest messages</button>
           <section id="raw-output-panel" aria-labelledby="raw-output-title" hidden>
             <div class="raw-output-head">
-              <strong id="raw-output-title">Raw IRC receiver tape</strong>
-              <span>Exact inbound wire lines, newest at the bottom</span>
+              <strong id="raw-output-title">Server log</strong>
+              <span>Every line received, newest at the bottom</span>
             </div>
             <ol id="raw-output-lines" tabindex="0" aria-label="Raw IRC output"></ol>
           </section>
-          <details id="command-guide">
-            <summary>IRC commands</summary>
-            <p><code>/join #channel</code> · <code>/part</code> · <code>/query nick</code> · <code>/msg nick text</code> · <code>/notice nick text</code> · <code>/nick name</code> · <code>/topic text</code> · <code>/me action</code> · <code>/raw COMMAND</code>. Other slash commands are sent as IRC commands; use <code>/help</code> to show this guide in the server buffer.</p>
-          </details>
           <form id="composer" autocomplete="off">
             <input
               type="text"
@@ -138,51 +126,27 @@
       </div>
 
       <!-- Network settings, reachable from the cog on each network and from
-           "+". The credential fields are the point: an account already held on
-           Libera is entered here, in the client, rather than in a separate
-           console the chat UI only hinted at. -->
+           "+". What a person has to decide comes first: which network, which
+           nickname, and the account they already hold there. Everything a
+           known network already determines sits under Advanced. -->
       <dialog id="network-dialog" aria-labelledby="network-dialog-title">
         <form id="network-form" autocomplete="off">
           <h2 id="network-dialog-title">Add a network</h2>
 
-          <label class="field">
-            <span>Name</span>
-            <input id="nf-name" name="name" required maxlength="64" placeholder="libera" />
-            <small id="nf-name-note">A short label for this connection.</small>
-          </label>
-
-          <label class="field">
-            <span>Server</span>
-            <input id="nf-addr" name="addr" required maxlength="255" placeholder="irc.libera.chat:6697" />
-          </label>
-
-          <label class="check">
-            <input id="nf-tls" name="tls" type="checkbox" checked />
-            <span>Use TLS<small>Libera requires TLS on port 6697.</small></span>
+          <label class="field" id="nf-preset-row">
+            <span>Network</span>
+            <select id="nf-preset" name="preset"></select>
           </label>
 
           <label class="field">
             <span>Nickname</span>
             <input id="nf-nick" name="nick" required maxlength="32" autocomplete="username" />
-            <small>Use the nickname your NickServ account is registered to.</small>
-          </label>
-
-          <label class="field">
-            <span>Real name <em>optional</em></span>
-            <input id="nf-realname" name="realname" maxlength="128" />
-          </label>
-
-          <label class="field">
-            <span>Auto-join channels <em>optional</em></span>
-            <input id="nf-autojoin" name="autojoin" maxlength="512" placeholder="#e6qu, #rust" />
-            <small>Comma or space separated. Re-joined automatically after a reconnect.</small>
           </label>
 
           <fieldset id="nf-credentials">
-            <legend>Account on this network</legend>
+            <legend>Your account on this network <em>optional</em></legend>
             <p class="field-note">
-              Already registered with NickServ? Enter that account and password
-              and the connection authenticates with SASL on every reconnect.
+              Already registered with NickServ? Enter that account and password.
               Leave both blank to connect without an account.
             </p>
 
@@ -220,6 +184,38 @@
               <span><strong>Remove the stored account and password</strong><small>The connection will stop authenticating.</small></span>
             </label>
           </fieldset>
+
+          <label class="field">
+            <span>Channels to join <em>optional</em></span>
+            <input id="nf-autojoin" name="autojoin" maxlength="512" placeholder="#e6qu, #rust" />
+            <small>Comma or space separated. Re-joined automatically after a reconnect.</small>
+          </label>
+
+          <details id="nf-advanced">
+            <summary>Advanced</summary>
+
+            <label class="field">
+              <span>Name</span>
+              <input id="nf-name" name="name" required maxlength="64" />
+              <small id="nf-name-note">A short label for this connection.</small>
+            </label>
+
+            <label class="field">
+              <span>Server</span>
+              <input id="nf-addr" name="addr" required maxlength="255" placeholder="irc.example.org:6697" />
+            </label>
+
+            <label class="check">
+              <input id="nf-tls" name="tls" type="checkbox" checked />
+              <span>Use TLS<small>Recommended for every public network.</small></span>
+            </label>
+
+            <label class="field">
+              <span>Real name <em>optional</em></span>
+              <input id="nf-realname" name="realname" maxlength="128" />
+              <small>Shown to others in /whois. Your nickname is used when this is blank.</small>
+            </label>
+          </details>
 
           <p id="nf-error" class="dialog-error" role="alert" hidden></p>
 

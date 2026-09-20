@@ -3,18 +3,18 @@
   <div data-api-network-log data-network-name="{{ name }}" data-refresh-seconds="5" data-refresh-status="network-log-refresh-status">
     <div class="page-head">
       <div>
-        <p class="eyebrow">Component log</p>
-        <h1 data-network-log-title>Loading component…</h1>
-        <p class="lede">The newest 1,000 lines from this always-on IRC or bridge component, including lifecycle notices. Secrets are never stored or shown.</p>
+        <p class="eyebrow">Network log</p>
+        <h1 data-network-log-title>Loading network log…</h1>
+        <p class="lede">The newest 1,000 lines from this network, including connection notices. Secrets are never stored or shown.</p>
       </div>
       <div class="page-actions">
         <button type="button" data-refresh-target="#network-log-panel">Refresh</button>
-        <a class="button-link secondary-link" data-network-log-detail>Component details</a>
+        <a class="button-link secondary-link" data-network-log-detail>Network details</a>
       </div>
     </div>
     <noscript><div class="banner-error">JavaScript is required because this page reads the owner API.</div></noscript>
     <section id="network-log-panel" class="panel" aria-live="polite">
-      <div class="chart-empty">Loading component log…</div>
+      <div class="chart-empty">Loading network log…</div>
     </section>
     <p id="network-log-refresh-status" class="refresh-status" aria-live="polite">Refreshes every five seconds.</p>
   </div>
