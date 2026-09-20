@@ -514,6 +514,15 @@ test("operation requests preserve an API problem detail", async () => {
   );
 });
 
+test("string length limits count characters, as the server does, not UTF-16 units", () => {
+  const limited = { type: "string", minLength: 2, maxLength: 4 };
+  // Four emoji are eight UTF-16 units but four characters.
+  assert.equal(parseApiSchema(limited, "😀😀😀😀", "value"), "😀😀😀😀");
+  assert.throws(() => parseApiSchema(limited, "😀😀😀😀😀", "value"), ApiSchemaError);
+  // One emoji is two units but a single character: below the minimum.
+  assert.throws(() => parseApiSchema(limited, "😀", "value"), ApiSchemaError);
+});
+
 test("an API problem carries the request field it belongs to", async () => {
   const refuse = (problem) => getOperationJson(
     async () => new Response(JSON.stringify(problem), {

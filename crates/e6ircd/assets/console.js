@@ -1,5 +1,5 @@
 import { apiContractLoader, getOperationJson } from "/console-contract.js";
-import { loadSettings, saveSettings } from "/console-settings.js";
+import { loadSettings, saveSetting } from "/console-settings.js";
 
 (() => {
   "use strict";
@@ -48,7 +48,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     consoleTheme.addEventListener("change", () => {
       const nextTheme = consoleTheme.value;
       applyConsoleTheme(nextTheme);
-      const warning = saveSettings(() => localStorage, { ...loaded.settings, theme: nextTheme });
+      const warning = saveSetting(() => localStorage, "theme", nextTheme);
       showConsoleThemeResult(warning || "Theme preference saved for chat and console.");
     });
   }

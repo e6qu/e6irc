@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { ApiError } from "./api-contract.js";
-export { DEFAULT_SETTINGS, SETTINGS_KEY, loadSettings, saveSettings } from "./settings.js";
+export { DEFAULT_SETTINGS, SETTINGS_KEY, loadSettings, saveSetting } from "./settings.js";
 
 export { ApiError };
 
@@ -43,6 +43,10 @@ export function backlogFrom(payload) {
 export function networkStateLabel(network) {
   if (network.enabled === false) return "disabled";
   if (network.connected === true) return "connected";
+  // No runtime means no driver exists for this network on this server (its
+  // bridge was not built in). It is not on its way anywhere, so it must not
+  // read "starting" forever; the console says "not running" for the same fact.
+  if (network.runtime === null) return "not running";
   return network.state?.replaceAll("_", " ") || "starting";
 }
 
@@ -62,7 +66,9 @@ export function networkStateHelp(network) {
   // Without them the advice points at the Server log, where they would be.
   const said = network.failureDetail ? `The network said: “${network.failureDetail}”` : null;
   const repair = stateRepair(network, said ? "" : " Open Server log for its reason.");
-  if (repair === null) return null;
+  // A refusal with no specific repair (a throttle, a ban, a rejected server
+  // password) still has the network's own words, and they are the whole point.
+  if (repair === null) return said;
   return said ? `${repair} ${said}` : repair;
 }
 
@@ -93,6 +99,7 @@ export function errorMessage(action, error) {
   if (error instanceof ApiError && error.status === 401) {
     return `Your session expired while trying to ${action}. Sign in again.`;
   }
-  const detail = error instanceof Error && error.message ? ` ${error.message}.` : "";
+  const sentence = error instanceof Error ? error.message.trim() : "";
+  const detail = sentence ? ` ${/[.!?]$/.test(sentence) ? sentence : `${sentence}.`}` : "";
   return `Could not ${action}.${detail}`;
 }

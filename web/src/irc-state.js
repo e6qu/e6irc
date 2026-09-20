@@ -191,11 +191,28 @@ export function topicReply(params) {
   return { channel: params[1], topic: params[2] };
 }
 
-// A CTCP ACTION (`\x01ACTION text\x01`) renders as "* nick text".
+// mIRC-style formatting: bold, italic, underline, strikethrough, monospace,
+// reverse and reset are single control bytes; colour is ^C with up to two
+// decimal pairs, and hex colour is ^D with up to two six-digit values. This
+// client renders plain text, so they are removed -- otherwise coloured bot
+// output and topics read as `04,01text`.
+const FORMATTING = /\x03(?:\d{1,2}(?:,\d{1,2})?)?|\x04(?:[0-9a-fA-F]{6}(?:,[0-9a-fA-F]{6})?)?|[\x02\x0f\x11\x16\x1d\x1e\x1f]/g;
+
+export function stripFormatting(text) {
+  return String(text ?? "").replace(FORMATTING, "");
+}
+
+// A CTCP ACTION (`\x01ACTION text\x01`) renders as "* nick text". Any other
+// CTCP is named rather than shown as raw \x01 bytes.
 export function asMessage(kind, from, text) {
   const action = text.match(/^\x01ACTION (.*?)\x01?$/s);
-  if (action) return { kind: "event", from: null, text: `* ${from} ${action[1]}` };
-  return { kind, from, text };
+  if (action) return { kind: "event", from: null, text: `* ${from} ${stripFormatting(action[1])}` };
+  const ctcp = text.match(/^\x01([^\x01 ]+)(?: (.*?))?\x01?$/s);
+  if (ctcp) {
+    const detail = ctcp[2] ? `: ${stripFormatting(ctcp[2])}` : "";
+    return { kind: "event", from: null, text: `${from} sent a CTCP ${ctcp[1]} request${detail}` };
+  }
+  return { kind, from, text: stripFormatting(text) };
 }
 
 // Prepend persisted history without replacing lines already present in the

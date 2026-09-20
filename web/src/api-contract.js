@@ -172,8 +172,12 @@ export function parseApiSchema(schema, value, label = "API response", path = "$"
     schemaError(label, path);
   }
   if (typeof value === "string") {
-    if (Number.isInteger(schema.minLength) && value.length < schema.minLength) schemaError(label, path);
-    if (Number.isInteger(schema.maxLength) && value.length > schema.maxLength) schemaError(label, path);
+    if (Number.isInteger(schema.minLength) && [...value].length < schema.minLength) schemaError(label, path);
+    // JSON Schema lengths count characters (code points), which is also what
+    // the server bounds. `.length` counts UTF-16 units, so a refusal quoting
+    // emoji would fail a 160-character limit at 81 and take the whole network
+    // list down with it.
+    if (Number.isInteger(schema.maxLength) && [...value].length > schema.maxLength) schemaError(label, path);
     if (typeof schema.pattern === "string" && !(new RegExp(schema.pattern).test(value))) schemaError(label, path);
     return value;
   }

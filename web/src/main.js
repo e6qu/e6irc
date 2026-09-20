@@ -21,7 +21,8 @@ import {
   networkStateIsFailure,
   networkStateLabel,
   networksFrom,
-  saveSettings,
+  SETTINGS_KEY,
+  saveSetting,
 } from "./client-state.js";
 import { apiContractLoader, getOperationJson } from "./api-contract.js";
 import { serializeComposerRequest } from "./composer-request.js";
@@ -45,6 +46,7 @@ import {
   parseIrc,
   reconcileChannelSnapshot,
   splitSigil,
+  stripFormatting,
   stripSigil,
   tagValue,
   topicReply,
@@ -126,7 +128,16 @@ const rawTape = [];
 const loadedSettings = loadSettings(() => window.localStorage);
 const settings = loadedSettings.settings;
 
+// What was last reported under each key, so a condition that is re-detected on
+// a timer is said once: the alert is neither rebuilt (a role=alert whose text
+// is reassigned is announced again) nor resurrected after it was dismissed.
+// Clearing the key -- the condition ended -- lets it be reported afresh.
+const reportedAlerts = new Map();
+
 function showAlert(key, text, tone = "warning", action = null) {
+  const report = `${tone}\n${text}\n${action?.label ?? ""}`;
+  if (reportedAlerts.get(key) === report) return;
+  reportedAlerts.set(key, report);
   let alert = alertsEl.querySelector(`[data-alert="${CSS.escape(key)}"]`);
   if (!alert) {
     alert = document.createElement("div");
@@ -163,11 +174,12 @@ function showAlert(key, text, tone = "warning", action = null) {
 }
 
 function clearAlert(key) {
+  reportedAlerts.delete(key);
   alertsEl.querySelector(`[data-alert="${CSS.escape(key)}"]`)?.remove();
 }
 
-function persistSettings() {
-  const warning = saveSettings(() => window.localStorage, settings);
+function persistSetting(key) {
+  const warning = saveSetting(() => window.localStorage, key, settings[key]);
   const storageState = el("storage-state");
   if (warning) {
     storageState.textContent = warning;
@@ -200,6 +212,18 @@ const buffers = new Map();
 const namesSnapshots = new Set();
 const namesRequested = new Set();
 let active = null;
+// Channels this client asked to join (folded), so that only those joins move
+// the view. Bounded: a channel that never confirms is forgotten with the rest
+// when the list is full.
+const requestedJoins = new Set();
+const MAX_REQUESTED_JOINS = 64;
+function rememberRequestedJoins(list) {
+  for (const channel of String(list).split(",")) {
+    if (!isChannel(channel)) continue;
+    if (requestedJoins.size >= MAX_REQUESTED_JOINS) requestedJoins.clear();
+    requestedJoins.add(fold(channel));
+  }
+}
 let myNick = null;
 let socket = null;
 let upstreamConnected = false;
@@ -306,6 +330,10 @@ if (sidebarToggle) {
 }
 
 document.addEventListener("keydown", (event) => {
+  // An open modal owns Escape. Cancelling the event here for the rail or the
+  // preferences menu beneath it would also cancel the dialog's close request,
+  // so the dialog would need a second press.
+  if (document.querySelector("dialog[open]")) return;
   if (event.key === "Escape" && document.body.classList.contains("sidebar-open")) {
     event.preventDefault();
     closeMobileSidebar({ restoreFocus: true });
@@ -783,7 +811,7 @@ function addLine(bufName, kind, bufKind, from, text, tags = null, wire = null) {
     // Trim on the actual DOM node count — the model was already clamped above,
     // so a guard on `b.lines.length` would never fire and the DOM would grow
     // without bound while pinned to one channel.
-    while (messagesEl.children.length > MAX_LINES && messagesEl.firstChild) {
+    while (messagesEl.children.length > lineLimit && messagesEl.firstChild) {
       messagesEl.removeChild(messagesEl.firstChild);
     }
     if (atLatest) {
@@ -854,6 +882,18 @@ function renameNick(from, to) {
   const fromKey = fold(stripSigil(from));
   const toName = stripSigil(to);
   if (!fromKey || !toName) return;
+  const conversation = buffers.get(fromKey);
+  if (conversation && conversation.kind === "dm" && !buffers.has(fold(toName))) {
+    // Sends to the old nick would go nowhere while echoing here as delivered.
+    buffers.delete(fromKey);
+    conversation.key = fold(toName);
+    conversation.display = toName;
+    buffers.set(conversation.key, conversation);
+    if (active === fromKey) active = conversation.key;
+    addEvent(toName, `${stripSigil(from)} is now ${toName}`);
+    renderBufferList();
+    if (active === conversation.key) renderActive();
+  }
   for (const b of buffers.values()) {
     if (b.kind !== "channel") continue;
     const entry = b.nicks.get(fromKey);
@@ -870,7 +910,7 @@ function renameNick(from, to) {
 function setTopic(chan, topic) {
   const b = ensureBuffer(chan, "channel");
   if (b.kind !== "channel") return;
-  b.topic = topic || "";
+  b.topic = stripFormatting(topic);
   if (b.key === active) buftopicEl.textContent = b.topic;
 }
 
@@ -912,7 +952,7 @@ function maybeNotify(b, line) {
     new Notification(title, { body: line.text, tag: b.key });
   } catch (error) {
     settings.notifications = false;
-    persistSettings();
+    persistSetting("notifications");
     updateSettingsUI();
     showAlert(
       "notifications",
@@ -969,7 +1009,11 @@ function handleLine(raw) {
         if (isMe(m.nick)) {
           const buffer = ensureBuffer(channel, "channel");
           if (buffer.kind === "channel") buffer.joined = true;
-          setActive(channel);
+          // Only a join asked for here moves the view. The bouncer rejoins
+          // every channel after an upstream reconnect, and another attached
+          // client can join too; following those would yank the reader out of
+          // the conversation they are in, once per channel.
+          if (requestedJoins.delete(fold(channel))) setActive(channel);
         } else if (m.nick) {
           addNick(channel, m.nick);
           addEvent(channel, `${m.nick} joined`);
@@ -1379,6 +1423,8 @@ composer.addEventListener("submit", (e) => {
     return;
   }
   const target = b ? b.display : "";
+  const joining = text.match(/^\/(?:join|j)\s+(\S+)/i);
+  if (joining) rememberRequestedJoins(joining[1]);
   nextSendId += 1;
   const requestId = nextSendId.toString(36);
   pendingSends.set(requestId, { buffer: b, text });
@@ -1405,6 +1451,7 @@ if (joinForm) {
     if (!chan) return;
     if (!isChannel(chan)) chan = "#" + chan;
     if (socket && socket.readyState === WebSocket.OPEN) {
+      rememberRequestedJoins(chan);
       try {
         if (!sendComposer("", `/join ${chan}`)) {
           addServer("Not connected — cannot join yet.");
@@ -1455,6 +1502,7 @@ function renderNetworkList(networks, failure = null) {
   for (const item of networks) {
     const row = document.createElement("li");
     row.className = "network-row";
+    row.dataset.network = item.name;
     if (network !== null && fold(item.name) === fold(network)) row.classList.add("is-active");
 
     const open = document.createElement("a");
@@ -1491,13 +1539,20 @@ function renderNetworkList(networks, failure = null) {
       open.append(note);
     }
 
-    const cog = document.createElement("button");
-    cog.type = "button";
+    // The dialog speaks IRC: nickname, NickServ, server. A bridge's fields are
+    // a token and room identifiers, which the console's per-type form owns.
+    const irc = item.kind === "irc";
+    const cog = document.createElement(irc ? "button" : "a");
     cog.className = "network-cog";
     cog.title = `Settings for ${item.name}`;
     cog.setAttribute("aria-label", `Settings for ${item.name}`);
     cog.textContent = "⚙";
-    cog.addEventListener("click", () => void openNetworkDialog(item.name));
+    if (irc) {
+      cog.type = "button";
+      cog.addEventListener("click", () => void openNetworkDialog(item.name));
+    } else {
+      cog.href = `/console/networks/${encodeURIComponent(item.name)}`;
+    }
 
     row.append(open, cog);
     networksEl.append(row);
@@ -1555,11 +1610,33 @@ function applyPreset() {
     return;
   }
   // Custom: the name and server are now the person's to fill in, so show them.
-  el("nf-name").value = "";
-  el("nf-addr").value = "";
+  // Only a known network's own values are cleared -- anything the person typed
+  // survives flipping the select back and forth.
+  const known = (field) => networkPresets.some((item) => item[field] === el(`nf-${field}`).value);
+  if (known("name")) el("nf-name").value = "";
+  if (known("addr")) el("nf-addr").value = "";
   el("nf-advanced").open = true;
   el("nf-name").focus();
 }
+
+// The reveal switch changes the input's type, which form.reset() does not
+// undo: without this a password shown, then cancelled, is still in clear (under
+// a button reading "Hide") the next time the dialog opens.
+function hideRevealedSecrets() {
+  for (const button of document.querySelectorAll("[data-reveal]")) {
+    const field = el(button.dataset.reveal);
+    if (!field) continue;
+    field.type = "password";
+    button.textContent = "Show";
+    button.setAttribute("aria-pressed", "false");
+    button.setAttribute("aria-label", "Show password");
+  }
+}
+// A typed secret does not outlive the dialog it was typed into.
+networkDialog?.addEventListener("close", () => {
+  networkForm?.reset();
+  hideRevealedSecrets();
+});
 
 // A required field inside a closed <details> would refuse the submit with no
 // visible reason. Open the section the moment the browser reports one.
@@ -1569,11 +1646,20 @@ el("nf-preset")?.addEventListener("change", applyPreset);
 // Editing shows what is configured but never a stored password: the API does
 // not return one, and this deliberately does not ask it to. Leaving the field
 // empty keeps whatever is already sealed, which is why the note changes.
+// Each opening gets a number. A slow response for an earlier opening must not
+// fill in -- or throw inside -- a later one: two quick clicks on different cogs
+// used to be able to save one network's server and nickname under the other's
+// name.
+let dialogOpening = 0;
+
 async function openNetworkDialog(name = null) {
   if (!networkDialog || !networkForm) return;
+  dialogOpening += 1;
+  const opening = dialogOpening;
   setDialogError("");
   clearFieldMarks();
   networkForm.reset();
+  hideRevealedSecrets();
   networkForm.dataset.editing = name || "";
   const editing = name !== null;
   el("network-dialog-title").textContent = editing ? `Settings — ${name}` : "Add a network";
@@ -1589,9 +1675,16 @@ async function openNetworkDialog(name = null) {
     : "Stored encrypted; never shown again once saved.";
   el("nf-tls").checked = true;
 
+  // Shown at once, so the click visibly did something, but not saveable until
+  // what it edits has arrived.
+  el("nf-save").disabled = true;
+  networkForm.setAttribute("aria-busy", "true");
+  if (!networkDialog.open) networkDialog.showModal();
+
   try {
     if (editing) {
       const detail = await apiGet(`/api/v1/me/networks/${encodeURIComponent(name)}`);
+      if (opening !== dialogOpening) return;
       el("nf-name").value = detail.name ?? name;
       el("nf-addr").value = detail.addr ?? "";
       el("nf-tls").checked = detail.tls !== false;
@@ -1600,7 +1693,9 @@ async function openNetworkDialog(name = null) {
       el("nf-autojoin").value = Array.isArray(detail.autojoin) ? detail.autojoin.join(", ") : "";
       el("nf-sasl-account").value = detail.sasl_account ?? "";
     } else {
-      networkPresets = (await apiGet("/api/v1/network-presets")).presets;
+      const catalog = (await apiGet("/api/v1/network-presets")).presets;
+      if (opening !== dialogOpening) return;
+      networkPresets = catalog;
       const options = [...networkPresets, { id: CUSTOM_PRESET, label: "Another network…" }];
       el("nf-preset").replaceChildren(...options.map((preset) => {
         const option = document.createElement("option");
@@ -1613,12 +1708,24 @@ async function openNetworkDialog(name = null) {
       applyPreset();
       el("nf-nick").value = el("account-link").dataset.shauthUser ?? "";
     }
+    el("nf-save").disabled = false;
   } catch (error) {
+    if (opening !== dialogOpening) return;
     setDialogError(errorMessage(editing ? `load ${name}` : "load the known networks", error));
+    if (editing) {
+      // Saving a form that never loaded would overwrite the stored channels
+      // and real name with blanks. Save stays off; reopening tries again.
+      return;
+    }
+    // Adding still works without the catalog: the person types the server.
+    networkPresets = [];
+    el("nf-preset-row").hidden = true;
     el("nf-advanced").open = true;
+    el("nf-save").disabled = false;
+  } finally {
+    if (opening === dialogOpening) networkForm.removeAttribute("aria-busy");
   }
 
-  networkDialog.showModal();
   (editing ? el("nf-sasl-account") : el("nf-nick")).focus();
 }
 
@@ -1719,7 +1826,7 @@ function syncServerLogLink() {
 if (serverLogLink) {
   serverLogLink.addEventListener("click", () => {
     settings.rawOutput = !settings.rawOutput;
-    persistSettings();
+    persistSetting("rawOutput");
     renderRawOutput();
     syncServerLogLink();
     if (settings.rawOutput) {
@@ -1792,18 +1899,52 @@ function renderLanding(networks, failure = null) {
 // the list is re-read while the page is visible. A failed refresh keeps the
 // last good list on screen and says so once, rather than blanking it.
 const NETWORK_REFRESH_MS = 10_000;
+let networkListTimer = null;
+let renderedNetworks = null;
+
+// Re-rendering replaces every row, which drops keyboard focus and any hover
+// text; so an unchanged list is left alone, and a changed one hands focus back
+// to the same control of the same network.
+function renderNetworkListKeepingFocus(networks) {
+  const rendered = JSON.stringify(networks);
+  if (rendered === renderedNetworks) return;
+  renderedNetworks = rendered;
+  const focused = document.activeElement;
+  const row = focused instanceof HTMLElement && networksEl.contains(focused) ? focused.closest(".network-row") : null;
+  const name = row?.dataset.network ?? null;
+  const control = focused?.classList.contains("network-cog") ? ".network-cog" : ".network-open";
+  renderNetworkList(networks);
+  if (name === null) return;
+  const again = Array.from(networksEl.querySelectorAll(".network-row")).find((item) => item.dataset.network === name);
+  again?.querySelector(control)?.focus();
+}
+
 async function refreshNetworkList() {
   try {
-    renderNetworkList(networksFrom(await apiGet("/api/v1/me/networks")));
+    renderNetworkListKeepingFocus(networksFrom(await apiGet("/api/v1/me/networks")));
     clearAlert("networks");
   } catch (error) {
-    showAlert("networks", errorMessage("refresh your networks", error), "error");
+    const expired = error instanceof ApiError && error.status === 401;
+    showAlert(
+      "networks",
+      errorMessage("refresh your networks", error),
+      "error",
+      expired ? { href: "/login", label: "Sign in" } : null,
+    );
+    // Asking again cannot succeed until the person signs in.
+    if (expired && networkListTimer !== null) {
+      window.clearInterval(networkListTimer);
+      networkListTimer = null;
+    }
   }
 }
 function keepNetworkListCurrent() {
-  window.setInterval(() => {
+  const refreshWhenShown = () => {
     if (document.visibilityState === "visible" && !networkDialog?.open) void refreshNetworkList();
-  }, NETWORK_REFRESH_MS);
+  };
+  networkListTimer = window.setInterval(refreshWhenShown, NETWORK_REFRESH_MS);
+  // Coming back to the tab should not show up to ten seconds of stale state.
+  document.addEventListener("visibilitychange", refreshWhenShown);
 }
 
 // ---- load earlier history ----------------------------------------------
@@ -1878,6 +2019,14 @@ if (loadEarlierBtn) loadEarlierBtn.addEventListener("click", loadEarlier);
 const themeSelect = el("theme-select");
 const notifyBtn = el("notify-toggle");
 
+// Another tab (the console's theme picker, a second chat) changed a preference.
+window.addEventListener("storage", (event) => {
+  if (event.key !== null && event.key !== SETTINGS_KEY) return;
+  Object.assign(settings, loadSettings(() => window.localStorage).settings);
+  applyTheme();
+  updateSettingsUI();
+});
+
 function updateSettingsUI() {
   if (themeSelect) themeSelect.value = settings.theme;
   if (notifyBtn) {
@@ -1892,7 +2041,7 @@ function updateSettingsUI() {
 if (themeSelect) {
   themeSelect.addEventListener("change", () => {
     settings.theme = themeSelect.value;
-    persistSettings();
+    persistSetting("theme");
     applyTheme();
   });
 }
@@ -1920,7 +2069,7 @@ if (notifyBtn) {
     } else {
       settings.notifications = false;
     }
-    persistSettings();
+    persistSetting("notifications");
     updateSettingsUI();
   });
 }
