@@ -111,12 +111,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
       # fuzz/ is a package of its own with its own lock, so the workspace check
-      # above never sees it. Same policy file, second manifest.
+      # above never sees it. Same policy file, second manifest: cargo-deny looks
+      # for deny.toml beside the manifest and then in each parent directory, so
+      # it finds the repository's. (The action passes `command-arguments` as one
+      # word, so `--config deny.toml` there is an unknown argument, not a path.)
       - name: cargo deny (fuzz package)
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           manifest-path: fuzz/Cargo.toml
-          command-arguments: --config deny.toml
 
   # Full OS/arch matrix (DESIGN §1): no cell is a second-class port.
   test:
