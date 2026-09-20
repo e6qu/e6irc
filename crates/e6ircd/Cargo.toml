@@ -35,7 +35,7 @@ e6irc-queue = { path = "../e6irc-queue" }
 e6irc-client = { path = "../e6irc-client" }
 # Publish dates verified against crates.io for the 24h cooldown:
 # bytes 1.12.1 (2026-07-08), tokio 1.53.0 (2026-07-17, 34h),
-# rustls 0.23.42 (2026-07-13), tokio-rustls 0.26.4 (2025-09-26),
+# rustls 0.23.45 (2026-09-14), tokio-rustls 0.26.4 (2025-09-26),
 # serde 1.0.228 (2025-09-27), toml 1.1.3 (2026-07-14).
 bytes = { version = "1.12.1", default-features = false }
 tokio = { version = "1.53.0", default-features = false, features = [
@@ -47,7 +47,7 @@ tokio = { version = "1.53.0", default-features = false, features = [
     # SIGTERM/SIGINT handling for graceful shutdown (main.rs, DESIGN §18).
     "signal",
 ] }
-rustls = { version = "0.23.42", default-features = false, features = [
+rustls = { version = "0.23.45", default-features = false, features = [
     "aws_lc_rs",
     "tls12",
     "std",

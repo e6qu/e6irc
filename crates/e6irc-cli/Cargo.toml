@@ -36,7 +36,7 @@ path = "src/main.rs"
 
 [dev-dependencies]
 e6ircd = { path = "../e6ircd" }
-rustls = { version = "0.23.42", default-features = false, features = ["aws_lc_rs", "tls12", "std"] }
+rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs", "tls12", "std"] }
 rustls-pki-types = { version = "1.15.0", default-features = false, features = ["std"] }
 rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs", "pem"] }
 sqlx = { version = "0.9.0", default-features = false, features = [
