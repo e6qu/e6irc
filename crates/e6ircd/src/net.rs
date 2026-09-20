@@ -576,7 +576,15 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 // shared daemon for every user. Config-file networks still fail
                 // hard (they are the operator's own, checked at start).
                 match crate::bouncer::driver_from_row(&row, secret_key.as_deref(), &owner) {
-                    Ok(driver) => reg.add(Some(&owner), &row.name, driver),
+                    Ok(driver) => {
+                        // A configuration-file network may already hold this
+                        // key. The operator's own entry wins; say so rather
+                        // than abort the boot or run two upstream sessions.
+                        if let Err(error) = reg.add(Some(&owner), &row.name, driver) {
+                            telemetry.record_error(ErrorKind::Bouncer);
+                            eprintln!("bnc: skipping stored network: {error}");
+                        }
+                    }
                     Err(e) => {
                         telemetry.record_error(ErrorKind::Bouncer);
                         eprintln!(

@@ -29,6 +29,10 @@ pub struct NetworkConfig {
     /// before it declares a silent upstream dead). 120s in production; tests
     /// shrink it to exercise the half-open-upstream path in real time.
     pub keepalive_idle: Duration,
+    /// First delay after the upstream refuses registration, doubled per
+    /// consecutive refusal. 30s in production; tests shrink it to reach the
+    /// parked state in real time.
+    pub rejection_retry_floor: Duration,
 }
 
 impl Default for NetworkConfig {
@@ -42,6 +46,7 @@ impl Default for NetworkConfig {
             buffer_cap: 1000,
             sasl: None,
             keepalive_idle: KEEPALIVE_IDLE,
+            rejection_retry_floor: super::REJECTION_RETRY_FLOOR,
         }
     }
 }
@@ -298,6 +303,14 @@ pub async fn preflight_irc(config: &NetworkConfig) -> Result<IrcPreflight, IrcPr
         }
     }
 
+    // Leave as a client would. Dropping the socket instead shows the upstream a
+    // read error, and its record of this nick can outlive the test long enough
+    // to refuse the driver that starts from the same settings a moment later.
+    // The result is already decided, so a failed goodbye is only logged.
+    if let Err(error) = connection.send_line("QUIT :connection test complete").await {
+        eprintln!("irc preflight: quit failed: {error}");
+    }
+
     Ok(IrcPreflight {
         resolved_addresses,
         dns_ms,
@@ -313,6 +326,7 @@ fn elapsed_millis(elapsed: Duration) -> u64 {
 }
 
 async fn run(config: NetworkConfig, mut ends: DriverEnds) {
+    ends.set_rejection_retry_floor(config.rejection_retry_floor);
     // Clean stop: the command channel closed (handle dropped).
     let shared = SharedDriver {
         config,
@@ -364,14 +378,6 @@ fn classify_registration(
             RegistrationResult::Rejected(e6irc_client::RegistrationRejection::without_diagnostic(
                 e6irc_client::RegistrationRefusal::NotRegistered,
             ))
-        }
-        Ok(Err(e))
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::Other
-            ) =>
-        {
-            RegistrationResult::Failed
         }
         Ok(Err(_)) => RegistrationResult::Failed,
         Err(_) => RegistrationResult::TimedOut,

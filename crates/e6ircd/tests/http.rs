@@ -486,6 +486,14 @@ async fn patch_json(
     (status, body)
 }
 
+/// `runtime.connection_attempts` of the first listed network.
+fn first_network_attempts(body: &str) -> u64 {
+    let v: serde_json::Value = serde_json::from_str(body).expect("json");
+    v["networks"][0]["runtime"]["connection_attempts"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no connection_attempts in {body}"))
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn bnc_network_management_lifecycle() {
@@ -759,6 +767,17 @@ async fn bnc_network_management_lifecycle() {
         reconnected,
         "re-enabled driver never reconnected: {latest_status}"
     );
+
+    // Enabling an already-enabled network is idempotent: it answers normally
+    // (it used to panic the handler on a registry assertion) and leaves the
+    // healthy upstream session alone instead of restarting it.
+    let attempts_before = first_network_attempts(&request(http, &list_req).await.2);
+    let (status, _, body) = request(http, &patch(true)).await;
+    assert_eq!(status, 200, "repeated enable: {body}");
+    let (_, _, body) = request(http, &list_req).await;
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["networks"][0]["connected"], true, "{body}");
+    assert_eq!(first_network_attempts(&body), attempts_before, "{body}");
 
     // delete it
     let del_req = format!(

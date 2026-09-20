@@ -703,6 +703,7 @@ pub(super) async fn preflight_network_core(
         buffer_cap: 1,
         sasl: req.sasl_account.zip(req.sasl_password),
         keepalive_idle: crate::bouncer::KEEPALIVE_IDLE,
+        rejection_retry_floor: crate::bouncer::REJECTION_RETRY_FLOOR,
     };
     crate::bouncer::preflight_irc(&config)
         .await
@@ -1482,7 +1483,9 @@ async fn create_network_core(
             ));
         }
     }
-    registry.add(Some(account), &req.name, driver);
+    // The row was just inserted under the uniqueness constraint, so anything
+    // already registered under this key has no durable definition: supersede it.
+    registry.replace(Some(account), &req.name, driver).await;
     audit_network_mutation(
         state,
         account,
@@ -1688,7 +1691,7 @@ pub(super) async fn set_network_enabled_core(
         "enable/disable failed",
     )?;
     if let Some(driver) = driver {
-        registry.add(Some(account), name, driver);
+        registry.ensure_running(Some(account), name, driver).await;
     } else {
         registry.remove(Some(account), name).await;
     }

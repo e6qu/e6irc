@@ -67,6 +67,20 @@ pub struct Registry {
 
 /// A registered network: its driver handle plus the persistence task that
 /// mirrors upstream lines to the database.
+/// [`Registry::add`] found a live driver already registered under the key.
+#[derive(Debug)]
+pub struct NetworkAlreadyRunning {
+    label: String,
+}
+
+impl std::fmt::Display for NetworkAlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "network '{}' is already running", self.label)
+    }
+}
+
+impl std::error::Error for NetworkAlreadyRunning {}
+
 struct Slot {
     handle: Arc<NetworkHandle>,
     persistence: Option<tokio::task::JoinHandle<()>>,
@@ -162,6 +176,7 @@ impl Registry {
                     buffer_cap: e.buffer_cap,
                     sasl: None,
                     keepalive_idle: super::KEEPALIVE_IDLE,
+                    rejection_retry_floor: super::REJECTION_RETRY_FLOOR,
                 };
                 Box::new(super::LocalDriver::new(core.clone(), config))
             } else {
@@ -178,7 +193,9 @@ impl Registry {
                 )
                 .map_err(|msg| format!("network '{}': {msg}", e.name))?
             };
-            registry.add(e.owner.as_deref(), &e.name, driver);
+            registry
+                .add(e.owner.as_deref(), &e.name, driver)
+                .map_err(|error| error.to_string())?;
         }
         Ok(registry)
     }
@@ -189,11 +206,28 @@ impl Registry {
         self.mutations.lock().await
     }
 
-    /// Start a driver for `(owner, name)` and register it, replacing any
-    /// existing driver under that key (the old handle drops, stopping it).
-    /// With a database, restore recent backlog and persist new lines.
-    pub fn add(&self, owner: Option<&str>, name: &str, driver: Box<dyn super::NetworkDriver>) {
+    /// Start a driver for `(owner, name)` and register it. With a database,
+    /// restore recent backlog and persist new lines.
+    ///
+    /// A key that already holds a live driver is refused *before* the new
+    /// driver starts, so a caller can never leave two upstream sessions racing
+    /// for one network. Callers that mean "supersede" use [`Registry::replace`];
+    /// callers that mean "make sure it runs" use [`Registry::ensure_running`].
+    pub fn add(
+        &self,
+        owner: Option<&str>,
+        name: &str,
+        driver: Box<dyn super::NetworkDriver>,
+    ) -> Result<(), NetworkAlreadyRunning> {
         let key = NetworkKey::new(owner, name);
+        // Held across the start: `start` only spawns the driver task, and the
+        // occupancy check must not race a second writer between check and insert.
+        let mut networks = self.networks.lock().expect("registry poisoned");
+        if networks.contains_key(&key) {
+            return Err(NetworkAlreadyRunning {
+                label: format!("{}/{}", key.display_owner(), name),
+            });
+        }
         // Capture the kind before `start()` consumes the driver.
         let kind = driver.kind();
         let handle = Arc::new(driver.start());
@@ -208,20 +242,15 @@ impl Registry {
             handle.set_history(pool.clone(), key.owner.clone(), key.name.clone());
             spawn_persistence(pool, key.owner.clone(), key.name.clone(), handle.clone())
         });
-        let slot = Slot {
-            handle,
-            persistence,
-            kind,
-        };
-        let old = self
-            .networks
-            .lock()
-            .expect("registry poisoned")
-            .insert(key, slot);
-        assert!(
-            old.is_none(),
-            "registry add replaced a live network; use replace instead"
+        networks.insert(
+            key,
+            Slot {
+                handle,
+                persistence,
+                kind,
+            },
         );
+        Ok(())
     }
 
     /// Replace one live driver only after its predecessor has disconnected.
@@ -239,7 +268,41 @@ impl Registry {
         if let Some(old) = old {
             old.stop().await;
         }
-        self.add(owner, name, driver);
+        self.add(owner, name, driver)
+            .expect("the mutation guard serializes registry writers");
+    }
+
+    /// Make `(owner, name)` run: start `driver` when nothing is registered,
+    /// supersede a driver the upstream parked, and leave a working or still
+    /// retrying one alone. Enabling an already-enabled network therefore never
+    /// drops a healthy upstream session. Returns whether `driver` was started.
+    pub async fn ensure_running(
+        &self,
+        owner: Option<&str>,
+        name: &str,
+        driver: Box<dyn super::NetworkDriver>,
+    ) -> bool {
+        let running = self
+            .networks
+            .lock()
+            .expect("registry poisoned")
+            .get(&NetworkKey::new(owner, name))
+            .map(|slot| slot.handle.runtime_snapshot().lifecycle);
+        match running {
+            Some(
+                super::NetworkLifecycle::Connecting
+                | super::NetworkLifecycle::Connected
+                | super::NetworkLifecycle::Reconnecting,
+            ) => false,
+            Some(
+                super::NetworkLifecycle::AuthenticationFailed
+                | super::NetworkLifecycle::RegistrationFailed,
+            )
+            | None => {
+                self.replace(owner, name, driver).await;
+                true
+            }
+        }
     }
 
     /// Remove `owner`'s network `name`, stopping its driver. Returns
@@ -1362,6 +1425,71 @@ mod key_tests {
         assert_ne!(registered, NetworkKey::new(Some("alice"), "oftc"));
     }
 
+    fn empty_registry() -> Registry {
+        Registry {
+            networks: Mutex::new(HashMap::new()),
+            mutations: tokio::sync::Mutex::new(()),
+            pool: None,
+            telemetry: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn adding_over_a_live_network_is_refused_before_a_second_driver_starts() {
+        let registry = empty_registry();
+        registry
+            .add(
+                Some("alice"),
+                "libera",
+                Box::new(crate::bouncer::LoopbackDriver::new(16)),
+            )
+            .expect("a fresh key");
+        let first = registry.get_owned("alice", "libera").expect("first driver");
+
+        let error = registry
+            .add(
+                Some("ALICE"),
+                "Libera",
+                Box::new(crate::bouncer::LoopbackDriver::new(16)),
+            )
+            .expect_err("the casefolded key is occupied");
+        assert_eq!(
+            error.to_string(),
+            "network 'alice/Libera' is already running"
+        );
+        let still = registry.get_owned("alice", "libera").expect("same driver");
+        assert!(Arc::ptr_eq(&first, &still));
+        assert!(!*first.watch_shutdown().borrow());
+    }
+
+    #[tokio::test]
+    async fn ensure_running_leaves_a_live_driver_alone_and_starts_an_absent_one() {
+        let registry = empty_registry();
+        assert!(
+            registry
+                .ensure_running(
+                    Some("alice"),
+                    "libera",
+                    Box::new(crate::bouncer::LoopbackDriver::new(16)),
+                )
+                .await
+        );
+        let first = registry.get_owned("alice", "libera").expect("started");
+        assert!(
+            !registry
+                .ensure_running(
+                    Some("alice"),
+                    "libera",
+                    Box::new(crate::bouncer::LoopbackDriver::new(16)),
+                )
+                .await,
+            "enabling an already-running network must not restart it"
+        );
+        let still = registry.get_owned("alice", "libera").expect("same driver");
+        assert!(Arc::ptr_eq(&first, &still));
+        assert!(!*first.watch_shutdown().borrow());
+    }
+
     #[tokio::test]
     async fn remove_owner_stops_exactly_that_accounts_networks() {
         let registry = Registry {
@@ -1370,26 +1498,34 @@ mod key_tests {
             pool: None,
             telemetry: None,
         };
-        registry.add(
-            Some("Alice"),
-            "libera",
-            Box::new(crate::bouncer::LoopbackDriver::new(16)),
-        );
-        registry.add(
-            Some("alice"),
-            "oftc",
-            Box::new(crate::bouncer::LoopbackDriver::new(16)),
-        );
-        registry.add(
-            Some("Bob"),
-            "libera",
-            Box::new(crate::bouncer::LoopbackDriver::new(16)),
-        );
-        registry.add(
-            None,
-            "shared",
-            Box::new(crate::bouncer::LoopbackDriver::new(16)),
-        );
+        registry
+            .add(
+                Some("Alice"),
+                "libera",
+                Box::new(crate::bouncer::LoopbackDriver::new(16)),
+            )
+            .expect("a fresh key");
+        registry
+            .add(
+                Some("alice"),
+                "oftc",
+                Box::new(crate::bouncer::LoopbackDriver::new(16)),
+            )
+            .expect("a fresh key");
+        registry
+            .add(
+                Some("Bob"),
+                "libera",
+                Box::new(crate::bouncer::LoopbackDriver::new(16)),
+            )
+            .expect("a fresh key");
+        registry
+            .add(
+                None,
+                "shared",
+                Box::new(crate::bouncer::LoopbackDriver::new(16)),
+            )
+            .expect("a fresh key");
         let alice_libera = registry
             .get_owned("ALICE", "LIBERA")
             .expect("Alice network");

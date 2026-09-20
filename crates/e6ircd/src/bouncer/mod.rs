@@ -227,6 +227,7 @@ pub fn build_driver(
                 buffer_cap,
                 sasl,
                 keepalive_idle: KEEPALIVE_IDLE,
+                rejection_retry_floor: REJECTION_RETRY_FLOOR,
             })))
         }
         NetworkKind::Local => {
@@ -427,6 +428,20 @@ impl Backoff {
         tokio::time::sleep(self.current + jitter).await;
         self.current = (self.current * 2).min(std::time::Duration::from_secs(30));
     }
+
+    /// The delay before re-dialing an upstream that *refused* the previous
+    /// attempt: `floor` doubled per consecutive refusal. A refusal is the
+    /// upstream's policy answer, not a lost packet, so it never takes the
+    /// sub-second transient schedule above — five registrations inside six
+    /// seconds is what earns a public network's throttle or ban.
+    pub(crate) fn rejection_delay(
+        &self,
+        floor: std::time::Duration,
+        consecutive_rejections: u32,
+    ) -> std::time::Duration {
+        let doublings = consecutive_rejections.saturating_sub(1).min(16);
+        floor.saturating_mul(1 << doublings) + std::time::Duration::from_millis(self.jitter_offset)
+    }
 }
 
 /// Outcome of one driver session attempt, for the always-on drivers'
@@ -443,18 +458,28 @@ pub(crate) enum SessionOutcome {
     /// unrepresentable: every driver must tell monitoring why the attempt
     /// ended before the shared runner can schedule another one.
     Dropped(NetworkFailure),
-    /// The upstream rejected the credentials (a terminal auth/registration
-    /// numeric), which — unlike a transient drop — will not succeed on a plain
-    /// retry. [`run_with_backoff`] counts these and stops re-dialing after a few
-    /// in a row, so a mistyped or revoked upstream password can't hammer the
-    /// upstream forever every ~30s.
+    /// The upstream rejected the credentials. A retry re-sends the same
+    /// password and can only fail the same way, while every failure counts
+    /// against the account on the upstream, so [`run_with_backoff`] parks on
+    /// the first one until the network is reconfigured.
     AuthRejected,
+    /// The upstream refused registration for a reason that may clear by itself
+    /// (a ghost holding the nick, a connection throttle, a ban that expires).
+    /// [`run_with_backoff`] retries these on the slow rejection schedule and
+    /// parks after [`MAX_CONSECUTIVE_REGISTRATION_REJECTIONS`] in a row.
     RegistrationRejected(e6irc_client::RegistrationRejection),
 }
 
-/// Consecutive upstream credential or registration rejections before a driver
-/// stops re-dialing and parks until the network is reconfigured.
+/// Consecutive upstream registration rejections before a driver stops
+/// re-dialing and parks until the network is reconfigured. Rejected
+/// *credentials* never reach this count: they park on the first rejection.
 pub(crate) const MAX_CONSECUTIVE_REGISTRATION_REJECTIONS: u32 = 5;
+
+/// First delay after an upstream refuses registration, doubled per consecutive
+/// refusal (30s, 1m, 2m, 4m, then park). Long enough to outlast a connection
+/// throttle and most of a ghost session's ping timeout; tests shrink it through
+/// [`DriverEnds::set_rejection_retry_floor`].
+pub(crate) const REJECTION_RETRY_FLOOR: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Depth of the bounded client→upstream command queue per network (shared by all
 /// attached clients). Past this a send is refused (`SendOutcome::Full`) and the
@@ -547,14 +572,16 @@ pub(crate) type DriverSession<C> =
         &'a mut DriverEnds,
     ) -> std::pin::Pin<Box<dyn Future<Output = SessionOutcome> + Send + 'a>>;
 
+/// Announce why the attempt ended, publish when the next one fires, and sleep
+/// until then. Returns `false` when the network was stopped while waiting.
 async fn wait_for_reconnect(
     ends: &mut DriverEnds,
-    backoff: &mut Backoff,
-    attempt_elapsed: std::time::Duration,
-    failure: NetworkFailure,
+    event: ConnectionEvent,
+    delay: std::time::Duration,
+    sleep: impl Future<Output = ()>,
 ) -> bool {
-    ends.emit(ConnectionEvent::Reconnecting(failure));
-    if let Err(lifecycle) = ends.schedule_retry(backoff.next_delay(attempt_elapsed)) {
+    ends.emit(event);
+    if let Err(lifecycle) = ends.schedule_retry(delay) {
         eprintln!(
             "bnc: cannot schedule reconnect from {} state",
             lifecycle.as_str()
@@ -564,8 +591,21 @@ async fn wait_for_reconnect(
     tokio::select! {
         biased;
         _ = ends.shutdown_signalled() => false,
-        _ = backoff.wait(attempt_elapsed) => true,
+        _ = sleep => true,
     }
+}
+
+/// Park a driver the upstream will keep refusing: publish the terminal state,
+/// say so in the buffer, and hold the task until the network is reconfigured
+/// (which drops the handle).
+async fn park(ends: &mut DriverEnds, event: ConnectionEvent) {
+    ends.emit(event);
+    ends.emit_line(
+        ":*bnc* NOTICE * :upstream rejected this network's credentials or registration; \
+         not reconnecting until this network is reconfigured"
+            .to_string(),
+    );
+    ends.shutdown_signalled().await;
 }
 
 pub(crate) async fn run_with_backoff<C>(
@@ -586,50 +626,37 @@ pub(crate) async fn run_with_backoff<C>(
         let started = tokio::time::Instant::now();
         match session(&config, ends).await {
             SessionOutcome::Stopped => return,
-            outcome @ (SessionOutcome::AuthRejected | SessionOutcome::RegistrationRejected(_)) => {
-                let (failure, event, diagnostic) = match outcome {
-                    SessionOutcome::AuthRejected => (
-                        NetworkFailure::AuthenticationRejected,
-                        ConnectionEvent::AuthenticationFailed,
-                        None,
-                    ),
-                    SessionOutcome::RegistrationRejected(rejection) => {
-                        let failure = registration_failure(rejection.refusal());
-                        let diagnostic = Some(rejection.diagnostic().to_string());
-                        (
-                            failure,
-                            ConnectionEvent::RegistrationFailed(rejection),
-                            diagnostic,
-                        )
-                    }
-                    _ => unreachable!("matched only terminal rejections"),
-                };
+            SessionOutcome::AuthRejected => {
+                park(ends, ConnectionEvent::AuthenticationFailed).await;
+                return;
+            }
+            SessionOutcome::RegistrationRejected(rejection) => {
                 consecutive_rejections += 1;
-                if let Some(diagnostic) = diagnostic {
-                    ends.emit_notice(lifecycle_notice("rejected", failure, Some(&diagnostic)));
-                }
                 if consecutive_rejections >= MAX_CONSECUTIVE_REGISTRATION_REJECTIONS {
-                    ends.emit(event);
-                    // Stop hammering an upstream that keeps rejecting unchanged
-                    // credentials or registration settings. Park until the
-                    // network is reconfigured (which drops the handle).
-                    ends.emit_line(
-                        ":*bnc* NOTICE * :upstream rejected registration repeatedly; \
-                         not reconnecting until this network is reconfigured"
-                            .to_string(),
-                    );
-                    ends.shutdown_signalled().await;
+                    park(ends, ConnectionEvent::RegistrationFailed(rejection)).await;
                     return;
                 }
-                if !wait_for_reconnect(ends, &mut backoff, started.elapsed(), failure).await {
+                let delay =
+                    backoff.rejection_delay(ends.rejection_retry_floor, consecutive_rejections);
+                let retrying = ConnectionEvent::RegistrationRetrying(rejection);
+                if !wait_for_reconnect(ends, retrying, delay, tokio::time::sleep(delay)).await {
                     return;
                 }
             }
             SessionOutcome::Dropped(failure) => {
-                // A transient (non-auth) drop: a connection-level failure that
-                // may well recover, so keep retrying and reset the auth counter.
-                consecutive_rejections = 0;
-                if !wait_for_reconnect(ends, &mut backoff, started.elapsed(), failure).await {
+                // Only a session that actually registered proves the upstream
+                // accepts this configuration. A drop *before* that (a throttled
+                // dial between two refusals, say) neither counts as a refusal
+                // nor forgives the ones already counted — otherwise a refusing
+                // upstream's own throttle would keep the driver from ever
+                // parking.
+                if ends.connected_this_attempt() {
+                    consecutive_rejections = 0;
+                }
+                let elapsed = started.elapsed();
+                let delay = backoff.next_delay(elapsed);
+                let reconnecting = ConnectionEvent::Reconnecting(failure);
+                if !wait_for_reconnect(ends, reconnecting, delay, backoff.wait(elapsed)).await {
                     return;
                 }
             }
@@ -1441,7 +1468,11 @@ pub enum ConnectionEvent {
     /// attempt follows. Carrying the reason makes an unclassified disconnect
     /// impossible for every driver using the public SPI.
     Reconnecting(NetworkFailure),
-    /// Repeated credential rejection parked the driver until it is reconfigured.
+    /// The upstream refused registration and a slower attempt follows. The
+    /// refusal rides along so its sanitized upstream text stays visible for
+    /// the whole wait instead of only once the driver parks.
+    RegistrationRetrying(e6irc_client::RegistrationRejection),
+    /// Credential rejection parked the driver until it is reconfigured.
     AuthenticationFailed,
     /// Repeated IRC registration rejection parked the driver until reconfigured.
     RegistrationFailed(e6irc_client::RegistrationRejection),
@@ -1842,6 +1873,11 @@ impl NetworkRuntime {
         state.connection_attempts = state.connection_attempts.saturating_add(1);
         state.state_changed_at = epoch_millis();
         state.attempt_started = std::time::Instant::now();
+    }
+
+    fn is_connected(&self) -> bool {
+        let state = self.state.lock().expect("network runtime poisoned");
+        matches!(state.phase, NetworkRuntimePhase::Connected { .. })
     }
 
     fn connected(&self) -> u64 {
@@ -2383,6 +2419,7 @@ impl NetworkHandle {
             irc_session,
             telemetry,
             reconnect_seed,
+            rejection_retry_floor: REJECTION_RETRY_FLOOR,
         };
         (handle, ends)
     }
@@ -2505,6 +2542,9 @@ pub struct DriverEnds {
     /// concurrent drivers de-correlate (see [`Backoff`]). Assigned once at
     /// construction from a process-wide counter.
     reconnect_seed: u64,
+    /// First delay after the upstream refuses registration; see
+    /// [`REJECTION_RETRY_FLOOR`].
+    rejection_retry_floor: std::time::Duration,
 }
 
 impl Drop for DriverEnds {
@@ -2624,6 +2664,15 @@ impl DriverEnds {
                         failure,
                         None,
                     ),
+                    ConnectionEvent::RegistrationRetrying(ref rejection) => {
+                        let failure = registration_failure(rejection.refusal());
+                        (
+                            DriverConnectionStatus::Reconnecting(failure),
+                            FailureDisposition::Retry,
+                            failure,
+                            Some(rejection.diagnostic()),
+                        )
+                    }
                     ConnectionEvent::AuthenticationFailed => (
                         DriverConnectionStatus::AuthenticationFailed,
                         FailureDisposition::Terminal(
@@ -2684,6 +2733,18 @@ impl DriverEnds {
 
     fn begin_attempt(&self) {
         self.runtime.begin_attempt();
+    }
+
+    /// Whether the attempt that just ended reached `Connected`. Read before
+    /// the failure is emitted, while the phase still describes the session.
+    fn connected_this_attempt(&self) -> bool {
+        self.runtime.is_connected()
+    }
+
+    /// Replace the production [`REJECTION_RETRY_FLOOR`]. A driver whose
+    /// configuration carries its own floor applies it before its run loop.
+    pub fn set_rejection_retry_floor(&mut self, floor: std::time::Duration) {
+        self.rejection_retry_floor = floor;
     }
 
     /// Record when the next reconnect attempt fires (visible in the runtime

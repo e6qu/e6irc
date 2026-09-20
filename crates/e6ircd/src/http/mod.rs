@@ -590,7 +590,9 @@ pub(super) async fn mutate_account_suspension(
         })?;
         let started_networks = prepared_networks.len();
         for (name, driver) in prepared_networks {
-            registry.add(Some(&change.folded), &name, driver);
+            registry
+                .ensure_running(Some(&change.folded), &name, driver)
+                .await;
         }
         Ok(format!(
             "Reactivated {} and started {started_networks} owned network(s).",
