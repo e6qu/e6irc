@@ -1649,6 +1649,12 @@ function markFieldAtFault(field) {
   input.focus();
 }
 
+function setNetworkFieldsLocked(locked) {
+  for (const control of networkForm.elements) {
+    if (!(control instanceof HTMLButtonElement)) control.disabled = locked;
+  }
+}
+
 // The curated networks come from the server's one catalog, so the chat client
 // and the console cannot disagree about an endpoint. "Custom" is the client's
 // own entry: it means "I will type the server myself".
@@ -1728,9 +1734,17 @@ async function openNetworkDialog(name = null) {
     ? "Leave blank to keep the stored password. Stored encrypted; never shown again."
     : "Stored encrypted; never shown again once saved.";
   el("nf-tls").checked = true;
+  // The suggested nickname needs nothing from the server, so it goes in before
+  // anything is awaited: set after the catalog arrived, it replaced whatever
+  // the person had typed in the meantime.
+  if (!editing) el("nf-nick").value = el("account-link").dataset.shauthUser ?? "";
 
   // Shown at once, so the click visibly did something, but not saveable until
-  // what it edits has arrived.
+  // what it edits has arrived. When editing, every box is about to be filled
+  // from the server, so none can be typed into until it has been: what was
+  // typed would be silently replaced. (A form that never loads stays locked,
+  // and Cancel is a button, which this leaves alone.)
+  setNetworkFieldsLocked(editing);
   el("nf-save").disabled = true;
   networkForm.setAttribute("aria-busy", "true");
   if (!networkDialog.open) networkDialog.showModal();
@@ -1739,6 +1753,8 @@ async function openNetworkDialog(name = null) {
     if (editing) {
       const detail = await apiGet(`/api/v1/me/networks/${encodeURIComponent(name)}`);
       if (opening !== dialogOpening) return;
+      setNetworkFieldsLocked(false);
+      el("nf-name").disabled = true;
       el("nf-name").value = detail.name ?? name;
       el("nf-addr").value = detail.addr ?? "";
       el("nf-tls").checked = detail.tls !== false;
@@ -1761,7 +1777,6 @@ async function openNetworkDialog(name = null) {
       // The first curated network (Libera) is the interop target this server is
       // tested against, so it is the default rather than a blank form.
       applyPreset();
-      el("nf-nick").value = el("account-link").dataset.shauthUser ?? "";
     }
     el("nf-save").disabled = false;
   } catch (error) {

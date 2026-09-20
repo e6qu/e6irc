@@ -963,6 +963,50 @@ test("an expired session during a refresh offers sign-in once and stops asking",
   expect(reads).toBe(after);
 });
 
+test("stored settings cannot be typed over before they have arrived", async ({ page }) => {
+  await mockLiveSocket(page);
+  await mockSession(page, [ircNetwork("Libera")]);
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  await mockNetworkDetails(page, async (route) => {
+    await held;
+    return route.fulfill({ contentType: "application/json", body: JSON.stringify(networkDetail("Libera", "irc.libera.example:6697")) });
+  });
+  await page.goto("/?network=Libera");
+  await page.getByRole("button", { name: "Settings for Libera" }).click();
+  const dialog = page.getByRole("dialog", { name: "Settings — Libera" });
+  // Every box is about to be filled from the server; one typed into now would
+  // silently lose what was typed.
+  await expect(dialog.locator("#nf-nick")).toBeDisabled();
+  await expect(dialog.locator("#nf-autojoin")).toBeDisabled();
+  await expect(dialog.getByRole("button", { name: "Cancel" })).toBeEnabled();
+  release();
+  await expect(dialog.locator("#nf-nick")).toBeEnabled();
+  await expect(dialog.locator("#nf-nick")).toHaveValue("Libera-nick");
+  await expect(dialog.locator("#nf-name")).toBeDisabled();
+});
+
+test("a nickname typed while the known networks load is not overwritten by the suggestion", async ({ page }) => {
+  await mockSession(page, []);
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  await page.route(/\/api\/v1\/network-presets$/, async (route) => {
+    await held;
+    return route.fallback();
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Add a network", exact: true }).last().click();
+  const dialog = page.getByRole("dialog", { name: "Add a network" });
+  // The suggestion needs nothing from the server, so it is there at once...
+  await expect(dialog.locator("#nf-nick")).toHaveValue("visual-test");
+  await expect(dialog.getByRole("button", { name: "Save" })).toBeDisabled();
+  // ...and what the person types over it survives the catalog arriving.
+  await dialog.locator("#nf-nick").fill("ada");
+  release();
+  await expect(dialog.getByRole("button", { name: "Save" })).toBeEnabled();
+  await expect(dialog.locator("#nf-nick")).toHaveValue("ada");
+});
+
 test("a refused network field is marked, revealed, and focused", async ({ page }) => {
   await mockSession(page, []);
   await page.route(/\/api\/v1\/me\/networks$/, (route) => {
@@ -978,7 +1022,11 @@ test("a refused network field is marked, revealed, and focused", async ({ page }
   const dialog = page.getByRole("dialog", { name: "Add a network" });
   await expect(dialog.locator("#nf-addr")).toBeHidden();
   // The session's nickname is too long to double as a username; one that can
-  // leaves the server's refusal as the only thing in the way.
+  // leaves the server's refusal as the only thing in the way. The dialog fills
+  // the nickname in once its presets have loaded, so wait for that: typing
+  // first would be overwritten by it.
+  await expect(dialog.locator("#nf-nick")).toHaveValue("visual-test");
+  await expect(dialog.getByRole("button", { name: "Save" })).toBeEnabled();
   await dialog.locator("#nf-nick").fill("visual");
   await dialog.getByRole("button", { name: "Save" }).click();
 
