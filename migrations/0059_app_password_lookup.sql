@@ -4,14 +4,28 @@
 -- one row the presented secret names, instead of for every app password the
 -- account holds (up to 32, all under one permit of the process-wide pool).
 --
--- Rows minted before this migration have no lookup: their secrets were never
--- stored, so it cannot be computed here. They are still verified, by trying
--- each, and gain their lookup the first time they are used.
+-- An app password without a lookup cannot exist: it would have to be tried
+-- blind on every attempt, which is the cost this migration removes. The secrets
+-- of app passwords minted before it were never stored, so their lookups cannot
+-- be computed here; those rows are revoked, each with an audit record naming
+-- this migration as the actor, and their owners mint new ones. There are no
+-- deployed users holding any.
+INSERT INTO audit_log (actor, action, target, detail)
+SELECT 'migration:0059', 'ACCOUNT_APP_PASSWORD_REVOKE', a.name,
+       'app password revoked: minted before app passwords were found by lookup'
+FROM account_credentials c
+JOIN accounts a ON a.id = c.account_id
+WHERE c.kind = 'app_password';
+
+DELETE FROM account_credentials WHERE kind = 'app_password';
+
 ALTER TABLE account_credentials ADD COLUMN secret_lookup BYTEA;
 
+-- Exactly the app passwords carry one: never a primary password, always an app
+-- password.
 ALTER TABLE account_credentials
-    ADD CONSTRAINT account_credentials_lookup_is_for_app_passwords
-    CHECK (secret_lookup IS NULL OR kind = 'app_password');
+    ADD CONSTRAINT account_credentials_lookup_names_app_passwords
+    CHECK ((kind = 'app_password') = (secret_lookup IS NOT NULL));
 
 CREATE UNIQUE INDEX account_credentials_secret_lookup_idx
     ON account_credentials (secret_lookup)

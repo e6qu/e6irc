@@ -2264,8 +2264,10 @@ but the CLI, TUI, and BNC must surface the rejection.
   (`account_credentials.secret_lookup`, migration 0059) — each replaced by a
   dummy when absent. Trying every stored hash made one guess cost up to 33
   computations under one permit and let the duration count an account's
-  credentials. App passwords minted before 0059 are each still tried until
-  their first successful use records the lookup.
+  credentials. A CHECK constraint makes the lookup present on exactly the app
+  passwords, so none can exist that would have to be tried blind; the ones
+  minted before 0059, whose secrets were never stored, were revoked by it with
+  an audit record each.
 - Every personal access token is minted by one capped path
   (`mint_api_token_under_cap`, 32 per account, checked under the account-row
   lock), the device grant included. Approval at the cap is refused in the

@@ -6943,14 +6943,75 @@ async fn recover_administrator_subcommand_prints_the_password_once() {
     std::fs::remove_file(&config_path).expect("remove config");
 }
 
-/// An app password names its own row, so holding many of them does not make a
-/// login try them all; one minted before that was recorded still works, and
-/// records it on first use.
+/// App passwords minted before lookups existed cannot be given one (their
+/// secrets were never stored), so migration 0059 revokes them, audited.
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn app_passwords_are_found_by_lookup_and_older_ones_gain_it_on_use() {
+async fn migration_0059_revokes_app_passwords_it_cannot_name_and_says_so() {
     let pool = db::connect_and_migrate(
-        &support::test_db("app_passwords_are_found_by_lookup_and_older_ones_gain_it_on_use").await,
+        &support::test_db("migration_0059_revokes_app_passwords_it_cannot_name_and_says_so").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account_with_contact(&pool, "Alice", "primary", None)
+        .await
+        .expect("alice");
+    // The table as it was before the migration, holding an app password.
+    sqlx::raw_sql(
+        "DROP INDEX account_credentials_secret_lookup_idx;
+         ALTER TABLE account_credentials
+             DROP CONSTRAINT account_credentials_lookup_names_app_passwords,
+             DROP COLUMN secret_lookup;
+         INSERT INTO account_credentials (account_id, kind, argon2_hash, label)
+         SELECT id, 'app_password', 'unused-hash', 'old laptop' FROM accounts;",
+    )
+    .execute(&pool)
+    .await
+    .expect("restore the earlier table");
+
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0059_app_password_lookup.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("migration 0059");
+
+    let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM account_credentials")
+        .fetch_all(&pool)
+        .await
+        .expect("credentials");
+    assert_eq!(kinds, ["local_password"], "the primary password is kept");
+    let audited: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT actor, action, target FROM audit_log WHERE actor = 'migration:0059'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(
+        audited,
+        [(
+            "migration:0059".to_string(),
+            "ACCOUNT_APP_PASSWORD_REVOKE".to_string(),
+            "Alice".to_string()
+        )]
+    );
+    assert_eq!(
+        db::verify_credentials(&pool, "alice", "primary")
+            .await
+            .expect("verify")
+            .as_deref(),
+        Some("Alice")
+    );
+}
+
+/// A login attempt verifies the primary password and the one app password the
+/// presented secret names; the schema lets no app password exist without the
+/// lookup that names it.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn app_passwords_are_found_by_lookup_and_none_can_exist_without_one() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("app_passwords_are_found_by_lookup_and_none_can_exist_without_one").await,
     )
     .await
     .expect("connect");
@@ -6965,26 +7026,6 @@ async fn app_passwords_are_found_by_lookup_and_older_ones_gain_it_on_use() {
                 .expect("app password"),
         );
     }
-    let without_lookup = |pool: sqlx::PgPool| async move {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM account_credentials
-             WHERE kind = 'app_password' AND secret_lookup IS NULL",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("count")
-    };
-    assert_eq!(
-        without_lookup(pool.clone()).await,
-        0,
-        "minting records the lookup"
-    );
-
-    // As minted before the lookup existed.
-    sqlx::query("UPDATE account_credentials SET secret_lookup = NULL WHERE label = 'device 1'")
-        .execute(&pool)
-        .await
-        .expect("age one app password");
     for secret in secrets.iter().chain([&"primary".to_string()]) {
         assert_eq!(
             db::verify_credentials(&pool, "ALICE", secret)
@@ -6994,11 +7035,27 @@ async fn app_passwords_are_found_by_lookup_and_older_ones_gain_it_on_use() {
             Some("Alice")
         );
     }
-    assert_eq!(
-        without_lookup(pool.clone()).await,
-        0,
-        "first use records the lookup"
-    );
+
+    // An app password that names no row would have to be tried blind on every
+    // attempt, so the schema does not let one exist -- nor a fast hash of a
+    // chosen password.
+    for (statement, what) in [
+        (
+            "UPDATE account_credentials SET secret_lookup = NULL WHERE label = 'device 1'",
+            "an app password without a lookup",
+        ),
+        (
+            "UPDATE account_credentials SET secret_lookup = '\\x00' WHERE kind = 'local_password'",
+            "a primary password with a lookup",
+        ),
+    ] {
+        let refused = sqlx::query(statement).execute(&pool).await;
+        let error = refused.expect_err(what).to_string();
+        assert!(
+            error.contains("account_credentials_lookup_names_app_passwords"),
+            "{what}: {error}"
+        );
+    }
     for wrong in [
         "",
         "primary ",

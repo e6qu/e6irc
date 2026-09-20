@@ -1701,10 +1701,10 @@ struct CredentialHash {
 struct StoredCredential {
     credential_id: i64,
     argon2_hash: String,
-    /// [`app_password_lookup`] of the secret, for an app password minted since
-    /// lookups were recorded.
+    /// [`app_password_lookup`] of the secret. Exactly the app passwords carry
+    /// one (a CHECK constraint says so), so its absence is what marks the
+    /// primary password.
     app_password_lookup: Option<Vec<u8>>,
-    is_app_password: bool,
 }
 
 /// What names an app password's row. The secret is 32 random bytes, so its
@@ -1721,9 +1721,6 @@ struct CredentialVerificationPlan {
     /// Verifications against the dummy hash, spent so the attempt costs the
     /// same whatever the account holds.
     dummies: usize,
-    /// Candidates that are app passwords with no lookup yet; one that matches
-    /// gets its lookup recorded.
-    unindexed: Vec<i64>,
 }
 
 /// Decide what to verify `presented` against.
@@ -1733,29 +1730,25 @@ struct CredentialVerificationPlan {
 /// an attempt took a count of the account's credentials — zero for an account
 /// that does not exist. Instead an attempt verifies the primary password, and
 /// the one app password whose lookup `presented` hashes to; whichever of the
-/// two is missing is replaced by a dummy. Every attempt therefore costs two
-/// computations. App passwords with no lookup (minted before it existed) cannot
-/// be ruled out by it, so each is still tried until its first use records one.
+/// two is missing is replaced by a dummy. Every attempt therefore costs exactly
+/// two computations.
 fn plan_credential_verification(
     stored: Vec<StoredCredential>,
     presented: &str,
 ) -> CredentialVerificationPlan {
     let lookup = app_password_lookup(presented);
-    let (mut primary, mut named, mut unindexed_rows) = (None, None, Vec::new());
+    let (mut primary, mut named) = (None, None);
     for credential in stored {
-        match (&credential.app_password_lookup, credential.is_app_password) {
-            (_, false) => primary = Some(credential),
-            (Some(stored_lookup), true) if *stored_lookup == lookup => named = Some(credential),
-            (Some(_), true) => {}
-            (None, true) => unindexed_rows.push(credential),
+        match &credential.app_password_lookup {
+            None => primary = Some(credential),
+            Some(stored_lookup) if *stored_lookup == lookup => named = Some(credential),
+            Some(_) => {}
         }
     }
     let dummies = usize::from(primary.is_none()) + usize::from(named.is_none());
-    let unindexed = unindexed_rows.iter().map(|c| c.credential_id).collect();
     let candidates = primary
         .into_iter()
         .chain(named)
-        .chain(unindexed_rows)
         .map(|credential| CredentialHash {
             credential_id: credential.credential_id,
             argon2_hash: credential.argon2_hash,
@@ -1764,7 +1757,6 @@ fn plan_credential_verification(
     CredentialVerificationPlan {
         candidates,
         dummies,
-        unindexed,
     }
 }
 
@@ -4920,8 +4912,7 @@ pub async fn verify_credentials(
             .map_err(DbError::Query)?;
     let stored: Vec<StoredCredential> = sqlx::query_as(
         "SELECT c.id AS credential_id, c.argon2_hash,
-                c.secret_lookup AS app_password_lookup,
-                c.kind = 'app_password' AS is_app_password
+                c.secret_lookup AS app_password_lookup
          FROM accounts a
          JOIN account_credentials c ON c.account_id = a.id
          WHERE a.name_folded = $1 AND (a.flags & $2) = 0
@@ -4938,24 +4929,13 @@ pub async fn verify_credentials(
     let (Some(display_name), Some(id)) = (display_name, matched_id) else {
         return Ok(None);
     };
-    // Record the use so the credential list can show it, and give an app
-    // password minted before lookups existed the lookup that names it, so the
-    // next attempt no longer has to try it blind. Best-effort: a failure here
-    // must not fail an otherwise-successful authentication, so it is logged,
-    // not propagated.
-    let lookup = plan
-        .unindexed
-        .contains(&id)
-        .then(|| app_password_lookup(password));
-    if let Err(e) = sqlx::query(
-        "UPDATE account_credentials
-         SET last_used_at = now(), secret_lookup = COALESCE(secret_lookup, $2)
-         WHERE id = $1",
-    )
-    .bind(id)
-    .bind(lookup)
-    .execute(pool)
-    .await
+    // Record the use so the credential list can show it. Best-effort: a
+    // failure here must not fail an otherwise-successful authentication, so it
+    // is logged, not propagated.
+    if let Err(e) = sqlx::query("UPDATE account_credentials SET last_used_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
     {
         eprintln!("db: failed to record credential use: {e}");
     }
@@ -6980,16 +6960,14 @@ mod credential_verification_plan_tests {
             credential_id: id,
             argon2_hash: format!("local-{id}"),
             app_password_lookup: None,
-            is_app_password: false,
         }
     }
 
-    fn app(id: i64, secret: Option<&str>) -> StoredCredential {
+    fn app(id: i64, secret: &str) -> StoredCredential {
         StoredCredential {
             credential_id: id,
             argon2_hash: format!("app-{id}"),
-            app_password_lookup: secret.map(app_password_lookup),
-            is_app_password: true,
+            app_password_lookup: Some(app_password_lookup(secret)),
         }
     }
 
@@ -7000,40 +6978,20 @@ mod credential_verification_plan_tests {
     #[test]
     fn one_attempt_costs_two_computations_however_many_app_passwords_exist() {
         let many: Vec<_> = std::iter::once(local(1))
-            .chain((2..=33).map(|id| app(id, Some(&format!("secret-{id}")))))
+            .chain((2..=33).map(|id| app(id, &format!("secret-{id}"))))
             .collect();
         for (stored, presented, expect_ids) in [
             (Vec::new(), "anything", vec![]),
             (vec![local(1)], "anything", vec![1]),
             (many.clone(), "not an app password", vec![1]),
             (many.clone(), "secret-17", vec![1, 17]),
-            (vec![app(2, Some("secret-2"))], "secret-2", vec![2]),
+            (vec![app(2, "secret-2")], "secret-2", vec![2]),
         ] {
             let plan = plan_credential_verification(stored, presented);
             let ids: Vec<i64> = plan.candidates.iter().map(|c| c.credential_id).collect();
             assert_eq!(ids, expect_ids, "{presented}");
             assert_eq!(plan.candidates.len() + plan.dummies, 2, "{presented}");
         }
-    }
-
-    /// An app password minted before lookups existed names no row, so each is
-    /// still tried — on top of the constant two, and only until its first use
-    /// records its lookup.
-    #[test]
-    fn app_passwords_without_a_lookup_are_each_still_tried() {
-        let plan = plan_credential_verification(
-            vec![
-                local(1),
-                app(2, None),
-                app(3, Some("secret-3")),
-                app(4, None),
-            ],
-            "secret-3",
-        );
-        let ids: Vec<i64> = plan.candidates.iter().map(|c| c.credential_id).collect();
-        assert_eq!(ids, [1, 3, 2, 4]);
-        assert_eq!(plan.dummies, 0);
-        assert_eq!(plan.unindexed, [2, 4]);
     }
 }
 
