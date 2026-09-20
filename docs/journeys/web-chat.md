@@ -17,12 +17,16 @@ available; at least one owned/shared network is enabled for chat.
 **Flow.**
 
 1. `/` loads the application shell and resolves `/api/v1/me`.
-2. `/api/v1/me/networks` supplies the owner-scoped network catalog and enabled
-   state.
-3. With no networks, the application shows an explicit empty state pointing to
-   BNC network configuration.
-4. Selecting a network opens `/ws/ui` for that network and renders connection
-   state; it never invents “connected” from stored configuration alone.
+2. `/api/v1/me/networks` supplies the owner-scoped networks and their state to
+   the sidebar list — the one place networks appear — which re-reads it every
+   ten seconds while the page is visible.
+3. With no network named in the address, the client opens a connected network,
+   else the first that can run, and rewrites the address to name it. Nobody
+   picks their only network. With no networks, an explicit empty state offers
+   **Add a network**, which opens the dialog in place.
+4. Opening a network opens `/ws/ui` for it and renders connection state; it
+   never invents “connected” from stored configuration alone. A disabled network
+   still opens, says why chat is unavailable, and links to where it is enabled.
 5. The initial snapshot/replay establishes buffers before live events are
    applied.
 6. A skip link reaches the chat log. Conversation and member activation use
@@ -55,8 +59,11 @@ REST-failure, network-creation, and authenticated WebSocket states are
 browser-tested against a real daemon. The same journey verifies the semantic
 conversation and member controls plus the skip-to-chat focus target. Focused
 client-state fixtures reject malformed, oversized, or contract-drift identity,
-catalog, and backlog responses, and cover loading, empty, populated, unavailable,
-expired-session, and forced-colors picker states with visual and axe checks.
+network-list, and backlog responses, and cover loading, empty, populated,
+unavailable, expired-session, and forced-colors states with visual and axe
+checks. Chromium fixtures also prove that a runnable network opens by itself,
+that the list follows a state change on the server, and that adding a network
+sends the session token and opens the result.
 The populated fixture proves reflow at a 200% equivalent layout width. The
 primary entry journey uses the real network catalog and attachment.
 
@@ -162,9 +169,10 @@ current network and conversation selection.
 7. Inactive conversations retain both unread traffic and unread direct-mention
    counts, so attention-worthy traffic is distinguishable before switching.
 8. Errors from the driver or IRC server appear in the relevant status path.
-   Enabling **Raw IRC output** opens a bounded receiver tape containing every
-   exact safe inbound wire line, so state changes, numerics, service replies,
-   and parser presentation can be compared without leaving the browser.
+   **Server log**, beside the conversations, opens a bounded log containing
+   every exact safe inbound wire line, so state changes, numerics, service
+   replies, and parser presentation can be compared without leaving the
+   browser.
 
 **Visible failures and recovery.** A disconnected composer cannot display a
 false successful send. CR/LF/NUL input, an over-limit complete line, more than
@@ -206,8 +214,9 @@ chat.
 2. Reloading the application restores the selected theme. System mode follows
    the browser/operating-system color preference rather than freezing the
    color observed when it was selected.
-3. Raw IRC output is off by default. Enabling it exposes the wire form already
-   present in the bounded transcript and persists that typed preference.
+3. The Server log is off by default. Its one switch is in the sidebar, not in
+   this menu; enabling it exposes the wire form already present in the bounded
+   transcript and persists that typed preference.
 4. Desktop notifications are off by default. Enabling them is an explicit
    action that requests browser permission at that moment, never on page load.
 5. With permission granted and notifications enabled, a hidden tab asks the

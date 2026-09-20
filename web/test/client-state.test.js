@@ -96,12 +96,12 @@ test("network projection preserves the closed API state", () => {
   assert.deepEqual(networksFrom({ networks: [] }), []);
   const offline = { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, runtime: null };
   assert.deepEqual(networksFrom({ networks: [offline] }), [
-    { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, state: null, failureCode: null, runtime: null },
+    { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, state: null, failureCode: null, failureDetail: null, runtime: null },
   ]);
   assert.deepEqual(
     networksFrom({ networks: [{ ...offline, connected: false, runtime: {
       state: "registration_failed",
-      last_error: { code: "registration_rejected" },
+      last_error: { code: "registration_rejected", diagnostic: "Closing Link: (SASL access only)" },
     } }] }),
     [{
       name: "Libera",
@@ -111,6 +111,7 @@ test("network projection preserves the closed API state", () => {
       connected: false,
       state: "registration_failed",
       failureCode: "registration_rejected",
+      failureDetail: "Closing Link: (SASL access only)",
       runtime: { state: "registration_failed", failureCode: "registration_rejected" },
     }],
   );
@@ -121,11 +122,12 @@ test("backlog projection preserves contract lines", () => {
 });
 
 test("identity projection keeps browser-visible fields", () => {
-  assert.deepEqual(identityFrom({ account: "alice", email: "a@example.test", role: "operator", logout_url: "/logout" }), {
+  assert.deepEqual(identityFrom({ account: "alice", email: "a@example.test", role: "operator", logout_url: "/logout", csrf_token: "session-bound" }), {
     account: "alice",
     email: "a@example.test",
     role: "operator",
     logoutURL: "/logout",
+    csrfToken: "session-bound",
   });
 });
 
@@ -184,7 +186,7 @@ test("parked lifecycle states remain actionable without a last-error detail", ()
   );
   assert.match(
     networkStateHelp({ state: "registration_failed", failureCode: null }),
-    /upstream reason/,
+    /Open Server log for its reason/,
   );
 });
 
@@ -196,5 +198,31 @@ test("states that are merely progress carry no advice and are not failures", () 
 });
 
 test("a disabled network says so rather than reporting a driver state", () => {
-  assert.equal(networkStateHelp({ enabled: false, state: "authentication_failed" }), "This network is turned off.");
+  assert.equal(networkStateHelp({ enabled: false, state: "authentication_failed" }), "This network is disabled.");
+});
+
+// The upstream's own sentence is the most useful thing the row can show: it is
+// the difference between "registration rejected" and "SASL access only".
+test("a refusal quotes the network's own reason, while retrying as well as once parked", () => {
+  for (const state of ["reconnecting", "registration_failed"]) {
+    assert.match(
+      networkStateHelp({
+        state,
+        failureCode: "registration_rejected",
+        failureDetail: "Closing Link: (SASL access only)",
+      }),
+      /verified SASL.*The network said: “Closing Link: \(SASL access only\)”$/,
+    );
+  }
+  assert.match(
+    networkStateHelp({ state: "reconnecting", failureCode: "nickname_in_use", failureDetail: null }),
+    /nickname is in use/,
+  );
+});
+
+test("a connected network carries no advice from an earlier failure", () => {
+  assert.equal(
+    networkStateHelp({ connected: true, state: "connected", failureCode: "registration_rejected" }),
+    null,
+  );
 });

@@ -134,6 +134,14 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     });
   }
 
+  // A browser cannot focus an invalid field inside closed details, so it would
+  // refuse the submission with nothing shown. `invalid` does not bubble.
+  for (const details of document.querySelectorAll("form details")) {
+    details.closest("form").addEventListener("invalid", (event) => {
+      if (event.target instanceof Node && details.contains(event.target)) details.open = true;
+    }, true);
+  }
+
   for (const form of document.querySelectorAll("[data-network-form]")) {
     const preset = form.querySelector("[data-network-preset]");
     const name = form.querySelector("[data-network-name]");
@@ -148,9 +156,15 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       continue;
     }
 
+    const advanced = form.querySelector("[data-network-advanced]");
+
     preset.addEventListener("change", () => {
       const option = preset.selectedOptions[0];
-      if (!option || option.value === "custom") return;
+      if (!option) return;
+      if (option.value === "custom") {
+        if (advanced instanceof HTMLDetailsElement) advanced.open = true;
+        return;
+      }
       name.value = option.dataset.name || "";
       addr.value = option.dataset.addr || "";
       tls.checked = option.dataset.tls === "true";
@@ -175,6 +189,8 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     ) {
       continue;
     }
+    const accountUnavailable = account.disabled;
+    const passwordUnavailable = password.disabled;
     clear.addEventListener("change", () => {
       if (clear.checked) {
         account.dataset.previousValue = account.value;
@@ -183,9 +199,9 @@ import { loadSettings, saveSettings } from "/console-settings.js";
         account.disabled = true;
         password.disabled = true;
       } else {
-        account.disabled = false;
+        account.disabled = accountUnavailable;
         account.value = account.dataset.previousValue || "";
-        password.disabled = password.dataset.storageAvailable !== "true";
+        password.disabled = passwordUnavailable;
       }
     });
   }
@@ -214,15 +230,10 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   const consoleApiContract = apiContractLoader(fetch);
 
   const apiRequest = async (form, operation, body) => {
-    const csrf = form.querySelector('input[name="csrf"]')?.value;
-    if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
     const contract = await consoleApiContract();
     return getOperationJson(fetch, contract, operation.method, operation.url, {
       credentials: "same-origin",
-      headers: {
-        "Content-Type": "application/json",
-        "X-E6IRC-CSRF": csrf,
-      },
+      csrf: form.querySelector('input[name="csrf"]')?.value,
       json: body,
     });
   };
@@ -607,7 +618,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     const runtime = view.runtime;
     const state = !view.enabled ? "disabled" : runtime === null ? "not running" : runtime.state.replaceAll("_", " ");
     const states = [
-      [runtime !== null && runtime.state === "connected" ? "on" : "off", "Lifecycle", state],
+      [runtime !== null && runtime.state === "connected" ? "on" : "off", "State", state],
       [runtime === null ? "off" : runtime.errors === 0 ? "on" : "warn", "Errors", runtime === null ? "Unavailable" : runtime.errors],
       [runtime !== null && runtime.attached_clients > 0 ? "on" : "off", "Attached clients", runtime === null ? "Unavailable" : runtime.attached_clients],
       [view.storage.lines > 0 ? "on" : "off", "Stored backlog", `${view.storage.lines} ${view.storage.lines === 1 ? "line" : "lines"}`],
@@ -621,12 +632,12 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   const networkOperationsMetrics = (runtime) => {
     const grid = element("div", "metric-grid");
     if (runtime === null) {
-      grid.append(append(element("article", "metric-card"), element("span", "metric-label", "Live metrics"), element("strong", "", "Unavailable"), element("small", "", "The network has no running driver.")));
+      grid.append(append(element("article", "metric-card"), element("span", "metric-label", "Live metrics"), element("strong", "", "Unavailable"), element("small", "", "This network is not running.")));
       return grid;
     }
     const metrics = [
-      ["Received from upstream", formatBytes(runtime.traffic.bytes_in), `${runtime.traffic.lines_in} upstream ${runtime.traffic.lines_in === 1 ? "line" : "lines"}`],
-      ["Sent to upstream", formatBytes(runtime.traffic.bytes_out), `${runtime.traffic.lines_out} upstream ${runtime.traffic.lines_out === 1 ? "line" : "lines"}`],
+      ["Received", formatBytes(runtime.traffic.bytes_in), `${runtime.traffic.lines_in} ${runtime.traffic.lines_in === 1 ? "line" : "lines"}`],
+      ["Sent", formatBytes(runtime.traffic.bytes_out), `${runtime.traffic.lines_out} ${runtime.traffic.lines_out === 1 ? "line" : "lines"}`],
       ["Connect latency", runtime.connect_latency_ms === null ? "Not measured" : `${runtime.connect_latency_ms} ms`, `${runtime.connection_attempts} ${runtime.connection_attempts === 1 ? "attempt" : "attempts"} since start`],
       ["Memory buffer", `${runtime.buffer.lines} / ${runtime.buffer.capacity}`, "Current lines / capacity"],
     ];
@@ -652,7 +663,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
         ["Last received", operationTime(runtime.last_input_at, "Never")],
         ["Last sent", operationTime(runtime.last_output_at, "Never")],
         ["Last error", operationTime(runtime.last_error_at, "Never")],
-        ["Last error reason", runtime.last_error === null ? "No classified runtime failure." : `${runtime.last_error.code}: ${runtime.last_error.summary}${runtime.last_error.diagnostic ? ` Upstream: ${runtime.last_error.diagnostic}` : ""}`],
+        ["Last error reason", runtime.last_error === null ? "No classified runtime failure." : `${runtime.last_error.code}: ${runtime.last_error.summary}${runtime.last_error.diagnostic ? ` Server said: ${runtime.last_error.diagnostic}` : ""}`],
       ];
     details.push(["Oldest stored line", operationTime(view.storage.oldest_at, "Never")], ["Newest stored line", operationTime(view.storage.newest_at, "Never")]);
     for (const [label, value] of details) summary.append(append(element("div"), element("span", "", label), element("strong", "", value)));
@@ -666,7 +677,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     }
     fragment.append(timeline);
     const backlog = element("section", "panel");
-    backlog.append(append(element("div", "panel-head"), append(element("div"), element("h2", "", "IRC transcript"), element("p", "", "The newest 100 persisted upstream IRC lines, shown oldest first—including NickServ replies, server numerics, and connection diagnostics.")), element("span", "count", `${view.storage.lines} stored`)));
+    backlog.append(append(element("div", "panel-head"), append(element("div"), element("h2", "", "IRC transcript"), element("p", "", "The newest 100 stored IRC lines, oldest first, including NickServ replies and connection errors.")), element("span", "count", `${view.storage.lines} stored`)));
     if (view.recent_lines.length === 0) {
       backlog.append(element("p", "empty", "No IRC output has been stored for this network."));
     } else {
@@ -719,9 +730,9 @@ import { loadSettings, saveSettings } from "/console-settings.js";
   }
 
   const renderNetworkLog = (panel, lines) => {
-    const log = logRegion("Component log");
+    const log = logRegion("Network log");
     if (lines.length === 0) {
-      log.append(element("p", "empty", "No component lines have been stored yet."));
+      log.append(element("p", "empty", "No log lines have been stored yet."));
     } else {
       for (const line of lines) log.append(element("code", "", line));
     }
@@ -739,17 +750,17 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     }
     try {
       const name = root.dataset.networkName;
-      if (!name) throw new Error("This component has no resource ID. Return to networks and try again.");
+      if (!name) throw new Error("This network log has no resource ID. Return to networks and try again.");
       const network = await apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`);
       const title = root.querySelector("[data-network-log-title]");
       if (title) title.textContent = `${network.name} log`;
       const detail = root.querySelector("[data-network-log-detail]");
       if (detail instanceof HTMLAnchorElement) detail.href = `/console/networks/${encodeURIComponent(network.name)}`;
       const result = await apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}/buffer?limit=1000`);
-      renderNetworkLog(panel, apiCollection(result, "lines", "component log"));
+      renderNetworkLog(panel, apiCollection(result, "lines", "network log"));
       if (status) status.textContent = "Live log refreshed.";
     } catch (error) {
-      panel.replaceChildren(monitoringEmpty(`Component log failed (${error.message}). Use Refresh to retry.`));
+      panel.replaceChildren(monitoringEmpty(`Network log failed (${error.message}). Use Refresh to retry.`));
       if (status) {
         status.textContent = `Live log refresh failed (${error.message}). Use Refresh to retry.`;
         status.classList.add("refresh-error");
@@ -981,27 +992,32 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     };
   };
 
+  // One field carries a different value for each network type, so its label
+  // and its "is required" message both come from here.
+  const serverNetworkKinds = {
+    irc: { required: ["addr", "nick", "realname"], labels: { addr: "Server", nick: "Nickname", realname: "Real name", sasl_account: "NickServ account", sasl_password: "NickServ password" } },
+    local: { required: ["nick", "realname"], labels: { addr: "Server", nick: "Nickname", realname: "Real name" } },
+    matrix: { required: ["nick", "sasl_password"], labels: { addr: "Homeserver", nick: "Provider user", sasl_password: "Login password" } },
+    discord: { required: ["sasl_password"], labels: { addr: "API base", sasl_password: "Bot token" } },
+    slack: { required: ["sasl_account", "sasl_password"], labels: { addr: "API base", sasl_account: "Bot token", sasl_password: "App-level token" } },
+  };
+
   const syncNetworkForm = (form) => {
-    const driver = form.elements.namedItem("kind");
-    if (!(driver instanceof HTMLSelectElement)) throw new Error("Network form has no driver selector.");
-    const kind = driver.value;
-    const requirements = {
-      irc: { required: ["addr", "nick", "realname"], visible: ["addr", "nick", "realname", "sasl_account", "sasl_password"] },
-      local: { required: ["nick", "realname"], visible: ["addr", "nick", "realname"] },
-      matrix: { required: ["nick", "sasl_password"], visible: ["addr", "nick", "sasl_password"] },
-      discord: { required: ["sasl_password"], visible: ["addr", "sasl_password"] },
-      slack: { required: ["sasl_account", "sasl_password"], visible: ["addr", "sasl_account", "sasl_password"] },
-    }[kind];
-    if (!requirements) throw new Error(`Unsupported network driver: ${kind}`);
+    const type = form.elements.namedItem("kind");
+    if (!(type instanceof HTMLSelectElement)) throw new Error("Network form has no type selector.");
+    const requirements = serverNetworkKinds[type.value];
+    if (!requirements) throw new Error(`Unsupported network type: ${type.value}`);
     for (const name of ["addr", "nick", "realname", "sasl_account", "sasl_password"]) {
       const input = form.elements.namedItem(name);
       if (!(input instanceof HTMLInputElement)) throw new Error(`Network form has no ${name} input.`);
-      const active = requirements.visible.includes(name);
-      input.disabled = !active;
+      const text = requirements.labels[name];
+      input.disabled = text === undefined;
       input.required = requirements.required.includes(name);
       const label = input.closest("label");
-      if (!label) throw new Error(`Network form ${name} input has no label.`);
-      label.hidden = !active;
+      const caption = label?.querySelector("span");
+      if (!label || !caption) throw new Error(`Network form ${name} input has no label.`);
+      label.hidden = text === undefined;
+      if (text !== undefined) caption.textContent = text;
     }
   };
 
@@ -1024,10 +1040,13 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       if (!value) throw new Error(`${label} is required.`);
       return value;
     };
-    const kind = required("kind", "Driver");
+    const kind = required("kind", "Type");
+    const requirements = serverNetworkKinds[kind];
+    if (!requirements) throw new Error(`Unsupported network type: ${kind}.`);
+    const labelled = (name) => required(name, requirements.labels[name]);
     const common = {
       revision,
-      name: required("name", "Network name"),
+      name: required("name", "Name"),
       kind,
       tls: fields.has("tls"),
       autojoin: splitValues(String(fields.get("autojoin") || ""), ","),
@@ -1040,46 +1059,27 @@ import { loadSettings, saveSettings } from "/console-settings.js";
         const saslAccount = optional("sasl_account");
         const saslPassword = optional("sasl_password");
         if (Boolean(saslAccount.sasl_account) !== Boolean(saslPassword.sasl_password)) {
-          throw new Error("IRC SASL account and password must be provided together.");
+          throw new Error("NickServ account and password must be provided together.");
         }
         return {
           ...common,
-          addr: required("addr", "Address"),
-          nick: required("nick", "Nickname / user"),
-          realname: required("realname", "Real name"),
+          addr: labelled("addr"),
+          nick: labelled("nick"),
+          realname: labelled("realname"),
           ...saslAccount,
           ...saslPassword,
         };
       }
       case "local":
-        return {
-          ...common,
-          addr,
-          nick: required("nick", "Nickname / user"),
-          realname: required("realname", "Real name"),
-        };
+        return { ...common, addr, nick: labelled("nick"), realname: labelled("realname") };
       case "matrix":
-        return {
-          ...common,
-          addr,
-          nick: required("nick", "Nickname / user"),
-          sasl_password: required("sasl_password", "Login password"),
-        };
+        return { ...common, addr, nick: labelled("nick"), sasl_password: labelled("sasl_password") };
       case "discord":
-        return {
-          ...common,
-          addr,
-          sasl_password: required("sasl_password", "Bot token"),
-        };
+        return { ...common, addr, sasl_password: labelled("sasl_password") };
       case "slack":
-        return {
-          ...common,
-          addr,
-          sasl_account: required("sasl_account", "Bot token"),
-          sasl_password: required("sasl_password", "App-level token"),
-        };
+        return { ...common, addr, sasl_account: labelled("sasl_account"), sasl_password: labelled("sasl_password") };
       default:
-        throw new Error(`Unsupported network driver: ${kind}.`);
+        throw new Error(`No request shape is defined for network type ${kind}.`);
     }
   };
 
@@ -1693,7 +1693,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
           });
           body.append(append(element("tr"), element("td", "meta", row.id), client, append(element("td"), element("span", "tag", row.transport)), element("td", "", account), append(element("td"), connected, element("div", "meta", `${row.idle_seconds} seconds idle`)), element("td", "", row.channels.length ? element("code", "", row.channels.join(", ")) : element("span", "meta", "—")), append(element("td"), disconnect)));
         }
-        const table = append(document.createElement("table"), append(document.createElement("thead"), append(document.createElement("tr"), element("th", "", "ID"), element("th", "", "Client"), element("th", "", "Transport"), element("th", "", "Account"), element("th", "", "Connected / idle"), element("th", "", "Channels"), element("th", "", "Actions"))), body);
+        const table = append(document.createElement("table"), append(document.createElement("thead"), append(document.createElement("tr"), element("th", "", "ID"), element("th", "", "Client"), element("th", "", "Connection type"), element("th", "", "Account"), element("th", "", "Connected / idle"), element("th", "", "Channels"), element("th", "", "Actions"))), body);
         connections.append(scrollRegion("Live connections", table));
       }
       const pager = element("div", "pager");
@@ -2513,11 +2513,12 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     }
   }, trigger);
 
+  // A blank real name sends the nickname, as an IRC client conventionally does.
   const ownerNetworkConnection = (fields) => ({
     addr: fieldValue(fields, "addr"),
     tls: fields.has("tls"),
     nick: fieldValue(fields, "nick"),
-    realname: fieldValue(fields, "realname"),
+    realname: fieldValue(fields, "realname") || fieldValue(fields, "nick"),
     autojoin: splitValues(String(fields.get("autojoin") || ""), ","),
     sasl_account: optionalValue(String(fields.get("sasl_account") || "")),
     sasl_password: optionalValue(String(fields.get("sasl_password") || "")),
@@ -2525,32 +2526,19 @@ import { loadSettings, saveSettings } from "/console-settings.js";
 
   for (const form of document.querySelectorAll("[data-api-owner-network-create]")) {
     const preflightButton = form.querySelector("[data-api-network-preflight]");
-    const addButton = form.querySelector('[type="submit"]');
-    let qualifiedConnection = null;
-    const connectionFingerprint = () => JSON.stringify(ownerNetworkConnection(new FormData(form)));
-    if (addButton instanceof HTMLButtonElement) addButton.disabled = true;
-    form.addEventListener("input", (event) => {
-      if (event.target instanceof HTMLInputElement && event.target.name === "name") return;
-      qualifiedConnection = null;
-      if (addButton instanceof HTMLButtonElement) addButton.disabled = true;
-    });
     if (preflightButton) {
       preflightButton.addEventListener("click", () => {
-        const fields = new FormData(form);
-        const connection = ownerNetworkConnection(fields);
-        if (!connection.addr || !connection.nick || !connection.realname) {
-          setOwnerNetworkResult("Enter a server, nickname, and real name.", false);
+        // A test needs no name, so only the fields it sends are validated.
+        for (const required of ["nick", "addr"]) {
+          const input = form.elements.namedItem(required);
+          if (input instanceof HTMLInputElement && !input.reportValidity()) return;
+        }
+        const connection = ownerNetworkConnection(new FormData(form));
+        if (!connection.addr || !connection.nick) {
+          setOwnerNetworkResult("Enter a server and nickname.", false);
           return;
         }
-        const { addr, tls, nick, realname, autojoin, sasl_account, sasl_password } = connection;
-        const fingerprint = connectionFingerprint();
-        void mutateOwnerNetwork(form, "/api/v1/me/networks/preflight", "POST", {
-          addr, tls, nick, realname, autojoin, sasl_account, sasl_password,
-        }, ownerNetworkPreflight, preflightButton).then((result) => {
-          if (!result || connectionFingerprint() !== fingerprint) return;
-          qualifiedConnection = fingerprint;
-          if (addButton instanceof HTMLButtonElement) addButton.disabled = false;
-        });
+        void mutateOwnerNetwork(form, "/api/v1/me/networks/preflight", "POST", connection, ownerNetworkPreflight, preflightButton);
       });
     }
     form.addEventListener("submit", (event) => {
@@ -2558,12 +2546,8 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       const fields = new FormData(form);
       const name = fieldValue(fields, "name");
       const connection = ownerNetworkConnection(fields);
-      if (!name || !connection.addr || !connection.nick || !connection.realname) {
-        setOwnerNetworkResult("Enter a network ID, server, nickname, and real name.", false);
-        return;
-      }
-      if (qualifiedConnection !== connectionFingerprint()) {
-        setOwnerNetworkResult("Test this exact connection before adding it.", false);
+      if (!name || !connection.addr || !connection.nick) {
+        setOwnerNetworkResult("Enter a name, server, and nickname.", false);
         return;
       }
       void mutateOwnerNetwork(form, form.action, "POST", { kind: "irc", name, ...connection });
@@ -2603,11 +2587,11 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     const body = {
       addr: fieldValue(fields, "addr"), tls: bridge || fields.has("tls"),
       nick: fieldValue(fields, "nick"),
-      realname: bridge ? null : fieldValue(fields, "realname"),
+      realname: bridge ? null : optionalValue(fieldValue(fields, "realname")),
       autojoin: splitValues(String(fields.get("autojoin") || ""), ","), credentials,
     };
-    if (!bridge && (!body.addr || !body.nick || !body.realname)) {
-      throw new Error("Enter the server, nickname, and real name.");
+    if (!bridge && (!body.addr || !body.nick)) {
+      throw new Error("Enter the server and nickname.");
     }
     return body;
   };
@@ -2767,6 +2751,9 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       const kind = ownerNetworkDetail.querySelector("[data-network-kind]"); if (kind) kind.textContent = `${network.kind} network`;
       const provider = network.addr || "Provider API";
       setField("kind", network.kind); setField("addr", provider); setField("transport", network.tls ? "TLS" : network.addr ? "Plaintext" : "Provider-managed"); setField("nick", network.nick || "Provider account"); setField("realname", network.realname || "Not set"); setField("autojoin", network.autojoin.length ? network.autojoin.join(", ") : "None"); setField("account-credential", network.has_sasl_account ? "Stored" : "Not set"); setField("secret-credential", network.has_sasl_password ? "Stored encrypted" : "Not set"); setField("enabled", network.enabled ? "Enabled" : "Disabled");
+      // A bridge stores provider tokens and room identifiers in the same fields.
+      const bridgeLabels = { nick: "Identity", autojoin: "Rooms / channel IDs", "account-credential": "Account credential", "secret-credential": "Secret credential" };
+      if (network.kind !== "irc") for (const [field, label] of Object.entries(bridgeLabels)) { const node = ownerNetworkDetail.querySelector(`[data-network-label="${field}"]`); if (node) node.textContent = label; }
       const summary = ownerNetworkDetail.querySelector("[data-network-summary]"); if (summary instanceof HTMLElement) summary.hidden = false;
       const actions = ownerNetworkDetail.querySelector("[data-network-actions]"); if (actions instanceof HTMLElement) actions.hidden = false;
       const destructive = ownerNetworkDetail.querySelector("[data-network-destructive]"); if (destructive instanceof HTMLElement) destructive.hidden = false;
@@ -2826,7 +2813,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       event.preventDefault();
       const code = fieldValue(new FormData(verify), "code");
       if (!code) { setOwnerNetworkResult("Enter the verification code from the email.", false); return; }
-      void accountCommand(verify, { action: "verify", code }, "NickServ VERIFY REGISTER queued. Confirm the result in the IRC transcript before saving SASL credentials.");
+      void accountCommand(verify, { action: "verify", code }, "NickServ VERIFY REGISTER queued. Confirm the result in the IRC transcript before saving the account and password.");
     });
     const save = ownerNetworkDetail.querySelector("[data-api-network-account-save]");
     if (save instanceof HTMLFormElement) save.addEventListener("submit", (event) => {
@@ -2835,7 +2822,7 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       const fields = new FormData(save);
       const account = fieldValue(fields, "sasl_account");
       const password = fieldValue(fields, "sasl_password");
-      if (!account || !password) { setOwnerNetworkResult("Enter the verified NickServ account and password.", false); return; }
+      if (!account || !password) { setOwnerNetworkResult("Enter the NickServ account and password.", false); return; }
       const body = {
         addr: currentNetwork.addr,
         tls: currentNetwork.tls,
@@ -2856,9 +2843,9 @@ import { loadSettings, saveSettings } from "/console-settings.js";
           const savedPassword = save.querySelector('[name="sasl_password"]');
           if (savedPassword instanceof HTMLInputElement) savedPassword.value = "";
           await refreshOwnerNetworkDetail();
-          setOwnerNetworkResult("SASL credentials saved. The network is reconnecting with the verified account.", true);
+          setOwnerNetworkResult("NickServ account saved. The network is reconnecting with it.", true);
         } catch (error) {
-          setOwnerNetworkResult(error instanceof Error ? error.message : "SASL credential update failed.", false);
+          setOwnerNetworkResult(error instanceof Error ? error.message : "NickServ account update failed.", false);
         }
       });
     });

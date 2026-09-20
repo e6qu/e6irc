@@ -858,6 +858,24 @@ fn document() -> serde_json::Value {
             "/api/v1/server": {
                 "get": { "summary": "Server name, network name, version", "responses": ok_json }
             },
+            "/api/v1/network-presets": {
+                "get": {
+                    "summary": "Curated public IRC networks and their published connection defaults",
+                    "responses": json_response("the preset catalog", serde_json::json!({
+                        "type": "object", "additionalProperties": false, "required": ["presets"],
+                        "properties": { "presets": { "type": "array", "maxItems": 32, "items": {
+                            "type": "object", "additionalProperties": false,
+                            "required": ["id", "label", "name", "addr", "tls"],
+                            "properties": {
+                                "id": { "type": "string", "minLength": 1, "maxLength": 64 },
+                                "label": { "type": "string", "minLength": 1, "maxLength": 64 },
+                                "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+                                "addr": { "type": "string", "minLength": 1, "maxLength": 255 },
+                                "tls": { "type": "boolean" }
+                            } } } }
+                    }))
+                }
+            },
             "/api/v1/openapi.json": {
                 "get": {
                     "summary": "This complete OpenAPI 3.1 contract",
@@ -2175,7 +2193,9 @@ mod tests {
     const CHAT_READ_OPERATIONS: &[(&str, &str)] = &[
         ("/api/v1/me", "get"),
         ("/api/v1/me/networks", "get"),
+        ("/api/v1/me/networks/{name}", "get"),
         ("/api/v1/me/networks/{name}/buffer", "get"),
+        ("/api/v1/network-presets", "get"),
     ];
 
     #[test]

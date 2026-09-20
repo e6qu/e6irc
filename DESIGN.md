@@ -1299,9 +1299,17 @@ is never its client/URL identifier: `Libera Chat` maps to the safe stable id
 `libera`. Presets are applied server-side so they work without JavaScript;
 the script only mirrors their fields for editing. A preset is endpoint
 provenance, not a compatibility claim for the deployment's current egress.
-The console disables creation until the exact endpoint, TLS choice, identity,
-channels, and optional credentials have passed the production preflight; any
-change to those fields invalidates the qualification. Invalid submissions re-render
+The same catalog is served at `GET /api/v1/network-presets`, which the chat
+client's network dialog reads, so both surfaces offer one list and an endpoint
+is corrected in one place. Both forms ask first for what a known network cannot
+supply — the network, a nickname, an optional NickServ account and password,
+and channels to join — and keep what a preset already determines (name, server,
+TLS, real name) under an Advanced disclosure that opens itself for a custom
+server or an invalid field. **Test connection** runs the production preflight
+on request; it is a diagnostic, never a condition for saving: the API has never
+required it, and each forced test cost a second full registration and a
+join/part flap in every configured channel on a public network. The preflight
+says `QUIT` when it is done instead of dropping the socket. Invalid submissions re-render
 the page with the precise shared validation problem and preserve non-secret
 input, including the resolved preset values. IRC addresses must be a syntactic
 `host:port` with a nonzero numeric port (and bracketed IPv6); configuration,
@@ -1365,6 +1373,14 @@ mutation gate across their database and live-registry transitions. Concurrent
 control-plane requests therefore have a single order and cannot resurrect a
 deleted driver, publish an older edit after a newer one, or leave storage and
 the running registry representing different operations.
+The registry refuses to register over a live driver *before* the second driver
+starts, so two upstream sessions can never race for one network, and each
+caller states what it means: create and edit **supersede** (stop the
+predecessor, then start), while enable and account reactivation **ensure
+running** (start when absent, supersede a driver the upstream parked, and
+leave a working or still-retrying one alone). Enabling an already-enabled
+network is therefore an idempotent success that never drops a healthy upstream
+session.
 
 ---
 
@@ -1453,10 +1469,24 @@ one implementation shared with the external-network path.
   that can contain a password, email address, verification code, recovery
   token, or replacement credential synthesize only a redacted trailing field,
   while the exact command is still sent upstream.
-- Auto-reconnect with exponential backoff + jitter, bounded so repeatedly
-  rejected credentials or IRC registration settings stop re-dialing rather
-  than hammering the upstream forever; authentication and registration
-  rejection have distinct terminal lifecycle states. On reconnect the driver
+- Auto-reconnect has two schedules, because a lost packet and a refusal are
+  different events. A transient drop retries with exponential backoff + jitter
+  from 200ms to a 30s cap. A refusal is the upstream's policy answer and never
+  takes that schedule. **Rejected credentials park on the first rejection**:
+  a retry re-sends the same password, can only fail the same way, and every
+  failure counts against the owner's account on the upstream. **Any other
+  registration refusal** (a ghost on the nick, a connection throttle, a ban
+  that expires) retries after 30s, 1m, 2m, and 4m and parks on the fifth in a
+  row, keeping the upstream's sanitized reason in the runtime snapshot for the
+  whole wait. Only a session that actually registered resets that count: a dial
+  that dies before registration neither counts as a refusal nor forgives the
+  ones already counted, so a refusing upstream's own throttle cannot keep the
+  driver from parking. A server `ERROR` is classified by the one pre-welcome
+  refusal predicate at every stage — capability discovery, capability
+  requests, SASL, and the welcome — so its reason (`Trying to reconnect too
+  fast`, `SASL access only`) is typed and kept wherever it arrives.
+  Authentication and registration rejection have distinct terminal lifecycle
+  states. On reconnect the driver
   re-registers under the configured nick — a 433 without SASL earns one
   replacement-nick retry (`nick_`), since the common cause is a lingering
   ghost of our own previous session — and re-joins the *configured*
@@ -1699,17 +1729,27 @@ list rather than swapping server HTML, since per-channel routing and nick-list
 state are naturally client state. Its embedded HTML and hashed assets carry a
 deny-by-default CSP permitting only same-origin scripts, styles, fonts, forms,
 images, and HTTP/WebSocket connections. The socket reconnects with backoff so a
-transient drop self-heals; opening the page without a `?network=` selector
-shows a picker of the caller's networks (its entry point). The persistent
-top-bar selector changes networks from every chat view, the preferences menu
-owns validated theme/notification settings, and responsive conversation
-navigation preserves the full chat pane on phones. The identity, console, and
+transient drop self-heals. Networks appear in exactly one place: the sidebar
+list, which opens a network, shows its state, and carries its settings control.
+It is re-read every ten seconds while the page is visible, because state
+changes on the server (a reconnect, a rejected password) and a list read once
+went stale and contradicted its own copies. A row whose network is not
+connected quotes the upstream's own sanitized reason beside the control that
+repairs it. Opening the page without a `?network=` selector opens a connected
+network, else the first that can run, and rewrites the address to say so;
+only an account with nothing runnable sees the landing panel, whose one action
+adds a network in place. Adding a network opens it. The preferences menu owns
+validated theme/notification settings, and responsive conversation navigation
+preserves the full chat pane on phones. Every mutation the chat client sends
+carries the session's `X-E6IRC-CSRF` value read from `/api/v1/me`; the shared
+API contract module owns that header and `Content-Type`, refusing an unsafe
+method without the token before it reaches the network, so neither client can
+set — or therefore forget — them by hand. The identity, console, and
 chat surfaces share the relay-desk visual system: dark routing chrome, compact
 monospaced provenance labels, high-contrast state colors, and one amber route
-trace joining network context to the active conversation. The network catalog
-links only enabled networks with a running driver; disabled or unbuilt entries
-remain visible status rows and point recovery toward management instead of
-offering a dead-end chat action. Identity, network-list,
+trace joining network context to the active conversation. A disabled network
+still opens: its page says why chat is unavailable and links to where it can be
+enabled. Identity, network-list,
 history, storage, notification, and socket-protocol failures have visible,
 actionable states; an API failure is never rendered as an empty account. The
 member list is rank-ordered with sigils kept live from channel `MODE`, and the
@@ -1757,10 +1797,10 @@ update every affected buffer using the same pairing rules as the BNC session
 tracker. Malformed membership commands and incomplete topic numerics are shown
 in the server buffer rather than ignored or allowed to throw in the socket
 handler.
-The browser has an optional raw-output receiver tape that retains and renders
-every exact safe inbound IRC wire line, including state-changing lines,
-numerics, and NickServ replies. `/help` documents the available composer
-grammar; `/query`, `/msg`, `/notice`, `/join`, `/part`, `/nick`, `/me`, `/raw`,
+The browser has an optional Server log that retains and renders every exact
+safe inbound IRC wire line, including state-changing lines, numerics, and
+NickServ replies; its one switch sits beside the conversations. The command
+reference exists once, in the help dialog, and `/help` prints that same list; `/query`, `/msg`, `/notice`, `/join`, `/part`, `/nick`, `/me`, `/raw`,
 and `/quote` preserve normal IRC workflows instead of requiring a
 configuration-only UI.
 Status values are the closed set `connected`, `disconnected`, and

@@ -6,6 +6,9 @@ node_modules/
 /.pnpm-store/
 /web/dist
 /web/test-results
+# Failure diagnostics from tools/test-oidc-browser.mjs when
+# E6IRC_BROWSER_ARTIFACTS_DIR is given relative to the repository root.
+/test-results
 .DS_Store
 
 # Web client build artifacts (built by `pnpm build` in web/; CI rebuilds

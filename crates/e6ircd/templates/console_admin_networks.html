@@ -5,17 +5,17 @@
         <div class="page-head">
           <div>
             <p class="eyebrow">Fleet</p>
-            <h1>All BNC networks</h1>
-            <p class="lede">Every account's always-on networks with live driver state. Disable a single misbehaving upstream here instead of suspending the whole account.</p>
+            <h1>All networks</h1>
+            <p class="lede">Every account's always-on networks with their live state. Disable a single misbehaving network here instead of suspending the whole account.</p>
           </div>
           <span class="count" id="admin-network-count">…</span>
         </div>
 
-        <div class="scroll" tabindex="0" role="region" aria-label="All accounts BNC networks">
+        <div class="scroll" tabindex="0" role="region" aria-label="All accounts' networks">
           <table>
-            <caption class="sr-only">All accounts' BNC networks with live state</caption>
+            <caption class="sr-only">All accounts' networks with live state</caption>
             <thead>
-              <tr><th>Status</th><th>Owner</th><th>Network</th><th>Driver</th><th>Upstream</th><th>Clients</th><th>Errors</th><th>Last failure</th><th>Actions</th></tr>
+              <tr><th>Status</th><th>Owner</th><th>Network</th><th>Type</th><th>Server</th><th>Clients</th><th>Errors</th><th>Last failure</th><th>Actions</th></tr>
             </thead>
             <tbody id="admin-network-rows" data-api-admin-network-list data-csrf="{{ shell.csrf }}">
               <tr><td colspan="9" class="empty">Loading networks…</td></tr>

@@ -7,7 +7,7 @@
     <div>
       <p class="eyebrow">Chat bridges</p>
       <h1>Integrations</h1>
-      <p class="lede">Connect Matrix, Discord, and Slack through the same always-on network lifecycle, backlog, and diagnostics as IRC.</p>
+      <p class="lede">Connect Matrix, Discord, and Slack with the same always-on connection, backlog, and diagnostics as IRC.</p>
     </div>
     <a class="button-link secondary-link" href="/console/networks">All networks</a>
   </div>
@@ -32,7 +32,7 @@
           <form class="inline-config-form" method="post" action="/api/v1/me/networks" data-api-owner-bridge-create>
             <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
             <input type="hidden" name="kind" value="{{ p.meta.feature }}" />
-            <label class="field"><span>Network name</span><input name="name" placeholder="{{ p.meta.feature }}-main" required /></label>
+            <label class="field"><span>Name</span><input name="name" placeholder="{{ p.meta.feature }}-main" required /></label>
             <label class="field"><span>Homeserver / API base {% if !p.meta.addr_required %}<em>optional</em>{% endif %}</span><input name="addr" placeholder="{% if p.meta.addr_required %}https://chat.example.com{% else %}Provider default{% endif %}" {% if p.meta.addr_required %}required{% endif %} /></label>
             {% if p.meta.needs_nick %}<label class="field"><span>Provider user</span><input name="nick" autocomplete="username" required /></label>{% endif %}
             {% if p.meta.needs_account %}<label class="field"><span>{{ p.meta.account_label }}</span><input type="password" name="sasl_account" autocomplete="new-password" required /></label>{% endif %}

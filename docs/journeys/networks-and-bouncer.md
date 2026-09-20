@@ -46,7 +46,7 @@ and `console_configuration_enables_and_persists_bnc_listener`.
 ## Add Libera Chat, OFTC, EFnet, Snoonet, or a custom IRC network
 
 **Actor and goal.** An account holder wants an always-on upstream configured
-entirely through **BNC networks**.
+from the chat client or **Your networks** in the console.
 
 **Preconditions.** PostgreSQL and the network registry are ready, the caller
 has a browser session, and a master key is configured if upstream SASL
@@ -54,43 +54,41 @@ credentials are supplied.
 
 **Flow.**
 
-There are two ways in, because the two do different jobs. The chat client
-carries the everyday one: each network in the sidebar has a settings control,
-and **+** adds one, defaulting to Libera. That dialog covers the connection and
-the account -- nickname, server, auto-join, and the NickServ account and
-password of an upstream account already held -- and never leaves the client,
-because an account on a network is a property of that network and belongs
-beside it. Signing in to Libera with existing credentials needs nothing else.
+The chat client carries the everyday path. Both it and the console read one
+server-side catalog of known networks (`GET /api/v1/network-presets` and the
+console's rendered select are the same constant) and ask for the same things in
+the same words.
 
-The console at `/console/networks` remains the full form, with the presets,
-the preflight, and the bridge drivers.
+1. In the chat client choose **+** beside **Networks**, or **Add a network** on
+   an empty account. The dialog opens in place.
+2. **Network** defaults to Libera Chat and also offers OFTC, EFnet, Snoonet,
+   and **Another network…**. **Nickname** defaults to the account name.
+3. Optionally enter the **NickServ account** and **NickServ password** of an
+   account already held on that network, and **Channels to join**. Signing in to
+   Libera with existing credentials needs nothing else.
+4. What a known network already determines — **Name**, **Server**, **Use TLS**,
+   **Real name** — sits under **Advanced**. Choosing **Another network…** opens
+   it, because the name and server are then the person's to supply; so does any
+   field the browser reports invalid. A blank real name sends the nickname.
+5. **Save** sends the request with the session's `X-E6IRC-CSRF` value and opens
+   the new network. Creation names one driver and its complete fields; absent
+   kind, TLS, or IRC identity is rejected. The server validates sizes and
+   syntax, blocks prohibited IP literals, seals any password, constructs the
+   driver, inserts the owner-scoped row, and starts it. Each DNS result is
+   vetted again at dial time.
+6. The sidebar list is the one place networks appear. It is re-read every ten
+   seconds while the page is visible, so connected, reconnecting, and parked
+   states follow the server; a network that is not connected quotes the
+   upstream's own reason beside its settings control.
 
-1. Open `/console/networks`. The form defaults to the Libera Chat preset and
-   also offers OFTC, EFnet, Snoonet, and Custom server.
-2. Selecting a preset fills the stable network ID, published TLS endpoint, and
-   TLS checkbox. Server-side preset resolution repeats this step on submit, so
-   the safety defaults do not depend on JavaScript or client-supplied hidden
-   values.
-3. Supply nickname, real name, and comma-separated autojoin channels,
-   and optional upstream SASL account/password.
-4. Choose **Test connection** before saving. The owner-scoped preflight applies
-   the same server-side preset and validation rules, then uses the production
-   resolver, prohibited-address vetting, TCP/TLS connector, optional SASL, and
-   IRC registration path. It renders DNS, connect, and registration timings,
-   the confirmed nickname, and vetted address count without inserting a row or
-   starting a reconnect loop. It temporarily joins every configured channel
-   and succeeds only after each join is confirmed. A successful result enables
-   **Add network** only for those exact connection fields; editing any of them
-   invalidates the result and disables creation again.
-5. Submit the CSRF-protected form. Creation names one driver and its complete
-   fields; absent kind, TLS, or IRC identity is rejected. The server validates
-   sizes and syntax, blocks prohibited IP literals, seals any password,
-   constructs the driver, inserts the owner-scoped row, and starts it. Each DNS
-   result is vetted again at dial time.
-6. The committed result reloads the network list. The list reads only
-   `GET /api/v1/me/networks`; status comes from its live runtime snapshot,
-   including connected state, attempts, timestamps, latency, traffic,
-   attachments, and fixed-category errors.
+The console at `/console/networks` offers the same form plus **Test
+connection** and the bridge drivers. **Test connection** is optional: the
+owner-scoped preflight uses the production resolver, prohibited-address
+vetting, TCP/TLS connector, optional SASL, and IRC registration path, renders
+DNS, connect, and registration timings, the confirmed nickname, and vetted
+address count without inserting a row or starting a reconnect loop, temporarily
+joins every configured channel, and says `QUIT` when it is done. It never gates
+**Add network**.
 
 **Visible failures and recovery.**
 
@@ -102,10 +100,18 @@ the preflight, and the bridge drivers.
 - Duplicate owner/network names conflict under IRC casemapping.
 - DNS/address policy, TCP/TLS failure, upstream SASL rejection, nickname
   collision, and registration timeout return a closed preflight failure code
-  before storage. The same conditions can
-  still happen asynchronously after saving (or later during reconnect); they
-  appear in live operations and leave the network configured for retry/edit.
-  A stored row is not misreported as connected.
+  when **Test connection** is used. The same conditions surface after saving
+  (or during a reconnect) on the network's own row and in live operations, and
+  leave the network configured for edit. A stored row is not misreported as
+  connected.
+- Rejected credentials park the driver on the first rejection: a retry would
+  re-send the same password and count against the account on the upstream.
+  Saving corrected or removed credentials restarts it.
+- Any other registration refusal — a ghost holding the nickname, a connection
+  throttle, a ban — retries after 30s, 1m, 2m, and 4m, shows the upstream's own
+  sanitized reason and the next attempt time for the whole wait, and parks on
+  the fifth refusal in a row. A dial that dies before registration does not
+  reset that count.
 - A synchronous driver-construction failure happens before insertion. Once
   storage succeeds, registry insertion owns the running/retrying driver.
 - A transient owner-network directory read leaves the table semantics intact,
@@ -125,7 +131,13 @@ traffic, latency, attempts, closed error codes, and a bounded sanitized IRC
 registration diagnostic identify the result without exposing credentials or
 arbitrary transport errors.
 
-**Evidence.** Preset integrity and server-side application have unit tests.
+**Evidence.** Preset integrity and server-side application have unit tests, and
+the catalog endpoint has an HTTP test. Chromium proves the chat dialog's
+defaults, its Advanced disclosure, the exact request body, and the session
+token on the request. Real-socket driver tests prove that rejected credentials
+dial exactly once, that a dropped dial between refusals does not reset the park
+count, and that a refusal keeps its reason while retrying; the client crate
+proves a server `ERROR` during SASL is a typed refusal.
 The production IRC-driver preflight has a real local registration oracle.
 `console_add_and_delete_network_via_the_console` proves the non-mutating
 console qualification plus creation/deletion with PostgreSQL; Chromium,
@@ -152,8 +164,9 @@ created from a different accepted connection.
 
 **Flow.**
 
-1. Open the network detail page. Its **NickServ account setup** section and IRC
-   transcript remain visible together.
+1. Open the network detail page. Its **NickServ account** section leads with the
+   account and password pair for an account already held; open **Register a new
+   NickServ account** beneath it. The IRC transcript remains visible beside it.
 2. Enter an email address and new password. The closed owner-scoped endpoint
    sends the ordinary IRC command `PRIVMSG NickServ :REGISTER password email`.
 3. Read NickServ's response in the transcript, check the email, and return with
@@ -194,8 +207,8 @@ while it is happening.
 
 **Preconditions.** A browser session on the chat client.
 
-**Flow.** Select **Server log** in the sidebar, beside the conversations. The
-receiver tape shows every inbound wire line, newest last, and keeps recording
+**Flow.** Select **Server log** in the sidebar, beside the conversations — its
+only switch. It shows every inbound wire line, newest last, and keeps recording
 whether or not it is on screen, so switching it on after something has gone
 wrong still shows what happened.
 
@@ -226,7 +239,7 @@ monitoring; live runtime diagnosis remains tied to the registry.
 **Flow.**
 
 1. The network list reads `GET /api/v1/me/networks` and shows
-   enabled/paused, connecting/connected/disconnected, driver kind, upstream,
+   enabled/disabled, connecting/connected/disconnected, driver kind, upstream,
    attached clients, and error count.
 2. **Inspect** shows configuration without returning the stored secret.
 3. **Operations** refreshes the live snapshot: attempt/success/disconnect
@@ -238,7 +251,7 @@ monitoring; live runtime diagnosis remains tied to the registry.
    registration failure also carries its bounded sanitized upstream diagnostic.
 4. The recent persisted IRC transcript is shown oldest-first, including
    NickServ replies, notices, and numerics, and remains available while the
-   network is paused.
+   network is disabled.
 5. Global **Monitoring** aggregates upstream traffic, availability, error
    deltas, and latency across networks.
 
@@ -268,7 +281,7 @@ PLAIN.
 
 **Flow.**
 
-1. Read the attach address from **BNC networks**.
+1. Read the attach address from **Your networks** in the console.
 2. Connect to the BNC listener and negotiate SASL PLAIN.
 3. Authenticate with account `account/network` and the primary or app
    password.
@@ -340,7 +353,7 @@ without leaking line content.
 **Evidence.** Proven by restart-spanning replay, trim isolation, deletion
 purge, wire-form, and detached buffer API tests against PostgreSQL.
 
-## Edit, pause, resume, or delete a network
+## Edit, disable, enable, or delete a network
 
 **Actor and goal.** An owner wants lifecycle control without editing files or
 restarting the daemon.
@@ -352,10 +365,12 @@ are ready, and a master key exists for any credential replacement.
 
 - **Edit** validates a complete replacement and swaps the live driver only
   after storage/runtime checks. Blank password retains the sealed secret;
-  **Remove stored SASL credentials** is explicit.
-- **Pause** stores disabled state and stops the driver while retaining
+  **Remove the stored account and password** is explicit.
+- **Disable** stores disabled state and stops the driver while retaining
   configuration/backlog.
-- **Resume** starts a fresh driver from the stored configuration.
+- **Enable** starts a fresh driver from the stored configuration. Enabling a
+  network that is already running is an idempotent success: a working or
+  still-retrying driver is left alone, and one the upstream parked is restarted.
 - **Delete** removes owner-scoped configuration, runtime driver, persistence
   task, and buffer.
 - Equivalent GET/POST/PUT/PATCH/DELETE API operations use the same mutation

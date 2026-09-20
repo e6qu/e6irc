@@ -451,24 +451,51 @@ export function apiContractLoader(fetcher) {
   };
 }
 
+const SAFE_METHODS = new Set(["GET", "HEAD"]);
+
+// Headers this module owns. A caller that could set them could also forget
+// them, which is how the chat client came to send every network save without
+// its CSRF token and have each one refused.
+const OWNED_HEADERS = new Set(["x-e6irc-csrf", "content-type"]);
+
+function mutationHeaders(method, csrf, hasJson) {
+  const headers = {};
+  if (hasJson) headers["Content-Type"] = "application/json";
+  if (SAFE_METHODS.has(method.toUpperCase())) {
+    if (csrf !== undefined) {
+      throw new ApiSchemaError(`${method.toUpperCase()} requests do not carry the session security token.`);
+    }
+    return headers;
+  }
+  if (typeof csrf !== "string" || csrf === "") {
+    throw new ApiSchemaError("The session security token is missing. Reload and try again.");
+  }
+  headers["X-E6IRC-CSRF"] = csrf;
+  return headers;
+}
+
 export async function getOperationJson(fetcher, document, method, url, options = {}) {
   const { operation } = declaredOperation(document, method, url);
   parseOperationPath(document, method, url);
   parseOperationQuery(document, method, url);
-  const { json, body: ignoredBody, ...request } = options;
+  const { json, csrf, body: ignoredBody, ...request } = options;
   if (ignoredBody !== undefined) {
     throw new ApiSchemaError("JSON API requests must use the json option.");
+  }
+  if (Object.keys(request.headers ?? {}).some((name) => OWNED_HEADERS.has(name.toLowerCase()))) {
+    throw new ApiSchemaError("The session security token and content type are set from the csrf and json options.");
   }
   if (json === undefined && operation.requestBody?.required === true) {
     throw new ApiSchemaError(`The API contract requires a JSON request body for ${method.toUpperCase()} ${new URL(url, "https://e6irc.invalid").pathname}.`);
   }
+  const owned = mutationHeaders(method, csrf, json !== undefined);
   if (json !== undefined) {
     request.body = serializeOperationRequest(document, method, url, json);
   }
   const response = await fetcher(url, {
     ...request,
     method,
-    headers: { Accept: "application/json", ...request.headers },
+    headers: { Accept: "application/json", ...request.headers, ...owned },
   });
   if (!response.ok) await apiFailure(response);
   if (response.status === 204) {

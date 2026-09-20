@@ -13,11 +13,11 @@
   <section class="panel">
     <div class="panel-head">
       <div>
-        <h2>Exact filters</h2>
-        <p>Filter on stored actor, action, or target values. Empty fields match every value.</p>
+        <h2>Find audit entries</h2>
+        <p>Matches whole values. Empty fields match everything.</p>
       </div>
       {% if has_filters || has_cursor %}
-        <a class="secondary-link" href="/console/audit">Clear filters and cursor</a>
+        <a class="secondary-link" href="/console/audit">Clear</a>
       {% endif %}
     </div>
     <form class="field-grid" method="get" action="/console/audit">
@@ -42,7 +42,7 @@
                inputmode="numeric" required />
       </label>
       <div class="form-actions field-wide">
-        <button class="primary" type="submit">Apply filters</button>
+        <button class="primary" type="submit">Apply</button>
       </div>
     </form>
   </section>

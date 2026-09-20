@@ -12,7 +12,7 @@
           <a class="button-link" href="/api/v1/me/connections">Open connections JSON</a>
         {% else %}
           <h1>Live connections</h1>
-          <p class="lede">Bounded, newest-first registered IRC connections across every transport.</p>
+          <p class="lede">Registered IRC connections, newest first.</p>
           <a class="button-link" href="/api/v1/admin/connections">Open connections JSON</a>
         {% endif %}
       </div>
@@ -25,10 +25,10 @@
     <section class="panel">
       <div class="panel-head">
         <div>
-          <h2>Exact connection lookup</h2>
-          <p>Nick and account matching follow the server's RFC1459 case-folding rules.</p>
+          <h2>Find a connection</h2>
+          <p>Matches the whole name, ignoring case.</p>
         </div>
-        <a class="secondary-link" data-api-session-clear href="/console/sessions">Clear filters and cursor</a>
+        <a class="secondary-link" data-api-session-clear href="/console/sessions">Clear</a>
       </div>
       {% if own %}
         <form class="field-grid" method="get" action="/console/my-sessions" data-api-connection-filter>
@@ -36,19 +36,19 @@
         <form class="field-grid" method="get" action="/console/sessions" data-api-connection-filter>
       {% endif %}
         <label class="field">
-          <span>Exact nick</span>
+          <span>Nickname</span>
           <input name="nick" maxlength="64" autocomplete="off" placeholder="alice" />
         </label>
         {% if !own %}
           <label class="field">
-            <span>Exact account</span>
+            <span>Account</span>
             <input name="account" maxlength="64" autocomplete="off" placeholder="alice" />
           </label>
         {% endif %}
         <label class="field">
-          <span>Transport</span>
+          <span>Connection type</span>
           <select name="transport">
-            <option value="">All transports</option>
+            <option value="">All connection types</option>
             <option value="tcp">TCP</option>
             <option value="tls">TLS</option>
             <option value="websocket">WebSocket</option>
@@ -67,7 +67,7 @@
           <span>Rows per page</span>
           <input type="number" name="limit" value="50" min="1" max="1000" inputmode="numeric" required />
         </label>
-        <div class="form-actions field-wide"><button class="primary" type="submit">Apply lookup</button></div>
+        <div class="form-actions field-wide"><button class="primary" type="submit">Apply</button></div>
       </form>
     </section>
 

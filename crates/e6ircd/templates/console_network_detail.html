@@ -11,7 +11,7 @@
       </div>
       <div class="page-actions" data-network-actions hidden>
         <button type="button" data-refresh-target="#network-operations">Refresh</button>
-        <a class="button-link secondary-link" data-network-logs>Component log</a>
+        <a class="button-link secondary-link" data-network-logs>Network log</a>
         <a class="button-link secondary-link" data-network-edit hidden>Edit configuration</a>
         <form method="post" data-api-owner-network-toggle>
           <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
@@ -22,59 +22,63 @@
     </div>
 
     <div class="network-summary" role="group" aria-label="Stored network configuration" data-network-summary hidden>
-      <div><span>Driver</span><strong data-network-field="kind">—</strong></div>
-      <div><span>Upstream</span><code data-network-field="addr">—</code></div>
-      <div><span>Transport</span><strong data-network-field="transport">—</strong></div>
-      <div><span>Identity</span><code data-network-field="nick">—</code></div>
+      <div><span>Type</span><strong data-network-field="kind">—</strong></div>
+      <div><span>Server</span><code data-network-field="addr">—</code></div>
+      <div><span>Connection</span><strong data-network-field="transport">—</strong></div>
+      <div><span data-network-label="nick">Nickname</span><code data-network-field="nick">—</code></div>
       <div><span>Real name</span><code data-network-field="realname">—</code></div>
-      <div><span>Autojoin</span><code data-network-field="autojoin">—</code></div>
-      <div><span>Account credential</span><strong data-network-field="account-credential">—</strong></div>
-      <div><span>Secret credential</span><strong data-network-field="secret-credential">—</strong></div>
+      <div><span data-network-label="autojoin">Channels to join</span><code data-network-field="autojoin">—</code></div>
+      <div><span data-network-label="account-credential">NickServ account</span><strong data-network-field="account-credential">—</strong></div>
+      <div><span data-network-label="secret-credential">NickServ password</span><strong data-network-field="secret-credential">—</strong></div>
       <div><span>Configured state</span><strong data-network-field="enabled">—</strong></div>
     </div>
 
     <section class="panel account-setup" data-network-account-setup hidden>
       <div class="panel-head">
         <div>
-          <p class="eyebrow">NickServ email round trip</p>
-          <h2>Register this network account</h2>
-          <p>These controls send standard IRC messages to NickServ. Replies appear verbatim in the IRC transcript below, and the same commands remain available in chat.</p>
+          <h2>NickServ account</h2>
+          <p>Sign in to this network with a NickServ account. Saving reconnects the network.</p>
         </div>
         <a class="button-link secondary-link" data-network-chat>Open IRC client</a>
       </div>
-      <div class="banner-info" data-network-registration-warning hidden>
-        <div><strong>The upstream must accept an unauthenticated connection first.</strong> Libera Chat blocks account creation from some hosting-provider addresses. If its refusal says verified SASL is required, run steps 1 and 2 from an unrestricted IRC connection, then return here for step 3.</div>
-        <a class="button-link" href="https://libera.chat/guides/sasl" target="_blank" rel="noopener noreferrer">Libera SASL guide</a>
-      </div>
-      <div class="account-setup-steps">
-        <form method="post" data-api-network-account-register>
-          <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-          <span class="step-mark" aria-hidden="true">1</span>
-          <h3>Request the email</h3>
-          <p><code>/msg NickServ REGISTER &lt;password&gt; &lt;email&gt;</code></p>
-          <label class="field"><span>Email address</span><input type="email" name="email" autocomplete="email" maxlength="254" required /></label>
-          <label class="field"><span>New NickServ password</span><input type="password" name="password" autocomplete="new-password" maxlength="200" required /></label>
-          <button type="submit">Request verification email</button>
-        </form>
-        <form method="post" data-api-network-account-verify>
-          <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-          <span class="step-mark" aria-hidden="true">2</span>
-          <h3>Verify the email</h3>
-          <p><code>/msg NickServ VERIFY REGISTER &lt;nick&gt; &lt;code&gt;</code></p>
-          <label class="field"><span>Code from the email</span><input name="code" autocomplete="one-time-code" maxlength="200" required /></label>
-          <button type="submit">Send verification code</button>
-        </form>
-        <form method="post" data-api-network-account-save>
-          <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-          <span class="step-mark" aria-hidden="true">3</span>
-          <h3>Use SASL on reconnect</h3>
-          <p>After NickServ confirms verification in the transcript, store the account and password and restart this connection.</p>
-          <label class="field"><span>NickServ account</span><input name="sasl_account" autocomplete="username" maxlength="255" required /></label>
-          <label class="field"><span>NickServ password</span><input type="password" name="sasl_password" autocomplete="current-password" maxlength="200" required /></label>
-          <button class="primary" type="submit">Save SASL and reconnect</button>
-        </form>
-      </div>
-      <p class="section-note">Normal command access: open the IRC client and use <code>/msg NickServ …</code>, or use <code>/raw PRIVMSG NickServ :…</code>. Sensitive NickServ commands are sent upstream but redacted from e6irc’s stored self-echo.</p>
+      <form class="network-form" method="post" data-api-network-account-save>
+        <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+        <label class="field"><span>NickServ account</span><input name="sasl_account" autocomplete="username" maxlength="255" required /></label>
+        <label class="field"><span>NickServ password</span><input type="password" name="sasl_password" autocomplete="current-password" maxlength="200" required /></label>
+        <div class="form-actions field-wide"><button class="primary" type="submit">Save and reconnect</button></div>
+      </form>
+      <details class="advanced account-registration" data-network-account-registration>
+        <summary>Register a new NickServ account</summary>
+        <p class="section-note">Each step sends a standard message to NickServ. Its replies appear in the IRC transcript below, and the same commands work from chat with <code>/msg NickServ …</code>.</p>
+        <div class="banner-info" data-network-registration-warning hidden>
+          <div><strong>Libera Chat refuses account creation from some hosting-provider addresses.</strong> If its reply says a verified account is required, do steps 1 and 2 from another IRC connection, then save the account and password above.</div>
+          <a class="button-link" href="https://libera.chat/guides/sasl" target="_blank" rel="noopener noreferrer">Libera SASL guide</a>
+        </div>
+        <div class="account-setup-steps">
+          <form method="post" data-api-network-account-register>
+            <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+            <span class="step-mark" aria-hidden="true">1</span>
+            <h3>Request the email</h3>
+            <p><code>/msg NickServ REGISTER &lt;password&gt; &lt;email&gt;</code></p>
+            <label class="field"><span>Email address</span><input type="email" name="email" autocomplete="email" maxlength="254" required /></label>
+            <label class="field"><span>New NickServ password</span><input type="password" name="password" autocomplete="new-password" maxlength="200" required /></label>
+            <button type="submit">Request verification email</button>
+          </form>
+          <form method="post" data-api-network-account-verify>
+            <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+            <span class="step-mark" aria-hidden="true">2</span>
+            <h3>Verify the email</h3>
+            <p><code>/msg NickServ VERIFY REGISTER &lt;nick&gt; &lt;code&gt;</code></p>
+            <label class="field"><span>Code from the email</span><input name="code" autocomplete="one-time-code" maxlength="200" required /></label>
+            <button type="submit">Send verification code</button>
+          </form>
+          <div>
+            <span class="step-mark" aria-hidden="true">3</span>
+            <h3>Save and reconnect</h3>
+            <p>When NickServ confirms the verification in the transcript, use <strong>Save and reconnect</strong> above. The new password is already filled in.</p>
+          </div>
+        </div>
+      </details>
     </section>
 
     <div id="network-operations"

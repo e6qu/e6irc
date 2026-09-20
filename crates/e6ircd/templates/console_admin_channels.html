@@ -14,11 +14,11 @@
   <section class="panel">
     <div class="panel-head">
       <div>
-        <h2>Exact lookup</h2>
-        <p>Channel and founder matching follows the server's RFC1459 case-folding rules.</p>
+        <h2>Find a channel</h2>
+        <p>Matches the whole channel or founder name, ignoring case.</p>
       </div>
       {% if has_filters || has_cursor %}
-        <a class="secondary-link" href="/console/admin/channels">Clear filters and cursor</a>
+        <a class="secondary-link" href="/console/admin/channels">Clear</a>
       {% endif %}
     </div>
     <form class="field-grid" method="get" action="/console/admin/channels">
@@ -38,7 +38,7 @@
                inputmode="numeric" required />
       </label>
       <div class="form-actions field-wide">
-        <button class="primary" type="submit">Apply lookup</button>
+        <button class="primary" type="submit">Apply</button>
       </div>
     </form>
   </section>

@@ -130,13 +130,13 @@ test("schema parser enforces response status, constants, and array bounds", asyn
   assert.deepEqual(await getOperationJson(async (url, options) => {
     request = { url, options };
     return response;
-  }, document, "POST", "/api/v1/me/widgets", { method: "GET" }), {
+  }, document, "POST", "/api/v1/me/widgets", { csrf: "session-bound", method: "GET" }), {
     created: true,
     ids: [1, 2],
   });
   assert.deepEqual(request, {
     url: "/api/v1/me/widgets",
-    options: { method: "POST", headers: { Accept: "application/json" } },
+    options: { method: "POST", headers: { Accept: "application/json", "X-E6IRC-CSRF": "session-bound" } },
   });
   for (const value of [
     { created: false, ids: [1] },
@@ -444,27 +444,51 @@ test("operation requests serialize only contract-checked JSON", async () => {
   assert.equal(await getOperationJson(async (url, options) => {
     request = { url, options };
     return new Response(null, { status: 204 });
-  }, document, "POST", "/api/v1/me/widgets", { json: { enabled: true } }), undefined);
+  }, document, "POST", "/api/v1/me/widgets", { csrf: "session-bound", json: { enabled: true } }), undefined);
   assert.deepEqual(request, {
     url: "/api/v1/me/widgets",
     options: {
       method: "POST",
-      headers: { Accept: "application/json" },
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "X-E6IRC-CSRF": "session-bound",
+      },
       body: '{"enabled":true}',
     },
   });
   await assert.rejects(
-    getOperationJson(async () => new Response(), document, "POST", "/api/v1/me/widgets", { json: {} }),
+    getOperationJson(async () => new Response(), document, "POST", "/api/v1/me/widgets", { csrf: "session-bound", json: {} }),
     ApiSchemaError,
   );
   await assert.rejects(
-    getOperationJson(async () => new Response(), document, "POST", "/api/v1/me/widgets", { body: "{}" }),
+    getOperationJson(async () => new Response(), document, "POST", "/api/v1/me/widgets", { csrf: "session-bound", body: "{}" }),
     ApiSchemaError,
   );
   await assert.rejects(
-    getOperationJson(async () => new Response(), document, "POST", "/api/v1/me/widgets"),
+    getOperationJson(async () => new Response(), document, "POST", "/api/v1/me/widgets", { csrf: "session-bound" }),
     ApiSchemaError,
   );
+
+  // An unsafe method never reaches the network without the session's CSRF
+  // token, and a caller cannot supply (or therefore omit) the header by hand.
+  let sent = 0;
+  const counting = async () => {
+    sent += 1;
+    return new Response(null, { status: 204 });
+  };
+  for (const options of [
+    { json: { enabled: true } },
+    { csrf: "", json: { enabled: true } },
+    { csrf: "session-bound", headers: { "x-e6irc-csrf": "by-hand" }, json: { enabled: true } },
+    { csrf: "session-bound", headers: { "Content-Type": "text/plain" }, json: { enabled: true } },
+  ]) {
+    await assert.rejects(
+      getOperationJson(counting, document, "POST", "/api/v1/me/widgets", options),
+      ApiSchemaError,
+    );
+  }
+  assert.equal(sent, 0);
   await assert.rejects(
     getOperationJson(async () => new Response(null, { status: 204 }), {
       paths: { "/api/v1/me/widgets": { post: { responses: {} } } },
@@ -483,6 +507,7 @@ test("operation requests preserve an API problem detail", async () => {
       { paths: { "/api/v1/me/profile": { patch: { responses: {} } } } },
       "PATCH",
       "/api/v1/me/profile",
+      { csrf: "session-bound" },
     ),
     /Profile storage unavailable/,
   );

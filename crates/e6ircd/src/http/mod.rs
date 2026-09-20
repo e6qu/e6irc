@@ -1128,6 +1128,7 @@ documented_routes! {
     "/healthz" => { get: health },
     "/readyz" => { get: readiness },
     "/api/v1/server" => { get: server_info },
+    "/api/v1/network-presets" => { get: network_presets },
     "/api/v1/monitoring/observation" => { get: application_observation },
     "/api/v1/openapi.json" => { get: openapi },
     "/api/v1/auth/app-passwords" => { post: create_app_password },
