@@ -1062,8 +1062,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   // One field carries a different value for each network type, so its label
   // and its "is required" message both come from here.
   const serverNetworkKinds = {
-    irc: { required: ["addr", "nick", "realname"], labels: { addr: "Server", nick: "Nickname", realname: "Real name", sasl_account: "NickServ account", sasl_password: "NickServ password" } },
-    local: { required: ["nick", "realname"], labels: { addr: "Server", nick: "Nickname", realname: "Real name" } },
+    irc: { required: ["addr", "nick", "username", "realname"], labels: { addr: "Server", nick: "Nickname", username: "Username", realname: "Real name", sasl_account: "NickServ account", sasl_password: "NickServ password" } },
+    local: { required: ["nick", "username", "realname"], labels: { addr: "Server", nick: "Nickname", username: "Username", realname: "Real name" } },
     matrix: { required: ["nick", "sasl_password"], labels: { addr: "Homeserver", nick: "Provider user", sasl_password: "Login password" } },
     discord: { required: ["sasl_password"], labels: { addr: "API base", sasl_password: "Bot token" } },
     slack: { required: ["sasl_account", "sasl_password"], secret: ["sasl_account"], labels: { addr: "API base", sasl_account: "Bot token", sasl_password: "App-level token" } },
@@ -1089,7 +1089,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       input.type = secret ? "password" : "text";
       input.autocomplete = secret ? "new-password" : "off";
     }
-    for (const name of ["addr", "nick", "realname", "sasl_account", "sasl_password"]) {
+    for (const name of ["addr", "nick", "username", "realname", "sasl_account", "sasl_password"]) {
       const input = form.elements.namedItem(name);
       if (!(input instanceof HTMLInputElement)) throw new Error(`Network form has no ${name} input.`);
       const text = requirements.labels[name];
@@ -1147,13 +1147,14 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           ...common,
           addr: labelled("addr"),
           nick: labelled("nick"),
+          username: labelled("username"),
           realname: labelled("realname"),
           ...saslAccount,
           ...saslPassword,
         };
       }
       case "local":
-        return { ...common, addr, nick: labelled("nick"), realname: labelled("realname") };
+        return { ...common, addr, nick: labelled("nick"), username: labelled("username"), realname: labelled("realname") };
       case "matrix":
         return { ...common, addr, nick: labelled("nick"), sasl_password: labelled("sasl_password") };
       case "discord":
@@ -2507,6 +2508,31 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     return refreshOwnerNetworks;
   };
 
+  // The API names the field a refusal belongs to, and so do the refusals made
+  // here before anything is sent: mark and focus it, opening the disclosure it
+  // sits in, instead of leaving a sentence to be matched to an input by eye.
+  const showOwnerNetworkFailure = (form, error) => {
+    setOwnerNetworkResult(error instanceof Error ? error.message : "Network request failed.", false);
+    const input = typeof error?.field === "string" ? form.elements.namedItem(error.field) : null;
+    if (input instanceof HTMLInputElement) {
+      const disclosure = input.closest("details");
+      if (disclosure) disclosure.open = true;
+      input.setAttribute("aria-invalid", "true");
+      input.addEventListener("input", () => input.removeAttribute("aria-invalid"), { once: true });
+      input.focus();
+    }
+  };
+
+  // Build a request body; a refusal is shown on the form and yields undefined.
+  const ownerNetworkBody = (form, build) => {
+    try {
+      return build();
+    } catch (error) {
+      showOwnerNetworkFailure(form, error);
+      return undefined;
+    }
+  };
+
   const mutateOwnerNetwork = (
     form,
     url,
@@ -2528,27 +2554,32 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       }
       return result;
     } catch (error) {
-      setOwnerNetworkResult(error instanceof Error ? error.message : "Network request failed.", false);
-      // The API names the field a refusal belongs to: mark and focus it,
-      // opening the disclosure it sits in, instead of leaving a sentence to be
-      // matched to an input by eye.
-      const input = typeof error?.field === "string" ? form.elements.namedItem(error.field) : null;
-      if (input instanceof HTMLInputElement) {
-        const disclosure = input.closest("details");
-        if (disclosure) disclosure.open = true;
-        input.setAttribute("aria-invalid", "true");
-        input.addEventListener("input", () => input.removeAttribute("aria-invalid"), { once: true });
-        input.focus();
-      }
+      showOwnerNetworkFailure(form, error);
       return undefined;
     }
   }, trigger);
+
+  // The `USER` name, shown as the ident. The API requires one and never
+  // derives it. A blank box means the nickname, as the form says -- but only
+  // when the nickname is itself a legal user name; it is never rewritten to
+  // fit. A typed value is the server's to judge (and the input's `pattern`).
+  const USER_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$/;
+  const userNameFor = (fields) => {
+    const typed = fieldValue(fields, "username");
+    const nick = fieldValue(fields, "nick");
+    if (typed || USER_NAME.test(nick)) return typed || nick;
+    throw Object.assign(
+      new Error(`Enter a username. The nickname ${nick} cannot double as one: letters, digits, - and _ only, starting with a letter or digit, at most 10 characters.`),
+      { field: "username" },
+    );
+  };
 
   // A blank real name sends the nickname, as an IRC client conventionally does.
   const ownerNetworkConnection = (fields) => ({
     addr: fieldValue(fields, "addr"),
     tls: fields.has("tls"),
     nick: fieldValue(fields, "nick"),
+    username: userNameFor(fields),
     realname: fieldValue(fields, "realname") || fieldValue(fields, "nick"),
     // Commas or spaces, as the chat client accepts: an IRC channel name can
     // contain neither, and "#a #b" typed here used to become one bogus channel.
@@ -2565,15 +2596,17 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     if (preflightButton) {
       preflightButton.addEventListener("click", () => {
         // A test needs no name, so only the fields it sends are validated.
-        for (const required of ["nick", "addr"]) {
+        for (const required of ["nick", "addr", "username"]) {
           const input = form.elements.namedItem(required);
           if (input instanceof HTMLInputElement && !input.reportValidity()) return;
         }
-        const connection = ownerNetworkConnection(new FormData(form));
-        if (!connection.addr || !connection.nick) {
+        const fields = new FormData(form);
+        if (!fieldValue(fields, "addr") || !fieldValue(fields, "nick")) {
           setOwnerNetworkResult("Enter a server and nickname.", false);
           return;
         }
+        const connection = ownerNetworkBody(form, () => ownerNetworkConnection(fields));
+        if (!connection) return;
         void mutateOwnerNetwork(form, "/api/v1/me/network-preflight", "POST", connection, ownerNetworkPreflight, preflightButton);
       });
     }
@@ -2581,11 +2614,12 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       event.preventDefault();
       const fields = new FormData(form);
       const name = fieldValue(fields, "name");
-      const connection = ownerNetworkConnection(fields);
-      if (!name || !connection.addr || !connection.nick) {
+      if (!name || !fieldValue(fields, "addr") || !fieldValue(fields, "nick")) {
         setOwnerNetworkResult("Enter a name, server, and nickname.", false);
         return;
       }
+      const connection = ownerNetworkBody(form, () => ownerNetworkConnection(fields));
+      if (!connection) return;
       void mutateOwnerNetwork(form, form.action, "POST", { kind: "irc", name, ...connection }).then((created) => {
         if (!created) return;
         // Back to the defaults, so the NickServ password does not sit in the
@@ -2626,28 +2660,27 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       : (account || password)
         ? { action: "set", account, password: password || null }
         : { action: "keep" };
+    if (!bridge && (!fieldValue(fields, "addr") || !fieldValue(fields, "nick"))) {
+      throw new Error("Enter the server and nickname.");
+    }
     const body = {
       addr: fieldValue(fields, "addr"), tls: bridge || fields.has("tls"),
       nick: fieldValue(fields, "nick"),
+      // A bridge has no user name and the API refuses one for it.
+      ...(bridge ? {} : { username: userNameFor(fields) }),
       // An IRC network always has a real name (the API refuses null for one),
       // so a blank box means the nickname, on edit exactly as on create.
       realname: bridge ? null : (fieldValue(fields, "realname") || fieldValue(fields, "nick")),
       autojoin: splitValues(String(fields.get("autojoin") || ""), bridge ? "," : /[\s,]+/), credentials,
     };
-    if (!bridge && (!body.addr || !body.nick)) {
-      throw new Error("Enter the server and nickname.");
-    }
     return body;
   };
 
   for (const form of document.querySelectorAll("[data-api-owner-network-update], [data-api-owner-bridge-update]")) {
     form.addEventListener("submit", (event) => {
       event.preventDefault();
-      try {
-        void mutateOwnerNetwork(form, form.action, "PUT", ownerNetworkUpdate(form, form.hasAttribute("data-api-owner-bridge-update")));
-      } catch (error) {
-        setOwnerNetworkResult(error instanceof Error ? error.message : "Invalid network configuration.", false);
-      }
+      const body = ownerNetworkBody(form, () => ownerNetworkUpdate(form, form.hasAttribute("data-api-owner-bridge-update")));
+      if (body) void mutateOwnerNetwork(form, form.action, "PUT", body);
     });
   }
 
@@ -2710,7 +2743,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const render = (network) => {
       if (network.kind !== "irc") { window.location.replace("/console/networks"); return; }
       if (ownerNetworkResult instanceof HTMLElement) { ownerNetworkResult.replaceChildren(); ownerNetworkResult.className = ""; }
-      hydrateTextInput(form, "addr", network.addr); hydrateTextInput(form, "nick", network.nick); hydrateTextInput(form, "realname", network.realname ?? ""); hydrateTextInput(form, "autojoin", network.autojoin.join(", ")); hydrateTextInput(form, "sasl_account", network.sasl_account ?? "");
+      hydrateTextInput(form, "addr", network.addr); hydrateTextInput(form, "nick", network.nick); hydrateTextInput(form, "username", network.username ?? ""); hydrateTextInput(form, "realname", network.realname ?? ""); hydrateTextInput(form, "autojoin", network.autojoin.join(", ")); hydrateTextInput(form, "sasl_account", network.sasl_account ?? "");
       hydrateCheckbox(form, "tls", network.tls);
       form.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
       const title = ownerNetworkEditor.querySelector("[data-network-editor-title]"); if (title) title.textContent = `Edit ${network.name}`;
@@ -2794,7 +2827,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const title = ownerNetworkDetail.querySelector("[data-network-title]"); if (title) title.textContent = network.name;
       const kind = ownerNetworkDetail.querySelector("[data-network-kind]"); if (kind) kind.textContent = `${network.kind} network`;
       const provider = network.addr || "Provider API";
-      setField("kind", network.kind); setField("addr", provider); setField("transport", network.tls ? "TLS" : network.addr ? "Plaintext" : "Provider-managed"); setField("nick", network.nick || "Provider account"); setField("realname", network.realname || "Not set"); setField("autojoin", network.autojoin.length ? network.autojoin.join(", ") : "None"); setField("account-credential", network.has_sasl_account ? "Stored" : "Not set"); setField("secret-credential", network.has_sasl_password ? "Stored encrypted" : "Not set"); setField("enabled", network.enabled ? "Enabled" : "Disabled");
+      setField("kind", network.kind); setField("addr", provider); setField("transport", network.tls ? "TLS" : network.addr ? "Plaintext" : "Provider-managed"); setField("nick", network.nick || "Provider account"); setField("username", network.username || "Not used"); setField("realname", network.realname || "Not set"); setField("autojoin", network.autojoin.length ? network.autojoin.join(", ") : "None"); setField("account-credential", network.has_sasl_account ? "Stored" : "Not set"); setField("secret-credential", network.has_sasl_password ? "Stored encrypted" : "Not set"); setField("enabled", network.enabled ? "Enabled" : "Disabled");
       // A bridge stores provider tokens and room identifiers in the same fields.
       const bridgeLabels = { nick: "Identity", autojoin: "Rooms / channel IDs", "account-credential": "Account credential", "secret-credential": "Secret credential" };
       if (network.kind !== "irc") for (const [field, label] of Object.entries(bridgeLabels)) { const node = ownerNetworkDetail.querySelector(`[data-network-label="${field}"]`); if (node) node.textContent = label; }
@@ -2871,6 +2904,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         addr: currentNetwork.addr,
         tls: currentNetwork.tls,
         nick: currentNetwork.nick,
+        username: currentNetwork.username,
         realname: currentNetwork.realname,
         autojoin: currentNetwork.autojoin,
         credentials: { action: "set", account, password },

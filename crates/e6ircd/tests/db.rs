@@ -6,12 +6,73 @@
 
 use e6irc_queue::{Config as QueueConfig, Policy, queue};
 use e6ircd::config::{Config, DatabaseConfig, ListenerConfig, NetworkKind};
-use e6ircd::core::{CoreIngress, DbReply, DbRequest, HistoryTargets, Input};
+use e6ircd::core::{CoreIngress, DbReply, DbRequest, Input};
 use e6ircd::{db, net};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 mod support;
+
+/// A full-access personal access token with the default lifetime, minted the
+/// way the REST endpoint mints one.
+async fn issue_api_token(
+    pool: &sqlx::PgPool,
+    account: &str,
+    label: &str,
+) -> Result<String, e6ircd::db::DbError> {
+    e6ircd::db::issue_scoped_api_token(
+        pool,
+        account,
+        label,
+        e6ircd::identity::ApiTokenScopes::new(e6ircd::identity::ApiTokenScope::ALL)
+            .expect("every scope is a non-empty set"),
+        e6ircd::identity::ApiTokenLifetimeDays::DEFAULT,
+    )
+    .await
+}
+
+/// Persist a server ban the way the server does: the audited mutation, so the
+/// ban and its audit record commit together.
+async fn add_server_ban(
+    pool: &sqlx::PgPool,
+    mask: &str,
+    mask_display: &str,
+    reason: &str,
+    set_by: &str,
+    kind: &str,
+) -> Result<(), e6ircd::db::DbError> {
+    e6ircd::db::mutate_server_ban_audited(
+        pool,
+        &e6ircd::core::ServerBanMutation::Add {
+            mask: mask.into(),
+            mask_display: mask_display.into(),
+            reason: reason.into(),
+            set_by: set_by.into(),
+            kind: kind.into(),
+        },
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The newest audit entries, unfiltered, through the query the console uses.
+async fn list_audit_log(
+    pool: &sqlx::PgPool,
+    page_size: db::AuditLogPageSize,
+) -> Result<Vec<db::AuditLogRow>, db::DbError> {
+    Ok(db::query_audit_log(
+        pool,
+        db::AuditLogFilter {
+            before_id: None,
+            actor: None,
+            action: None,
+            target: None,
+            page_size,
+        },
+    )
+    .await?
+    .entries)
+}
 
 static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
@@ -80,7 +141,7 @@ async fn tgts(
     max_ts: e6irc_proto::time::Millis,
     limit: usize,
 ) -> Vec<(String, e6irc_proto::time::Millis)> {
-    db::query_targets(pool, channels, me, min_ts, max_ts, limit)
+    db::query_targets(pool, channels, Some(me), min_ts, max_ts, limit)
         .await
         .expect("targets query")
 }
@@ -92,11 +153,11 @@ async fn verify_password_roundtrip() {
         .await
         .expect("connect");
 
-    db::create_account(&pool, "Alice", "correct horse")
+    db::create_account_with_contact(&pool, "Alice", "correct horse", None)
         .await
         .expect("create");
     // duplicate registration fails loudly, case-insensitively
-    let dup = db::create_account(&pool, "alice", "x").await;
+    let dup = db::create_account_with_contact(&pool, "alice", "x", None).await;
     assert!(
         matches!(dup, Err(db::DbError::DuplicateAccount(_))),
         "{dup:?}"
@@ -250,7 +311,7 @@ async fn account_contact_email_is_stored_normalized_and_private_by_default() {
 async fn sasl_over_real_socket() {
     let url = support::test_db("sasl_over_real_socket").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    db::create_account(&pool, "sasluser", "s3cret")
+    db::create_account_with_contact(&pool, "sasluser", "s3cret", None)
         .await
         .expect("create");
     drop(pool);
@@ -307,10 +368,10 @@ async fn sasl_over_real_socket() {
 async fn sasl_oauthbearer_with_api_token() {
     let url = support::test_db("sasl_oauthbearer_with_api_token").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    db::create_account(&pool, "tokuser", "pw")
+    db::create_account_with_contact(&pool, "tokuser", "pw", None)
         .await
         .expect("create");
-    let token = db::issue_api_token(&pool, "tokuser", "cli")
+    let token = issue_api_token(&pool, "tokuser", "cli")
         .await
         .expect("token");
     drop(pool);
@@ -333,7 +394,14 @@ async fn sasl_oauthbearer_with_api_token() {
         .await
         .unwrap();
     let nick = c
-        .register_oauthbearer("toknick", "T", &token)
+        .register_oauthbearer(
+            &e6irc_client::Identity {
+                nick: "toknick",
+                username: "toknick",
+                realname: "T",
+            },
+            &token,
+        )
         .await
         .expect("oauthbearer login");
     assert_eq!(nick, "toknick");
@@ -362,9 +430,16 @@ async fn sasl_oauthbearer_with_api_token() {
         .await
         .unwrap();
     assert!(
-        bad.register_oauthbearer("bad", "B", "not-a-real-token")
-            .await
-            .is_err(),
+        bad.register_oauthbearer(
+            &e6irc_client::Identity {
+                nick: "bad",
+                username: "bad",
+                realname: "B"
+            },
+            "not-a-real-token"
+        )
+        .await
+        .is_err(),
         "invalid token must be refused"
     );
 }
@@ -377,7 +452,7 @@ async fn app_password_issued_over_http_works_for_sasl() {
 
     let url = support::test_db("app_password_issued_over_http_works_for_sasl").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    db::create_account(&pool, "apppw", "mainpass")
+    db::create_account_with_contact(&pool, "apppw", "mainpass", None)
         .await
         .expect("create");
     drop(pool);
@@ -471,7 +546,7 @@ async fn auth_endpoint_rate_limit_returns_429_after_burst() {
 
     let url = support::test_db("auth_endpoint_rate_limit_returns_429_after_burst").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    db::create_account(&pool, "rluser", "mainpass")
+    db::create_account_with_contact(&pool, "rluser", "mainpass", None)
         .await
         .expect("create");
     drop(pool);
@@ -665,37 +740,30 @@ async fn buffered_history_flushes_when_the_sender_is_dropped() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn history_worker_resolves_offline_direct_message_candidates() {
+async fn history_worker_tells_an_unknown_msgid_from_an_empty_page() {
     let pool = db::connect_and_migrate(
-        &support::test_db("history_worker_resolves_offline_direct_message_candidates").await,
+        &support::test_db("history_worker_tells_an_unknown_msgid_from_an_empty_page").await,
     )
     .await
     .expect("connect");
-    for (msgid, target, body) in [
-        ("account-message", "alice!bob", "registered"),
-        ("anonymous-message", "bob!~carol", "unauthenticated"),
-    ] {
+    for (msgid, target) in [("newest-here", "#here"), ("elsewhere", "#other")] {
         sqlx::query(
-            "INSERT INTO messages
-                 (msgid, target, sender_prefix, kind, body, ts, dm_peers)
-             VALUES ($1, $2, 'peer!u@host', 'privmsg', $3, now(),
-                     string_to_array($2, '!'))",
+            "INSERT INTO messages (msgid, target, sender_prefix, kind, body, ts)
+             VALUES ($1, $2, 'peer!u@host', 'privmsg', 'text', now())",
         )
         .bind(msgid)
         .bind(target)
-        .bind(body)
         .execute(&pool)
         .await
         .expect("insert history");
     }
-
     let (request_tx, request_rx) = queue::<DbRequest>(QueueConfig {
-        name: "history-target-request",
+        name: "history-msgid-request",
         capacity: 8,
         policy: Policy::Fifo,
     });
     let (core_tx, mut core_rx) = queue::<Input>(QueueConfig {
-        name: "history-target-reply",
+        name: "history-msgid-reply",
         capacity: 8,
         policy: Policy::Fifo,
     });
@@ -704,34 +772,32 @@ async fn history_worker_resolves_offline_direct_message_candidates() {
         request_rx,
         CoreIngress::single(core_tx),
     ));
-
-    for (targets, expected) in [
-        (
-            HistoryTargets::PreferExisting {
-                primary: "alice!bob".into(),
-                fallback: "bob!~alice".into(),
-            },
-            "registered",
-        ),
-        (
-            HistoryTargets::PreferExisting {
-                primary: "bob!carol".into(),
-                fallback: "bob!~carol".into(),
-            },
-            "unauthenticated",
-        ),
+    let unknown = || {
+        Err(e6ircd::core::HistoryFault::UnknownMsgid {
+            subcommand: "AFTER",
+        })
+    };
+    for (msgid, expected) in [
+        // Known here, nothing after it: a real, empty page.
+        ("newest-here", Ok(Vec::new())),
+        ("never-existed", unknown()),
+        // Another buffer's msgid is unknown *here*; it must not position this one.
+        ("elsewhere", unknown()),
     ] {
         request_tx
             .push(DbRequest::QueryHistory {
                 conn: e6ircd::core::ConnId(9),
-                targets,
-                display: "peer".into(),
+                target: "#here".into(),
+                display: "#here".into(),
                 batch_ref: "batch".into(),
                 caps: e6ircd::core::HistoryResponseCaps {
                     batch: true,
                     ..Default::default()
                 },
-                query: e6ircd::core::HistoryQuery::Latest { limit: 10 },
+                query: e6ircd::core::HistoryQuery::AfterMsgid {
+                    msgid: msgid.into(),
+                    limit: 10,
+                },
                 label: None,
             })
             .await
@@ -742,9 +808,7 @@ async fn history_worker_resolves_offline_direct_message_candidates() {
         let Input::HistoryPage { rows, .. } = reply.payload else {
             panic!("unexpected worker reply")
         };
-        let rows = rows.expect("history page");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].body, expected);
+        assert_eq!(rows, expected, "{msgid}");
     }
 }
 
@@ -756,7 +820,7 @@ async fn credential_list_and_revoke() {
 
     let url = support::test_db("credential_list_and_revoke").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    db::create_account(&pool, "creduser", "pw")
+    db::create_account_with_contact(&pool, "creduser", "pw", None)
         .await
         .expect("create");
     // two app passwords
@@ -880,7 +944,9 @@ async fn credential_list_and_revoke() {
 async fn verify_records_credential_last_used() {
     let url = support::test_db("verify_records_credential_last_used").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    db::create_account(&pool, "lu", "pw").await.expect("create");
+    db::create_account_with_contact(&pool, "lu", "pw", None)
+        .await
+        .expect("create");
     let app = db::issue_app_password(&pool, "lu", "pw", "laptop")
         .await
         .expect("app pw");
@@ -931,7 +997,9 @@ async fn verify_records_credential_last_used() {
 async fn revoke_credential_cannot_delete_the_primary_password() {
     let url = support::test_db("revoke_credential_cannot_delete_the_primary_password").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    db::create_account(&pool, "rc", "pw").await.expect("create");
+    db::create_account_with_contact(&pool, "rc", "pw", None)
+        .await
+        .expect("create");
     db::issue_app_password(&pool, "rc", "pw", "laptop")
         .await
         .expect("app pw");
@@ -976,7 +1044,7 @@ async fn primary_password_rotation_is_single_and_rejects_app_passwords() {
     let url =
         support::test_db("primary_password_rotation_is_single_and_rejects_app_passwords").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    db::create_account(&pool, "rotate", "old")
+    db::create_account_with_contact(&pool, "rotate", "old", None)
         .await
         .expect("create");
     let app = db::issue_app_password(&pool, "rotate", "old", "client")
@@ -1069,7 +1137,7 @@ async fn primary_password_rotation_is_single_and_rejects_app_passwords() {
 async fn app_passwords_are_capped_per_account() {
     let url = support::test_db("app_passwords_are_capped_per_account").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    db::create_account(&pool, "cap", "pw")
+    db::create_account_with_contact(&pool, "cap", "pw", None)
         .await
         .expect("create");
     // Mint the maximum (32); each succeeds.
@@ -1091,18 +1159,18 @@ async fn app_passwords_are_capped_per_account() {
 async fn api_tokens_are_capped_per_account() {
     let url = support::test_db("api_tokens_are_capped_per_account").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    db::create_account(&pool, "tcap", "pw")
+    db::create_account_with_contact(&pool, "tcap", "pw", None)
         .await
         .expect("create");
     // Mint the maximum (32) through the capped REST path; each succeeds.
     for i in 0..32 {
-        db::issue_api_token(&pool, "tcap", &format!("cli{i}"))
+        issue_api_token(&pool, "tcap", &format!("cli{i}"))
             .await
             .unwrap_or_else(|e| panic!("token {i} should succeed: {e}"));
     }
     // The 33rd is refused with the dedicated error — the cap is enforced
     // atomically in the DB layer, not by a racy list-then-insert in the handler.
-    let over = db::issue_api_token(&pool, "tcap", "one too many").await;
+    let over = issue_api_token(&pool, "tcap", "one too many").await;
     assert!(
         matches!(over, Err(db::DbError::TooManyCredentials)),
         "the 33rd PAT must be refused: {over:?}"
@@ -1114,7 +1182,7 @@ async fn api_tokens_are_capped_per_account() {
 async fn api_token_storage_rejects_invalid_grants_and_lifetimes() {
     let url = support::test_db("api_token_storage_rejects_invalid_grants_and_lifetimes").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    db::create_account(&pool, "token-shape", "pw")
+    db::create_account_with_contact(&pool, "token-shape", "pw", None)
         .await
         .expect("create");
     let account_id: i64 =
@@ -1168,7 +1236,7 @@ async fn api_token_storage_rejects_invalid_grants_and_lifetimes() {
 async fn bnc_networks_are_capped_per_account() {
     let url = support::test_db("bnc_networks_are_capped_per_account").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    db::create_account(&pool, "ncap", "pw")
+    db::create_account_with_contact(&pool, "ncap", "pw", None)
         .await
         .expect("create");
     let row = |i: usize| db::BncNetworkRow {
@@ -1177,6 +1245,7 @@ async fn bnc_networks_are_capped_per_account() {
         addr: "irc.example:6697".into(),
         tls: true,
         nick: "ncap".into(),
+        username: Some("tester".into()),
         realname: Some("Network Cap".into()),
         autojoin: vec![],
         sasl_account: None,
@@ -1256,7 +1325,7 @@ async fn channel_access_is_capped_per_channel() {
 async fn read_marker_persists() {
     let url = support::test_db("read_marker_persists").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    db::create_account(&pool, "mark", "pw")
+    db::create_account_with_contact(&pool, "mark", "pw", None)
         .await
         .expect("create");
 
@@ -1345,7 +1414,7 @@ async fn history_rest_endpoint() {
     use e6ircd::config::HttpConfig;
     let url = support::test_db("history_rest_endpoint").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    db::create_account(&pool, "web", "pw")
+    db::create_account_with_contact(&pool, "web", "pw", None)
         .await
         .expect("create");
     // The REST history read authorizes the target against a registered
@@ -1362,7 +1431,7 @@ async fn history_rest_endpoint() {
         .await
         .expect("session");
     // A second account with no relationship to #web must be refused (IDOR).
-    db::create_account(&pool, "other", "pw")
+    db::create_account_with_contact(&pool, "other", "pw", None)
         .await
         .expect("create other");
     let other_session = db::create_web_session(&pool, "other", None)
@@ -1584,7 +1653,7 @@ PING x
     // A third party cannot reach it, not even by passing the raw conversation
     // key: the key is derived from *their* account, so it can only ever name a
     // conversation they are part of.
-    db::create_account(&pool2, "snoop", "pw")
+    db::create_account_with_contact(&pool2, "snoop", "pw", None)
         .await
         .expect("snoop");
     let snoop_session = db::create_web_session(&pool2, "snoop", None)
@@ -1850,7 +1919,7 @@ async fn read_marker_preloaded_after_restart() {
     // MARKREAD query returns `*` after a restart even though a marker persists.
     let url = support::test_db("read_marker_preloaded_after_restart").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    db::create_account(&pool, "marky", "pw")
+    db::create_account_with_contact(&pool, "marky", "pw", None)
         .await
         .expect("acct");
     drop(pool);
@@ -1922,7 +1991,7 @@ async fn sasl_registration_fails_loudly_on_nick_in_use() {
     // use, reported after CAP END) as terminal instead of blocking forever.
     let url = support::test_db("sasl_registration_fails_loudly_on_nick_in_use").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    db::create_account(&pool, "dupacct", "pw")
+    db::create_account_with_contact(&pool, "dupacct", "pw", None)
         .await
         .expect("acct");
     drop(pool);
@@ -1944,7 +2013,13 @@ async fn sasl_registration_fails_loudly_on_nick_in_use() {
     let mut c1 = e6irc_client::Connection::connect(&addr.to_string())
         .await
         .unwrap();
-    c1.register("dup", "First").await.expect("register");
+    c1.register(&e6irc_client::Identity {
+        nick: "dup",
+        username: "dup",
+        realname: "First",
+    })
+    .await
+    .expect("register");
 
     // Client 2 authenticates via SASL but requests the same nick. After 903 the
     // server refuses registration with 433; register_sasl must return an error,
@@ -1954,7 +2029,15 @@ async fn sasl_registration_fails_loudly_on_nick_in_use() {
         .unwrap();
     let res = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        c2.register_sasl("dup", "Second", "dupacct", "pw"),
+        c2.register_sasl(
+            &e6irc_client::Identity {
+                nick: "dup",
+                username: "dup",
+                realname: "Second",
+            },
+            "dupacct",
+            "pw",
+        ),
     )
     .await
     .expect("register_sasl must not hang on an in-use nick");
@@ -2046,7 +2129,7 @@ async fn chathistory_targets_db_path_shows_dm_correspondent_as_a_nick() {
     // must agree.
     let url =
         support::test_db("chathistory_targets_db_path_shows_dm_correspondent_as_a_nick").await;
-    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    db::connect_and_migrate(&url).await.expect("connect");
     let config = Config {
         server_name: "irc.dm.example".into(),
         network_name: "DmNet".into(),
@@ -2082,18 +2165,8 @@ async fn chathistory_targets_db_path_shows_dm_correspondent_as_a_nick() {
     aw.write_all(b"PRIVMSG bob :hi there\r\n").await.unwrap();
     expect_line(&mut breader, "PRIVMSG bob :hi there").await;
 
-    // Wait for the DM to land in the messages table.
-    for _ in 0..100 {
-        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE dm_peers IS NOT NULL")
-            .fetch_one(&pool)
-            .await
-            .expect("count");
-        if n >= 1 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-
+    // Both parties are unauthenticated, so the conversation is in the ring
+    // only; TARGETS must still list it, merged into the database's answer.
     let lo = e6irc_proto::time::server_time(e6irc_proto::time::Millis::from_millis(1000));
     let hi = e6irc_proto::time::server_time(e6irc_proto::time::Millis::from_millis(
         std::time::SystemTime::now()
@@ -2119,13 +2192,12 @@ async fn chathistory_targets_db_path_shows_dm_correspondent_as_a_nick() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn chathistory_dm_with_a_disconnected_unauthenticated_peer_is_readable() {
-    // Regression: an *unauthenticated* peer's DM is stored under `~nick`, but the
-    // offline read resolves the nick to the bare (account) form. Once the peer
-    // disconnects, the account-form key names no stored conversation, so
-    // without the `~nick` fallback `CHATHISTORY LATEST <nick>` returned an empty
-    // batch for backlog `CHATHISTORY TARGETS` still advertises.
-    let url = support::test_db("chathistory_dm_disconnected_unauth_peer").await;
+async fn a_stranger_taking_a_nick_gets_none_of_its_previous_conversations() {
+    // `~nick` is whoever holds the nick now. A conversation with an
+    // unauthenticated party is therefore never stored and never served from
+    // storage: unauthenticated bob messages alice and quits; the next `bob`
+    // must find neither the conversation nor the correspondent.
+    let url = support::test_db("a_stranger_taking_a_nick_gets_none_of_its_previous").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
     let config = Config {
         server_name: "irc.dm2.example".into(),
@@ -2139,88 +2211,131 @@ async fn chathistory_dm_with_a_disconnected_unauthenticated_peer_is_readable() {
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
-
-    // bob is the querier; alice (unauthenticated) sends him a DM then quits.
-    let bob_stream = TcpStream::connect(running.addrs[0]).await.expect("bob");
-    let (br, mut bw) = bob_stream.into_split();
-    let mut breader = BufReader::new(br);
-    bw.write_all(
-        b"CAP LS 302\r\nCAP REQ :batch draft/chathistory message-tags server-time\r\n\
-          NICK bob\r\nUSER b 0 * :B\r\nCAP END\r\n",
-    )
-    .await
-    .unwrap();
-    expect_line(&mut breader, "001").await;
-
-    let alice_stream = TcpStream::connect(running.addrs[0]).await.expect("alice");
-    let (ar, mut aw) = alice_stream.into_split();
-    let mut areader = BufReader::new(ar);
-    aw.write_all(b"NICK alice\r\nUSER a 0 * :A\r\n")
+    let connect = |nick: &'static str| {
+        let addr = running.addrs[0];
+        async move {
+            let (read, mut write) = TcpStream::connect(addr).await.expect(nick).into_split();
+            let mut reader = BufReader::new(read);
+            write
+                .write_all(
+                    format!(
+                        "CAP LS 302\r\nCAP REQ :batch draft/chathistory message-tags \
+                         server-time\r\nNICK {nick}\r\nUSER u 0 * :U\r\nCAP END\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            expect_line(&mut reader, "001").await;
+            (reader, write)
+        }
+    };
+    let (mut alice_reader, mut alice) = connect("alice").await;
+    let (bob_reader, mut bob) = connect("bob").await;
+    alice.write_all(b"JOIN #sentinel\r\n").await.unwrap();
+    bob.write_all(b"PRIVMSG alice :for your eyes only\r\n")
         .await
         .unwrap();
-    expect_line(&mut areader, "001").await;
-    aw.write_all(b"PRIVMSG bob :hi there\r\n").await.unwrap();
-    expect_line(&mut breader, "PRIVMSG bob :hi there").await;
-
-    // Wait for the DM to persist before switching the lookup to the offline
-    // identity path.
+    expect_line(&mut alice_reader, "for your eyes only").await;
+    // The log queue is first-in first-out: once this later channel message is
+    // stored, the direct message before it would have been too.
+    alice
+        .write_all(b"PRIVMSG #sentinel :after the direct message\r\n")
+        .await
+        .unwrap();
     for _ in 0..100 {
-        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE dm_peers IS NOT NULL")
+        let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM messages")
             .fetch_one(&pool)
             .await
             .expect("count");
-        if n >= 1 {
+        if stored >= 1 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    let direct: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM messages WHERE dm_peers IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(direct, 0, "a conversation with a `~` party was stored");
 
-    // alice disconnects; poll until she is fully offline, so bob's read resolves
-    // her nick to the bare form (exercising the fallback, not the live-session
-    // path — which would resolve the correct `~alice` key directly and pass
-    // trivially).
-    aw.write_all(b"QUIT :bye\r\n").await.unwrap();
-    drop(aw);
-    drop(areader);
+    bob.write_all(b"QUIT :bye\r\n").await.unwrap();
+    drop((bob, bob_reader));
     loop {
-        bw.write_all(b"ISON alice\r\n").await.unwrap();
-        let line = expect_line(&mut breader, " 303 ").await;
-        let present = line
+        alice.write_all(b"ISON bob\r\n").await.unwrap();
+        let line = expect_line(&mut alice_reader, " 303 ").await;
+        if !line
             .rsplit_once(" :")
-            .map(|(_, t)| t.contains("alice"))
-            .unwrap_or(false);
-        if !present {
+            .is_some_and(|(_, nicks)| nicks.contains("bob"))
+        {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    // bob reads the DM history by alice's nick. The account-form key names no
-    // stored conversation; the `~alice` fallback must resolve the backlog.
-    bw.write_all(b"CHATHISTORY LATEST alice * 10\r\n")
+    let (mut stranger_reader, mut stranger) = connect("bob").await;
+    stranger
+        .write_all(
+            b"CHATHISTORY LATEST alice * 10\r\n\
+              CHATHISTORY TARGETS timestamp=2000-01-01T00:00:00.000Z \
+              timestamp=2999-01-01T00:00:00.000Z 10\r\n",
+        )
         .await
         .unwrap();
-    let batch_open = expect_line(&mut breader, "BATCH +").await;
-    let batch_ref = batch_open
-        .split(" BATCH +")
-        .nth(1)
-        .and_then(|s| s.split(' ').next())
-        .expect("batch ref")
-        .to_string();
-    let mut found = false;
-    loop {
-        let line = expect_line(&mut breader, "").await;
-        if line.contains("BATCH -") {
-            break;
-        }
-        if line.contains(&format!("batch={batch_ref}")) && line.contains("hi there") {
-            found = true;
-        }
+    for batch in ["chathistory alice", "draft/chathistory-targets"] {
+        expect_line(&mut stranger_reader, batch).await;
+        let next = expect_line(&mut stranger_reader, "").await;
+        assert!(
+            next.contains("BATCH -"),
+            "the new `bob` was served the previous one's {batch}: {next}"
+        );
     }
+}
+
+/// Migration 0058 removes what was stored before the rule existed, and only that.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn stored_conversations_with_an_unauthenticated_party_are_purged() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("stored_conversations_with_an_unauthenticated_party_are_purged").await,
+    )
+    .await
+    .expect("connect");
+    for (msgid, target) in [
+        ("legacy-anonymous", "alice!~bob"),
+        ("accounts", "alice!carol"),
+        ("channel", "#room"),
+    ] {
+        sqlx::query(
+            "INSERT INTO messages (msgid, target, sender_prefix, kind, body, ts, dm_peers)
+             VALUES ($1, $2, 'peer!u@host', 'privmsg', 'text', now(),
+                     CASE WHEN left($2, 1) = '#' THEN NULL ELSE string_to_array($2, '!') END)",
+        )
+        .bind(msgid)
+        .bind(target)
+        .execute(&pool)
+        .await
+        .expect("insert history");
+    }
+    // Even before the purge runs, a stored `~` conversation is never listed.
+    let ever = e6irc_proto::time::Millis::from_millis;
     assert!(
-        found,
-        "the disconnected unauthenticated peer's DM must be replayed, not an empty batch"
+        tgts(&pool, &[], "~bob", ever(0), ever(4_000_000_000_000), 10)
+            .await
+            .is_empty()
     );
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0058_purge_unauthenticated_direct_messages.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("purge");
+    let kept: Vec<String> = sqlx::query_scalar("SELECT msgid FROM messages ORDER BY msgid")
+        .fetch_all(&pool)
+        .await
+        .expect("remaining");
+    assert_eq!(kept, ["accounts", "channel"]);
 }
 
 #[tokio::test]
@@ -2229,10 +2344,12 @@ async fn bnc_networks_crud() {
     let pool = db::connect_and_migrate(&support::test_db("bnc_networks_crud").await)
         .await
         .expect("connect");
-    db::create_account(&pool, "alice", "pw")
+    db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("acct");
-    let bob_id = db::create_account(&pool, "bob", "pw").await.expect("acct");
+    let bob_id = db::create_account_with_contact(&pool, "bob", "pw", None)
+        .await
+        .expect("acct");
 
     let libera = db::BncNetworkRow {
         kind: NetworkKind::Irc,
@@ -2240,6 +2357,7 @@ async fn bnc_networks_crud() {
         addr: "irc.libera.chat:6697".into(),
         tls: true,
         nick: "alice_".into(),
+        username: Some("tester".into()),
         realname: Some("Alice".into()),
         autojoin: vec!["#rust".into(), "#e6irc".into()],
         sasl_account: Some("alice".into()),
@@ -2315,6 +2433,7 @@ async fn bnc_networks_crud() {
         addr: "https://matrix.example".into(),
         tls: true,
         nick: "e6bot".into(),
+        username: None,
         realname: Some("Alice".into()),
         autojoin: vec!["#room:matrix.example".into()],
         sasl_account: None,
@@ -2414,7 +2533,7 @@ async fn bnc_network_name_selection_is_case_insensitive() {
         db::connect_and_migrate(&support::test_db("bnc_network_name_case_insensitive").await)
             .await
             .expect("connect");
-    db::create_account(&pool, "alice", "pw")
+    db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("acct");
 
@@ -2424,6 +2543,7 @@ async fn bnc_network_name_selection_is_case_insensitive() {
         addr: "irc.libera.chat:6697".into(),
         tls: true,
         nick: "alice_".into(),
+        username: Some("tester".into()),
         realname: Some("Mixed Case".into()),
         autojoin: vec![],
         sasl_account: None,
@@ -2521,7 +2641,7 @@ async fn deleting_a_bnc_network_purges_its_casefolded_buffer() {
     )
     .await
     .expect("connect");
-    db::create_account(&pool, "MixedCase", "pw")
+    db::create_account_with_contact(&pool, "MixedCase", "pw", None)
         .await
         .expect("acct");
     let net = db::BncNetworkRow {
@@ -2530,6 +2650,7 @@ async fn deleting_a_bnc_network_purges_its_casefolded_buffer() {
         addr: "irc.libera.chat:6697".into(),
         tls: true,
         nick: "mc".into(),
+        username: Some("tester".into()),
         realname: Some("Mixed Case".into()),
         autojoin: vec![],
         sasl_account: None,
@@ -2593,7 +2714,7 @@ async fn concurrent_bnc_read_markers_cannot_exceed_the_account_cap() {
     )
     .await
     .expect("connect");
-    db::create_account(&pool, "alice", "pw")
+    db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("account");
     for index in 0..250 {
@@ -3223,7 +3344,7 @@ async fn channel_registration_stores_initial_topic_in_its_insert() {
     )
     .await
     .expect("connect");
-    db::create_account(&pool, "boss", "pw")
+    db::create_account_with_contact(&pool, "boss", "pw", None)
         .await
         .expect("account");
     let topic = ("initial".to_string(), "boss!b@h".to_string(), 1000);
@@ -3240,7 +3361,7 @@ async fn channel_registration_stores_initial_topic_in_its_insert() {
             1000
         )]
     );
-    let audit = db::list_audit_log(&pool, audit_page_size(1))
+    let audit = list_audit_log(&pool, audit_page_size(1))
         .await
         .expect("audit");
     let entry = &audit[0];
@@ -3261,7 +3382,7 @@ async fn channel_topic_persist_and_load() {
     let pool = db::connect_and_migrate(&support::test_db("channel_topic_persist_and_load").await)
         .await
         .expect("connect");
-    db::create_account(&pool, "boss", "pw")
+    db::create_account_with_contact(&pool, "boss", "pw", None)
         .await
         .expect("account");
     sqlx::query(
@@ -3315,7 +3436,7 @@ async fn channel_keeptopic_persist_and_load() {
         db::connect_and_migrate(&support::test_db("channel_keeptopic_persist_and_load").await)
             .await
             .expect("connect");
-    db::create_account(&pool, "boss", "pw")
+    db::create_account_with_contact(&pool, "boss", "pw", None)
         .await
         .expect("account");
     sqlx::query(
@@ -3402,7 +3523,7 @@ async fn channel_mlock_persist_and_load() {
     let pool = db::connect_and_migrate(&support::test_db("channel_mlock_persist_and_load").await)
         .await
         .expect("connect");
-    db::create_account(&pool, "boss", "pw")
+    db::create_account_with_contact(&pool, "boss", "pw", None)
         .await
         .expect("account");
     sqlx::query(
@@ -3622,6 +3743,164 @@ async fn managed_config_migration_backfills_legacy_oidc_claims() {
     assert_eq!(after, before, "backfill is idempotent");
 }
 
+/// 0057 states the user name every existing IRC network has been sending: the
+/// old derivation (the first ten bytes of the nick), repaired only where the
+/// grammar no longer admits it. A network that worked keeps its identity; new
+/// configuration still gets no default.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn username_migration_backfills_what_each_network_was_already_sending() {
+    let pool = sqlx::PgPool::connect(
+        &support::test_db("username_migration_backfills_what_each_network_was_sending").await,
+    )
+    .await
+    .expect("connect");
+    MIGRATIONS
+        .run_to(56, &pool)
+        .await
+        .expect("migrate through 0056");
+    let cases = [
+        ("alice", "alice"),
+        ("alice_updated", "alice_upda"),
+        ("_bot", "bot"),
+        ("|me|", "me"),
+        ("[away]x", "awayx"),
+        ("a.b`c", "abc"),
+        ("zoë-ß", "zo-"),
+        ("ééééééééééx", "e6irc"),
+        ("___", "e6irc"),
+    ];
+    let account: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (name, name_folded) VALUES ('owner', 'owner') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("legacy account");
+    for (index, (nick, _)) in cases.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO bnc_networks (account_id, name, addr, nick, kind)
+             VALUES ($1, $2, 'irc.example:6697', $3, 'irc')",
+        )
+        .bind(account)
+        .bind(format!("irc{index}"))
+        .bind(nick)
+        .execute(&pool)
+        .await
+        .expect("legacy irc network");
+    }
+    sqlx::query(
+        "INSERT INTO bnc_networks (account_id, name, addr, nick, kind)
+         VALUES ($1, 'bridge', '', '', 'discord')",
+    )
+    .bind(account)
+    .execute(&pool)
+    .await
+    .expect("legacy bridge");
+
+    let managed = e6ircd::config::ManagedConfig::from_config(&Config::default(), None)
+        .expect("bootstrap managed settings");
+    let mut settings = serde_json::to_value(managed).expect("serialize managed settings");
+    settings
+        .as_object_mut()
+        .expect("managed settings object")
+        .retain(|field, _| MANAGED_CONFIG_0052_FIELDS.contains(&field.as_str()));
+    let legacy_entry = |kind: &str, name: &str, nick: &str| {
+        serde_json::json!({
+            "name": name, "kind": kind, "owner": null, "addr": "irc.example:6697",
+            "tls": true, "nick": nick, "realname": "Real", "autojoin": [],
+            "buffer_cap": 1000, "sasl_account": null, "sasl_password": null
+        })
+    };
+    let mut stated = legacy_entry("irc", "stated", "_bot");
+    stated["username"] = "chosen".into();
+    settings["networks"] = serde_json::json!([
+        legacy_entry("irc", "legacy-irc", "_bot"),
+        legacy_entry("local", "legacy-local", "alice_updated"),
+        stated,
+    ]);
+    settings["oidc_providers"] = serde_json::json!([]);
+    sqlx::query(
+        "INSERT INTO server_settings (singleton, revision, settings, updated_by)
+         VALUES (TRUE, 1, $1, 'legacy')",
+    )
+    .bind(settings)
+    .execute(&pool)
+    .await
+    .expect("legacy settings");
+
+    MIGRATIONS.run(&pool).await.expect("migrate current");
+
+    let stored: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT nick, username FROM bnc_networks ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("backfilled networks");
+    let mut expected: Vec<(String, Option<String>)> = cases
+        .iter()
+        .map(|(nick, username)| (nick.to_string(), Some(username.to_string())))
+        .collect();
+    expected.push((String::new(), None));
+    assert_eq!(stored, expected);
+    for (_, username) in &stored {
+        if let Some(username) = username {
+            username
+                .parse::<e6ircd::bouncer::UpstreamUsername>()
+                .unwrap_or_else(|error| panic!("backfilled {username:?}: {error}"));
+        }
+    }
+    // A bridge cannot be given a user name, nor an IRC network lose its own.
+    for violation in [
+        "UPDATE bnc_networks SET username = 'x' WHERE kind = 'discord'",
+        "UPDATE bnc_networks SET username = NULL WHERE kind = 'irc'",
+    ] {
+        assert!(
+            sqlx::query(violation).execute(&pool).await.is_err(),
+            "{violation}"
+        );
+    }
+
+    let loaded = db::load_managed_config(&pool)
+        .await
+        .expect("typed settings after migration");
+    assert_eq!(
+        loaded
+            .settings
+            .networks
+            .iter()
+            .map(|network| (network.name.as_str(), network.username.as_deref()))
+            .collect::<Vec<_>>(),
+        [
+            ("legacy-irc", Some("bot")),
+            ("legacy-local", Some("alice_upda")),
+            ("stated", Some("chosen")),
+        ]
+    );
+
+    let before: serde_json::Value =
+        sqlx::query_scalar("SELECT settings FROM server_settings WHERE singleton")
+            .fetch_one(&pool)
+            .await
+            .expect("migrated settings");
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0057_bnc_network_username.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("repeat migration");
+    let after: serde_json::Value =
+        sqlx::query_scalar("SELECT settings FROM server_settings WHERE singleton")
+            .fetch_one(&pool)
+            .await
+            .expect("repeated settings");
+    assert_eq!(after, before, "backfill is idempotent");
+    let repeated: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT nick, username FROM bnc_networks ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("repeated networks");
+    assert_eq!(repeated, stored);
+}
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn managed_config_migration_leaves_empty_or_absent_provider_lists_unchanged() {
@@ -3680,8 +3959,10 @@ async fn channel_access_persist_and_load() {
     let pool = db::connect_and_migrate(&support::test_db("channel_access_persist_and_load").await)
         .await
         .expect("connect");
-    db::create_account(&pool, "boss", "pw").await.expect("boss");
-    db::create_account(&pool, "alice", "pw")
+    db::create_account_with_contact(&pool, "boss", "pw", None)
+        .await
+        .expect("boss");
+    db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("alice");
     sqlx::query(
@@ -3736,7 +4017,7 @@ async fn owned_channel_control_is_scoped_and_complete() {
     .await
     .expect("connect");
     for account in ["boss", "alice", "mallory"] {
-        db::create_account(&pool, account, "pw")
+        db::create_account_with_contact(&pool, account, "pw", None)
             .await
             .expect("account");
     }
@@ -3852,7 +4133,7 @@ async fn owned_channel_control_is_scoped_and_complete() {
             .len(),
         1
     );
-    let audit = db::list_audit_log(&pool, audit_page_size(20))
+    let audit = list_audit_log(&pool, audit_page_size(20))
         .await
         .expect("audit");
     for action in [
@@ -3875,8 +4156,10 @@ async fn channel_founder_transfer() {
     let pool = db::connect_and_migrate(&support::test_db("channel_founder_transfer").await)
         .await
         .expect("connect");
-    db::create_account(&pool, "boss", "pw").await.expect("boss");
-    db::create_account(&pool, "alice", "pw")
+    db::create_account_with_contact(&pool, "boss", "pw", None)
+        .await
+        .expect("boss");
+    db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("alice");
     sqlx::query(
@@ -3976,7 +4259,7 @@ async fn server_ban_worker_mutates_and_audits_atomically() {
             "kline".to_string(),
         )]
     );
-    let audit = db::list_audit_log(&pool, audit_page_size(10))
+    let audit = list_audit_log(&pool, audit_page_size(10))
         .await
         .expect("audit");
     assert_eq!(
@@ -4019,7 +4302,7 @@ async fn server_ban_worker_mutates_and_audits_atomically() {
         }
     ));
     assert!(db::list_server_bans(&pool).await.expect("bans").is_empty());
-    let audit = db::list_audit_log(&pool, audit_page_size(10))
+    let audit = list_audit_log(&pool, audit_page_size(10))
         .await
         .expect("audit");
     assert_eq!(audit[0].action, "UNKLINE");
@@ -4043,10 +4326,10 @@ async fn server_bans_persist_and_load() {
             .await;
     assert!(invalid.is_err(), "server-ban kind must be constrained");
 
-    db::add_server_ban(&pool, "baddie@*", "baddie@*", "spam", "god", "kline")
+    add_server_ban(&pool, "baddie@*", "baddie@*", "spam", "god", "kline")
         .await
         .expect("add1");
-    db::add_server_ban(
+    add_server_ban(
         &pool,
         "203.0.113.0",
         "203.0.113.0",
@@ -4057,7 +4340,7 @@ async fn server_bans_persist_and_load() {
     .await
     .expect("add2");
     // Same textual mask as the K-line but a different kind coexists.
-    db::add_server_ban(&pool, "baddie@*", "baddie@*", "gecos", "god", "xline")
+    add_server_ban(&pool, "baddie@*", "baddie@*", "gecos", "god", "xline")
         .await
         .expect("add3");
     let mut list = db::list_server_bans(&pool).await.expect("list");
@@ -4087,7 +4370,7 @@ async fn server_bans_persist_and_load() {
     );
 
     // Re-banning the same (mask, kind) upserts (new reason/setter, no dup).
-    db::add_server_ban(&pool, "baddie@*", "baddie@*", "spam again", "root", "kline")
+    add_server_ban(&pool, "baddie@*", "baddie@*", "spam again", "root", "kline")
         .await
         .expect("upsert");
     let list = db::list_server_bans(&pool).await.expect("list");
@@ -4099,9 +4382,21 @@ async fn server_bans_persist_and_load() {
     );
 
     // Removal is scoped to the kind — the X-line on the same mask survives.
-    db::remove_server_ban(&pool, "baddie@*", "kline")
+    assert!(
+        db::mutate_server_ban_audited(
+            &pool,
+            &e6ircd::core::ServerBanMutation::Remove {
+                expected_id: None,
+                mask: "baddie@*".into(),
+                mask_display: "baddie@*".into(),
+                kind: "kline".into(),
+                actor: "god".into(),
+            },
+        )
         .await
-        .expect("remove");
+        .expect("remove"),
+        "the K-line existed"
+    );
     let mut list = db::list_server_bans(&pool).await.expect("list");
     list.sort();
     assert_eq!(
@@ -4135,7 +4430,7 @@ async fn audit_log_records_and_lists() {
     db::insert_audit_log(&pool, "god", "KLINE", "baddie@*", "spam")
         .await
         .expect("a2");
-    let list = db::list_audit_log(&pool, audit_page_size(10))
+    let list = list_audit_log(&pool, audit_page_size(10))
         .await
         .expect("list");
     // newest-first
@@ -4156,14 +4451,14 @@ async fn account_directory_posture_filters_and_cursor_pages_are_stable() {
     .await
     .expect("connect");
     for name in ["Alice", "Bob", "Carol"] {
-        db::create_account(&pool, name, "pw")
+        db::create_account_with_contact(&pool, name, "pw", None)
             .await
             .unwrap_or_else(|error| panic!("create {name}: {error}"));
     }
     db::issue_app_password_for_account(&pool, "Alice", "desktop")
         .await
         .expect("app password");
-    db::issue_api_token(&pool, "Alice", "active")
+    issue_api_token(&pool, "Alice", "active")
         .await
         .expect("API token");
     db::create_web_session(&pool, "Alice", None)
@@ -4190,8 +4485,8 @@ async fn account_directory_posture_filters_and_cursor_pages_are_stable() {
              SELECT decode(repeat('cd', 32), 'hex'), id,
                     now() - interval '1 hour' FROM account
          ), network AS (
-             INSERT INTO bnc_networks (account_id, name, addr, nick, kind)
-             SELECT id, 'local', '', 'Alice', 'irc' FROM account
+             INSERT INTO bnc_networks (account_id, name, addr, nick, username, kind)
+             SELECT id, 'local', '', 'Alice', 'alice', 'irc' FROM account
          )
          INSERT INTO channels (name, name_folded, founder_account_id)
          SELECT '#alice', '#alice', id FROM account",
@@ -4221,7 +4516,7 @@ async fn account_directory_posture_filters_and_cursor_pages_are_stable() {
     let cursor = first.next_before_id.expect("older page cursor");
     assert_eq!(cursor, first.entries[1].id);
 
-    db::create_account(&pool, "Dave", "pw")
+    db::create_account_with_contact(&pool, "Dave", "pw", None)
         .await
         .expect("concurrent account");
     let second = db::query_account_directory(
@@ -4275,7 +4570,7 @@ async fn policy_directories_filter_posture_and_cursor_pages_are_stable() {
     .await
     .expect("connect");
     for name in ["Alice", "Bob"] {
-        db::create_account(&pool, name, "pw")
+        db::create_account_with_contact(&pool, name, "pw", None)
             .await
             .unwrap_or_else(|error| panic!("create {name}: {error}"));
     }
@@ -4385,7 +4680,7 @@ async fn policy_directories_filter_posture_and_cursor_pages_are_stable() {
         ("192.0.2.*", "192.0.2.*", "proxy", "Bob", "dline"),
         ("*bot*", "*Bot*", "automation", "Alice", "xline"),
     ] {
-        db::add_server_ban(&pool, mask, display, reason, setter, kind)
+        add_server_ban(&pool, mask, display, reason, setter, kind)
             .await
             .unwrap_or_else(|error| panic!("add {kind} {display}: {error}"));
     }
@@ -4409,7 +4704,7 @@ async fn policy_directories_filter_posture_and_cursor_pages_are_stable() {
         ["xline", "dline"]
     );
     let ban_cursor = first_bans.next_before_id.expect("older ban cursor");
-    db::add_server_ban(
+    add_server_ban(
         &pool,
         "new@host",
         "New@Host",
@@ -4568,7 +4863,7 @@ async fn managed_configuration_rejects_stale_writes_without_auditing_them() {
     assert_eq!(loaded.revision, saved.revision);
     assert_eq!(loaded.settings, changed);
     assert_eq!(loaded.updated_by, "alice");
-    let audit = db::list_audit_log(&pool, audit_page_size(10))
+    let audit = list_audit_log(&pool, audit_page_size(10))
         .await
         .expect("audit");
     assert_eq!(
@@ -4603,7 +4898,7 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
     )
     .await
     .expect("connect");
-    db::create_account(&pool, "alice", "pw")
+    db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("account");
 
@@ -4633,6 +4928,7 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
         addr: "https://slack.com/api".into(),
         tls: true,
         nick: String::new(),
+        username: None,
         realname: None,
         autojoin: vec!["C123".into()],
         buffer_cap: 100,
@@ -4650,6 +4946,7 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
         addr: "https://slack.com/api".into(),
         tls: true,
         nick: String::new(),
+        username: None,
         realname: None,
         autojoin: vec!["C456".into()],
         sasl_account: Some(old.seal("xoxb-account", &owner_context)),
@@ -4711,7 +5008,7 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
             .is_err(),
         "old key still opened a rotated account-network secret"
     );
-    let audit = db::list_audit_log(&pool, audit_page_size(10))
+    let audit = list_audit_log(&pool, audit_page_size(10))
         .await
         .expect("audit");
     assert_eq!(audit[0].action, "SECRET_ROTATE");
@@ -4729,7 +5026,7 @@ async fn unreadable_secret_rolls_back_the_entire_rotation() {
     )
     .await
     .expect("connect");
-    db::create_account(&pool, "alice", "pw")
+    db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("account");
     let old = SecretKey::generate();
@@ -4750,6 +5047,7 @@ async fn unreadable_secret_rolls_back_the_entire_rotation() {
             addr: "irc.example:6697".into(),
             tls: true,
             nick: "alice".into(),
+            username: Some("tester".into()),
             realname: Some("Alice".into()),
             autojoin: Vec::new(),
             sasl_account: Some("alice".into()),
@@ -4773,7 +5071,7 @@ async fn unreadable_secret_rolls_back_the_entire_rotation() {
         "the earlier settings update escaped the failed transaction"
     );
     assert!(
-        db::list_audit_log(&pool, audit_page_size(10))
+        list_audit_log(&pool, audit_page_size(10))
             .await
             .expect("audit")
             .is_empty(),
@@ -4789,10 +5087,12 @@ async fn oidc_identity_link_list_and_conflict() {
         db::connect_and_migrate(&support::test_db("oidc_identity_link_list_and_conflict").await)
             .await
             .expect("connect");
-    db::create_account(&pool, "alice", "pw")
+    db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("alice");
-    db::create_account(&pool, "bob", "pw").await.expect("bob");
+    db::create_account_with_contact(&pool, "bob", "pw", None)
+        .await
+        .expect("bob");
 
     // First link attaches; a repeat for the same account is idempotent.
     assert_eq!(
@@ -4955,7 +5255,7 @@ async fn oidc_web_session_records_logout_hint() {
         db::connect_and_migrate(&support::test_db("oidc_web_session_records_logout_hint").await)
             .await
             .expect("connect");
-    db::create_account(&pool, "alice", "pw")
+    db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("acct");
 
@@ -5019,7 +5319,7 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
     )
     .await
     .expect("connect");
-    db::create_account(&pool, "alice", "pw")
+    db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("acct");
     let first = db::create_web_session_with_identity(
@@ -5120,11 +5420,13 @@ async fn history_read_authorization_is_scoped() {
         db::connect_and_migrate(&support::test_db("history_read_authorization_is_scoped").await)
             .await
             .expect("connect");
-    db::create_account(&pool, "alice", "pw")
+    db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("alice");
-    db::create_account(&pool, "bob", "pw").await.expect("bob");
-    db::create_account(&pool, "carol", "pw")
+    db::create_account_with_contact(&pool, "bob", "pw", None)
+        .await
+        .expect("bob");
+    db::create_account_with_contact(&pool, "carol", "pw", None)
         .await
         .expect("carol");
     // Register #chan with alice as founder.
@@ -5209,7 +5511,7 @@ async fn approved_device_grant_polls_to_a_working_token_then_is_consumed() {
     )
     .await
     .expect("connect");
-    db::create_account(&pool, "devacct", "pw")
+    db::create_account_with_contact(&pool, "devacct", "pw", None)
         .await
         .expect("create account");
     // A pre-approval poll is Pending, not consumed.
@@ -5227,10 +5529,11 @@ async fn approved_device_grant_polls_to_a_working_token_then_is_consumed() {
         db::DeviceStatus::Pending,
         "unapproved grant is pending and left intact"
     );
-    assert!(
+    assert_eq!(
         db::approve_device_grant(&pool, "USERCODE1", "devacct")
             .await
             .expect("approve"),
+        db::DeviceApproval::Approved,
         "a fresh grant approves"
     );
     // Approved poll: consume + mint atomically, and the token must actually work.
@@ -5263,6 +5566,93 @@ async fn approved_device_grant_polls_to_a_working_token_then_is_consumed() {
         .await
         .expect("count tokens");
     assert_eq!(tokens, 1, "exactly one token minted for the approved grant");
+}
+
+/// The per-account token cap has no side door: a device grant mints through
+/// the same capped path the REST endpoint uses. Over the cap the approving
+/// browser is told so, and a grant approved before the cap was reached is
+/// consumed and denied at the poll — the device is never left polling.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn device_grants_mint_under_the_per_account_token_cap() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("device_grants_mint_under_the_per_account_token_cap").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account_with_contact(&pool, "devacct", "pw", None)
+        .await
+        .expect("create account");
+    let mint = |label: String| {
+        let pool = pool.clone();
+        async move {
+            db::issue_scoped_api_token(
+                &pool,
+                "devacct",
+                &label,
+                e6ircd::identity::ApiTokenScopes::new(e6ircd::identity::ApiTokenScope::ALL)
+                    .expect("every scope is a non-empty set"),
+                e6ircd::identity::ApiTokenLifetimeDays::DEFAULT,
+            )
+            .await
+        }
+    };
+    for index in 0..31 {
+        mint(format!("token {index}")).await.expect("under the cap");
+    }
+
+    // Approved with one slot left, which is then taken before the device polls.
+    let (raced_device, raced_user) = db::create_device_grant(&pool).await.expect("grant");
+    assert_eq!(
+        db::approve_device_grant(&pool, &raced_user, "devacct")
+            .await
+            .expect("approve"),
+        db::DeviceApproval::Approved
+    );
+    mint("token 31".into()).await.expect("the last slot");
+
+    // At the cap, approval is refused where a person can read why.
+    let (refused_device, refused_user) = db::create_device_grant(&pool).await.expect("grant");
+    assert_eq!(
+        db::approve_device_grant(&pool, &refused_user, "devacct")
+            .await
+            .expect("approve at the cap"),
+        db::DeviceApproval::TokenLimitReached
+    );
+    assert_eq!(
+        db::poll_device_grant(&pool, &refused_device, "device")
+            .await
+            .expect("poll"),
+        db::DeviceStatus::Pending,
+        "a refused approval leaves the grant for another account or a later try"
+    );
+
+    // The grant approved earlier cannot mint past the cap, and says so once.
+    assert_eq!(
+        db::poll_device_grant(&pool, &raced_device, "device")
+            .await
+            .expect("poll"),
+        db::DeviceStatus::Denied
+    );
+    assert_eq!(
+        db::poll_device_grant(&pool, &raced_device, "device")
+            .await
+            .expect("poll again"),
+        db::DeviceStatus::Unknown,
+        "a denied grant is consumed"
+    );
+    let tokens: i64 = sqlx::query_scalar("SELECT count(*) FROM api_tokens")
+        .fetch_one(&pool)
+        .await
+        .expect("count tokens");
+    assert_eq!(tokens, 32, "no minting path exceeds the cap");
+    let denied: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'ACCOUNT_DEVICE_TOKEN_DENIED'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(denied, 1, "the denial is on the record");
 }
 
 #[tokio::test]
@@ -5311,10 +5701,12 @@ async fn web_session_inventory_and_revocation_are_owner_scoped() {
     )
     .await
     .expect("connect");
-    db::create_account(&pool, "alice", "pw")
+    db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("alice");
-    db::create_account(&pool, "bob", "pw").await.expect("bob");
+    db::create_account_with_contact(&pool, "bob", "pw", None)
+        .await
+        .expect("bob");
 
     let desktop_agent = db::SessionUserAgent::from_header(" Desktop\tBrowser ")
         .expect("normalized desktop user agent");
@@ -5384,7 +5776,7 @@ async fn concurrent_browser_session_issuance_enforces_the_active_cap() {
     )
     .await
     .expect("connect");
-    db::create_account(&pool, "alice", "pw")
+    db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("alice");
 
@@ -5553,20 +5945,21 @@ async fn suspension_revokes_every_bearer_and_blocks_new_credential_issuance() {
     db::bootstrap_first_admin(&pool, "Alice", "correct horse battery staple")
         .await
         .expect("administrator");
-    let bob_id = db::create_account(&pool, "Bob", "bob password")
+    let bob_id = db::create_account_with_contact(&pool, "Bob", "bob password", None)
         .await
         .expect("Bob");
     let session = db::create_web_session(&pool, "Bob", None)
         .await
         .expect("browser session");
-    let token = db::issue_api_token(&pool, "Bob", "automation")
+    let token = issue_api_token(&pool, "Bob", "automation")
         .await
         .expect("personal access token");
     let (device_code, user_code) = db::create_device_grant(&pool).await.expect("device grant");
-    assert!(
+    assert_eq!(
         db::approve_device_grant(&pool, &user_code, "Bob")
             .await
-            .expect("approve device")
+            .expect("approve device"),
+        db::DeviceApproval::Approved
     );
 
     let change = db::set_account_suspended(&pool, bob_id, true, "Alice", &[])
@@ -5623,7 +6016,7 @@ async fn suspension_revokes_every_bearer_and_blocks_new_credential_issuance() {
         Err(db::DbError::BadCredentials)
     ));
     assert!(matches!(
-        db::issue_api_token(&pool, "Bob", "forbidden").await,
+        issue_api_token(&pool, "Bob", "forbidden").await,
         Err(db::DbError::BadCredentials)
     ));
 
@@ -5663,12 +6056,14 @@ async fn suspension_preserves_an_active_administrator_and_rejects_self_targeting
     let alice_id = db::bootstrap_first_admin(&pool, "Alice", "administrator password")
         .await
         .expect("Alice");
-    let bob_id = db::create_account(&pool, "Bob", "second administrator password")
-        .await
-        .expect("Bob");
-    let carol_id = db::create_account(&pool, "Carol", "configured administrator password")
-        .await
-        .expect("Carol");
+    let bob_id =
+        db::create_account_with_contact(&pool, "Bob", "second administrator password", None)
+            .await
+            .expect("Bob");
+    let carol_id =
+        db::create_account_with_contact(&pool, "Carol", "configured administrator password", None)
+            .await
+            .expect("Carol");
     assert!(matches!(
         db::set_account_administrator(&pool, alice_id, false, "Alice", &[]).await,
         Err(db::DbError::CannotDemoteSelf)
@@ -5901,7 +6296,7 @@ async fn permanent_account_deletion_requires_succession_purges_and_retires() {
     let alice_id = db::bootstrap_first_admin(&pool, "Alice", "administrator password")
         .await
         .expect("Alice");
-    let bob_id = db::create_account(&pool, "Bob", "member password")
+    let bob_id = db::create_account_with_contact(&pool, "Bob", "member password", None)
         .await
         .expect("Bob");
     sqlx::query(
@@ -5928,12 +6323,12 @@ async fn permanent_account_deletion_requires_succession_purges_and_retires() {
     let session = db::create_web_session(&pool, "Bob", None)
         .await
         .expect("session");
-    let api_token = db::issue_api_token(&pool, "Bob", "automation")
+    let api_token = issue_api_token(&pool, "Bob", "automation")
         .await
         .expect("token");
     sqlx::query(
-        "INSERT INTO bnc_networks (account_id, name, addr, nick)
-         VALUES ($1, 'libera', 'irc.libera.chat:6697', 'Bob')",
+        "INSERT INTO bnc_networks (account_id, name, addr, nick, username)
+         VALUES ($1, 'libera', 'irc.libera.chat:6697', 'Bob', 'bob')",
     )
     .bind(bob_id)
     .execute(&pool)
@@ -5969,10 +6364,11 @@ async fn permanent_account_deletion_requires_succession_purges_and_retires() {
     .await
     .expect("messages");
     let (_device_code, user_code) = db::create_device_grant(&pool).await.expect("device");
-    assert!(
+    assert_eq!(
         db::approve_device_grant(&pool, &user_code, "Bob")
             .await
-            .expect("approve")
+            .expect("approve"),
+        db::DeviceApproval::Approved
     );
 
     let deleted = db::delete_account_permanently(&pool, bob_id, "Alice", &[])
@@ -6008,7 +6404,7 @@ async fn permanent_account_deletion_requires_succession_purges_and_retires() {
     .expect("residues");
     assert_eq!(residues, (0, 0, 0, 0));
     assert!(matches!(
-        db::create_account(&pool, "bOB", "new owner").await,
+        db::create_account_with_contact(&pool, "bOB", "new owner", None).await,
         Err(db::DbError::DuplicateAccount(_))
     ));
     let direct = sqlx::query("INSERT INTO accounts (name, name_folded) VALUES ('BOB', 'bob')")
@@ -6032,7 +6428,7 @@ async fn permanent_account_deletion_requires_succession_purges_and_retires() {
         db::account_deletion_target(&pool, alice_id, &["alice".into(), "ghost".into()]).await,
         Err(db::DbError::LastAdministrator)
     ));
-    db::create_account(&pool, "Dana", "administrator candidate")
+    db::create_account_with_contact(&pool, "Dana", "administrator candidate", None)
         .await
         .expect("Dana");
     assert!(
@@ -6062,19 +6458,19 @@ async fn account_export_and_security_activity_are_owner_scoped_and_secret_free()
     )
     .await
     .expect("Alice");
-    db::create_account(&pool, "Bob", "other password")
+    db::create_account_with_contact(&pool, "Bob", "other password", None)
         .await
         .expect("Bob");
     let session = db::create_web_session(&pool, "Alice", None)
         .await
         .expect("session");
-    let bearer = db::issue_api_token(&pool, "Alice", "secret-token-label")
+    let bearer = issue_api_token(&pool, "Alice", "secret-token-label")
         .await
         .expect("token");
     sqlx::query(
         "INSERT INTO bnc_networks
-            (account_id, name, addr, tls, nick, sasl_account, sasl_password_sealed)
-         VALUES ($1, 'libera', 'irc.libera.chat:6697', true, 'Alice',
+            (account_id, name, addr, tls, nick, username, sasl_account, sasl_password_sealed)
+         VALUES ($1, 'libera', 'irc.libera.chat:6697', true, 'Alice', 'alice',
                  'alice', 'enc:v1:must-not-export')",
     )
     .bind(alice_id)
@@ -6164,7 +6560,7 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     )
     .await
     .expect("connect");
-    let account_id = db::create_account(&pool, "Alice", "password")
+    let account_id = db::create_account_with_contact(&pool, "Alice", "password", None)
         .await
         .expect("account");
     sqlx::query(
@@ -6281,7 +6677,7 @@ async fn concurrent_mutual_demotion_keeps_one_administrator() {
     let alice_id = db::bootstrap_first_admin(&pool, "Alice", "administrator password")
         .await
         .expect("Alice");
-    let bob_id = db::create_account(&pool, "Bob", "second administrator")
+    let bob_id = db::create_account_with_contact(&pool, "Bob", "second administrator", None)
         .await
         .expect("Bob");
     db::set_account_administrator(&pool, bob_id, true, "Alice", &[])
@@ -6340,7 +6736,7 @@ async fn corrupt_stored_password_hash_is_a_store_fault_not_a_wrong_password() {
     )
     .await
     .expect("connect");
-    let alice_id = db::create_account(&pool, "Alice", "correct password")
+    let alice_id = db::create_account_with_contact(&pool, "Alice", "correct password", None)
         .await
         .expect("Alice");
     sqlx::query("UPDATE account_credentials SET argon2_hash = 'not-a-hash' WHERE account_id = $1")
@@ -6365,4 +6761,272 @@ async fn corrupt_stored_password_hash_is_a_store_fault_not_a_wrong_password() {
             "primary-password verification must report the damaged hash"
         );
     }
+}
+
+/// The operator's way back in when every administrator credential is lost or
+/// the identity provider is broken: run on the host, against the database the
+/// configuration names. It acts once, on one named account, and is on the
+/// record.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn administrator_recovery_restores_one_named_account_and_is_audited() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("administrator_recovery_restores_one_named_account_and_is_audited").await,
+    )
+    .await
+    .expect("connect");
+    let alice_id = db::create_account_with_contact(&pool, "Alice", "forgotten", None)
+        .await
+        .expect("alice");
+    let mallory_id = db::create_account_with_contact(&pool, "mallory", "pw", None)
+        .await
+        .expect("mallory");
+    db::create_account_with_contact(&pool, "root", "pw", None)
+        .await
+        .expect("root");
+    let stale_session = db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("session");
+
+    let recovered = db::recover_administrator(&pool, "ALICE")
+        .await
+        .expect("recover");
+    assert_eq!(
+        recovered.account, "Alice",
+        "the stored name, not the typed one"
+    );
+    assert_eq!(
+        db::verify_local_password(&pool, "alice", &recovered.password)
+            .await
+            .expect("verify")
+            .as_deref(),
+        Some("Alice")
+    );
+    assert_eq!(
+        db::verify_local_password(&pool, "alice", "forgotten")
+            .await
+            .expect("verify"),
+        None,
+        "the lost password no longer opens the account"
+    );
+    let flags = db::account_flags(&pool, "alice")
+        .await
+        .expect("flags")
+        .expect("alice");
+    assert!(flags.is_admin());
+    assert!(
+        db::session_identity(&pool, &stale_session)
+            .await
+            .expect("session lookup")
+            .is_none(),
+        "whoever held the old credential is signed out"
+    );
+    let _ = alice_id;
+
+    // An account that was only ever provisioned by an identity provider has no
+    // password to replace; it gains one.
+    sqlx::query("DELETE FROM account_credentials WHERE account_id = (SELECT id FROM accounts WHERE name_folded = 'root')")
+        .execute(&pool)
+        .await
+        .expect("drop root's password");
+    let root = db::recover_administrator(&pool, "root")
+        .await
+        .expect("recover root");
+    assert_eq!(
+        db::verify_local_password(&pool, "root", &root.password)
+            .await
+            .expect("verify")
+            .as_deref(),
+        Some("root")
+    );
+
+    // Nothing is guessed: an unknown name and a suspended account are refused.
+    assert!(matches!(
+        db::recover_administrator(&pool, "nobody").await,
+        Err(db::DbError::UnknownAccount(name)) if name == "nobody"
+    ));
+    db::set_account_suspended(&pool, mallory_id, true, "alice", &[])
+        .await
+        .expect("suspend mallory");
+    assert!(matches!(
+        db::recover_administrator(&pool, "mallory").await,
+        Err(db::DbError::RecoveryOfSuspendedAccount(name)) if name == "mallory"
+    ));
+    assert!(
+        !db::account_flags(&pool, "mallory")
+            .await
+            .expect("flags")
+            .expect("mallory")
+            .is_admin()
+    );
+
+    let recoveries: Vec<(String, String)> = sqlx::query_as(
+        "SELECT actor, target FROM audit_log WHERE action = 'ADMINISTRATOR_RECOVERY' ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(
+        recoveries,
+        [
+            (
+                "host:recover-administrator".to_string(),
+                "alice".to_string()
+            ),
+            ("host:recover-administrator".to_string(), "root".to_string()),
+        ]
+    );
+}
+
+/// The same recovery, as the operator runs it: the binary, the configuration
+/// file, and an account name — nothing else, and nothing over the network.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn recover_administrator_subcommand_prints_the_password_once() {
+    let url = support::test_db("recover_administrator_subcommand_prints_the_password_once").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    db::create_account_with_contact(&pool, "alice", "forgotten", None)
+        .await
+        .expect("alice");
+    let config_path = std::env::temp_dir().join(format!(
+        "e6irc-recover-administrator-{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &config_path,
+        format!(
+            "server_name = \"irc.recover.example\"\nnetwork_name = \"Recover\"\n\n[[listeners]]\naddr = \"127.0.0.1:0\"\n\n[database]\nurl = \"{url}\"\n"
+        ),
+    )
+    .expect("write config");
+    let run = |arguments: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_e6ircd"))
+            .arg("recover-administrator")
+            .args(arguments)
+            .arg("--config")
+            .arg(&config_path)
+            .output()
+            .expect("run e6ircd recover-administrator")
+    };
+
+    let refused = run(&["--account", "nobody"]);
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty(), "a refusal prints no password");
+    let complaint = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        complaint.contains("no such account: nobody") && complaint.contains("nothing was changed"),
+        "{complaint}"
+    );
+    assert!(!run(&[]).status.success(), "the account must be named");
+
+    let recovered = run(&["--account", "alice"]);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let password = String::from_utf8(recovered.stdout).expect("password");
+    assert_eq!(
+        db::verify_local_password(&pool, "alice", password.trim())
+            .await
+            .expect("verify")
+            .as_deref(),
+        Some("alice")
+    );
+    assert!(
+        db::account_flags(&pool, "alice")
+            .await
+            .expect("flags")
+            .expect("alice")
+            .is_admin()
+    );
+    std::fs::remove_file(&config_path).expect("remove config");
+}
+
+/// An app password names its own row, so holding many of them does not make a
+/// login try them all; one minted before that was recorded still works, and
+/// records it on first use.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn app_passwords_are_found_by_lookup_and_older_ones_gain_it_on_use() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("app_passwords_are_found_by_lookup_and_older_ones_gain_it_on_use").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account_with_contact(&pool, "Alice", "primary", None)
+        .await
+        .expect("alice");
+    let mut secrets = Vec::new();
+    for index in 0..3 {
+        secrets.push(
+            db::issue_app_password_for_account(&pool, "alice", &format!("device {index}"))
+                .await
+                .expect("app password"),
+        );
+    }
+    let without_lookup = |pool: sqlx::PgPool| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM account_credentials
+             WHERE kind = 'app_password' AND secret_lookup IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count")
+    };
+    assert_eq!(
+        without_lookup(pool.clone()).await,
+        0,
+        "minting records the lookup"
+    );
+
+    // As minted before the lookup existed.
+    sqlx::query("UPDATE account_credentials SET secret_lookup = NULL WHERE label = 'device 1'")
+        .execute(&pool)
+        .await
+        .expect("age one app password");
+    for secret in secrets.iter().chain([&"primary".to_string()]) {
+        assert_eq!(
+            db::verify_credentials(&pool, "ALICE", secret)
+                .await
+                .expect("verify")
+                .as_deref(),
+            Some("Alice")
+        );
+    }
+    assert_eq!(
+        without_lookup(pool.clone()).await,
+        0,
+        "first use records the lookup"
+    );
+    for wrong in [
+        "",
+        "primary ",
+        "bm90IGFuIGFwcCBwYXNzd29yZCwganVzdCBiYXNlNjQgdGV4dA==",
+    ] {
+        assert_eq!(
+            db::verify_credentials(&pool, "alice", wrong)
+                .await
+                .expect("verify"),
+            None
+        );
+    }
+    assert_eq!(
+        db::verify_credentials(&pool, "nobody", &secrets[0])
+            .await
+            .expect("verify"),
+        None,
+        "an app password opens only its own account"
+    );
+    let primary_has_lookup: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM account_credentials
+                       WHERE kind = 'local_password' AND secret_lookup IS NOT NULL)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("primary");
+    assert!(
+        !primary_has_lookup,
+        "a chosen password is never stored under a fast hash"
+    );
 }

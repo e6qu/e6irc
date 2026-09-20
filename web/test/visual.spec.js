@@ -61,10 +61,11 @@ const apiContract = {
       post: {
         requestBody: { required: true, content: { "application/json": { schema: {
           type: "object", additionalProperties: false,
-          required: ["kind", "name", "addr", "tls", "nick", "realname", "autojoin"],
+          required: ["kind", "name", "addr", "tls", "nick", "username", "realname", "autojoin"],
           properties: {
             kind: { const: "irc" }, name: { type: "string" }, addr: { type: "string" }, tls: { type: "boolean" },
-            nick: { type: "string" }, realname: { type: "string" },
+            nick: { type: "string" }, username: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$" },
+            realname: { type: "string" },
             autojoin: { type: "array", items: { type: "string" } },
             sasl_account: { type: "string" }, sasl_password: { type: "string" },
           },
@@ -343,14 +344,14 @@ test("console adds a known network from a nickname alone, with no forced test", 
   await expect(advanced).not.toHaveAttribute("open");
   expect(await page.locator("form[data-api-owner-network-create] label > span:first-of-type").allTextContents()).toEqual([
     "IRC network", "Nickname", "NickServ account optional", "NickServ password optional", "Channels to join optional",
-    "Name", "Server", "Use TLSRecommended for public IRC networks.", "Real name optional",
+    "Name", "Server", "Use TLSRecommended for public IRC networks.", "Username optional", "Real name optional",
   ]);
   await expectAccessible(page);
 
   await add.click();
   await expect.poll(() => page.evaluate(() => window.consoleApiMutations)).toEqual([{
     method: "POST", url: "/api/v1/me/networks", json: {
-      kind: "irc", name: "libera", addr: "irc.libera.chat:6697", tls: false, nick: "alice", realname: "alice",
+      kind: "irc", name: "libera", addr: "irc.libera.chat:6697", tls: false, nick: "alice", username: "alice", realname: "alice",
       autojoin: [], sasl_account: null, sasl_password: null,
     },
   }]);
@@ -372,7 +373,7 @@ test("console adds a known network from a nickname alone, with no forced test", 
   await page.getByRole("button", { name: "Test connection", exact: true }).click();
   await expect.poll(() => page.evaluate(() => window.consoleApiMutations.at(-1))).toEqual({
     method: "POST", url: "/api/v1/me/network-preflight", json: {
-      addr: "irc.libera.chat:6697", tls: false, nick: "alice", realname: "Alice Example",
+      addr: "irc.libera.chat:6697", tls: false, nick: "alice", username: "alice", realname: "Alice Example",
       autojoin: [], sasl_account: null, sasl_password: null,
     },
   });
@@ -381,7 +382,7 @@ test("console adds a known network from a nickname alone, with no forced test", 
 test("console network editor sends the nickname for a blank real name and restores the password field", async ({ page }) => {
   const editor = await consoleTemplate("console_network_edit.html", { name: "libera", "shell.csrf": "test-csrf" });
   const network = {
-    kind: "irc", name: "libera", addr: "irc.libera.chat:6697", tls: true, nick: "alice", realname: null,
+    kind: "irc", name: "libera", addr: "irc.libera.chat:6697", tls: true, nick: "alice", username: "alice", realname: null,
     autojoin: ["#e6irc"], sasl_account: "alice", has_sasl_account: true, has_sasl_password: true, enabled: true,
   };
   await mountConsoleRuntime(page, `<main>${editor}</main>`, await consoleStyles(), { "/api/v1/me/networks/libera": network });
@@ -400,7 +401,7 @@ test("console network editor sends the nickname for a blank real name and restor
   await page.getByRole("button", { name: "Save changes", exact: true }).click();
   await expect.poll(() => page.evaluate(() => window.consoleApiMutations)).toEqual([{
     method: "PUT", url: "/api/v1/me/networks/libera", json: {
-      addr: "irc.libera.chat:6697", tls: true, nick: "alice", realname: "alice", autojoin: ["#e6irc"],
+      addr: "irc.libera.chat:6697", tls: true, nick: "alice", username: "alice", realname: "alice", autojoin: ["#e6irc"],
       credentials: { action: "set", account: "alice", password: null },
     },
   }]);
@@ -409,7 +410,7 @@ test("console network editor sends the nickname for a blank real name and restor
 test("console network page shows the NickServ account first and registration on request", async ({ page }) => {
   const detail = await consoleTemplate("console_network_detail.html", { name: "libera", "shell.csrf": "test-csrf" });
   const network = {
-    kind: "irc", name: "libera", addr: "irc.libera.chat:6697", tls: true, nick: "alice", realname: null,
+    kind: "irc", name: "libera", addr: "irc.libera.chat:6697", tls: true, nick: "alice", username: "alice", realname: null,
     autojoin: [], sasl_account: null, has_sasl_account: false, has_sasl_password: false, enabled: true,
   };
   const operations = { enabled: true, runtime: null, storage: { lines: 0, oldest_at: null, newest_at: null }, recent_lines: [] };
@@ -522,7 +523,7 @@ test("a background refresh never pulls the rows out from under a pending confirm
   const confirmDialog = shell.match(/<dialog class="confirm-dialog"[\s\S]*?<\/dialog>/)[0];
   await mountConsoleRuntime(page, `<main>${form}</main>${confirmDialog}`, await consoleStyles(), {
     "/api/v1/me/networks": { networks: [{
-      name: "libera", kind: "irc", addr: "irc.libera.chat:6697", tls: true, nick: "alice", realname: "Alice", autojoin: [],
+      name: "libera", kind: "irc", addr: "irc.libera.chat:6697", tls: true, nick: "alice", username: "alice", realname: "Alice", autojoin: [],
       sasl_account: null, has_sasl_account: false, has_sasl_password: false, enabled: true, connected: true,
       runtime: { state: "connected", attached_clients: 0, errors: 0, last_error: null },
     }] },
@@ -756,16 +757,16 @@ const ircNetwork = (name, extra = {}) => ({
   runtime: { state: "connected", last_error: null }, ...extra,
 });
 const networkDetail = (name, addr) => ({
-  name, kind: "irc", addr, tls: true, nick: `${name}-nick`, realname: "Viewer", autojoin: ["#kept"],
+  name, kind: "irc", addr, tls: true, nick: `${name}-nick`, username: "viewer", realname: "Viewer", autojoin: ["#kept"],
   sasl_account: null, has_sasl_account: false, has_sasl_password: false, enabled: true,
 });
 const detailContract = {
   get: { responses: { 200: response({
     type: "object", additionalProperties: false,
-    required: ["name", "kind", "addr", "tls", "nick", "realname", "autojoin", "sasl_account", "has_sasl_account", "has_sasl_password", "enabled"],
+    required: ["name", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "sasl_account", "has_sasl_account", "has_sasl_password", "enabled"],
     properties: {
       name: { type: "string" }, kind: { type: "string" }, addr: { type: "string" }, tls: { type: "boolean" },
-      nick: { type: "string" }, realname: { type: ["string", "null"] },
+      nick: { type: "string" }, username: { type: ["string", "null"] }, realname: { type: ["string", "null"] },
       autojoin: { type: "array", items: { type: "string" } }, sasl_account: { type: ["string", "null"] },
       has_sasl_account: { type: "boolean" }, has_sasl_password: { type: "boolean" }, enabled: { type: "boolean" },
     },
@@ -887,6 +888,28 @@ test("only a join asked for here moves the view", async ({ page }) => {
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("#asked");
 });
 
+test("a connection the server refuses by policy is said once and not hammered", async ({ page }) => {
+  let attempts = 0;
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    attempts += 1;
+    // What the server does to the 33rd live socket of one account.
+    socket.close({ code: 1008, reason: "This account has 32 live chat connections open, the most allowed. Close another tab and retry." });
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  await page.goto("/?network=Libera");
+
+  const alert = page.getByRole("alert").filter({ hasText: "32 live chat connections" });
+  await expect(alert).toBeVisible();
+  await expect(alert).toContainText("e6irc is not retrying");
+  // Longer than the first reconnect delay: a refusal is not a dropped link.
+  await page.waitForTimeout(2500);
+  expect(attempts).toBe(1);
+
+  // The person decides when the condition has changed.
+  await alert.getByRole("button", { name: "Retry now" }).click();
+  await expect.poll(() => attempts).toBe(2);
+});
+
 test("opening a network returns to the conversation that was open, never to whatever replay mentioned last", async ({ page }) => {
   const attach = (channels) => page.routeWebSocket(/\/ws\/ui/, (socket) => {
     socket.send(JSON.stringify({ t: "status", v: "connected" }));
@@ -954,6 +977,9 @@ test("a refused network field is marked, revealed, and focused", async ({ page }
   await page.getByRole("button", { name: "Add a network", exact: true }).last().click();
   const dialog = page.getByRole("dialog", { name: "Add a network" });
   await expect(dialog.locator("#nf-addr")).toBeHidden();
+  // The session's nickname is too long to double as a username; one that can
+  // leaves the server's refusal as the only thing in the way.
+  await dialog.locator("#nf-nick").fill("visual");
   await dialog.getByRole("button", { name: "Save" }).click();
 
   // The server is under Advanced, so the refusal has to open it to point there.
@@ -1002,6 +1028,15 @@ test("adding a network asks only what a known network cannot supply, and carries
   await dialog.locator("#nf-sasl-password").fill("correct horse");
   await dialog.getByRole("button", { name: "Save" }).click();
 
+  // A blank username means the nickname, but "visual-test" is a character too
+  // long to be one. It is not shortened to fit: the form asks, at the box.
+  await expect(dialog.getByRole("alert")).toContainText("Enter a username");
+  await expect(dialog.locator("#nf-username")).toBeFocused();
+  await expect(dialog.locator("#nf-username")).toHaveAttribute("aria-invalid", "true");
+  expect(created).toBeUndefined();
+  await dialog.locator("#nf-username").fill("visual");
+  await dialog.getByRole("button", { name: "Save" }).click();
+
   await expect(page).toHaveURL(/\?network=libera$/);
   expect(created).toEqual({
     csrf: "session-bound-token",
@@ -1011,6 +1046,7 @@ test("adding a network asks only what a known network cannot supply, and carries
       addr: "irc.libera.chat:6697",
       tls: true,
       nick: "visual-test",
+      username: "visual",
       realname: "visual-test",
       autojoin: [],
       sasl_account: "visual-account",

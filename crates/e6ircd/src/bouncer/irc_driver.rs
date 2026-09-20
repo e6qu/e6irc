@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use e6irc_client::{Connection, RelayEvent};
 
-use super::upstream_identity::{UpstreamChannel, UpstreamNick, UpstreamRealname};
+use super::upstream_identity::{UpstreamChannel, UpstreamNick, UpstreamRealname, UpstreamUsername};
 use super::{ConnectionEvent, DriverEnds, NetworkHandle};
 
 /// Static configuration for one upstream network.
@@ -19,6 +19,8 @@ pub struct NetworkConfig {
     /// Use TLS to the upstream.
     pub tls: bool,
     pub nick: UpstreamNick,
+    /// The `USER` name (ident), exactly as sent. Never derived from the nick.
+    pub username: UpstreamUsername,
     pub realname: UpstreamRealname,
     /// Channels to auto-join after registering.
     pub autojoin: Vec<UpstreamChannel>,
@@ -42,6 +44,7 @@ impl Default for NetworkConfig {
             addr: String::new(),
             tls: false,
             nick: "e6bnc".parse().expect("the default nickname is valid"),
+            username: "e6bnc".parse().expect("the default user name is valid"),
             realname: "e6irc bouncer"
                 .parse()
                 .expect("the default real name is valid"),
@@ -270,27 +273,10 @@ pub async fn preflight_irc(
     // followed by the goodbye below.
     let registration_started = Instant::now();
     let outcome = async {
-        let registration = async {
-            match &config.sasl {
-                Some((account, password)) => {
-                    connection
-                        .register_sasl(
-                            config.nick.as_str(),
-                            config.realname.as_str(),
-                            account,
-                            password,
-                        )
-                        .await
-                }
-                None => {
-                    connection
-                        .register(config.nick.as_str(), config.realname.as_str())
-                        .await
-                }
-            }
-        };
+        let registration = register(config, &mut connection);
         let confirmed_nick = match tokio::time::timeout_at(deadline, registration).await {
-            Ok(Ok(confirmed_nick)) => confirmed_nick,
+            Ok(Ok(welcomed)) => configured_nick_was_granted(config.nick.as_str(), welcomed)
+                .map_err(|rejection| preflight_refusal(Some(rejection)))?,
             Ok(Err(error)) => {
                 return Err(match RegistrationError::classify(error) {
                     RegistrationError::CredentialsRejected(rejection) => {
@@ -409,6 +395,39 @@ impl RegistrationError {
     }
 }
 
+/// Register as exactly the configured identity — the one registration the
+/// driver and the connection test both perform, so a test cannot pass with an
+/// identity the driver would not send.
+async fn register(config: &NetworkConfig, connection: &mut Connection) -> std::io::Result<String> {
+    let identity = e6irc_client::Identity {
+        nick: config.nick.as_str(),
+        username: config.username.as_str(),
+        realname: config.realname.as_str(),
+    };
+    match &config.sasl {
+        Some((account, password)) => connection.register_sasl(&identity, account, password).await,
+        None => connection.register(&identity).await,
+    }
+}
+
+/// The welcomed nickname, when it is the configured one. A server that
+/// truncates to its NICKLEN, or renames on registration, welcomes the
+/// connection under a name the owner never chose; running under it would be an
+/// identity invented on their behalf, with whatever channel access and services
+/// relationship that name has. Case is the server's to normalise.
+pub(super) fn configured_nick_was_granted(
+    configured: &str,
+    welcomed: String,
+) -> Result<String, e6irc_client::RegistrationRejection> {
+    if e6irc_proto::casemap::CaseMapping::Rfc1459.eq(configured, &welcomed) {
+        Ok(welcomed)
+    } else {
+        Err(e6irc_client::RegistrationRejection::welcomed_as(
+            configured, &welcomed,
+        ))
+    }
+}
+
 /// What one bounded registration attempt means to the session loop. A refusal
 /// of the configured nickname is a refusal like any other: the driver never
 /// substitutes a nickname the owner did not choose. It reports the upstream's
@@ -488,28 +507,16 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
         }
         Err(_) => return dropped(super::NetworkFailure::ConnectionTimedOut),
     };
-    let register_fut = async {
-        match &config.sasl {
-            Some((account, password)) => {
-                conn.register_sasl(
-                    config.nick.as_str(),
-                    config.realname.as_str(),
-                    account,
-                    password,
-                )
-                .await
-            }
-            None => {
-                conn.register(config.nick.as_str(), config.realname.as_str())
-                    .await
-            }
-        }
-    };
+    let register_fut = register(config, &mut conn);
     let registration = tokio::select! {
         _ = ends.shutdown_signalled() => return super::SessionOutcome::Stopped,
         result = tokio::time::timeout(Duration::from_secs(30), register_fut) => result,
     };
-    let mut current_nick = match registration_outcome(registration) {
+    let granted = registration_outcome(registration).and_then(|welcomed| {
+        configured_nick_was_granted(config.nick.as_str(), welcomed)
+            .map_err(super::SessionOutcome::RegistrationRejected)
+    });
+    let mut current_nick = match granted {
         Ok(nick) => nick,
         Err(outcome) => return outcome,
     };
@@ -591,6 +598,15 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                         if m.command == "PONG"
                             && m.params.last().map(String::as_str) == Some("e6bnc-keepalive")
                         {
+                            continue;
+                        }
+                        // Capabilities are negotiated hop by hop. `CAP NEW` and
+                        // `CAP DEL` describe this driver's negotiation with the
+                        // upstream; an attached client negotiated with the
+                        // bouncer and would act on them against the wrong hop.
+                        // There is no separate server-log stream to keep them
+                        // in, so they end here.
+                        if m.command == "CAP" {
                             continue;
                         }
                     }
@@ -1025,7 +1041,15 @@ mod tests {
         let outcome = registration_outcome(
             tokio::time::timeout(
                 Duration::from_secs(5),
-                connection.register_sasl("bncbot", "real", "account", "secret"),
+                connection.register_sasl(
+                    &e6irc_client::Identity {
+                        nick: "bncbot",
+                        username: "bncbot",
+                        realname: "real",
+                    },
+                    "account",
+                    "secret",
+                ),
             )
             .await,
         );

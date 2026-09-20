@@ -147,7 +147,15 @@ askama = { version = "0.16.0", default-features = false, features = [
 # optional discord/slack gateway drivers (wss:// gateways). Optional and
 # behind those features; rustls TLS to keep the single TLS stack. Also
 # dev-deps below (plaintext, for the ws-irc test); cargo unions features.
-tokio-tungstenite = { version = "0.30.0", optional = true, default-features = false, features = [
+#
+# Held on 0.29.0 (2026-03-17) deliberately, for the reason reqwest is held on
+# 0.12 above: axum 0.8.9 — the newest axum release on 2026-09-20 — serves
+# /ws/irc and /ws/ui through tokio-tungstenite ^0.29, so taking 0.30.0
+# (2026-07-11) here put two WebSocket stacks in one binary. 0.30 changes no
+# API this crate uses: tungstenite 0.30 adds a server-side Sec-WebSocket-Key
+# check (the server side is axum's, on 0.29 either way) and raises its rand
+# and sha dependencies. It moves to 0.30 when axum does.
+tokio-tungstenite = { version = "0.29.0", optional = true, default-features = false, features = [
     "connect",
     "rustls-tls-webpki-roots",
 ] }
@@ -166,9 +174,10 @@ rcgen = { version = "0.14.8", default-features = false, features = [
     "aws_lc_rs",
     "pem",
 ] }
-# tokio-tungstenite 0.30.0 (2026-07-11, >24h): ws client for the ws-irc
-# e2e test; futures-util is dev-only here (Stream/Sink for the client).
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
+# tokio-tungstenite 0.29.0 (2026-03-17; held with axum, see above): ws client
+# for the ws-irc e2e test; futures-util is dev-only here (Stream/Sink for the
+# client).
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = [
     "connect",
 ] }
 futures-util = { version = "0.3", default-features = false }

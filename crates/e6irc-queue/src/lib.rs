@@ -303,24 +303,104 @@ impl<T> Sender<T> {
     /// simply stops reading its socket until the consumer catches up.
     pub fn push(&self, payload: T) -> Push<'_, T> {
         Push {
-            sender: self,
+            parked: ParkedProducer::new(self),
             payload: Some(payload),
+        }
+    }
+
+    /// Await the moment the queue has room (or its receiver is gone), without
+    /// committing a payload to the wait. For a producer that must keep doing
+    /// other work while it waits — it holds its events itself, selects on this
+    /// beside its other duties, and offers them with [`Sender::try_push`] once
+    /// it resolves. Room seen is not room held: another producer may take the
+    /// slot first, and the `try_push` then says so.
+    pub fn room(&self) -> Room<'_, T> {
+        Room {
+            parked: ParkedProducer::new(self),
+        }
+    }
+}
+
+/// One producer's place in a full queue's FIFO line of waiters.
+///
+/// Dropping it while still in line leaves the line, so a cancelled producer
+/// cannot consume a later wakeup and leave a live producer parked. Dropping it
+/// after a pop already chose it — the freed slot's only wakeup was spent on
+/// it — passes that wakeup to the next in line, for the same reason.
+struct ParkedProducer<'a, T> {
+    sender: &'a Sender<T>,
+    waiter: Option<u64>,
+}
+
+impl<'a, T> ParkedProducer<'a, T> {
+    fn new(sender: &'a Sender<T>) -> Self {
+        Self {
+            sender,
             waiter: None,
+        }
+    }
+
+    /// Join the line (once), or refresh the waker already in it.
+    fn park(&mut self, state: &mut State<T>, cx: &Context<'_>) {
+        let waiter = match self.waiter {
+            Some(waiter) => waiter,
+            None => {
+                let waiter = state.next_push_waiter;
+                state.next_push_waiter = state
+                    .next_push_waiter
+                    .checked_add(1)
+                    .expect("queue push-waiter identity exhausted");
+                self.waiter = Some(waiter);
+                waiter
+            }
+        };
+        match state
+            .push_wakers
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == waiter)
+        {
+            Some((_, registered)) => registered.clone_from(cx.waker()),
+            None => state.push_wakers.push_back((waiter, cx.waker().clone())),
+        }
+    }
+
+    /// The wait is over: this producer got what it was in line for.
+    fn served(&mut self, state: &mut State<T>) {
+        remove_push_waiter(state, self.waiter.take());
+    }
+}
+
+impl<T> Drop for ParkedProducer<'_, T> {
+    fn drop(&mut self) {
+        let Some(waiter) = self.waiter.take() else {
+            return;
+        };
+        let next;
+        {
+            let mut state = self.sender.shared.lock();
+            let still_parked = remove_push_waiter(&mut state, Some(waiter));
+            // Parked once and no longer listed: a pop took this registration
+            // and spent the freed slot's only wakeup on this producer. It will
+            // never use the slot, so the next parked producer must be told —
+            // nothing else will wake it while the consumer waits on an empty
+            // queue.
+            next = (!still_parked && state.buf.len() < self.sender.shared.config.capacity)
+                .then(|| state.push_wakers.pop_front())
+                .flatten();
+        }
+        if let Some((_, waker)) = next {
+            waker.wake();
         }
     }
 }
 
 /// A cancellation-safe asynchronous queue push.
 ///
-/// A full queue registers this future once in FIFO waiter order. Dropping the
-/// future removes that registration, so a cancelled producer cannot consume a
-/// later wakeup and leave a live producer parked; dropping it after a wakeup
-/// it never acted on passes that wakeup to the next producer, for the same
-/// reason.
+/// A full queue registers this future once in FIFO waiter order; see
+/// [`ParkedProducer`] for what dropping it does.
 pub struct Push<'a, T> {
-    sender: &'a Sender<T>,
+    parked: ParkedProducer<'a, T>,
     payload: Option<T>,
-    waiter: Option<u64>,
 }
 
 impl<T> Unpin for Push<'_, T> {}
@@ -330,49 +410,31 @@ impl<T> Future for Push<'_, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        let sender = this.parked.sender;
         let mut receiver_waker = None;
         let result;
         {
-            let mut state = this.sender.shared.lock();
+            let mut state = sender.shared.lock();
             if !state.receiver_alive {
-                remove_push_waiter(&mut state, this.waiter.take());
+                this.parked.served(&mut state);
                 return Poll::Ready(Err(this
                     .payload
                     .take()
                     .expect("push future polled after ready")));
             }
-            if state.buf.len() < this.sender.shared.config.capacity {
-                remove_push_waiter(&mut state, this.waiter.take());
+            if state.buf.len() < sender.shared.config.capacity {
+                this.parked.served(&mut state);
                 let seq = state.next_sequence();
                 state.buf.push_back(Envelope {
                     seq,
                     payload: this.payload.take().expect("push future polled after ready"),
                 });
-                state.update_mode(this.sender.shared.config.policy);
-                this.sender.shared.publish(&state);
+                state.update_mode(sender.shared.config.policy);
+                sender.shared.publish(&state);
                 receiver_waker = state.waker.take();
                 result = Poll::Ready(Ok(seq));
             } else {
-                let waiter = match this.waiter {
-                    Some(waiter) => waiter,
-                    None => {
-                        let waiter = state.next_push_waiter;
-                        state.next_push_waiter = state
-                            .next_push_waiter
-                            .checked_add(1)
-                            .expect("queue push-waiter identity exhausted");
-                        this.waiter = Some(waiter);
-                        waiter
-                    }
-                };
-                match state
-                    .push_wakers
-                    .iter_mut()
-                    .find(|(candidate, _)| *candidate == waiter)
-                {
-                    Some((_, registered)) => registered.clone_from(cx.waker()),
-                    None => state.push_wakers.push_back((waiter, cx.waker().clone())),
-                }
+                this.parked.park(&mut state, cx);
                 result = Poll::Pending;
             }
         }
@@ -383,29 +445,25 @@ impl<T> Future for Push<'_, T> {
     }
 }
 
-impl<T> Drop for Push<'_, T> {
-    fn drop(&mut self) {
-        if self.payload.is_none() {
-            return;
-        }
-        let next;
-        {
-            let mut state = self.sender.shared.lock();
-            let Some(waiter) = self.waiter.take() else {
-                return;
-            };
-            let still_parked = remove_push_waiter(&mut state, Some(waiter));
-            // Parked once and no longer listed: a pop took this registration
-            // and spent the freed slot's only wakeup on this future. It will
-            // never use the slot, so the next parked producer must be told —
-            // nothing else will wake it while the consumer waits on an empty
-            // queue.
-            next = (!still_parked && state.buf.len() < self.sender.shared.config.capacity)
-                .then(|| state.push_wakers.pop_front())
-                .flatten();
-        }
-        if let Some((_, waker)) = next {
-            waker.wake();
+/// Resolves once the queue has room or its receiver is gone; see
+/// [`Sender::room`].
+pub struct Room<'a, T> {
+    parked: ParkedProducer<'a, T>,
+}
+
+impl<T> Future for Room<'_, T> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        let sender = this.parked.sender;
+        let mut state = sender.shared.lock();
+        if !state.receiver_alive || state.buf.len() < sender.shared.config.capacity {
+            this.parked.served(&mut state);
+            Poll::Ready(())
+        } else {
+            this.parked.park(&mut state, cx);
+            Poll::Pending
         }
     }
 }
@@ -889,6 +947,72 @@ mod tests {
         assert_eq!(rx.try_pop().unwrap().payload, 2);
     }
 
+    struct CountedRoom<'a> {
+        room: Pin<Box<Room<'a, u32>>>,
+        wakes: StdArc<CountWakes>,
+    }
+
+    impl<'a> CountedRoom<'a> {
+        fn on(sender: &'a Sender<u32>) -> Self {
+            Self {
+                room: Box::pin(sender.room()),
+                wakes: StdArc::new(CountWakes(Default::default())),
+            }
+        }
+
+        fn poll(&mut self) -> Poll<()> {
+            let waker = Waker::from(self.wakes.clone());
+            self.room.as_mut().poll(&mut Context::from_waker(&waker))
+        }
+    }
+
+    #[test]
+    fn room_waits_for_a_pop_without_holding_a_payload() {
+        let (tx, mut rx) = fifo(1);
+        assert!(
+            CountedRoom::on(&tx).poll().is_ready(),
+            "an empty queue has room"
+        );
+        tx.try_push(0).unwrap();
+        let mut waiting = CountedRoom::on(&tx);
+        assert!(waiting.poll().is_pending());
+        assert_eq!(rx.try_pop().unwrap().payload, 0);
+        assert_eq!(waiting.wakes.count(), 1);
+        assert!(waiting.poll().is_ready());
+        // Room seen is not room held: the slot is still there to push into.
+        tx.try_push(1).unwrap();
+        assert_eq!(rx.try_pop().unwrap().payload, 1);
+    }
+
+    #[test]
+    fn room_resolves_when_the_receiver_is_gone() {
+        let (tx, rx) = fifo(1);
+        tx.try_push(0).unwrap();
+        let mut waiting = CountedRoom::on(&tx);
+        assert!(waiting.poll().is_pending());
+        drop(rx);
+        assert_eq!(waiting.wakes.count(), 1);
+        assert!(
+            waiting.poll().is_ready(),
+            "so the push can report the close"
+        );
+        assert!(matches!(tx.try_push(1), Err(PushError::Closed(1))));
+    }
+
+    #[test]
+    fn a_room_waiter_dropped_after_its_wakeup_hands_the_slot_to_the_next() {
+        let (tx, mut rx) = fifo(1);
+        tx.try_push(0).unwrap();
+        let mut woken_then_dropped = CountedRoom::on(&tx);
+        assert!(woken_then_dropped.poll().is_pending());
+        let mut next = Parked::on(&tx, 2);
+        assert_eq!(rx.try_pop().unwrap().payload, 0);
+        assert_eq!(next.wakes.count(), 0);
+        drop(woken_then_dropped);
+        assert_eq!(next.wakes.count(), 1);
+        assert!(next.poll().is_ready());
+    }
+
     #[test]
     #[should_panic]
     fn zero_capacity_is_a_loud_construction_error() {
@@ -944,6 +1068,47 @@ mod loom_tests {
             let mut got = Vec::new();
             for _ in 0..2 {
                 let env = loom::future::block_on(rx.pop()).expect("two pushes in flight");
+                got.push(env.payload);
+            }
+            t1.join().unwrap();
+            t2.join().unwrap();
+            got.sort_unstable();
+            assert_eq!(got, vec![1, 2]);
+        });
+    }
+
+    /// The cross-shard lane's way of producing — hold the event, wait for
+    /// `room`, offer it with `try_push` — under contention: two such producers
+    /// share a capacity-1 queue. A lost wakeup parks one forever (a deadlocked
+    /// branch in loom); losing the race for a slot must only mean waiting again.
+    #[test]
+    fn room_then_try_push_loses_no_wakeup_under_all_interleavings() {
+        async fn offer(tx: Sender<u32>, mut payload: u32) {
+            loop {
+                match tx.try_push(payload) {
+                    Ok(_) => return,
+                    Err(PushError::Full(back)) => {
+                        payload = back;
+                        tx.room().await;
+                    }
+                    Err(PushError::Closed(_)) => panic!("receiver alive"),
+                }
+            }
+        }
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(2);
+        model.check(|| {
+            let (tx, mut rx) = queue::<u32>(Config {
+                name: "loom-room",
+                capacity: 1,
+                policy: Policy::Fifo,
+            });
+            let tx2 = tx.clone();
+            let t1 = loom::thread::spawn(move || loom::future::block_on(offer(tx, 1)));
+            let t2 = loom::thread::spawn(move || loom::future::block_on(offer(tx2, 2)));
+            let mut got = Vec::new();
+            for _ in 0..2 {
+                let env = loom::future::block_on(rx.pop()).expect("two offers in flight");
                 got.push(env.payload);
             }
             t1.join().unwrap();

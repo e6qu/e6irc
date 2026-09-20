@@ -129,6 +129,48 @@ fn required_home() -> io::Result<PathBuf> {
 /// Load a cached token. A missing file is `Ok(None)`; malformed, oversized, or
 /// insecure storage is an error rather than an unauthenticated fallback.
 pub fn load_token(path: &Path) -> io::Result<Option<CachedToken>> {
+    let Some(bytes) = read_private_file(path, "token cache")? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Read one secret (a password, a bearer token) from a file, so it need not be
+/// typed where `ps` and the shell history can see it. The file is held to the
+/// token cache's standard — not readable by group or others, and bounded — and
+/// one trailing line break is dropped, because that is what an editor or `echo`
+/// leaves behind. A missing or empty file is an error: the caller was told to
+/// find a secret here.
+pub fn read_secret_file(path: &Path) -> io::Result<String> {
+    let bytes = read_private_file(path, "secret file")?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no secret file at {}", path.display()),
+        )
+    })?;
+    let text = String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("secret file is not UTF-8 text: {}", path.display()),
+        )
+    })?;
+    let secret = text.strip_suffix('\n').map_or(text.as_str(), |line| {
+        line.strip_suffix('\r').unwrap_or(line)
+    });
+    if secret.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("secret file is empty: {}", path.display()),
+        ));
+    }
+    Ok(secret.to_owned())
+}
+
+/// The bytes of a file only its owner can read, or `None` when there is no such
+/// file. `what` names the file's role in error messages.
+fn read_private_file(path: &Path, what: &str) -> io::Result<Option<Vec<u8>>> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -139,35 +181,33 @@ pub fn load_token(path: &Path) -> io::Result<Option<CachedToken>> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "token cache exceeds the {MAX_TOKEN_FILE_BYTES}-byte limit: {}",
+                "{what} exceeds the {MAX_TOKEN_FILE_BYTES}-byte limit: {}",
                 path.display()
             ),
         ));
     }
-    check_private_permissions(&metadata, path)?;
+    check_private_permissions(&metadata, path, what)?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.take(MAX_TOKEN_FILE_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_TOKEN_FILE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "token cache grew while it was being read",
+            format!("{what} grew while it was being read"),
         ));
     }
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    Ok(Some(bytes))
 }
 
 #[cfg(unix)]
-fn check_private_permissions(metadata: &fs::Metadata, path: &Path) -> io::Result<()> {
+fn check_private_permissions(metadata: &fs::Metadata, path: &Path, what: &str) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "token cache is accessible by group or other users; chmod 600 {}",
+                "{what} is accessible by group or other users; chmod 600 {}",
                 path.display()
             ),
         ));
@@ -176,7 +216,11 @@ fn check_private_permissions(metadata: &fs::Metadata, path: &Path) -> io::Result
 }
 
 #[cfg(not(unix))]
-fn check_private_permissions(_metadata: &fs::Metadata, _path: &Path) -> io::Result<()> {
+fn check_private_permissions(
+    _metadata: &fs::Metadata,
+    _path: &Path,
+    _what: &str,
+) -> io::Result<()> {
     Ok(())
 }
 
@@ -375,6 +419,46 @@ mod tests {
         let error = load_token(&path).err().expect("must refuse broad mode");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_secret_file_is_private_nonempty_text_without_its_line_break() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = temporary_path("secret-file");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("password");
+        let write = |contents: &[u8], mode: u32| {
+            fs::write(&path, contents).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        for (contents, secret) in [
+            (&b"hunter2\n"[..], "hunter2"),
+            (b"hunter2\r\n", "hunter2"),
+            (b"hunter2", "hunter2"),
+            (b" spaces are part of it \n", " spaces are part of it "),
+        ] {
+            write(contents, 0o600);
+            assert_eq!(read_secret_file(&path).unwrap(), secret);
+        }
+        write(b"hunter2\n", 0o640);
+        let exposed = read_secret_file(&path).expect_err("group-readable");
+        assert_eq!(exposed.kind(), io::ErrorKind::PermissionDenied);
+        assert!(exposed.to_string().contains("chmod 600"), "{exposed}");
+        for empty in [&b""[..], b"\n"] {
+            write(empty, 0o600);
+            assert_eq!(
+                read_secret_file(&path).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            read_secret_file(&path).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

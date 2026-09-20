@@ -76,8 +76,16 @@ cargo build --profile release-client -p e6irc-cli -p e6irc-tui
 
 # TUI (TLS + BNC account/network selection; history/read markers are automatic)
 ./target/release-client/e6irc-tui --server bnc.example:6697 --nick alice --tls \
-  --account alice/libera --password 'app-password' --channel '#e6irc'
+  --account alice/libera --password-file ~/.config/e6irc/app-password --channel '#e6irc'
 ```
+
+A password or token is read from a file (`--password-file`,
+`--oauth-token-file`, `api --bearer-token-file`) or from the environment
+(`E6IRC_PASSWORD`, `E6IRC_OAUTH_TOKEN`, `E6IRC_API_TOKEN`). `--password` and
+`--oauth-token` still work, but a value typed on a command line is visible to
+every local user in the process list. Both clients refuse to send a credential
+over a connection that is neither TLS nor loopback;
+`--allow-cleartext-credentials` is the explicit override.
 
 For a browser-approved token shared by the CLI and TUI:
 

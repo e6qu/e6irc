@@ -319,6 +319,73 @@ fn origin_names_host(origin: &str, host: &str) -> bool {
     })
 }
 
+/// Most live chat sockets one account may hold at once, across all of its
+/// networks and browser sessions. The web client holds one per open tab, so
+/// this matches the most browser sessions an account may have
+/// (`MAX_BROWSER_SESSIONS_PER_ACCOUNT`). Each socket is a task, a broadcast
+/// subscription with its replay, and a slot in the service-wide connection
+/// bound; without a per-account bound one credential could take all of them.
+pub(crate) const MAX_UI_SOCKETS_PER_ACCOUNT: usize = 32;
+
+/// WebSocket close code 1008, "policy violation" (RFC 6455 §7.4.1).
+const CLOSE_POLICY_VIOLATION: u16 = 1008;
+
+/// What a refused socket's close frame says. The web client shows a close
+/// reason verbatim; a close reason is at most 123 bytes.
+const UI_SOCKET_LIMIT_REASON: &str = "This account has 32 live chat connections open, the most allowed. Close another tab and retry.";
+
+/// Live chat sockets open per folded account.
+pub(crate) struct UiSocketLimiter {
+    open: Mutex<HashMap<String, usize>>,
+}
+
+/// One account's admission to hold one live chat socket, for as long as the
+/// socket's task runs.
+pub(crate) struct UiSocketSlot {
+    limiter: Arc<UiSocketLimiter>,
+    account: String,
+}
+
+impl UiSocketLimiter {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            open: Mutex::default(),
+        })
+    }
+
+    /// A slot for `account`, or `None` when it already holds
+    /// [`MAX_UI_SOCKETS_PER_ACCOUNT`].
+    fn admit(self: &Arc<Self>, account: &str) -> Option<UiSocketSlot> {
+        let account = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account);
+        let mut open = self.open.lock().expect("live chat socket limiter lock");
+        let held = open.entry(account.clone()).or_insert(0);
+        if *held >= MAX_UI_SOCKETS_PER_ACCOUNT {
+            return None;
+        }
+        *held += 1;
+        Some(UiSocketSlot {
+            limiter: self.clone(),
+            account,
+        })
+    }
+}
+
+impl Drop for UiSocketSlot {
+    fn drop(&mut self) {
+        let mut open = self
+            .limiter
+            .open
+            .lock()
+            .expect("live chat socket limiter lock");
+        if let Some(held) = open.get_mut(&self.account) {
+            *held -= 1;
+            if *held == 0 {
+                open.remove(&self.account);
+            }
+        }
+    }
+}
+
 /// The web client's live socket: cookie-authenticated, attaches to one
 /// of the caller's networks, and pushes line, status, and replay-complete JSON
 /// events that the browser client parses into buffers and a member list.
@@ -344,18 +411,52 @@ pub(super) async fn ws_ui(
     let Some(handle) = registry.get_owned(&account, &params.network) else {
         return problem(StatusCode::NOT_FOUND, "No such network", None);
     };
+    // Counted before the upgrade, so sockets still in their handshake count.
+    let slot = state.ui_sockets.admit(&account);
     ws.max_message_size(MAX_UI_WS_FRAME)
         .max_frame_size(MAX_UI_WS_FRAME)
-        .on_upgrade(move |socket| ws_ui_conn(handle, socket, composer))
+        .on_upgrade(move |socket| {
+            ws_ui_conn(
+                handle,
+                socket,
+                composer,
+                slot,
+                crate::bouncer::ATTACH_LIVENESS_INTERVAL,
+            )
+        })
 }
 
+/// Serve one live chat socket until either side ends it.
+///
+/// `slot` is the account's admission; without one the socket is closed at once
+/// with a policy-violation code and a reason — after the upgrade, because a
+/// browser gives its page no status or body for a refused upgrade, only a
+/// close frame's code and reason.
+///
+/// `liveness` bounds how long a silent peer is believed: after one interval
+/// without a frame it is sent a WebSocket Ping, and after a second it is given
+/// up on. A browser answers Ping by itself, so a live peer on a quiet network
+/// costs one small frame per interval, and a half-open connection — a laptop
+/// that slept, a NAT that forgot the flow — stops holding its task, its socket,
+/// and its place in the attached-client count.
 pub(super) async fn ws_ui_conn(
     handle: std::sync::Arc<crate::bouncer::NetworkHandle>,
     mut socket: WebSocket,
     composer: ComposerAuthority,
+    slot: Option<UiSocketSlot>,
+    liveness: std::time::Duration,
 ) {
     use crate::bouncer::DriverEvent;
     use tokio::sync::broadcast::error::RecvError;
+
+    let Some(_slot) = slot else {
+        let close = axum::extract::ws::CloseFrame {
+            code: CLOSE_POLICY_VIOLATION,
+            reason: UI_SOCKET_LIMIT_REASON.into(),
+        };
+        drop(send_frame(&mut socket, WsMessage::Close(Some(close))).await);
+        return;
+    };
 
     // Watch the stop signal too. The event broadcast never closes while this
     // task holds an `Arc<NetworkHandle>` (the handle keeps a sender), so
@@ -423,6 +524,8 @@ pub(super) async fn ws_ui_conn(
     {
         return;
     }
+    let mut peer_silence = crate::bouncer::SilenceDeadline::new(liveness);
+    let mut awaiting_pong = false;
     loop {
         tokio::select! {
             // Network removed/replaced/disabled: send a typed terminal status
@@ -494,7 +597,22 @@ pub(super) async fn ws_ui_conn(
                     break;
                 }
             },
-            frame = socket.recv() => match frame {
+            frame = peer_silence.bound(socket.recv()) => {
+                let Some(frame) = frame else {
+                    if awaiting_pong {
+                        break;
+                    }
+                    awaiting_pong = true;
+                    peer_silence.restart();
+                    if send_frame(&mut socket, WsMessage::Ping(Default::default())).await.is_err() {
+                        break;
+                    }
+                    continue;
+                };
+                // Any frame is a sign of life, not only the Pong.
+                awaiting_pong = false;
+                peer_silence.restart();
+                match frame {
                 Some(Ok(WsMessage::Text(t))) => {
                     let request = match composer_request(&t) {
                         Ok(request) => request,
@@ -583,6 +701,7 @@ pub(super) async fn ws_ui_conn(
                 }
                 Some(Ok(WsMessage::Pong(_))) => {}
                 Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
+                }
             },
         }
     }
@@ -1210,5 +1329,148 @@ mod send_deadline_tests {
         assert!(delivered.is_ok());
         let failed = within_send_deadline(deadline, async { Err::<(), ()>(()) }).await;
         assert!(matches!(failed, Err(SendFailure::Transport)));
+    }
+}
+
+#[cfg(test)]
+mod ui_socket_bound_tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message as Peer;
+
+    const LIVENESS: std::time::Duration = std::time::Duration::from_millis(150);
+
+    /// Serve `ws_ui_conn` for one test network on a loopback port.
+    async fn serve(
+        handle: Arc<crate::bouncer::NetworkHandle>,
+        limiter: Arc<UiSocketLimiter>,
+    ) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let app = Router::new().route(
+            "/ws",
+            get(move |ws: WebSocketUpgrade| {
+                let (handle, limiter) = (handle.clone(), limiter.clone());
+                async move {
+                    let slot = limiter.admit("Alice");
+                    ws.on_upgrade(move |socket| {
+                        ws_ui_conn(handle, socket, ComposerAuthority::MaySend, slot, LIVENESS)
+                    })
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        addr
+    }
+
+    fn attachable_network() -> (
+        Arc<crate::bouncer::NetworkHandle>,
+        crate::bouncer::DriverEnds,
+    ) {
+        let (handle, ends) = crate::bouncer::NetworkHandle::channels(8);
+        handle.history_restored();
+        (Arc::new(handle), ends)
+    }
+
+    async fn attached_clients_become(handle: &crate::bouncer::NetworkHandle, expected: u64) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while handle.runtime_snapshot().attached_clients != expected {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "attached clients stayed at {}, expected {expected}",
+                handle.runtime_snapshot().attached_clients
+            )
+        });
+    }
+
+    /// A peer whose TCP connection stays open but which never answers — a
+    /// laptop that slept, a NAT that forgot the flow — must not hold its task,
+    /// its socket, and its place in the attached-client count forever.
+    #[tokio::test]
+    async fn a_peer_that_stops_answering_pings_is_detached() {
+        let (handle, _ends) = attachable_network();
+        let addr = serve(handle.clone(), UiSocketLimiter::new()).await;
+        // Never polled again after the handshake, so it never answers a ping.
+        let (_silent, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("connect");
+        attached_clients_become(&handle, 1).await;
+        attached_clients_become(&handle, 0).await;
+    }
+
+    #[tokio::test]
+    async fn a_quiet_peer_that_answers_pings_stays_attached() {
+        let (handle, _ends) = attachable_network();
+        let addr = serve(handle.clone(), UiSocketLimiter::new()).await;
+        let (mut peer, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("connect");
+        // Reading is what lets the client library answer each ping.
+        let mut pings = 0;
+        let quiet = tokio::time::timeout(LIVENESS * 5, async {
+            while let Some(frame) = peer.next().await {
+                match frame.expect("frame") {
+                    Peer::Ping(_) => pings += 1,
+                    Peer::Close(_) => return,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            quiet.is_err(),
+            "the server closed a peer that was answering"
+        );
+        assert!(
+            pings >= 2,
+            "the server pinged {pings} time(s) across five intervals"
+        );
+        assert_eq!(handle.runtime_snapshot().attached_clients, 1);
+    }
+
+    #[tokio::test]
+    async fn one_account_holds_a_bounded_number_of_sockets_and_is_told_why() {
+        let (handle, _ends) = attachable_network();
+        let limiter = UiSocketLimiter::new();
+        let addr = serve(handle.clone(), limiter.clone()).await;
+        let held: Vec<_> = (0..MAX_UI_SOCKETS_PER_ACCOUNT)
+            .map(|_| limiter.admit("alice").expect("under the cap"))
+            .collect();
+        assert!(
+            limiter.admit("ALICE").is_none(),
+            "the cap is per folded account"
+        );
+        assert!(
+            limiter.admit("bob").is_some(),
+            "another account is unaffected"
+        );
+
+        let (mut refused, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("the upgrade itself succeeds so the browser can read the reason");
+        let close = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            match refused.next().await {
+                Some(Ok(Peer::Close(frame))) => frame.expect("close frame"),
+                Some(Ok(other)) => panic!("sent {other:?} to a refused socket"),
+                other => panic!("no close frame: {other:?}"),
+            }
+        })
+        .await
+        .expect("close");
+        assert_eq!(u16::from(close.code), 1008);
+        assert!(close.reason.contains("32"), "{}", close.reason);
+        assert_eq!(handle.runtime_snapshot().attached_clients, 0);
+
+        drop(held);
+        assert!(
+            limiter.admit("alice").is_some(),
+            "a closed socket frees its slot"
+        );
     }
 }

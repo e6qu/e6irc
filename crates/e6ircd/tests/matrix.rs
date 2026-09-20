@@ -82,6 +82,7 @@ async fn matrix_bridge_relays_both_ways() {
 
     // Start the bridge as the bot, bridging the room.
     let handle = Box::new(MatrixDriver::new(MatrixConfig {
+        device: e6ircd::bouncer::MatrixDevice::for_network(Some("conduit-test"), "bridge"),
         homeserver: base.clone(),
         user: bot.clone(),
         password: "botpass".into(),

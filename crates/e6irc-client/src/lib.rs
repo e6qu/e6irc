@@ -7,6 +7,7 @@
 
 #![deny(clippy::let_underscore_must_use)]
 
+pub mod credentials;
 pub mod token_cache;
 
 use std::io;
@@ -305,6 +306,10 @@ pub struct ConnectionOptions {
     /// syntactic host portion of `address` is used.
     pub tls_server_name: Option<String>,
     pub nick: String,
+    /// The user name (ident) sent in `USER`. Stated, never derived: a legal
+    /// nickname (`_bot`) is not a legal user name, and servers answer a bad one
+    /// by closing the link.
+    pub username: String,
     pub realname: String,
     pub authentication: Authentication,
     /// How long the server may take to finish registration, and afterwards to
@@ -313,6 +318,28 @@ pub struct ConnectionOptions {
     /// while saying nothing relevant would otherwise hang a scripted client
     /// forever, and only the caller knows how long its user will wait.
     pub response_deadline: std::time::Duration,
+    /// Whether SASL credentials may cross a plaintext connection to a server
+    /// that is not this machine. Required, so that sending a password in the
+    /// clear is something a caller's user asked for, never a default.
+    pub cleartext_credentials: CleartextCredentials,
+}
+
+/// See [`ConnectionOptions::cleartext_credentials`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleartextCredentials {
+    Refuse,
+    Allow,
+}
+
+/// Who a connection registers as. Named fields, because three adjacent strings
+/// in a call are one transposition away from a real name sent as the user name.
+#[derive(Debug, Clone, Copy)]
+pub struct Identity<'a> {
+    pub nick: &'a str,
+    /// The `USER` name (ident). Stated by the caller; see
+    /// [`ConnectionOptions::username`].
+    pub username: &'a str,
+    pub realname: &'a str,
 }
 
 /// A connection the server has welcomed, with the nickname it confirmed —
@@ -337,6 +364,21 @@ impl ConnectionOptions {
     }
 
     async fn connect_and_register(&self) -> io::Result<Registered> {
+        // SASL PLAIN is the password in base64 and OAUTHBEARER is the token
+        // itself, so without TLS both are readable by everything on the path.
+        // Decided before dialing: nothing leaves the machine first.
+        if !self.tls
+            && !matches!(self.authentication, Authentication::None)
+            && self.cleartext_credentials == CleartextCredentials::Refuse
+            && !is_loopback_host(tls_server_name(&self.address)?)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to send SASL credentials in cleartext to a server that is not this \
+                 machine; connect with --tls, or pass --allow-cleartext-credentials to send \
+                 them unprotected",
+            ));
+        }
         let mut connection = if self.tls {
             let name = match self.tls_server_name.as_deref() {
                 Some(name) if !name.trim().is_empty() => name,
@@ -352,17 +394,20 @@ impl ConnectionOptions {
         } else {
             Connection::connect(&self.address).await?
         };
+        let identity = Identity {
+            nick: &self.nick,
+            username: &self.username,
+            realname: &self.realname,
+        };
         let nick = match &self.authentication {
-            Authentication::None => connection.register(&self.nick, &self.realname).await?,
+            Authentication::None => connection.register(&identity).await?,
             Authentication::Plain { account, password } => {
                 connection
-                    .register_sasl(&self.nick, &self.realname, account, password)
+                    .register_sasl(&identity, account, password)
                     .await?
             }
             Authentication::OAuthBearer { token } => {
-                connection
-                    .register_oauthbearer(&self.nick, &self.realname, token)
-                    .await?
+                connection.register_oauthbearer(&identity, token).await?
             }
         };
         connection.response_deadline = Some(self.response_deadline);
@@ -389,6 +434,53 @@ async fn within<T>(
                 format!("the server did not finish {what} within {deadline:?}"),
             ))
         })
+}
+
+/// Whether `host` is this machine: `localhost`, a name under `.localhost`
+/// (RFC 6761), or a loopback address, bracketed or not. The one rule for "a
+/// plaintext connection that cannot be overheard"; the qualification harness
+/// applies the same rule to plaintext HTTP.
+pub fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+/// Whether `word` is a `USER` name every server accepts: 1–10 bytes, an ASCII
+/// letter or digit first, then ASCII letters, digits, `_` and `-`. A server
+/// answers a user name it dislikes by closing the link rather than with a
+/// numeric, so the portable grammar is the strict one. e6ircd's
+/// `UpstreamUsername` is the same grammar with reasons, and is tested against
+/// this predicate.
+pub fn is_portable_username(word: &str) -> bool {
+    let mut bytes = word.bytes();
+    word.len() <= 10
+        && bytes
+            .next()
+            .is_some_and(|first| first.is_ascii_alphanumeric())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+/// The `USER` name of a native client: the one stated, else the nickname —
+/// the one default both clients document — and that only when the nickname is
+/// itself a portable user name. A nickname that is not (`_bot`, `ada|away`,
+/// anything past ten bytes) is never shortened or rewritten into one; the
+/// caller is told to state a user name instead.
+pub fn stated_or_nick_username(stated: Option<&str>, nick: &str) -> io::Result<String> {
+    match stated {
+        Some(username) => Ok(username.to_owned()),
+        None if is_portable_username(nick) => Ok(nick.to_owned()),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the nickname {nick} cannot double as the IRC user name (ASCII letters, digits, \
+                 '_' and '-', starting with a letter or digit, at most 10 bytes); pass --username"
+            ),
+        )),
+    }
 }
 
 /// Extract a TLS validation name from `host:port`, including bracketed IPv6.
@@ -912,8 +1004,7 @@ impl Connection {
     /// during CAP negotiation, then register `nick`.
     pub async fn register_sasl(
         &mut self,
-        nick: &str,
-        realname: &str,
+        identity: &Identity<'_>,
         account: &str,
         password: &str,
     ) -> io::Result<String> {
@@ -925,8 +1016,7 @@ impl Connection {
             bytes.extend_from_slice(password.as_bytes());
             e6irc_proto::base64::encode(&bytes)
         };
-        self.register_with_sasl(nick, realname, payload, "PLAIN")
-            .await
+        self.register_with_sasl(identity, payload, "PLAIN").await
     }
 
     /// Negotiate SASL, offer `mechanism`, and wait for the server's empty
@@ -944,14 +1034,14 @@ impl Connection {
     /// payload built, which is all that differs between them).
     async fn register_with_sasl(
         &mut self,
-        nick: &str,
-        realname: &str,
+        identity: &Identity<'_>,
         payload: String,
         mechanism: &str,
     ) -> io::Result<String> {
-        self.send_registration_identity(nick, realname).await?;
+        self.send_registration_identity(identity).await?;
         self.send_sasl_payload(&payload).await?;
-        self.finish_sasl_then_welcome(nick, mechanism).await
+        self.finish_sasl_then_welcome(identity.nick, mechanism)
+            .await
     }
 
     async fn send_sasl_payload(&mut self, payload: &str) -> io::Result<()> {
@@ -977,41 +1067,51 @@ impl Connection {
     /// e6irc API token) during CAP negotiation, then register `nick`.
     pub async fn register_oauthbearer(
         &mut self,
-        nick: &str,
-        realname: &str,
+        identity: &Identity<'_>,
         token: &str,
     ) -> io::Result<String> {
         self.begin_sasl("OAUTHBEARER").await?;
         // RFC 7628 client response: gs2 header, then the bearer credential.
         let payload =
             e6irc_proto::base64::encode(format!("n,,\x01auth=Bearer {token}\x01\x01").as_bytes());
-        self.register_with_sasl(nick, realname, payload, "OAUTHBEARER")
+        self.register_with_sasl(identity, payload, "OAUTHBEARER")
             .await
     }
 
     /// Register with a nick and realname, answering PINGs, until the
     /// welcome (001) arrives. Returns the confirmed nick.
-    pub async fn register(&mut self, nick: &str, realname: &str) -> io::Result<String> {
+    pub async fn register(&mut self, identity: &Identity<'_>) -> io::Result<String> {
         match self.begin_cap().await? {
             CapabilityNegotiation::Open => {
                 self.request_metadata_capabilities().await?;
-                self.send_registration_identity(nick, realname).await?;
+                self.send_registration_identity(identity).await?;
                 self.send_line("CAP END").await?;
             }
             // Nothing is authenticated on this path, so a server without
             // capability negotiation costs only the optional metadata.
             CapabilityNegotiation::Unsupported => {
-                self.send_registration_identity(nick, realname).await?;
+                self.send_registration_identity(identity).await?;
             }
         }
-        self.await_welcome(nick).await
+        self.await_welcome(identity.nick).await
     }
 
-    async fn send_registration_identity(&mut self, nick: &str, realname: &str) -> io::Result<()> {
-        self.send_line(&format!("NICK {nick}")).await?;
+    async fn send_registration_identity(&mut self, identity: &Identity<'_>) -> io::Result<()> {
+        // `NICK` and the first `USER` parameter are single words on the wire;
+        // an empty one, or one with a space in it, silently becomes a different
+        // command (`USER 0 * :real` names the user "0").
+        for (what, word) in [("nick", identity.nick), ("username", identity.username)] {
+            if word.is_empty() || word.contains(char::is_whitespace) || word.starts_with(':') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("the registration {what} must be one non-empty word"),
+                ));
+            }
+        }
+        self.send_line(&format!("NICK {}", identity.nick)).await?;
         self.send_line(&format!(
-            "USER {} 0 * :{realname}",
-            registration_username(nick)
+            "USER {} 0 * :{}",
+            identity.username, identity.realname
         ))
         .await
     }
@@ -1284,17 +1384,6 @@ fn is_join_refusal(command: &str) -> bool {
     )
 }
 
-/// Return a USER field that fits the portable ten-character limit.
-fn registration_username(nick: &str) -> &str {
-    let end = nick
-        .char_indices()
-        .map(|(start, character)| start + character.len_utf8())
-        .take_while(|&end| end <= 10)
-        .last()
-        .unwrap_or(0);
-    &nick[..end]
-}
-
 /// Map a registration-refusal numeric to a terminal error, if it is one. These
 /// are the replies a server sends when it will not complete registration for
 /// the requested nick/credentials; a client that keeps waiting for `001` after
@@ -1331,6 +1420,41 @@ impl RegistrationRejection {
             refusal,
             diagnostic: "no detail from upstream".to_string(),
         }
+    }
+
+    /// The server welcomed the connection, but under a nickname other than the
+    /// one requested (a server truncating to its NICKLEN, say). Whether that is
+    /// acceptable is the caller's decision — a bouncer's attach listener answers
+    /// with the upstream's nickname on purpose — so this is a value a caller
+    /// builds, not an error this library raises.
+    pub fn welcomed_as(requested: &str, welcomed: &str) -> Self {
+        Self {
+            refusal: RegistrationRefusal::InvalidNickname,
+            diagnostic: bounded_diagnostic(&format!(
+                "requested {requested}, but the server welcomed {welcomed}"
+            )),
+        }
+    }
+
+    /// Read a pre-welcome server reply as a refusal to register, if it is one.
+    /// Public because not every registration goes through this library's
+    /// socket: the bouncer's in-process network registers over a queue and must
+    /// read the core's replies by the same table, not a second copy of it.
+    pub fn from_reply(message: &OwnedMessage) -> Option<Self> {
+        let refusal = match message.command.as_str() {
+            "ERROR" => RegistrationRefusal::NotRegistered,
+            "432" => RegistrationRefusal::InvalidNickname,
+            "468" => RegistrationRefusal::InvalidUsername,
+            "433" => RegistrationRefusal::NicknameInUse,
+            "464" => RegistrationRefusal::ServerPasswordRejected,
+            "465" => RegistrationRefusal::NetworkBanned,
+            "451" => RegistrationRefusal::NotRegistered,
+            _ => return None,
+        };
+        Some(Self {
+            refusal,
+            diagnostic: registration_diagnostic(message),
+        })
     }
 
     pub fn from_error(error: &io::Error) -> Option<Self> {
@@ -1375,12 +1499,37 @@ impl std::fmt::Display for RegistrationRefusalError {
 impl std::error::Error for RegistrationRefusalError {}
 
 impl RegistrationRefusal {
+    /// Whether this refusal ends by itself, with nothing about the client's
+    /// configuration changed. A caller that gives up on repeated refusals must
+    /// not give up on these: whoever it serves would have to notice and re-save
+    /// settings that were never wrong.
+    ///
+    /// `SaslUnavailable` is the one such refusal: Solanum-family servers
+    /// withdraw the `sasl` capability for as long as services are down.
+    /// `NotRegistered` is deliberately not one, although a connection throttle
+    /// arrives that way: a pre-welcome `ERROR` also carries bans, "SASL access
+    /// only" and rejected usernames, and only the server's prose tells them
+    /// apart. A throttle is outlasted by any slow retry schedule; the permanent
+    /// closures never are, and retrying those forever is the worse mistake.
+    pub const fn clears_without_reconfiguration(self) -> bool {
+        match self {
+            Self::SaslUnavailable => true,
+            Self::InvalidNickname
+            | Self::InvalidUsername
+            | Self::NicknameInUse
+            | Self::ServerPasswordRejected
+            | Self::NetworkBanned
+            | Self::NotRegistered
+            | Self::SaslFailed => false,
+        }
+    }
+
     pub fn from_error(error: &io::Error) -> Option<Self> {
         RegistrationRejection::from_error(error).map(|rejection| rejection.refusal())
     }
 
-    fn error(self, message: &OwnedMessage) -> io::Error {
-        let kind = match self {
+    const fn error_kind(self) -> io::ErrorKind {
+        match self {
             Self::NicknameInUse => io::ErrorKind::AlreadyExists,
             Self::InvalidNickname => io::ErrorKind::InvalidInput,
             Self::InvalidUsername => io::ErrorKind::InvalidInput,
@@ -1388,14 +1537,7 @@ impl RegistrationRefusal {
             Self::NetworkBanned => io::ErrorKind::ConnectionAborted,
             Self::NotRegistered | Self::SaslFailed => io::ErrorKind::Other,
             Self::SaslUnavailable => io::ErrorKind::Unsupported,
-        };
-        io::Error::new(
-            kind,
-            RegistrationRefusalError {
-                refusal: self,
-                diagnostic: registration_diagnostic(message),
-            },
-        )
+        }
     }
 }
 
@@ -1405,17 +1547,15 @@ impl RegistrationRefusal {
 /// "SASL access only" — and it can arrive at any of those stages, so it is
 /// classified here rather than by whichever loop happens to be running.
 fn registration_refused(message: &OwnedMessage) -> Option<io::Error> {
-    let refusal = match message.command.as_str() {
-        "ERROR" => RegistrationRefusal::NotRegistered,
-        "432" => RegistrationRefusal::InvalidNickname,
-        "468" => RegistrationRefusal::InvalidUsername,
-        "433" => RegistrationRefusal::NicknameInUse,
-        "464" => RegistrationRefusal::ServerPasswordRejected,
-        "465" => RegistrationRefusal::NetworkBanned,
-        "451" => RegistrationRefusal::NotRegistered,
-        _ => return None,
-    };
-    Some(refusal.error(message))
+    RegistrationRejection::from_reply(message).map(|rejection| {
+        io::Error::new(
+            rejection.refusal.error_kind(),
+            RegistrationRefusalError {
+                refusal: rejection.refusal,
+                diagnostic: rejection.diagnostic,
+            },
+        )
+    })
 }
 
 fn registration_diagnostic(message: &OwnedMessage) -> String {
@@ -1430,8 +1570,9 @@ fn registration_diagnostic(message: &OwnedMessage) -> String {
 
 /// The one bound on server-influenced text carried inside a typed refusal:
 /// short enough for a status line, and free of control characters so it can be
-/// relayed as an IRC NOTICE or printed to a terminal.
-fn bounded_diagnostic(detail: &str) -> String {
+/// relayed as an IRC NOTICE or printed to a terminal. Public so that a caller
+/// with refusals of its own (the bouncer's bridges) bounds them identically.
+pub fn bounded_diagnostic(detail: &str) -> String {
     detail
         .chars()
         .take(160)
@@ -1591,13 +1732,6 @@ mod tests {
             assert_eq!(rejection.refusal(), expected);
             assert_eq!(rejection.diagnostic(), "refused");
         }
-    }
-
-    #[test]
-    fn registration_username_fits_the_portable_limit() {
-        assert_eq!(registration_username("alice_updated"), "alice_upda");
-        assert_eq!(registration_username("short"), "short");
-        assert_eq!(registration_username("ééééééééééx"), "ééééé");
     }
 
     #[test]
@@ -1767,9 +1901,9 @@ mod tests {
         let (mut connection, server) = scripted(steps);
         let registration = async {
             match ending {
-                Ending::Welcomed => connection.register("nick", "real").await,
+                Ending::Welcomed => connection.register(&TEST_IDENTITY).await,
                 Ending::SaslRefused(..) => {
-                    connection.register_sasl("nick", "real", "acct", "pw").await
+                    connection.register_sasl(&TEST_IDENTITY, "acct", "pw").await
                 }
             }
         };
@@ -1801,7 +1935,7 @@ mod tests {
 
     const IDENTITY_THEN_WELCOME: [Step; 4] = [
         Expect("NICK nick"),
-        Expect("USER nick 0 * :real"),
+        Expect("USER ident 0 * :real"),
         Expect("CAP END"),
         Send(":srv 001 nick :Welcome"),
     ];
@@ -1960,7 +2094,7 @@ mod tests {
                 ":srv 421 * CAP :Unknown command",
                 vec![
                     Expect("NICK nick"),
-                    Expect("USER nick 0 * :real"),
+                    Expect("USER ident 0 * :real"),
                     Send(":srv 001 nick :Welcome"),
                 ],
             ),
@@ -1994,7 +2128,7 @@ mod tests {
         });
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            connection.register("nick", "real"),
+            connection.register(&TEST_IDENTITY),
         )
         .await
         .expect("an endless list must end the registration")
@@ -2003,6 +2137,14 @@ mod tests {
         drop(server.await.unwrap());
     }
 
+    /// A user name that is visibly not the nickname: nothing may derive one
+    /// from the other.
+    const TEST_IDENTITY: Identity<'static> = Identity {
+        nick: "nick",
+        username: "ident",
+        realname: "real",
+    };
+
     fn duplex_connection(capacity: usize) -> (Connection, tokio::io::DuplexStream) {
         let (client_io, server_io) = tokio::io::duplex(capacity);
         let (reader, writer) = tokio::io::split(client_io);
@@ -2010,6 +2152,38 @@ mod tests {
             Connection::from_halves(Box::new(reader), Box::new(writer)),
             server_io,
         )
+    }
+
+    /// `USER  0 * :real` names the user "0", and `USER al ice 0 * :real` shifts
+    /// every parameter after it. Neither may reach the wire.
+    #[tokio::test]
+    async fn an_empty_or_spaced_registration_word_is_refused_before_it_is_sent() {
+        for (nick, username) in [
+            ("nick", ""),
+            ("nick", "al ice"),
+            ("", "ident"),
+            ("nick", ":x"),
+        ] {
+            let (mut connection, server_io) = duplex_connection(4096);
+            let identity = Identity {
+                nick,
+                username,
+                realname: "real",
+            };
+            let error = connection
+                .send_registration_identity(&identity)
+                .await
+                .expect_err("not one word");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            drop(connection);
+            let mut sent = Vec::new();
+            tokio::io::split(server_io)
+                .0
+                .read_to_end(&mut sent)
+                .await
+                .unwrap();
+            assert!(sent.is_empty(), "{nick:?}/{username:?} reached the wire");
+        }
     }
 
     #[tokio::test]
@@ -2067,7 +2241,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            conn.register_sasl("nick", "real", "acct", "pw"),
+            conn.register_sasl(&TEST_IDENTITY, "acct", "pw"),
         )
         .await;
         assert!(
@@ -2094,7 +2268,7 @@ mod tests {
         });
 
         let error = conn
-            .register_sasl("nick", "real", "acct", "pw")
+            .register_sasl(&TEST_IDENTITY, "acct", "pw")
             .await
             .unwrap_err();
         let rejection = RegistrationRejection::from_error(&error)
@@ -2122,7 +2296,7 @@ mod tests {
             while reader.read(&mut buffer).await.unwrap_or(0) != 0 {}
         });
 
-        let error = conn.register("nick", "real").await.unwrap_err();
+        let error = conn.register(&TEST_IDENTITY).await.unwrap_err();
         let rejection = RegistrationRejection::from_error(&error)
             .expect("a server ERROR before CAP completes is a typed refusal");
         assert_eq!(rejection.refusal(), RegistrationRefusal::NotRegistered);
@@ -2145,7 +2319,7 @@ mod tests {
             assert_eq!(lines.next_line().await.unwrap().unwrap(), "NICK nick");
             assert_eq!(
                 lines.next_line().await.unwrap().unwrap(),
-                "USER nick 0 * :real"
+                "USER ident 0 * :real"
             );
             assert!(
                 lines
@@ -2164,7 +2338,7 @@ mod tests {
 
         assert_eq!(
             connection
-                .register_oauthbearer("nick", "real", "token")
+                .register_oauthbearer(&TEST_IDENTITY, "token")
                 .await
                 .unwrap(),
             "nick"
@@ -2343,9 +2517,94 @@ mod tests {
             tls: false,
             tls_server_name: None,
             nick: "requested".into(),
+            username: "ident".into(),
             realname: "real".into(),
             authentication: Authentication::None,
             response_deadline,
+            cleartext_credentials: CleartextCredentials::Refuse,
+        }
+    }
+
+    /// SASL PLAIN is the password, base64-encoded; OAUTHBEARER is the token.
+    /// Without TLS either is readable by everything on the path.
+    #[tokio::test]
+    async fn credentials_are_not_sent_in_cleartext_to_another_machine() {
+        let plain = Authentication::Plain {
+            account: "account".into(),
+            password: "secret".into(),
+        };
+        let bearer = Authentication::OAuthBearer {
+            token: "token".into(),
+        };
+        for authentication in [plain.clone(), bearer] {
+            // TEST-NET-1: never dialed, because the refusal comes first.
+            let mut options = anonymous("192.0.2.1:6667".into(), std::time::Duration::from_secs(2));
+            options.authentication = authentication;
+            let error = must_give_up(options.connect_registered()).await;
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+            assert!(error.to_string().contains("cleartext"), "{error}");
+        }
+
+        // Loopback never leaves the machine; anonymous has nothing to protect;
+        // and the caller's user may insist. None of these is refused up front
+        // (the dial to a closed loopback port then fails as a dial).
+        for (address, authentication, cleartext) in [
+            ("127.0.0.1:1", plain.clone(), CleartextCredentials::Refuse),
+            ("localhost:1", plain.clone(), CleartextCredentials::Refuse),
+            ("[::1]:1", plain.clone(), CleartextCredentials::Refuse),
+            (
+                "192.0.2.1:1",
+                Authentication::None,
+                CleartextCredentials::Refuse,
+            ),
+            ("192.0.2.1:1", plain, CleartextCredentials::Allow),
+        ] {
+            let mut options = anonymous(address.into(), std::time::Duration::from_millis(200));
+            options.authentication = authentication;
+            options.cleartext_credentials = cleartext;
+            let error = must_give_up(options.connect_registered()).await;
+            assert_ne!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "{address}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unstated_username_is_the_nick_only_when_the_nick_is_a_legal_one() {
+        assert_eq!(
+            stated_or_nick_username(None, "alice").unwrap(),
+            "alice",
+            "a nick that is a legal user name doubles as one"
+        );
+        assert_eq!(
+            stated_or_nick_username(Some("ident"), "_bot").unwrap(),
+            "ident",
+            "a stated user name is used as stated"
+        );
+        // Never shortened, stripped or otherwise made to fit.
+        for nick in ["_bot", "ada|away", "[away]", "adalovelace", "zoë", ""] {
+            let error = stated_or_nick_username(None, nick).expect_err(nick);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{nick}");
+            assert!(error.to_string().contains("--username"), "{error}");
+        }
+    }
+
+    #[test]
+    fn loopback_hosts_are_recognised_by_name_and_by_address() {
+        for host in [
+            "localhost",
+            "irc.localhost",
+            "127.0.0.1",
+            "127.8.8.8",
+            "::1",
+            "[::1]",
+        ] {
+            assert!(is_loopback_host(host), "{host}");
+        }
+        for host in ["localhost.example", "192.0.2.1", "::2", "irc.example", ""] {
+            assert!(!is_loopback_host(host), "{host}");
         }
     }
 

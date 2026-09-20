@@ -1189,6 +1189,9 @@ let reconnectDelay = 0;
 let reconnectTimer = null;
 let reconnectAttempt = 0;
 let terminalSocket = false;
+// WebSocket close code 1008: the peer refused the connection as a matter of
+// policy. A dropped link is retried; a refusal is not.
+const POLICY_VIOLATION = 1008;
 const RECONNECT_MIN = 1000;
 const RECONNECT_MAX = 30000;
 
@@ -1313,6 +1316,20 @@ function connect() {
     setComposerAvailable(false);
     if (terminalSocket) {
       setStatus(`${network} unavailable`, "error");
+      return;
+    }
+    if (event.code === POLICY_VIOLATION) {
+      // The server refused this connection for a stated reason (too many live
+      // connections for the account). Nothing about that changes by asking
+      // again every few seconds, so it is said once and left to the person.
+      const reason = event.reason || "The server refused this connection.";
+      setStatus("live connection refused", "error");
+      showAlert(
+        "socket",
+        `${reason} e6irc is not retrying by itself.`,
+        "error",
+        { label: "Retry now", onClick: retryConnectionNow },
+      );
       return;
     }
     const detail = event.reason ? `: ${event.reason}` : event.code === 1006 ? " unexpectedly" : "";
@@ -1609,6 +1626,7 @@ const NETWORK_FIELD_INPUTS = Object.freeze({
   name: "nf-name",
   addr: "nf-addr",
   nick: "nf-nick",
+  username: "nf-username",
   realname: "nf-realname",
   autojoin: "nf-autojoin",
   sasl_account: "nf-sasl-account",
@@ -1725,6 +1743,7 @@ async function openNetworkDialog(name = null) {
       el("nf-addr").value = detail.addr ?? "";
       el("nf-tls").checked = detail.tls !== false;
       el("nf-nick").value = detail.nick ?? "";
+      el("nf-username").value = detail.username ?? "";
       el("nf-realname").value = detail.realname ?? "";
       el("nf-autojoin").value = Array.isArray(detail.autojoin) ? detail.autojoin.join(", ") : "";
       el("nf-sasl-account").value = detail.sasl_account ?? "";
@@ -1782,6 +1801,7 @@ if (networkForm) {
       addr: el("nf-addr").value,
       tls: el("nf-tls").checked,
       nick,
+      username: el("nf-username").value,
       realname: el("nf-realname").value,
       autojoin: el("nf-autojoin").value,
       account,
@@ -1796,8 +1816,7 @@ if (networkForm) {
     } catch (error) {
       if (!(error instanceof NetworkRequestError)) throw error;
       setDialogError(error.message);
-      el("nf-advanced").open = true;
-      (account || !password ? el("nf-addr") : el("nf-sasl-account")).focus();
+      markFieldAtFault(error.field);
       return;
     }
 

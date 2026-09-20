@@ -34,7 +34,10 @@ def code_only(text: str) -> str:
 
 allsrc = "\n".join(code_only(t) for t in texts.values())
 
-defre = re.compile(r'\bpub\s+(?:fn|struct|enum|const|static|type|trait)\s+([A-Za-z_][A-Za-z0-9_]*)')
+# `fn` takes its qualifiers with it: without them `pub async fn run` was never
+# looked at, and `pub const fn new` was read as a constant named `fn`.
+defre = re.compile(r'\bpub\s+(?:(?:(?:const|async|unsafe)\s+)*fn|struct|enum|const|static|type|trait)'
+                   r'\s+([A-Za-z_][A-Za-z0-9_]*)')
 allow = "dead-pub-allow"
 
 dead = []

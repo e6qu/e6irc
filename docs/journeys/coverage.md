@@ -150,15 +150,15 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 
 | CI job | Product risk addressed |
 |---|---|
-| `lint` | formatting, warnings, all-feature and per-bridge compilation, frontend unit tests/build; shell syntax of every script; the container entrypoint, backup/restore, load-sweep, qualification, migration-integrity, and no-deferral guard contracts; no-op/dead-code/dead-public/duplication/no-deferral/journey/client-capability/template-accessibility/API-first guards |
-| `deny` | licenses, advisories, bans, and dependency-source policy |
+| `lint` | formatting, warnings, all-feature and per-bridge compilation, frontend unit tests/build; shell syntax of every script; the backup/restore, load-sweep, qualification, migration-integrity, and no-deferral guard contracts; no-op/dead-code/dead-public/duplication/no-deferral/fuzz-lock/journey/client-capability/template-accessibility/API-first guards |
+| `deny` | licenses, advisories, bans (including one version of each network stack), and dependency-source policy, for the workspace and for the separate `fuzz/` package |
 | `test` | all-feature workspace behavior on six OS/architecture cells |
 | `coverage` | all-feature workspace line-coverage regression floor |
 | `db-tests` | real PostgreSQL storage/all-feature HTTP bridge management/OIDC/browser/BNC/`ws_ui`/`ws_scope`/CLI journeys |
 | `cross-browser` | the complete OIDC, console, network, and chat browser journey repeated in Firefox and WebKit against the real daemon, PostgreSQL, and a local live upstream |
 | `visual-regression` | Chromium visual snapshots and axe accessibility checks of the chat and console shells against the development server |
 | `postgres-recovery` | isolated empty PostgreSQL first boot plus live stop/start degradation and recovery under HTTP and IRC traffic |
-| `production-container` | deployable image and embedded web-client shape |
+| `production-container` | deployable image and embedded web-client shape; the built distroless image booted with its real command against PostgreSQL to a served `/healthz`, a ready `/readyz`, the login page, its own `healthcheck` probe, user 10001, no shell, a missing variable refused by name, and a clean exit on SIGTERM within the stop budget |
 | `load-smoke` | real daemon with 64 clients, eight channels, duplicate-proof exact fan-out, generous numeric thresholds, and graceful shutdown |
 | `native-client-journeys` | deterministic archive contract plus real PTY render/message/terminal-restore journey |
 | `shauth-sso` | exact external single-sign-on/logout integration |
@@ -167,11 +167,15 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 | `loom` | queue concurrency interleavings |
 | `fuzz-smoke` | parser, serializer, stateful core, multi-client core, and hostile TUI server output |
 | `size-report` | informational release binary-size visibility |
+| `ci-ok` | the single required check: it needs every job above and fails unless each one succeeded, so a failed, cancelled, or skipped job cannot merge green; the release workflow publishes only from a `main` commit whose CI run concluded successfully |
 
-The `Release image and native archives` workflow publishes direct amd64/arm64
+The `Release image and native archives` workflow runs when CI completes and
+publishes only from a `main` commit whose CI concluded successfully, building
+that exact commit. It publishes direct amd64/arm64
 images, verifies the assembled manifest, emits signed build/SBOM attestations,
 verifies those attestations as a consumer, and prunes complete old image
-groups. On a matching version tag it also builds all six native targets,
+groups. On a matching version tag, and only when the tagged commit has a
+successful CI run on `main`, it also builds all six native targets,
 attests each deterministic archive, checks that the complete six-file set
 arrived, writes sorted SHA-256 checksums, and creates the GitHub release.
 

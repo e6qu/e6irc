@@ -768,7 +768,12 @@ async fn client(
     // would wedge every client behind the barrier with zero output instead.
     let setup = async {
         let mut conn = connect(&args).await?;
-        conn.register(&format!("load{id}"), "load").await?;
+        conn.register(&e6irc_client::Identity {
+            nick: &format!("load{id}"),
+            username: "load",
+            realname: "load",
+        })
+        .await?;
         conn.send_line(&format!("JOIN {channel}")).await?;
         // Wait for end-of-names (366) so we know the join completed.
         loop {

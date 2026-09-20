@@ -622,24 +622,28 @@ try {
   await networkDriver.selectOption("local");
   assert.equal(await networkForm.locator('[name="addr"]').isVisible(), true);
   assert.equal(await networkForm.locator('[name="nick"]').isVisible(), true);
+  assert.equal(await networkForm.locator('[name="username"]').isVisible(), true);
+  assert.equal(await networkForm.locator('[name="username"]').getAttribute("required"), "");
   assert.equal(await networkForm.locator('[name="realname"]').isVisible(), true);
   assert.equal(await networkForm.locator('[name="sasl_account"]').isVisible(), false);
   assert.equal(await networkForm.locator('[name="sasl_password"]').isVisible(), false);
   await networkDriver.selectOption("irc");
   assert.equal(await networkForm.locator('[name="addr"]').getAttribute("required"), "");
   assert.equal(await networkForm.locator('[name="nick"]').getAttribute("required"), "");
+  assert.equal(await networkForm.locator('[name="username"]').getAttribute("required"), "");
   assert.equal(await networkForm.locator('[name="realname"]').getAttribute("required"), "");
   assert.equal(await networkForm.locator('[name="sasl_password"]').getAttribute("required"), null);
   // The captions are the shared vocabulary; the fields are then addressed by
   // name, because a password label also carries its reveal button's text.
   assert.deepEqual(
     await networkForm.locator("label:not([hidden]) > span:first-child").allInnerTexts(),
-    ["Name", "Owner blank for shared", "Type", "Server", "Nickname", "Real name", "Channels to join",
+    ["Name", "Owner blank for shared", "Type", "Server", "Nickname", "Username", "Real name", "Channels to join",
       "Buffer capacity", "NickServ account", "NickServ password"],
   );
   await networkForm.locator('[name="name"]').fill("shared-browser");
   await networkForm.locator('[name="addr"]').fill(upstream.address);
   await networkForm.locator('[name="nick"]').fill("sharedbrowser");
+  await networkForm.locator('[name="username"]').fill("sharedid");
   await networkForm.locator('[name="realname"]').fill("Shared Browser");
   await networkForm.locator('[name="autojoin"]').fill("#shared");
   await networkForm.locator('[name="tls"]').uncheck();
@@ -1090,6 +1094,7 @@ try {
   await page.locator('input[name="name"]').fill("journey");
   await page.locator('input[name="addr"]').fill(upstream.address);
   await page.locator('input[name="nick"]').fill("webjourney");
+  await page.locator('input[name="username"]').fill("webident");
   await page.locator('input[name="realname"]').fill("Web Journey");
   await page.locator('input[name="autojoin"]').fill("#journey");
   await page.locator('input[name="tls"]').uncheck();
@@ -1098,7 +1103,10 @@ try {
       && response.request().method() === "POST",
     { timeout: 45_000 },
   );
+  // The user name typed in the form is what the upstream is sent -- by the
+  // connection test and by the network itself -- not something made from the nick.
   await page.getByRole("button", { name: "Test connection", exact: true }).click();
+  await upstream.waitForLine((line) => line === "USER webident 0 * :Web Journey");
   const preflight = await preflightResponse;
   assert.equal(preflight.status(), 200, await preflight.text());
   await page.getByRole("status").filter({ hasText: /Registered as webjourney/ }).waitFor({ timeout: 45_000 });
@@ -1479,6 +1487,7 @@ try {
             addr: "irc.example:6697",
             tls: true,
             nick: "webnick",
+            username: "webident",
             realname: null,
             autojoin: [],
             sasl_account: null,

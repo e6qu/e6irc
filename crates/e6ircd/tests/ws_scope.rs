@@ -57,6 +57,7 @@ async fn bouncer(
             addr: upstream.to_string(),
             tls: false,
             nick: "alicebnc".into(),
+            username: Some("tester".into()),
             realname: Some("alicebnc".into()),
             autojoin: vec!["#lobby".into()],
             buffer_cap: 1000,
@@ -134,7 +135,7 @@ async fn ui_socket_sending_requires_write_authority() {
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    e6ircd::db::create_account(&pool, "alice", "s3cr3t")
+    e6ircd::db::create_account_with_contact(&pool, "alice", "s3cr3t", None)
         .await
         .expect("account");
     let lifetime = ApiTokenLifetimeDays::new(7).expect("lifetime");
@@ -166,7 +167,13 @@ async fn ui_socket_sending_requires_write_authority() {
     let mut peer = e6irc_client::Connection::connect(&up.to_string())
         .await
         .unwrap();
-    peer.register("peer", "peer").await.unwrap();
+    peer.register(&e6irc_client::Identity {
+        nick: "peer",
+        username: "peer",
+        realname: "peer",
+    })
+    .await
+    .unwrap();
     peer.send_line("JOIN #lobby").await.unwrap();
 
     let mut read_only = attach(http, &[("authorization", format!("Bearer {reader}"))]).await;
@@ -226,7 +233,13 @@ async fn the_composer_cannot_end_or_renegotiate_the_upstream_session() {
     let mut peer = e6irc_client::Connection::connect(&up.to_string())
         .await
         .unwrap();
-    peer.register("peer", "peer").await.unwrap();
+    peer.register(&e6irc_client::Identity {
+        nick: "peer",
+        username: "peer",
+        realname: "peer",
+    })
+    .await
+    .unwrap();
     peer.send_line("JOIN #lobby").await.unwrap();
 
     let mut browser = attach(http, &[cookie]).await;
@@ -306,7 +319,7 @@ async fn database_with_session(database: &str) -> (String, (&'static str, String
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    e6ircd::db::create_account(&pool, "alice", "s3cr3t")
+    e6ircd::db::create_account_with_contact(&pool, "alice", "s3cr3t", None)
         .await
         .expect("account");
     let session = e6ircd::db::create_web_session(&pool, "alice", None)

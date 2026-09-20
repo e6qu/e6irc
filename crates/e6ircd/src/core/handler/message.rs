@@ -119,6 +119,15 @@ pub(super) fn record_history(
     let sender_is_bot = entry.sender_is_bot;
     let multiline = entry.multiline.clone();
     state.push_history(key, entry);
+    // A conversation with an unauthenticated party is never persisted. `~nick`
+    // is not a person, it is whoever holds the nick right now: stored under it,
+    // the conversation — and the list of who they talked to — would be handed
+    // to the next stranger who takes the nick. It lives only in the ring, which
+    // is purged when that party disconnects (`ServerState::close`); the other
+    // party, authenticated or not, keeps it for exactly that long.
+    if dm_peers.iter().any(|peer| peer.starts_with('~')) {
+        return;
+    }
     // Persist only when a database is configured (the same db-present proxy the
     // other DB writes use). Without one the hot ring is the entire record, so
     // there is nothing to enqueue — and enqueuing anyway would fail on every
@@ -188,7 +197,7 @@ pub(super) enum ResolvedKind {
         status_prefix: Option<StatusSigil>,
     },
     User {
-        peer: ConnId,
+        peer: std::sync::Arc<crate::core::state::PublicUser>,
     },
 }
 
@@ -218,15 +227,15 @@ pub(super) fn resolve_message_target(
     let (status_prefix, chan_target) = StatusSigil::split(target);
     if !chan_target.starts_with('#') {
         let key = state.nick_key(target);
-        let Some(peer) = state.registered_peer(&key) else {
+        let Some(peer) = state.registered_user(&key) else {
             if loud {
                 state.err_nosuchnick(conn, target);
             }
             return None;
         };
         return Some(ResolvedTarget {
+            recipients: vec![peer.recipient],
             kind: ResolvedKind::User { peer },
-            recipients: vec![state.local_recipient(peer)],
         });
     }
     let key = state.chan_key(chan_target);
@@ -404,24 +413,8 @@ pub(super) fn deliver_one_message(
             unreachable!("resolve_message_target returns Channel or User");
         };
         deliver_and_echo(state, conn, &resolved.recipients, &delivery);
-        // The conversation is recorded once, under a key both participants
-        // derive identically, so each side's CHATHISTORY sees the whole thread
-        // rather than only the half it sent.
-        let peer_nick = state.sessions[&peer]
-            .nick()
-            .map(String::from)
-            .expect("registered");
-        let (conv, peers) =
-            state.dm_conversation(&state.conn_identity(conn), &state.conn_identity(peer));
-        record_history(state, &conv, peers, entry);
-        // Away auto-reply, PRIVMSG only (NOTICE must stay reply-free), and never
-        // for a message to yourself — you don't need to be told you're away.
-        if loud
-            && peer != conn
-            && let Some(away) = state.sessions[&peer].away.clone()
-        {
-            state.numeric(conn, RPL_AWAY, &[&peer_nick], Some(&away));
-        }
+        record_conversation(state, conn, &peer, entry);
+        away_reply(state, conn, &peer, loud);
     }
 }
 
@@ -652,7 +645,7 @@ fn deliver_one_tagmsg(state: &mut ServerState, conn: ConnId, target: &str, clien
     // would, rather than falling through to the nick branch and answering
     // ERR_NOSUCHNICK. The echoed `target` keeps the sigil, like PRIVMSG.
     let (status_prefix, chan_target) = StatusSigil::split(target);
-    let recipients: Vec<ConnId> = if chan_target.starts_with('#') {
+    let recipients: Vec<Recipient> = if chan_target.starts_with('#') {
         let key = state.chan_key(chan_target);
         let Some(chan) = state.channels.get(&key) else {
             state.err_nosuchchannel(conn, clip_echo(target));
@@ -669,32 +662,28 @@ fn deliver_one_tagmsg(state: &mut ServerState, conn: ConnId, target: &str, clien
             );
             return;
         }
-        chan.members()
-            .filter(|(member, modes)| {
-                *member != conn && status_prefix.is_none_or(|sig| sig.admits(modes))
-            })
-            .map(|(member, _)| member)
-            .collect()
+        chan.recipients_where(|member, modes| {
+            member != conn && status_prefix.is_none_or(|sig| sig.admits(modes))
+        })
     } else {
         let key = state.nick_key(target);
-        let Some(peer) = state.registered_peer(&key) else {
+        let Some(peer) = state.registered_user(&key) else {
             state.err_nosuchnick(conn, target);
             return;
         };
-        vec![peer]
+        vec![peer.recipient]
     };
 
     let time = state.time_tag();
     for recipient in recipients {
-        let caps = state.sessions.get(&recipient).map(|s| s.caps);
-        let Some(caps) = caps else { continue };
+        let caps = recipient.caps();
         if !caps.message_tags {
             continue; // spec: TAGMSG must not reach cap-less clients
         }
         let line = make_line(caps.server_time.then(|| time.clone()), caps.account_tag);
         // A delivery, not a response: bypass labeled-response capture.
         let bytes = bytes::Bytes::from(format!("{line}\r\n"));
-        state.send_bytes_uncaptured(recipient, bytes);
+        state.send_recipient_uncaptured(recipient, bytes);
     }
     if state.sessions[&conn].caps.echo_message {
         let caps = state.sessions[&conn].caps;
@@ -1163,33 +1152,19 @@ pub(super) fn deliver_multiline(
     // Away auto-reply, PRIVMSG only — same as the single-line path (a multiline
     // DM to an away user must tell the sender they're away, once, just like an
     // ordinary PRIVMSG does; NOTICE stays reply-free).
-    if loud
-        && let ResolvedKind::User { peer } = &resolved.kind
-        && *peer != conn
-        && let Some(away) = state.sessions[peer].away.clone()
-    {
-        let peer_nick = state.sessions[peer]
-            .nick()
-            .map(String::from)
-            .expect("registered");
-        state.numeric(conn, RPL_AWAY, &[&peer_nick], Some(&away));
+    if let ResolvedKind::User { peer } = &resolved.kind {
+        away_reply(state, conn, peer, loud);
     }
 
     // History records what a client without the capability would have seen:
     // one entry per non-blank line, the first carrying the message's msgid.
-    let (hist_key, peers) = match &resolved.kind {
-        ResolvedKind::Channel { key, status_prefix } => {
-            if status_prefix.is_some() {
-                return; // STATUSMSG never enters history (see the other path)
-            }
-            (crate::core::state::HistoryKey::from(key), Vec::new())
-        }
-        ResolvedKind::User { peer } => {
-            let (key, peers) =
-                state.dm_conversation(&state.conn_identity(conn), &state.conn_identity(*peer));
-            (key, peers)
-        }
-    };
+    if let ResolvedKind::Channel {
+        status_prefix: Some(_),
+        ..
+    } = &resolved.kind
+    {
+        return; // STATUSMSG never enters history (see the other path)
+    }
     // A multiline message is ONE history entry carrying its single (live)
     // msgid and its lines encoded together, so CHATHISTORY reconstructs the
     // whole message under the id it was delivered with (per the CHATHISTORY
@@ -1205,21 +1180,61 @@ pub(super) fn deliver_multiline(
         .map(|(t, _)| t.as_str())
         .collect::<Vec<_>>()
         .join(" ");
-    record_history(
-        state,
-        &hist_key,
-        peers,
-        crate::core::state::HistoryEntry {
-            msgid,
-            ts,
-            sender_prefix: prefix.clone(),
-            sender_account: sender_account.clone(),
-            kind,
-            body: fallback,
-            sender_is_bot,
-            multiline: Some(encode_multiline(&batch.lines)),
-        },
-    );
+    let entry = crate::core::state::HistoryEntry {
+        msgid,
+        ts,
+        sender_prefix: prefix.clone(),
+        sender_account: sender_account.clone(),
+        kind,
+        body: fallback,
+        sender_is_bot,
+        multiline: Some(encode_multiline(&batch.lines)),
+    };
+    match &resolved.kind {
+        ResolvedKind::Channel { key, .. } => record_history(state, &key.into(), Vec::new(), entry),
+        ResolvedKind::User { peer } => record_conversation(state, conn, peer, entry),
+    }
+}
+
+/// Record a direct message in its conversation. The conversation is recorded
+/// under a key both participants derive identically, so each side's
+/// CHATHISTORY sees the whole thread rather than only the half it sent — and a
+/// ring belongs to a shard, so when the two sessions live on different shards
+/// the peer's shard is sent the entry to keep its own copy. Only this shard
+/// persists it (see `record_history`); the copy is for the ring alone.
+fn record_conversation(
+    state: &mut ServerState,
+    conn: ConnId,
+    peer: &crate::core::state::PublicUser,
+    entry: crate::core::state::HistoryEntry,
+) {
+    let (key, peers) =
+        state.dm_conversation(&state.conn_identity(conn), &peer.identity(state.casemap));
+    let session = peer.recipient.owner();
+    if !state.owns_session(session) {
+        state.route_input(crate::core::Input::ConversationEntry {
+            session,
+            key: key.clone(),
+            entry: entry.clone(),
+        });
+    }
+    record_history(state, &key, peers, entry);
+}
+
+/// Away auto-reply, PRIVMSG only (NOTICE must stay reply-free), and never for a
+/// message to yourself — you don't need to be told you're away.
+fn away_reply(
+    state: &mut ServerState,
+    conn: ConnId,
+    peer: &crate::core::state::PublicUser,
+    loud: bool,
+) {
+    if loud
+        && peer.conn() != conn
+        && let Some(away) = &peer.away
+    {
+        state.numeric(conn, RPL_AWAY, &[&peer.nick], Some(away));
+    }
 }
 
 pub(super) fn multiline_on_owner(

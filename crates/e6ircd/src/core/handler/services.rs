@@ -189,7 +189,7 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 return;
             }
             let key = state.nick_key(nick);
-            let Some(victim) = state.nick_connection(&key) else {
+            let Some(victim) = state.nick_reservation(&key).map(|owner| owner.conn()) else {
                 state.service_notice(conn, "NickServ", &format!("\x02{nick}\x02 is not online."));
                 return;
             };
@@ -201,10 +201,11 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 .nick()
                 .map(String::from)
                 .unwrap_or_default();
-            let server = state.config.server_name.clone();
-            let reason = format!("GHOST command used by {by}");
-            state.send(victim, &format!("ERROR :Closing Link: {server} ({reason})"));
-            state.close(victim, &reason);
+            super::session_action(
+                state,
+                victim,
+                crate::core::state::SessionAction::Ghost { by },
+            );
             state.service_notice(
                 conn,
                 "NickServ",
@@ -1417,10 +1418,13 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
     {
         let session = state.sessions.get_mut(&conn).expect("checked");
         session.signon = signon;
-        session.last_active = active;
+        session.last_active.set(active);
     }
     state.mark_nick_registered(conn);
-    state.max_users = state.max_users.max(state.sessions.registered_len());
+    // Published now rather than with the rest of this event's changes: the
+    // welcome below announces the user to whoever MONITORs the nick, and that
+    // announcement is made from the published record.
+    state.sync_channel_member(conn, crate::core::state::ChannelMemberChange::Identity);
     let prefix = state.sessions[&conn].prefix();
     let (server, network) = (
         state.config.server_name.clone(),
@@ -1478,24 +1482,14 @@ pub(super) fn version() -> &'static str {
 }
 
 pub(super) fn send_lusers(state: &mut ServerState, conn: ConnId) {
-    let users = state.sessions.registered_len();
-    let invisible = state
-        .sessions
-        .values()
-        .filter(|s| s.is_registered() && s.invisible)
-        .count();
+    // Server-wide, whichever shards the users and channels live on.
+    let everyone = state.registered_users();
+    let users = everyone.len();
+    let invisible = everyone.iter().filter(|user| user.invisible).count();
     let visible = users - invisible;
-    let opers = state
-        .sessions
-        .values()
-        .filter(|s| s.is_registered() && s.oper)
-        .count();
-    let unknown = state
-        .sessions
-        .values()
-        .filter(|s| !s.is_registered())
-        .count();
-    let channels = state.channels.len();
+    let opers = everyone.iter().filter(|user| user.oper).count();
+    let (connections, channels, max) = state.census();
+    let unknown = connections.saturating_sub(users);
     state.numeric(
         conn,
         RPL_LUSERCLIENT,
@@ -1534,7 +1528,6 @@ pub(super) fn send_lusers(state: &mut ServerState, conn: ConnId) {
         &[],
         Some(&format!("I have {users} clients and 0 servers")),
     );
-    let max = state.max_users;
     state.numeric(
         conn,
         RPL_LOCALUSERS,

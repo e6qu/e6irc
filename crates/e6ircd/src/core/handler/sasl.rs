@@ -653,5 +653,11 @@ pub(super) fn notify_account_change(state: &mut ServerState, conn: ConnId, accou
     }
     let prefix = state.sessions[&conn].prefix();
     let line = format!(":{prefix} ACCOUNT {account}");
-    notify_event(state, conn, &line, |c| c.account_notify, false);
+    notify_event(
+        state,
+        conn,
+        &line,
+        crate::core::state::UserEventAudience::AccountNotify,
+        false,
+    );
 }

@@ -225,10 +225,6 @@ impl ApiTokenScopes {
         (bits != 0).then_some(Self(bits))
     }
 
-    pub const fn full_access() -> Self {
-        Self(0b1111)
-    }
-
     pub fn device_access() -> Self {
         Self::new([
             ApiTokenScope::Read,

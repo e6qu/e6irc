@@ -114,6 +114,7 @@ async fn attach_relays_over_the_loopback_driver() {
             Default::default(),
             "attacher",
             "attacher",
+            e6ircd::bouncer::ATTACH_LIVENESS_INTERVAL,
         )
         .await
     });

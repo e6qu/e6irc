@@ -38,6 +38,16 @@ e6irc targets IRCv3, not just RFC 1459/2812.
 in use. A registered [account](#services-nickserv-chanserv-oper) can own a
 nick.
 
+**User name** (ident) — the first parameter of `USER`, shown before the `@` in
+a client's address (`nick!username@host`). It is not the
+[nick](#irc-and-ircv3), not the real name, and not an
+[account](#services-nickserv-chanserv-oper). A server that dislikes it closes
+the link rather than sending a numeric, so e6irc requires one to be configured
+(`username`, at most 10 ASCII letters, digits, `_` or `-`, starting with a
+letter or digit) and never derives or rewrites it.
+
+**Real name** — the trailing parameter of `USER`; free text shown in WHOIS.
+
 **Channel** — a named room (e.g. `#dev`); channel names start with `#`.
 
 **Registration** (client) — the IRC handshake: a client sends `NICK` and

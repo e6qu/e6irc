@@ -79,6 +79,30 @@ def defined_test_names() -> set[str]:
     return names
 
 
+def check_ci_aggregate(errors: list[str], jobs_section: str, jobs: set[str]) -> None:
+    """`ci-ok` is the required check, so it must need every other job.
+
+    A job left out of its `needs` could fail without failing the one check
+    branch protection looks at.
+    """
+
+    aggregate = re.search(
+        r"^  ci-ok:\n(?:    .*\n|\n)*?    needs:\s*\[(?P<needs>[^\]]*)\]",
+        jobs_section,
+        re.MULTILINE,
+    )
+    if aggregate is None:
+        fail(errors, "ci.yml has no `ci-ok` job with an inline `needs: [...]` list")
+        return
+    needed = set(re.findall(r"[a-z][a-z0-9-]*", aggregate.group("needs")))
+    for job in sorted(jobs - needed - {"ci-ok"}):
+        fail(errors, f"ci.yml `ci-ok` does not need the job `{job}`")
+    for job in sorted(needed - jobs):
+        fail(errors, f"ci.yml `ci-ok` needs `{job}`, which is not a job")
+    if "if: always()" not in jobs_section[aggregate.start() : aggregate.end()]:
+        fail(errors, "ci.yml `ci-ok` must run with `if: always()`")
+
+
 def check_ci_mapping(errors: list[str], coverage: str) -> None:
     """The CI mapping names every job the workflow runs, and no job it does not."""
 
@@ -88,6 +112,7 @@ def check_ci_mapping(errors: list[str], coverage: str) -> None:
         fail(errors, "ci.yml has no jobs section to compare the CI mapping against")
         return
     jobs = set(re.findall(r"^  ([a-z][a-z0-9-]*):$", jobs_section[1], re.MULTILINE))
+    check_ci_aggregate(errors, jobs_section[1], jobs)
     mapping = coverage.split("## CI mapping", 1)
     if len(mapping) != 2:
         fail(errors, "coverage.md has no CI mapping section")

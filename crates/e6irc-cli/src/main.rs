@@ -7,9 +7,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use e6irc_client::token_cache::{default_token_path, load_token};
+use e6irc_client::credentials::{CredentialArguments, SecretSources, process_environment};
+use e6irc_client::token_cache::default_token_path;
 use e6irc_client::{
-    Authentication, ClientEvent, Connection, ConnectionOptions, OwnedMessage, TerminalSafe,
+    CleartextCredentials, ClientEvent, Connection, ConnectionOptions, OwnedMessage, TerminalSafe,
     is_channel_target,
 };
 use serde::Serialize;
@@ -73,40 +74,46 @@ struct Cli {
     /// Nickname to register with IRC commands.
     #[arg(long, short, global = true)]
     nick: Option<String>,
-    /// SASL account (enables SASL PLAIN when set with --password).
-    #[arg(
-        long,
-        global = true,
-        requires = "password",
-        conflicts_with_all = ["oauth_token", "oauth_from_cache"]
-    )]
+    /// IRC user name (ident) sent in USER. When absent, --nick is used, and
+    /// only if it is itself a legal user name (ASCII letters, digits, '_' and
+    /// '-', starting with a letter or digit, at most 10 bytes). A nick that is
+    /// not — `_bot`, `ada|away` — is never rewritten to fit: the command stops
+    /// and asks for --username.
+    #[arg(long, short, global = true)]
+    username: Option<String>,
+    /// SASL PLAIN account. Its password comes from --password-file, the
+    /// E6IRC_PASSWORD environment variable, or --password.
+    #[arg(long, global = true)]
     account: Option<String>,
-    /// SASL password.
-    #[arg(
-        long,
-        global = true,
-        requires = "account",
-        conflicts_with_all = ["oauth_token", "oauth_from_cache"]
-    )]
+    /// SASL PLAIN password. A value typed here is visible to every local user
+    /// in the process list and is kept by the shell's history: prefer
+    /// --password-file or E6IRC_PASSWORD.
+    #[arg(long, global = true, conflicts_with = "password_file")]
     password: Option<String>,
-    /// SASL OAUTHBEARER token.
-    #[arg(
-        long,
-        global = true,
-        conflicts_with_all = ["account", "password", "oauth_from_cache"]
-    )]
+    /// File holding the SASL PLAIN password (one trailing line break is
+    /// dropped). Refused if group or other users can read it.
+    #[arg(long, global = true)]
+    password_file: Option<PathBuf>,
+    /// SASL OAUTHBEARER token; E6IRC_OAUTH_TOKEN when no flag is given. A value
+    /// typed here is visible to other local users: prefer --oauth-token-file.
+    #[arg(long, global = true, conflicts_with = "oauth_token_file")]
     oauth_token: Option<String>,
+    /// File holding the SASL OAUTHBEARER token, under the same rules as
+    /// --password-file.
+    #[arg(long, global = true)]
+    oauth_token_file: Option<PathBuf>,
     /// Load the SASL OAUTHBEARER token created by `e6irc login`.
-    #[arg(
-        long,
-        global = true,
-        conflicts_with_all = ["account", "password", "oauth_token"]
-    )]
+    #[arg(long, global = true)]
     oauth_from_cache: bool,
     /// Token-cache path for login, API authentication, or --oauth-from-cache.
     /// Defaults to the current platform's private application-data directory.
     #[arg(long, global = true)]
     token_file: Option<PathBuf>,
+    /// Send SASL credentials over a connection without --tls to a server that
+    /// is not this machine. Without this flag that is refused: the password or
+    /// token would cross the network readable by anyone on the path.
+    #[arg(long, global = true)]
+    allow_cleartext_credentials: bool,
     /// Connect over TLS (validating against the public CA set).
     #[arg(long, global = true)]
     tls: bool,
@@ -158,9 +165,15 @@ enum Command {
         /// API base URL. Defaults to the cached login origin.
         #[arg(long)]
         base: Option<String>,
-        /// Bearer token; falls back to E6IRC_API_TOKEN, then the login cache.
-        #[arg(long)]
+        /// Bearer token; E6IRC_API_TOKEN when no flag is given, then the login
+        /// cache. A value typed here is visible to other local users: prefer
+        /// --bearer-token-file or the environment.
+        #[arg(long, conflicts_with = "bearer_token_file")]
         token: Option<String>,
+        /// File holding the bearer token, under the same rules as
+        /// --password-file. (The global --token-file names the login cache.)
+        #[arg(long = "bearer-token-file")]
+        bearer_token_file: Option<PathBuf>,
         /// JSON request body (for POST/PUT).
         #[arg(long)]
         body: Option<String>,
@@ -199,70 +212,61 @@ async fn run(cli: Cli) -> std::io::Result<()> {
     // HTTP-only commands run before any IRC transport is opened.
     if let Command::Login { base } = &cli.command {
         let cache_path = token_path(cli.token_file.as_deref())?;
-        return http::login(base, &cache_path).await;
+        return http::login(base, &cache_path, cleartext_credentials(&cli)).await;
     }
     if let Command::Api {
         method,
         path,
         base,
         token,
+        bearer_token_file,
         body,
     } = &cli.command
     {
+        let token = SecretSources {
+            argument: token.clone(),
+            file: bearer_token_file.clone(),
+        }
+        .resolve(http::API_TOKEN_ENVIRONMENT, &process_environment)?;
         return http::api(
             method,
             path,
             base.as_deref(),
-            token.clone(),
+            token,
             body.clone(),
             cli.token_file.as_deref(),
+            cleartext_credentials(&cli),
         )
         .await;
     }
 
     let server = irc_server(cli.server.as_deref())?;
     let nick = irc_nick(cli.nick.as_deref())?;
-    let authentication = match (
-        &cli.account,
-        &cli.password,
-        &cli.oauth_token,
-        cli.oauth_from_cache,
-    ) {
-        (Some(account), Some(password), None, false) => Authentication::Plain {
-            account: account.clone(),
-            password: password.clone(),
+    let username = e6irc_client::stated_or_nick_username(cli.username.as_deref(), nick)?;
+    let authentication = CredentialArguments {
+        account: cli.account.clone(),
+        password: SecretSources {
+            argument: cli.password.clone(),
+            file: cli.password_file.clone(),
         },
-        (None, None, Some(token), false) => Authentication::OAuthBearer {
-            token: token.clone(),
+        oauth_token: SecretSources {
+            argument: cli.oauth_token.clone(),
+            file: cli.oauth_token_file.clone(),
         },
-        (None, None, None, true) => {
-            let path = token_path(cli.token_file.as_deref())?;
-            let token = load_token(&path)?.ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("no cached token at {}; run e6irc login", path.display()),
-                )
-            })?;
-            Authentication::OAuthBearer {
-                token: token.access_token().to_owned(),
-            }
-        }
-        (None, None, None, false) => Authentication::None,
-        _ => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "choose anonymous, paired --account/--password, --oauth-token, or --oauth-from-cache",
-            ));
-        }
-    };
+        oauth_from_cache: cli.oauth_from_cache,
+        token_file: cli.token_file.clone(),
+    }
+    .resolve(&process_environment)?;
     let mut conn = ConnectionOptions {
         address: server.to_owned(),
         tls: cli.tls,
         tls_server_name: cli.tls_name.clone(),
         nick: nick.to_owned(),
+        username,
         realname: "e6irc-cli".into(),
         authentication,
         response_deadline: std::time::Duration::from_secs(cli.response_timeout),
+        cleartext_credentials: cleartext_credentials(&cli),
     }
     .connect_registered()
     .await?
@@ -428,6 +432,14 @@ async fn run(cli: Cli) -> std::io::Result<()> {
     Ok(())
 }
 
+fn cleartext_credentials(cli: &Cli) -> CleartextCredentials {
+    if cli.allow_cleartext_credentials {
+        CleartextCredentials::Allow
+    } else {
+        CleartextCredentials::Refuse
+    }
+}
+
 fn irc_server(server: Option<&str>) -> std::io::Result<&str> {
     irc_argument(server, "--server")
 }
@@ -533,12 +545,34 @@ mod tests {
         assert!(with(&["--account", "alice", "--password", "secret"]));
         assert!(with(&["--oauth-token", "token"]));
         assert!(with(&["--oauth-from-cache"]));
-        assert!(!send_parses(&["--account", "alice"]));
-        assert!(!send_parses(&[
+        // An account's password may come from the environment, which only
+        // resolution can see; what parsing refuses is one secret given twice.
+        assert!(with(&["--account", "alice"]));
+        assert!(with(&["--account", "alice", "--password-file", "pw"]));
+        assert!(!with(&["--password", "typed", "--password-file", "pw"]));
+        assert!(!with(&[
             "--oauth-token",
-            "token",
-            "--oauth-from-cache"
+            "typed",
+            "--oauth-token-file",
+            "token"
         ]));
+        assert!(with(&["--allow-cleartext-credentials"]));
+    }
+
+    #[test]
+    fn the_api_token_has_the_same_three_sources() {
+        let api = |extra: &[&str]| {
+            Cli::try_parse_from(
+                ["e6irc", "api", "GET", "/api/v1/me"]
+                    .into_iter()
+                    .chain(extra.iter().copied()),
+            )
+            .is_ok()
+        };
+        assert!(api(&[]));
+        assert!(api(&["--token", "typed"]));
+        assert!(api(&["--bearer-token-file", "token"]));
+        assert!(!api(&["--token", "typed", "--bearer-token-file", "token"]));
     }
 
     #[test]

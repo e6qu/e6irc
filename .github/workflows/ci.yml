@@ -1,3 +1,14 @@
+# Every action is pinned to a full commit SHA; the trailing comment is the
+# release that commit is. A tag can be moved to other code; a commit cannot. One
+# version per action across ci.yml, release.yml, and qualification.yml. To
+# refresh a pin, resolve the new release tag and replace the SHA and the
+# comment everywhere the action is used:
+#   gh api repos/OWNER/REPO/git/ref/tags/TAG --jq '.object.type, .object.sha'
+# and when the type is `tag` (an annotated tag) dereference it to the commit:
+#   gh api repos/OWNER/REPO/git/tags/SHA --jq .object.sha
+# dtolnay/rust-toolchain has no releases and chooses the toolchain from the ref
+# it is called by, so it is pinned to a commit of its `master` branch and the
+# toolchain is always passed as the `toolchain` input.
 name: CI
 
 on:
@@ -18,19 +29,19 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: tools/check-systemd-unit.sh
-      - run: tools/test-docker-entrypoint.sh
       - run: tools/test-backup-restore.sh
       # One script per invocation: `-n` parses only its first operand, and the
       # rest would become that script's positional parameters, unread.
       - name: Shell syntax
         run: |
-          for script in tools/*.sh tools/*/*.sh deploy/*.sh; do
+          for script in tools/*.sh tools/*/*.sh; do
             case "$(head -n 1 "$script")" in
               '#!/bin/sh'*) sh -n "$script" ;;
               *) bash -n "$script" ;;
@@ -41,6 +52,8 @@ jobs:
       - run: tools/test-qualification.sh
       - run: tools/test-check-migration-integrity.sh
       - run: tools/test-check-no-defer.sh
+      # fuzz/Cargo.lock resolves on its own; keep it on the workspace's versions.
+      - run: python3 tools/check-fuzz-lock.py
       - name: Migration integrity
         run: |
           git fetch --no-tags --depth=1 origin main
@@ -95,8 +108,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      # fuzz/ is a package of its own with its own lock, so the workspace check
+      # above never sees it. Same policy file, second manifest.
+      - name: cargo deny (fuzz package)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: fuzz/Cargo.toml
+          command-arguments: --config deny.toml
 
   # Full OS/arch matrix (DESIGN §1): no cell is a second-class port.
   test:
@@ -113,11 +133,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # --all-features includes embed-web, which embeds web/dist.
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       - run: cargo test --workspace --all-features --target ${{ matrix.target }}
@@ -143,11 +164,12 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
+          toolchain: stable
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       - run: cargo install cargo-llvm-cov --version 0.8.4 --locked
       - name: Measure portable and PostgreSQL-backed production paths
@@ -176,9 +198,11 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       # Each Rust test owns a database created through this administrative URL.
       # Serial binaries keep the service load predictable; the browser may
@@ -224,7 +248,7 @@ jobs:
           E6IRC_BROWSER_ARTIFACTS_DIR: test-results/browser
       - name: Retain failed browser diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: browser-diagnostics-chromium
           path: test-results/browser
@@ -256,9 +280,11 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       - name: Start dex (mock connector)
         run: |
@@ -288,7 +314,7 @@ jobs:
             node tools/test-oidc-browser.mjs
       - name: Retain failed browser diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: browser-diagnostics-${{ matrix.browser }}
           path: test-results/browser
@@ -298,14 +324,14 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile
       - name: Install Chromium for visual regression
         run: pnpm -C web exec playwright install chromium
       - run: pnpm -C web test:visual
       - name: Retain failed visual diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: visual-regression-diagnostics
           path: web/test-results
@@ -319,9 +345,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build -p e6ircd
       - run: python3 tools/test-postgres-recovery.py
 
@@ -329,7 +357,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: docker build --build-arg E6IRC_BUILD_REVISION="${{ github.sha }}" --tag e6irc:ci .
       - name: Verify the fully baked web client
         run: |
@@ -337,15 +365,22 @@ jobs:
           trap 'docker rm "$container_id" >/dev/null' EXIT
           docker cp "$container_id:/usr/local/bin/e6ircd" /tmp/e6ircd
           strings /tmp/e6ircd | grep -F "Open my account"
+      # Run the image itself: its entrypoint, its unprivileged user, its shared
+      # libraries, and a PostgreSQL across a network, up to a served /healthz,
+      # a ready /readyz, and a clean exit on SIGTERM inside the stop budget.
+      - name: Boot the built image against PostgreSQL
+        run: tools/test-production-container.sh e6irc:ci
       - run: tools/test-prune-ghcr-versions.sh
 
   load-smoke:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build -p e6ircd -p e6irc-load
       - run: tools/test-load-smoke.sh
 
@@ -353,9 +388,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: python3 tools/test-native-release-package.py
       - run: cargo build -p e6ircd -p e6irc-tui
       - run: python3 tools/test-tui-pty.py
@@ -364,10 +401,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: e6qu/shauth
           ref: 0fda680cba964e5768ed75a9c3e5b7230c418ca6
@@ -391,9 +430,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build -p e6ircd
       - name: Check out pinned irctest
         run: |
@@ -405,7 +446,7 @@ jobs:
             sleep 5
           done
           git -C ../irctest checkout a468d9fcd64abc72b02ecb20f4f8612fd72c8829
-      - uses: actions/setup-python@v6.3.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
       - name: Run irctest green list
@@ -435,9 +476,11 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build -p e6ircd
       - name: Check out pinned irctest
         run: |
@@ -449,7 +492,7 @@ jobs:
             sleep 5
           done
           git -C ../irctest checkout a468d9fcd64abc72b02ecb20f4f8612fd72c8829
-      - uses: actions/setup-python@v6.3.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
       - name: Run persistence-backed irctest green list
@@ -493,9 +536,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Start Conduit
         run: |
           docker run -d --name conduit -p 16167:6167 \
@@ -515,9 +560,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo test -p e6irc-queue --release
         env:
           RUSTFLAGS: --cfg loom -Dwarnings
@@ -539,15 +586,15 @@ jobs:
     # protocol crate, so a cold cache spends most of the budget compiling.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Pinned nightly: the 2026-07-24 nightly ICEs in rustc_codegen_ssa on a
       # tokio task type under the fuzzer's ASAN+sancov instrumentation (a
       # compiler bug, not our code). Pin to the last nightly that built the fuzz
       # targets; bump when upstream fixes the codegen regression.
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
           toolchain: nightly-2026-07-23
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
@@ -569,9 +616,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --release --workspace
       - name: Report stripped binary sizes
         run: |
@@ -585,3 +634,45 @@ jobs:
               fi
             done
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # The one check branch protection requires. It needs every other job, so a
+  # job added above without being added here fails tools/check-journeys.py.
+  # `always()` makes it run when a dependency failed, was cancelled, or was
+  # skipped — GitHub would otherwise skip this job too, and a skipped required
+  # check counts as passing.
+  ci-ok:
+    if: always()
+    needs:
+      [
+        lint,
+        deny,
+        test,
+        coverage,
+        db-tests,
+        cross-browser,
+        visual-regression,
+        postgres-recovery,
+        production-container,
+        load-smoke,
+        native-client-journeys,
+        shauth-sso,
+        irctest,
+        irctest-services,
+        matrix-bridge,
+        loom,
+        fuzz-smoke,
+        size-report,
+      ]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to have succeeded
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$RESULTS"
+          unsuccessful="$(jq -r '[to_entries[] | select(.value.result != "success") | .key] | join(" ")' <<<"$RESULTS")"
+          if [ -n "$unsuccessful" ]; then
+            echo "not successful: $unsuccessful" >&2
+            exit 1
+          fi

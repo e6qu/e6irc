@@ -314,14 +314,9 @@ fn oidc_endpoint(issuer: &CampaignUrl, value: &str) -> Option<CampaignUrl> {
     endpoint.has_scope(issuer.scope).then_some(endpoint)
 }
 
-pub(super) fn is_loopback_host(host: &str) -> bool {
-    host == "localhost"
-        || host.ends_with(".localhost")
-        || host
-            .trim_matches(['[', ']'])
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
-}
+/// The project's one rule for "this machine", shared with the native clients'
+/// refusal to send credentials over plaintext to anywhere else.
+pub(super) use e6irc_client::is_loopback_host;
 
 pub(super) fn is_external_host(host: &str) -> bool {
     EndpointScope::parse_host(host) == Some(EndpointScope::External)

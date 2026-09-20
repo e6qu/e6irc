@@ -92,7 +92,7 @@ impl CoreShardCount {
 }
 
 /// Index of one configured core shard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CoreShardId(usize);
 
 impl CoreShardId {
@@ -132,6 +132,46 @@ pub struct CoreIngress {
     shards: Arc<[Sender<Input>]>,
     count: CoreShardCount,
     directories: CoreDirectories,
+    traffic: Arc<CrossShardTraffic>,
+}
+
+/// What the workers know together about the events passing between them. It
+/// is what lets shutdown be a drain: no worker closes its queue while another
+/// may still send to it.
+#[derive(Default)]
+struct CrossShardTraffic {
+    /// Events one worker has addressed to another that the other has not yet
+    /// finished handling. An event stops counting only after whatever it
+    /// caused has itself been counted, so zero means nothing is on its way and
+    /// nothing will be.
+    in_flight: std::sync::atomic::AtomicUsize,
+    /// Workers that have handled [`Input::Shutdown`].
+    stopping: std::sync::atomic::AtomicUsize,
+    /// Signalled whenever either of those may have completed the drain.
+    changed: tokio::sync::Notify,
+}
+
+impl CrossShardTraffic {
+    fn sent(&self) {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn settled(&self) {
+        if self.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.changed.notify_waiters();
+        }
+    }
+
+    fn worker_stopping(&self) {
+        self.stopping.fetch_add(1, Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+
+    /// Every worker has seen shutdown and nothing is passing between them.
+    fn drained(&self, workers: usize) -> bool {
+        self.stopping.load(Ordering::SeqCst) == workers
+            && self.in_flight.load(Ordering::SeqCst) == 0
+    }
 }
 
 impl CoreIngress {
@@ -140,6 +180,7 @@ impl CoreIngress {
             shards: Arc::from([sender]),
             count: CoreShardCount::single(),
             directories: CoreDirectories::default(),
+            traffic: Arc::default(),
         }
     }
 
@@ -158,6 +199,7 @@ impl CoreIngress {
             shards: shards.into(),
             count: CoreShardCount::new(count),
             directories: CoreDirectories::default(),
+            traffic: Arc::default(),
         }
     }
 
@@ -182,25 +224,23 @@ impl CoreIngress {
         &self,
         now: e6irc_proto::time::MonoMillis,
     ) -> Result<(), ()> {
-        self.broadcast(None, || Input::Tick { now }).await
+        self.broadcast(|| Input::Tick { now }).await
     }
 
     pub(crate) async fn broadcast_shutdown(&self) -> Result<(), ()> {
-        self.broadcast(None, || Input::Shutdown).await
+        self.broadcast(|| Input::Shutdown).await
     }
 
-    async fn broadcast(
-        &self,
-        excluded: Option<CoreShardId>,
-        mut input: impl FnMut() -> Input,
-    ) -> Result<(), ()> {
-        for (index, shard) in self.shards.iter().enumerate() {
-            if excluded.is_some_and(|excluded| index == excluded.0) {
-                continue;
+    /// Offer every shard its copy. One closed shard does not excuse the rest:
+    /// during shutdown the others still need theirs.
+    async fn broadcast(&self, mut input: impl FnMut() -> Input) -> Result<(), ()> {
+        let mut delivered = Ok(());
+        for shard in self.shards.iter() {
+            if shard.push(input()).await.is_err() {
+                delivered = Err(());
             }
-            shard.push(input()).await.map_err(|_| ())?;
         }
-        Ok(())
+        delivered
     }
 
     pub(crate) fn directories(&self) -> CoreDirectories {
@@ -216,6 +256,7 @@ impl Input {
     /// Panics on an event that has no single owner: those are broadcast.
     pub(crate) fn owner_shard(&self, shards: CoreShardCount) -> CoreShardId {
         match self {
+            Input::FromShard(input) => input.owner_shard(shards),
             Input::Open { conn, .. }
             | Input::Line { conn, .. }
             | Input::OverlongLine { conn }
@@ -224,11 +265,17 @@ impl Input {
             | Input::DbReply { conn, .. }
             | Input::HistoryPage { conn, .. }
             | Input::TargetsPage { conn, .. } => shards.session_owner(*conn).shard(),
-            Input::ChannelJoin { owner, .. } => owner.shard(),
-            Input::ChannelJoinResult { session, .. } => session.shard(),
+            Input::ChannelJoin { owner, .. } | Input::ChannelMemberVanished { owner, .. } => {
+                owner.shard()
+            }
+            Input::ChannelJoinResult { session, .. }
+            | Input::ConversationEntry { session, .. }
+            | Input::SessionAction { session, .. } => session.shard(),
             Input::ChannelPart { owner, .. } => owner.shard(),
             Input::ChannelPartResult { session, .. } => session.shard(),
             Input::ChannelQuit { quit } => quit.shard(),
+            Input::ChannelUserEvent { report } => report.shard(),
+            Input::UserEventPart { part } => part.shard(),
             Input::ChannelTopic { topic } => topic.owner().shard(),
             Input::ChannelTopicResult { session, .. } => session.shard(),
             Input::ChannelTopicPersisted { owner, .. } => owner.shard(),
@@ -265,6 +312,9 @@ impl Input {
             }
             Input::ReadMarkerApplied { .. } => {
                 panic!("read-marker event must be broadcast by a core worker")
+            }
+            Input::UnauthenticatedIdentityReleased { .. } => {
+                panic!("identity-released event must be broadcast by a core worker")
             }
             Input::AdminConnectionList { .. } => {
                 panic!("connection-list event must be broadcast by a core worker")
@@ -446,6 +496,11 @@ impl std::error::Error for ConnectionIdExhausted {}
 /// Events into the core worker.
 #[derive(Debug)]
 pub enum Input {
+    /// An event one core worker addressed to another, as it travels. Only a
+    /// worker wraps and unwraps it. The wrapper is what tells the workers'
+    /// own traffic — which shutdown must drain — from input arriving from
+    /// outside, which shutdown stops taking.
+    FromShard(Box<Input>),
     /// A connection was accepted; `tx` is its send queue.
     Open {
         conn: ConnId,
@@ -520,6 +575,40 @@ pub enum Input {
     ChannelServiceResult {
         session: SessionOwner,
         result: ChannelServicePersistence,
+    },
+    /// One direct message, for the ring of the shard its recipient lives on.
+    /// The sender's shard has recorded (and persisted) it already; a ring
+    /// belongs to a shard, and the recipient reads its history from its own.
+    ConversationEntry {
+        session: SessionOwner,
+        key: state::HistoryKey,
+        entry: state::HistoryEntry,
+    },
+    /// An unauthenticated identity left on another shard (broadcast).
+    UnauthenticatedIdentityReleased {
+        identity: String,
+    },
+    /// A JOIN was answered after its session had gone; the channel's owner
+    /// takes the member back out.
+    ChannelMemberVanished {
+        owner: ChannelOwner,
+        conn: ConnId,
+    },
+    /// Something one user may do *to* another's session — KILL, NickServ
+    /// GHOST, SETHOST — carried out by the shard that session lives on.
+    SessionAction {
+        session: SessionOwner,
+        action: state::SessionAction,
+    },
+    /// Something happened to a user; the owner of some of their channels
+    /// reports who among its members should hear of it.
+    ChannelUserEvent {
+        report: state::ChannelUserEvent,
+    },
+    /// One reporter's share of a user event's audience, for the shard those
+    /// sessions live on, which tells each of them once.
+    UserEventPart {
+        part: state::UserEventPart,
     },
     /// A channel command whose mutation and authorization belong to its owner.
     ChannelCommand {
@@ -613,10 +702,10 @@ pub enum Input {
         conn: ConnId,
         reply: DbReply,
     },
-    /// A resolved CHATHISTORY page from PostgreSQL. `Err` means the store
-    /// failed — the handler answers a CHATHISTORY FAIL rather than an empty
-    /// batch, so a transient DB fault is never indistinguishable from a buffer
-    /// with no history.
+    /// A resolved CHATHISTORY page from PostgreSQL. `Err` means there is no
+    /// page — the store failed, or does not know the msgid asked about — and
+    /// the handler answers a CHATHISTORY FAIL rather than an empty batch, so
+    /// neither is ever indistinguishable from a buffer with no history.
     HistoryPage {
         conn: ConnId,
         display: String,
@@ -624,7 +713,7 @@ pub enum Input {
         /// Capabilities that affect history rendering, captured at request
         /// time so a later CAP change cannot alter a deferred reply.
         caps: HistoryResponseCaps,
-        rows: Result<Vec<HistoryRow>, ()>,
+        rows: Result<Vec<HistoryRow>, HistoryFault>,
         /// Labeled-response label to place on the batch, if the command that
         /// triggered this deferred page was labeled.
         label: Option<String>,
@@ -1281,7 +1370,10 @@ pub enum DbRequest {
     /// in-memory ring. Answered with [`Input::HistoryPage`].
     QueryHistory {
         conn: ConnId,
-        targets: HistoryTargets,
+        /// The stored buffer: a folded channel name, or the conversation key
+        /// of two *accounts*. Never a conversation with an unauthenticated
+        /// (`~nick`) party — those are not stored (see `record_history`).
+        target: String,
         display: String,
         batch_ref: String,
         /// Request-time capabilities that affect history rendering.
@@ -1298,10 +1390,16 @@ pub enum DbRequest {
         conn: ConnId,
         /// Casefolded channel targets the requester may see.
         channels: Vec<String>,
-        /// The requester's casefolded nick, used to find the direct-message
-        /// conversations they take part in. Their correspondents are buffers
-        /// too, and a bouncer reconnecting needs them alongside channels.
-        me: String,
+        /// The requester's account identity, used to find the stored
+        /// direct-message conversations they take part in. Their correspondents
+        /// are buffers too, and a bouncer reconnecting needs them alongside
+        /// channels. `None` for an unauthenticated requester, who has no stored
+        /// conversations: `~nick` is whoever holds the nick now.
+        me: Option<String>,
+        /// Conversations in the window that exist only in this session's rings
+        /// (one party is unauthenticated), as `(correspondent identity, latest)`.
+        /// The database cannot know them; they are merged into its answer.
+        session_only: Vec<(String, e6irc_proto::time::Millis)>,
         min_ts: e6irc_proto::time::Millis,
         max_ts: e6irc_proto::time::Millis,
         limit: usize,
@@ -1431,15 +1529,6 @@ pub enum DbRequest {
     },
 }
 
-/// Stored targets that may back one CHATHISTORY request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HistoryTargets {
-    /// A channel or an online direct-message peer resolves exactly.
-    Exact(String),
-    /// An offline nick may name an account or an unauthenticated `~nick`.
-    PreferExisting { primary: String, fallback: String },
-}
-
 /// Which command asked for an account to be created. Carried on the request
 /// and echoed on the reply, so the answer is phrased in the language of the
 /// command that asked: NickServ speaks in notices, the
@@ -1467,6 +1556,17 @@ pub enum CredentialOrigin {
 }
 
 /// A resolved CHATHISTORY window.
+/// Why the database has no page for a CHATHISTORY request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryFault {
+    /// The store failed; the window may well exist.
+    Unavailable,
+    /// The store answered, and holds no message with this id in the requested
+    /// buffer. Not an empty page: a client resuming from a msgid that is gone
+    /// would read "nothing newer" as "up to date".
+    UnknownMsgid { subcommand: &'static str },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryQuery {
     Latest {
@@ -1528,6 +1628,43 @@ pub enum HistoryQuery {
         msgid: String,
         limit: usize,
     },
+}
+
+impl HistoryQuery {
+    /// The subcommand a client used to ask for this window.
+    pub(crate) fn subcommand(&self) -> &'static str {
+        match self {
+            Self::Latest { .. } | Self::LatestAfter { .. } | Self::LatestAfterMsgid { .. } => {
+                "LATEST"
+            }
+            Self::Before { .. } | Self::BeforeMsgid { .. } => "BEFORE",
+            Self::After { .. } | Self::AfterMsgid { .. } => "AFTER",
+            Self::Around { .. } | Self::AroundMsgid { .. } => "AROUND",
+            Self::BetweenSelectors { .. } => "BETWEEN",
+        }
+    }
+
+    /// The message ids this window is positioned by.
+    pub(crate) fn msgid_pivots(&self) -> Vec<&str> {
+        match self {
+            Self::LatestAfterMsgid { msgid, .. }
+            | Self::BeforeMsgid { msgid, .. }
+            | Self::AfterMsgid { msgid, .. }
+            | Self::AroundMsgid { msgid, .. } => vec![msgid],
+            Self::BetweenSelectors { first, second, .. } => [first, second]
+                .into_iter()
+                .filter_map(|bound| match bound {
+                    SelectorBound::Msgid(msgid) => Some(msgid.as_str()),
+                    SelectorBound::Timestamp(_) => None,
+                })
+                .collect(),
+            Self::Latest { .. }
+            | Self::LatestAfter { .. }
+            | Self::Before { .. }
+            | Self::After { .. }
+            | Self::Around { .. } => Vec::new(),
+        }
+    }
 }
 
 /// One resolved CHATHISTORY BETWEEN endpoint: a message id or a timestamp. The
@@ -1740,8 +1877,8 @@ pub struct Core {
     state: ServerState,
     shard: CoreShardId,
     shards: CoreShardCount,
-    /// Effects for other shards, waiting for the worker to route them.
-    outbound: Vec<CoreEffect>,
+    /// Events for other shards, waiting for the worker to send them.
+    outbound: Vec<Routed>,
     next_sequence: u64,
     reported_gauges: (usize, usize, usize),
 }
@@ -1774,120 +1911,241 @@ pub(crate) enum CoreEffect {
         request_id: u64,
         query: LiveConnectionQuery,
     },
+    /// An unauthenticated (`~nick`) identity left; every shard frees the
+    /// conversations it kept with it.
+    BroadcastIdentityReleased {
+        identity: String,
+    },
     Delivery {
         owner: SessionOwner,
         line: Bytes,
     },
 }
 
+impl CoreEffect {
+    /// One shard's copy of a broadcast, and whether the emitting shard needs a
+    /// copy too (it does unless the code that emitted it already applied it
+    /// there). `None` for an effect that has a single owner.
+    fn broadcast_copy(&self) -> Option<(Input, bool)> {
+        Some(match self {
+            CoreEffect::Input(_) | CoreEffect::Delivery { .. } => return None,
+            CoreEffect::BroadcastChannelList { request } => (
+                Input::ChannelList {
+                    request: request.clone(),
+                },
+                true,
+            ),
+            CoreEffect::BroadcastAdminConnectionList { request_id, query } => (
+                Input::AdminConnectionList {
+                    request_id: *request_id,
+                    query: query.clone(),
+                },
+                true,
+            ),
+            CoreEffect::BroadcastIdentityReleased { identity } => (
+                Input::UnauthenticatedIdentityReleased {
+                    identity: identity.clone(),
+                },
+                false,
+            ),
+            CoreEffect::BroadcastServerBan { mutation } => (
+                Input::ServerBanApplied {
+                    mutation: mutation.clone(),
+                },
+                false,
+            ),
+            CoreEffect::BroadcastAccountSuspension {
+                account,
+                suspended,
+                reason,
+                actor,
+            } => (
+                Input::AccountSuspensionApplied {
+                    account: account.clone(),
+                    suspended: *suspended,
+                    reason: reason.clone(),
+                    actor: actor.clone(),
+                },
+                false,
+            ),
+            CoreEffect::BroadcastReadMarker {
+                account,
+                target,
+                display,
+                marker_ms,
+            } => (
+                Input::ReadMarkerApplied {
+                    account: account.clone(),
+                    target: target.clone(),
+                    display: display.clone(),
+                    marker_ms: *marker_ms,
+                },
+                false,
+            ),
+        })
+    }
+}
+
+/// One event with the other shard it is for.
+pub(crate) struct Routed {
+    pub to: CoreShardId,
+    pub input: Input,
+}
+
+/// Why a core worker's loop ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoreWorkerExit {
+    /// Shutdown was requested and every shard's cross-shard traffic has drained.
+    Stopped,
+    /// Every producer into this worker's queue is gone.
+    IngressClosed,
+    /// Another shard's queue closed while this server was still serving.
+    PeerClosed { destination: CoreShardId },
+    /// Events for another shard piled up past [`CROSS_SHARD_BACKLOG_LIMIT`]:
+    /// that shard has stopped taking them. The worker stops rather than grow
+    /// without bound or silently drop what clients were promised.
+    Backlogged {
+        destination: CoreShardId,
+        pending: usize,
+    },
+}
+
+/// Most events one worker may hold for other shards whose queues are full.
+///
+/// A worker never waits on another worker's full queue: two workers each
+/// waiting for room in the other's queue, neither reading its own, is a
+/// deadlock ordinary channel traffic can produce. It keeps such events itself,
+/// in order, and carries on reading its own queue — which is what makes room
+/// in it for the other worker. That backlog needs a bound, because one client
+/// line can fan out into thousands of deliveries. It matches the ingress
+/// queues' capacity: a shard with a full queue *and* this much waiting behind
+/// it has stopped, and [`CoreWorkerExit::Backlogged`] says so loudly.
+pub(crate) const CROSS_SHARD_BACKLOG_LIMIT: usize = 65_536;
+
 /// One core and the only queue allowed to drive its state transitions.
 pub(crate) struct CoreWorker {
     core: Core,
     receiver: Receiver<Input>,
     ingress: CoreIngress,
+    /// Events for each other shard, oldest first, that did not fit its queue.
+    backlog: Vec<VecDeque<Input>>,
+    /// This worker has handled [`Input::Shutdown`]: it takes no more input
+    /// from outside, and stops once the workers' own traffic has drained.
+    stopping: bool,
 }
 
 impl CoreWorker {
     pub(crate) fn new(core: Core, receiver: Receiver<Input>, ingress: CoreIngress) -> Self {
+        let backlog = (0..ingress.shards.len()).map(|_| VecDeque::new()).collect();
         Self {
             core,
             receiver,
             ingress,
+            backlog,
+            stopping: false,
         }
     }
 
-    pub(crate) async fn run(mut self) {
-        while let Some(envelope) = self.receiver.pop().await {
-            let stop = matches!(&envelope.payload, Input::Shutdown);
-            self.core.handle_scheduled(ScheduledInput {
-                shard: self.core.shard,
-                sequence: envelope.seq,
-                input: envelope.payload,
-            });
-            let own = self.core.shard;
-            for effect in self.core.take_effects() {
-                let routed = match effect {
-                    CoreEffect::Input(input) => Self::route(&self.ingress, own, input).await,
-                    CoreEffect::Delivery { owner, line } => {
-                        let input = Input::Delivery {
-                            conn: owner.conn(),
-                            line,
-                        };
-                        Self::route(&self.ingress, own, input).await
+    pub(crate) async fn run(mut self) -> CoreWorkerExit {
+        let traffic = self.ingress.traffic.clone();
+        let shards = self.ingress.shards.clone();
+        loop {
+            if let Err(exit) = self.send_backlog() {
+                return exit;
+            }
+            // Armed before the check, so a change between the check and the
+            // wait below still wakes it.
+            let changed = traffic.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.stopping && traffic.drained(shards.len()) {
+                return CoreWorkerExit::Stopped;
+            }
+            let blocked = self.backlog.iter().position(|events| !events.is_empty());
+            let room = async {
+                match blocked {
+                    Some(destination) => shards[destination].room().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let popped = tokio::select! {
+                envelope = self.receiver.pop() => Some(envelope),
+                () = room => None,
+                () = &mut changed, if self.stopping => None,
+            };
+            match popped {
+                Some(Some(envelope)) => self.accept(envelope),
+                Some(None) => return CoreWorkerExit::IngressClosed,
+                None => {}
+            }
+        }
+    }
+
+    fn accept(&mut self, envelope: e6irc_queue::Envelope<Input>) {
+        let (input, from_shard) = match envelope.payload {
+            Input::FromShard(input) => (*input, true),
+            input => (input, false),
+        };
+        // Once stopping, only the workers' own traffic is still served: it is
+        // finite, and the others rely on it being handled. Input from outside
+        // (client lines, database replies, ticks) is refused from here on, as
+        // it was when a worker stopped the moment it saw the shutdown.
+        if self.stopping && !from_shard {
+            self.core.skip_scheduled(envelope.seq);
+            return;
+        }
+        let shutdown = matches!(input, Input::Shutdown);
+        self.core.handle_scheduled(ScheduledInput {
+            shard: self.core.shard,
+            sequence: envelope.seq,
+            input,
+        });
+        for Routed { to, input } in self.core.take_effects() {
+            self.ingress.traffic.sent();
+            self.backlog[to.0].push_back(Input::FromShard(Box::new(input)));
+        }
+        // Only now: what this event caused is counted, so the count cannot
+        // touch zero while its consequences are still unsent.
+        if from_shard {
+            self.ingress.traffic.settled();
+        }
+        if shutdown {
+            self.stopping = true;
+            self.ingress.traffic.worker_stopping();
+        }
+    }
+
+    /// Offer each shard its waiting events, in order, until its queue is full.
+    fn send_backlog(&mut self) -> Result<(), CoreWorkerExit> {
+        for (destination, events) in self.backlog.iter_mut().enumerate() {
+            while let Some(input) = events.pop_front() {
+                match self.ingress.shards[destination].try_push(input) {
+                    Ok(_) => {}
+                    Err(PushError::Full(input)) => {
+                        events.push_front(input);
+                        break;
                     }
-                    CoreEffect::BroadcastChannelList { request } => {
-                        self.ingress
-                            .broadcast(Some(own), || Input::ChannelList {
-                                request: request.clone(),
-                            })
-                            .await
+                    // A shard that is gone cannot be owed anything. While
+                    // stopping that is just the order workers left in; while
+                    // serving, its state is lost and so is this server.
+                    Err(PushError::Closed(_)) => {
+                        self.ingress.traffic.settled();
+                        if !self.stopping {
+                            return Err(CoreWorkerExit::PeerClosed {
+                                destination: CoreShardId(destination),
+                            });
+                        }
                     }
-                    CoreEffect::BroadcastServerBan { mutation } => {
-                        self.ingress
-                            .broadcast(Some(own), || Input::ServerBanApplied {
-                                mutation: mutation.clone(),
-                            })
-                            .await
-                    }
-                    CoreEffect::BroadcastAccountSuspension {
-                        account,
-                        suspended,
-                        reason,
-                        actor,
-                    } => {
-                        self.ingress
-                            .broadcast(Some(own), || Input::AccountSuspensionApplied {
-                                account: account.clone(),
-                                suspended,
-                                reason: reason.clone(),
-                                actor: actor.clone(),
-                            })
-                            .await
-                    }
-                    CoreEffect::BroadcastReadMarker {
-                        account,
-                        target,
-                        display,
-                        marker_ms,
-                    } => {
-                        self.ingress
-                            .broadcast(Some(own), || Input::ReadMarkerApplied {
-                                account: account.clone(),
-                                target: target.clone(),
-                                display: display.clone(),
-                                marker_ms,
-                            })
-                            .await
-                    }
-                    CoreEffect::BroadcastAdminConnectionList { request_id, query } => {
-                        self.ingress
-                            .broadcast(Some(own), || Input::AdminConnectionList {
-                                request_id,
-                                query: query.clone(),
-                            })
-                            .await
-                    }
-                };
-                if routed.is_err() {
-                    panic!("cross-shard target closed");
                 }
             }
-            if stop {
-                return;
+            if events.len() > CROSS_SHARD_BACKLOG_LIMIT {
+                return Err(CoreWorkerExit::Backlogged {
+                    destination: CoreShardId(destination),
+                    pending: events.len(),
+                });
             }
         }
-    }
-
-    /// Push an event to the shard that owns it. That shard is never this
-    /// one — [`Core::handle`] keeps its own shard's effects — so the await
-    /// can only ever wait on a queue some other worker drains.
-    async fn route(ingress: &CoreIngress, own: CoreShardId, input: Input) -> Result<(), ()> {
-        debug_assert_ne!(
-            input.owner_shard(ingress.shard_count()),
-            own,
-            "a worker was asked to await its own queue"
-        );
-        ingress.push(input).await.map(drop).map_err(drop)
+        Ok(())
     }
 }
 
@@ -1928,6 +2186,7 @@ impl Core {
         shards: CoreShardCount,
         directories: CoreDirectories,
     ) -> Self {
+        telemetry.expect_core_shards(shards.len());
         Self {
             state: ServerState::new(shard, shards, config, db_tx, telemetry, directories),
             shard,
@@ -1967,42 +2226,46 @@ impl Core {
         self.handle(event.input);
     }
 
-    /// The effects of the events handled so far that belong to other shards.
-    fn take_effects(&mut self) -> Vec<CoreEffect> {
+    /// What the events handled so far caused on other shards.
+    fn take_effects(&mut self) -> Vec<Routed> {
         std::mem::take(&mut self.outbound)
     }
 
-    /// Keep what this shard must handle itself; queue the rest for routing.
-    /// A broadcast reaches every shard, so it does both.
+    /// An event this worker took from its queue without handling it.
+    fn skip_scheduled(&mut self, sequence: u64) {
+        debug_assert_eq!(sequence, self.next_sequence);
+        self.next_sequence = sequence
+            .checked_add(1)
+            .expect("core queue sequence exhausted");
+    }
+
+    /// Keep what this shard must handle itself; address the rest to its
+    /// shard. A broadcast is one copy per shard.
     fn sort_effect(&mut self, effect: CoreEffect, local: &mut VecDeque<Input>) {
-        match effect {
-            CoreEffect::Input(input) if input.owner_shard(self.shards) == self.shard => {
-                local.push_back(input);
+        if let Some((_, here)) = effect.broadcast_copy() {
+            for shard in (0..self.shards.len()).map(CoreShardId) {
+                let (input, _) = effect.broadcast_copy().expect("still a broadcast");
+                if shard != self.shard {
+                    self.outbound.push(Routed { to: shard, input });
+                } else if here {
+                    local.push_back(input);
+                }
             }
-            CoreEffect::Delivery { owner, line } if owner.shard() == self.shard => {
-                local.push_back(Input::Delivery {
-                    conn: owner.conn(),
-                    line,
-                });
-            }
-            CoreEffect::BroadcastChannelList { request } => {
-                local.push_back(Input::ChannelList {
-                    request: request.clone(),
-                });
-                self.outbound
-                    .push(CoreEffect::BroadcastChannelList { request });
-            }
-            CoreEffect::BroadcastAdminConnectionList { request_id, query } => {
-                local.push_back(Input::AdminConnectionList {
-                    request_id,
-                    query: query.clone(),
-                });
-                self.outbound
-                    .push(CoreEffect::BroadcastAdminConnectionList { request_id, query });
-            }
-            // The remaining broadcasts were applied to this shard by the code
-            // that emitted them.
-            effect => self.outbound.push(effect),
+            return;
+        }
+        let input = match effect {
+            CoreEffect::Input(input) => input,
+            CoreEffect::Delivery { owner, line } => Input::Delivery {
+                conn: owner.conn(),
+                line,
+            },
+            _ => unreachable!("broadcasts are handled above"),
+        };
+        let to = input.owner_shard(self.shards);
+        if to == self.shard {
+            local.push_back(input);
+        } else {
+            self.outbound.push(Routed { to, input });
         }
     }
 
@@ -2062,7 +2325,12 @@ impl Core {
     /// only task that drains that queue, so awaiting room in it would park the
     /// worker — and every tick and the shutdown flush behind it — forever.
     pub fn handle(&mut self, input: Input) {
-        let mut local = VecDeque::from([input]);
+        let mut local = VecDeque::from([match input {
+            // A core driven directly (tests, fuzzers) is handed what a worker
+            // would have unwrapped.
+            Input::FromShard(input) => *input,
+            input => input,
+        }]);
         while let Some(input) = local.pop_front() {
             self.handle_one(input);
             for effect in self.state.take_effects() {
@@ -2082,6 +2350,7 @@ impl Core {
             self.state.telemetry.record_connection_opened();
         }
         match input {
+            Input::FromShard(_) => unreachable!("unwrapped before it is handled"),
             Input::Open {
                 conn,
                 tx,
@@ -2144,6 +2413,18 @@ impl Core {
                 handler::channel_part_result(&mut self.state, session.conn(), result, label);
             }
             Input::ChannelQuit { quit } => self.state.quit_channel_member(quit),
+            Input::UnauthenticatedIdentityReleased { identity } => {
+                self.state.forget_unauthenticated_identity(&identity);
+            }
+            Input::ChannelMemberVanished { owner, conn } => {
+                self.state.remove_vanished_member(&owner, conn);
+            }
+            Input::SessionAction { session, action } => {
+                handler::session_action(&mut self.state, session.conn(), action);
+            }
+            Input::ChannelUserEvent { report } => self.state.report_user_event(report),
+            Input::UserEventPart { part } => self.state.deliver_user_event_part(part),
+            Input::ConversationEntry { key, entry, .. } => self.state.push_history(&key, entry),
             Input::ChannelTopic { topic } => {
                 assert_eq!(
                     topic.owner().shard(),
@@ -2361,6 +2642,7 @@ impl Core {
                 // The batch is what the connection's held output is waiting
                 // behind, so it is emitted through the hold, which is then
                 // released in the order the client issued its commands.
+                self.state.history_request_finished(conn);
                 self.state.emit_deferred(conn, |state| {
                     handler::history_page(
                         state,
@@ -2380,6 +2662,7 @@ impl Core {
                 targets,
                 label,
             } => {
+                self.state.history_request_finished(conn);
                 self.state.emit_deferred(conn, |state| {
                     handler::targets_page(state, conn, &batch_ref, caps, targets, label.as_deref());
                 });
@@ -2522,6 +2805,9 @@ impl Core {
             }
             self.state.close(conn, "SendQ exceeded");
         }
+        self.state.publish_changed_channels();
+        self.state.publish_census();
+        self.state.publish_changed_sessions();
         let sessions_after = self.state.sessions.len();
         self.state.telemetry.record_connections_closed(
             (sessions_before + usize::from(opened)).saturating_sub(sessions_after),
@@ -2533,7 +2819,7 @@ impl Core {
         );
         self.state
             .telemetry
-            .adjust_core_gauges(self.reported_gauges, gauges);
+            .adjust_core_gauges(self.shard.0, self.reported_gauges, gauges);
         self.reported_gauges = gauges;
         self.state
             .telemetry
@@ -2541,24 +2827,66 @@ impl Core {
     }
 }
 
-/// Deliver one output event; a full/closed send queue means the client
-/// is too slow (or gone) and the connection must die — the classic
-/// SendQ-exceeded kill. Never silently dropped.
-fn deliver(tx: &Sender<Output>, line: WireLine) -> Result<(), SendqExceeded> {
-    match tx.try_push(Output(line.0)) {
-        Ok(_) => Ok(()),
-        Err(PushError::Full(_)) => Err(SendqExceeded),
-        // Receiver gone: the I/O task is already dead. On the common
-        // reader-first close a `Closed{conn}` event is already in flight to us.
-        // On a writer-first close (write half RSTs while the read half hangs)
-        // there is no such event and outbound lines are dropped for now — but
-        // the liveness reaper PINGs the idle session and reaps it once the PONG
-        // deadline passes, so this can't leave a permanent zombie.
-        Err(PushError::Closed(_)) => Ok(()),
+/// The one way output reaches a connection: its send queue, and whether the
+/// connection has been told goodbye.
+///
+/// Once the closing `ERROR` has been written nothing more may follow it: a line
+/// after `ERROR :Closing Link` is something a strict client or a test harness
+/// can trip on. A session usually disappears in the same event that says
+/// goodbye, but not at shutdown — shutdown is a drain, and a shard that has
+/// sent its clients the `ERROR` keeps serving what other shards send it until
+/// they have all stopped. The marker lives here, on the handle every path must
+/// use, so no delivery site has to remember it.
+pub(crate) struct SessionOutput {
+    tx: Sender<Output>,
+    said_goodbye: bool,
+}
+
+/// What became of a line offered to a [`SessionOutput`].
+pub(crate) enum Written {
+    Queued,
+    /// Discarded: the connection's closing `ERROR` has already been written.
+    AfterGoodbye,
+}
+
+impl SessionOutput {
+    pub(crate) fn new(tx: Sender<Output>) -> Self {
+        Self {
+            tx,
+            said_goodbye: false,
+        }
+    }
+
+    /// Queue one line. A full send queue means the client is too slow and the
+    /// connection must die — the classic SendQ-exceeded kill. Never silently
+    /// dropped.
+    pub(crate) fn write(&self, line: WireLine) -> Result<Written, SendqExceeded> {
+        if self.said_goodbye {
+            return Ok(Written::AfterGoodbye);
+        }
+        match self.tx.try_push(Output(line.0)) {
+            Ok(_) => Ok(Written::Queued),
+            Err(PushError::Full(_)) => Err(SendqExceeded),
+            // Receiver gone: the I/O task is already dead. On the common
+            // reader-first close a `Closed{conn}` event is already in flight to
+            // us. On a writer-first close (write half RSTs while the read half
+            // hangs) there is no such event and outbound lines are dropped for
+            // now — but the liveness reaper PINGs the idle session and reaps it
+            // once the PONG deadline passes, so this can't leave a permanent
+            // zombie.
+            Err(PushError::Closed(_)) => Ok(Written::Queued),
+        }
+    }
+
+    /// Queue the connection's closing line; nothing is written after it.
+    /// Best-effort: a queue too full for it is a connection already lost.
+    pub(crate) fn write_goodbye(&mut self, line: WireLine) {
+        drop(self.write(line));
+        self.said_goodbye = true;
     }
 }
 
-struct SendqExceeded;
+pub(crate) struct SendqExceeded;
 
 #[cfg(test)]
 mod wire_line_tests {
@@ -2738,12 +3066,12 @@ mod ingress_tests {
 
     fn take_service_result(core: &mut Core, session: SessionOwner) -> Input {
         let mut effects = core.take_effects();
-        match effects.pop() {
-            Some(super::CoreEffect::Input(
+        match effects.pop().map(|routed| routed.input) {
+            Some(
                 result @ Input::ChannelServiceResult {
                     session: received, ..
                 },
-            )) if received == session && effects.is_empty() => result,
+            ) if received == session && effects.is_empty() => result,
             _ => panic!("owner did not produce one requester result"),
         }
     }
@@ -2838,7 +3166,10 @@ mod ingress_tests {
         });
         assert!(matches!(
             first.take_effects().as_slice(),
-            [super::CoreEffect::Input(Input::Admin { .. })]
+            [super::Routed {
+                to: CoreShardId(1),
+                input: Input::Admin { .. }
+            }]
         ));
         assert_eq!(second.shard, CoreShardId(1));
     }
@@ -3041,15 +3372,9 @@ mod ingress_tests {
 
     /// Carry every routed event one core produced to the other core.
     fn relay(from: &mut Core, to: &mut Core) {
-        for effect in from.take_effects() {
-            match effect {
-                super::CoreEffect::Input(input) => to.handle(input),
-                super::CoreEffect::Delivery { owner, line } => to.handle(Input::Delivery {
-                    conn: owner.conn(),
-                    line,
-                }),
-                _ => panic!("unexpected broadcast"),
-            }
+        for routed in from.take_effects() {
+            assert_eq!(routed.to, to.shard);
+            to.handle(routed.input);
         }
     }
 
@@ -3092,6 +3417,61 @@ mod ingress_tests {
             .try_pop()
             .expect("the connection is held behind a history page that will never come");
         assert!(pong.payload.0.ends_with(b"after-history\r\n"));
+    }
+
+    /// `close()` releases output withheld behind a deferred reply before the
+    /// closing ERROR, because the reply it waited on can no longer arrive.
+    /// Shutdown ends the session just as finally, so it owes the client the
+    /// same: what was produced, in order, then the ERROR.
+    #[test]
+    fn shutdown_flushes_output_held_behind_a_deferred_reply_before_the_closing_error() {
+        let TwoWorkerHarness {
+            mut first,
+            mut second,
+            ..
+        } = two_worker_harness();
+        let channel = channel_on_second(&second);
+        let (alice, mut alice_rx) = register_on_first(&mut first, "alice");
+        first
+            .state
+            .sessions
+            .get_mut(&alice)
+            .expect("alice session")
+            .caps
+            .chathistory = true;
+        first.handle(Input::Line {
+            conn: alice,
+            line: format!("JOIN {channel}").into_bytes(),
+        });
+        relay(&mut first, &mut second);
+        relay(&mut second, &mut first);
+        // The history page is asked of the other shard and never comes back.
+        first.handle(Input::Line {
+            conn: alice,
+            line: format!("CHATHISTORY LATEST {channel} * 10").into_bytes(),
+        });
+        while alice_rx.try_pop().is_some() {}
+        first.handle(Input::Line {
+            conn: alice,
+            line: b"PING before-shutdown".to_vec(),
+        });
+        assert!(alice_rx.try_pop().is_none(), "the PONG is held");
+
+        first.handle(Input::Shutdown);
+        let mut written = Vec::new();
+        while let Some(output) = alice_rx.try_pop() {
+            written.push(
+                String::from_utf8_lossy(&output.payload.0)
+                    .trim_end()
+                    .to_string(),
+            );
+        }
+        assert_eq!(written.len(), 2, "{written:?}");
+        assert!(written[0].ends_with("before-shutdown"), "{written:?}");
+        assert!(
+            written[1].starts_with("ERROR :Closing Link:"),
+            "{written:?}"
+        );
     }
 
     /// Open and register `nick` as connection 2 on the first shard.
@@ -3160,6 +3540,792 @@ mod ingress_tests {
             std::str::from_utf8(&answer.payload.0)
                 .expect("wire output")
                 .contains("Topic could not be persisted")
+        );
+    }
+
+    /// Two running workers over queues of `capacity`, as `net` starts them.
+    struct LivePair {
+        ingress: CoreIngress,
+        workers: Vec<tokio::task::JoinHandle<super::CoreWorkerExit>>,
+        /// A channel each shard owns: `owned[0]` by shard 0, `owned[1]` by shard 1.
+        owned: [&'static str; 2],
+    }
+
+    fn live_pair(capacity: usize) -> LivePair {
+        let config = Config {
+            name: "live-pair",
+            capacity,
+            policy: Policy::Fifo,
+        };
+        let (first_tx, first_rx) = queue(config);
+        let (second_tx, second_rx) = queue(config);
+        let ingress = CoreIngress::with_shards(first_tx, vec![second_tx]);
+        let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
+        let mut cores = Vec::new();
+        for shard in 0..2 {
+            let (db, _db_rx) = queue(Config {
+                name: "live-pair-db",
+                capacity: 1,
+                policy: Policy::Fifo,
+            });
+            let mut config = core_config();
+            config.sendq = 4096;
+            config.max_hot_channels = 16;
+            cores.push(Core::with_telemetry_on_shard_with_directories(
+                config,
+                db,
+                Arc::new(crate::observability::Telemetry::new()),
+                CoreShardId(shard),
+                shards,
+                ingress.directories(),
+            ));
+        }
+        let owned_by = |shard: usize| {
+            ["#alpha", "#beta", "#gamma", "#delta", "#epsilon"]
+                .into_iter()
+                .find(|name| cores[0].state.channel_owner(name).shard() == CoreShardId(shard))
+                .expect("a channel owned by each shard")
+        };
+        let owned = [owned_by(0), owned_by(1)];
+        let workers = cores
+            .into_iter()
+            .zip([first_rx, second_rx])
+            .map(|(core, rx)| tokio::spawn(CoreWorker::new(core, rx, ingress.clone()).run()))
+            .collect();
+        LivePair {
+            ingress,
+            workers,
+            owned,
+        }
+    }
+
+    impl LivePair {
+        /// Connect and register `nick` as connection `conn` (its shard is
+        /// `conn % 2`), returning its output.
+        async fn client(&self, conn: u64, nick: &str) -> Receiver<Output> {
+            let (tx, mut rx) = queue(Config {
+                name: "live-pair-client",
+                capacity: 4096,
+                policy: Policy::Fifo,
+            });
+            self.ingress
+                .push(Input::Open {
+                    conn: ConnId(conn),
+                    tx,
+                    host: "host.test".into(),
+                    transport: ConnectionTransport::Tcp,
+                })
+                .await
+                .expect("open");
+            self.line(conn, &format!("NICK {nick}")).await;
+            self.line(conn, &format!("USER {nick} 0 * :{nick}")).await;
+            await_line(&mut rx, " 422 ").await;
+            rx
+        }
+
+        async fn line(&self, conn: u64, line: &str) {
+            self.ingress
+                .push(Input::Line {
+                    conn: ConnId(conn),
+                    line: line.as_bytes().to_vec(),
+                })
+                .await
+                .expect("line");
+        }
+
+        async fn stop(self) {
+            self.ingress
+                .broadcast_shutdown()
+                .await
+                .expect("workers alive");
+            for worker in self.workers {
+                let exit = tokio::time::timeout(Duration::from_secs(5), worker)
+                    .await
+                    .expect("worker stops")
+                    .expect("worker does not panic");
+                assert_eq!(exit, super::CoreWorkerExit::Stopped);
+            }
+        }
+    }
+
+    /// The next output line containing `needle`.
+    async fn await_line(rx: &mut Receiver<Output>, needle: &str) -> String {
+        loop {
+            let line = next_output(rx).await.payload.0;
+            let line = String::from_utf8_lossy(&line).trim_end().to_string();
+            if line.contains(needle) {
+                return line;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn workers_flooding_each_other_through_full_queues_keep_moving() {
+        // One slot per queue: every cross-shard event finds the other queue
+        // full while that worker is itself trying to send back.
+        let pair = live_pair(1);
+        let [here, there] = pair.owned;
+        let mut outputs = Vec::new();
+        for conn in 1..=6 {
+            let mut rx = pair.client(conn, &format!("user{conn}")).await;
+            for channel in [here, there] {
+                pair.line(conn, &format!("JOIN {channel}")).await;
+                await_line(&mut rx, " 366 ").await;
+            }
+            outputs.push(rx);
+        }
+        let flood = |conn: u64, channel: &'static str| {
+            let ingress = pair.ingress.clone();
+            tokio::spawn(async move {
+                for n in 0..40 {
+                    ingress
+                        .push(Input::Line {
+                            conn: ConnId(conn),
+                            line: format!("PRIVMSG {channel} :flood {n}").into_bytes(),
+                        })
+                        .await
+                        .expect("line");
+                }
+            })
+        };
+        // Connection 2 lives on shard 0 and floods shard 1's channel, and the
+        // other way round: both workers fan out toward each other at once.
+        let floods = [flood(2, there), flood(1, here)];
+        let watcher = outputs.last_mut().expect("connection 6");
+        for _ in 0..2 {
+            await_line(watcher, ":flood 39").await;
+        }
+        for flood in floods {
+            flood.await.expect("flood task");
+        }
+        pair.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_shard_that_has_seen_shutdown_still_serves_the_others_until_all_have() {
+        let pair = live_pair(64);
+        let [here, _] = pair.owned;
+        let mut bob = pair.client(1, "bob").await;
+        // Shard 0 is told to stop first. It must not close its queue while
+        // shard 1 can still send to it — that was a panic on shard 1, and a
+        // shutdown that skipped the database flush.
+        pair.ingress.shards[0]
+            .push(Input::Shutdown)
+            .await
+            .expect("shard 0 alive");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        pair.line(1, &format!("JOIN {here}")).await;
+        await_line(&mut bob, " 366 ").await;
+        pair.ingress.shards[1]
+            .push(Input::Shutdown)
+            .await
+            .expect("shard 1 alive");
+        for worker in pair.workers {
+            let exit = tokio::time::timeout(Duration::from_secs(5), worker)
+                .await
+                .expect("worker stops")
+                .expect("worker does not panic");
+            assert_eq!(exit, super::CoreWorkerExit::Stopped);
+        }
+    }
+
+    thread_local! {
+        /// The monotonic clock of the [`Shards`] built on this test's thread.
+        static MONO_NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    fn thread_mono_clock() -> e6irc_proto::time::MonoMillis {
+        e6irc_proto::time::MonoMillis::from_millis(MONO_NOW.with(std::cell::Cell::get))
+    }
+
+    /// The wall clock of those cores follows the same thread-local time, from
+    /// a fixed origin: each message a test sends after advancing it has its own
+    /// timestamp, so anything ordered by time is ordered the same on every run.
+    fn thread_wall_clock() -> e6irc_proto::time::Millis {
+        e6irc_proto::time::Millis::from_millis(1_000_000 + MONO_NOW.with(std::cell::Cell::get))
+    }
+
+    /// Cores stepped by hand — two unless a test asks otherwise: every line is
+    /// handled, and whatever it causes is carried between the shards until all
+    /// are quiet, so a test reads like the single-shard ones. Connection `n`
+    /// lives on shard `n % workers`.
+    struct Shards {
+        cores: Vec<Core>,
+        /// A channel each shard owns: `owned[0]` by shard 0, `owned[1]` by shard 1.
+        owned: [&'static str; 2],
+        outputs: std::collections::HashMap<u64, Receiver<Output>>,
+        /// Each shard's requests to the database worker (there is none).
+        database: Vec<Receiver<super::DbRequest>>,
+    }
+
+    impl Shards {
+        fn new() -> Self {
+            Self::build(2, false)
+        }
+
+        /// With a database configured, so history falls through to it.
+        fn with_database() -> Self {
+            Self::build(2, true)
+        }
+
+        /// The same server on one worker: what every answer must equal.
+        fn on_one_worker() -> Self {
+            Self::build(1, false)
+        }
+
+        fn build(workers: usize, database: bool) -> Self {
+            let mut senders: Vec<_> = (0..workers)
+                .map(|_| {
+                    queue(Config {
+                        name: "shards",
+                        capacity: 1,
+                        policy: Policy::Fifo,
+                    })
+                    .0
+                })
+                .collect();
+            let ingress = CoreIngress::with_shards(senders.remove(0), senders);
+            let shards = CoreShardCount::new(NonZeroUsize::new(workers).expect("a worker"));
+            let mut requests = Vec::new();
+            let cores: Vec<Core> = (0..workers)
+                .map(|shard| {
+                    let (db, db_rx) = queue(Config {
+                        name: "shards-db",
+                        capacity: 64,
+                        policy: Policy::Fifo,
+                    });
+                    if database {
+                        requests.push(db_rx);
+                    }
+                    let mut config = core_config();
+                    config.sasl_enabled = database;
+                    config.sendq = 256;
+                    config.max_hot_channels = 16;
+                    config.mono_clock = thread_mono_clock;
+                    config.clock = thread_wall_clock;
+                    config.opers = vec![("root".into(), "secret".into())];
+                    Core::with_telemetry_on_shard_with_directories(
+                        config,
+                        db,
+                        Arc::new(crate::observability::Telemetry::new()),
+                        CoreShardId(shard),
+                        shards,
+                        ingress.directories(),
+                    )
+                })
+                .collect();
+            let owned_by = |shard: usize| {
+                ["#alpha", "#beta", "#gamma", "#delta", "#epsilon"]
+                    .into_iter()
+                    .find(|name| cores[0].state.channel_owner(name).shard() == CoreShardId(shard))
+                    .expect("a channel owned by each shard")
+            };
+            Self {
+                owned: [owned_by(0), owned_by(workers - 1)],
+                cores,
+                outputs: std::collections::HashMap::new(),
+                database: requests,
+            }
+        }
+
+        fn advance_clock(seconds: u64) {
+            MONO_NOW.with(|now| now.set(now.get() + seconds * 1000));
+        }
+
+        /// Connect and register `nick` as connection `conn`, requesting `caps`.
+        fn client(&mut self, conn: u64, nick: &str, caps: &str) {
+            let (tx, rx) = queue(Config {
+                name: "shards-client",
+                capacity: 256,
+                policy: Policy::Fifo,
+            });
+            self.outputs.insert(conn, rx);
+            let shard = conn as usize % self.cores.len();
+            self.cores[shard].handle(Input::Open {
+                conn: ConnId(conn),
+                tx,
+                host: "host.test".into(),
+                transport: ConnectionTransport::Tcp,
+            });
+            if !caps.is_empty() {
+                self.line(conn, &format!("CAP REQ :{caps}"));
+            }
+            self.line(conn, &format!("NICK {nick}"));
+            self.line(conn, &format!("USER {nick} 0 * :Real {nick}"));
+            self.line(conn, "CAP END");
+            self.drain(conn);
+        }
+
+        fn line(&mut self, conn: u64, line: &str) {
+            let shard = conn as usize % self.cores.len();
+            self.cores[shard].handle(Input::Line {
+                conn: ConnId(conn),
+                line: line.as_bytes().to_vec(),
+            });
+            self.settle();
+        }
+
+        fn close(&mut self, conn: u64) {
+            let shard = conn as usize % self.cores.len();
+            self.cores[shard].handle(Input::Closed {
+                conn: ConnId(conn),
+                reason: "Connection closed".into(),
+            });
+            self.settle();
+        }
+
+        /// Carry events between the shards until neither has any to send.
+        fn settle(&mut self) {
+            loop {
+                let routed: Vec<super::Routed> = self
+                    .cores
+                    .iter_mut()
+                    .flat_map(|core| core.take_effects())
+                    .collect();
+                if routed.is_empty() {
+                    return;
+                }
+                for super::Routed { to, input } in routed {
+                    self.cores[to.0].handle(input);
+                }
+            }
+        }
+
+        fn drain(&mut self, conn: u64) -> Vec<String> {
+            let rx = self.outputs.get_mut(&conn).expect("connected client");
+            let mut lines = Vec::new();
+            while let Some(output) = rx.try_pop() {
+                lines.push(
+                    String::from_utf8_lossy(&output.payload.0)
+                        .trim_end()
+                        .to_string(),
+                );
+            }
+            lines
+        }
+    }
+
+    /// Idle time is the session's own clock, read where it is asked about. A
+    /// line must not cost one member update per channel the sender is in.
+    #[test]
+    fn activity_is_not_fanned_out_to_every_channel_and_a_remote_who_still_sees_idle() {
+        let mut shards = Shards::new();
+        let there = shards.owned[1];
+        shards.client(2, "alice", "");
+        shards.client(1, "bob", "");
+        shards.line(2, &format!("JOIN {there}"));
+        shards.line(1, &format!("JOIN {there}"));
+        Shards::advance_clock(60);
+        shards.cores[0].handle(Input::Line {
+            conn: ConnId(2),
+            line: b"VERSION".to_vec(),
+        });
+        assert!(
+            shards.cores[0].take_effects().is_empty(),
+            "a line unrelated to any channel was sent to the shard owning one"
+        );
+        Shards::advance_clock(30);
+        shards.drain(1);
+        shards.line(1, &format!("WHO {there} %nl"));
+        let out = shards.drain(1);
+        assert!(
+            out.iter().any(|line| line.ends_with(" alice 30")),
+            "the channel's owner must report alice idle since her last line: {out:#?}"
+        );
+    }
+
+    fn lines_with<'a>(out: &'a [String], needle: &str) -> Vec<&'a str> {
+        out.iter()
+            .map(String::as_str)
+            .filter(|line| line.contains(needle))
+            .collect()
+    }
+
+    /// alice is connection 2 (shard 0), bob connection 1 (shard 1).
+    fn alice_and_bob(caps: &str) -> Shards {
+        let mut shards = Shards::new();
+        shards.client(2, "alice", caps);
+        shards.client(1, "bob", caps);
+        shards
+    }
+
+    #[test]
+    fn a_message_reaches_a_nick_on_another_shard() {
+        let mut shards = alice_and_bob("message-tags");
+        shards.line(2, "PRIVMSG bob :hello");
+        shards.line(2, "NOTICE bob :psst");
+        shards.line(2, "@+typing=active TAGMSG bob");
+        assert!(shards.drain(2).is_empty(), "no such nick?");
+        let out = shards.drain(1);
+        for expected in ["PRIVMSG bob :hello", "NOTICE bob :psst", "TAGMSG bob"] {
+            assert_eq!(lines_with(&out, expected).len(), 1, "{expected}: {out:#?}");
+        }
+        // The away reply comes from the recipient's state, wherever it lives.
+        shards.line(1, "AWAY :gone fishing");
+        shards.line(2, "PRIVMSG bob :you there?");
+        let out = shards.drain(2);
+        assert_eq!(
+            lines_with(&out, " 301 alice bob :gone fishing").len(),
+            1,
+            "{out:#?}"
+        );
+    }
+
+    #[test]
+    fn a_direct_conversation_is_readable_from_both_shards() {
+        let mut shards = alice_and_bob("batch draft/chathistory");
+        shards.line(2, "PRIVMSG bob :one");
+        shards.line(1, "PRIVMSG alice :two");
+        for (conn, peer) in [(2, "bob"), (1, "alice")] {
+            shards.drain(conn);
+            shards.line(conn, &format!("CHATHISTORY LATEST {peer} * 10"));
+            let out = shards.drain(conn);
+            assert!(
+                lines_with(&out, ":one").len() == 1 && lines_with(&out, ":two").len() == 1,
+                "connection {conn} sees only its own half: {out:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn whois_ison_and_userhost_answer_for_a_nick_on_another_shard() {
+        let mut shards = alice_and_bob("");
+        let [here, there] = shards.owned;
+        // bob: an operator of a channel each shard owns, one of them secret.
+        shards.line(1, &format!("JOIN {here},{there},#hidden"));
+        shards.line(1, "MODE #hidden +s");
+        shards.line(1, "AWAY :out");
+        Shards::advance_clock(42);
+        shards.drain(2);
+
+        shards.line(2, "WHOIS bob");
+        let out = shards.drain(2);
+        assert_eq!(
+            lines_with(&out, " 311 alice bob bob host.test * :Real bob").len(),
+            1,
+            "{out:#?}"
+        );
+        let channels = lines_with(&out, " 319 ");
+        assert_eq!(channels.len(), 1, "{out:#?}");
+        assert!(
+            channels[0].contains(&format!("@{here}")) && channels[0].contains(&format!("@{there}")),
+            "channels owned by either shard, with bob's rank: {channels:?}"
+        );
+        assert!(!channels[0].contains("#hidden"), "a secret channel leaked");
+        assert_eq!(lines_with(&out, " 317 alice bob 42 ").len(), 1, "{out:#?}");
+        assert_eq!(lines_with(&out, " 301 alice bob :out").len(), 1, "{out:#?}");
+        assert!(lines_with(&out, " 401 ").is_empty(), "{out:#?}");
+
+        // Sharing the secret channel discloses it, as on one shard.
+        shards.line(1, "MODE #hidden +o bob");
+        shards.line(2, "JOIN #hidden");
+        shards.drain(2);
+        shards.line(2, "WHOIS bob");
+        assert_eq!(lines_with(&shards.drain(2), "#hidden").len(), 1);
+
+        shards.line(2, "ISON bob nobody");
+        assert_eq!(lines_with(&shards.drain(2), " 303 alice :bob").len(), 1);
+        shards.line(2, "USERHOST bob");
+        assert_eq!(
+            lines_with(&shards.drain(2), " 302 alice :bob=-bob@host.test").len(),
+            1
+        );
+    }
+
+    /// The ring copy a peer's shard keeps is purged with the original when an
+    /// unauthenticated party leaves: the next holder of the nick may connect to
+    /// either shard.
+    #[test]
+    fn an_unauthenticated_conversation_is_purged_from_every_shard() {
+        let mut shards = alice_and_bob("batch draft/chathistory");
+        shards.line(1, "PRIVMSG alice :between us");
+        shards.close(1);
+        // A stranger takes the nick, on the shard alice's copy lives on.
+        shards.client(4, "bob", "batch draft/chathistory");
+        shards.line(4, "CHATHISTORY LATEST alice * 10");
+        let out = shards.drain(4);
+        assert!(
+            lines_with(&out, "between us").is_empty(),
+            "the previous bob's conversation was served to the next: {out:#?}"
+        );
+    }
+
+    #[test]
+    fn kill_and_ghost_reach_a_session_on_another_shard() {
+        let mut shards = alice_and_bob("");
+        shards.line(2, "OPER root secret");
+        shards.line(2, "KILL bob :enough");
+        assert!(
+            shards.cores[1].state.sessions.get(&ConnId(1)).is_none(),
+            "bob survived a KILL from the other shard"
+        );
+        assert!(lines_with(&shards.drain(2), " 401 ").is_empty());
+
+        // carol's account owns the nick a stale connection still holds.
+        shards.client(3, "carol", "");
+        shards.client(4, "visitor", "");
+        shards.cores[0]
+            .state
+            .sessions
+            .get_mut(&ConnId(4))
+            .expect("visitor")
+            .account = Some("carol".into());
+        shards.line(4, "PRIVMSG NickServ :GHOST carol");
+        assert!(
+            shards.cores[1].state.sessions.get(&ConnId(3)).is_none(),
+            "the ghost on the other shard is still connected"
+        );
+        assert_eq!(lines_with(&shards.drain(4), "has been ghosted").len(), 1);
+    }
+
+    #[test]
+    fn monitor_follows_a_nick_on_another_shard() {
+        let mut shards = Shards::new();
+        shards.client(1, "bob", "");
+        shards.line(1, "MONITOR + alice");
+        assert_eq!(lines_with(&shards.drain(1), " 731 bob :alice").len(), 1);
+        shards.client(2, "alice", "");
+        assert_eq!(
+            lines_with(&shards.drain(1), " 730 bob :alice!alice@host.test").len(),
+            1,
+            "online on the other shard"
+        );
+        shards.line(1, "MONITOR S");
+        assert_eq!(lines_with(&shards.drain(1), " 730 bob :alice!").len(), 1);
+        shards.close(2);
+        assert_eq!(lines_with(&shards.drain(1), " 731 bob :alice").len(), 1);
+    }
+
+    /// One user, however many channels they share with you and whichever
+    /// shards own those channels: each of their events reaches you once.
+    #[test]
+    fn a_users_events_reach_each_peer_once_across_channel_owners() {
+        let caps = "away-notify account-notify setname chghost";
+        let mut shards = alice_and_bob(caps);
+        let [here, there] = shards.owned;
+        for conn in [1, 2] {
+            shards.line(conn, &format!("JOIN {here},{there}"));
+        }
+        shards.client(3, "watcher", "extended-monitor away-notify");
+        shards.line(3, "MONITOR + alice");
+        shards.drain(1);
+        shards.drain(3);
+
+        shards.line(2, "AWAY :brb");
+        assert_eq!(lines_with(&shards.drain(1), " AWAY :brb").len(), 1);
+        assert_eq!(
+            lines_with(&shards.drain(3), " AWAY :brb").len(),
+            1,
+            "an extended-monitor watcher on the other shard"
+        );
+        shards.line(2, "SETNAME :Alice Again");
+        assert_eq!(
+            lines_with(&shards.drain(1), " SETNAME :Alice Again").len(),
+            1
+        );
+        shards.line(1, "OPER root secret");
+        shards.drain(1);
+        shards.line(1, "SETHOST alice cloak.test");
+        assert_eq!(
+            lines_with(&shards.drain(1), " CHGHOST alice cloak.test").len(),
+            1
+        );
+        shards.line(2, "NICK alicia");
+        assert_eq!(lines_with(&shards.drain(1), " NICK alicia").len(), 1);
+        shards.line(2, "QUIT :bye");
+        assert_eq!(lines_with(&shards.drain(1), " QUIT :").len(), 1);
+    }
+
+    #[test]
+    fn a_labeled_kick_of_several_targets_is_one_labeled_response() {
+        let mut shards = Shards::new();
+        let [here, there] = shards.owned;
+        shards.client(2, "alice", "batch labeled-response");
+        shards.client(1, "bob", "");
+        for conn in [2, 1] {
+            shards.line(conn, &format!("JOIN {here},{there}"));
+        }
+        shards.drain(2);
+        shards.line(2, &format!("@label=k1 KICK {here},{there} bob,nobody"));
+        let out = shards.drain(2);
+        let labeled = lines_with(&out, "label=k1");
+        assert_eq!(labeled.len(), 1, "one labeled response: {out:#?}");
+        assert!(
+            labeled[0].contains("BATCH +"),
+            "several lines make a batch: {out:#?}"
+        );
+        assert_eq!(
+            lines_with(&out, &format!("KICK {here} bob")).len(),
+            1,
+            "{out:#?}"
+        );
+        assert_eq!(lines_with(&out, " 441 ").len(), 1, "{out:#?}");
+        assert_eq!(lines_with(&out, "BATCH -").len(), 1, "{out:#?}");
+    }
+
+    #[test]
+    fn a_labeled_join_answered_in_pieces_is_one_labeled_response() {
+        let mut shards = Shards::new();
+        let there = shards.owned[1];
+        shards.client(2, "alice", "batch labeled-response");
+        // One target is refused on the spot, the other is answered by its owner.
+        shards.line(2, &format!("@label=j1 JOIN {there},not-a-channel"));
+        let out = shards.drain(2);
+        let labeled = lines_with(&out, "label=j1");
+        assert_eq!(labeled.len(), 1, "one labeled response: {out:#?}");
+        assert!(labeled[0].contains("BATCH +"), "{out:#?}");
+        assert_eq!(
+            lines_with(&out, &format!(" JOIN {there}")).len(),
+            1,
+            "{out:#?}"
+        );
+        assert_eq!(lines_with(&out, "not-a-channel").len(), 1, "{out:#?}");
+    }
+
+    #[test]
+    fn lusers_and_whowas_count_the_whole_server() {
+        let mut shards = alice_and_bob("");
+        let [here, there] = shards.owned;
+        shards.line(2, &format!("JOIN {here}"));
+        shards.line(1, &format!("JOIN {there}"));
+        shards.line(1, "MODE bob +i");
+        shards.drain(2);
+        shards.line(2, "LUSERS");
+        let out = shards.drain(2);
+        assert_eq!(
+            lines_with(&out, ":There are 1 users and 1 invisible on 1 servers").len(),
+            1,
+            "{out:#?}"
+        );
+        assert_eq!(lines_with(&out, " 254 alice 2 :").len(), 1, "{out:#?}");
+        assert_eq!(lines_with(&out, ":I have 2 clients").len(), 1, "{out:#?}");
+
+        shards.close(1);
+        shards.line(2, "WHOWAS bob");
+        let out = shards.drain(2);
+        assert_eq!(
+            lines_with(&out, " 314 alice bob bob host.test").len(),
+            1,
+            "{out:#?}"
+        );
+    }
+
+    /// The per-session cap on database history requests is kept where the
+    /// session is. The shard that owns the channel — and asks the database on
+    /// the session's behalf — has no such session to count against.
+    #[test]
+    fn history_of_a_channel_on_another_shard_still_reaches_the_database() {
+        let mut shards = Shards::with_database();
+        let there = shards.owned[1];
+        shards.client(2, "alice", "batch draft/chathistory");
+        shards.line(2, &format!("JOIN {there}"));
+        shards.drain(2);
+        while shards.database[1].try_pop().is_some() {}
+        shards.line(2, &format!("CHATHISTORY LATEST {there} * 10"));
+        assert!(shards.drain(2).is_empty(), "answered by the database page");
+        assert!(
+            matches!(
+                shards.database[1].try_pop().map(|request| request.payload),
+                Some(super::DbRequest::QueryHistory { .. })
+            ),
+            "the channel's owner did not ask the database"
+        );
+    }
+
+    /// alice joins a channel owned by each shard, speaks in both, and asks
+    /// which of her buffers have history. Returns the TARGETS lines.
+    fn targets_after_speaking_in(mut shards: Shards, channels: [&str; 2]) -> Vec<String> {
+        shards.client(2, "alice", "batch draft/chathistory server-time");
+        for channel in channels {
+            shards.line(2, &format!("JOIN {channel}"));
+            Shards::advance_clock(1);
+            shards.line(2, &format!("PRIVMSG {channel} :hello"));
+        }
+        shards.drain(2);
+        shards.line(
+            2,
+            "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:01.000Z \
+             timestamp=2999-01-01T00:00:00.000Z 10",
+        );
+        shards
+            .drain(2)
+            .into_iter()
+            .filter(|line| line.contains("CHATHISTORY TARGETS"))
+            .map(|line| {
+                line.split_once(" CHATHISTORY ")
+                    .expect("targets line")
+                    .1
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// With no database the rings are the record, and a channel's ring lives on
+    /// the shard that owns the channel. TARGETS must still find it.
+    #[test]
+    fn targets_from_the_rings_lists_a_channel_owned_by_another_shard() {
+        let two = Shards::new();
+        let channels = two.owned;
+        let from_two_workers = targets_after_speaking_in(two, channels);
+        assert_eq!(
+            from_two_workers
+                .iter()
+                .map(|line| line.split(' ').nth(1).expect("target"))
+                .collect::<Vec<_>>(),
+            channels,
+            "oldest activity first, whichever shard owns the channel"
+        );
+        MONO_NOW.with(|now| now.set(0));
+        assert_eq!(
+            from_two_workers,
+            targets_after_speaking_in(Shards::on_one_worker(), channels),
+            "the answer on two workers is the answer on one"
+        );
+    }
+
+    /// Shutdown is a drain: a shard that has told its clients goodbye still
+    /// serves what the other shards send it. None of that may reach a client
+    /// after its closing ERROR — the ERROR is the last line of the connection.
+    #[test]
+    fn nothing_is_written_to_a_session_after_its_closing_error() {
+        let mut shards = alice_and_bob("");
+        let there = shards.owned[1];
+        for conn in [2, 1] {
+            shards.line(conn, &format!("JOIN {there}"));
+        }
+        shards.drain(1);
+        // bob's shard is told to stop first; alice's is still serving.
+        shards.cores[1].handle(Input::Shutdown);
+        shards.line(2, &format!("PRIVMSG {there} :are you still there?"));
+        shards.line(2, "PRIVMSG bob :hello?");
+        shards.line(2, "QUIT :bye");
+        let out = shards.drain(1);
+        assert_eq!(
+            out,
+            ["ERROR :Closing Link: irc.test (Server shutting down)"],
+            "the closing ERROR must be the last thing the connection is sent"
+        );
+    }
+
+    #[test]
+    fn a_join_that_outlives_its_session_leaves_no_member_behind() {
+        let mut shards = Shards::new();
+        let there = shards.owned[1];
+        shards.client(2, "alice", "");
+        // The JOIN is on its way to the owner when the connection drops.
+        shards.cores[0].handle(Input::Line {
+            conn: ConnId(2),
+            line: format!("JOIN {there}").into_bytes(),
+        });
+        shards.cores[0].handle(Input::Closed {
+            conn: ConnId(2),
+            reason: "Connection reset".into(),
+        });
+        shards.settle();
+        let key = shards.cores[1].state.chan_key(there);
+        assert!(
+            shards.cores[1].state.channels.get(&key).is_none(),
+            "the channel is held open by a member whose session is gone"
         );
     }
 
@@ -3362,7 +4528,7 @@ mod ingress_tests {
                     away: false,
                     oper: false,
                     bot: false,
-                    last_active: mono_clock(),
+                    last_active: crate::core::state::LastActive::new(mono_clock()),
                 },
             },
             target.into(),
@@ -3764,7 +4930,7 @@ mod ingress_tests {
             mut second,
             first_tx,
             first_rx,
-            second_tx,
+            second_tx: _,
             second_rx,
             ingress,
         } = two_worker_harness();
@@ -3826,21 +4992,16 @@ mod ingress_tests {
                 line: b"PRIVMSG #chat :hello".to_vec(),
             })
             .expect("queue source message");
-        first_tx.try_push(Input::Shutdown).expect("stop source");
-
         let destination = tokio::spawn(CoreWorker::new(second, second_rx, ingress.clone()).run());
-        CoreWorker::new(first, first_rx, ingress.clone())
-            .run()
-            .await;
+        let source = tokio::spawn(CoreWorker::new(first, first_rx, ingress.clone()).run());
         let join = out_rx.pop().await.expect("remote join delivered");
         assert!(join.payload.0.starts_with(b"@time="));
         assert!(join.payload.0.ends_with(b"JOIN #chat * :Sender\r\n"));
         let message = out_rx.pop().await.expect("remote message delivered");
         assert!(message.payload.0.starts_with(b"@time="));
         assert!(message.payload.0.ends_with(b"PRIVMSG #chat :hello\r\n"));
-        second_tx
-            .try_push(Input::Shutdown)
-            .expect("stop destination");
+        ingress.broadcast_shutdown().await.expect("workers alive");
+        source.await.expect("source worker");
         destination.await.expect("destination worker");
     }
 

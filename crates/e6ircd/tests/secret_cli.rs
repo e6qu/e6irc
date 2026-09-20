@@ -73,6 +73,7 @@ fn genkey_seal_and_load_round_trip() {
         addr = "irc.example:6697"
         tls = true
         nick = "e6bnc"
+        username = "e6bnc"
         realname = "e6bnc"
         autojoin = []
         buffer_cap = 1000

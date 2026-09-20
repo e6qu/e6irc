@@ -124,9 +124,11 @@ mod tests {
             tls: false,
             tls_server_name: None,
             nick: "nick".into(),
+            username: "ident".into(),
             realname: "real".into(),
             authentication,
             response_deadline: Duration::from_secs(5),
+            cleartext_credentials: e6irc_client::CleartextCredentials::Refuse,
         }
         .connect_registered()
         .await

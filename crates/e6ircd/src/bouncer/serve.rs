@@ -170,10 +170,14 @@ impl Registry {
                 let identity_error = |error: super::UpstreamIdentityError| {
                     format!("network '{}' (kind=local) has invalid {error}", e.name)
                 };
+                let username = e.username.as_deref().ok_or_else(|| {
+                    format!("network '{}' (kind=local) requires username", e.name)
+                })?;
                 let config = NetworkConfig {
                     addr: e.addr.clone(),
                     tls: e.tls,
                     nick: e.nick.parse().map_err(identity_error)?,
+                    username: username.parse().map_err(identity_error)?,
                     realname: realname.parse().map_err(identity_error)?,
                     autojoin: super::UpstreamChannel::parse_list(&e.autojoin)
                         .map_err(identity_error)?,
@@ -184,17 +188,20 @@ impl Registry {
                 };
                 Box::new(super::LocalDriver::new(core.clone(), config))
             } else {
-                super::build_driver(
-                    e.kind,
-                    e.addr.clone(),
-                    e.tls,
-                    e.nick.clone(),
+                super::build_driver(super::DriverSpec {
+                    kind: e.kind,
+                    owner: e.owner.clone(),
+                    name: e.name.clone(),
+                    addr: e.addr.clone(),
+                    tls: e.tls,
+                    nick: e.nick.clone(),
+                    username: e.username.clone(),
                     realname,
-                    e.autojoin.clone(),
-                    e.buffer_cap,
-                    e.sasl_account.clone(),
-                    e.sasl_password.clone(),
-                )
+                    autojoin: e.autojoin.clone(),
+                    buffer_cap: e.buffer_cap,
+                    sasl_account: e.sasl_account.clone(),
+                    sasl_password: e.sasl_password.clone(),
+                })
                 .map_err(|msg| format!("network '{}': {msg}", e.name))?
             };
             registry
@@ -626,7 +633,19 @@ where
     write.flush().await?;
 
     let joined = read.unsplit(write);
-    attach(joined, &handle, caps, &account, &downstream_nick).await
+    let end = attach(
+        joined,
+        &handle,
+        caps,
+        &account,
+        &downstream_nick,
+        super::ATTACH_LIVENESS_INTERVAL,
+    )
+    .await?;
+    // Why it ended, not just that it did: "client quit" and "client stopped
+    // answering" are different stories to whoever reads this log.
+    eprintln!("bnc: {account} detached from '{network}': {end}");
+    Ok(())
 }
 
 /// Drive registration to a `Registered` verdict. Requires a successful

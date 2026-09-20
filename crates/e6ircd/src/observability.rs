@@ -6,7 +6,6 @@
 //! metric labels or enter persisted monitoring history.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -329,8 +328,11 @@ pub(crate) struct Telemetry {
     http_requests_total: AtomicU64,
     http_server_errors_total: AtomicU64,
     database_requests_total: AtomicU64,
-    core_seen: AtomicBool,
-    core_heartbeat_elapsed_ms: AtomicU64,
+    /// When each core shard last finished an event, as elapsed milliseconds
+    /// plus one (zero means "never"). One slot per shard: a single shared stamp
+    /// would let any healthy shard vouch for a wedged one, and every connection
+    /// and channel the wedged shard owns would be dead behind a green `/readyz`.
+    core_heartbeats: std::sync::OnceLock<Box<[AtomicU64]>>,
     errors: [AtomicU64; ErrorKind::COUNT],
     error_last_seen_ms: [AtomicU64; ErrorKind::COUNT],
     latency: [LatencyHistogram; LatencyKind::COUNT],
@@ -375,8 +377,7 @@ impl Telemetry {
             http_requests_total: AtomicU64::new(0),
             http_server_errors_total: AtomicU64::new(0),
             database_requests_total: AtomicU64::new(0),
-            core_seen: AtomicBool::new(false),
-            core_heartbeat_elapsed_ms: AtomicU64::new(0),
+            core_heartbeats: std::sync::OnceLock::new(),
             errors: std::array::from_fn(|_| AtomicU64::new(0)),
             error_last_seen_ms: std::array::from_fn(|_| AtomicU64::new(0)),
             latency: std::array::from_fn(|_| LatencyHistogram::new()),
@@ -477,8 +478,41 @@ impl Telemetry {
             .snapshot(limit.min(OPERATIONAL_LOG_CAPACITY))
     }
 
+    /// Declare how many core shards will report a heartbeat. Every core calls
+    /// this when it is built, so readiness waits for all of them — including a
+    /// shard that never gets as far as its first event.
+    pub(crate) fn expect_core_shards(&self, count: usize) {
+        let heartbeats = self
+            .core_heartbeats
+            .get_or_init(|| (0..count).map(|_| AtomicU64::new(0)).collect());
+        assert_eq!(
+            heartbeats.len(),
+            count,
+            "core shards disagree about how many of them there are"
+        );
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+
+    /// Milliseconds since the *least recently heard* core shard finished an
+    /// event; `None` until every expected shard has been heard once.
+    fn stalest_core_heartbeat_age_ms(&self) -> Option<u64> {
+        let now = self.elapsed_ms();
+        self.core_heartbeats
+            .get()?
+            .iter()
+            .map(|stamp| match stamp.load(Ordering::Relaxed) {
+                0 => None,
+                stamp => Some(now.saturating_sub(stamp - 1)),
+            })
+            .try_fold(0, |worst, age| Some(worst.max(age?)))
+    }
+
     pub(crate) fn adjust_core_gauges(
         &self,
+        shard: usize,
         previous: (usize, usize, usize),
         current: (usize, usize, usize),
     ) {
@@ -492,20 +526,16 @@ impl Telemetry {
             previous_unregistered,
             current_unregistered,
         );
-        self.core_seen.store(true, Ordering::Relaxed);
-        self.core_heartbeat_elapsed_ms.store(
-            self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-            Ordering::Relaxed,
-        );
+        let heartbeats = self
+            .core_heartbeats
+            .get()
+            .expect("a core declares its shard count before handling events");
+        heartbeats[shard].store(self.elapsed_ms().saturating_add(1), Ordering::Relaxed);
     }
 
     pub(crate) fn core_is_fresh(&self, maximum_age: Duration) -> bool {
-        if !self.core_seen.load(Ordering::Relaxed) {
-            return false;
-        }
-        let now = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        now.saturating_sub(self.core_heartbeat_elapsed_ms.load(Ordering::Relaxed))
-            <= maximum_age.as_millis().min(u64::MAX as u128) as u64
+        self.stalest_core_heartbeat_age_ms()
+            .is_some_and(|age| age <= maximum_age.as_millis().min(u64::MAX as u128) as u64)
     }
 
     pub(crate) fn snapshot(&self, bnc_networks: u64, bnc_connected: u64) -> Snapshot {
@@ -551,8 +581,9 @@ impl Telemetry {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             sampled_at_ms: epoch_millis(),
             uptime_seconds: elapsed_ms / 1000,
-            core_heartbeat_age_ms: elapsed_ms
-                .saturating_sub(self.core_heartbeat_elapsed_ms.load(Ordering::Relaxed)),
+            // The worst shard: the age a wedged shard would show. Before every
+            // shard has reported, that is the whole uptime.
+            core_heartbeat_age_ms: self.stalest_core_heartbeat_age_ms().unwrap_or(elapsed_ms),
             active_connections: self.active_connections.load(Ordering::Relaxed),
             registered_connections: self.registered_connections.load(Ordering::Relaxed),
             unregistered_connections: self.unregistered_connections.load(Ordering::Relaxed),
@@ -949,7 +980,8 @@ mod tests {
         telemetry.record_error(ErrorKind::Read);
         telemetry.observe_latency(LatencyKind::Core, Duration::from_micros(900));
         telemetry.observe_latency(LatencyKind::Core, Duration::from_micros(4_000));
-        telemetry.adjust_core_gauges((0, 0, 0), (3, 2, 1));
+        telemetry.expect_core_shards(1);
+        telemetry.adjust_core_gauges(0, (0, 0, 0), (3, 2, 1));
 
         let snapshot = telemetry.snapshot(4, 3);
         assert_eq!(snapshot.schema_version, SNAPSHOT_SCHEMA_VERSION);
@@ -1056,9 +1088,29 @@ mod tests {
     #[test]
     fn readiness_requires_a_core_heartbeat() {
         let telemetry = Telemetry::new();
+        telemetry.expect_core_shards(1);
         assert!(!telemetry.core_is_fresh(Duration::from_secs(45)));
-        telemetry.adjust_core_gauges((0, 0, 0), (0, 0, 0));
+        telemetry.adjust_core_gauges(0, (0, 0, 0), (0, 0, 0));
         assert!(telemetry.core_is_fresh(Duration::from_secs(45)));
+    }
+
+    #[test]
+    fn a_silent_core_shard_is_not_masked_by_a_healthy_one() {
+        let telemetry = Telemetry::new();
+        telemetry.expect_core_shards(2);
+        telemetry.adjust_core_gauges(0, (0, 0, 0), (0, 0, 0));
+        assert!(
+            !telemetry.core_is_fresh(Duration::from_secs(45)),
+            "shard 1 has never reported"
+        );
+        telemetry.adjust_core_gauges(1, (0, 0, 0), (0, 0, 0));
+        assert!(telemetry.core_is_fresh(Duration::from_secs(45)));
+
+        // Shard 1 wedges while shard 0 keeps working: readiness is the worst.
+        std::thread::sleep(Duration::from_millis(30));
+        telemetry.adjust_core_gauges(0, (0, 0, 0), (0, 0, 0));
+        assert!(!telemetry.core_is_fresh(Duration::from_millis(10)));
+        assert!(telemetry.snapshot(0, 0).core_heartbeat_age_ms >= 30);
     }
 
     #[test]

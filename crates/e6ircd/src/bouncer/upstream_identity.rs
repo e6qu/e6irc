@@ -25,8 +25,8 @@ pub struct UpstreamIdentityError {
 }
 
 impl UpstreamIdentityError {
-    /// The request/configuration field at fault (`nick`, `realname`,
-    /// `autojoin`), for a form to point at.
+    /// The request/configuration field at fault (`nick`, `username`,
+    /// `realname`, `autojoin`), for a form to point at.
     pub const fn field(&self) -> &'static str {
         self.field
     }
@@ -50,8 +50,7 @@ fn breaks_a_parameter(character: char) -> bool {
     character.is_whitespace() || character.is_control()
 }
 
-/// The nickname offered to an upstream in `NICK` (and, truncated, as the
-/// `USER` name).
+/// The nickname offered to an upstream in `NICK`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamNick(String);
 
@@ -99,6 +98,63 @@ impl FromStr for UpstreamNick {
 }
 
 impl fmt::Display for UpstreamNick {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The user name (ident) sent as the first `USER` parameter.
+///
+/// It used to be the first ten bytes of the nickname. A nickname may begin
+/// with `_`, `[` or `|`; a user name may not, so Solanum and its relatives
+/// closed the link on perfectly legal nicknames (`Invalid username [~_bot]`)
+/// and the owner had no field to correct. It is now something the owner states.
+///
+/// Unlike the nickname's, this grammar is the strictest common one rather than
+/// merely structural, because servers do not answer a bad user name with a
+/// numeric a client can act on: they close the link. Solanum's `valid_username`
+/// requires an alphanumeric first character; `.` is left out because whether
+/// (and how many) dots are accepted is per-server configuration
+/// (`dots_in_ident`); ten bytes is the classic `USERLEN`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamUsername(String);
+
+impl UpstreamUsername {
+    pub const MAX_BYTES: usize = 10;
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for UpstreamUsername {
+    type Err = UpstreamIdentityError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let error = |reason| UpstreamIdentityError {
+            field: "username",
+            reason,
+        };
+        let Some(first) = value.bytes().next() else {
+            return Err(error("is required"));
+        };
+        if value.len() > Self::MAX_BYTES {
+            return Err(error("is limited to 10 bytes"));
+        }
+        if !first.is_ascii_alphanumeric() {
+            return Err(error("must begin with an ASCII letter or digit"));
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(error("may contain only ASCII letters, digits, '_' and '-'"));
+        }
+        Ok(Self(value.to_string()))
+    }
+}
+
+impl fmt::Display for UpstreamUsername {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
@@ -229,6 +285,82 @@ impl ConfirmedChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The very nicknames whose derived user names got networks refused are
+    /// what this grammar turns away, along with everything per-server.
+    #[test]
+    fn a_username_is_one_every_server_accepts() {
+        for good in [
+            "alice",
+            "e6irc",
+            "a",
+            "0day",
+            "bot-2",
+            "first_last",
+            "abcdefghij",
+        ] {
+            assert_eq!(good.parse::<UpstreamUsername>().expect(good).as_str(), good);
+        }
+        for (bad, reason) in [
+            ("", "is required"),
+            ("_bot", "must begin with an ASCII letter or digit"),
+            ("|me|", "must begin with an ASCII letter or digit"),
+            ("-dash", "must begin with an ASCII letter or digit"),
+            ("~ident", "must begin with an ASCII letter or digit"),
+            (
+                "first.last",
+                "may contain only ASCII letters, digits, '_' and '-'",
+            ),
+            ("me|", "may contain only ASCII letters, digits, '_' and '-'"),
+            (
+                "al ice",
+                "may contain only ASCII letters, digits, '_' and '-'",
+            ),
+            ("zoë", "may contain only ASCII letters, digits, '_' and '-'"),
+            (
+                "a\r\nJOIN",
+                "may contain only ASCII letters, digits, '_' and '-'",
+            ),
+            ("abcdefghijk", "is limited to 10 bytes"),
+        ] {
+            let error = bad.parse::<UpstreamUsername>().expect_err(bad);
+            assert_eq!(error.field(), "username");
+            assert_eq!(error.reason(), reason, "{bad:?}");
+        }
+    }
+
+    /// The native clients decide whether a nickname may double as the user
+    /// name with `e6irc_client::is_portable_username`. Two grammars that must
+    /// agree are tested to agree.
+    #[test]
+    fn the_clients_username_predicate_is_this_grammar() {
+        for word in [
+            "alice",
+            "a",
+            "0day",
+            "bot-2",
+            "first_last",
+            "abcdefghij",
+            "abcdefghijk",
+            "",
+            "_bot",
+            "-dash",
+            "~ident",
+            "first.last",
+            "me|",
+            "al ice",
+            "zoë",
+            "a\r\nJOIN",
+            ":a",
+            "A9_-",
+        ] {
+            assert_eq!(
+                e6irc_client::is_portable_username(word),
+                word.parse::<UpstreamUsername>().is_ok(),
+                "{word:?}"
+            );
+        }
+    }
 
     #[test]
     fn a_nickname_is_exactly_one_wire_parameter() {

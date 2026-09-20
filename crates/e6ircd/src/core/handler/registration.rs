@@ -87,6 +87,11 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         if !case_change_only {
             if let Some(old_nick) = old_nick_display {
+                // The old nick is free for anyone to take, and `~oldnick` with
+                // it (see `ServerState::close`, which does the same).
+                if state.sessions[&conn].account.is_none() {
+                    state.release_unauthenticated_identity(&old_nick);
+                }
                 monitor_notify(state, &old_nick, false);
             }
             monitor_notify(state, nick, true);

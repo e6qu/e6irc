@@ -186,6 +186,8 @@ pub(super) enum CreateNetwork {
         addr: String,
         tls: bool,
         nick: String,
+        /// The IRC `USER` name. Required: it is never derived from the nick.
+        username: String,
         realname: String,
         autojoin: Vec<String>,
         #[serde(default)]
@@ -224,6 +226,8 @@ struct NetworkCreation {
     addr: String,
     tls: bool,
     nick: String,
+    /// `Some` exactly for `kind=irc`; a bridge request cannot carry one.
+    username: Option<String>,
     realname: String,
     autojoin: Vec<String>,
     sasl_account: Option<String>,
@@ -239,6 +243,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 addr,
                 tls,
                 nick,
+                username,
                 realname,
                 autojoin,
                 sasl_account,
@@ -249,6 +254,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 addr,
                 tls,
                 nick,
+                username: Some(username),
                 realname,
                 autojoin,
                 sasl_account,
@@ -267,6 +273,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 addr,
                 tls,
                 nick,
+                username: None,
                 realname: String::new(),
                 autojoin,
                 sasl_account: None,
@@ -284,6 +291,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 addr,
                 tls,
                 nick: String::new(),
+                username: None,
                 realname: String::new(),
                 autojoin,
                 sasl_account: None,
@@ -302,6 +310,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 addr,
                 tls,
                 nick: String::new(),
+                username: None,
                 realname: String::new(),
                 autojoin,
                 sasl_account: Some(sasl_account),
@@ -320,6 +329,7 @@ pub(super) struct PreflightNetwork {
     pub(super) addr: String,
     pub(super) tls: bool,
     pub(super) nick: String,
+    pub(super) username: String,
     pub(super) realname: String,
     #[serde(default)]
     pub(super) autojoin: Vec<String>,
@@ -449,6 +459,8 @@ pub(super) struct NetworkResponse {
     addr: String,
     tls: bool,
     nick: String,
+    /// The IRC `USER` name; `null` for a bridge.
+    username: Option<String>,
     realname: Option<String>,
     autojoin: Vec<String>,
     sasl_account: Option<String>,
@@ -571,6 +583,7 @@ pub(super) fn network_response(
         addr: network.addr,
         tls: network.tls,
         nick: network.nick,
+        username: network.username,
         realname: network.realname,
         autojoin: network.autojoin,
         sasl_account: account,
@@ -689,7 +702,13 @@ pub(super) async fn preflight_network(
 pub(super) async fn preflight_network_core(
     req: PreflightNetwork,
 ) -> Result<crate::bouncer::IrcPreflight, NetworkMutationError> {
-    let identity = validate_irc_upstream(&req.addr, &req.nick, Some(&req.realname), &req.autojoin)?;
+    let identity = validate_irc_upstream(
+        &req.addr,
+        &req.nick,
+        Some(&req.username),
+        Some(&req.realname),
+        &req.autojoin,
+    )?;
     if let Some(account) = req.sasl_account.as_deref()
         && let Err(error) = validate_credential_field(account, 255)
     {
@@ -712,6 +731,7 @@ pub(super) async fn preflight_network_core(
         addr: req.addr,
         tls: req.tls,
         nick: identity.nick,
+        username: identity.username,
         realname: identity
             .realname
             .expect("the preflight request's realname was supplied and parsed"),
@@ -1030,6 +1050,7 @@ pub(super) fn check_upstream_bounds(
 #[derive(Debug)]
 pub(super) struct IrcUpstreamIdentity {
     pub(super) nick: crate::bouncer::UpstreamNick,
+    pub(super) username: crate::bouncer::UpstreamUsername,
     pub(super) realname: Option<crate::bouncer::UpstreamRealname>,
     pub(super) autojoin: Vec<crate::bouncer::UpstreamChannel>,
 }
@@ -1049,9 +1070,22 @@ fn identity_problem(error: crate::bouncer::UpstreamIdentityError) -> NetworkMuta
 pub(super) fn validate_irc_upstream(
     addr: &str,
     nick: &str,
+    username: Option<&str>,
     realname: Option<&str>,
     autojoin: &[String],
 ) -> Result<IrcUpstreamIdentity, NetworkMutationError> {
+    // Required, and never derived from the nick: a legal nickname (`_bot`) is
+    // not a legal user name, and an upstream answers a bad one by closing the
+    // link. Absent is said before anything else so a client that predates the
+    // field learns which one it is missing.
+    let Some(username) = username else {
+        return Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Missing required fields",
+            Some("username is required for IRC networks"),
+        )
+        .with_field("username"));
+    };
     if addr.is_empty() || nick.is_empty() {
         return Err(network_error(
             StatusCode::BAD_REQUEST,
@@ -1075,6 +1109,7 @@ pub(super) fn validate_irc_upstream(
     check_upstream_bounds(addr, nick, realname, autojoin)?;
     Ok(IrcUpstreamIdentity {
         nick: nick.parse().map_err(identity_problem)?,
+        username: username.parse().map_err(identity_problem)?,
         realname: realname
             .map(str::parse)
             .transpose()
@@ -1258,11 +1293,20 @@ fn validate_bridge_upstream(
     addr: &str,
     tls: bool,
     nick: &str,
+    username: Option<&str>,
     realname: Option<&str>,
     autojoin: &[String],
 ) -> Result<(), NetworkMutationError> {
     use crate::config::NetworkKind;
     check_upstream_bounds(addr, nick, realname, autojoin)?;
+    if username.is_some() {
+        return Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Unsupported bridge field",
+            Some("username applies only to IRC networks"),
+        )
+        .with_field("username"));
+    }
     if !tls {
         return Err(network_error(
             StatusCode::BAD_REQUEST,
@@ -1406,6 +1450,7 @@ pub(super) async fn update_network_core(
     addr: &str,
     tls: bool,
     nick: &str,
+    username: Option<&str>,
     realname: Option<&str>,
     autojoin: &[String],
     credentials: NetworkCredentialUpdate<'_>,
@@ -1422,13 +1467,14 @@ pub(super) async fn update_network_core(
         .with_field("realname"));
     }
     if row.kind == crate::config::NetworkKind::Irc {
-        validate_irc_upstream(addr, nick, realname, autojoin)?;
+        validate_irc_upstream(addr, nick, username, realname, autojoin)?;
     } else {
-        validate_bridge_upstream(row.kind, addr, tls, nick, realname, autojoin)?;
+        validate_bridge_upstream(row.kind, addr, tls, nick, username, realname, autojoin)?;
     }
     row.addr = addr.to_string();
     row.tls = tls;
     row.nick = nick.to_string();
+    row.username = username.map(str::to_string);
     row.realname = realname.map(str::to_string);
     row.autojoin = autojoin.to_vec();
     apply_network_credentials(state, account, &mut row, credentials)?;
@@ -1491,9 +1537,23 @@ async fn create_network_core(
     // interpolated into NICK/USER/JOIN lines, so a CR/LF/NUL there is a
     // line-injection primitive; `addr` is SSRF-vetted; all are length-bounded.
     if kind == NetworkKind::Irc {
-        validate_irc_upstream(&req.addr, &req.nick, Some(&req.realname), &req.autojoin)?;
+        validate_irc_upstream(
+            &req.addr,
+            &req.nick,
+            req.username.as_deref(),
+            Some(&req.realname),
+            &req.autojoin,
+        )?;
     } else {
-        validate_bridge_upstream(kind, &req.addr, req.tls, &req.nick, None, &req.autojoin)?;
+        validate_bridge_upstream(
+            kind,
+            &req.addr,
+            req.tls,
+            &req.nick,
+            req.username.as_deref(),
+            None,
+            &req.autojoin,
+        )?;
     }
     // Fields that are create-only (the name) or SASL-specific (bounds + the NUL
     // check that matters because PLAIN uses NUL as its field separator, and the
@@ -1555,17 +1615,20 @@ async fn create_network_core(
 
     // Build before inserting. A factory rejection must not create durable state
     // that then depends on a best-effort compensating delete.
-    let driver = crate::bouncer::build_driver(
+    let driver = crate::bouncer::build_driver(crate::bouncer::DriverSpec {
         kind,
-        req.addr.clone(),
-        req.tls,
-        req.nick.clone(),
-        req.realname.clone(),
-        req.autojoin.clone(),
-        1000,
-        req.sasl_account.clone(),
-        req.sasl_password.clone(),
-    )
+        owner: Some(account.to_string()),
+        name: req.name.clone(),
+        addr: req.addr.clone(),
+        tls: req.tls,
+        nick: req.nick.clone(),
+        username: req.username.clone(),
+        realname: req.realname.clone(),
+        autojoin: req.autojoin.clone(),
+        buffer_cap: 1000,
+        sasl_account: req.sasl_account.clone(),
+        sasl_password: req.sasl_password.clone(),
+    })
     .map_err(|error| network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error)))?;
 
     let row = crate::db::BncNetworkRow {
@@ -1574,6 +1637,7 @@ async fn create_network_core(
         addr: req.addr.clone(),
         tls: req.tls,
         nick: req.nick.clone(),
+        username: req.username.clone(),
         realname: (kind == NetworkKind::Irc).then(|| req.realname.clone()),
         autojoin: req.autojoin.clone(),
         sasl_account: stored_account,
@@ -1717,6 +1781,10 @@ pub(super) struct UpdateNetwork {
     pub(super) addr: String,
     pub(super) tls: bool,
     pub(super) nick: String,
+    /// Required when the stored network is `kind=irc`, refused for a bridge;
+    /// which one applies is known only once the row is loaded.
+    #[serde(default)]
+    pub(super) username: Option<String>,
     #[serde(default)]
     pub(super) realname: Option<String>,
     #[serde(default)]
@@ -1765,6 +1833,7 @@ pub(super) async fn update_network(
         &req.addr,
         req.tls,
         &req.nick,
+        req.username.as_deref(),
         req.realname.as_deref(),
         &req.autojoin,
         credentials,
@@ -1909,20 +1978,20 @@ pub(super) async fn delete_network(
 mod tests {
     use super::{
         BufferQuery, CreateNetwork, IRC_NETWORK_PRESETS, NetworkAccountCommand, PreflightNetwork,
-        network_name_ok, runtime_response, upstream_addr_is_internal, validate_irc_upstream,
-        validate_single_service_token,
+        network_name_ok, runtime_response, upstream_addr_is_internal, validate_bridge_upstream,
+        validate_irc_upstream, validate_single_service_token,
     };
 
     #[test]
     fn network_creation_is_complete_and_kind_specific() {
-        let irc = r#"{"kind":"irc","name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[]}"#;
+        let irc = r#"{"kind":"irc","name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice","autojoin":[]}"#;
         assert!(serde_json::from_str::<CreateNetwork>(irc).is_ok());
         assert!(serde_json::from_str::<CreateNetwork>(
-            r#"{"name":"implicit","addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[]}"#
+            r#"{"name":"implicit","addr":"irc.example:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice","autojoin":[]}"#
         )
         .is_err());
         assert!(serde_json::from_str::<CreateNetwork>(
-            r#"{"kind":"irc","name":"incomplete","addr":"irc.example:6697","nick":"alice","realname":"Alice","autojoin":[]}"#
+            r#"{"kind":"irc","name":"incomplete","addr":"irc.example:6697","nick":"alice","username":"alice","realname":"Alice","autojoin":[]}"#
         )
         .is_err());
         assert!(serde_json::from_str::<CreateNetwork>(
@@ -1935,7 +2004,7 @@ mod tests {
     fn preflight_requires_explicit_transport_and_identity() {
         assert!(
             serde_json::from_str::<PreflightNetwork>(
-                r#"{"addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice"}"#
+                r#"{"addr":"irc.example:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice"}"#
             )
             .is_ok()
         );
@@ -2037,10 +2106,84 @@ mod tests {
         assert!(axum::extract::Query::<BufferQuery>::try_from_uri(&uri).is_err());
     }
 
+    /// The user name is stated by the owner. A nickname that is legal but whose
+    /// first ten bytes are not a legal user name (`_bot`) used to get its network
+    /// refused by the upstream with nothing the owner could correct.
+    #[test]
+    fn an_irc_network_states_its_username_and_a_bridge_cannot() {
+        let with_username = |username: Option<&str>| {
+            validate_irc_upstream("irc.example:6697", "_bot", username, Some("Bot"), &[])
+        };
+        assert_eq!(
+            with_username(Some("bot"))
+                .expect("stated")
+                .username
+                .as_str(),
+            "bot"
+        );
+        for (username, detail) in [
+            (None, "username is required for IRC networks"),
+            (Some(""), "username is required"),
+            (
+                Some("_bot"),
+                "username must begin with an ASCII letter or digit",
+            ),
+            (
+                Some("first.last"),
+                "username may contain only ASCII letters, digits, '_' and '-'",
+            ),
+            (Some("elevenbytes"), "username is limited to 10 bytes"),
+        ] {
+            let error = with_username(username).expect_err("must be refused");
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+            assert_eq!(error.field, Some("username"), "{username:?}: {error:?}");
+            assert!(error.message().ends_with(detail), "{username:?}: {error:?}");
+        }
+
+        let bridge = validate_bridge_upstream(
+            crate::config::NetworkKind::Discord,
+            "",
+            true,
+            "",
+            Some("bot"),
+            None,
+            &[],
+        )
+        .expect_err("a bridge has no IRC registration");
+        assert_eq!(bridge.field, Some("username"));
+        assert!(
+            bridge
+                .message()
+                .ends_with("username applies only to IRC networks")
+        );
+
+        // The request shapes themselves: required on create and on the
+        // connection test, and not a field a bridge request has at all.
+        let irc = |username: &str| {
+            format!(
+                r#"{{"kind":"irc","name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice",{username}"realname":"Alice","autojoin":[]}}"#
+            )
+        };
+        assert!(serde_json::from_str::<CreateNetwork>(&irc(r#""username":"alice","#)).is_ok());
+        assert!(serde_json::from_str::<CreateNetwork>(&irc("")).is_err());
+        assert!(
+            serde_json::from_str::<CreateNetwork>(
+                r#"{"kind":"discord","name":"d","addr":"","tls":true,"autojoin":[],"sasl_password":"t","username":"bot"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<PreflightNetwork>(
+                r#"{"addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice"}"#
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn malformed_irc_upstream_is_rejected_before_it_can_be_persisted() {
         for addr in ["irc.example", "irc.example:0", "irc.example:not-a-port"] {
-            let error = validate_irc_upstream(addr, "alice", None, &[])
+            let error = validate_irc_upstream(addr, "alice", Some("alice"), None, &[])
                 .expect_err("malformed address must fail");
             assert!(error.message().contains("host:port"), "{addr}: {error:?}");
         }
@@ -2050,11 +2193,12 @@ mod tests {
     fn an_identity_that_would_reshape_a_wire_line_is_refused_at_its_field() {
         let ok = |nick: &str, realname: Option<&str>, autojoin: &[&str]| {
             let autojoin: Vec<String> = autojoin.iter().map(ToString::to_string).collect();
-            validate_irc_upstream("irc.example:6697", nick, realname, &autojoin)
+            validate_irc_upstream("irc.example:6697", nick, Some("ident"), realname, &autojoin)
         };
         let identity = ok("alice", Some("Alice Example"), &["#e6irc", "&local"])
             .expect("an ordinary identity");
         assert_eq!(identity.nick.as_str(), "alice");
+        assert_eq!(identity.username.as_str(), "ident");
         assert_eq!(identity.autojoin.len(), 2);
 
         for (nick, realname, autojoin, field) in [

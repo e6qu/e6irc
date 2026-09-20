@@ -12,7 +12,9 @@ use e6irc_proto::numerics::{
 };
 use e6irc_queue::Sender;
 
-use super::{CoreEffect, CoreShardCount, CoreShardId, Output, SessionOwner, WireLine, deliver};
+use super::{
+    CoreEffect, CoreShardCount, CoreShardId, Output, SessionOutput, SessionOwner, WireLine, Written,
+};
 use crate::observability::Telemetry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -108,9 +110,75 @@ impl NickDirectory {
 #[derive(Clone, Default)]
 pub(crate) struct MembershipDirectory {
     by_conn: Arc<Mutex<HashMap<ConnId, HashSet<ChanKey>>>>,
+    /// What a channel's owner publishes about it for the shards that do not
+    /// hold it: enough to list a user's channels in WHOIS with their rank, to
+    /// keep a secret channel out of that list, and to say when the channel's
+    /// history ring last saw a message.
+    channels: Arc<Mutex<HashMap<ChanKey, PublicChannel>>>,
+}
+
+/// A channel as any shard may describe it; see [`MembershipDirectory`].
+pub(crate) struct PublicChannel {
+    name: String,
+    secret: bool,
+    /// Members holding op or voice. Everyone else is a plain member.
+    ranks: HashMap<ConnId, MemberModes>,
+    /// The newest message in the channel's history ring, if it has one. The
+    /// ring lives with the channel's owner; with no database it is the whole
+    /// record, and CHATHISTORY TARGETS is answered from this on every shard.
+    latest_message: Option<e6irc_proto::time::Millis>,
 }
 
 impl MembershipDirectory {
+    fn publish_channel(&self, key: &ChanKey, channel: Option<PublicChannel>) {
+        let mut channels = self.channels.lock().expect("membership directory poisoned");
+        match channel {
+            Some(channel) => channels.insert(key.clone(), channel),
+            None => channels.remove(key),
+        };
+    }
+
+    /// A channel's display name and the time of the newest message in its
+    /// history ring, when it has one.
+    pub(crate) fn channel_activity(
+        &self,
+        key: &ChanKey,
+    ) -> Option<(String, e6irc_proto::time::Millis)> {
+        let channels = self.channels.lock().expect("membership directory poisoned");
+        let channel = channels.get(key)?;
+        Some((channel.name.clone(), channel.latest_message?))
+    }
+
+    /// `target`'s channels as WHOIS shows them to `requester`: rank sigil and
+    /// display name, sorted, without the secret channels the two do not share.
+    pub(crate) fn whois_channels(&self, target: ConnId, requester: ConnId) -> Vec<String> {
+        let by_conn = self.by_conn.lock().expect("membership directory poisoned");
+        let channels = self.channels.lock().expect("membership directory poisoned");
+        let shared = by_conn.get(&requester);
+        let mut shown: Vec<String> = by_conn
+            .get(&target)
+            .into_iter()
+            .flatten()
+            .filter_map(|key| {
+                let channel = channels.get(key)?;
+                // A +s (secret) channel is disclosed only to a requester who
+                // also shares it, so WHOIS can't enumerate hidden channels a
+                // target is in.
+                if channel.secret && !shared.is_some_and(|shared| shared.contains(key)) {
+                    return None;
+                }
+                let sigil = match channel.ranks.get(&target) {
+                    Some(modes) if modes.op => "@",
+                    Some(modes) if modes.voice => "+",
+                    _ => "",
+                };
+                Some(format!("{sigil}{}", channel.name))
+            })
+            .collect();
+        shown.sort();
+        shown
+    }
+
     pub(crate) fn join(&self, conn: ConnId, key: ChanKey) {
         self.by_conn
             .lock()
@@ -451,9 +519,246 @@ impl ChannelOptionsDirectory {
     }
 }
 
+/// What any shard may know about a registered user: the public face of a
+/// session, as WHOIS, WHO, ISON, USERHOST, MONITOR and message delivery see it.
+///
+/// A session lives on one shard; the people asking about it live on all of
+/// them. The owning shard publishes this record whenever the session's public
+/// state changes (see [`ServerState::publish_changed_sessions`]), and every
+/// shard — the owning one included — answers from it. One record, one answer:
+/// a single-worker server and a many-worker one cannot differ.
+#[derive(Debug)]
+pub(crate) struct PublicUser {
+    pub(crate) recipient: Recipient,
+    pub(crate) nick: String,
+    pub(crate) user: String,
+    pub(crate) host: String,
+    pub(crate) realname: String,
+    pub(crate) account: Option<String>,
+    pub(crate) away: Option<String>,
+    pub(crate) oper: bool,
+    pub(crate) bot: bool,
+    pub(crate) invisible: bool,
+    pub(crate) wallops: bool,
+    pub(crate) signon: e6irc_proto::time::Millis,
+    pub(crate) last_active: LastActive,
+}
+
+impl PublicUser {
+    fn of(session: &Session, recipient: Recipient) -> Self {
+        Self {
+            recipient,
+            nick: session.nick().expect("registered").to_string(),
+            user: session.user().expect("registered").to_string(),
+            host: session.host.clone(),
+            realname: session.realname().expect("registered").to_string(),
+            account: session.account.clone(),
+            away: session.away.clone(),
+            oper: session.oper,
+            bot: session.bot,
+            invisible: session.invisible,
+            wallops: session.wallops,
+            signon: session.signon,
+            last_active: session.last_active.clone(),
+        }
+    }
+
+    /// Whether this is still what `session` looks like from outside.
+    fn describes(&self, session: &Session) -> bool {
+        self.recipient.caps() == session.caps
+            && Some(self.nick.as_str()) == session.nick()
+            && Some(self.user.as_str()) == session.user()
+            && self.host == session.host
+            && Some(self.realname.as_str()) == session.realname()
+            && self.account == session.account
+            && self.away == session.away
+            && self.oper == session.oper
+            && self.bot == session.bot
+            && self.invisible == session.invisible
+            && self.wallops == session.wallops
+            && self.signon == session.signon
+    }
+
+    pub(crate) fn conn(&self) -> ConnId {
+        self.recipient.conn()
+    }
+
+    pub(crate) fn prefix(&self) -> String {
+        format!("{}!{}@{}", self.nick, self.user, self.host)
+    }
+
+    /// Who this user *is* for owning direct-message history; see
+    /// [`ServerState::conn_identity`].
+    pub(crate) fn identity(&self, casemap: CaseMapping) -> String {
+        match &self.account {
+            Some(account) => casemap.casefold(account),
+            None => format!("~{}", casemap.casefold(&self.nick)),
+        }
+    }
+
+    fn member_identity(&self) -> MemberIdentity {
+        MemberIdentity::new(self.nick.clone(), self.prefix(), self.invisible)
+    }
+
+    fn member_profile(&self) -> ChannelMemberProfile {
+        ChannelMemberProfile {
+            user: self.user.clone(),
+            host: self.host.clone(),
+            realname: self.realname.clone(),
+            account: self.account.clone(),
+            away: self.away.is_some(),
+            oper: self.oper,
+            bot: self.bot,
+            last_active: self.last_active.clone(),
+        }
+    }
+}
+
+/// Process-wide [`PublicUser`] records, by connection.
+#[derive(Clone, Default)]
+pub(crate) struct UserDirectory {
+    by_conn: Arc<Mutex<HashMap<ConnId, Arc<PublicUser>>>>,
+}
+
+impl UserDirectory {
+    fn publish(&self, user: Arc<PublicUser>) {
+        self.by_conn
+            .lock()
+            .expect("user directory poisoned")
+            .insert(user.conn(), user);
+    }
+
+    fn withdraw(&self, conn: ConnId) {
+        self.by_conn
+            .lock()
+            .expect("user directory poisoned")
+            .remove(&conn);
+    }
+
+    pub(crate) fn get(&self, conn: ConnId) -> Option<Arc<PublicUser>> {
+        self.by_conn
+            .lock()
+            .expect("user directory poisoned")
+            .get(&conn)
+            .cloned()
+    }
+
+    fn len(&self) -> usize {
+        self.by_conn.lock().expect("user directory poisoned").len()
+    }
+
+    fn all(&self) -> Vec<Arc<PublicUser>> {
+        self.by_conn
+            .lock()
+            .expect("user directory poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Some online user logged in to `account` (casefolded), if any.
+    fn logged_in_as(&self, account: &str, casemap: CaseMapping) -> Option<Arc<PublicUser>> {
+        self.by_conn
+            .lock()
+            .expect("user directory poisoned")
+            .values()
+            .find(|user| {
+                user.account
+                    .as_deref()
+                    .is_some_and(|name| casemap.casefold(name) == account)
+            })
+            .cloned()
+    }
+}
+
+#[derive(Default)]
+struct UserEventProgress {
+    parts_heard: usize,
+    told: HashSet<ConnId>,
+}
+
+/// Process-wide MONITOR lists: who watches each nick. The watcher and the
+/// watched may live on different shards, and it is the watched nick's shard
+/// that sees it come, go and change.
+#[derive(Clone, Default)]
+pub(crate) struct MonitorDirectory {
+    by_nick: Arc<Mutex<HashMap<NickKey, HashSet<ConnId>>>>,
+}
+
+impl MonitorDirectory {
+    pub(crate) fn watch(&self, key: NickKey, watcher: ConnId) {
+        self.by_nick
+            .lock()
+            .expect("monitor directory poisoned")
+            .entry(key)
+            .or_default()
+            .insert(watcher);
+    }
+
+    pub(crate) fn unwatch(&self, key: &NickKey, watcher: ConnId) {
+        let mut by_nick = self.by_nick.lock().expect("monitor directory poisoned");
+        if let Some(watchers) = by_nick.get_mut(key) {
+            watchers.remove(&watcher);
+            if watchers.is_empty() {
+                by_nick.remove(key);
+            }
+        }
+    }
+
+    pub(crate) fn watchers(&self, key: &NickKey) -> Vec<ConnId> {
+        self.by_nick
+            .lock()
+            .expect("monitor directory poisoned")
+            .get(key)
+            .map(|watchers| watchers.iter().copied().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Server-wide head counts (LUSERS), which no one shard can take alone. Each
+/// shard adds what changed on it after every event.
+#[derive(Clone, Default)]
+pub(crate) struct Census {
+    connections: Arc<std::sync::atomic::AtomicUsize>,
+    channels: Arc<std::sync::atomic::AtomicUsize>,
+    most_users: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// The server-wide WHOWAS ring: a nick may be asked about from any shard.
+#[derive(Clone, Default)]
+pub(crate) struct WhowasDirectory {
+    newest_first: Arc<Mutex<std::collections::VecDeque<WhowasEntry>>>,
+}
+
+impl WhowasDirectory {
+    fn record(&self, entry: WhowasEntry) {
+        let mut ring = self.newest_first.lock().expect("whowas directory poisoned");
+        if ring.len() == WHOWAS_CAP {
+            ring.pop_back();
+        }
+        ring.push_front(entry);
+    }
+
+    /// Up to `limit` records of `key`, newest first.
+    pub(crate) fn of(&self, casemap: CaseMapping, key: &NickKey, limit: usize) -> Vec<WhowasEntry> {
+        self.newest_first
+            .lock()
+            .expect("whowas directory poisoned")
+            .iter()
+            .filter(|entry| casemap.casefold(&entry.nick) == key.as_str())
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+}
+
 /// Process-wide directories shared by all core shards.
 #[derive(Clone, Default)]
 pub(crate) struct CoreDirectories {
+    pub(crate) census: Census,
+    pub(crate) whowas: WhowasDirectory,
+    pub(crate) users: UserDirectory,
+    pub(crate) monitors: MonitorDirectory,
     pub(crate) nicks: NickDirectory,
     pub(crate) memberships: MembershipDirectory,
     pub(crate) founders: FounderDirectory,
@@ -635,7 +940,7 @@ impl PendingServiceReply {
 }
 
 pub(crate) struct Session {
-    pub tx: Sender<Output>,
+    output: SessionOutput,
     pub host: String,
     pub transport: crate::core::ConnectionTransport,
     /// Registration state and the identity fields, as one sum type (see
@@ -682,6 +987,9 @@ pub(crate) struct Session {
     pub monitoring: HashMap<NickKey, String>,
     /// The `draft/multiline` batch this connection is filling, if any.
     pub multiline: Option<MultilineBatch>,
+    /// Labeled commands whose one response is being assembled from several
+    /// channel owners' answers, by label.
+    pub(crate) label_groups: HashMap<String, LabelGroup>,
     /// Read markers for a client that isn't logged in: per-connection and not
     /// persisted (there is no account to key them to). A logged-in client uses
     /// the account-keyed `ServerState::read_markers` instead. A marker set here
@@ -700,7 +1008,7 @@ pub(crate) struct Session {
     /// Monotonic millisecond of the last non-keepalive command — the elapsed
     /// idle duration since it (WHOIS idle / WHOX `l`) and the reaper's idle-ping
     /// cadence both read it. (WHOIS *signon*, a real timestamp, is `signon`.)
-    pub last_active: e6irc_proto::time::MonoMillis,
+    pub last_active: LastActive,
     pub signon: e6irc_proto::time::Millis,
     /// Monotonic millisecond the connection opened, for the registration
     /// deadline (an unregistered connection that never completes is reaped).
@@ -735,7 +1043,22 @@ pub(crate) struct Session {
     /// ambiguous-overtake case above is a real hazard, and that one is closed.
     pub deferred_replies: usize,
     pub held: Vec<Bytes>,
+    /// CHATHISTORY requests this session has waiting on the database, bounded
+    /// by [`MAX_HISTORY_REQUESTS_IN_FLIGHT`].
+    history_requests_in_flight: usize,
+    /// What the rest of the server currently believes about this session: the
+    /// record in the [`UserDirectory`], also copied into every channel it is
+    /// in. `None` until it registers.
+    published: Option<Arc<PublicUser>>,
 }
+
+/// Most CHATHISTORY requests one session may have waiting on the database at
+/// once. Every request the ring cannot answer takes a slot in the one database
+/// queue that logins, registrations, read markers and message logging share, so
+/// without a bound a single client pipelining such requests fills it and those
+/// fail for everyone. Eight is far beyond what a client paging its open buffers
+/// on reconnect keeps outstanding.
+pub(crate) const MAX_HISTORY_REQUESTS_IN_FLIGHT: usize = 8;
 
 #[derive(Clone, Copy)]
 struct SessionHandle {
@@ -760,6 +1083,10 @@ pub(crate) struct SessionStore {
     /// every event, and counting every session each time is O(sessions) per
     /// event.
     registered: usize,
+    /// Sessions handed out mutably, or removed, since the last
+    /// [`SessionStore::take_touched`]: the only ones whose public state can
+    /// have changed.
+    touched: Vec<ConnId>,
 }
 
 pub(crate) struct SessionIter<'a> {
@@ -789,7 +1116,32 @@ impl SessionStore {
             free: Vec::new(),
             len: 0,
             registered: 0,
+            touched: Vec::new(),
         }
+    }
+
+    /// The sessions that may have changed since the last call, each once.
+    fn take_touched(&mut self) -> Vec<ConnId> {
+        let mut touched = std::mem::take(&mut self.touched);
+        touched.sort_unstable_by_key(|conn| conn.0);
+        touched.dedup();
+        touched
+    }
+
+    /// Mutable access for the output path alone — queueing or holding a line
+    /// for the connection. It is not recorded as a possible change to what
+    /// others see, because a delivery to ten thousand members would otherwise
+    /// queue ten thousand sessions for a comparison none of them can fail.
+    fn output_mut(&mut self, conn: &ConnId) -> Option<&mut Session> {
+        self.lookup_mut(conn)
+    }
+
+    /// Every session, for writing its last output; like [`Self::output_mut`],
+    /// not a change to what others see.
+    fn closing_sessions_mut(&mut self) -> impl Iterator<Item = &mut Session> {
+        self.slots
+            .iter_mut()
+            .filter_map(|slot| slot.session.as_mut())
     }
 
     /// The number of registered sessions.
@@ -824,6 +1176,11 @@ impl SessionStore {
     }
 
     pub(crate) fn get_mut(&mut self, conn: &ConnId) -> Option<&mut Session> {
+        self.touched.push(*conn);
+        self.lookup_mut(conn)
+    }
+
+    fn lookup_mut(&mut self, conn: &ConnId) -> Option<&mut Session> {
         let handle = *self.by_conn.get(conn)?;
         let slot = self.slots.get_mut(handle.slot)?;
         (slot.generation == handle.generation)
@@ -882,6 +1239,7 @@ impl SessionStore {
             return None;
         }
         let session = slot.session.take()?;
+        self.touched.push(*conn);
         self.len -= 1;
         self.registered -= usize::from(session.is_registered());
         if let Some(next) = slot.generation.checked_add(1) {
@@ -1045,6 +1403,34 @@ pub(crate) struct MemberIdentity {
     pub(crate) invisible: bool,
 }
 
+/// When a session last did something, on the monotonic clock: the one value
+/// behind every "seconds idle" answer.
+///
+/// It is a shared handle, not a copied timestamp, because it changes with
+/// every line a client sends. The session writes it; whoever answers about the
+/// user — this shard's WHOIS, another shard's WHO for a channel it owns — reads
+/// the same value. Copying it into each channel's member record instead meant
+/// one update per channel per line.
+#[derive(Debug, Clone)]
+pub(crate) struct LastActive(Arc<std::sync::atomic::AtomicU64>);
+
+impl LastActive {
+    pub(crate) fn new(at: e6irc_proto::time::MonoMillis) -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicU64::new(at.as_millis())))
+    }
+
+    pub(crate) fn set(&self, at: e6irc_proto::time::MonoMillis) {
+        self.0
+            .store(at.as_millis(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn get(&self) -> e6irc_proto::time::MonoMillis {
+        e6irc_proto::time::MonoMillis::from_millis(
+            self.0.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ChannelMemberProfile {
     pub(crate) user: String,
@@ -1054,7 +1440,7 @@ pub(crate) struct ChannelMemberProfile {
     pub(crate) away: bool,
     pub(crate) oper: bool,
     pub(crate) bot: bool,
-    pub(crate) last_active: e6irc_proto::time::MonoMillis,
+    pub(crate) last_active: LastActive,
 }
 
 impl ChannelMemberProfile {
@@ -1073,7 +1459,7 @@ impl ChannelMemberProfile {
             away: false,
             oper: false,
             bot: false,
-            last_active,
+            last_active: LastActive::new(last_active),
         }
     }
 }
@@ -1157,16 +1543,100 @@ impl Peers {
         }
     }
 
-    fn extend(&mut self, members: &[Recipient]) {
+    /// Add those of `members` the event is for.
+    fn extend(&mut self, members: &[Recipient], audience: UserEventAudience) {
         for recipient in members {
-            if recipient.conn() != self.subject {
+            if recipient.conn() != self.subject && audience.admits(&recipient.caps()) {
                 self.recipients.insert(recipient.conn(), *recipient);
             }
         }
     }
+}
 
-    fn into_recipients(self) -> impl Iterator<Item = Recipient> {
-        self.recipients.into_values()
+/// What one user may do to another user's session. The session may live on
+/// any shard; [`ServerState::act_on_session`] gets it there.
+#[derive(Debug)]
+pub enum SessionAction {
+    /// Oper KILL: `killer` is the name the reason and the audit attribute it to.
+    Kill { comment: String, killer: String },
+    /// NickServ GHOST, by the owner of the nick's account.
+    Ghost { by: String },
+    /// Oper SETHOST; `oper` is told the outcome.
+    SetHost {
+        host: String,
+        oper: SessionOwner,
+        oper_nick: String,
+    },
+}
+
+/// Which of a user's peers an event about them is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserEventAudience {
+    /// QUIT and NICK: everyone who can see the user.
+    Everyone,
+    AwayNotify,
+    AccountNotify,
+    Setname,
+    Chghost,
+}
+
+impl UserEventAudience {
+    fn admits(self, caps: &Caps) -> bool {
+        match self {
+            Self::Everyone => true,
+            Self::AwayNotify => caps.away_notify,
+            Self::AccountNotify => caps.account_notify,
+            Self::Setname => caps.setname,
+            Self::Chghost => caps.chghost,
+        }
+    }
+}
+
+/// One thing that happened to a user — they quit, changed nick, went away —
+/// that everyone who can see them is told exactly once.
+///
+/// Who can see them is spread over the shards that own their channels, and a
+/// peer may share channels owned by several. So each of those shards reports
+/// the peers it knows of — one [`UserEventPart`] per shard the peers live on —
+/// and the shard a peer's session lives on, which alone sees every part that
+/// names it, delivers the line the first time and ignores the rest. Electing
+/// one channel to speak for a pair would be cheaper and could *miss* a peer who
+/// leaves that channel at the wrong moment; a missed QUIT is a ghost in a
+/// client's nick list, which is worse than any duplicate.
+#[derive(Debug, Clone)]
+pub struct UserEvent {
+    id: (CoreShardId, u64),
+    subject: ConnId,
+    line: Arc<str>,
+    audience: UserEventAudience,
+    /// How many parts each shard will receive. With one, nothing can repeat.
+    parts: usize,
+}
+
+/// One reporter's share of a [`UserEvent`]'s audience, for one session shard.
+#[derive(Debug)]
+pub struct UserEventPart {
+    shard: CoreShardId,
+    event: UserEvent,
+    recipients: Vec<Recipient>,
+}
+
+impl UserEventPart {
+    pub(crate) fn shard(&self) -> CoreShardId {
+        self.shard
+    }
+}
+
+/// A user event for the owner of some of the user's channels to report on.
+#[derive(Debug)]
+pub struct ChannelUserEvent {
+    channels: ShardChannels,
+    event: UserEvent,
+}
+
+impl ChannelUserEvent {
+    pub(crate) fn shard(&self) -> CoreShardId {
+        self.channels.shard()
     }
 }
 
@@ -1190,8 +1660,7 @@ impl ShardChannels {
 #[derive(Debug)]
 pub struct ChannelQuit {
     channels: ShardChannels,
-    conn: ConnId,
-    line: String,
+    event: UserEvent,
 }
 
 /// A parsed request, owned by its channel shard.
@@ -1495,7 +1964,8 @@ pub struct ChannelMemberUpdate {
     recipient: Recipient,
     identity: MemberIdentity,
     profile: ChannelMemberProfile,
-    change: ChannelMemberChange,
+    /// The NICK line to relay, when the update is a change of nick.
+    event: Option<UserEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -1510,14 +1980,14 @@ impl ChannelMemberUpdate {
         recipient: Recipient,
         identity: MemberIdentity,
         profile: ChannelMemberProfile,
-        change: ChannelMemberChange,
+        event: Option<UserEvent>,
     ) -> Self {
         Self {
             channels,
             recipient,
             identity,
             profile,
-            change,
+            event,
         }
     }
 
@@ -1770,12 +2240,8 @@ pub enum ChannelTagmsgResult {
 }
 
 impl ChannelQuit {
-    fn new(channels: ShardChannels, conn: ConnId, line: String) -> Self {
-        Self {
-            channels,
-            conn,
-            line,
-        }
+    fn new(channels: ShardChannels, event: UserEvent) -> Self {
+        Self { channels, event }
     }
 
     pub(crate) fn shard(&self) -> CoreShardId {
@@ -1908,8 +2374,8 @@ impl MlockModes {
 }
 
 /// One line of channel history in the hot ring.
-#[derive(Clone)]
-pub(crate) struct HistoryEntry {
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
     pub msgid: String,
     /// Unix **milliseconds** (see `Config::clock`): CHATHISTORY pages by this,
     /// so second granularity would make same-second messages unorderable.
@@ -2410,6 +2876,10 @@ impl ChannelOwner {
 pub(crate) struct ChannelDirectory {
     shards: CoreShardCount,
     channels: HashMap<ChanKey, Channel>,
+    /// Channels handed out mutably, or removed, since the last
+    /// [`ChannelDirectory::take_touched`]: the only ones whose published
+    /// description can have changed.
+    touched: Vec<ChanKey>,
 }
 
 impl ChannelDirectory {
@@ -2417,6 +2887,7 @@ impl ChannelDirectory {
         Self {
             shards,
             channels: HashMap::new(),
+            touched: Vec::new(),
         }
     }
 
@@ -2436,7 +2907,21 @@ impl ChannelDirectory {
     }
 
     pub(crate) fn get_mut(&mut self, key: &ChanKey) -> Option<&mut Channel> {
+        self.touched.push(key.clone());
         self.channels.get_mut(key)
+    }
+
+    /// Something published about `key` changed without the channel itself
+    /// being borrowed mutably (its history ring, which is kept beside it).
+    fn touch(&mut self, key: ChanKey) {
+        self.touched.push(key);
+    }
+
+    fn take_touched(&mut self) -> Vec<ChanKey> {
+        let mut touched = std::mem::take(&mut self.touched);
+        touched.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        touched.dedup();
+        touched
     }
 
     pub(crate) fn contains_key(&self, key: &ChanKey) -> bool {
@@ -2447,10 +2932,12 @@ impl ChannelDirectory {
         &mut self,
         key: ChanKey,
     ) -> std::collections::hash_map::Entry<'_, ChanKey, Channel> {
+        self.touched.push(key.clone());
         self.channels.entry(key)
     }
 
     pub(crate) fn remove(&mut self, key: &ChanKey) -> Option<Channel> {
+        self.touched.push(key.clone());
         self.channels.remove(key)
     }
 
@@ -2473,10 +2960,12 @@ impl Index<&ChanKey> for ChannelDirectory {
 
 pub(crate) struct ServerState {
     shard: CoreShardId,
+    shards: CoreShardCount,
     pub telemetry: Arc<Telemetry>,
     pub config: CoreConfig,
     pub casemap: CaseMapping,
     pub sessions: SessionStore,
+    users: UserDirectory,
     nicks: NickDirectory,
     memberships: MembershipDirectory,
     pub channels: ChannelDirectory,
@@ -2492,14 +2981,17 @@ pub(crate) struct ServerState {
     /// Requests to the DB worker (answered via `Input::DbReply`).
     pub db_tx: Sender<super::DbRequest>,
     /// High-water mark of simultaneously registered users (LUSERS max).
-    pub max_users: usize,
     /// Wall-clock millisecond the server state was created (STATS u uptime,
     /// which reports the difference in whole seconds).
     pub started_at: e6irc_proto::time::Millis,
     /// Monotonic per-process counter for msgid uniqueness.
     pub msgid_counter: u64,
-    /// MONITOR: watched nick → watching connections.
-    pub monitors: HashMap<NickKey, HashSet<ConnId>>,
+    /// MONITOR: watched nick → watching connections, on every shard.
+    pub(crate) monitors: MonitorDirectory,
+    user_event_sequence: u64,
+    /// Events some of whose reporters this shard has yet to hear from, with
+    /// the recipients already told.
+    user_events_in_progress: HashMap<(CoreShardId, u64), UserEventProgress>,
     /// Read markers: (account, target) → epoch millis. Mirrors the
     /// PostgreSQL table; this is the hot copy the core serves.
     pub read_markers: HashMap<(AccountKey, ChanKey), e6irc_proto::time::Millis>,
@@ -2536,7 +3028,10 @@ pub(crate) struct ServerState {
     /// of making authorization/existence decisions against stale hot state.
     pub pending_server_bans: HashSet<(String, String)>,
     /// Recent nick departures/changes for WHOWAS, newest-first.
-    pub whowas: std::collections::VecDeque<WhowasEntry>,
+    pub(crate) whowas: WhowasDirectory,
+    census: Census,
+    /// What this shard last added to the [`Census`]: connections, channels.
+    census_reported: (usize, usize),
     /// Hot history rings, keyed by channel or direct-message conversation.
     /// Channels and conversations share one store, one LRU and one cap, so
     /// the ring, overflow and eviction rules cannot drift apart between them.
@@ -2586,6 +3081,17 @@ pub(crate) const MAX_REGISTRATION_BUCKETS: usize = 4096;
 /// how fast one address can mint accounts.
 const REGISTRATION_REFILL_WINDOW_MS: u64 = 60 * 60 * 1000;
 
+/// The one response to a labeled command that is answered in several pieces:
+/// a multi-target JOIN, PART, KICK or PRIVMSG whose targets are owned by other
+/// shards, each of which answers on its own. labeled-response promises exactly
+/// one response per label, so the pieces are gathered here — with whatever the
+/// command answered on the spot — and framed together, as a batch if they are
+/// several lines, when the last one arrives.
+pub(crate) struct LabelGroup {
+    pub(crate) outstanding: usize,
+    pub(crate) lines: Vec<Bytes>,
+}
+
 /// Buffered direct responses to a labeled command.
 pub(crate) struct Capture {
     pub conn: ConnId,
@@ -2602,6 +3108,8 @@ pub(crate) struct Capture {
     /// labeled-response framer must not ACK the command as empty, and a channel
     /// owner must not release the requester — the deferred reply does both.
     pub deferred: bool,
+    /// How many separate answers the command left to asynchronous paths.
+    pub deferrals: usize,
 }
 
 /// A historical nick record for WHOWAS.
@@ -2645,7 +3153,7 @@ impl ServerState {
             away: session.away.is_some(),
             oper: session.oper,
             bot: session.bot,
-            last_active: session.last_active,
+            last_active: session.last_active.clone(),
         }
     }
 
@@ -3032,20 +3540,37 @@ impl ServerState {
         self.sync_channel_member(conn, ChannelMemberChange::Identity);
     }
 
+    /// Publish `conn`'s public state as it is now: to the user directory, and
+    /// to the owner of every channel it is in. `change` says what, beyond the
+    /// record itself, the channels must do about it (relay a NICK line).
     pub fn sync_channel_member(&mut self, conn: ConnId, change: ChannelMemberChange) {
         if !self.sessions[&conn].is_registered() {
             return;
         }
         let recipient = self.local_recipient(conn);
-        let identity = self.local_member_identity(conn);
-        let profile = self.local_member_profile(conn);
-        for channels in self.session_channels_by_shard(conn) {
+        let user = Arc::new(PublicUser::of(&self.sessions[&conn], recipient));
+        self.users.publish(user.clone());
+        self.sessions
+            .output_mut(&conn)
+            .expect("indexed above")
+            .published = Some(user.clone());
+        let owners = self.session_channels_by_shard(conn);
+        let event = match change {
+            ChannelMemberChange::Identity => None,
+            ChannelMemberChange::Nick { previous_prefix } => Some(self.user_event(
+                conn,
+                &format!(":{previous_prefix} NICK {}", user.nick),
+                UserEventAudience::Everyone,
+                owners.len(),
+            )),
+        };
+        for channels in owners {
             let update = ChannelMemberUpdate::new(
                 channels,
                 recipient,
-                identity.clone(),
-                profile.clone(),
-                change.clone(),
+                user.member_identity(),
+                user.member_profile(),
+                event.clone(),
             );
             if update.shard() == self.shard {
                 self.apply_channel_member_update(update);
@@ -3054,6 +3579,54 @@ impl ServerState {
                     .push(CoreEffect::Input(crate::core::Input::ChannelMemberUpdate {
                         update,
                     }));
+            }
+        }
+    }
+
+    /// Publish what this event changed about the channels this shard owns, for
+    /// the shards that answer WHOIS about their members. It costs a pass over
+    /// the members of each channel the event changed — and every event that
+    /// changes a channel (a join, a part, a mode, a topic) already costs one,
+    /// to tell those members.
+    pub(crate) fn publish_changed_channels(&mut self) {
+        for key in self.channels.take_touched() {
+            let published = self.channels.get(&key).map(|channel| PublicChannel {
+                name: channel.name.clone(),
+                secret: channel.modes.secret,
+                ranks: channel
+                    .members()
+                    .filter(|(_, modes)| modes.op || modes.voice)
+                    .map(|(conn, modes)| (conn, modes.clone()))
+                    .collect(),
+                latest_message: self
+                    .history
+                    .get(&HistoryKey::from(&key))
+                    .and_then(|ring| ring.entries.iter().map(|entry| entry.ts).max()),
+            });
+            self.memberships.publish_channel(&key, published);
+        }
+    }
+
+    /// Bring the rest of the server up to date with every session this event
+    /// changed. Run once after each event, over the sessions it touched, so a
+    /// handler cannot change what others see — an account, operator status, a
+    /// host, a real name — and forget to say so. (Each used to have to call
+    /// `sync_channel_member` itself; several never did, and were papered over
+    /// by a sync on every line the client sent.)
+    pub(crate) fn publish_changed_sessions(&mut self) {
+        for conn in self.sessions.take_touched() {
+            match self.sessions.get(&conn) {
+                None => self.users.withdraw(conn),
+                Some(session) if !session.is_registered() => {}
+                Some(session) => {
+                    let current = session
+                        .published
+                        .as_ref()
+                        .is_some_and(|published| published.describes(session));
+                    if !current {
+                        self.sync_channel_member(conn, ChannelMemberChange::Identity);
+                    }
+                }
             }
         }
     }
@@ -3075,24 +3648,144 @@ impl ServerState {
             self.shard,
             "member update reached wrong shard"
         );
-        let mut peers = Peers::of(update.recipient.conn());
         for key in update.channels.keys() {
-            let updated = self.channels.get_mut(key).is_some_and(|channel| {
+            if let Some(channel) = self.channels.get_mut(key) {
                 channel.update_member(
                     update.recipient,
                     update.identity.clone(),
                     update.profile.clone(),
-                )
-            });
-            if updated {
-                peers.extend(&self.channels[key].recipients());
+                );
             }
         }
-        let ChannelMemberChange::Nick { previous_prefix } = update.change else {
-            return;
+        if let Some(event) = update.event {
+            self.report_user_event(ChannelUserEvent {
+                channels: update.channels,
+                event,
+            });
+        }
+    }
+
+    /// A new event about `subject`, to be reported on by `reporters` parties.
+    fn user_event(
+        &mut self,
+        subject: ConnId,
+        line: &str,
+        audience: UserEventAudience,
+        reporters: usize,
+    ) -> UserEvent {
+        self.user_event_sequence += 1;
+        UserEvent {
+            id: (self.shard, self.user_event_sequence),
+            subject,
+            line: line.into(),
+            audience,
+            parts: reporters,
+        }
+    }
+
+    /// Tell everyone who can see `subject` — the peers in its channels, and
+    /// for anything but QUIT/NICK the extended-monitor watchers of its nick —
+    /// about something that happened to it, once each. `include_self` also
+    /// tells the subject (CHGHOST, which the user did not originate).
+    pub(crate) fn notify_user_event(
+        &mut self,
+        subject: ConnId,
+        line: &str,
+        audience: UserEventAudience,
+        include_self: bool,
+    ) {
+        let owners = self.session_channels_by_shard(subject);
+        // The watchers are one more reporter, alongside each channel owner.
+        let event = self.user_event(subject, line, audience, owners.len() + 1);
+        for channels in owners {
+            let report = ChannelUserEvent {
+                channels,
+                event: event.clone(),
+            };
+            if report.shard() == self.shard {
+                self.report_user_event(report);
+            } else {
+                self.route_input(crate::core::Input::ChannelUserEvent { report });
+            }
+        }
+        let mut watchers = Peers::of(subject);
+        if let Some(nick) = self.sessions.get(&subject).and_then(Session::nick) {
+            let watching: Vec<Recipient> = self
+                .monitors
+                .watchers(&self.nick_key(nick))
+                .into_iter()
+                .filter_map(|watcher| Some(self.users.get(watcher)?.recipient))
+                .filter(|recipient| recipient.caps().extended_monitor)
+                .collect();
+            watchers.extend(&watching, audience);
+        }
+        self.send_user_event_parts(&event, watchers);
+        if include_self {
+            self.send_timed(subject, line);
+        }
+    }
+
+    /// Report the peers of an event's subject among the channels this shard owns.
+    pub(crate) fn report_user_event(&mut self, report: ChannelUserEvent) {
+        assert_eq!(report.shard(), self.shard, "user event reached wrong shard");
+        let mut peers = Peers::of(report.event.subject);
+        for key in report.channels.keys() {
+            if let Some(channel) = self.channels.get(key) {
+                peers.extend(&channel.recipients(), report.event.audience);
+            }
+        }
+        self.send_user_event_parts(&report.event, peers);
+    }
+
+    /// Hand each shard the part of `peers` whose sessions it holds. When other
+    /// reporters exist every shard gets a part, even an empty one: a shard
+    /// forgets an event once it has heard from all of them.
+    fn send_user_event_parts(&mut self, event: &UserEvent, peers: Peers) {
+        let mut by_shard: Vec<Vec<Recipient>> = vec![Vec::new(); self.channels.shard_count()];
+        for recipient in peers.recipients.into_values() {
+            by_shard[recipient.shard().0].push(recipient);
+        }
+        for (shard, recipients) in by_shard.into_iter().enumerate() {
+            if event.parts == 1 && recipients.is_empty() {
+                continue;
+            }
+            let part = UserEventPart {
+                shard: CoreShardId(shard),
+                event: event.clone(),
+                recipients,
+            };
+            if part.shard == self.shard {
+                self.deliver_user_event_part(part);
+            } else {
+                self.route_input(crate::core::Input::UserEventPart { part });
+            }
+        }
+    }
+
+    /// Deliver an event to those of `part`'s recipients who have not had it.
+    pub(crate) fn deliver_user_event_part(&mut self, part: UserEventPart) {
+        assert_eq!(
+            part.shard, self.shard,
+            "user event part reached wrong shard"
+        );
+        let UserEventPart {
+            event, recipients, ..
+        } = part;
+        let fresh: Vec<Recipient> = if event.parts == 1 {
+            recipients
+        } else {
+            let pending = self.user_events_in_progress.entry(event.id).or_default();
+            pending.parts_heard += 1;
+            let fresh = recipients
+                .into_iter()
+                .filter(|recipient| pending.told.insert(recipient.conn()))
+                .collect();
+            if pending.parts_heard == event.parts {
+                self.user_events_in_progress.remove(&event.id);
+            }
+            fresh
         };
-        let line = format!(":{previous_prefix} NICK {}", update.identity.nick);
-        self.broadcast_recipients(peers.into_recipients(), &line);
+        self.broadcast_recipients(fresh, &event.line);
     }
 
     pub(crate) fn take_effects(&mut self) -> Vec<CoreEffect> {
@@ -3165,17 +3858,20 @@ impl ServerState {
             config,
             casemap: CaseMapping::Rfc1459,
             sessions: SessionStore::new(),
+            users: directories.users,
             nicks: directories.nicks,
             memberships: directories.memberships,
+            shards,
             channels: ChannelDirectory::new(shards),
             doomed: Vec::new(),
             effects: Vec::new(),
             suspended_accounts: HashSet::new(),
             db_tx,
-            max_users: 0,
             started_at,
             msgid_counter: 0,
-            monitors: HashMap::new(),
+            monitors: directories.monitors,
+            user_event_sequence: 0,
+            user_events_in_progress: HashMap::new(),
             read_markers: HashMap::new(),
             pending_read_markers: HashMap::new(),
             registered_founders: directories.founders,
@@ -3186,7 +3882,9 @@ impl ServerState {
             channel_options: directories.channel_options,
             server_bans: Vec::new(),
             pending_server_bans: HashSet::new(),
-            whowas: std::collections::VecDeque::new(),
+            whowas: directories.whowas,
+            census: directories.census,
+            census_reported: (0, 0),
             history: HashMap::new(),
             hot_history: std::collections::VecDeque::new(),
             emitting_deferred: None,
@@ -3287,6 +3985,7 @@ impl ServerState {
             }
             ring.entries.push_back(entry);
         }
+        self.channel_ring_changed(key);
         // Move to MRU.
         self.hot_history.retain(|k| k != key);
         self.hot_history.push_front(key.clone());
@@ -3295,6 +3994,7 @@ impl ServerState {
         while self.hot_history.len() > self.config.max_hot_channels {
             if let Some(cold) = self.hot_history.pop_back() {
                 self.history.remove(&cold);
+                self.channel_ring_changed(&cold);
             }
         }
     }
@@ -3345,10 +4045,44 @@ impl ServerState {
             realname: realname.to_string(),
             signoff: (self.config.clock)(),
         };
-        if self.whowas.len() == WHOWAS_CAP {
-            self.whowas.pop_back();
-        }
-        self.whowas.push_front(entry);
+        self.whowas.record(entry);
+    }
+
+    /// Add this event's change in this shard's connections and channels to
+    /// the server-wide counts.
+    pub(crate) fn publish_census(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = (self.sessions.len(), self.channels.len());
+        let (connections, channels) = self.census_reported;
+        // Wrapping add of the difference: adds or subtracts as needed.
+        self.census
+            .connections
+            .fetch_add(now.0.wrapping_sub(connections), Relaxed);
+        self.census
+            .channels
+            .fetch_add(now.1.wrapping_sub(channels), Relaxed);
+        self.census_reported = now;
+    }
+
+    /// The server-wide `(connections, channels, most users ever)`, counting
+    /// this shard as it is *now* — mid-event — rather than as last published.
+    pub(crate) fn census(&self) -> (usize, usize, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (connections, channels) = self.census_reported;
+        let users = self.users.len();
+        (
+            self.census
+                .connections
+                .load(Relaxed)
+                .wrapping_sub(connections)
+                .wrapping_add(self.sessions.len()),
+            self.census
+                .channels
+                .load(Relaxed)
+                .wrapping_sub(channels)
+                .wrapping_add(self.channels.len()),
+            self.census.most_users.fetch_max(users, Relaxed).max(users),
+        )
     }
 
     /// Whether two connections share at least one channel.
@@ -3607,17 +4341,52 @@ impl ServerState {
         self.nicks.registered_owner(key)
     }
 
+    /// Every registered user, on every shard.
+    pub(crate) fn registered_users(&self) -> Vec<Arc<PublicUser>> {
+        self.users.all()
+    }
+
+    /// A channel's display name and when its history ring last saw a message,
+    /// whichever shard owns the channel (and so holds the ring).
+    pub(crate) fn channel_activity(
+        &self,
+        key: &ChanKey,
+    ) -> Option<(String, e6irc_proto::time::Millis)> {
+        self.memberships.channel_activity(key)
+    }
+
+    /// The ring under `key` gained or lost entries. When it is a channel's,
+    /// what this shard publishes about that channel is out of date.
+    fn channel_ring_changed(&mut self, key: &HistoryKey) {
+        if key.as_str().starts_with('#') {
+            self.channels.touch(ChanKey(key.as_str().to_string()));
+        }
+    }
+
+    /// `target`'s channels as WHOIS shows them to `requester`.
+    pub(crate) fn whois_channels(&self, target: ConnId, requester: ConnId) -> Vec<String> {
+        self.memberships.whois_channels(target, requester)
+    }
+
+    /// Where `conn`'s session lives, whether or not it is this shard.
+    pub(crate) fn session_shard(&self, conn: ConnId) -> SessionOwner {
+        self.shards.session_owner(conn)
+    }
+
+    /// The published record of `conn`, on whichever shard it lives.
+    pub(crate) fn user(&self, conn: ConnId) -> Option<Arc<PublicUser>> {
+        self.users.get(conn)
+    }
+
+    /// The registered user holding `key`, on whichever shard they live.
+    pub(crate) fn registered_user(&self, key: &NickKey) -> Option<Arc<PublicUser>> {
+        self.users.get(self.nicks.registered_owner(key)?.conn())
+    }
+
     pub fn mark_nick_registered(&self, conn: ConnId) {
         if let Some(nick) = self.sessions[&conn].nick() {
             self.nicks.mark_registered(&self.nick_key(nick), conn);
         }
-    }
-
-    /// The local connection owning `key`.
-    pub fn nick_connection(&self, key: &NickKey) -> Option<ConnId> {
-        self.nick_reservation(key)
-            .filter(|owner| owner.shard() == self.shard)
-            .map(SessionOwner::conn)
     }
 
     /// Release `key` only when `conn` still owns it.
@@ -3629,9 +4398,8 @@ impl ServerState {
     /// casing when they are connected, otherwise the casefolded form itself
     /// (the only spelling still on record once they have gone).
     pub fn display_nick(&self, folded: &str) -> String {
-        self.nick_connection(&NickKey(folded.to_string()))
-            .and_then(|conn| self.sessions.get(&conn))
-            .and_then(|s| s.nick().map(String::from))
+        self.registered_user(&NickKey(folded.to_string()))
+            .map(|user| user.nick.clone())
             .unwrap_or_else(|| folded.to_string())
     }
 
@@ -3642,14 +4410,9 @@ impl ServerState {
         match identity.strip_prefix('~') {
             Some(nick) => self.display_nick(nick),
             None => self
-                .sessions
-                .values()
-                .find(|s| {
-                    s.account
-                        .as_deref()
-                        .is_some_and(|a| self.casemap.casefold(a) == identity)
-                })
-                .and_then(|s| s.nick().map(String::from))
+                .users
+                .logged_in_as(identity, self.casemap)
+                .map(|user| user.nick.clone())
                 .unwrap_or_else(|| identity.to_string()),
         }
     }
@@ -3664,12 +4427,12 @@ impl ServerState {
     /// occur in a nick or an account name, so an unauthenticated identity can
     /// never be claimed later by an account of the same name.
     ///
-    /// Two successive *unauthenticated* holders of a nick do still share the
-    /// `~nick` identity — without accounts there is nothing stronger to key on,
-    /// and scoping it to the connection instead would cut the other participant
-    /// off from their own conversation the moment the peer disconnected. The
-    /// account boundary is the one that carries privilege, and it is the one
-    /// enforced here; irctest's `testChathistoryDMs` covers the regression.
+    /// Two successive *unauthenticated* holders of a nick derive the same
+    /// `~nick` — without accounts there is nothing stronger to key on. That is
+    /// why such a conversation is never written to the database, and why the
+    /// rings holding it are freed on every shard the moment the identity is let
+    /// go, by disconnecting or by changing nick (`release_unauthenticated_identity`):
+    /// it lasts exactly as long as the party it was with.
     pub fn conn_identity(&self, conn: ConnId) -> String {
         match self.sessions.get(&conn) {
             Some(s) => match &s.account {
@@ -3685,8 +4448,8 @@ impl ServerState {
     /// an offline one is taken to be an account name, which is what lets a
     /// conversation with a registered user be read while they are away.
     pub fn nick_identity(&self, nick: &str) -> String {
-        match self.registered_peer(&self.nick_key(nick)) {
-            Some(conn) => self.conn_identity(conn),
+        match self.registered_user(&self.nick_key(nick)) {
+            Some(user) => user.identity(self.casemap),
             None => self.casemap.casefold(nick),
         }
     }
@@ -3707,20 +4470,6 @@ impl ServerState {
         (HistoryKey(key), peers)
     }
 
-    /// Resolve a nick to the connection that owns it, but only once that
-    /// session is fully registered. A pre-registration session reserves its
-    /// nick (so the nick collides for others) yet has no `user`/`realname`
-    /// and is not a user, so it resolves to `None` here. Every user-facing
-    /// lookup (WHOIS/USERHOST/MONITOR/SETHOST) goes through this instead of
-    /// `nicks` directly, which keeps `Session::prefix()`'s "registered"
-    /// expectations honest — an unregistered holder can never be prefix-built
-    /// (that would panic the shared core worker and take down the server).
-    pub fn registered_peer(&self, key: &NickKey) -> Option<ConnId> {
-        self.registered_nick_owner(key)
-            .filter(|owner| owner.shard() == self.shard)
-            .map(SessionOwner::conn)
-    }
-
     pub fn open(
         &mut self,
         conn: ConnId,
@@ -3732,7 +4481,7 @@ impl ServerState {
         let prev = self.sessions.insert(
             conn,
             Session {
-                tx,
+                output: SessionOutput::new(tx),
                 host,
                 transport,
                 reg: Registration::Registering {
@@ -3757,6 +4506,7 @@ impl ServerState {
                 channels: HashSet::new(),
                 monitoring: HashMap::new(),
                 multiline: None,
+                label_groups: HashMap::new(),
                 anon_read_markers: HashMap::new(),
                 // Seed the flood bucket full, with its refill watermark at the
                 // open time — NOT a zero `MonoMillis` sentinel. The monotonic
@@ -3776,11 +4526,13 @@ impl ServerState {
                 // sweep ago. Both are re-stamped before they gate anything
                 // (`last_active` at registration, `last_ping_sent` when a PING is
                 // actually sent), so open-time is a correct, sentinel-free floor.
-                last_active: opened_at,
+                last_active: LastActive::new(opened_at),
                 signon: e6irc_proto::time::Millis::from_millis(0),
                 opened_at,
                 awaiting_pong: false,
                 deferred_replies: 0,
+                history_requests_in_flight: 0,
+                published: None,
                 held: Vec::new(),
                 last_ping_sent: opened_at,
             },
@@ -3858,7 +4610,7 @@ impl ServerState {
         // kill, not unbounded growth.
         if self.emitting_deferred != Some(conn) {
             let sendq = self.config.sendq;
-            match self.sessions.get_mut(&conn) {
+            match self.sessions.output_mut(&conn) {
                 Some(session) if session.deferred_replies > 0 => {
                     if session.held.len() < sendq {
                         session.held.push(bytes);
@@ -3874,10 +4626,30 @@ impl ServerState {
             return; // events may race a close; the session is gone
         };
         let byte_count = bytes.strip_suffix(b"\r\n").unwrap_or(&bytes).len();
-        if deliver(&session.tx, WireLine::sanitized(bytes)).is_err() {
-            self.doomed.push(conn);
-        } else {
-            self.telemetry.record_irc_output(byte_count);
+        match session.output.write(WireLine::sanitized(bytes)) {
+            Ok(Written::Queued) => self.telemetry.record_irc_output(byte_count),
+            Ok(Written::AfterGoodbye) => {}
+            Err(_sendq_exceeded) => self.doomed.push(conn),
+        }
+    }
+
+    /// Take one of `conn`'s database history slots; `false` when all are taken.
+    pub(crate) fn history_request_started(&mut self, conn: ConnId) -> bool {
+        let Some(session) = self.sessions.get_mut(&conn) else {
+            return false;
+        };
+        if session.history_requests_in_flight >= MAX_HISTORY_REQUESTS_IN_FLIGHT {
+            return false;
+        }
+        session.history_requests_in_flight += 1;
+        true
+    }
+
+    /// The database answered one of `conn`'s history requests.
+    pub(crate) fn history_request_finished(&mut self, conn: ConnId) {
+        if let Some(session) = self.sessions.get_mut(&conn) {
+            session.history_requests_in_flight =
+                session.history_requests_in_flight.saturating_sub(1);
         }
     }
 
@@ -3897,6 +4669,7 @@ impl ServerState {
             && capture.conn == conn
         {
             capture.deferred = true;
+            capture.deferrals += 1;
         }
     }
 
@@ -3937,24 +4710,97 @@ impl ServerState {
         let Some(label) = label else {
             return self.emit_deferred(conn, emit);
         };
-        let previous = self.emitting_deferred.replace(conn);
-        // Capture the emitted lines (they route to `capture` because it targets
-        // this conn) so the framer can tag/batch them, exactly as a synchronous
-        // labeled command's direct replies are captured in `dispatch`.
+        let mut captured = self.capture_lines(conn, &label, emit);
+        // One of several answers to one labeled command: it waits for the rest.
+        if let Some(session) = self.sessions.output_mut(&conn)
+            && let Some(group) = session.label_groups.get_mut(&label)
+        {
+            group.lines.append(&mut captured);
+            group.outstanding -= 1;
+            if group.outstanding > 0 {
+                // This answer's hold is released; the response is not complete.
+                return self.release_deferred(conn);
+            }
+            captured = session
+                .label_groups
+                .remove(&label)
+                .expect("present above")
+                .lines;
+        }
+        self.emit_deferred(conn, |state| {
+            super::handler::frame_labeled(state, conn, &label, captured);
+        });
+    }
+
+    /// A labeled command left `capture`'s answer to asynchronous paths. If it
+    /// left it to several, or answered part of it on the spot, those pieces
+    /// must still come out as the one response the label is promised.
+    pub(crate) fn await_labeled_answers(&mut self, capture: Capture) {
+        let Some(label) = capture.label else {
+            return;
+        };
+        if capture.deferrals == 0 || (capture.deferrals == 1 && capture.lines.is_empty()) {
+            return; // nothing to gather: the single answer frames itself
+        }
+        if let Some(session) = self.sessions.output_mut(&capture.conn) {
+            session.label_groups.insert(
+                label,
+                LabelGroup {
+                    outstanding: capture.deferrals,
+                    lines: capture.lines,
+                },
+            );
+        }
+    }
+
+    /// Run `emit` and return the lines it sent to `conn` instead of sending
+    /// them (they route to the capture because it targets this conn), so a
+    /// framer can tag or batch them — exactly as a synchronous labeled
+    /// command's direct replies are captured in `dispatch`.
+    pub(crate) fn capture_lines(
+        &mut self,
+        conn: ConnId,
+        label: &str,
+        emit: impl FnOnce(&mut Self),
+    ) -> Vec<Bytes> {
         debug_assert!(self.capture.is_none(), "deferred reply nested in a capture");
         self.capture = Some(Capture {
             conn,
             lines: Vec::new(),
             reply_target: None,
             reply_caps: None,
-            label: Some(label.clone()),
+            label: Some(label.to_string()),
             deferred: false,
+            deferrals: 0,
         });
         emit(self);
-        let captured = self.capture.take().map(|c| c.lines).unwrap_or_default();
-        super::handler::frame_labeled(self, conn, &label, captured);
-        self.emitting_deferred = previous;
-        self.release_deferred(conn);
+        self.capture.take().map(|c| c.lines).unwrap_or_default()
+    }
+
+    /// A member whose session was gone before its JOIN was answered: the
+    /// session's QUIT named only the channels it knew it was in, so this one
+    /// never heard. Left alone the member counts toward `+l` forever and the
+    /// channel can never empty. The others are told with a PART, which — unlike
+    /// a second QUIT — cannot repeat what another shared channel already said.
+    pub(crate) fn remove_vanished_member(&mut self, owner: &ChannelOwner, conn: ConnId) {
+        assert_eq!(owner.shard(), self.shard, "departure reached wrong shard");
+        let key = owner.key();
+        let Some(channel) = self.channels.get_mut(key) else {
+            return;
+        };
+        let Some(prefix) = channel
+            .member_identities()
+            .find_map(|(member, _, identity)| (member == conn).then(|| identity.prefix.clone()))
+        else {
+            return;
+        };
+        channel.remove_member(conn);
+        let line = format!(":{prefix} PART {}", channel.name);
+        self.memberships.part(conn, key);
+        self.broadcast_channel(key, &line, None);
+        if !self.channels[key].has_members() {
+            self.remove_channel(key);
+        }
     }
 
     /// Emit an async reply framed under `label` (if any) that was NOT held behind
@@ -3987,6 +4833,7 @@ impl ServerState {
                     reply_caps: None,
                     label: Some(label.clone()),
                     deferred: false,
+                    deferrals: 0,
                 });
                 emit(self);
                 let captured = self.capture.take().map(|c| c.lines).unwrap_or_default();
@@ -4291,7 +5138,10 @@ impl ServerState {
     /// labeled-response capture and the deferred-reply hold: this is the last
     /// line the session will ever see, and no later reply will arrive to release
     /// output held behind an in-flight deferred page — so a held ERROR would
-    /// simply be lost. The sockets close when the `Core` is dropped immediately
+    /// simply be lost. For the same reason what is *already* held is released
+    /// first, in production order, exactly as [`Self::close`] does: the client
+    /// is owed everything the server produced for it, then the ERROR. The
+    /// sockets close when the `Core` is dropped immediately
     /// after this call, which drops every session's `Sender<Output>`; each write
     /// task then drains its queue — flushing this ERROR — before shutting the
     /// socket down.
@@ -4301,27 +5151,20 @@ impl ServerState {
             self.config.server_name
         );
         let bytes = Bytes::from(format!("{line}\r\n"));
-        for session in self.sessions.values() {
-            // Best-effort per client: a peer already gone just means its send
-            // queue is closed, which `deliver` treats as a no-error close.
-            let _ = deliver(&session.tx, WireLine::sanitized(bytes.clone()));
-        }
-    }
-
-    /// Everyone sharing at least one channel with `conn`, deduplicated,
-    /// excluding `conn` itself.
-    pub fn channel_peers(&self, conn: ConnId) -> Vec<ConnId> {
-        let Some(session) = self.sessions.get(&conn) else {
-            return Vec::new();
-        };
-        let mut seen = HashSet::new();
-        for key in &session.channels {
-            if let Some(chan) = self.channels.get(key) {
-                seen.extend(chan.recipients().iter().map(|recipient| recipient.conn()));
+        // The sessions stay until this worker stops — it still serves the
+        // other shards while they drain — but for their clients this is the
+        // last line (see `SessionOutput`).
+        for session in self.sessions.closing_sessions_mut() {
+            session.deferred_replies = 0;
+            for held in std::mem::take(&mut session.held) {
+                // A queue too full for it is a connection already lost, as for
+                // the goodbye itself.
+                drop(session.output.write(WireLine::sanitized(held)));
             }
+            session
+                .output
+                .write_goodbye(WireLine::sanitized(bytes.clone()));
         }
-        seen.remove(&conn);
-        seen.into_iter().collect()
     }
 
     /// A notice from a services pseudo-client (NickServ, ChanServ).
@@ -4384,8 +5227,10 @@ impl ServerState {
             format!("{head}{reason}")
         });
         if let Some(line) = quit_line {
-            for channels in self.session_channels_by_shard(conn) {
-                let quit = ChannelQuit::new(channels, conn, line.clone());
+            let owners = self.session_channels_by_shard(conn);
+            let event = self.user_event(conn, &line, UserEventAudience::Everyone, owners.len());
+            for channels in owners {
+                let quit = ChannelQuit::new(channels, event.clone());
                 if quit.shard() == self.shard {
                     self.quit_channel_member(quit);
                 } else {
@@ -4396,12 +5241,7 @@ impl ServerState {
         let session = self.sessions.remove(&conn).expect("checked above");
         self.memberships.release(conn);
         for key in session.monitoring.keys() {
-            if let Some(watchers) = self.monitors.get_mut(key) {
-                watchers.remove(&conn);
-                if watchers.is_empty() {
-                    self.monitors.remove(key);
-                }
-            }
+            self.monitors.unwatch(key, conn);
         }
         if let Some(nick) = session.nick() {
             let nick_key = NickKey(self.casemap.casefold(nick));
@@ -4417,24 +5257,38 @@ impl ServerState {
             // An authenticated identity is an account (stable, DB-backed) and is
             // deliberately retained.
             if session.account.is_none() {
-                let my_identity = format!("~{}", self.casemap.casefold(nick));
-                self.history
-                    .retain(|k, _| match k.as_str().split_once('!') {
-                        // A DM key is `lo!hi` where each side is an identity
-                        // (`~<foldednick>` for an unauthenticated peer); keep it
-                        // only if neither side is us. A channel name *can* legally
-                        // contain `!` (sanitize::valid_channel_name allows it), so
-                        // a channel key can also split here — but the key is
-                        // casefolded and `~` folds to `^` under rfc1459, so a
-                        // folded channel key never contains the `~`-prefixed
-                        // `my_identity` and is thus always retained.
-                        Some((lo, hi)) => lo != my_identity && hi != my_identity,
-                        // No `!`: not a DM key, always kept.
-                        None => true,
-                    });
-                self.hot_history.retain(|k| self.history.contains_key(k));
+                self.release_unauthenticated_identity(nick);
             }
         }
+    }
+
+    /// An unauthenticated session has let go of `nick` — by leaving or by
+    /// changing nick — and with it the `~nick` identity. Every shard frees the
+    /// conversations kept with it (each party's shard keeps a copy).
+    pub(crate) fn release_unauthenticated_identity(&mut self, nick: &str) {
+        let identity = format!("~{}", self.casemap.casefold(nick));
+        self.forget_unauthenticated_identity(&identity);
+        self.effects
+            .push(CoreEffect::BroadcastIdentityReleased { identity });
+    }
+
+    /// Free this shard's direct-message rings of a released `~nick` identity.
+    pub(crate) fn forget_unauthenticated_identity(&mut self, identity: &str) {
+        self.history
+            .retain(|k, _| match k.as_str().split_once('!') {
+                // A DM key is `lo!hi` where each side is an identity
+                // (`~<foldednick>` for an unauthenticated peer); keep it only
+                // if neither side is the one that left. A channel name *can*
+                // legally contain `!` (sanitize::valid_channel_name allows it),
+                // so a channel key can also split here — but the key is
+                // casefolded and `~` folds to `^` under rfc1459, so a folded
+                // channel key never contains the `~`-prefixed identity and is
+                // thus always retained.
+                Some((lo, hi)) => lo != identity && hi != identity,
+                // No `!`: not a DM key, always kept.
+                None => true,
+            });
+        self.hot_history.retain(|k| self.history.contains_key(k));
     }
 
     /// Apply a registered session's departure on the channel-owning shard.
@@ -4443,21 +5297,21 @@ impl ServerState {
     /// to that channel.
     pub fn quit_channel_member(&mut self, quit: ChannelQuit) {
         assert_eq!(quit.shard(), self.shard, "QUIT reached wrong channel shard");
-        let mut peers = Peers::of(quit.conn);
+        let mut peers = Peers::of(quit.event.subject);
         for key in quit.channels.keys() {
             let removed = self
                 .channels
                 .get_mut(key)
-                .and_then(|channel| channel.remove_member(quit.conn));
+                .and_then(|channel| channel.remove_member(quit.event.subject));
             if removed.is_none() {
                 continue;
             }
-            peers.extend(&self.channels[key].recipients());
+            peers.extend(&self.channels[key].recipients(), quit.event.audience);
             if !self.channels[key].has_members() {
                 self.remove_channel(key);
             }
         }
-        self.broadcast_recipients(peers.into_recipients(), &quit.line);
+        self.send_user_event_parts(&quit.event, peers);
     }
 }
 

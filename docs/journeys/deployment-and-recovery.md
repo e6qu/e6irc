@@ -100,9 +100,14 @@ when archives are requested.
 
 - Every pull request builds/tests all workspace features on Linux, macOS, and
   Windows for x86-64 and ARM64.
-- Every merge to `main` builds the production image natively on Linux amd64
-  and arm64, verifies each image’s runtime shape, and publishes one immutable
-  12-character commit-SHA multi-architecture GHCR manifest.
+- Every pull request and every push to `main` must pass the aggregate `ci-ok`
+  check, which needs every CI job and fails unless each one succeeded.
+- Every commit on `main` whose CI run succeeded — and no other — is built into
+  the production image natively on Linux amd64
+  and arm64; the release workflow starts from CI's completion, not from the
+  push, and builds the exact commit CI verified. It verifies each image’s
+  runtime shape and publishes one immutable 12-character commit-SHA
+  multi-architecture GHCR manifest.
 - Each architecture digest receives signed build-provenance and SPDX
   software-bill-of-materials attestations as Open Container Initiative
   referrers. The assembled multi-architecture digest
@@ -139,8 +144,11 @@ manifest shape. Ordinary pull-request CI proves the native packager's exact
 members, executable/document modes, and byte-for-byte reproducibility; the
 tag workflow uses that packager on all six native runners and refuses an
 incomplete archive set. `systemd-analyze verify` checks the service in CI,
-the same gate compares its stop budget to the daemon flush budget, and the
-portable entrypoint test executes both generated-path and operator-path modes.
+the same gate compares its stop budget to the daemon flush budget, and
+`crates/e6ircd/tests/config_cli.rs` drives the binary's environment-stated configuration:
+valid, refused by variable name, and never printing a value. The
+production-container job then boots the distroless image itself and proves it
+has no shell.
 
 ## Restart without losing durable state
 

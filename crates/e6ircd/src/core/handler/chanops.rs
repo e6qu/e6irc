@@ -415,7 +415,13 @@ pub(super) fn cmd_away(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     state.sync_channel_member(conn, crate::core::state::ChannelMemberChange::Identity);
-    notify_event(state, conn, &notify, |c| c.away_notify, false);
+    notify_event(
+        state,
+        conn,
+        &notify,
+        crate::core::state::UserEventAudience::AwayNotify,
+        false,
+    );
 }
 
 pub(super) fn cmd_list(state: &mut ServerState, conn: ConnId, p: &[&str]) {
@@ -529,19 +535,14 @@ pub(super) fn userhost_entries(state: &ServerState, p: &[&str]) -> Vec<String> {
     let mut entries = Vec::new();
     for &nick in p.iter().take(5) {
         let key = state.nick_key(nick);
-        if let Some(peer) = state.registered_peer(&key) {
-            let s = &state.sessions[&peer];
-            let away_marker = if s.away.is_some() { "-" } else { "+" };
+        if let Some(user) = state.registered_user(&key) {
+            let away_marker = if user.away.is_some() { "-" } else { "+" };
             // `*` after the nick marks an IRC operator (Modern RPL_USERHOST),
             // matching the oper flag WHO/WHOIS already surface.
-            let oper_marker = if s.oper { "*" } else { "" };
+            let oper_marker = if user.oper { "*" } else { "" };
             entries.push(format!(
                 "{}{}={}{}@{}",
-                s.nick().expect("registered"),
-                oper_marker,
-                away_marker,
-                s.user().expect("registered"),
-                s.host,
+                user.nick, oper_marker, away_marker, user.user, user.host,
             ));
         }
     }

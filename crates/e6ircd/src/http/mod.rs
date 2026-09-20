@@ -40,6 +40,7 @@ use openapi::*;
 pub(crate) use preflight::PreflightLimiter;
 use preflight::PreflightPermit;
 use sessions::*;
+pub(crate) use ws::UiSocketLimiter;
 use ws::*;
 
 /// The database pool for an unauthenticated endpoint, or a 503 problem
@@ -158,6 +159,8 @@ pub struct AppState {
     /// Admission control for connection tests, which dial third parties from
     /// the address every tenant shares.
     pub(crate) preflight_limiter: Arc<PreflightLimiter>,
+    /// Live chat sockets open per account.
+    pub(crate) ui_sockets: Arc<UiSocketLimiter>,
     /// The per-IP connection cap, shared with the TCP listeners so IRC sessions
     /// opened over `/ws/irc` count against the same budget as raw-socket ones.
     pub(crate) conn_limiter: crate::net::ConnLimiter,
@@ -3178,11 +3181,16 @@ mod pages {
         }
         let (outcome, approved) =
             match super::device::approve_user_code(&state, &account, &fields.user_code).await {
-                Ok(true) => ("Device approved — you can return to it now.", true),
-                Ok(false) => (
+                Ok(crate::db::DeviceApproval::Approved) => {
+                    ("Device approved — you can return to it now.", true)
+                }
+                Ok(crate::db::DeviceApproval::NoPendingGrant) => (
                     "No pending device with that code — check it and try again.",
                     false,
                 ),
+                Ok(crate::db::DeviceApproval::TokenLimitReached) => {
+                    (super::device::DEVICE_TOKEN_LIMIT_DETAIL, false)
+                }
                 Err(e) => {
                     eprintln!("http: device approve failed: {e}");
                     (

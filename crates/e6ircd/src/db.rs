@@ -73,6 +73,9 @@ pub enum DbError {
     /// An administrator attempted to suspend the account authenticating the
     /// request.
     CannotSuspendSelf,
+    /// Host-side administrator recovery named a suspended account. Recovery
+    /// does not undo a suspension as a side effect; the operator names another.
+    RecoveryOfSuspendedAccount(String),
     /// An administrator attempted to remove its own durable authority.
     CannotDemoteSelf,
     /// At least one active effective durable-or-configured administrator must remain.
@@ -117,6 +120,10 @@ impl std::fmt::Display for DbError {
             Self::TooManyAccessEntries => write!(f, "channel holds too many access entries"),
             Self::AlreadyInitialized => write!(f, "server account bootstrap is already complete"),
             Self::CannotSuspendSelf => write!(f, "an administrator cannot suspend itself"),
+            Self::RecoveryOfSuspendedAccount(n) => write!(
+                f,
+                "account {n} is suspended; recovery does not lift a suspension — name an active account"
+            ),
             Self::CannotDemoteSelf => {
                 write!(f, "an administrator cannot remove its own authority")
             }
@@ -611,12 +618,6 @@ async fn account_name_is_retired(
     .map_err(DbError::Query)
 }
 
-/// Create an account with a local password. Used by NickServ REGISTER
-/// and by tests/admin tooling.
-pub async fn create_account(pool: &PgPool, name: &str, password: &str) -> Result<i64, DbError> {
-    create_account_with_contact(pool, name, password, None).await
-}
-
 /// Create an account with an optional validated contact email.
 pub async fn create_account_with_contact(
     pool: &PgPool,
@@ -1109,6 +1110,89 @@ pub async fn bootstrap_first_admin(
     Ok(account_id)
 }
 
+/// The account an operator recovered from the host, and the one-time password
+/// that now opens it.
+#[derive(Debug)]
+pub struct AdministratorRecovery {
+    /// The account's stored name, which may differ in case from the one typed.
+    pub account: String,
+    pub password: String,
+}
+
+/// Who the audit log records for a recovery: not an account, because the point
+/// is that no account could act.
+const ADMINISTRATOR_RECOVERY_ACTOR: &str = "host:recover-administrator";
+
+/// Give an operator who holds the host — and so the database — a way back in
+/// when every administrator credential is lost or the identity provider that
+/// backed them is broken (`e6ircd recover-administrator`).
+///
+/// It acts on one existing, active account the operator names, in one
+/// transaction: the local password is replaced (or added, for an account only
+/// an identity provider ever opened) with a generated one returned once,
+/// durable administrator authority is granted, the account's browser sessions
+/// end — whoever held the lost credential is signed out — and the audit log
+/// records it. Nothing is guessed: an unknown name or a suspended account is
+/// refused. Nothing stays open afterwards: unlike the first-run browser
+/// bootstrap there is no token or page for anyone else to reach.
+pub async fn recover_administrator(
+    pool: &PgPool,
+    account: &str,
+) -> Result<AdministratorRecovery, DbError> {
+    use argon2::password_hash::rand_core::RngCore;
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut secret = [0u8; 32];
+    OsRng.fill_bytes(&mut secret);
+    let password = e6irc_proto::base64::encode(&secret);
+    // Hashed before the transaction, so the account row is not locked for it.
+    let hash = hash_password(password.clone()).await?;
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let row: Option<(i64, String, i64)> =
+        sqlx::query_as("SELECT id, name, flags FROM accounts WHERE name_folded = $1 FOR UPDATE")
+            .bind(&folded)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(DbError::Query)?;
+    let Some((account_id, name, flags)) = row else {
+        return Err(DbError::UnknownAccount(account.to_string()));
+    };
+    if flags & ACCOUNT_FLAG_SUSPENDED != 0 {
+        return Err(DbError::RecoveryOfSuspendedAccount(name));
+    }
+    sqlx::query(
+        "DELETE FROM account_credentials WHERE account_id = $1 AND kind = 'local_password'",
+    )
+    .bind(account_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    insert_primary_password(&mut transaction, account_id, &hash).await?;
+    sqlx::query("UPDATE accounts SET flags = flags | $2 WHERE id = $1")
+        .bind(account_id)
+        .bind(ACCOUNT_FLAG_ADMIN)
+        .execute(&mut *transaction)
+        .await
+        .map_err(DbError::Query)?;
+    sqlx::query("DELETE FROM web_sessions WHERE account_id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(DbError::Query)?;
+    insert_audit_log_with(
+        &mut *transaction,
+        ADMINISTRATOR_RECOVERY_ACTOR,
+        "ADMINISTRATOR_RECOVERY",
+        &folded,
+        "local password replaced, administrator authority granted, and browser sessions ended from the host",
+    )
+    .await?;
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(AdministratorRecovery {
+        account: name,
+        password,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountDeletionTarget {
     pub id: i64,
@@ -1578,8 +1662,11 @@ fn hasher() -> Argon2<'static> {
 /// credential endpoints (`create_app_password`, which calls `issue_app_password`
 /// directly, *not* through the worker) — and a per-path bound leaves any path
 /// that forgets it able to spawn unbounded argon2 and exhaust memory (tokio's
-/// blocking pool is ~512 threads ⇒ ~10 GiB). Enforced at the two choke points
-/// below (`hash_password`, `verify_credentials`) so no caller can bypass it.
+/// blocking pool is ~512 threads ⇒ ~10 GiB). Enforced at the only three
+/// functions that compute Argon2 — `hash_password`, `matching_credential_id`,
+/// and `spend_dummy_verification` — so no caller can bypass it. A permit covers
+/// a bounded amount of work: a login attempt is two computations (see
+/// `plan_credential_verification`), everything else is one.
 const MAX_CONCURRENT_ARGON2: usize = 4;
 
 /// The single gate every argon2 op passes through (see [`MAX_CONCURRENT_ARGON2`]).
@@ -1609,6 +1696,78 @@ struct CredentialHash {
     argon2_hash: String,
 }
 
+/// One of an account's stored credentials, as a login attempt sees it.
+#[derive(Clone, sqlx::FromRow)]
+struct StoredCredential {
+    credential_id: i64,
+    argon2_hash: String,
+    /// [`app_password_lookup`] of the secret, for an app password minted since
+    /// lookups were recorded.
+    app_password_lookup: Option<Vec<u8>>,
+    is_app_password: bool,
+}
+
+/// What names an app password's row. The secret is 32 random bytes, so its
+/// SHA-256 identifies it without helping anyone guess it — the way personal
+/// access tokens and browser sessions are already found.
+fn app_password_lookup(secret: &str) -> Vec<u8> {
+    token_hash(secret)
+}
+
+/// The Argon2 work one login attempt will do.
+struct CredentialVerificationPlan {
+    /// Stored hashes the presented password could match.
+    candidates: Vec<CredentialHash>,
+    /// Verifications against the dummy hash, spent so the attempt costs the
+    /// same whatever the account holds.
+    dummies: usize,
+    /// Candidates that are app passwords with no lookup yet; one that matches
+    /// gets its lookup recorded.
+    unindexed: Vec<i64>,
+}
+
+/// Decide what to verify `presented` against.
+///
+/// Trying every stored hash made one guess cost up to 33 Argon2 computations
+/// under a single permit of the four the whole process has, and made the time
+/// an attempt took a count of the account's credentials — zero for an account
+/// that does not exist. Instead an attempt verifies the primary password, and
+/// the one app password whose lookup `presented` hashes to; whichever of the
+/// two is missing is replaced by a dummy. Every attempt therefore costs two
+/// computations. App passwords with no lookup (minted before it existed) cannot
+/// be ruled out by it, so each is still tried until its first use records one.
+fn plan_credential_verification(
+    stored: Vec<StoredCredential>,
+    presented: &str,
+) -> CredentialVerificationPlan {
+    let lookup = app_password_lookup(presented);
+    let (mut primary, mut named, mut unindexed_rows) = (None, None, Vec::new());
+    for credential in stored {
+        match (&credential.app_password_lookup, credential.is_app_password) {
+            (_, false) => primary = Some(credential),
+            (Some(stored_lookup), true) if *stored_lookup == lookup => named = Some(credential),
+            (Some(_), true) => {}
+            (None, true) => unindexed_rows.push(credential),
+        }
+    }
+    let dummies = usize::from(primary.is_none()) + usize::from(named.is_none());
+    let unindexed = unindexed_rows.iter().map(|c| c.credential_id).collect();
+    let candidates = primary
+        .into_iter()
+        .chain(named)
+        .chain(unindexed_rows)
+        .map(|credential| CredentialHash {
+            credential_id: credential.credential_id,
+            argon2_hash: credential.argon2_hash,
+        })
+        .collect();
+    CredentialVerificationPlan {
+        candidates,
+        dummies,
+        unindexed,
+    }
+}
+
 /// Verify every supplied credential without short-circuiting.
 ///
 /// A stored hash that does not parse is damaged data, not a wrong password:
@@ -1619,6 +1778,7 @@ struct CredentialHash {
 /// fails closed either way.
 async fn matching_credential_id(
     credentials: Vec<CredentialHash>,
+    dummies: usize,
     password: String,
 ) -> Result<Option<i64>, DbError> {
     let _permit = ARGON2_PERMITS
@@ -1628,6 +1788,10 @@ async fn matching_credential_id(
     tokio::task::spawn_blocking(move || {
         let mut matched_id = None;
         let mut unreadable = None;
+        for _ in 0..dummies {
+            let parsed = PasswordHash::new(dummy_verify_hash()).expect("dummy hash parses");
+            let _ = hasher().verify_password(password.as_bytes(), &parsed);
+        }
         for credential in &credentials {
             match PasswordHash::new(&credential.argon2_hash) {
                 Ok(parsed) => {
@@ -1733,12 +1897,13 @@ pub async fn issue_app_password_for_account(
         return Err(DbError::TooManyCredentials);
     }
     sqlx::query(
-        "INSERT INTO account_credentials (account_id, kind, argon2_hash, label)
-         VALUES ($1, 'app_password', $2, $3)",
+        "INSERT INTO account_credentials (account_id, kind, argon2_hash, label, secret_lookup)
+         VALUES ($1, 'app_password', $2, $3, $4)",
     )
     .bind(account_id)
     .bind(&hash)
     .bind(label)
+    .bind(app_password_lookup(&secret))
     .execute(&mut *tx)
     .await
     .map_err(DbError::Query)?;
@@ -1756,6 +1921,7 @@ pub async fn issue_app_password_for_account(
 
 /// One worker loop; run as a task. Replies always reach the core (or
 /// the core is gone and the server is shutting down).
+// dead-pub-allow: integration tests drive the real worker loop with `DbRequest`s; the server's entry point, `run_worker_observed`, takes the crate-private `Telemetry` and cannot be called from a test crate.
 pub async fn run_worker(
     pool: PgPool,
     mut rx: Receiver<DbRequest>,
@@ -2205,7 +2371,7 @@ async fn handle_request(
         }
         DbRequest::QueryHistory {
             conn,
-            targets,
+            target,
             display,
             batch_ref,
             caps,
@@ -2213,18 +2379,22 @@ async fn handle_request(
             label,
         } => {
             let rows = async {
-                let effective = resolve_history_target(pool, targets)
-                    .await
-                    .map_err(DbError::Query)?;
-                query_history(pool, &effective, query).await
+                let rows = query_history(pool, &target, query.clone()).await?;
+                if rows.is_empty() && positioned_by_unknown_msgid(pool, &target, &query).await? {
+                    return Ok(Err(crate::core::HistoryFault::UnknownMsgid {
+                        subcommand: query.subcommand(),
+                    }));
+                }
+                Ok(Ok(rows))
             }
             .await
-            .map_err(|e| {
+            .unwrap_or_else(|e: DbError| {
                 record_database_error(telemetry);
                 // The error string is logged here; the core only needs to know
                 // it failed so it can FAIL the CHATHISTORY rather than reply
                 // with a misleading empty page.
                 eprintln!("db: history query failed: {e}");
+                Err(crate::core::HistoryFault::Unavailable)
             });
             core_tx
                 .push(Input::HistoryPage {
@@ -2242,6 +2412,7 @@ async fn handle_request(
             conn,
             channels,
             me,
+            session_only,
             min_ts,
             max_ts,
             limit,
@@ -2249,8 +2420,15 @@ async fn handle_request(
             caps,
             label,
         } => {
-            let targets = query_targets(pool, &channels, &me, min_ts, max_ts, limit)
+            let targets = query_targets(pool, &channels, me.as_deref(), min_ts, max_ts, limit)
                 .await
+                .map(|mut targets| {
+                    // Same order and bound as the query: oldest activity first.
+                    targets.extend(session_only);
+                    targets.sort_by_key(|(_, latest)| *latest);
+                    targets.truncate(limit);
+                    targets
+                })
                 .map_err(|e| {
                     record_database_error(telemetry);
                     eprintln!("db: targets query failed: {e}");
@@ -2863,21 +3041,44 @@ macro_rules! history_window {
     };
 }
 
-/// Resolve the stored target for an exact or offline-ambiguous history request.
-async fn resolve_history_target(
+/// Whether `query` is positioned by a msgid that `target` holds no message for.
+///
+/// An unknown pivot makes the window's position NULL and the page empty — which
+/// is also what a known pivot with nothing beyond it looks like. So an empty
+/// page is only an answer once this says the pivot exists; when it returns
+/// `true` the caller must fail loudly (`unknown msgid`) instead of serving the
+/// empty page, or a client resuming from a vanished msgid reads "nothing newer"
+/// as "up to date".
+///
+/// This asks the `messages` table, so it is authoritative exactly when the
+/// database is the record for `target`: every REST read, and an IRC read whose
+/// in-memory ring is incomplete. A caller answering from a *complete* ring (no
+/// database, or a ring that still holds the target's whole history) must ask
+/// the ring instead — a message may be in it and not yet flushed here. The
+/// pivot is looked up within `target`, never globally: a msgid from another
+/// buffer is unknown *here*. `target` is the stored key (a casefolded channel
+/// name, or the conversation key of two accounts). Call it only after
+/// [`query_history`] came back empty; a timestamp-positioned query has no
+/// pivots and always yields `false`.
+pub(crate) async fn positioned_by_unknown_msgid(
     pool: &PgPool,
-    targets: crate::core::HistoryTargets,
-) -> Result<String, sqlx::Error> {
-    let (primary, fallback) = match targets {
-        crate::core::HistoryTargets::Exact(target) => return Ok(target),
-        crate::core::HistoryTargets::PreferExisting { primary, fallback } => (primary, fallback),
-    };
-    let primary_exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE target = $1)")
-            .bind(&primary)
-            .fetch_one(pool)
-            .await?;
-    Ok(if primary_exists { primary } else { fallback })
+    target: &str,
+    query: &crate::core::HistoryQuery,
+) -> Result<bool, DbError> {
+    for msgid in query.msgid_pivots() {
+        let known: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE msgid = $1 AND target = $2)",
+        )
+        .bind(msgid)
+        .bind(target)
+        .fetch_one(pool)
+        .await
+        .map_err(DbError::Query)?;
+        if !known {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub async fn query_history(
@@ -3179,7 +3380,7 @@ struct HistoryTargetRow {
 pub async fn query_targets(
     pool: &PgPool,
     channels: &[String],
-    me: &str,
+    me: Option<&str>,
     min_ts: e6irc_proto::time::Millis,
     max_ts: e6irc_proto::time::Millis,
     limit: usize,
@@ -3200,6 +3401,7 @@ pub async fn query_targets(
                     MAX(ts) AS latest
              FROM messages
              WHERE dm_peers @> ARRAY[$5::text]
+               AND NOT EXISTS (SELECT 1 FROM UNNEST(dm_peers) p WHERE left(p, 1) = '~')
              GROUP BY name
          ) buffers
          GROUP BY name
@@ -3609,44 +3811,12 @@ pub async fn set_channel_founder(
     Ok(res.rows_affected() > 0)
 }
 
-/// Persist a server ban (KLINE/DLINE/XLINE). Upserts on `(mask, kind)` so
-/// re-banning an existing mask of the same kind refreshes its reason/setter.
-pub async fn add_server_ban(
-    pool: &PgPool,
-    mask: &str,
-    mask_display: &str,
-    reason: &str,
-    set_by: &str,
-    kind: &str,
-) -> Result<(), DbError> {
-    sqlx::query(
-        "INSERT INTO server_bans (mask, mask_display, reason, set_by, kind) VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (mask, kind) DO UPDATE
-            SET mask_display = EXCLUDED.mask_display, reason = EXCLUDED.reason, set_by = EXCLUDED.set_by",
-    )
-    .bind(mask)
-    .bind(mask_display)
-    .bind(reason)
-    .bind(set_by)
-    .bind(kind)
-    .execute(pool)
-    .await
-    .map_err(DbError::Query)?;
-    Ok(())
-}
-
-/// Remove a server ban by `(mask, kind)` (UN*LINE).
-pub async fn remove_server_ban(pool: &PgPool, mask: &str, kind: &str) -> Result<(), DbError> {
-    sqlx::query("DELETE FROM server_bans WHERE mask = $1 AND kind = $2")
-        .bind(mask)
-        .bind(kind)
-        .execute(pool)
-        .await
-        .map_err(DbError::Query)?;
-    Ok(())
-}
-
-async fn mutate_server_ban_audited(
+/// Add or remove a server ban (KLINE/DLINE/XLINE) together with its audit
+/// record, in one transaction: a ban nobody is on record for cannot exist. An
+/// add upserts on `(mask, kind)`, so re-banning a mask of the same kind
+/// refreshes its reason and setter. Returns whether anything changed — `false`
+/// when the ban to remove was not there.
+pub async fn mutate_server_ban_audited(
     pool: &PgPool,
     mutation: &crate::core::ServerBanMutation,
 ) -> Result<bool, DbError> {
@@ -3854,25 +4024,6 @@ pub async fn query_audit_log(
     })
 }
 
-/// The most recent `limit` audit entries, newest first.
-pub async fn list_audit_log(
-    pool: &PgPool,
-    page_size: AuditLogPageSize,
-) -> Result<Vec<AuditLogRow>, DbError> {
-    Ok(query_audit_log(
-        pool,
-        AuditLogFilter {
-            before_id: None,
-            actor: None,
-            action: None,
-            target: None,
-            page_size,
-        },
-    )
-    .await?
-    .entries)
-}
-
 /// Query the security-relevant activity visible to one account. Actor matches
 /// include the account's own mutations; target matches include administrator
 /// actions taken against it. Exact RFC1459 folding prevents one account from
@@ -3986,6 +4137,7 @@ pub async fn export_account_json(pool: &PgPool, account: &str) -> Result<Option<
                     'address', n.addr,
                     'tls', n.tls,
                     'nick', n.nick,
+                    'username', n.username,
                     'realname', n.realname,
                     'autojoin', n.autojoin,
                     'sasl_account', n.sasl_account,
@@ -4274,6 +4426,11 @@ pub enum DeviceStatus {
     /// Consuming the grant and minting the token happen in one transaction, so
     /// an approved grant is never destroyed by a token-mint failure.
     Approved(String),
+    /// The grant was approved, but its account can no longer be given a token:
+    /// it is at the per-account cap, or was suspended or deleted since. The
+    /// grant is consumed, so the device is told once (`access_denied`) instead
+    /// of polling to expiry.
+    Denied,
     /// The grant window elapsed.
     Expired,
     /// No such grant (bad or already-consumed device code).
@@ -4322,35 +4479,64 @@ pub async fn create_device_grant(pool: &PgPool) -> Result<(String, String), DbEr
     Ok((device_code, user_code))
 }
 
+/// What became of an attempt to approve a device grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceApproval {
+    Approved,
+    /// No pending, unexpired grant has that user code.
+    NoPendingGrant,
+    /// The approving account already holds [`MAX_API_TOKENS_PER_ACCOUNT`]
+    /// tokens. The grant is left pending: the person reading this can revoke a
+    /// token and approve again.
+    TokenLimitReached,
+}
+
 /// Approve a pending grant by its `user_code`, binding it to `account`.
-/// Returns whether a pending, unexpired grant was approved.
+///
+/// The cap is checked here so the person approving is the one told about it,
+/// while they can act on it. It is *enforced* where the token is minted
+/// ([`poll_device_grant`]); a slot taken between the two surfaces there.
 pub async fn approve_device_grant(
     pool: &PgPool,
     user_code: &str,
     account: &str,
-) -> Result<bool, DbError> {
+) -> Result<DeviceApproval, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let account_id = lock_active_account_id(&mut tx, &folded).await?;
+    if api_token_count(&mut tx, account_id).await? >= MAX_API_TOKENS_PER_ACCOUNT {
+        return Ok(DeviceApproval::TokenLimitReached);
+    }
     let res = sqlx::query(
         "UPDATE device_grants SET account = $2
          WHERE user_code = $1 AND account IS NULL AND expires_at > now()",
     )
     .bind(user_code)
     .bind(account)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(DbError::Query)?;
-    Ok(res.rows_affected() > 0)
+    tx.commit().await.map_err(DbError::Query)?;
+    Ok(if res.rows_affected() > 0 {
+        DeviceApproval::Approved
+    } else {
+        DeviceApproval::NoPendingGrant
+    })
 }
 
 /// Poll a grant; if approved and valid, atomically consume it and mint the
 /// caller's API token (labelled `token_label`) in the same transaction,
 /// returning the token in [`DeviceStatus::Approved`].
 ///
-/// Consume-and-mint is one transaction on purpose: if the mint fails (a
-/// transient DB error, or the account having been deleted between approval and
-/// poll), the transaction rolls back and the approved grant is left intact, so
-/// the client's next poll retries rather than being forced to restart the whole
-/// device flow. The `DELETE ... RETURNING` row lock still guarantees only one
-/// concurrent poll can win, so there is no double-mint.
+/// Consume-and-mint is one transaction on purpose: if the mint fails for a
+/// transient reason (a database error), the transaction rolls back and the
+/// approved grant is left intact, so the client's next poll retries rather than
+/// being forced to restart the whole device flow. A mint that can never succeed
+/// — the account is at its token cap, or is suspended or gone — is different:
+/// the grant is consumed, the denial is audited, and the device is answered
+/// [`DeviceStatus::Denied`] once, because retrying would only poll to expiry.
+/// The `DELETE ... RETURNING` row lock still guarantees only one concurrent
+/// poll can win, so there is no double-mint.
 pub async fn poll_device_grant(
     pool: &PgPool,
     device_code: &str,
@@ -4367,17 +4553,38 @@ pub async fn poll_device_grant(
     .await
     .map_err(DbError::Query)?;
     if let Some(account) = approved {
-        // Mint in the same transaction: on any error `tx` drops without commit,
-        // rolling the DELETE back so the grant survives for the next poll.
-        let token = insert_api_token(
-            &mut *tx,
+        let folded = CaseMapping::Rfc1459.casefold(&account);
+        // Mint in the same transaction: on a transient error `tx` drops without
+        // commit, rolling the DELETE back so the grant survives for the next poll.
+        let token = match mint_api_token_under_cap(
+            &mut tx,
             &account,
             token_label,
             crate::identity::ApiTokenScopes::device_access(),
             crate::identity::ApiTokenLifetimeDays::DEFAULT,
         )
-        .await?;
-        let folded = CaseMapping::Rfc1459.casefold(&account);
+        .await
+        {
+            Ok(token) => token,
+            Err(refusal @ (DbError::TooManyCredentials | DbError::BadCredentials)) => {
+                insert_audit_log_with(
+                    &mut *tx,
+                    &folded,
+                    "ACCOUNT_DEVICE_TOKEN_DENIED",
+                    &folded,
+                    match refusal {
+                        DbError::TooManyCredentials => {
+                            "approved device grant denied: personal access token limit reached"
+                        }
+                        _ => "approved device grant denied: account is suspended or gone",
+                    },
+                )
+                .await?;
+                tx.commit().await.map_err(DbError::Query)?;
+                return Ok(DeviceStatus::Denied);
+            }
+            Err(error) => return Err(error),
+        };
         insert_audit_log_with(
             &mut *tx,
             &folded,
@@ -4695,49 +4902,64 @@ struct CredentialVerificationRow {
 }
 
 /// Verify an account password or app password.
+///
+/// Every attempt costs two Argon2 computations under one permit, whether or
+/// not the account exists (see [`plan_credential_verification`]).
 pub async fn verify_credentials(
     pool: &PgPool,
     account: &str,
     password: &str,
 ) -> Result<Option<String>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let rows: Vec<CredentialVerificationRow> = sqlx::query_as(
-        "SELECT a.name AS display_name, c.argon2_hash, c.id AS credential_id FROM accounts a
+    let display_name: Option<String> =
+        sqlx::query_scalar("SELECT name FROM accounts WHERE name_folded = $1 AND (flags & $2) = 0")
+            .bind(&folded)
+            .bind(ACCOUNT_FLAG_SUSPENDED)
+            .fetch_optional(pool)
+            .await
+            .map_err(DbError::Query)?;
+    let stored: Vec<StoredCredential> = sqlx::query_as(
+        "SELECT c.id AS credential_id, c.argon2_hash,
+                c.secret_lookup AS app_password_lookup,
+                c.kind = 'app_password' AS is_app_password
+         FROM accounts a
          JOIN account_credentials c ON c.account_id = a.id
-         WHERE a.name_folded = $1 AND (a.flags & $2) = 0",
+         WHERE a.name_folded = $1 AND (a.flags & $2) = 0
+         ORDER BY c.id",
     )
     .bind(&folded)
     .bind(ACCOUNT_FLAG_SUSPENDED)
     .fetch_all(pool)
     .await
     .map_err(DbError::Query)?;
-    if rows.is_empty() {
-        spend_dummy_verification(password.to_string()).await;
+    let plan = plan_credential_verification(stored, password);
+    let matched_id =
+        matching_credential_id(plan.candidates, plan.dummies, password.to_string()).await?;
+    let (Some(display_name), Some(id)) = (display_name, matched_id) else {
         return Ok(None);
+    };
+    // Record the use so the credential list can show it, and give an app
+    // password minted before lookups existed the lookup that names it, so the
+    // next attempt no longer has to try it blind. Best-effort: a failure here
+    // must not fail an otherwise-successful authentication, so it is logged,
+    // not propagated.
+    let lookup = plan
+        .unindexed
+        .contains(&id)
+        .then(|| app_password_lookup(password));
+    if let Err(e) = sqlx::query(
+        "UPDATE account_credentials
+         SET last_used_at = now(), secret_lookup = COALESCE(secret_lookup, $2)
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(lookup)
+    .execute(pool)
+    .await
+    {
+        eprintln!("db: failed to record credential use: {e}");
     }
-    let display_name = rows[0].display_name.clone();
-    let creds = rows
-        .into_iter()
-        .map(|row| CredentialHash {
-            credential_id: row.credential_id,
-            argon2_hash: row.argon2_hash,
-        })
-        .collect();
-    let matched_id = matching_credential_id(creds, password.to_string()).await?;
-    if let Some(id) = matched_id {
-        // Record the use so the credential list can show it. Best-effort: a
-        // failure here must not fail an otherwise-successful authentication, so
-        // it is logged, not propagated.
-        if let Err(e) =
-            sqlx::query("UPDATE account_credentials SET last_used_at = now() WHERE id = $1")
-                .bind(id)
-                .execute(pool)
-                .await
-        {
-            eprintln!("db: failed to record credential last-used time: {e}");
-        }
-    }
-    Ok(matched_id.map(|_| display_name))
+    Ok(Some(display_name))
 }
 
 /// Verify only an account's primary password.
@@ -4773,6 +4995,7 @@ pub async fn verify_local_password(
             credential_id,
             argon2_hash,
         }],
+        0,
         password.to_string(),
     )
     .await?;
@@ -4871,6 +5094,7 @@ pub async fn change_local_password(
             credential_id,
             argon2_hash,
         }],
+        0,
         current_password.to_string(),
     )
     .await?
@@ -4957,6 +5181,8 @@ pub struct BncNetworkRow {
     pub addr: String,
     pub tls: bool,
     pub nick: String,
+    /// The IRC `USER` name. Present exactly for `kind = irc` (a table CHECK).
+    pub username: Option<String>,
     pub realname: Option<String>,
     pub autojoin: Vec<String>,
     pub sasl_account: Option<String>,
@@ -4982,6 +5208,7 @@ fn bnc_row(row: &sqlx::postgres::PgRow) -> Result<BncNetworkRow, DbError> {
         addr: row.get("addr"),
         tls: row.get("tls"),
         nick: row.get("nick"),
+        username: row.get("username"),
         realname: row.get("realname"),
         enabled: row.get("enabled"),
         autojoin: row.get("autojoin"),
@@ -5023,8 +5250,8 @@ pub async fn create_bnc_network(
     let id = sqlx::query_scalar(
         "INSERT INTO bnc_networks
            (account_id, name, addr, tls, nick, realname, autojoin,
-            sasl_account, sasl_password_sealed, kind, enabled)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            sasl_account, sasl_password_sealed, kind, enabled, username)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          ON CONFLICT (account_id, lower(name)) DO NOTHING
          RETURNING id",
     )
@@ -5039,6 +5266,7 @@ pub async fn create_bnc_network(
     .bind(&net.sasl_password_sealed)
     .bind(net.kind.as_db_str())
     .bind(net.enabled)
+    .bind(&net.username)
     .fetch_optional(&mut *tx)
     .await
     .map_err(DbError::Query)?
@@ -5059,7 +5287,7 @@ pub async fn list_bnc_networks(
 ) -> Result<Vec<BncNetworkRow>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let rows = sqlx::query(
-        "SELECT n.name, n.addr, n.tls, n.nick, n.realname, n.autojoin,
+        "SELECT n.name, n.addr, n.tls, n.nick, n.username, n.realname, n.autojoin,
                 n.sasl_account, n.sasl_password_sealed, n.enabled, n.kind
          FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
          WHERE a.name_folded = $1 ORDER BY n.name",
@@ -5082,7 +5310,7 @@ pub struct OwnedBncNetworkRow {
 pub async fn list_bnc_network_inventory(pool: &PgPool) -> Result<Vec<OwnedBncNetworkRow>, DbError> {
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT a.name AS owner, n.name, n.addr, n.tls, n.nick, n.realname, n.autojoin,
+        "SELECT a.name AS owner, n.name, n.addr, n.tls, n.nick, n.username, n.realname, n.autojoin,
                 n.sasl_account, n.sasl_password_sealed, n.enabled, n.kind
          FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
          ORDER BY a.name_folded, lower(n.name)",
@@ -5110,7 +5338,7 @@ pub async fn get_bnc_network(
 ) -> Result<Option<BncNetworkRow>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let row = sqlx::query(
-        "SELECT n.name, n.addr, n.tls, n.nick, n.realname, n.autojoin,
+        "SELECT n.name, n.addr, n.tls, n.nick, n.username, n.realname, n.autojoin,
                 n.sasl_account, n.sasl_password_sealed, n.enabled, n.kind
          FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
          WHERE a.name_folded = $1 AND lower(n.name) = lower($2)",
@@ -5160,7 +5388,7 @@ pub async fn update_bnc_network(
     let done = sqlx::query(
         "UPDATE bnc_networks n
          SET addr = $3, tls = $4, nick = $5, realname = $6, autojoin = $7,
-             sasl_account = $8, sasl_password_sealed = $9
+             sasl_account = $8, sasl_password_sealed = $9, username = $10
          FROM accounts a
          WHERE n.account_id = a.id AND a.name_folded = $1 AND lower(n.name) = lower($2)",
     )
@@ -5173,6 +5401,7 @@ pub async fn update_bnc_network(
     .bind(&network.autojoin)
     .bind(&network.sasl_account)
     .bind(&network.sasl_password_sealed)
+    .bind(&network.username)
     .execute(pool)
     .await
     .map_err(DbError::Query)?;
@@ -5189,7 +5418,7 @@ pub async fn list_startable_bnc_networks(
 ) -> Result<Vec<(String, BncNetworkRow)>, DbError> {
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT a.name AS owner, n.name, n.addr, n.tls, n.nick, n.realname,
+        "SELECT a.name AS owner, n.name, n.addr, n.tls, n.nick, n.username, n.realname,
                 n.autojoin, n.sasl_account, n.sasl_password_sealed, n.enabled, n.kind
          FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
          WHERE n.enabled AND (a.flags & $1) = 0",
@@ -6438,26 +6667,11 @@ pub async fn delete_other_web_sessions(
 
 // ---- personal access tokens ---------------------------------------------
 
-/// Mint a full-access PAT using the bounded default lifetime. Kept as the
-/// internal/test convenience entry point; user-facing issuance calls
-/// [`issue_scoped_api_token`] with the exact requested grant.
-/// Most PATs one account may hold via the REST create endpoint, matching the
-/// REST layer's `MAX_CREDENTIALS_PER_ACCOUNT`. Bounds authenticated storage
-/// growth. (The device-grant login path mints through `insert_api_token`
-/// directly; each of those requires an interactive approval, so it is not a
-/// flood vector and is intentionally not gated here.)
+/// Most personal access tokens one account may hold, matching the REST layer's
+/// `MAX_CREDENTIALS_PER_ACCOUNT`. Bounds authenticated storage growth. Every
+/// token is minted by [`mint_api_token_under_cap`] — the REST endpoint and an
+/// approved device grant alike — so the cap has no exception.
 const MAX_API_TOKENS_PER_ACCOUNT: i64 = 32;
-
-pub async fn issue_api_token(pool: &PgPool, account: &str, label: &str) -> Result<String, DbError> {
-    issue_scoped_api_token(
-        pool,
-        account,
-        label,
-        crate::identity::ApiTokenScopes::full_access(),
-        crate::identity::ApiTokenLifetimeDays::DEFAULT,
-    )
-    .await
-}
 
 pub async fn issue_scoped_api_token(
     pool: &PgPool,
@@ -6466,24 +6680,9 @@ pub async fn issue_scoped_api_token(
     scopes: crate::identity::ApiTokenScopes,
     lifetime: crate::identity::ApiTokenLifetimeDays,
 ) -> Result<String, DbError> {
-    // Cap and insert in one transaction with the account row locked FOR UPDATE.
-    // A count-then-insert across two pool statements (which is what the REST
-    // handler used to do) lets two concurrent requests each read cap-1 and both
-    // insert, overshooting the cap — the same TOCTOU `issue_app_password` closes.
     let folded = CaseMapping::Rfc1459.casefold(account);
     let mut tx = pool.begin().await.map_err(DbError::Query)?;
-    let account_id = lock_active_account_id(&mut tx, &folded).await?;
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE account_id = $1")
-        .bind(account_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(DbError::Query)?;
-    if count >= MAX_API_TOKENS_PER_ACCOUNT {
-        return Err(DbError::TooManyCredentials);
-    }
-    // The account row is locked in this tx, so `insert_api_token`'s own
-    // name-folded lookup resolves the same row under the lock.
-    let token = insert_api_token(&mut *tx, account, label, scopes, lifetime).await?;
+    let token = mint_api_token_under_cap(&mut tx, account, label, scopes, lifetime).await?;
     insert_audit_log_with(
         &mut *tx,
         &folded,
@@ -6496,47 +6695,60 @@ pub async fn issue_scoped_api_token(
     Ok(token)
 }
 
-/// Mint a fresh PAT for `account` on the given executor and return the
-/// plaintext token. Executor-generic so it can run either standalone against a
-/// pool or *inside a transaction* — the device-grant path mints here in the
-/// same transaction that consumes the grant, so consume and mint commit or roll
-/// back together.
-async fn insert_api_token<'e, E>(
-    executor: E,
+/// How many personal access tokens `account_id` holds. Meaningful as a cap
+/// check only while the caller's transaction holds the account row's lock.
+async fn api_token_count(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: i64,
+) -> Result<i64, DbError> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE account_id = $1")
+        .bind(account_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(DbError::Query)
+}
+
+/// The one way a personal access token comes to exist: mint it for `account`
+/// inside the caller's transaction and return the plaintext, shown once.
+///
+/// The cap and the insert run with the account row locked `FOR UPDATE`. A
+/// count-then-insert across two pool statements lets two concurrent requests
+/// each read cap-1 and both insert, overshooting the cap — the same race
+/// `issue_app_password` closes. Taking the caller's transaction lets the
+/// device-grant path consume its grant and mint together. A suspended or
+/// missing account is [`DbError::BadCredentials`]; an account at the cap is
+/// [`DbError::TooManyCredentials`].
+async fn mint_api_token_under_cap(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account: &str,
     label: &str,
     scopes: crate::identity::ApiTokenScopes,
     lifetime: crate::identity::ApiTokenLifetimeDays,
-) -> Result<String, DbError>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
+) -> Result<String, DbError> {
     use argon2::password_hash::rand_core::RngCore;
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let account_id = lock_active_account_id(transaction, &folded).await?;
+    if api_token_count(transaction, account_id).await? >= MAX_API_TOKENS_PER_ACCOUNT {
+        return Err(DbError::TooManyCredentials);
+    }
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
     let token = format!(
         "e6p_{}",
         e6irc_proto::base64::encode(&bytes).replace(['+', '/'], "-")
     );
-    let folded = CaseMapping::Rfc1459.casefold(account);
-    let inserted = sqlx::query(
+    sqlx::query(
         "INSERT INTO api_tokens (token_hash, account_id, label, scopes, expires_at)
-         SELECT $1, a.id, $2, $5, now() + make_interval(days => $6)
-         FROM accounts a
-         WHERE a.name_folded = $3 AND (a.flags & $4) = 0",
+         VALUES ($1, $2, $3, $4, now() + make_interval(days => $5))",
     )
     .bind(token_hash(&token))
+    .bind(account_id)
     .bind(label)
-    .bind(&folded)
-    .bind(ACCOUNT_FLAG_SUSPENDED)
     .bind(scopes.database_values())
     .bind(i32::from(lifetime.value()))
-    .execute(executor)
+    .execute(&mut **transaction)
     .await
     .map_err(DbError::Query)?;
-    if inserted.rows_affected() == 0 {
-        return Err(DbError::BadCredentials);
-    }
     Ok(token)
 }
 
@@ -6757,6 +6969,72 @@ pub async fn revoke_credential(pool: &PgPool, account: &str, id: i64) -> Result<
         "app password revoked",
     )
     .await
+}
+
+#[cfg(test)]
+mod credential_verification_plan_tests {
+    use super::{StoredCredential, app_password_lookup, plan_credential_verification};
+
+    fn local(id: i64) -> StoredCredential {
+        StoredCredential {
+            credential_id: id,
+            argon2_hash: format!("local-{id}"),
+            app_password_lookup: None,
+            is_app_password: false,
+        }
+    }
+
+    fn app(id: i64, secret: Option<&str>) -> StoredCredential {
+        StoredCredential {
+            credential_id: id,
+            argon2_hash: format!("app-{id}"),
+            app_password_lookup: secret.map(app_password_lookup),
+            is_app_password: true,
+        }
+    }
+
+    /// One login attempt costs the same Argon2 work whether the account
+    /// exists, has no app passwords, or has all 32 — so an account's app
+    /// passwords are neither a multiplier on an attacker's guesses nor a
+    /// timing signal that the account exists.
+    #[test]
+    fn one_attempt_costs_two_computations_however_many_app_passwords_exist() {
+        let many: Vec<_> = std::iter::once(local(1))
+            .chain((2..=33).map(|id| app(id, Some(&format!("secret-{id}")))))
+            .collect();
+        for (stored, presented, expect_ids) in [
+            (Vec::new(), "anything", vec![]),
+            (vec![local(1)], "anything", vec![1]),
+            (many.clone(), "not an app password", vec![1]),
+            (many.clone(), "secret-17", vec![1, 17]),
+            (vec![app(2, Some("secret-2"))], "secret-2", vec![2]),
+        ] {
+            let plan = plan_credential_verification(stored, presented);
+            let ids: Vec<i64> = plan.candidates.iter().map(|c| c.credential_id).collect();
+            assert_eq!(ids, expect_ids, "{presented}");
+            assert_eq!(plan.candidates.len() + plan.dummies, 2, "{presented}");
+        }
+    }
+
+    /// An app password minted before lookups existed names no row, so each is
+    /// still tried — on top of the constant two, and only until its first use
+    /// records its lookup.
+    #[test]
+    fn app_passwords_without_a_lookup_are_each_still_tried() {
+        let plan = plan_credential_verification(
+            vec![
+                local(1),
+                app(2, None),
+                app(3, Some("secret-3")),
+                app(4, None),
+            ],
+            "secret-3",
+        );
+        let ids: Vec<i64> = plan.candidates.iter().map(|c| c.credential_id).collect();
+        assert_eq!(ids, [1, 3, 2, 4]);
+        assert_eq!(plan.dummies, 0);
+        assert_eq!(plan.unindexed, [2, 4]);
+    }
 }
 
 #[cfg(test)]

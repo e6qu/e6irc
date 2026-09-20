@@ -16,10 +16,16 @@
 //
 // Shaping them here, away from the DOM, is what makes both testable.
 
+/**
+ * A refusal made before anything is sent. `field` is the request field at
+ * fault, in the API's own vocabulary, so the form marks the same box whether
+ * the refusal came from here or from the server.
+ */
 export class NetworkRequestError extends Error {
-  constructor(message) {
+  constructor(field, message) {
     super(message);
     this.name = "NetworkRequestError";
+    this.field = field;
   }
 }
 
@@ -44,20 +50,50 @@ export function credentialAction({ clearing = false, account = "", password = ""
   const trimmed = account.trim();
   if (!trimmed && !password) return { action: "keep" };
   if (!trimmed) {
-    throw new NetworkRequestError("Enter the NickServ account this password belongs to.");
+    throw new NetworkRequestError("sasl_account", "Enter the NickServ account this password belongs to.");
   }
   return { action: "set", account: trimmed, ...(password ? { password } : {}) };
 }
 
-function connection({ addr, tls, nick, autojoin }) {
+// The server's `UpstreamUsername` grammar. Mirrored here only so a refusal can
+// be shown before a round trip; the server remains the authority.
+const USERNAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$/;
+const USERNAME_RULE = "letters, digits, - and _ only, starting with a letter or digit, at most 10 characters";
+
+/**
+ * The `USER` parameter, which an upstream shows as the ident.
+ *
+ * The API requires one and never derives it. A blank box means the nickname,
+ * as the form says -- but a nickname may hold characters a username may not,
+ * and then the person is asked for one rather than handed a rewritten one.
+ */
+function usernameFor(typed, nickname) {
+  const username = String(typed ?? "").trim();
+  if (username) {
+    if (!USERNAME.test(username)) {
+      throw new NetworkRequestError("username", `That username cannot be used: ${USERNAME_RULE}.`);
+    }
+    return username;
+  }
+  if (!USERNAME.test(nickname)) {
+    throw new NetworkRequestError(
+      "username",
+      `Enter a username. The nickname ${nickname} cannot double as one: ${USERNAME_RULE}.`,
+    );
+  }
+  return nickname;
+}
+
+function connection({ addr, tls, nick, username, autojoin }) {
   const dialled = String(addr ?? "").trim();
   const nickname = String(nick ?? "").trim();
-  if (!dialled) throw new NetworkRequestError("Enter the server to connect to.");
-  if (!nickname) throw new NetworkRequestError("Enter a nickname.");
+  if (!dialled) throw new NetworkRequestError("addr", "Enter the server to connect to.");
+  if (!nickname) throw new NetworkRequestError("nick", "Enter a nickname.");
   return {
     addr: dialled,
     tls: Boolean(tls),
     nick: nickname,
+    username: usernameFor(username, nickname),
     autojoin: autojoinList(autojoin),
   };
 }
@@ -72,11 +108,11 @@ function connection({ addr, tls, nick, autojoin }) {
 export function createNetworkBody(form) {
   const base = connection(form);
   const name = String(form.name ?? "").trim();
-  if (!name) throw new NetworkRequestError("Name this network.");
+  if (!name) throw new NetworkRequestError("name", "Name this network.");
   const account = String(form.account ?? "").trim();
   const password = form.password ?? "";
   if (password && !account) {
-    throw new NetworkRequestError("Enter the NickServ account this password belongs to.");
+    throw new NetworkRequestError("sasl_account", "Enter the NickServ account this password belongs to.");
   }
   return {
     kind: "irc",

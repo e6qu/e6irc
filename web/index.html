@@ -214,6 +214,14 @@
             </label>
 
             <label class="field">
+              <span>Username <em>optional</em></span>
+              <!-- autocomplete="off", not "username": that token means the
+                   e6irc login, and this value goes to a third-party network. -->
+              <input id="nf-username" name="username" maxlength="10" autocomplete="off" autocapitalize="none" spellcheck="false" />
+              <small>The ident shown before the @ in your address. Your nickname is used when this is blank.</small>
+            </label>
+
+            <label class="field">
               <span>Real name <em>optional</em></span>
               <input id="nf-realname" name="realname" maxlength="128" />
               <small>Shown to others in /whois. Your nickname is used when this is blank.</small>

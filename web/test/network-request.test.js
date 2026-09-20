@@ -83,6 +83,59 @@ test("replace sends the nickname for an empty real name, as create does", () => 
   assert.equal(body.realname, "ada");
 });
 
+// The username is the `USER` parameter an upstream shows as the ident. The API
+// requires it and never derives one, so the form has to: a blank box means the
+// nickname, as the form says -- but only when the nickname is a legal username.
+// Anything else is refused at the box rather than quietly rewritten.
+test("a blank username sends the nickname on create and on replace", () => {
+  const create = createNetworkBody({ name: "libera", addr: "irc.libera.chat:6697", tls: true, nick: "ada" });
+  assert.equal(create.username, "ada");
+  const replace = updateNetworkBody({ addr: "irc.libera.chat:6697", tls: true, nick: "ada", username: "  " });
+  assert.equal(replace.username, "ada");
+});
+
+test("a typed username is sent as typed", () => {
+  const body = createNetworkBody({
+    name: "libera",
+    addr: "irc.libera.chat:6697",
+    tls: true,
+    nick: "ada|away",
+    username: "ada_l",
+  });
+  assert.equal(body.username, "ada_l");
+});
+
+test("a nickname that is not a legal username is never rewritten into one", () => {
+  for (const nick of ["ada|away", "[ada]", "_ada", "adalovelace1815"]) {
+    assert.throws(
+      () => createNetworkBody({ name: "libera", addr: "irc.libera.chat:6697", tls: true, nick }),
+      (error) => error instanceof NetworkRequestError && error.field === "username",
+      nick,
+    );
+  }
+});
+
+test("an illegal typed username is refused at its own box", () => {
+  for (const username of ["ada.l", "-ada", "ada l", "adalovelace1", "ädä"]) {
+    assert.throws(
+      () => updateNetworkBody({ addr: "irc.libera.chat:6697", tls: true, nick: "ada", username }),
+      (error) => error instanceof NetworkRequestError && error.field === "username",
+      username,
+    );
+  }
+});
+
+test("every refusal names the box it belongs to", () => {
+  const at = (field, build) =>
+    assert.throws(build, (error) => error instanceof NetworkRequestError && error.field === field, field);
+  at("addr", () => updateNetworkBody({ addr: "", tls: true, nick: "ada" }));
+  at("nick", () => updateNetworkBody({ addr: "irc.libera.chat:6697", tls: true, nick: " " }));
+  at("name", () => createNetworkBody({ name: " ", addr: "irc.libera.chat:6697", tls: true, nick: "ada" }));
+  at("sasl_account", () =>
+    createNetworkBody({ name: "libera", addr: "irc.libera.chat:6697", tls: true, nick: "ada", password: "x" }));
+  at("sasl_account", () => credentialAction({ password: "x" }));
+});
+
 test("the connection fields are required before anything is sent", () => {
   assert.throws(() => updateNetworkBody({ addr: "", tls: true, nick: "ada" }), NetworkRequestError);
   assert.throws(() => updateNetworkBody({ addr: "irc.libera.chat:6697", tls: true, nick: " " }), NetworkRequestError);

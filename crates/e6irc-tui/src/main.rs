@@ -3,14 +3,14 @@
 //! messages to the render loop over a channel.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use e6irc_client::token_cache::{default_token_path, load_token};
+use e6irc_client::credentials::{CredentialArguments, SecretSources, process_environment};
 use e6irc_client::{
-    Authentication, ClientEvent, Connection, ConnectionOptions, JoinRefusal, OwnedMessage,
+    CleartextCredentials, ClientEvent, Connection, ConnectionOptions, JoinRefusal, OwnedMessage,
     Registered,
 };
 use e6irc_tui::app::{Action, App};
@@ -33,27 +33,48 @@ struct Cli {
     /// Nickname to register with.
     #[arg(long, short)]
     nick: String,
+    /// IRC user name (ident) sent in USER. When absent, --nick is used, and
+    /// only if it is itself a legal user name (ASCII letters, digits, '_' and
+    /// '-', starting with a letter or digit, at most 10 bytes). A nick that is
+    /// not — `_bot`, `ada|away` — is never rewritten to fit: the client stops
+    /// and asks for --username.
+    #[arg(long, short)]
+    username: Option<String>,
     /// Initial channel to join.
     #[arg(long, short)]
     channel: String,
-    /// SASL PLAIN account. For BNC attachment use account/network.
-    #[arg(long, requires = "password", conflicts_with = "oauth_token")]
+    /// SASL PLAIN account. For BNC attachment use account/network. Its
+    /// password comes from --password-file, E6IRC_PASSWORD, or --password.
+    #[arg(long)]
     account: Option<String>,
-    /// SASL PLAIN password.
-    #[arg(long, requires = "account", conflicts_with = "oauth_token")]
+    /// SASL PLAIN password. A value typed here is visible to every local user
+    /// in the process list and is kept by the shell's history: prefer
+    /// --password-file or E6IRC_PASSWORD.
+    #[arg(long, conflicts_with = "password_file")]
     password: Option<String>,
-    /// SASL OAUTHBEARER token.
-    #[arg(long, conflicts_with_all = ["account", "password", "oauth_from_cache"])]
+    /// File holding the SASL PLAIN password (one trailing line break is
+    /// dropped). Refused if group or other users can read it.
+    #[arg(long)]
+    password_file: Option<PathBuf>,
+    /// SASL OAUTHBEARER token; E6IRC_OAUTH_TOKEN when no flag is given. A value
+    /// typed here is visible to other local users: prefer --oauth-token-file.
+    #[arg(long, conflicts_with = "oauth_token_file")]
     oauth_token: Option<String>,
+    /// File holding the SASL OAUTHBEARER token, under the same rules as
+    /// --password-file.
+    #[arg(long)]
+    oauth_token_file: Option<PathBuf>,
     /// Load the OAUTHBEARER token created by `e6irc login`.
-    #[arg(
-        long,
-        conflicts_with_all = ["account", "password", "oauth_token"]
-    )]
+    #[arg(long)]
     oauth_from_cache: bool,
     /// Token-cache path used by --oauth-from-cache.
     #[arg(long, requires = "oauth_from_cache")]
     token_file: Option<PathBuf>,
+    /// Send SASL credentials over a connection without --tls to a server that
+    /// is not this machine. Without this flag that is refused: the password or
+    /// token would cross the network readable by anyone on the path.
+    #[arg(long)]
+    allow_cleartext_credentials: bool,
     /// Connect over TLS using the public CA set.
     #[arg(long)]
     tls: bool,
@@ -107,44 +128,34 @@ fn main() -> io::Result<()> {
 }
 
 async fn async_main(cli: Cli) -> io::Result<()> {
-    let authentication = match (
-        cli.account,
-        cli.password,
-        cli.oauth_token,
-        cli.oauth_from_cache,
-    ) {
-        (Some(account), Some(password), None, false) => Authentication::Plain { account, password },
-        (None, None, Some(token), false) => Authentication::OAuthBearer { token },
-        (None, None, None, true) => {
-            let path = token_path(cli.token_file.as_deref())?;
-            let cached = load_token(&path)?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("no cached token at {}; run e6irc login", path.display()),
-                )
-            })?;
-            Authentication::OAuthBearer {
-                token: cached.access_token().to_owned(),
-            }
-        }
-        (None, None, None, false) => Authentication::None,
-        // clap makes this unreachable for command-line input. Keeping the
-        // validation here too protects programmatic/parser changes.
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "choose anonymous, paired --account/--password, --oauth-token, or --oauth-from-cache",
-            ));
-        }
-    };
+    let authentication = CredentialArguments {
+        account: cli.account,
+        password: SecretSources {
+            argument: cli.password,
+            file: cli.password_file,
+        },
+        oauth_token: SecretSources {
+            argument: cli.oauth_token,
+            file: cli.oauth_token_file,
+        },
+        oauth_from_cache: cli.oauth_from_cache,
+        token_file: cli.token_file,
+    }
+    .resolve(&process_environment)?;
     let connection_options = ConnectionOptions {
         address: cli.server,
         tls: cli.tls,
         tls_server_name: cli.tls_name,
         nick: cli.nick.clone(),
+        username: e6irc_client::stated_or_nick_username(cli.username.as_deref(), &cli.nick)?,
         realname: "e6irc-tui".into(),
         authentication,
         response_deadline: Duration::from_secs(cli.response_timeout),
+        cleartext_credentials: if cli.allow_cleartext_credentials {
+            CleartextCredentials::Allow
+        } else {
+            CleartextCredentials::Refuse
+        },
     };
     let read_markers = !cli.no_read_markers;
     let mut joined_channels = std::collections::BTreeSet::from([cli.channel.clone()]);
@@ -294,13 +305,6 @@ async fn async_main(cli: Cli) -> io::Result<()> {
             "UI failed: {run_error}; terminal restoration also failed: {restore_error}"
         ))),
     }
-}
-
-fn token_path(explicit: Option<&Path>) -> io::Result<PathBuf> {
-    explicit
-        .map(Path::to_path_buf)
-        .map(Ok)
-        .unwrap_or_else(default_token_path)
 }
 
 /// A registered connection and everything the UI starts a session from.
@@ -740,6 +744,8 @@ mod tests {
                 "irc.example:6697",
                 "--nick",
                 "alice",
+                "--username",
+                "alice",
                 "--channel",
                 "#chat",
             ]
@@ -760,16 +766,19 @@ mod tests {
             "token.json"
         ]));
         assert!(!parses(&["--token-file", "token.json"]));
-        assert!(!parses(&["--account", "alice"]));
-        assert!(!parses(&["--password", "secret"]));
+        // An account's password may come from the environment, which only
+        // resolution can see (`e6irc_client::credentials` owns and tests which
+        // combinations are mistakes); parsing refuses one secret given twice.
+        assert!(parses(&["--account", "alice"]));
+        assert!(parses(&["--account", "alice", "--password-file", "pw"]));
+        assert!(!parses(&["--password", "typed", "--password-file", "pw"]));
         assert!(!parses(&[
-            "--account",
-            "alice",
-            "--password",
-            "secret",
             "--oauth-token",
-            "device-token",
+            "typed",
+            "--oauth-token-file",
+            "token",
         ]));
+        assert!(parses(&["--allow-cleartext-credentials"]));
     }
 
     #[test]
@@ -906,9 +915,11 @@ mod tests {
             tls: false,
             tls_server_name: None,
             nick: "requested".into(),
+            username: "ident".into(),
             realname: "real".into(),
-            authentication: Authentication::None,
+            authentication: e6irc_client::Authentication::None,
             response_deadline: Duration::from_secs(5),
+            cleartext_credentials: CleartextCredentials::Refuse,
         };
         let mut channels =
             std::collections::BTreeSet::from(["#closed".to_owned(), "#open".to_owned()]);

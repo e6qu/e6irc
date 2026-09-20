@@ -6295,7 +6295,7 @@ fn chathistory_db_error_fails_rather_than_empty_batch() {
             batch: true,
             ..Default::default()
         },
-        rows: Err(()),
+        rows: Err(e6ircd::core::HistoryFault::Unavailable),
         label: None,
     });
     let out = s.drain(alice);
@@ -11251,4 +11251,279 @@ fn an_invite_sent_while_the_channel_is_open_does_not_pass_a_later_invite_only() 
         s.drain(puppet).iter().any(|line| line.contains(" JOIN ")),
         "an operator's invitation passes +i"
     );
+}
+
+/// A msgid the store has never seen is not "nothing newer": a client resuming
+/// from it would conclude it is up to date. It fails loudly. A timestamp that
+/// matches nothing is a real position in time, and stays an empty page.
+#[test]
+fn chathistory_with_an_unknown_msgid_fails_and_an_unmatched_timestamp_is_empty() {
+    let mut s = TestServer::new_no_persistence();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch draft/chathistory");
+    s.line(alice, "JOIN #h");
+    s.line(alice, "PRIVMSG #h :one");
+    s.drain(alice);
+    for request in [
+        "BEFORE #h msgid=nope 10",
+        "AFTER #h msgid=nope 10",
+        "AROUND #h msgid=nope 10",
+        "LATEST #h msgid=nope 10",
+        "BETWEEN #h msgid=nope timestamp=2000-01-01T00:00:00.000Z 10",
+    ] {
+        let subcommand = request.split(' ').next().expect("subcommand");
+        s.line(alice, &format!("CHATHISTORY {request}"));
+        assert_eq!(
+            s.drain(alice),
+            vec![format!(
+                ":irc.test.example FAIL CHATHISTORY MESSAGE_ERROR {subcommand} #h :unknown msgid"
+            )],
+            "{request}"
+        );
+    }
+    s.line(
+        alice,
+        "CHATHISTORY AFTER #h timestamp=2999-01-01T00:00:00.000Z 10",
+    );
+    let out = s.drain(alice);
+    assert!(
+        out.len() == 2 && out[0].contains("BATCH +") && out[1].contains("BATCH -"),
+        "a timestamp with nothing after it is an empty page: {out:#?}"
+    );
+}
+
+/// The database is the authority when the ring is not; its "no such msgid"
+/// is the same loud failure, carrying the label of the command that asked.
+#[test]
+fn chathistory_unknown_msgid_from_the_database_is_the_same_labeled_failure() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(
+        &mut s,
+        1,
+        "alice",
+        "batch draft/chathistory labeled-response",
+    );
+    s.line(alice, "JOIN #h");
+    s.drain(alice);
+    s.line(alice, "@label=r1 CHATHISTORY AFTER #h msgid=nope 10");
+    assert!(s.drain(alice).is_empty(), "answered by the database page");
+    let (batch_ref, caps, label) = s
+        .db_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            e6ircd::core::DbRequest::QueryHistory {
+                batch_ref,
+                caps,
+                label,
+                ..
+            } => Some((batch_ref, caps, label)),
+            _ => None,
+        })
+        .expect("deferred history query");
+    s.core.handle(Input::HistoryPage {
+        conn: alice,
+        display: "#h".into(),
+        batch_ref,
+        caps,
+        rows: Err(e6ircd::core::HistoryFault::UnknownMsgid {
+            subcommand: "AFTER",
+        }),
+        label,
+    });
+    assert_eq!(
+        s.drain(alice),
+        vec![
+            "@label=r1 :irc.test.example FAIL CHATHISTORY MESSAGE_ERROR AFTER #h :unknown msgid"
+                .to_string()
+        ]
+    );
+}
+
+/// One client pipelining history requests the ring cannot answer must not
+/// fill the database queue everyone's logins and message logging share.
+#[test]
+fn in_flight_chathistory_database_requests_are_capped_per_session() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch draft/chathistory");
+    s.line(alice, "JOIN #h");
+    s.drain(alice);
+    s.db_requests();
+    for _ in 0..8 {
+        s.line(alice, "CHATHISTORY LATEST #h * 10");
+    }
+    s.line(alice, "CHATHISTORY TARGETS timestamp=2000-01-01T00:00:00.000Z timestamp=2999-01-01T00:00:00.000Z 10");
+    let queued = s.db_requests();
+    assert_eq!(
+        queued.len(),
+        8,
+        "the ninth request must not reach the queue"
+    );
+
+    // Answer the first page: its reply, then the refusal that was held behind it.
+    let Some(e6ircd::core::DbRequest::QueryHistory {
+        batch_ref, caps, ..
+    }) = queued.into_iter().next()
+    else {
+        panic!("history query expected");
+    };
+    s.core.handle(Input::HistoryPage {
+        conn: alice,
+        display: "#h".into(),
+        batch_ref,
+        caps,
+        rows: Ok(Vec::new()),
+        label: None,
+    });
+    // A slot is free again, so the next request is queued.
+    s.line(alice, "CHATHISTORY LATEST #h * 10");
+    assert_eq!(
+        s.db_requests().len(),
+        1,
+        "a finished request frees its slot"
+    );
+    for _ in 0..8 {
+        s.core.handle(Input::HistoryPage {
+            conn: alice,
+            display: "#h".into(),
+            batch_ref: "b".into(),
+            caps: e6ircd::core::HistoryResponseCaps {
+                batch: true,
+                ..Default::default()
+            },
+            rows: Ok(Vec::new()),
+            label: None,
+        });
+    }
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|line| line
+            == ":irc.test.example FAIL CHATHISTORY MESSAGE_ERROR TARGETS \
+                :Too many history requests in flight"),
+        "the request over the cap must be refused loudly: {out:#?}"
+    );
+}
+
+/// `~nick` names whoever holds the nick right now, so a conversation with an
+/// unauthenticated party belongs to nobody durable: it is never written to the
+/// database and never asked of it. It lives in the ring, for the session.
+#[test]
+fn a_conversation_with_an_unauthenticated_party_never_touches_the_database() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch draft/chathistory");
+    identify(&mut s, alice, "alice");
+    let bob = s.register(2, "bob");
+    s.db_requests();
+    s.line(bob, "PRIVMSG alice :from a stranger");
+    s.line(alice, "PRIVMSG bob :to a stranger");
+    assert!(
+        !s.db_requests()
+            .iter()
+            .any(|request| matches!(request, e6ircd::core::DbRequest::LogMessage { .. })),
+        "a direct message with a `~` party was queued for persistence"
+    );
+
+    // Still readable for the session — from the ring, not the database.
+    s.drain(alice);
+    s.line(alice, "CHATHISTORY LATEST bob * 10");
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|line| line.ends_with(":from a stranger"))
+            && out.iter().any(|line| line.ends_with(":to a stranger")),
+        "{out:#?}"
+    );
+    // TARGETS asks the database about channels and account conversations, and
+    // carries the session-only conversation alongside so it is still listed.
+    s.line(
+        alice,
+        "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:01.000Z timestamp=2999-01-01T00:00:00.000Z 10",
+    );
+    let session_only = s
+        .db_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            e6ircd::core::DbRequest::QueryTargets { session_only, .. } => Some(session_only),
+            _ => None,
+        })
+        .expect("targets query");
+    assert_eq!(
+        session_only
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["~bob"]
+    );
+
+    // Bob leaves; a stranger takes the nick and asks for "his" history.
+    s.line(bob, "QUIT :bye");
+    let stranger = register_with_caps(&mut s, 3, "bob", "batch draft/chathistory");
+    s.db_requests();
+    s.drain(stranger);
+    s.line(stranger, "CHATHISTORY LATEST alice * 10");
+    let out = s.drain(stranger);
+    assert!(
+        out.len() == 2 && out[0].contains("BATCH +") && out[1].contains("BATCH -"),
+        "the previous occupant's conversation must be gone: {out:#?}"
+    );
+    s.line(
+        stranger,
+        "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:01.000Z timestamp=2999-01-01T00:00:00.000Z 10",
+    );
+    for request in s.db_requests() {
+        match request {
+            e6ircd::core::DbRequest::QueryHistory { target, .. } => {
+                panic!("the database was asked for {target:?}")
+            }
+            e6ircd::core::DbRequest::QueryTargets {
+                me, session_only, ..
+            } => {
+                assert_eq!(me, None, "a `~` identity must not be searched for");
+                assert!(session_only.is_empty(), "{session_only:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// What a channel knows about a member is a copy of the session's public
+/// state. Every change to that state must reach the copy — not only the ones
+/// whose handler remembered to send it, and not one line later.
+#[test]
+fn a_change_to_a_members_public_state_shows_in_who_at_once() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    s.line(alice, "JOIN #wx");
+    s.line(bob, "JOIN #wx");
+    s.line(alice, "OPER god letmein");
+    s.drain(alice);
+    s.drain(bob);
+    s.line(bob, "WHO #wx");
+    let out = s.drain(bob);
+    let row = out
+        .iter()
+        .find(|line| line.contains(" 352 ") && line.contains(" alice "))
+        .expect("alice's row");
+    assert!(
+        row.contains(" H*@ "),
+        "the new operator is not marked: {row}"
+    );
+}
+
+/// Giving up a nick releases its `~nick` identity exactly as disconnecting
+/// does: whoever takes the nick next must not inherit its conversations.
+#[test]
+fn renaming_away_from_a_nick_frees_its_unauthenticated_conversations() {
+    let mut s = TestServer::new_no_persistence();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch draft/chathistory");
+    let bob = s.register(2, "bob");
+    s.line(bob, "PRIVMSG alice :between us");
+    s.line(bob, "NICK robert");
+    let stranger = register_with_caps(&mut s, 3, "bob", "batch draft/chathistory");
+    s.drain(stranger);
+    s.line(stranger, "CHATHISTORY LATEST alice * 10");
+    let out = s.drain(stranger);
+    assert!(
+        !out.iter().any(|line| line.contains("between us")),
+        "the nick's previous holder's conversation was served: {out:#?}"
+    );
+    let _ = alice;
 }

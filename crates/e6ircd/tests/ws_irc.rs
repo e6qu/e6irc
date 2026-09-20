@@ -74,7 +74,13 @@ async fn ws_client_registers_and_messages_a_tcp_client() {
         .await
         .expect("tcp");
     let mut tcp = tcp;
-    tcp.register("tcpclient", "tcp").await.expect("register");
+    tcp.register(&e6irc_client::Identity {
+        nick: "tcpclient",
+        username: "tcpclient",
+        realname: "tcp",
+    })
+    .await
+    .expect("register");
     tcp.send_line("JOIN #ws").await.unwrap();
     loop {
         let m = tcp.next_message().await.unwrap().unwrap();

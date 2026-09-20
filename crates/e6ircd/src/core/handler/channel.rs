@@ -433,6 +433,14 @@ fn emit_join_response(state: &mut ServerState, conn: ConnId, result: ChannelJoin
         }
         ChannelJoinResult::Joined(join) => {
             let Some(session) = state.sessions.get_mut(&conn) else {
+                // The session left while its JOIN was being answered, so its
+                // QUIT never named this channel. Take the member back out.
+                let owner = state.channel_owner(join.key.as_str());
+                if state.owns_channel(&owner) {
+                    state.remove_vanished_member(&owner, conn);
+                } else {
+                    state.route_input(crate::core::Input::ChannelMemberVanished { owner, conn });
+                }
                 return;
             };
             session.channels.insert(join.key.clone());
@@ -722,6 +730,7 @@ pub(super) fn names_on_owner(
         reply_caps: Some(actor.recipient.caps()),
         label: None,
         deferred: false,
+        deferrals: 0,
     });
     send_names_with_caps(
         state,
@@ -1471,6 +1480,7 @@ pub(super) fn mode_change_on_owner(
         reply_caps: Some(actor.recipient.caps()),
         label: None,
         deferred: false,
+        deferrals: 0,
     });
     let mut arguments = Vec::with_capacity(change.arguments.len() + 1);
     arguments.push(change.modes);

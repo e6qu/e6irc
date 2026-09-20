@@ -102,35 +102,53 @@ pub(super) fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.err_needmoreparams(conn, "KILL");
         return;
     };
-    let key = state.nick_key(target);
-    if state.nick_connection(&key).is_none() {
+    let Some(victim) = state.registered_user(&state.nick_key(target)) else {
         state.err_nosuchnick(conn, target);
         return;
-    }
-    let comment = p.get(1).copied().unwrap_or("Killed");
-    let oper_nick = state.sessions[&conn]
+    };
+    let killer = state.sessions[&conn]
         .nick()
         .map(String::from)
         .expect("registered");
-    kill_by_nick(state, target, comment, &oper_nick);
+    session_action(
+        state,
+        victim.conn(),
+        crate::core::state::SessionAction::Kill {
+            comment: p.get(1).copied().unwrap_or("Killed").to_string(),
+            killer,
+        },
+    );
 }
 
-/// Disconnect the session currently holding `target` (by nick): audit it, snotice
-/// the other opers, send the standard KILL close `ERROR`, and close it. Returns
-/// whether a session was found and closed. `killer` is the display name
-/// attributed in the reason and audit — an oper's nick, or an admin account for
-/// the HTTP console. Shared by oper KILL and the admin console.
-pub(crate) fn kill_by_nick(
+/// Carry out `action` on `conn`'s session: here if it lives on this shard,
+/// otherwise by sending it to the shard it does live on. A session that is gone
+/// by the time the action arrives has nothing left to act on.
+pub(crate) fn session_action(
     state: &mut ServerState,
-    target: &str,
-    comment: &str,
-    killer: &str,
-) -> bool {
-    let key = state.nick_key(target);
-    let Some(victim) = state.nick_connection(&key) else {
-        return false;
-    };
-    kill_connection(state, victim, comment, killer)
+    conn: ConnId,
+    action: crate::core::state::SessionAction,
+) {
+    let session = state.session_shard(conn);
+    if !state.owns_session(session) {
+        state.route_input(crate::core::Input::SessionAction { session, action });
+        return;
+    }
+    match action {
+        crate::core::state::SessionAction::Kill { comment, killer } => {
+            kill_connection(state, conn, &comment, &killer);
+        }
+        crate::core::state::SessionAction::Ghost { by } => {
+            let server = state.config.server_name.clone();
+            let reason = format!("GHOST command used by {by}");
+            state.send(conn, &format!("ERROR :Closing Link: {server} ({reason})"));
+            state.close(conn, &reason);
+        }
+        crate::core::state::SessionAction::SetHost {
+            host,
+            oper,
+            oper_nick,
+        } => set_host(state, conn, &host, oper, &oper_nick),
+    }
 }
 
 /// Disconnect one exact registered connection. HTTP control-plane rows carry
@@ -224,20 +242,23 @@ pub(crate) fn record_audit_by(
 /// notice rather than subscribing to flags. Best-effort, like any NOTICE.
 pub(super) fn notify_opers(state: &mut ServerState, except: Option<ConnId>, text: &str) {
     let server = state.config.server_name.clone();
-    let recipients: Vec<(ConnId, String)> = state
-        .sessions
-        .iter()
-        .filter(|(c, s)| s.is_registered() && s.oper && Some(**c) != except)
-        .filter_map(|(&c, s)| s.nick().map(|n| (c, n.to_string())))
+    // Every operator, on whichever shard: the published records.
+    let recipients: Vec<_> = state
+        .registered_users()
+        .into_iter()
+        .filter(|user| user.oper && Some(user.conn()) != except)
         .collect();
-    for (c, nick) in recipients {
+    for user in recipients {
         // `text` can embed client-controlled, unbounded data (a KILL comment, a
         // ban reason), so fit it to the wire limit per recipient — the head's
         // length varies with the recipient's nick — or a maximal comment pushes
         // the line past 512 and the recipient's framing discards it whole.
-        let head = format!(":{server} NOTICE {nick} :*** Notice -- ");
+        let head = format!(":{server} NOTICE {} :*** Notice -- ", user.nick);
         let fitted = fit_trailing(&head, text);
-        state.send(c, &format!("{head}{fitted}"));
+        state.send_recipient_uncaptured(
+            user.recipient,
+            bytes::Bytes::from(format!("{head}{fitted}\r\n")),
+        );
     }
 }
 
@@ -818,27 +839,57 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
-    let nk = state.nick_key(nick);
-    let Some(target) = state.registered_peer(&nk) else {
+    let Some(target) = state.registered_user(&state.nick_key(nick)) else {
         state.err_nosuchnick(conn, clip_echo(nick));
         return;
     };
-    let (user, old_prefix) = {
-        let s = &state.sessions[&target];
-        (s.user().map(String::from).unwrap_or_default(), s.prefix())
+    record_audit(state, conn, "SETHOST", nick, newhost);
+    let oper = state.session_shard(conn);
+    session_action(
+        state,
+        target.conn(),
+        crate::core::state::SessionAction::SetHost {
+            host: newhost.to_string(),
+            oper,
+            oper_nick,
+        },
+    );
+}
+
+/// Apply a SETHOST on the shard the target's session lives on.
+fn set_host(
+    state: &mut ServerState,
+    target: ConnId,
+    newhost: &str,
+    oper: crate::core::SessionOwner,
+    oper_nick: &str,
+) {
+    let Some(session) = state.sessions.get_mut(&target) else {
+        return;
     };
-    state.sessions.get_mut(&target).expect("checked").host = newhost.to_string();
+    let (nick, user, old_prefix) = (
+        session.nick().map(String::from).unwrap_or_default(),
+        session.user().map(String::from).unwrap_or_default(),
+        session.prefix(),
+    );
+    session.host = newhost.to_string();
 
     // Announce with the old prefix so clients can match, to every
     // chghost-capable peer (including the target), then to extended-monitor
     // watchers of the target's nick.
     let chghost = format!(":{old_prefix} CHGHOST {user} {newhost}");
-    notify_event(state, target, &chghost, |c| c.chghost, true);
+    notify_event(
+        state,
+        target,
+        &chghost,
+        crate::core::state::UserEventAudience::Chghost,
+        state.sessions[&target].caps.chghost,
+    );
     // A chghost-capable target learned of the change from the CHGHOST above; a
     // client without the cap would otherwise never be told its own host moved.
     // Fill that gap with RPL_VISIBLEHOST so every target learns its new visible
     // host — the CHGHOST is for *other* clients' view, 396 is for the target's.
-    if state.sessions.get(&target).is_some_and(|s| !s.caps.chghost) {
+    if !state.sessions[&target].caps.chghost {
         state.numeric(
             target,
             RPL_VISIBLEHOST,
@@ -846,10 +897,12 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             Some("is now your visible host"),
         );
     }
-    record_audit(state, conn, "SETHOST", nick, newhost);
-    state.send(
-        conn,
-        &format!(":{server} NOTICE {oper_nick} :Set host of {nick} to {newhost}"),
+    let server = state.config.server_name.clone();
+    state.send_recipient_uncaptured(
+        crate::core::state::Recipient::new(oper, Default::default()),
+        bytes::Bytes::from(format!(
+            ":{server} NOTICE {oper_nick} :Set host of {nick} to {newhost}\r\n"
+        )),
     );
 }
 
@@ -870,13 +923,13 @@ pub(super) fn cmd_wallops(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let head = format!(":{prefix} WALLOPS :");
     let text = crate::core::handler::fit_trailing(&head, text);
     let line = format!("{head}{text}");
-    let recipients: Vec<ConnId> = state
-        .sessions
-        .iter()
-        .filter(|(_, s)| s.is_registered() && s.wallops)
-        .map(|(c, _)| *c)
+    let recipients: Vec<_> = state
+        .registered_users()
+        .into_iter()
+        .filter(|user| user.wallops)
+        .map(|user| user.recipient)
         .collect();
     for recipient in recipients {
-        state.send_timed(recipient, &line);
+        state.send_timed_recipient(recipient, &line);
     }
 }

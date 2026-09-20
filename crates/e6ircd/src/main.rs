@@ -3,17 +3,31 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use e6ircd::config::{Config, ConfigError};
+use e6ircd::environment_config;
 use e6ircd::net;
 use e6ircd::secret::SecretKey;
 
 const USAGE: &str = "usage:\n  \
-    e6ircd [--config <path>]        run the server\n  \
-    e6ircd check-config [--config <path>]\n  \
+    e6ircd [<configuration>]        run the server\n  \
+    e6ircd check-config [<configuration>]\n  \
                                      validate configuration and exit\n  \
     e6ircd genkey                   print a new base64 master key\n  \
     e6ircd seal [--key-file <path>] seal stdin into an enc:v2: blob\n  \
-    e6ircd rotate-secrets [--config <path>]\n  \
-                                     atomically re-seal database secrets";
+    e6ircd rotate-secrets [<configuration>]\n  \
+                                     atomically re-seal database secrets\n  \
+    e6ircd recover-administrator --account <name> [<configuration>]\n  \
+                                     lost every administrator login: give one\n  \
+                                     existing account a new one-time password\n  \
+                                     and administrator authority (audited)\n  \
+    e6ircd healthcheck [--addr <ip:port>] [--ready]\n  \
+                                     probe the running server's /healthz (or\n  \
+                                     /readyz); exit 0 only on HTTP 200. The\n  \
+                                     address is --addr, else E6IRC_HTTP_ADDR,\n  \
+                                     else that variable's default\n\
+<configuration> is one of:\n  \
+    --config <path>                 a TOML file (default: e6irc.toml)\n  \
+    --config-from-environment       the E6IRC_* variables a container is\n  \
+                                     given, read in memory; nothing is written";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -21,8 +35,113 @@ fn main() -> ExitCode {
         Some("genkey") => genkey(),
         Some("seal") => seal(&args[1..]),
         Some("rotate-secrets") => rotate_secrets(&args[1..]),
+        Some("recover-administrator") => recover_administrator(&args[1..]),
         Some("check-config") => check_config(&args[1..]),
+        Some("healthcheck") => healthcheck(&args[1..]),
         _ => run(&args),
+    }
+}
+
+/// The whole probe -- connect, write, read -- must finish inside this, so a
+/// container runtime's own health timeout never has to kill it.
+const HEALTHCHECK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// `e6ircd healthcheck`: the image's `HEALTHCHECK`. The runtime image has no
+/// HTTP client, so this is the daemon probing itself: it takes the address from
+/// the same environment variable, with the same default, as the server the
+/// image runs, and speaks one plain HTTP request over `std::net`. Exit 0 only on 200, 1 with one reason line otherwise, 2 for
+/// a usage error. It prints nothing taken from the environment but the address.
+fn healthcheck(args: &[String]) -> ExitCode {
+    let mut addr = None;
+    let mut path = "/healthz";
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--ready" => path = "/readyz",
+            "--addr" => match rest.next() {
+                Some(value) => addr = Some(value.clone()),
+                None => return usage_error(),
+            },
+            _ => return usage_error(),
+        }
+    }
+    let configured = addr
+        .or_else(|| std::env::var(environment_config::HTTP_ADDR_VARIABLE).ok())
+        .unwrap_or_else(|| environment_config::DEFAULT_HTTP_ADDR.to_string());
+    let Ok(listener) = configured.parse::<std::net::SocketAddr>() else {
+        eprintln!("e6ircd healthcheck: {configured:?} is not an ip:port address");
+        return ExitCode::from(2);
+    };
+    match probe(probe_target(listener), path, HEALTHCHECK_DEADLINE) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(reason) => {
+            eprintln!("e6ircd healthcheck: {path} on {listener}: {reason}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn usage_error() -> ExitCode {
+    eprintln!("{USAGE}");
+    ExitCode::from(2)
+}
+
+/// A listener bound to the unspecified address is reached on loopback of the
+/// same family; any other bind address is dialled as it is.
+fn probe_target(listener: std::net::SocketAddr) -> std::net::SocketAddr {
+    let ip = match listener.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => std::net::Ipv4Addr::LOCALHOST.into(),
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => std::net::Ipv6Addr::LOCALHOST.into(),
+        ip => ip,
+    };
+    std::net::SocketAddr::new(ip, listener.port())
+}
+
+fn probe(
+    target: std::net::SocketAddr,
+    path: &str,
+    deadline: std::time::Duration,
+) -> Result<(), String> {
+    use std::io::Write;
+    let started = std::time::Instant::now();
+    let remaining = || {
+        deadline
+            .checked_sub(started.elapsed())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| "timed out".to_string())
+    };
+    let mut stream = std::net::TcpStream::connect_timeout(&target, remaining()?)
+        .map_err(|error| format!("cannot connect: {}", error.kind()))?;
+    let (write_timeout, read_timeout) = (remaining()?, remaining()?);
+    stream
+        .set_write_timeout(Some(write_timeout))
+        .and_then(|()| stream.set_read_timeout(Some(read_timeout)))
+        .map_err(|error| format!("cannot bound the probe: {}", error.kind()))?;
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .map_err(|error| format!("cannot send the request: {}", error.kind()))?;
+    // "HTTP/1.1 200" is twelve bytes; nothing after the status code matters.
+    let mut head = [0u8; 12];
+    let mut filled = 0;
+    while filled < head.len() {
+        stream
+            .set_read_timeout(Some(remaining()?))
+            .map_err(|error| format!("cannot bound the probe: {}", error.kind()))?;
+        match stream.read(&mut head[filled..]) {
+            Ok(0) => return Err("the server closed the connection without answering".into()),
+            Ok(read) => filled += read,
+            Err(error) => return Err(format!("no answer: {}", error.kind())),
+        }
+    }
+    match std::str::from_utf8(&head) {
+        Ok(line) if line.starts_with("HTTP/1.") && &line[8..9] == " " => match &line[9..12] {
+            "200" => Ok(()),
+            status => Err(format!("status {status}")),
+        },
+        _ => Err("the answer is not HTTP".into()),
     }
 }
 
@@ -33,33 +152,63 @@ fn check_config(args: &[String]) -> ExitCode {
     }
 }
 
-fn config_path(args: &[String]) -> Result<PathBuf, ()> {
-    match args {
-        [] => Ok(PathBuf::from("e6irc.toml")),
-        [flag, path] if flag == "--config" => Ok(PathBuf::from(path)),
-        _ => Err(()),
+/// Where the configuration is stated: exactly one of a file and the
+/// environment. Every subcommand that needs the configuration takes either, so
+/// each of them runs in a container that has no file to point at.
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigSource {
+    File(PathBuf),
+    Environment,
+}
+
+impl ConfigSource {
+    fn from_arguments(args: &[String]) -> Result<Self, ()> {
+        match args {
+            [] => Ok(Self::File(PathBuf::from("e6irc.toml"))),
+            [flag, path] if flag == "--config" => Ok(Self::File(PathBuf::from(path))),
+            [flag] if flag == "--config-from-environment" => Ok(Self::Environment),
+            _ => Err(()),
+        }
+    }
+
+    /// The configuration, or the one-line reason there is none. No reason
+    /// quotes a value: a file's offending line and an environment variable's
+    /// content are each as likely a secret as not.
+    fn load(&self) -> Result<Config, String> {
+        let (loaded, source, origin) = match self {
+            Self::File(path) => (
+                Config::load(path),
+                std::fs::read_to_string(path).ok(),
+                path.display().to_string(),
+            ),
+            Self::Environment => (
+                environment_config::configuration_table(&environment_config::process_environment)
+                    .map_err(|error| ConfigError::Invalid(error.to_string()))
+                    .and_then(Config::from_table),
+                None,
+                "the environment".to_owned(),
+            ),
+        };
+        loaded.map_err(|error| {
+            let failure = match error {
+                ConfigError::Parse(parse) => describe_parse_error(parse, source.as_deref()),
+                other => other.to_string(),
+            };
+            format!("{failure} ({origin})")
+        })
     }
 }
 
-/// Resolve the config path and load the config, or print a diagnostic and
-/// return `FAILURE`. `context` is the error prefix (`"e6ircd"` for the main
-/// command, `"e6ircd rotate-secrets"` for the subcommand).
+/// Resolve where the configuration is stated and load it, or print a
+/// diagnostic and return `FAILURE`. `context` is the error prefix (`"e6ircd"`
+/// for the main command, `"e6ircd rotate-secrets"` for the subcommand).
 fn load_config_or_fail(args: &[String], context: &str) -> Result<Config, ExitCode> {
-    let config_path = match config_path(args) {
-        Ok(path) => path,
-        Err(()) => {
-            eprintln!("{USAGE}");
-            return Err(ExitCode::FAILURE);
-        }
+    let Ok(source) = ConfigSource::from_arguments(args) else {
+        eprintln!("{USAGE}");
+        return Err(ExitCode::FAILURE);
     };
-    Config::load(&config_path).map_err(|error| {
-        let failure = match error {
-            ConfigError::Parse(parse) => {
-                describe_parse_error(parse, std::fs::read_to_string(&config_path).ok().as_deref())
-            }
-            other => other.to_string(),
-        };
-        eprintln!("{context}: {failure} ({})", config_path.display());
+    source.load().map_err(|failure| {
+        eprintln!("{context}: {failure}");
         ExitCode::FAILURE
     })
 }
@@ -151,6 +300,58 @@ fn rotate_secrets(args: &[String]) -> ExitCode {
         }
         Err(error) => {
             eprintln!("e6ircd rotate-secrets: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The operator's way back in when no administrator can sign in: every
+/// administrator credential is lost, or the identity provider behind them is
+/// broken. Reaching it takes what only the host's operator has — this binary,
+/// the configuration file, and through it the database — and nothing about it
+/// is reachable from the network or happens by itself. One run recovers one
+/// named account (see [`e6ircd::db::recover_administrator`]). The new password
+/// works at once; a running server reads administrator authority when it
+/// starts, so it must be restarted before the account can administer.
+fn recover_administrator(args: &[String]) -> ExitCode {
+    const CONTEXT: &str = "e6ircd recover-administrator";
+    let (account, config_args) = match args {
+        [flag, account, rest @ ..] if flag == "--account" && !account.is_empty() => (account, rest),
+        _ => {
+            eprintln!("{CONTEXT}: name the account to recover with --account <name>\n{USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let config = match load_config_or_fail(config_args, CONTEXT) {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+    let Some(database) = config.database else {
+        eprintln!("{CONTEXT}: [database] is required; accounts live there");
+        return ExitCode::FAILURE;
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    match runtime.block_on(async {
+        let pool = e6ircd::db::connect_and_migrate(&database.url).await?;
+        e6ircd::db::recover_administrator(&pool, account).await
+    }) {
+        Ok(recovery) => {
+            eprintln!(
+                "{CONTEXT}: account {} now has administrator authority and a new local \
+                 password, printed once below. Its browser sessions were ended and the \
+                 audit log records this. Restart e6ircd — a running server reads \
+                 administrator authority when it starts — then sign in at /login and \
+                 change the password.",
+                recovery.account
+            );
+            println!("{}", recovery.password);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{CONTEXT}: {error}; nothing was changed");
             ExitCode::FAILURE
         }
     }
@@ -300,6 +501,71 @@ async fn wait_for_shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-shot HTTP peer answering every connection with `response`.
+    fn answering(response: &'static [u8]) -> std::net::SocketAddr {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("address");
+        std::thread::spawn(move || {
+            if let Ok((mut peer, _)) = listener.accept() {
+                let mut request = [0u8; 256];
+                // The probe sends its request first; read some of it so the
+                // close below is not a reset racing the client's write.
+                drop(peer.read(&mut request));
+                drop(peer.write_all(response));
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn the_health_probe_succeeds_only_on_200() {
+        let second = std::time::Duration::from_secs(1);
+        assert_eq!(
+            probe(answering(b"HTTP/1.1 200 OK\r\n\r\nok"), "/healthz", second),
+            Ok(())
+        );
+        assert_eq!(
+            probe(
+                answering(b"HTTP/1.1 503 Service Unavailable\r\n\r\n"),
+                "/readyz",
+                second
+            ),
+            Err("status 503".to_string())
+        );
+        assert_eq!(
+            probe(answering(b"SSH-2.0-OpenSSH_9\r\n"), "/healthz", second),
+            Err("the answer is not HTTP".to_string())
+        );
+        assert_eq!(
+            probe(answering(b""), "/healthz", second),
+            Err("the server closed the connection without answering".to_string())
+        );
+    }
+
+    #[test]
+    fn the_health_probe_gives_up_at_its_deadline_and_on_a_closed_port() {
+        // Accepts and then says nothing.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = silent.local_addr().expect("address");
+        let started = std::time::Instant::now();
+        let result = probe(addr, "/healthz", std::time::Duration::from_millis(300));
+        assert!(result.is_err(), "{result:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        drop(silent);
+        let refused = probe(addr, "/healthz", std::time::Duration::from_millis(300))
+            .expect_err("nothing listens there any more");
+        assert!(refused.starts_with("cannot connect"), "{refused}");
+    }
+
+    #[test]
+    fn an_unspecified_bind_address_is_probed_on_loopback_of_its_family() {
+        let target = |addr: &str| probe_target(addr.parse().expect("address")).to_string();
+        assert_eq!(target("0.0.0.0:8080"), "127.0.0.1:8080");
+        assert_eq!(target("[::]:8080"), "[::1]:8080");
+        assert_eq!(target("10.1.2.3:9000"), "10.1.2.3:9000");
+    }
 
     fn parse_failure(source: &str) -> String {
         let error = toml::from_str::<Config>(source).expect_err("unparsable configuration");

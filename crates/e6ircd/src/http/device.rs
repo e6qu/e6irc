@@ -352,6 +352,7 @@ pub(super) async fn device_token(
             token_type: "bearer",
         }),
         Ok(crate::db::DeviceStatus::Pending) => oauth_err("authorization_pending"),
+        Ok(crate::db::DeviceStatus::Denied) => oauth_err("access_denied"),
         Ok(crate::db::DeviceStatus::Expired) => oauth_err("expired_token"),
         Ok(crate::db::DeviceStatus::Unknown) => oauth_err("invalid_grant"),
         Err(e) => {
@@ -371,6 +372,10 @@ pub(super) struct DeviceApproveReq {
     pub(super) user_code: String,
 }
 
+/// What the person approving a device is told when their account is at the
+/// personal access token cap: the device's token would be one more.
+pub(super) const DEVICE_TOKEN_LIMIT_DETAIL: &str = "This account already holds the most personal access tokens allowed (32). Revoke one, then approve the device again.";
+
 /// Normalise a user-typed code (users may type it lowercase or with a
 /// separator) and approve its pending grant as `account`. Shared by the JSON
 /// API and the `/device` verification page.
@@ -378,7 +383,7 @@ pub(super) async fn approve_user_code(
     state: &AppState,
     account: &str,
     raw_code: &str,
-) -> Result<bool, crate::db::DbError> {
+) -> Result<crate::db::DeviceApproval, crate::db::DbError> {
     let pool = pool_of(state);
     let code: String = raw_code
         .chars()
@@ -405,11 +410,11 @@ mod tests {
 
     #[test]
     fn managed_network_requests_are_driver_specific() {
-        assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"irc","revision":1,"name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#).is_ok());
+        assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"irc","revision":1,"name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#).is_ok());
         assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"irc","revision":1,"name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#).is_err());
         assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"discord","revision":1,"name":"bot","addr":"","tls":true,"nick":"alice","autojoin":[],"buffer_cap":1000,"sasl_password":"token"}"#).is_err());
         for request in [
-            r#"{"kind":"local","revision":1,"name":"home","addr":"","tls":false,"nick":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000}"#,
+            r#"{"kind":"local","revision":1,"name":"home","addr":"","tls":false,"nick":"alice","username":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000}"#,
             r#"{"kind":"matrix","revision":1,"name":"matrix","addr":"https://matrix.example.test","tls":true,"nick":"@alice:example.test","autojoin":[],"buffer_cap":1000,"sasl_password":"password"}"#,
             r#"{"kind":"discord","revision":1,"name":"discord","addr":"","tls":true,"autojoin":[],"buffer_cap":1000,"sasl_password":"token"}"#,
             r#"{"kind":"slack","revision":1,"name":"slack","addr":"","tls":true,"autojoin":[],"buffer_cap":1000,"sasl_account":"xoxb-token","sasl_password":"xapp-token"}"#,
@@ -420,11 +425,11 @@ mod tests {
             );
         }
         for request in [
-            r#"{"kind":"irc","revision":1,"name":"irc","addr":"irc.example:6697","tls":true,"nick":"alice","realname":" ","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#,
+            r#"{"kind":"irc","revision":1,"name":"irc","addr":"irc.example:6697","tls":true,"nick":"alice","username":"alice","realname":" ","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#,
             r#"{"kind":"matrix","revision":1,"name":"matrix","addr":"","tls":true,"nick":"@alice:example.test","autojoin":[],"buffer_cap":1000,"sasl_password":"password"}"#,
-            r#"{"kind":"irc","revision":1,"name":"irc","owner":" ","addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#,
-            r#"{"kind":"irc","revision":1,"name":"irc","addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[" "],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#,
-            r#"{"kind":"irc","revision":1,"name":"irc","addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"sasl_account":" ","sasl_password":" "}"#,
+            r#"{"kind":"irc","revision":1,"name":"irc","owner":" ","addr":"irc.example:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#,
+            r#"{"kind":"irc","revision":1,"name":"irc","addr":"irc.example:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice","autojoin":[" "],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#,
+            r#"{"kind":"irc","revision":1,"name":"irc","addr":"irc.example:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"sasl_account":" ","sasl_password":" "}"#,
         ] {
             assert!(
                 admin_network_request(serde_json::from_str::<AdminNetworkBody>(request).unwrap())
@@ -456,8 +461,15 @@ pub(super) async fn device_approve(
     JsonBody(req): JsonBody<DeviceApproveReq>,
 ) -> Response {
     match approve_user_code(&state, &account, &req.user_code).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => problem(StatusCode::NOT_FOUND, "No such pending code", None),
+        Ok(crate::db::DeviceApproval::Approved) => StatusCode::NO_CONTENT.into_response(),
+        Ok(crate::db::DeviceApproval::NoPendingGrant) => {
+            problem(StatusCode::NOT_FOUND, "No such pending code", None)
+        }
+        Ok(crate::db::DeviceApproval::TokenLimitReached) => problem(
+            StatusCode::CONFLICT,
+            "Too many tokens",
+            Some(DEVICE_TOKEN_LIMIT_DETAIL),
+        ),
         Err(e) => {
             eprintln!("http: device approve failed: {e}");
             problem(
@@ -1192,7 +1204,7 @@ pub(super) async fn admin_patch_configuration(
         );
     }
     let settings = body.settings.apply_to(&current.settings);
-    if let Err(error) = settings.validate() {
+    if let Err(error) = settings.validate(state.http_bind) {
         return problem(
             StatusCode::BAD_REQUEST,
             "Invalid configuration",
@@ -1561,7 +1573,7 @@ async fn mutate_managed_configuration(
             );
         }
     };
-    if let Err(error) = settings.validate() {
+    if let Err(error) = settings.validate(state.http_bind) {
         return problem(
             StatusCode::BAD_REQUEST,
             "Invalid configuration change",
@@ -2383,7 +2395,7 @@ pub(super) async fn create_api_token(
         );
     };
     let pool = pool_of(&state);
-    // The per-account PAT cap is enforced atomically inside `issue_api_token`
+    // The per-account PAT cap is enforced atomically inside `issue_scoped_api_token`
     // (count + insert in one FOR UPDATE transaction), so there is no racy
     // list-then-insert here: two concurrent creates can't both slip past cap-1.
     match crate::db::issue_scoped_api_token(pool, &account, &req.label, scopes, lifetime).await {

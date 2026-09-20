@@ -221,6 +221,53 @@ A 2026-09-20 review of the whole tree after #333 found, and this change fixes:
   the journey guard never resolved the tests a journey cites; the console
   operation check compared an empty set.
 
+The owner decisions that review raised were all taken as "fix it", in the same
+change:
+
+- **Several core workers.** `core_workers > 1` answered differently from one
+  worker: a message, WHOIS, ISON, USERHOST, MONITOR, KILL or GHOST aimed at a
+  nick on another shard did not find it, LUSERS and WHOWAS counted one shard,
+  a labeled command answered in pieces lost the pieces, a join could outlive
+  its session, and two workers with full queues deadlocked on each other. Every
+  shard — a lone one included — now answers from the same process-wide
+  directories, publication is tracked rather than remembered, a worker never
+  waits on another's queue, shutdown is a drain, readiness needs every shard's
+  heartbeat, and irctest passes unchanged at two workers.
+- **Conversations with unauthenticated users** are never stored or read from
+  the database (migration 0058 purges the old ones): a stranger taking a
+  released nick used to inherit the previous holder's direct messages.
+- **CHATHISTORY** with a msgid the store does not hold answers `FAIL … :unknown
+  msgid` from the core, the bouncer and the REST API instead of an empty page,
+  and a session's database history requests are capped.
+- **The IRC user name is configured, never derived** (`username`, migration
+  0057, required for `irc` and `local` networks on every ingress). The forms
+  and native clients share one stated default — blank means the nickname, only
+  when the nickname is a legal user name — and never rewrite one to fit.
+- **The bouncer.** A services outage no longer parks a SASL network; a welcome
+  under another nickname is a refusal; the `local` driver waits for its 001; a
+  half-open attached client is pinged and detached; the failure and its retry
+  time are one transition. Matrix: permanent refusals park, one login per
+  driver with a stable device and a logout, and a filtered sync.
+- **Native clients.** Secrets come from a file or the environment as well as a
+  flag, and neither client — nor `e6irc api`/`login` — sends a credential over
+  a connection that is neither TLS nor loopback without an explicit override.
+- **Accounts and the API.** Every personal access token is minted under one
+  per-account cap, the device grant included. A login attempt costs two Argon2
+  computations whatever the account holds (app passwords are found by lookup,
+  migration 0059) instead of up to 33. `/ws/ui` is capped per account and pings
+  a silent browser. A configuration whose listeners collide or whose sizes are
+  absurd is refused. `e6ircd recover-administrator` is the explicit, local,
+  audited way back in for an operator who lost every administrator login. Six
+  unaudited test-only side doors in the database layer are gone, and shutdown
+  flushes held output before the closing `ERROR`.
+- **Delivery.** One `ci-ok` job gates every other; a release is published only
+  from a commit whose CI run succeeded; every action and base image is pinned
+  to a digest; the runtime image is distroless — the daemon states its own
+  configuration from the environment (`--config-from-environment`), in memory,
+  so the shell entrypoint, its temporary secrets file and its TOML quoting are
+  gone; the container has a `HEALTHCHECK` backed by `e6ircd healthcheck`; the systemd unit is hardened; the fuzz lockfile is checked for
+  drift; the dead-public guard sees `pub async fn`.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

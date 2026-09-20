@@ -154,11 +154,12 @@ fn document() -> serde_json::Value {
     });
     let network_response_schema = serde_json::json!({
         "type": "object", "additionalProperties": false,
-        "required": ["name", "kind", "addr", "tls", "nick", "realname", "autojoin", "sasl_account", "has_sasl_account", "has_sasl_password", "enabled", "connected", "runtime"],
+        "required": ["name", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "sasl_account", "has_sasl_account", "has_sasl_password", "enabled", "connected", "runtime"],
         "properties": {
             "name": { "type": "string", "minLength": 1 },
             "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] },
             "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" },
+            "username": { "type": ["string", "null"], "description": "IRC user name (ident); null for a bridge." },
             "realname": { "type": ["string", "null"] },
             "autojoin": { "type": "array", "items": { "type": "string" } },
             "sasl_account": { "type": ["string", "null"] },
@@ -643,10 +644,10 @@ fn document() -> serde_json::Value {
             "description": { "type": "string" },
             "motd": { "type": "array", "items": { "type": "string" } },
             "nicklen": { "type": "integer", "minimum": 1, "maximum": 64 },
-            "sendq": { "type": "integer", "minimum": 1 },
-            "core_queue": { "type": "integer", "minimum": 1 },
-            "core_workers": { "type": "integer", "minimum": 1 },
-            "max_hot_channels": { "type": "integer", "minimum": 1 },
+            "sendq": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_SENDQ },
+            "core_queue": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_CORE_QUEUE },
+            "core_workers": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_CORE_WORKERS },
+            "max_hot_channels": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_HOT_CHANNELS },
             "listeners": { "type": "array", "items": listener_schema },
             "registration": registration_schema,
             "limits": limits_schema,
@@ -673,8 +674,8 @@ fn document() -> serde_json::Value {
     }));
     configuration_properties.insert("networks".into(), serde_json::json!({
         "type": "array", "items": { "type": "object", "additionalProperties": false,
-            "required": ["name", "owner", "kind", "addr", "tls", "nick", "realname", "autojoin", "buffer_cap", "sasl_account", "sasl_password"],
-            "properties": { "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "realname": { "type": ["string", "null"] }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] } } }
+            "required": ["name", "owner", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "buffer_cap", "sasl_account", "sasl_password"],
+            "properties": { "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": ["string", "null"] }, "realname": { "type": ["string", "null"] }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] } } }
     }));
     configuration_properties.insert(
         "credentials_from_bootstrap".into(),
@@ -704,8 +705,8 @@ fn document() -> serde_json::Value {
         schema
     };
     let managed_network_request_schema = serde_json::json!({ "oneOf": [
-        managed_network_variant("irc", &["revision", "name", "addr", "tls", "nick", "realname", "autojoin", "buffer_cap", "sasl_account", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": ["string", "null"], "writeOnly": true }, "sasl_password": { "type": ["string", "null"], "writeOnly": true } } })),
-        managed_network_variant("local", &["revision", "name", "addr", "tls", "nick", "realname", "autojoin", "buffer_cap"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 } } })),
+        managed_network_variant("irc", &["revision", "name", "addr", "tls", "nick", "username", "realname", "autojoin", "buffer_cap", "sasl_account", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": ["string", "null"], "writeOnly": true }, "sasl_password": { "type": ["string", "null"], "writeOnly": true } } })),
+        managed_network_variant("local", &["revision", "name", "addr", "tls", "nick", "username", "realname", "autojoin", "buffer_cap"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 } } })),
         managed_network_variant("matrix", &["revision", "name", "addr", "tls", "nick", "autojoin", "buffer_cap", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_password": { "type": "string", "writeOnly": true } } })),
         managed_network_variant("discord", &["revision", "name", "addr", "tls", "autojoin", "buffer_cap", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_password": { "type": "string", "writeOnly": true } } })),
         managed_network_variant("slack", &["revision", "name", "addr", "tls", "autojoin", "buffer_cap", "sasl_account", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": "string", "writeOnly": true }, "sasl_password": { "type": "string", "writeOnly": true } } }))
@@ -1154,7 +1155,7 @@ fn document() -> serde_json::Value {
                         }
                     } } },
                     "responses": { "200": { "description": "access_token once approved" },
-                        "400": { "description": "authorization_pending / expired_token / invalid_grant" } } }
+                        "400": { "description": "RFC 8628 error: authorization_pending, expired_token, invalid_grant, or access_denied — the grant was approved but its account is at the personal access token cap, suspended, or gone; the grant is consumed and polling must stop" } } }
             },
             "/api/v1/auth/device/approve": {
                 "post": {
@@ -1169,6 +1170,7 @@ fn document() -> serde_json::Value {
                     } } },
                     "responses": { "204": { "description": "approved" },
                         "401": { "description": "browser session required" },
+                        "409": { "description": "the approving account already holds the most personal access tokens allowed; the grant stays pending" },
                         "403": { "description": "invalid or missing CSRF token" },
                         "404": { "description": "no such pending code" } } }
             },
@@ -1424,13 +1426,13 @@ fn document() -> serde_json::Value {
                     "description": "Each network includes stored configuration, `connected` (true/false, or null with no running handle), and an owner-safe `runtime` object when its driver is active: lifecycle/timestamps, a credential-safe last-error code and summary, connect latency, attempts/errors, attached clients, traffic, and in-memory buffer usage.",
                     "security": authenticated, "responses": network_list_response },
                 "post": { "summary": "Create a BNC network and start its driver",
-                    "description": "Every request explicitly selects one driver and its complete connection intent. IRC requires addr, tls, nick, realname, and autojoin, with paired optional SASL credentials. Matrix requires an HTTP(S) homeserver, tls=true, provider user, autojoin, and password. Discord requires tls=true, autojoin, and a bot token. Slack requires tls=true, autojoin, bot token, and app token. An empty bridge addr explicitly selects that provider's built-in endpoint.",
+                    "description": "Every request explicitly selects one driver and its complete connection intent. IRC requires addr, tls, nick, username, realname, and autojoin, with paired optional SASL credentials; username is the IRC user name sent in USER, is never derived from the nick, and is refused for every other kind. Matrix requires an HTTP(S) homeserver, tls=true, provider user, autojoin, and password. Discord requires tls=true, autojoin, and a bot token. Slack requires tls=true, autojoin, bot token, and app token. An empty bridge addr explicitly selects that provider's built-in endpoint.",
                     "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "oneOf": [
                             { "type": "object", "additionalProperties": false,
-                                "required": ["kind", "name", "addr", "tls", "nick", "realname", "autojoin"],
-                                "properties": { "kind": { "const": "irc" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] } } },
+                                "required": ["kind", "name", "addr", "tls", "nick", "username", "realname", "autojoin"],
+                                "properties": { "kind": { "const": "irc" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] } } },
                             { "type": "object", "additionalProperties": false,
                                 "required": ["kind", "name", "addr", "tls", "nick", "autojoin", "sasl_password"],
                                 "properties": { "kind": { "const": "matrix" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "const": true }, "nick": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "sasl_password": { "type": "string", "writeOnly": true } } },
@@ -1451,11 +1453,12 @@ fn document() -> serde_json::Value {
                     "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "type": "object", "additionalProperties": false,
-                            "required": ["addr", "tls", "nick", "realname"],
+                            "required": ["addr", "tls", "nick", "username", "realname"],
                             "properties": {
                                 "addr": { "type": "string", "minLength": 1, "maxLength": 255 },
                                 "tls": { "type": "boolean" },
                                 "nick": { "type": "string", "minLength": 1, "maxLength": 64 },
+                                "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER; never derived from the nick." },
                                 "realname": { "type": "string", "minLength": 1, "maxLength": 128 },
                                 "autojoin": { "type": "array", "items": { "type": "string" } },
                                 "sasl_account": { "type": ["string", "null"], "minLength": 1, "maxLength": 255, "writeOnly": true },
@@ -1546,6 +1549,7 @@ fn document() -> serde_json::Value {
                                 "addr": { "type": "string" },
                                 "tls": { "type": "boolean" },
                                 "nick": { "type": "string" },
+                                "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required when the stored network is kind=irc (400 with field=username when absent or invalid); refused for a bridge." },
                                 "realname": { "type": "string" },
                                 "autojoin": { "type": "array", "items": { "type": "string" } },
                                 "credentials": {
@@ -1611,7 +1615,7 @@ fn document() -> serde_json::Value {
                             "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 } }
                     ],
                     "responses": { "200": history_response["200"],
-                        "400": { "description": "invalid window, timestamp, or limit" },
+                        "400": { "description": "invalid window, timestamp, or limit; `field` names the query parameter at fault. Pages are positioned by time only: a message id is not an accepted `before` or `after`" },
                         "403": { "description": "not allowed to read this channel" },
                         "503": { "description": "database unavailable" } } }
             },
