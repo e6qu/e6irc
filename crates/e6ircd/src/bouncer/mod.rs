@@ -29,6 +29,7 @@ mod matrix;
 mod serve;
 #[cfg(feature = "slack")]
 mod slack;
+mod upstream_identity;
 
 #[cfg(feature = "discord")]
 pub use discord::{DiscordConfig, DiscordDriver};
@@ -41,6 +42,9 @@ pub use matrix::{MatrixConfig, MatrixDriver};
 pub use serve::{NetworkStatus, Registry, bnc_serve};
 #[cfg(feature = "slack")]
 pub use slack::{SlackConfig, SlackDriver};
+pub use upstream_identity::{
+    UpstreamChannel, UpstreamIdentityError, UpstreamNick, UpstreamRealname,
+};
 
 /// The secret-context a BNC upstream password is sealed under: its *owning*
 /// e6irc account, casefolded, with a `bnc:` purpose tag. Binding the blob to the
@@ -218,12 +222,14 @@ pub fn build_driver(
                     );
                 }
             };
+            let identity_error =
+                |error: UpstreamIdentityError| format!("kind=irc has invalid {error}");
             Ok(Box::new(IrcDriver::new(NetworkConfig {
                 addr,
                 tls,
-                nick,
-                realname,
-                autojoin,
+                nick: nick.parse().map_err(identity_error)?,
+                realname: realname.parse().map_err(identity_error)?,
+                autojoin: UpstreamChannel::parse_list(&autojoin).map_err(identity_error)?,
                 buffer_cap,
                 sasl,
                 keepalive_idle: KEEPALIVE_IDLE,

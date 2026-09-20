@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use e6irc_client::{Connection, RelayEvent};
 
+use super::upstream_identity::{UpstreamChannel, UpstreamNick, UpstreamRealname};
 use super::{ConnectionEvent, DriverEnds, NetworkHandle};
 
 /// Static configuration for one upstream network.
@@ -17,10 +18,10 @@ pub struct NetworkConfig {
     pub addr: String,
     /// Use TLS to the upstream.
     pub tls: bool,
-    pub nick: String,
-    pub realname: String,
+    pub nick: UpstreamNick,
+    pub realname: UpstreamRealname,
     /// Channels to auto-join after registering.
-    pub autojoin: Vec<String>,
+    pub autojoin: Vec<UpstreamChannel>,
     /// Detached buffer capacity.
     pub buffer_cap: usize,
     /// SASL PLAIN credentials for the upstream, when it requires auth.
@@ -40,8 +41,10 @@ impl Default for NetworkConfig {
         Self {
             addr: String::new(),
             tls: false,
-            nick: "e6bnc".into(),
-            realname: "e6irc bouncer".into(),
+            nick: "e6bnc".parse().expect("the default nickname is valid"),
+            realname: "e6irc bouncer"
+                .parse()
+                .expect("the default real name is valid"),
             autojoin: Vec::new(),
             buffer_cap: 1000,
             sasl: None,
@@ -253,10 +256,19 @@ pub async fn preflight_irc(config: &NetworkConfig) -> Result<IrcPreflight, IrcPr
         match &config.sasl {
             Some((account, password)) => {
                 connection
-                    .register_sasl(&config.nick, &config.realname, account, password)
+                    .register_sasl(
+                        config.nick.as_str(),
+                        config.realname.as_str(),
+                        account,
+                        password,
+                    )
                     .await
             }
-            None => connection.register(&config.nick, &config.realname).await,
+            None => {
+                connection
+                    .register(config.nick.as_str(), config.realname.as_str())
+                    .await
+            }
         }
     };
     let confirmed_nick = match tokio::time::timeout(Duration::from_secs(30), registration).await {
@@ -290,11 +302,11 @@ pub async fn preflight_irc(config: &NetworkConfig) -> Result<IrcPreflight, IrcPr
     for channel in &config.autojoin {
         match tokio::time::timeout(
             Duration::from_secs(30),
-            connection.join_with_latest_history(channel, 0),
+            connection.join_with_latest_history(channel.as_str(), 0),
         )
         .await
         {
-            Ok(Ok(_)) => joined_channels.push(channel.clone()),
+            Ok(Ok(_)) => joined_channels.push(channel.to_string()),
             Ok(Err(error)) => {
                 eprintln!("irc preflight: channel join failed: {error}");
                 return Err(IrcPreflightFailure::ChannelJoinFailed);
@@ -428,10 +440,18 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     let register_fut = async {
         match &config.sasl {
             Some((account, password)) => {
-                conn.register_sasl(&config.nick, &config.realname, account, password)
+                conn.register_sasl(
+                    config.nick.as_str(),
+                    config.realname.as_str(),
+                    account,
+                    password,
+                )
+                .await
+            }
+            None => {
+                conn.register(config.nick.as_str(), config.realname.as_str())
                     .await
             }
-            None => conn.register(&config.nick, &config.realname).await,
         }
     };
     let registration = tokio::select! {
@@ -446,12 +466,12 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     // us in before the drop (runtime joins are tracked in `shared.joined`).
     // Autojoin wins on a fold-collision: its casing is the operator's.
     let rejoin: Vec<String> = {
-        let mut list = config.autojoin.clone();
+        let mut list: Vec<String> = config.autojoin.iter().map(ToString::to_string).collect();
         let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
         let folded: std::collections::HashSet<String> = config
             .autojoin
             .iter()
-            .map(|c| casemap.casefold(c))
+            .map(|c| casemap.casefold(c.as_str()))
             .collect();
         let extras: Vec<String> = shared
             .joined
@@ -579,7 +599,7 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                     // account's other sessions must see both sides of the
                     // conversation, and the originator sees it exactly when it
                     // negotiated echo-message on attach.
-                    if let Some(echo) = self_echo(&cmd.line, &current_nick, &config.nick, &upstream) {
+                    if let Some(echo) = self_echo(&cmd.line, &current_nick, config.nick.as_str(), &upstream) {
                         ends.emit_echo(echo, cmd.origin);
                     }
                 }
@@ -975,12 +995,12 @@ mod tests {
             let handle = IrcNetwork::start(NetworkConfig {
                 addr: addr.into(),
                 tls: true,
-                nick,
-                realname: "e6irc BNC interop probe".into(),
+                nick: nick.parse().expect("probe nickname"),
+                realname: "e6irc BNC interop probe".parse().expect("test real name"),
                 buffer_cap: 32,
                 autojoin: autojoin
                     .iter()
-                    .map(|channel| (*channel).to_string())
+                    .map(|channel| channel.parse().expect("probe channel"))
                     .collect(),
                 ..NetworkConfig::default()
             });

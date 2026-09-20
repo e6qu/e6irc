@@ -83,8 +83,8 @@ async fn preflight_uses_the_real_driver_registration_path_without_starting_a_net
     let addr = upstream().await;
     let result = preflight_irc(&NetworkConfig {
         addr: addr.to_string(),
-        nick: "preflight".into(),
-        realname: "preflight qualification".into(),
+        nick: "preflight".parse().expect("test nickname"),
+        realname: "preflight qualification".parse().expect("test real name"),
         ..NetworkConfig::default()
     })
     .await
@@ -103,9 +103,9 @@ async fn driver_registers_relays_and_buffers() {
 
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
-        realname: "bnc".into(),
-        autojoin: vec!["#bnc".into()],
+        nick: "bncbot".parse().expect("test nickname"),
+        realname: "bnc".parse().expect("test real name"),
+        autojoin: vec!["#bnc".parse().expect("test channel")],
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -294,8 +294,8 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
 
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
-        realname: "bnc".into(),
+        nick: "bncbot".parse().expect("test nickname"),
+        realname: "bnc".parse().expect("test real name"),
         autojoin: vec![],
         ..NetworkConfig::default()
     });
@@ -671,8 +671,8 @@ async fn driver_authenticates_to_sasl_upstream() {
     // driver with SASL creds
     let handle = IrcNetwork::start(NetworkConfig {
         addr: up.to_string(),
-        nick: "bncacct".into(),
-        realname: "bnc".into(),
+        nick: "bncacct".parse().expect("test nickname"),
+        realname: "bnc".parse().expect("test real name"),
         sasl: Some(("bncacct".into(), "bncpass".into())),
         ..NetworkConfig::default()
     });
@@ -1189,7 +1189,7 @@ async fn a_taken_nickname_is_reported_and_never_replaced() {
 
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
+        nick: "bncbot".parse().expect("test nickname"),
         rejection_retry_floor: std::time::Duration::from_millis(200),
         ..NetworkConfig::default()
     });
@@ -1253,7 +1253,7 @@ async fn driver_tracks_forced_upstream_nick_change() {
 
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
+        nick: "bncbot".parse().expect("test nickname"),
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -1329,8 +1329,8 @@ async fn runtime_joined_channels_are_rejoined_after_reconnect() {
 
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
-        autojoin: vec!["#static".into()],
+        nick: "bncbot".parse().expect("test nickname"),
+        autojoin: vec!["#static".parse().expect("test channel")],
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -1401,7 +1401,7 @@ async fn silent_upstream_trips_keepalive_and_reconnects() {
 
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
+        nick: "bncbot".parse().expect("test nickname"),
         keepalive_idle: std::time::Duration::from_millis(150),
         ..NetworkConfig::default()
     });
@@ -1439,7 +1439,7 @@ async fn repeated_registration_rejection_parks_the_driver() {
     // registration attempt fail with a terminal (non-transient) rejection.
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
+        nick: "bncbot".parse().expect("test nickname"),
         sasl: Some(("account".into(), "secret".into())),
         rejection_retry_floor: std::time::Duration::from_millis(20),
         ..NetworkConfig::default()
@@ -1494,7 +1494,7 @@ async fn rejected_credentials_park_without_a_second_dial() {
     });
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
+        nick: "bncbot".parse().expect("test nickname"),
         sasl: Some(("account".into(), "wrong".into())),
         rejection_retry_floor: std::time::Duration::from_millis(20),
         ..NetworkConfig::default()
@@ -1539,7 +1539,7 @@ async fn a_dropped_dial_between_refusals_does_not_reset_the_park_count() {
     });
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
+        nick: "bncbot".parse().expect("test nickname"),
         rejection_retry_floor: std::time::Duration::from_millis(20),
         ..NetworkConfig::default()
     });
@@ -1571,7 +1571,7 @@ async fn a_refused_registration_keeps_its_reason_while_retrying() {
     });
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
+        nick: "bncbot".parse().expect("test nickname"),
         rejection_retry_floor: std::time::Duration::from_secs(30),
         ..NetworkConfig::default()
     });
@@ -1611,8 +1611,8 @@ async fn full_buffer_evicts_oldest() {
     }
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
-        autojoin: vec!["#ring".into()],
+        nick: "bncbot".parse().expect("test nickname"),
+        autojoin: vec!["#ring".parse().expect("test channel")],
         buffer_cap: 3,
         ..NetworkConfig::default()
     });

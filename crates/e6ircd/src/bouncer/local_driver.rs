@@ -36,9 +36,11 @@ impl LocalDriver {
     pub fn new(core: CoreHandles, config: NetworkConfig) -> Self {
         Self {
             core,
-            nick: config.nick,
-            realname: config.realname,
-            autojoin: config.autojoin,
+            // Already parsed: the same one-parameter guarantees hold for the
+            // lines this driver injects into the in-process core.
+            nick: config.nick.to_string(),
+            realname: config.realname.as_str().to_string(),
+            autojoin: config.autojoin.iter().map(ToString::to_string).collect(),
             buffer_cap: config.buffer_cap,
         }
     }

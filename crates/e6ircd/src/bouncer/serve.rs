@@ -167,12 +167,16 @@ impl Registry {
                 NetworkKind::Matrix | NetworkKind::Discord | NetworkKind::Slack => String::new(),
             };
             let driver: Box<dyn super::NetworkDriver> = if e.kind == NetworkKind::Local {
+                let identity_error = |error: super::UpstreamIdentityError| {
+                    format!("network '{}' (kind=local) has invalid {error}", e.name)
+                };
                 let config = NetworkConfig {
                     addr: e.addr.clone(),
                     tls: e.tls,
-                    nick: e.nick.clone(),
-                    realname,
-                    autojoin: e.autojoin.clone(),
+                    nick: e.nick.parse().map_err(identity_error)?,
+                    realname: realname.parse().map_err(identity_error)?,
+                    autojoin: super::UpstreamChannel::parse_list(&e.autojoin)
+                        .map_err(identity_error)?,
                     buffer_cap: e.buffer_cap,
                     sasl: None,
                     keepalive_idle: super::KEEPALIVE_IDLE,

@@ -54,8 +54,8 @@ async fn attached_client_gets_playback_and_live_and_can_send() {
     // driver joins #room on the upstream
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bnc".into(),
-        autojoin: vec!["#room".into()],
+        nick: "bnc".parse().expect("test nickname"),
+        autojoin: vec!["#room".parse().expect("test channel")],
         ..NetworkConfig::default()
     });
     wait_connected(&handle).await;
@@ -163,8 +163,8 @@ async fn two_clients_attach_to_one_always_on_network() {
     let addr = upstream().await;
     let handle = std::sync::Arc::new(IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "shared".into(),
-        autojoin: vec!["#multi".into()],
+        nick: "shared".parse().expect("test nickname"),
+        autojoin: vec!["#multi".parse().expect("test channel")],
         ..NetworkConfig::default()
     }));
     wait_connected(&handle).await;
@@ -309,8 +309,8 @@ async fn self_echo_excluded_for_originator_but_reaches_others_and_buffer() {
     let addr = upstream().await;
     let handle = std::sync::Arc::new(IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "echobot".into(),
-        autojoin: vec!["#echo".into()],
+        nick: "echobot".parse().expect("test nickname"),
+        autojoin: vec!["#echo".parse().expect("test channel")],
         ..NetworkConfig::default()
     }));
     wait_connected(&handle).await;
@@ -374,8 +374,8 @@ async fn self_echo_delivered_once_when_negotiated() {
     let addr = upstream().await;
     let handle = std::sync::Arc::new(IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "echobot".into(),
-        autojoin: vec!["#echo".into()],
+        nick: "echobot".parse().expect("test nickname"),
+        autojoin: vec!["#echo".parse().expect("test channel")],
         ..NetworkConfig::default()
     }));
     wait_connected(&handle).await;

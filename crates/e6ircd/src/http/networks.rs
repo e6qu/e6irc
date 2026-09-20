@@ -689,7 +689,7 @@ pub(super) async fn preflight_network(
 pub(super) async fn preflight_network_core(
     req: PreflightNetwork,
 ) -> Result<crate::bouncer::IrcPreflight, NetworkMutationError> {
-    validate_irc_upstream(&req.addr, &req.nick, Some(&req.realname), &req.autojoin)?;
+    let identity = validate_irc_upstream(&req.addr, &req.nick, Some(&req.realname), &req.autojoin)?;
     if let Some(account) = req.sasl_account.as_deref()
         && let Err(error) = validate_credential_field(account, 255)
     {
@@ -711,9 +711,11 @@ pub(super) async fn preflight_network_core(
     let config = crate::bouncer::NetworkConfig {
         addr: req.addr,
         tls: req.tls,
-        nick: req.nick,
-        realname: req.realname,
-        autojoin: req.autojoin,
+        nick: identity.nick,
+        realname: identity
+            .realname
+            .expect("the preflight request's realname was supplied and parsed"),
+        autojoin: identity.autojoin,
         buffer_cap: 1,
         sasl: req.sasl_account.zip(req.sasl_password),
         keepalive_idle: crate::bouncer::KEEPALIVE_IDLE,
@@ -1010,14 +1012,34 @@ pub(super) fn check_upstream_bounds(
     Ok(())
 }
 
+/// The identity fields of an IRC upstream, parsed. Holding the parsed values is
+/// what lets the preflight build a driver configuration without a second,
+/// possibly different, notion of what a valid nickname is.
+#[derive(Debug)]
+pub(super) struct IrcUpstreamIdentity {
+    pub(super) nick: crate::bouncer::UpstreamNick,
+    pub(super) realname: Option<crate::bouncer::UpstreamRealname>,
+    pub(super) autojoin: Vec<crate::bouncer::UpstreamChannel>,
+}
+
+fn identity_problem(error: crate::bouncer::UpstreamIdentityError) -> NetworkMutationError {
+    network_error(
+        StatusCode::BAD_REQUEST,
+        "Invalid IRC identity",
+        Some(&error.to_string()),
+    )
+    .with_field(error.field())
+}
+
 /// Full validation for an IRC upstream's connection/identity fields (create and
-/// edit): `addr`/`nick` required, plus the shared [`check_upstream_bounds`].
+/// edit): `addr`/`nick` required, the shared [`check_upstream_bounds`], and the
+/// one identity grammar the driver factory also applies.
 pub(super) fn validate_irc_upstream(
     addr: &str,
     nick: &str,
     realname: Option<&str>,
     autojoin: &[String],
-) -> Result<(), NetworkMutationError> {
+) -> Result<IrcUpstreamIdentity, NetworkMutationError> {
     if addr.is_empty() || nick.is_empty() {
         return Err(network_error(
             StatusCode::BAD_REQUEST,
@@ -1038,7 +1060,16 @@ pub(super) fn validate_irc_upstream(
         )
         .with_field("addr"));
     }
-    check_upstream_bounds(addr, nick, realname, autojoin)
+    check_upstream_bounds(addr, nick, realname, autojoin)?;
+    Ok(IrcUpstreamIdentity {
+        nick: nick.parse().map_err(identity_problem)?,
+        realname: realname
+            .map(str::parse)
+            .transpose()
+            .map_err(identity_problem)?,
+        autojoin: crate::bouncer::UpstreamChannel::parse_list(autojoin)
+            .map_err(identity_problem)?,
+    })
 }
 
 /// Resolve one owner-scoped row for an API mutation.
@@ -1946,6 +1977,41 @@ mod tests {
             let error = validate_irc_upstream(addr, "alice", None, &[])
                 .expect_err("malformed address must fail");
             assert!(error.message().contains("host:port"), "{addr}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn an_identity_that_would_reshape_a_wire_line_is_refused_at_its_field() {
+        let ok = |nick: &str, realname: Option<&str>, autojoin: &[&str]| {
+            let autojoin: Vec<String> = autojoin.iter().map(ToString::to_string).collect();
+            validate_irc_upstream("irc.example:6697", nick, realname, &autojoin)
+        };
+        let identity = ok("alice", Some("Alice Example"), &["#e6irc", "&local"])
+            .expect("an ordinary identity");
+        assert_eq!(identity.nick.as_str(), "alice");
+        assert_eq!(identity.autojoin.len(), 2);
+
+        for (nick, realname, autojoin, field) in [
+            // `NICK al ice` carries two parameters.
+            ("al ice", Some("Alice"), &[][..], "nick"),
+            ("#alice", Some("Alice"), &[][..], "nick"),
+            ("alice!x@y", Some("Alice"), &[][..], "nick"),
+            ("alice", Some("two\u{1b}[2Jlines"), &[][..], "realname"),
+            // `JOIN 0` leaves every channel.
+            ("alice", Some("Alice"), &["0"][..], "autojoin"),
+            // A key nobody configured, and a second channel in one entry.
+            ("alice", Some("Alice"), &["#a key"][..], "autojoin"),
+            ("alice", Some("Alice"), &["#a,#b"][..], "autojoin"),
+            ("alice", Some("Alice"), &["e6irc"][..], "autojoin"),
+        ] {
+            let error = ok(nick, realname, autojoin).expect_err("must be refused");
+            assert_eq!(
+                error.status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "{error:?}"
+            );
+            assert_eq!(error.field, Some(field), "{nick:?} {autojoin:?}: {error:?}");
+            assert!(error.message().contains(field), "{error:?}");
         }
     }
 
