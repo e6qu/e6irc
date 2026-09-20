@@ -2587,7 +2587,9 @@ import { loadSettings, saveSettings } from "/console-settings.js";
     const body = {
       addr: fieldValue(fields, "addr"), tls: bridge || fields.has("tls"),
       nick: fieldValue(fields, "nick"),
-      realname: bridge ? null : optionalValue(fieldValue(fields, "realname")),
+      // An IRC network always has a real name (the API refuses null for one),
+      // so a blank box means the nickname, on edit exactly as on create.
+      realname: bridge ? null : (fieldValue(fields, "realname") || fieldValue(fields, "nick")),
       autojoin: splitValues(String(fields.get("autojoin") || ""), ","), credentials,
     };
     if (!bridge && (!body.addr || !body.nick)) {

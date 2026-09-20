@@ -378,7 +378,7 @@ test("console adds a known network from a nickname alone, with no forced test", 
   });
 });
 
-test("console network editor keeps a blank real name blank and restores the password field", async ({ page }) => {
+test("console network editor sends the nickname for a blank real name and restores the password field", async ({ page }) => {
   const editor = await consoleTemplate("console_network_edit.html", { name: "libera", "shell.csrf": "test-csrf" });
   const network = {
     kind: "irc", name: "libera", addr: "irc.libera.chat:6697", tls: true, nick: "alice", realname: null,
@@ -400,7 +400,7 @@ test("console network editor keeps a blank real name blank and restores the pass
   await page.getByRole("button", { name: "Save changes", exact: true }).click();
   await expect.poll(() => page.evaluate(() => window.consoleApiMutations)).toEqual([{
     method: "PUT", url: "/api/v1/me/networks/libera", json: {
-      addr: "irc.libera.chat:6697", tls: true, nick: "alice", realname: null, autojoin: ["#e6irc"],
+      addr: "irc.libera.chat:6697", tls: true, nick: "alice", realname: "alice", autojoin: ["#e6irc"],
       credentials: { action: "set", account: "alice", password: null },
     },
   }]);

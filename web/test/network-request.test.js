@@ -76,9 +76,11 @@ test("a password with no account is refused on both endpoints", () => {
   );
 });
 
-test("replace treats an empty real name as none rather than unchanged", () => {
+test("replace sends the nickname for an empty real name, as create does", () => {
   const body = updateNetworkBody({ addr: "irc.libera.chat:6697", tls: true, nick: "ada", realname: "  " });
-  assert.equal(body.realname, null);
+  // The API refuses a null real name for an IRC network, so a blank box must
+  // not produce one: it means the nickname, as the form says and as on create.
+  assert.equal(body.realname, "ada");
 });
 
 test("the connection fields are required before anything is sent", () => {

@@ -91,14 +91,15 @@ export function createNetworkBody(form) {
 /**
  * Body for replacing an IRC network's mutable configuration.
  *
- * realname is optional here, and an empty box means "no real name" rather than
- * "unchanged", which the contract expresses as null.
+ * An IRC network always has a real name -- the server refuses null for one --
+ * so an empty box means what the form says it means, on edit exactly as on
+ * create: the nickname is used.
  */
 export function updateNetworkBody(form) {
-  const realname = String(form.realname ?? "").trim();
+  const base = connection(form);
   return {
-    ...connection(form),
-    realname: realname || null,
+    ...base,
+    realname: String(form.realname ?? "").trim() || base.nick,
     credentials: credentialAction(form),
   };
 }
