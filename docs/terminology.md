@@ -265,6 +265,52 @@ platform for real-time events.
 **IRC-over-WebSocket** — the browser transport (`/ws/irc`) that carries the IRC
 protocol over a WebSocket, so a web client speaks IRC without a raw TCP port.
 
+**Preset** — one entry of the curated catalog of public IRC networks
+(`IRC_NETWORK_PRESETS`: Libera Chat, OFTC, EFnet, Snoonet), served at
+`GET /api/v1/network-presets`. Every preset is a TLS endpoint on port 6697. A
+preset only fills the add-network form; the request carries the resulting
+fields, never a preset identifier.
+
+**Preflight** — the optional **Test connection** diagnostic
+(`POST /api/v1/me/network-preflight`, `preflight_irc`). It resolves, connects,
+and registers exactly as the always-on IRC driver would, joins the requested
+channels, reports each stage's timing, sends `QUIT`, and stores nothing: no
+network is created and no driver is started. Saving a network never depends
+on it.
+
+**Refusal schedule** — the delays before a driver re-dials an upstream that
+refused its registration: 30 seconds, then 1, 2, and 4 minutes, long enough for
+a ghost of the driver's own session to time out upstream. An ordinary
+connection loss uses the shorter reconnect backoff instead.
+
+**Parked** — a driver that has stopped re-dialing and stays stopped until its
+network is reconfigured. Rejected credentials park on the first rejection,
+because every further attempt counts against the account upstream; any other
+registration refusal parks on the fifth in a row, after the refusal schedule
+is exhausted. A parked network shows why and what repairs it.
+
+**Supersede** and **ensure-running** — the two ways the registry starts a
+driver for a network that may already have one (`bouncer/serve.rs`).
+*Supersede* (`Registry::replace`) stops the running driver, waits for it to
+disconnect, and starts the new one; saving changed settings uses it.
+*Ensure-running* (`Registry::ensure_running`) starts a driver when none is
+registered, supersedes a parked one, and leaves a connecting, connected, or
+reconnecting one alone, so enabling an already-enabled network never drops a
+healthy upstream session. A plain `Registry::add` refuses a network that
+already has a live driver, so two upstream sessions can never race for one
+network.
+
+**Server log** — the chat client's wire log: a conversation beside the
+channels that shows every IRC line received for the open network, verbatim
+except that sensitive commands are redacted. The console's per-network
+**Network log** is a different, persisted view of driver lifecycle and
+failures.
+
+**Relay-desk** — the visual system shared by the identity pages, the console,
+the chat client, and the terminal client: dark routing chrome, compact
+monospaced provenance labels, high-contrast state colors, and one amber route
+trace joining network context to the active conversation.
+
 ---
 
 ## History and persistence
@@ -312,6 +358,23 @@ interface client (`e6irc-tui`).
 **REST** — the HTTP JSON API under `/api/v1` (accounts, tokens, networks,
 admin, OpenAPI spec).
 
+**Read-copy-update (RCU)** — a sharing pattern in which a writer publishes a
+new immutable snapshot and readers keep using the one they already hold, so
+readers never lock. e6irc's channel recipient lists work this way; its managed
+configuration does not (it sits behind a read–write lock off the hot path).
+
+**Link-time optimization (LTO)** — compiler optimization across crate
+boundaries at link time. Release builds use the "fat" whole-program form with
+one code-generation unit.
+
+**Authenticated encryption with associated data (AEAD)** — encryption that
+also proves the ciphertext, and the context it was bound to, were not altered.
+Stored credentials are sealed with the ChaCha20-Poly1305 AEAD cipher.
+
+**Web Content Accessibility Guidelines (WCAG)** — the W3C accessibility
+standard. The browser suites hold the chat, console, and identity pages to its
+level AA, including contrast.
+
 **embed-web** — the build feature that bakes the built web client
 (`web/dist`, a vanilla JavaScript bundle produced by Vite) into the binary and
 serves it at `/`;
@@ -358,6 +421,16 @@ published.
 immutable content **digest** (`@sha256:…`), not a mutable tag. A **multi-arch
 manifest** is an index listing per-architecture images (amd64 + arm64) under
 one reference, so the right one is pulled per host.
+
+**Open Container Initiative (OCI)** — the standard for container image and
+registry formats. An **OCI referrer** is an artifact a registry stores as
+attached to an image digest; e6irc's signed attestations are published that
+way, so they add no tag and do not change the image manifest.
+
+**Software bill of materials (SBOM)** — a machine-readable inventory of what
+an image contains. **SPDX** (Software Package Data Exchange) is the Linux
+Foundation format e6irc's is written in (SPDX 2.3 JSON); one is generated and
+attested for each architecture image.
 
 **Terraform** — the infrastructure-as-code tool. **Terragrunt** is the
 thin wrapper the environment uses to compose Terraform with shared state and

@@ -116,9 +116,12 @@ temporarily mutes its live region, so a buffer switch does not announce old
 messages as new; subsequent live additions remain politely announced. The
 new-message control is a native button with an exact accessible count and
 returns the reader to the latest line without moving them to another buffer.
-The network catalog exposes only routes that can open as links or selector
-options. Disabled and unbuilt routes remain readable status rows, so keyboard
-and pointer users do not enter a chat view that cannot attach.
+Every row of the sidebar network list is a link named for the network and its
+state; there is no separate network selector. A disabled network, or one this
+server cannot run, still opens: its page says why chat is unavailable, links to
+the network's console page where it can be enabled or reconfigured, and opens
+no socket, so keyboard and pointer users never land in a composer that cannot
+attach.
 
 **Rejected sends.** A correlated server refusal never creates a local echo or
 automatically retries. It leaves the reason visible and offers a **Restore
@@ -159,7 +162,12 @@ current network and conversation selection.
    driver's bounded queue, and returns a correlated `sent` or `send-error`
    event. Missing `/raw`, `/quote`, `/me`, `/join`, `/nick`, `/msg`, `/notice`,
    or `/query` operands and text entered without a channel/direct-message target
-   are explicit rejections.
+   are explicit rejections. So is any line whose command — after slash
+   translation, so `/raw` and `/quote` included — is `QUIT`, which would end
+   the always-on upstream session, or `PING`, `PONG`, `CAP`, `AUTHENTICATE`,
+   `CHATHISTORY`, or `MARKREAD`, which e6irc answers itself on the raw attach
+   path and never forwards. A `read`-scoped token may open the socket and read
+   it; every composer frame it sends is rejected.
 4. Only `sent` creates local echo and sent-history. A rejection keeps the text
    available for retry, so displayed success means server-side queue
    admission—not merely a browser socket write.
@@ -273,11 +281,12 @@ administrator set.
 **Flow.**
 
 - Global navigation exposes the surfaces allowed by the signed-in role.
-- User surfaces are BNC networks, registered channels, own sessions, and
-  account/access.
-- Administrators additionally see overview, accounts, channel registry,
-  server bans, monitoring, audit, configuration, all live connections, and
-  integrations.
+- Everyone sees **You**: Your networks, Your channels, Your sessions, and
+  Account & access.
+- Administrators additionally see **Server**, in three groups. People:
+  Accounts, Live connections, Server bans. Chat: Channel registry, All
+  networks, Integrations. Operations: Overview, Monitoring, Live logs, Audit
+  log, Configuration.
 - Sign out leaves the application at a public, reload-safe confirmation page
   with a clear route back to authentication.
 

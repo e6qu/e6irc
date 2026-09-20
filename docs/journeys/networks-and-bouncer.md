@@ -92,12 +92,21 @@ joins every configured channel, and says `QUIT` when it is done. It never gates
 
 **Visible failures and recovery.**
 
-- An unknown/tampered preset is rejected, not treated as Custom.
+- A known network only fills the form. The request carries the resulting
+  server, TLS choice, identity, channels, and credentials, never a preset
+  identifier, so an edited or stale choice is validated exactly like hand-typed
+  values and cannot select anything the fields do not say.
 - Invalid network ID, endpoint, nickname, channel list, TLS policy, or
   credential pair re-renders the form with the specific error and non-secret
   values preserved.
 - Missing secret key refuses a supplied password before persistence.
 - Duplicate owner/network names conflict under IRC casemapping.
+- **Test connection** answers `429` with `Retry-After` while the same account
+  has a test running, after six tests in a minute, or while the server runs as
+  many as it allows at once.
+- Starting a network — enable, create, or edit, by the owner or an
+  administrator — is refused with `409 Owner suspended` while its owner is
+  suspended, and a restart does not start a suspended owner's networks.
 - DNS/address policy, TCP/TLS failure, upstream SASL rejection, nickname
   collision, and registration timeout return a closed preflight failure code
   when **Test connection** is used. The same conditions surface after saving
@@ -134,20 +143,24 @@ traffic, latency, attempts, closed error codes, and a bounded sanitized IRC
 registration diagnostic identify the result without exposing credentials or
 arbitrary transport errors.
 
-**Evidence.** Preset integrity and server-side application have unit tests, and
-the catalog endpoint has an HTTP test. Chromium proves the chat dialog's
+**Evidence.** `public_irc_presets_are_safe_tls_endpoints` proves catalog
+integrity and `network_presets_endpoint_serves_the_curated_catalog` proves the
+endpoint both clients read. Chromium proves the chat dialog's
 defaults, its Advanced disclosure, the exact request body, and the session
 token on the request. Real-socket driver tests prove that rejected credentials
 dial exactly once, that a dropped dial between refusals does not reset the park
 count, and that a refusal keeps its reason while retrying; the client crate
 proves a server `ERROR` during SASL is a typed refusal.
 The production IRC-driver preflight has a real local registration oracle.
-`console_add_and_delete_network_via_the_console` proves the non-mutating
-console qualification plus creation/deletion with PostgreSQL; Chromium,
-Firefox, and WebKit each repeat that qualification-before-create journey
-through the rendered controls and local live upstream;
-`bnc_network_management_lifecycle` proves the REST qualification contract,
-empty-registry invariant, mutation, live driver start, BNC attach,
+`console_networks_page_lists_the_callers_networks` proves the rendered
+**Your networks** page against PostgreSQL. In `tools/test-oidc-browser.mjs`
+Chromium, Firefox, and WebKit each find **Add network** enabled before any
+test, run the optional **Test connection** against a local live upstream and
+see that it created nothing, then add the network and watch it join and
+replay; `web/test/visual.spec.js` proves in Chromium that a known network is
+added from a nickname alone, with no forced test.
+`bnc_network_management_lifecycle` proves the REST preflight contract, that a
+preflight leaves the registry empty, mutation, live driver start, BNC attach,
 update/toggle/delete, and secret handling. The opt-in BNC-driver probes cover
 Libera, OFTC, and Ergo; public-server qualification remains outside CI and
 qualifies only the egress where it ran. A 2026-08-23 production-container run
@@ -225,7 +238,8 @@ identify the upstream cause used to choose the recovery text.
 
 **Security and observability.** Commands carrying a password, email, code, or
 recovery token are redacted in the synthesized echo while still being sent
-upstream verbatim, so the tape never becomes a place credentials accumulate.
+upstream verbatim, so the Server log never becomes a place credentials
+accumulate.
 
 **Evidence.** The parked lifecycle/error-code pairings, generic parked-state
 recovery, and the redaction classifier have unit tests.

@@ -203,11 +203,11 @@ test("operation parser gives a literal path precedence over a template", () => {
   };
   const document = {
     paths: {
-      "/api/v1/me/networks/{name}": { get: { responses: { 200: { content: { "application/json": { schema: templateSchema } } } } } },
-      "/api/v1/me/networks/preflight": { get: { responses: { 200: { content: { "application/json": { schema: literalSchema } } } } } },
+      "/api/v1/examples/{name}": { get: { responses: { 200: { content: { "application/json": { schema: templateSchema } } } } } },
+      "/api/v1/examples/preflight": { get: { responses: { 200: { content: { "application/json": { schema: literalSchema } } } } } },
     },
   };
-  assert.deepEqual(parseOperationResponse(document, "GET", "/api/v1/me/networks/preflight", { preflight: true }), { preflight: true });
+  assert.deepEqual(parseOperationResponse(document, "GET", "/api/v1/examples/preflight", { preflight: true }), { preflight: true });
 });
 
 test("operation parser rejects ambiguous templates", () => {

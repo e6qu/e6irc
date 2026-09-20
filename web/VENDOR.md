@@ -1,14 +1,18 @@
 # Web client dependencies & provenance
 
-The web client is a Vite project. Its dependencies are pinned in
-`package.json` and locked with integrity (SHA-512) hashes in
-`pnpm-lock.yaml` — that lockfile is the provenance record; `node_modules`
-and `dist` are build artifacts and are not committed.
+The web client is a Vite project. `package.json` names `vite` and `playwright`
+at exact versions and `@axe-core/playwright` as the range `^4.12.1`. What pins
+all three, and every transitive package, is `pnpm-lock.yaml`: it records one
+exact version each (`@axe-core/playwright` 4.12.1) with an integrity (SHA-512)
+hash, and CI, the container build, and the release build all install with
+`--frozen-lockfile`, which fails rather than resolve anything the lockfile does
+not name. That lockfile is the provenance record; `node_modules` and `dist` are
+build artifacts and are not committed.
 
 Build:
 
 ```
-cd web && pnpm install && pnpm build   # -> web/dist (content-hashed)
+cd web && pnpm install --frozen-lockfile && pnpm build   # -> web/dist (content-hashed)
 ```
 
 The production bundle has no runtime package dependencies; the chat client is

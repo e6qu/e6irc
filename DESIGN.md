@@ -139,7 +139,7 @@ These are project-wide rules, enforced in review and (where possible) CI:
     asserted against.
   - `ComposerResult` — a web-composer response is either `Sent` or `Rejected`;
     success cannot carry an error and rejection always has one.
-  - `CredentialAttemptBudget` — IRC registration, services, and BNC attach
+  - `CredentialAttemptBudget` — IRC registration, services, OPER, and BNC attach
     consume the same closed per-connection authentication budget. Valid and
     malformed completed SASL payloads spend a slot, exhaustion is permanent,
     and no ninth attempt can reach password verification. An authenticated
@@ -286,11 +286,28 @@ These are project-wide rules, enforced in review and (where possible) CI:
     cannot accidentally be applied to channels or online peers, and the two
     candidate keys cannot be passed as unrelated request fields.
   - `Hidden` — a `+s` (secret) channel is invisible to non-members on *every*
-    query surface. The predicate lives once in `Channel::hidden_from`, and the
-    deny surfaces (MODE/KNOCK/TOPIC) take the returned `Hidden` token to the one
-    `deny_hidden` helper, which answers `ERR_NOSUCHCHANNEL`. No surface can
-    hand-pick a different numeric (a `TOPIC` query once returned 442, confirming
-    the channel exists — an existence oracle); the token has no other consumer.
+    surface, including the ones that change the channel. The predicate lives
+    once in `Channel::hidden_from`, and the deny surfaces
+    (MODE/KNOCK/TOPIC/KICK/INVITE) carry the returned `Hidden` token — across
+    the channel-owner hop when there is one — to the one `deny_hidden` helper,
+    which answers `ERR_NOSUCHCHANNEL`. No surface can hand-pick a different
+    numeric (`TOPIC`, `KICK` and `INVITE` once returned 442, confirming the
+    channel exists — an existence oracle); the token has no other consumer.
+  - A deferred reply is matched by exactly one release on every path. A
+    command that may answer synchronously (a refusal, a full queue) answers
+    under the dispatch capture and defers nothing; only a request that was
+    actually queued defers, and a capture records that it was deferred rather
+    than having it inferred from "nothing was sent". A defer no verdict would
+    release held every later line for that connection until the send-queue
+    kill — which a refused ChanServ REGISTER did to its caller.
+  - A core worker never awaits a push into its own bounded queue: it is the
+    only task that can pop it, so a full queue meant parking forever, with
+    ticks and shutdown (and the database flush) parked behind it. Effects for
+    this shard are handled inline by `Core::handle`, so the worker, the tests,
+    and the fuzzers share one semantics; only other shards' effects are routed.
+  - The registered-session count is maintained at the transitions, in the one
+    function that can register a session, and debug-asserted against a full
+    scan; it used to be recounted over every session after every event.
   - `require_form_actor` — the one precondition shared by every
     server-rendered mutation: resolve the cookie account and verify the
     submitted session-bound CSRF token before returning an actor. Forms carry
@@ -322,7 +339,12 @@ These are project-wide rules, enforced in review and (where possible) CI:
     queued CHATHISTORY read and login behind it. The structural guard (offload +
     `unreachable!`) makes "an argon2 op on the serial loop" unwritable.
   - `TerminalSafe` — untrusted server text that reaches the user's terminal
-    (in `e6irc-cli` and `e6irc-tui`) can only take this form, and its sole
+    (in `e6irc-cli` and `e6irc-tui`) as *text for a person* can only take this
+    form. The two machine-readable outputs keep exact values instead, and are
+    safe for stated reasons: `tail --json` always writes DEL and C1 as `\uXXXX`
+    (inside a JSON string that is the same value, so a pipe loses nothing and a
+    terminal sees nothing), and `e6irc api` neutralizes the response body only
+    when standard output is a terminal, giving a program the exact bytes. Its sole
     constructor `from_untrusted` neutralizes every terminal control byte (the
     C0/C1/DEL/CSI escapes the wire parser lets through, since it rejects only
     CR/LF/NUL). The TUI's `LogLine` fields are typed `TerminalSafe`, so a render
@@ -451,11 +473,28 @@ e6irc/
 │   ├── e6irc-client/         # client library: connection, TLS, SASL (PLAIN +
 │   │                         #   OAUTHBEARER), chathistory helpers
 │   ├── e6irc-cli/            # scripting-oriented CLI client binary
-│   └── e6irc-tui/            # ratatui TUI client binary
+│   ├── e6irc-tui/            # ratatui TUI client binary
+│   ├── e6irc-load/           # load generator binary: many concurrent clients,
+│   │                         #   connect rate and exact fan-out measurement
+│   └── e6irc-qualification/  # runs credential-gated external qualifications
+│                             #   and writes and verifies their evidence files
+├── fuzz/                     # cargo-fuzz targets and corpus; its own package,
+│                             #   outside the workspace, built by CI's fuzz-smoke
 ├── web/                      # Vite project (vanilla JavaScript chat client)
 ├── migrations/               # sqlx migrations (embedded in binary)
-├── tools/                    # dev/CI scripts (compat harness, load generator)
-├── DESIGN.md · PLAN.md · BUGS.md
+├── deploy/                   # container entrypoint, systemd unit, and the
+│                             #   deployment guide
+├── docs/                     # glossary, user journeys and their coverage,
+│                             #   client capabilities, API-first inventory
+├── tools/                    # CI guards and their tests, backup/restore,
+│                             #   release packaging, browser and recovery
+│                             #   journeys, load sweep and qualification scripts
+├── test/                     # Compose override for the Shauth single-sign-on
+│                             #   journey
+├── vendor/                   # third-party test material (irctest, reference
+│                             #   servers, a Libera snapshot); never compiled in
+├── Dockerfile · deny.toml
+├── AGENTS.md (CLAUDE.md is a symlink to it) · DESIGN.md · PLAN.md · BUGS.md
 └── LICENSE                   # AGPL-3.0-or-later
 ```
 
@@ -718,11 +757,19 @@ The following is the performance target and review checklist, not a claim that
 every mechanism is present. Shipped foundations include borrowed IRC parsing,
 `Cow` tag/ISUPPORT unescaping, bounded queues, capability-variant
 serialize-once fan-out in shared `Bytes`, partial-write-correct vectored SendQ
-draining capped below platform scatter/gather limits, release LTO, CoW
-recipient snapshots, dense generation-safe session IDs, batched accepts, a
+draining capped below platform scatter/gather limits, release link-time
+optimization (LTO), copy-on-write recipient snapshots, dense generation-safe session IDs, batched accepts, a
 timer-wheel reaper, reusable outbound write batches, and reproducible load
-tracking. Arc-swapped configuration and Criterion microbenchmarks are not yet
-present. Any nontrivial optimization lands with evidence that proves it:
+tracking. Lock-free configuration reload and microbenchmarks are not present:
+no benchmark crate is a dependency, and managed configuration does not reach a
+hot path at all. It is one revisioned snapshot behind an
+`Arc<tokio::sync::RwLock<…>>` shared by the HTTP handlers, the observability
+sampler, and storage maintenance. `PATCH /api/v1/admin/configuration` holds the
+write lock across the revision check, the live BNC-listener change, and the
+PostgreSQL write; the sampler and maintenance workers read their settings from
+the same snapshot each cycle. A managed value the core, an IRC listener, or
+sign-in consumes is stored and reported as restart-required, because those take
+their configuration once, at start (§18). Any nontrivial optimization lands with evidence that proves it:
 
 - **Zero-copy end-to-end**: parsing borrows from the receive buffer
   (§7.1); a routed message is serialized once per capability variant and
@@ -731,9 +778,11 @@ present. Any nontrivial optimization lands with evidence that proves it:
   concatenation.
 - **Copy-on-write where sharing beats copying**: tag values unescape to
   `Cow` (allocate only when an escape exists); channel recipient
-  snapshots are Arc'd CoW lists so fan-out iterates outside any lock;
-  reloadable config is an Arc-swapped snapshot (RCU pattern) — readers
-  never lock.
+  snapshots are Arc'd copy-on-write lists so fan-out iterates outside any
+  lock. If a reloadable value ever has to be read on the routing path, it
+  becomes an atomically swapped `Arc` snapshot (the read-copy-update pattern)
+  so those readers never lock; today none is, and the read–write lock above is
+  taken only by control-plane requests and two periodic workers.
 - **Cache-conscious layout**: hot structs ordered and sized against
   cache lines; `#[repr(align(64))]` separation between producer- and
   consumer-owned fields to prevent false sharing (queue internals as
@@ -751,8 +800,9 @@ present. Any nontrivial optimization lands with evidence that proves it:
   and public API are the gate any such change must pass unchanged.
 - **Build-level**: fat LTO, `codegen-units = 1` (§6). Benchmark evidence
   decides PGO, BOLT, and any allocator change.
-- **Measured, always**: microbenchmarks live beside hot modules; `tools/load`
-  macrobenchmarks track connect rate, exact fan-out sequence membership, and
+- **Measured, always**: a microbenchmark, when one is added, lives beside its
+  hot module; the `e6irc-load` crate and the `tools/load` scripts are the
+  macrobenchmark, tracking connect rate, exact fan-out sequence membership, and
   p50/p90/p99/max latency under a controlled environment. The harness accepts
   explicit minimum-rate/maximum-P99 thresholds and treats missing, duplicate,
   out-of-range, and malformed deliveries as failures. Every pull request runs
@@ -1061,7 +1111,13 @@ folded authentication deny key in the ordered core. The final transaction
 rechecks every invariant, reserves the name permanently, purges pending/
 consumed invitation contact data, device grants, owned BNC buffer, sent and
 direct-message history, and then deletes the account so credentials, sessions,
-identity links, networks, markers, and access rows cascade. The redacted audit
+identity links, networks, markers (the bouncer's `bnc_read_markers` included,
+which lacked the cascade until migration 0056 and made deletion fail for anyone
+who had sent one MARKREAD), and access rows cascade. An account's own messages
+are matched by both spellings of its name, because `messages.sender_account`
+stores the display name. Administrator, suspension, and deletion changes take
+one transaction-scoped advisory lock first, so two administrators demoting each
+other cannot both commit and leave none. The redacted audit
 event and retirement commit together. On database failure the HTTP boundary
 removes the live deny key before returning the error; success stops owned
 drivers and clears live administrator authority. No shipped creation path—or
@@ -1167,7 +1223,15 @@ minute by default). Both are UI-managed, bounded in memory, and fail closed
 when the bucket registry cannot admit another active account. The HTTP service
 also enforces a 1 MiB request-body limit, 1,024-request aggregate concurrency
 limit, and 30-second request deadline before work can consume unbounded
-process resources.
+process resources. The concurrency bound is one semaphore for the whole
+service, not one per route, and a request abandoned at the deadline answers a
+`408` problem document. A connection test dials a host the caller chose from
+the address every tenant shares, so it has its own admission: one running test
+per account, six started per account per minute, and eight running in the
+process; a refusal is a `429` with `Retry-After` and costs the account nothing.
+The verb lives at `/api/v1/me/network-preflight`, outside the positions a
+network name occupies — the contract check refuses any two route patterns one
+URL could satisfy, so no resource name is unreachable.
 The same admin-gated data is also served as a
 server-rendered management **console** at `/console` (accounts, registered
 channels, server bans, audit preview), with a dedicated filterable,
@@ -1314,9 +1378,33 @@ the page with the precise shared validation problem and preserve non-secret
 input, including the resolved preset values. IRC addresses must be a syntactic
 `host:port` with a nonzero numeric port (and bracketed IPv6); configuration,
 REST, and console creation share that invariant so an invalid endpoint cannot
-be persisted into an endless reconnect loop. If no master key is configured,
+be persisted into an endless reconnect loop. The identity a driver puts on the
+wire is parsed, not checked: `UpstreamNick`, `UpstreamRealname`, and
+`UpstreamChannel` are built only by `FromStr` at the one driver factory, so the
+configuration file, a stored row, and the API admit exactly the same values and
+a driver cannot be handed an unchecked one. The grammar is structural — what no
+server could read as one nickname or one channel (`al ice` is a two-parameter
+`NICK`; an autojoin entry of `0` means "leave every channel"; `#a key` supplies
+a key nobody configured) — not a network's nickname policy, which still comes
+back as a loud 432. A refusal names the request field it belongs to in the
+problem body (`field`), and both network forms mark, reveal, and focus that
+input. A blank real name means the nickname, on edit exactly as on create,
+because the form says so and an IRC network always has one. If no master key is configured,
 credential inputs are visibly
 unavailable rather than accepting a password the server must refuse to store.
+
+Console pages that refresh themselves do so through one scheduler, because
+replacing rows under the person using them is a defect, not a cosmetic one: a
+tick is skipped while the page is hidden, while a confirmation dialog is open
+(replacing the rows detached the form it was about to submit, and confirming
+then did nothing, silently), and while keyboard focus or a text selection is
+inside the region. Logs are updated in place — lines that scrolled off are
+dropped, new ones appended — so the reader keeps their place, and a log opens
+at its newest line. The refresh status line is a live region, so it speaks for
+the first load, a pressed Refresh, and the start or end of a failure, never for
+a routine tick. A Refresh button whose target has no refresher throws instead of
+doing nothing. Removing a shared network, an IRC operator, or an identity
+provider asks first, like every other destructive control.
 
 Each network has an owner-scoped
 operations page refreshed every ten seconds: lifecycle and state-transition
@@ -1349,7 +1437,7 @@ observable rather than silently starting with missing history.
 `/console/integrations` (admin) manages the chat-platform bridges:
 per-platform build availability, the complete stored inventory (including
 disabled bridges and bridges whose feature is absent), status, inspect,
-pause/resume, add/remove, and a platform-shaped edit form. The form replaces
+Disable/Enable, add/Remove, and a platform-shaped edit form. The form replaces
 endpoints, Matrix identity, and channel selection while treating credential
 inputs as write-only: blank preserves the encrypted value, Matrix/Discord can
 replace their password/token, and Slack can independently replace either
@@ -1409,8 +1497,19 @@ above the trait, provides for every network kind:
   attach, the same contract a real server has. Synthesized echoes retain only
   validated client-only tags and mint their own `time` provenance; a downstream
   cannot forge or duplicate server `time`/`msgid` tags in persisted history.
+  What belongs to the attachment itself never reaches the upstream: a client's
+  `PING` is answered locally (so lag checks work while the upstream is
+  reconnecting or parked, and its `PONG`s do not fill the backlog), a `PONG` is
+  consumed, and `QUIT` ends that attachment only — every IRC client sends one
+  on exit, and forwarding it would end the always-on session the bouncer
+  exists to keep. The browser composer refuses the same commands, judged on the
+  final line after slash translation so `/raw` cannot smuggle them.
 - **Detached buffering**: events accumulate in a per-network ring persisted
-  to PostgreSQL. The BNC attach listener also keeps per-account, per-target
+  to PostgreSQL. A lifecycle notice is buffered and persisted once per
+  *transition* (lifecycle plus failure code); repeats are delivered live only.
+  An upstream that is down all weekend would otherwise fill the ring, and then
+  the stored backlog, with identical "reconnecting" lines and evict the very
+  history the bouncer exists to keep. The BNC attach listener also keeps per-account, per-target
   read markers (`bnc_read_markers`, served over `MARKREAD`); they are
   separate from the ircd core's per-account markers (§11) because a BNC
   target lives on an external network the core knows nothing about.
@@ -1499,9 +1598,29 @@ one implementation shared with the external-network path.
   autojoin channels plus every channel the upstream confirmed membership in
   before the drop (runtime JOIN/PART/KICK are tracked as they are
   acknowledged upstream; a forced upstream NICK renames the tracked
-  identity). A process restart falls back to the configured autojoin, which
-  is the operator-declared floor. Upstream SASL PLAIN uses credentials
-  stored encrypted (§15).
+  identity). Tracked membership is bounded at 512 channels, per session and in
+  the reconnect intent: the names come from the upstream, which a tenant may
+  point at a server of their own, so an unbounded set was a memory and
+  reconnect-flood lever on the shared daemon. Past the bound the session ends
+  as `channel_limit_exceeded`; a confirmed name e6irc cannot track is announced
+  live and not rejoined. A process restart falls back to the configured
+  autojoin, which is the operator-declared floor. Upstream SASL PLAIN uses
+  credentials stored encrypted (§15). The client records what the server
+  advertises and requests only that, the metadata capabilities in one
+  `CAP REQ`. Only a verdict on the credentials themselves — a 904 for a
+  mechanism the server offers — is an authentication failure, which parks at
+  once. A server that does not offer the mechanism or the capability
+  (`sasl_unavailable`), or that ends the exchange without a verdict
+  (`sasl_failed`: nick locked, aborted, too long), is a registration refusal
+  carrying the server's own words, retried on the refusal schedule. Treating
+  those as "rejected credentials" parked a network instantly and left its owner
+  retyping a correct password. A server with no capability negotiation at all
+  registers plainly — unless SASL is configured, where registering
+  unauthenticated would be a silent downgrade, so it is refused. The idle
+  window that detects a half-open upstream is measured from the last line the
+  upstream sent; downstream traffic does not restart it (it used to, so a dead
+  link was never noticed while anyone was typing), and the Discord and Slack
+  gateways share the same deadline type.
   Once authentication or registration failure parks the driver, its command
   boundary returns terminal unavailability instead of accepting lines into a
   queue that has no consumer.
@@ -1747,8 +1866,26 @@ only one is not a choice. With several, the client does not pick "the first"
 on the person's behalf: the landing panel asks them to choose from the list
 (and, on a phone, offers the control that shows it rather than opening it
 unasked). An account with nothing runnable sees the same panel, whose action
-adds a network in place. Adding a network opens it. The preferences menu owns
-validated theme/notification settings, and responsive conversation navigation
+adds a network in place. Adding a network opens it. A refresh that changes
+nothing leaves the list alone, and one that changes it hands keyboard focus
+back to the same control of the same network; an expired session offers Sign
+in once and stops asking. Each opening of the settings dialog is numbered, so a
+slow answer for an earlier opening can neither fill in nor throw inside a later
+one, and settings that failed to load cannot be saved as blanks over the stored
+ones. Only a join asked for in this client moves the view: the bouncer
+rejoining every channel after an upstream reconnect does not. Replay therefore
+no longer decides where a network opens (it used to leave whichever channel it
+mentioned last): once the attach replay ends, the client reopens the
+conversation that was open on that network last time, else a network's only
+conversation, else it stays put for the person to choose. A bridge
+network's settings control leads to its own per-type form rather than the IRC
+dialog. No field that takes a third-party credential is marked `username` or
+`current-password`: the only credential a browser holds for this origin is the
+e6irc login, and those tokens invite it to be filled in and sent to another
+network (a test scans the chat shell and every template for it). The
+preferences menu owns validated theme/notification settings, stored one key at
+a time so the chat and the console — which share the record — cannot undo each
+other's change, and responsive conversation navigation
 preserves the full chat pane on phones. Every mutation the chat client sends
 carries the session's `X-E6IRC-CSRF` value read from `/api/v1/me`; the shared
 API contract module owns that header and `Content-Type`, refusing an unsafe
@@ -1871,7 +2008,12 @@ Non-interactive, pipe-friendly: `e6irc send '#chan' 'msg'`,
 `e6irc api <method> <path>` (bounded authenticated HTTP/HTTPS passthrough).
 IRC commands support plaintext or public-CA TLS and anonymous, paired SASL
 PLAIN, or SASL OAUTHBEARER registration. `tail --json` emits one complete JSON
-object per message, including structured tags, for safe automation.
+object per message, including structured tags, for safe automation. An
+unbounded `tail` that loses its server exits nonzero, and `&` channels are
+joined like `#` ones. Every wait on the server — connecting and registering,
+a capability request, a join with its history — is bounded by
+`--response-timeout` (30 s by default), so a peer that holds the socket open
+with irrelevant lines cannot hang a script.
 Every authentication mode requests the same optional server-time,
 message-tags, and account-tag metadata capabilities, so changing credentials
 cannot silently reduce the information delivered to the caller.
@@ -1896,7 +2038,18 @@ bounded scrollback, a relay/status strip, an active-first conversation rail,
 a visible horizontally-following composer caret, `/help`, `/join`, `/msg`,
 `/win`, `/raw`, literal-slash escape with `//`, `/quit`, Ctrl-End return to the
 latest message, Ctrl-C exit, automatic reconnect with the same explicit
-request, and loud disconnect/write/drop state. The slash-command grammar is
+request, and loud disconnect/write/drop state. Reconnection is not a fixed
+two-second loop: rejected credentials, a rejected server password, and a ban
+are never retried (the client stops with a final status, as the bouncer's
+driver parks), and any other failure backs off exponentially from
+`--reconnect-delay` to five minutes. A refused channel is dropped from the
+session with a status line instead of failing the whole connect. The client
+adopts the nickname the server confirmed — a BNC's welcome carries the real
+upstream nick, which may differ from `--nick` — and follows its own NICK
+changes, so direct messages and its own JOIN/PART are recognised. Every error
+numeric, FAIL/WARN/NOTE, ERROR, and KICK is rendered: a message refused by a
+moderated channel is said in the buffer it was sent from instead of standing
+there as a delivered-looking local echo. The slash-command grammar is
 closed: malformed
 or unknown commands remain in the composer with an explanation instead of
 silently doing nothing or leaking into a conversation. On initial
@@ -1952,7 +2105,8 @@ but the CLI, TUI, and BNC must surface the rejection.
   legacy context-free `enc:v1:` remains read-only compatible. A sealed value
   with no/wrong key is a hard startup error, and plaintext bootstrap values
   pass through until the managed control plane imports them sealed.
-  AEAD is **ChaCha20-Poly1305** via the in-tree aws-lc-rs (already pulled
+  The authenticated encryption with associated data (AEAD) cipher is
+  **ChaCha20-Poly1305** via the in-tree aws-lc-rs (already pulled
   by rustls) — chosen over XChaCha20-Poly1305 to avoid a new crypto
   dependency; the fresh-random 96-bit nonce per value makes reuse
   negligible at config-secret volumes. `e6ircd genkey` mints a key and
@@ -2159,7 +2313,8 @@ Layers, bottom to top:
   and makes the process exit non-zero. HTTP-to-core control requests have a
   five-second reply deadline, so even a live but wedged core cannot hold an
   API request forever.
-- BNC listener changes apply live. Core identity/limits, IRC listeners, OIDC,
+- BNC listener and observability-sampling changes apply live. Core
+  identity/limits, IRC listeners, OIDC,
   operator, and access-policy changes are stored immediately and explicitly
   reported as restart-required; no response claims those values were applied
   to the running core.
@@ -2167,7 +2322,7 @@ Layers, bottom to top:
   Each merge to `main` publishes a **multi-architecture container image**
   (linux/amd64 and linux/arm64) whose runtime base is
   `debian:bookworm-slim`. Each architecture digest has signed build-provenance
-  and SPDX-SBOM attestations; the assembled manifest has signed provenance,
+  and SPDX software-bill-of-materials attestations; the assembled manifest has signed provenance,
   and the release workflow verifies them after publication. A hardened,
   CI-validated systemd unit is shipped for native Linux installation.
   The container daemon is built with every bridge plus the embedded web
@@ -2188,7 +2343,7 @@ Layers, bottom to top:
   `-arm64` image manifests to GitHub Container Registry. Mutable `latest` and
   branch tags were not published, the manifest shape was verified after push,
   and only the newest 20 release groups were retained.
-  Untagged OCI attestation referrers are retained and pruned by the same
+  Untagged Open Container Initiative (OCI) attestation referrers are retained and pruned by the same
   oldest-kept-release boundary rather than accumulating outside those groups.
 
 ---

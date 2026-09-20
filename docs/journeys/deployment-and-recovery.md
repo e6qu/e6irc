@@ -103,8 +103,9 @@ when archives are requested.
 - Every merge to `main` builds the production image natively on Linux amd64
   and arm64, verifies each image’s runtime shape, and publishes one immutable
   12-character commit-SHA multi-architecture GHCR manifest.
-- Each architecture digest receives signed build-provenance and SPDX SBOM
-  attestations as OCI referrers. The assembled multi-architecture digest
+- Each architecture digest receives signed build-provenance and SPDX
+  software-bill-of-materials attestations as Open Container Initiative
+  referrers. The assembled multi-architecture digest
   receives signed provenance, and the workflow verifies each attestation
   through the same public consumer command operators use.
 - The runtime image is `debian:bookworm-slim`; the server runs as an
@@ -239,14 +240,16 @@ logging the database password.
 **Actor and goal.** An operator wants a verifiable recovery copy of every
 durable e6irc row and a guarded way to replace a damaged database from it.
 
-**Preconditions.** PostgreSQL client tools compatible with the server are on
-`PATH`; `E6IRC_DATABASE_URL` reaches the intended database; the external
+**Preconditions.** PostgreSQL client tools compatible with the server and
+`python3` are on `PATH`; `E6IRC_DATABASE_URL` holds the same URL e6ircd
+connects with and reaches the intended database; the external
 master-key files are backed up separately. e6ircd must be stopped before a
 restore so no process can write post-backup state into the replacement.
 
 **Flow.**
 
-1. Run `tools/backup-postgres.sh /var/backups/e6irc.dump`. It uses a
+1. Run `tools/backup-postgres.sh /var/backups/e6irc.dump` with
+   `E6IRC_DATABASE_URL` set. It uses a
    custom-format `pg_dump`, excludes ownership/privilege coupling, validates
    the archive with `pg_restore --list`, and atomically publishes a private
    dump plus a SHA-256 sidecar without overwriting an existing backup.
@@ -267,22 +270,43 @@ restore so no process can write post-backup state into the replacement.
 **Visible failures and recovery.** Existing backup paths, a missing sidecar,
 checksum mismatch, invalid archive, wrong explicit confirmation, different
 connected database name, or any `pg_dump`/`pg_restore` failure exits nonzero.
+A database URL the tools cannot hand to the PostgreSQL clients faithfully is
+refused before any client runs, with the reason and nothing the URL contained:
+a scheme other than `postgres://` or `postgresql://`, several hosts, a port
+outside 1–65535, a bare `#`, a bare `+` in a query value, bytes that are not
+percent-encoded UTF-8, or a query parameter the tools do not forward. Nothing is
+dropped silently, so `sslmode` and the certificate parameters (in either the
+libpq or the daemon's hyphenated spelling) apply to the backup exactly as they
+do to the daemon; only `statement-cache-capacity`, which sizes a daemon cache,
+is ignored.
 Restore uses one transaction, so a failed archive application does not leave a
 half-restored schema. Keep the source database and backup unchanged, correct
 the named failure, and retry while e6ircd remains stopped.
 
-**Security and observability.** The database URL is passed through the
-`PGDATABASE` environment rather than command arguments; scripts use a private
-umask and never print the URL. Backups contain sealed credentials and personal
+**Security and observability.** `tools/postgres-url-environment.py` splits the
+database URL once, percent-decoding each part, into the per-field libpq
+environment variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`,
+`PGDATABASE`, `PGSSLMODE`, …) and executes the client with them, so neither the
+URL nor the password is ever a process argument. The scripts use a private
+umask and never print the URL or the password; a PostgreSQL client's own
+connection error names the host, port, user, or database it could not use, and
+never the password. Backups contain sealed credentials and personal
 data and therefore require the same access controls as the database. The
 restore requires two matching pieces of operator intent—the expected database
 argument and confirmation environment value—before issuing `--clean`.
 
-**Evidence.** A portable shell contract test proves no-overwrite, checksum,
+**Evidence.** `tools/test-backup-restore.sh` proves no-overwrite, checksum,
 confirmation, live-name, archive-validation, and single-transaction command
-construction. The process-level PostgreSQL recovery journey creates a real
-custom archive after traffic and migrations, destroys durable proof rows,
-restores the archive, and boots the daemon against the recovered store.
+construction, that each client receives the decoded fields in its environment
+and no part of the URL as an argument, and that every unusable URL is refused
+without being repeated. `tools/test-postgres-recovery.py` runs the shipped
+scripts against a real PostgreSQL that checks the password, listens off the
+default port, and offers no TLS: a password made of URL delimiters
+authenticates, a wrong one and `sslmode=require` both fail without leaving a
+dump, a real custom archive is taken after traffic and migrations, durable
+proof rows are destroyed, a restore naming another database is refused without
+changing anything, the archive is restored, and the daemon boots against the
+recovered store.
 
 ## Recover from secret-key loss or rotation
 

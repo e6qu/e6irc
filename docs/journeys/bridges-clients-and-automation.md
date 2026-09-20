@@ -25,8 +25,8 @@ credentials/endpoints and owns the configured bridge network.
 5. The bridge starts as a normal `NetworkDriver`; web/BNC attachments,
    buffering, lifecycle, traffic, latency, and error monitoring use the same
    owner/network model as IRC.
-6. Pause/resume/delete from **Integrations**; inspect detailed runtime state
-   through the corresponding network.
+6. **Disable**, **Enable**, or **Remove** the bridge from **Integrations**;
+   inspect detailed runtime state through the corresponding network.
 
 **Visible failures and recovery.** A driver not compiled into the binary is
 shown and rejected explicitly. Invalid/rejected credentials are fatal until

@@ -723,8 +723,43 @@ function renderNickList() {
   }
 }
 
+// Which conversation was open on each network, so opening the network again
+// returns to it. Replay no longer decides the view (it used to leave whichever
+// channel it mentioned last), so something the person chose has to. Storage
+// being unavailable only means there is nothing to return to.
+const openConversationKey = () => `e6irc.conversation.${fold(network)}`;
+function rememberOpenConversation() {
+  if (!network) return;
+  try {
+    if (active === SERVER) window.localStorage.removeItem(openConversationKey());
+    else window.localStorage.setItem(openConversationKey(), active);
+  } catch {
+    // Already reported by the preferences load; nothing is lost but the memory.
+  }
+}
+
+// Once per page, when the attach replay has finished: reopen what was open,
+// else open a network's only conversation (not a choice), else leave the view
+// where it is for the person to pick. Never "the last channel replay showed".
+let initialViewSettled = false;
+function settleInitialView() {
+  if (initialViewSettled) return;
+  initialViewSettled = true;
+  if (active !== SERVER) return; // the person already went somewhere
+  let remembered = null;
+  try {
+    remembered = window.localStorage.getItem(openConversationKey());
+  } catch {
+    remembered = null;
+  }
+  const conversations = Array.from(buffers.values()).filter((b) => b.key !== SERVER);
+  const target = (remembered && buffers.get(remembered)) || (conversations.length === 1 ? conversations[0] : null);
+  if (target) setActive(target.display);
+}
+
 function setActive(name) {
   active = fold(name);
+  if (initialViewSettled) rememberOpenConversation();
   const b = buffers.get(active);
   if (b) {
     b.unread = 0;
@@ -1322,6 +1357,7 @@ function connect() {
     } else if (event.type === "snapshot") {
       snapshotComplete = true;
       if (upstreamConnected) resyncMemberships();
+      settleInitialView();
     } else if (event.type === "session") {
       applySessionSnapshot(event.nick, event.channels);
     } else if (event.type === "status" && event.value === "unavailable") {

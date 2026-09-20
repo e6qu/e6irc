@@ -65,7 +65,7 @@
           <label class="field field-wide">
             <span>Channels to join <em>optional</em></span>
             <input name="autojoin" autocomplete="off" value="{{ form.autojoin }}" placeholder="#e6irc, #rust" />
-            <small>Comma-separated channel names.</small>
+            <small>Separate channels with commas or spaces.</small>
           </label>
           <details class="advanced field-wide" data-network-advanced {% if form.preset == "custom" || form.preset == "" %}open{% endif %}>
             <summary>Advanced</summary>

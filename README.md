@@ -4,7 +4,7 @@ A monolithic Rust IRC ecosystem: one server binary that is at once a
 modern **IRCv3 daemon**, a versioned **REST API**, an **OIDC** web
 backend for a bundled vanilla-JavaScript/Vite web client, and a per-user **BNC host**
 (always-on bouncer sessions to external IRC networks, plus bridges to
-non-IRC services such as Matrix) — shipped alongside native **CLI** and
+Matrix, Discord, and Slack) — shipped alongside native **CLI** and
 **TUI** clients.
 
 Single server = the whole network (no server-to-server linking).
@@ -19,13 +19,14 @@ surface. See the [client capability matrix](docs/client-capabilities.md).
 
 | Crate | Binary | What it is |
 |-------|--------|-----------|
-| `e6ircd` | `e6ircd` | The server: IRCv3 daemon + REST API + web backend + OIDC RP + BNC host + Matrix bridge |
+| `e6ircd` | `e6ircd` | The server: IRCv3 daemon + REST API + web backend + OIDC RP + BNC host + Matrix, Discord, and Slack bridges |
 | `e6irc-cli` | `e6irc` | Command-line client (device login, send/tail/history/raw, SASL, one-shot HTTPS REST calls) |
 | `e6irc-tui` | `e6irc-tui` | Terminal client (ratatui, multi-buffer, history, shared read positions) |
 | `e6irc-client` | — | Async client library shared by the CLI/TUI and the load harness |
 | `e6irc-proto` | — | IRC message framing and parsing |
 | `e6irc-queue` | — | The core's async work queue (loom-checked) |
 | `e6irc-load` | `e6irc-load` | Load harness for the concurrency/fan-out targets |
+| `e6irc-qualification` | `e6irc-qualification` | Runs credential-gated qualifications against external services and writes and verifies their evidence files |
 
 ## Highlights
 
@@ -43,8 +44,9 @@ surface. See the [client capability matrix](docs/client-capabilities.md).
 - **BNC**: per-account always-on networks with backlog persistence and
   replay, SASL to upstreams, encrypted credential storage, and a pluggable
   driver SPI. Each network exposes owner-scoped lifecycle, connection latency,
-  traffic, attached-client, error, and buffer diagnostics. A **Matrix** bridge
-  ships behind a feature flag; the local
+  traffic, attached-client, error, and buffer diagnostics. **Matrix**,
+  **Discord**, and **Slack** bridges each ship behind their own feature flag;
+  the local
   in-process network gives always-on presence with no external socket.
 - **Web client**: server-rendered login, self-service, and operational
   console pages plus a vanilla-JavaScript chat client over `/ws/ui`.
@@ -123,11 +125,12 @@ OpenID Connect, and deployment vocabulary used throughout.
 Engineering conventions live in `AGENTS.md` (the boy-scout rule and
 scope law) and `DESIGN.md` §2 (the quality laws: no silent no-ops, no
 silent fallbacks, provenance required, make bug classes unrepresentable).
-Before you stop, the tree must be green: `cargo fmt --all --check`,
-`cargo clippy --workspace --all-targets` (in each feature config),
-`cargo test --workspace`, `cargo deny check`, and `tools/check-noops.sh`.
-The product-level traceability contract is checked by
-`tools/check-journeys.py`.
+Before you stop, the tree must be green. The complete gate list — builds in
+every feature configuration, tests, clippy, formatting, `cargo deny`, and the
+no-op, dead-code, dead-public, duplication, and no-deferral guards — is the
+"Practical checklist before you stop" in `AGENTS.md`; it is kept there only, so
+that it cannot drift from a second copy. The product-level traceability
+contract is checked by `tools/check-journeys.py`.
 
 ## License
 

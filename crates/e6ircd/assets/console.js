@@ -113,6 +113,12 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         trigger?.focus();
         return;
       }
+      if (!form.isConnected) {
+        // requestSubmit() on a detached form does nothing at all, so the
+        // confirmed action would vanish without a word.
+        window.alert("That item changed while you were confirming, so nothing was done. Please try again.");
+        return;
+      }
       form.dataset.confirmed = "true";
       form.requestSubmit(submitter?.isConnected ? submitter : undefined);
     });
@@ -209,9 +215,12 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   for (const button of document.querySelectorAll("[data-refresh-target]")) {
     button.addEventListener("click", () => {
       const panel = document.querySelector(button.dataset.refreshTarget);
-      if (!panel) return;
-      const refresh = panelRefreshers.get(panel);
-      if (refresh) void refresh(true);
+      const refresh = panel ? panelRefreshers.get(panel) : undefined;
+      // The log pages registered their refresher on a different element than
+      // the one their button names, so Refresh did nothing -- on the very
+      // pages whose error text says "Use Refresh to retry".
+      if (!refresh) throw new Error(`Nothing refreshes ${button.dataset.refreshTarget}.`);
+      void refresh(true);
     });
   }
 
@@ -291,22 +300,79 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   const serializeRefresh = (refresh, reportQueued) => {
     let running = false;
     let queued = false;
-    return async (announceQueue = false) => {
+    let asked = false;
+    return async (byPerson = false) => {
+      asked ||= byPerson;
       if (running) {
         queued = true;
-        if (announceQueue) reportQueued();
+        if (byPerson) reportQueued();
         return;
       }
       running = true;
       try {
         do {
           queued = false;
-          await refresh();
+          const announce = asked;
+          asked = false;
+          await refresh(announce);
         } while (queued);
       } finally {
         running = false;
       }
     };
+  };
+
+  // The status line is a live region. A timer that rewrites it to
+  // "Refreshing…" and back every few seconds is continuous noise for a screen
+  // reader, so a background refresh stays silent: the line speaks for the
+  // first load, when a person presses Refresh, and whenever a failure begins
+  // or ends.
+  const spokenStatus = (status, byPerson) => {
+    if (!status) return null;
+    const speak = byPerson || status.dataset.loaded !== "true" || status.classList.contains("refresh-error");
+    status.dataset.loaded = "true";
+    return speak ? status : null;
+  };
+
+  // Background refreshes replace the rows they refresh. Doing that under a
+  // person who is using those rows loses their keyboard focus or text
+  // selection, and detaches the form a pending confirmation refers to -- after
+  // which confirming submitted nothing, silently. So a tick is skipped while
+  // the page is hidden, a confirmation is open, or the region is in use.
+  const scheduleBackgroundRefresh = (region, refresh, seconds) => {
+    if (!Number.isFinite(seconds) || seconds < 5) return;
+    window.setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      if (confirmationDialog instanceof HTMLDialogElement && confirmationDialog.open) return;
+      if (region.contains(document.activeElement)) return;
+      const selection = document.getSelection();
+      if (selection && !selection.isCollapsed && region.contains(selection.anchorNode)) return;
+      void refresh();
+    }, seconds * 1000);
+  };
+
+  // A log is a sliding window of the newest lines. Updating it in place --
+  // dropping what scrolled off, appending what arrived -- keeps the reader's
+  // place, selection and focus, and lets role=log announce only new lines.
+  // Replacing it wholesale snapped a 1000-line log back to its top every five
+  // seconds, away from the newest lines the page tells people to read.
+  const fillLog = (region, lines, emptyText) => {
+    const atNewest = region.scrollHeight - region.scrollTop - region.clientHeight < 8;
+    const shown = Array.from(region.querySelectorAll(":scope > code"));
+    let drop = 0;
+    while (drop < shown.length && !shown.slice(drop).every((node, index) => node.textContent === lines[index])) drop += 1;
+    for (const node of shown.slice(0, drop)) node.remove();
+    for (const line of lines.slice(shown.length - drop)) region.append(element("code", "", line));
+    region.querySelector(":scope > p.empty")?.remove();
+    if (lines.length === 0) region.append(element("p", "empty", emptyText));
+    if (atNewest) region.scrollTop = region.scrollHeight;
+  };
+  const logIn = (panel, label) => {
+    const existing = panel.querySelector(":scope > .backlog");
+    if (existing) return existing;
+    const created = logRegion(label);
+    panel.replaceChildren(created);
+    return created;
   };
 
   const refreshAfterMutation = async (refresh) => {
@@ -570,8 +636,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     panel.replaceChildren(fragment);
   };
 
-  const refreshMonitoringNow = async (panel) => {
-    const status = document.getElementById(panel.dataset.refreshStatus);
+  const refreshMonitoringNow = async (panel, byPerson) => {
+    const statusLine = document.getElementById(panel.dataset.refreshStatus);
+    const status = spokenStatus(statusLine, byPerson);
     panel.setAttribute("aria-busy", "true");
     if (status) {
       status.textContent = "Refreshing…";
@@ -585,9 +652,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       if (status) status.textContent = "Live data refreshed.";
     } catch (error) {
       panel.replaceChildren(monitoringEmpty(`Live monitoring failed (${error.message}). Use Refresh to retry.`));
-      if (status) {
-        status.textContent = `Live refresh failed (${error.message}). Use Refresh to retry.`;
-        status.classList.add("refresh-error");
+      if (statusLine) {
+        statusLine.textContent = `Live refresh failed (${error.message}). Use Refresh to retry.`;
+        statusLine.classList.add("refresh-error");
       }
     } finally {
       panel.removeAttribute("aria-busy");
@@ -596,7 +663,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
 
   for (const panel of document.querySelectorAll("[data-api-admin-monitoring]")) {
     const refresh = serializeRefresh(
-      () => refreshMonitoringNow(panel),
+      (byPerson) => refreshMonitoringNow(panel, byPerson),
       () => {
         const status = document.getElementById(panel.dataset.refreshStatus);
         if (status) status.textContent = "Refresh queued.";
@@ -606,7 +673,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     void refresh();
     const seconds = Number(panel.dataset.refreshSeconds);
     if (Number.isFinite(seconds) && seconds >= 5) {
-      window.setInterval(() => void refresh(), seconds * 1000);
+      scheduleBackgroundRefresh(panel, refresh, seconds);
     }
   }
 
@@ -681,16 +748,26 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     if (view.recent_lines.length === 0) {
       backlog.append(element("p", "empty", "No IRC output has been stored for this network."));
     } else {
-      const lines = logRegion("Recent raw IRC backlog");
-      for (const line of view.recent_lines) lines.append(element("code", "", line));
+      // Reuse the transcript's own node so a refresh does not throw the reader
+      // back to the oldest line while they follow a NickServ exchange. A node
+      // loses its scroll offset when it is moved, so that is carried across.
+      const lines = panel.querySelector('.backlog[aria-label="Recent raw IRC backlog"]') ?? logRegion("Recent raw IRC backlog");
+      const place = lines.isConnected ? lines.scrollTop : null;
       backlog.append(lines);
+      fragment.append(backlog);
+      panel.replaceChildren(fragment);
+      if (place !== null) lines.scrollTop = place;
+      fillLog(lines, view.recent_lines, "");
+      if (place === null) lines.scrollTop = lines.scrollHeight;
+      return;
     }
     fragment.append(backlog);
     panel.replaceChildren(fragment);
   };
 
-  const refreshNetworkOperationsNow = async (panel) => {
-    const status = document.getElementById(panel.dataset.refreshStatus);
+  const refreshNetworkOperationsNow = async (panel, byPerson) => {
+    const statusLine = document.getElementById(panel.dataset.refreshStatus);
+    const status = spokenStatus(statusLine, byPerson);
     panel.setAttribute("aria-busy", "true");
     if (status) {
       status.textContent = "Refreshing…";
@@ -704,9 +781,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       if (status) status.textContent = "Live data refreshed.";
     } catch (error) {
       panel.replaceChildren(monitoringEmpty(`Live network operations failed (${error.message}). Use Refresh to retry.`));
-      if (status) {
-        status.textContent = `Live refresh failed (${error.message}). Use Refresh to retry.`;
-        status.classList.add("refresh-error");
+      if (statusLine) {
+        statusLine.textContent = `Live refresh failed (${error.message}). Use Refresh to retry.`;
+        statusLine.classList.add("refresh-error");
       }
     } finally {
       panel.removeAttribute("aria-busy");
@@ -715,7 +792,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
 
   for (const panel of document.querySelectorAll("[data-api-network-operations]")) {
     const refresh = serializeRefresh(
-      () => refreshNetworkOperationsNow(panel),
+      (byPerson) => refreshNetworkOperationsNow(panel, byPerson),
       () => {
         const status = document.getElementById(panel.dataset.refreshStatus);
         if (status) status.textContent = "Refresh queued.";
@@ -725,23 +802,18 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     void refresh();
     const seconds = Number(panel.dataset.refreshSeconds);
     if (Number.isFinite(seconds) && seconds >= 5) {
-      window.setInterval(() => void refresh(), seconds * 1000);
+      scheduleBackgroundRefresh(panel, refresh, seconds);
     }
   }
 
   const renderNetworkLog = (panel, lines) => {
-    const log = logRegion("Network log");
-    if (lines.length === 0) {
-      log.append(element("p", "empty", "No log lines have been stored yet."));
-    } else {
-      for (const line of lines) log.append(element("code", "", line));
-    }
-    panel.replaceChildren(log);
+    fillLog(logIn(panel, "Network log"), lines, "No log lines have been stored yet.");
   };
 
-  const refreshNetworkLogNow = async (root) => {
+  const refreshNetworkLogNow = async (root, byPerson) => {
     const panel = root.querySelector("#network-log-panel");
-    const status = document.getElementById(root.dataset.refreshStatus);
+    const statusLine = document.getElementById(root.dataset.refreshStatus);
+    const status = spokenStatus(statusLine, byPerson);
     if (!(panel instanceof HTMLElement)) return;
     panel.setAttribute("aria-busy", "true");
     if (status) {
@@ -761,9 +833,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       if (status) status.textContent = "Live log refreshed.";
     } catch (error) {
       panel.replaceChildren(monitoringEmpty(`Network log failed (${error.message}). Use Refresh to retry.`));
-      if (status) {
-        status.textContent = `Live log refresh failed (${error.message}). Use Refresh to retry.`;
-        status.classList.add("refresh-error");
+      if (statusLine) {
+        statusLine.textContent = `Live log refresh failed (${error.message}). Use Refresh to retry.`;
+        statusLine.classList.add("refresh-error");
       }
     } finally {
       panel.removeAttribute("aria-busy");
@@ -772,34 +844,28 @@ import { loadSettings, saveSetting } from "/console-settings.js";
 
   for (const root of document.querySelectorAll("[data-api-network-log]")) {
     const refresh = serializeRefresh(
-      () => refreshNetworkLogNow(root),
+      (byPerson) => refreshNetworkLogNow(root, byPerson),
       () => {
         const status = document.getElementById(root.dataset.refreshStatus);
         if (status) status.textContent = "Refresh queued.";
       },
     );
-    panelRefreshers.set(root, refresh);
+    const panel = root.querySelector("[id$='-log-panel']");
+    if (!(panel instanceof HTMLElement)) throw new Error("This log page has no panel to refresh.");
+    panelRefreshers.set(panel, refresh);
     void refresh();
-    const seconds = Number(root.dataset.refreshSeconds);
-    if (Number.isFinite(seconds) && seconds >= 5) window.setInterval(() => void refresh(), seconds * 1000);
+    scheduleBackgroundRefresh(panel, refresh, Number(root.dataset.refreshSeconds));
   }
 
   const renderServerLog = (panel, entries) => {
-    const log = logRegion("Live server logs");
-    if (entries.length === 0) {
-      log.append(element("p", "empty", "No operational events have been recorded yet."));
-    } else {
-      for (const entry of entries) {
-        const at = new Date(entry.at_ms).toISOString();
-        log.append(element("code", "", `${at} — ${entry.component} — ${entry.severity}: ${entry.message}`));
-      }
-    }
-    panel.replaceChildren(log);
+    const lines = entries.map((entry) => `${new Date(entry.at_ms).toISOString()} — ${entry.component} — ${entry.severity}: ${entry.message}`);
+    fillLog(logIn(panel, "Live server logs"), lines, "No operational events have been recorded yet.");
   };
 
-  const refreshServerLogNow = async (root) => {
+  const refreshServerLogNow = async (root, byPerson) => {
     const panel = root.querySelector("#server-log-panel");
-    const status = document.getElementById(root.dataset.refreshStatus);
+    const statusLine = document.getElementById(root.dataset.refreshStatus);
+    const status = spokenStatus(statusLine, byPerson);
     if (!(panel instanceof HTMLElement)) return;
     panel.setAttribute("aria-busy", "true");
     if (status) {
@@ -812,9 +878,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       if (status) status.textContent = "Live logs refreshed.";
     } catch (error) {
       panel.replaceChildren(monitoringEmpty(`Live logs failed (${error.message}). Use Refresh to retry.`));
-      if (status) {
-        status.textContent = `Live log refresh failed (${error.message}). Use Refresh to retry.`;
-        status.classList.add("refresh-error");
+      if (statusLine) {
+        statusLine.textContent = `Live log refresh failed (${error.message}). Use Refresh to retry.`;
+        statusLine.classList.add("refresh-error");
       }
     } finally {
       panel.removeAttribute("aria-busy");
@@ -823,16 +889,17 @@ import { loadSettings, saveSetting } from "/console-settings.js";
 
   for (const root of document.querySelectorAll("[data-api-server-log]")) {
     const refresh = serializeRefresh(
-      () => refreshServerLogNow(root),
+      (byPerson) => refreshServerLogNow(root, byPerson),
       () => {
         const status = document.getElementById(root.dataset.refreshStatus);
         if (status) status.textContent = "Refresh queued.";
       },
     );
-    panelRefreshers.set(root, refresh);
+    const panel = root.querySelector("[id$='-log-panel']");
+    if (!(panel instanceof HTMLElement)) throw new Error("This log page has no panel to refresh.");
+    panelRefreshers.set(panel, refresh);
     void refresh();
-    const seconds = Number(root.dataset.refreshSeconds);
-    if (Number.isFinite(seconds) && seconds >= 5) window.setInterval(() => void refresh(), seconds * 1000);
+    scheduleBackgroundRefresh(panel, refresh, Number(root.dataset.refreshSeconds));
   }
 
   const overviewSection = (target, title, href, headings, rows) => {
@@ -999,7 +1066,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     local: { required: ["nick", "realname"], labels: { addr: "Server", nick: "Nickname", realname: "Real name" } },
     matrix: { required: ["nick", "sasl_password"], labels: { addr: "Homeserver", nick: "Provider user", sasl_password: "Login password" } },
     discord: { required: ["sasl_password"], labels: { addr: "API base", sasl_password: "Bot token" } },
-    slack: { required: ["sasl_account", "sasl_password"], labels: { addr: "API base", sasl_account: "Bot token", sasl_password: "App-level token" } },
+    slack: { required: ["sasl_account", "sasl_password"], secret: ["sasl_account"], labels: { addr: "API base", sasl_account: "Bot token", sasl_password: "App-level token" } },
   };
 
   const syncNetworkForm = (form) => {
@@ -1007,6 +1074,21 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     if (!(type instanceof HTMLSelectElement)) throw new Error("Network form has no type selector.");
     const requirements = serverNetworkKinds[type.value];
     if (!requirements) throw new Error(`Unsupported network type: ${type.value}`);
+    // The two credential inputs mean different things per type. A value typed
+    // under one meaning must not survive into another: a Slack bot token left
+    // in place would be relabelled "NickServ account" and sent to an IRC
+    // network. And where a type makes the first input a token, it is masked
+    // and kept out of the browser's form history like any other secret.
+    const changedType = form.dataset.syncedKind !== undefined && form.dataset.syncedKind !== type.value;
+    form.dataset.syncedKind = type.value;
+    for (const name of ["sasl_account", "sasl_password"]) {
+      const input = form.elements.namedItem(name);
+      if (!(input instanceof HTMLInputElement)) continue;
+      if (changedType) input.value = "";
+      const secret = name === "sasl_password" || (requirements.secret ?? []).includes(name);
+      input.type = secret ? "password" : "text";
+      input.autocomplete = secret ? "new-password" : "off";
+    }
     for (const name of ["addr", "nick", "realname", "sasl_account", "sasl_password"]) {
       const input = form.elements.namedItem(name);
       if (!(input instanceof HTMLInputElement)) throw new Error(`Network form has no ${name} input.`);
@@ -1137,30 +1219,6 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     });
   }
 
-  for (const form of document.querySelectorAll("[data-api-network-delete]")) {
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      const fields = new FormData(form);
-      const revision = Number(fields.get("revision"));
-      if (!Number.isSafeInteger(revision) || revision < 0) {
-        setConfigurationResult("The configuration revision is invalid. Reload and try again.", false);
-        return;
-      }
-      const name = String(fields.get("name") || "").trim();
-      if (!name) {
-        setConfigurationResult("The network name is missing. Reload and try again.", false);
-        return;
-      }
-      void mutateConfiguration(
-        form,
-        `/api/v1/admin/configuration/networks/${encodeURIComponent(name)}`,
-        "DELETE",
-        { revision, owner: optionalValue(String(fields.get("owner") || "")) },
-        `removed server network ${name}`,
-      );
-    });
-  }
-
   for (const form of document.querySelectorAll("[data-api-oper-create]")) {
     form.addEventListener("submit", (event) => {
       event.preventDefault();
@@ -1178,26 +1236,6 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         "POST",
         { revision, name, password },
         `added IRC operator ${name}`,
-      );
-    });
-  }
-
-  for (const form of document.querySelectorAll("[data-api-oper-delete]")) {
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      const fields = new FormData(form);
-      const revision = Number(fields.get("revision"));
-      const name = String(fields.get("name") || "").trim();
-      if (!Number.isSafeInteger(revision) || revision < 0 || !name) {
-        setConfigurationResult("The operator or configuration revision is missing. Reload and try again.", false);
-        return;
-      }
-      void mutateConfiguration(
-        form,
-        `/api/v1/admin/configuration/opers/${encodeURIComponent(name)}`,
-        "DELETE",
-        { revision },
-        `removed IRC operator ${name}`,
       );
     });
   }
@@ -1236,26 +1274,6 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     });
   }
 
-  for (const form of document.querySelectorAll("[data-api-oidc-delete]")) {
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      const fields = new FormData(form);
-      const revision = Number(fields.get("revision"));
-      const name = String(fields.get("name") || "").trim();
-      if (!Number.isSafeInteger(revision) || revision < 0 || !name) {
-        setConfigurationResult("The provider or configuration revision is missing. Reload and try again.", false);
-        return;
-      }
-      void mutateConfiguration(
-        form,
-        `/api/v1/admin/configuration/oidc-providers/${encodeURIComponent(name)}`,
-        "DELETE",
-        { revision },
-        `removed OpenID Connect provider ${name}`,
-      );
-    });
-  }
-
   const configurationValue = (form, name, value) => {
     const field = form.elements.namedItem(name);
     if (field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement) field.value = value ?? "";
@@ -1285,6 +1303,10 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     form.dataset.apiConfigurationDelete = kind;
     form.append(configurationHidden("csrf", csrf), configurationHidden("revision", revision), configurationHidden("name", name));
     if (owner !== undefined) form.append(configurationHidden("owner", owner));
+    // Removing an identity provider locks out everyone who signs in through
+    // it; an operator or a shared network is no smaller. Every other
+    // destructive control on the console asks first -- so do these.
+    form.dataset.confirm = `Remove ${kind === "oidc" ? "identity provider" : kind === "oper" ? "IRC operator" : "server network"} ${name}?`;
     const button = element("button", "danger", "Remove");
     button.type = "submit";
     form.append(button);
@@ -2437,17 +2459,18 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     tableLoadFailure(previous, 7, error, retry);
   };
   let refreshOwnerNetworks;
-  const refreshOwnerNetworksNow = async () => {
+  const refreshOwnerNetworksNow = async (byPerson) => {
     if (!(ownerNetworkRows instanceof HTMLElement)) return;
     ownerNetworkRows.setAttribute("aria-busy", "true");
-    if (ownerNetworkRefreshStatus) {
-      ownerNetworkRefreshStatus.textContent = "Refreshing…";
-      ownerNetworkRefreshStatus.classList.remove("refresh-error");
+    const status = spokenStatus(ownerNetworkRefreshStatus, byPerson);
+    if (status) {
+      status.textContent = "Refreshing…";
+      status.classList.remove("refresh-error");
     }
     try {
       const result = await apiRead("/api/v1/me/networks");
       renderOwnerNetworks(apiCollection(result, "networks", "network directory"));
-      if (ownerNetworkRefreshStatus) ownerNetworkRefreshStatus.textContent = "Live data refreshed.";
+      if (status) status.textContent = "Live data refreshed.";
       return true;
     } catch (error) {
       renderOwnerNetworkFailure(error, () => { if (refreshOwnerNetworks) void refreshOwnerNetworks(true); });
@@ -2468,10 +2491,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       },
     );
     void refreshOwnerNetworks();
-    const seconds = Number(ownerNetworkRows.dataset.refreshSeconds);
-    if (Number.isFinite(seconds) && seconds >= 5) {
-      window.setInterval(() => { void refreshOwnerNetworks(); }, seconds * 1000);
-    }
+    scheduleBackgroundRefresh(ownerNetworkRows, refreshOwnerNetworks, Number(ownerNetworkRows.dataset.refreshSeconds));
   }
 
   let refreshOwnerNetworkEditor;
@@ -2530,9 +2550,14 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     tls: fields.has("tls"),
     nick: fieldValue(fields, "nick"),
     realname: fieldValue(fields, "realname") || fieldValue(fields, "nick"),
-    autojoin: splitValues(String(fields.get("autojoin") || ""), ","),
+    // Commas or spaces, as the chat client accepts: an IRC channel name can
+    // contain neither, and "#a #b" typed here used to become one bogus channel.
+    autojoin: splitValues(String(fields.get("autojoin") || ""), /[\s,]+/),
     sasl_account: optionalValue(String(fields.get("sasl_account") || "")),
-    sasl_password: optionalValue(String(fields.get("sasl_password") || "")),
+    // Verbatim: a password may begin or end with a space, and trimming it
+    // here stored a different secret than the one typed (the editor and the
+    // chat client never trimmed).
+    sasl_password: String(fields.get("sasl_password") || "") || null,
   });
 
   for (const form of document.querySelectorAll("[data-api-owner-network-create]")) {
@@ -2549,7 +2574,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           setOwnerNetworkResult("Enter a server and nickname.", false);
           return;
         }
-        void mutateOwnerNetwork(form, "/api/v1/me/networks/preflight", "POST", connection, ownerNetworkPreflight, preflightButton);
+        void mutateOwnerNetwork(form, "/api/v1/me/network-preflight", "POST", connection, ownerNetworkPreflight, preflightButton);
       });
     }
     form.addEventListener("submit", (event) => {
@@ -2561,7 +2586,13 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         setOwnerNetworkResult("Enter a name, server, and nickname.", false);
         return;
       }
-      void mutateOwnerNetwork(form, form.action, "POST", { kind: "irc", name, ...connection });
+      void mutateOwnerNetwork(form, form.action, "POST", { kind: "irc", name, ...connection }).then((created) => {
+        if (!created) return;
+        // Back to the defaults, so the NickServ password does not sit in the
+        // form and a second click is not a confusing "already exists".
+        form.reset();
+        setOwnerNetworkResult(`Added ${created.name}. It is connecting now.`, true);
+      });
     });
   }
 
@@ -2601,7 +2632,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       // An IRC network always has a real name (the API refuses null for one),
       // so a blank box means the nickname, on edit exactly as on create.
       realname: bridge ? null : (fieldValue(fields, "realname") || fieldValue(fields, "nick")),
-      autojoin: splitValues(String(fields.get("autojoin") || ""), ","), credentials,
+      autojoin: splitValues(String(fields.get("autojoin") || ""), bridge ? "," : /[\s,]+/), credentials,
     };
     if (!bridge && (!body.addr || !body.nick)) {
       throw new Error("Enter the server and nickname.");

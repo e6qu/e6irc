@@ -185,9 +185,9 @@ network inventory and the registry holds live drivers.
 
 **Flow.**
 
-1. **Networks** (admin section) lists every account's networks with owner,
-   driver kind, upstream, enabled state, live lifecycle, attached clients,
-   error count, and the last classified failure.
+1. **All networks** (under **Server**, **Chat**) lists every account's
+   networks in the columns Status, Owner, Network, Type, Server, Clients,
+   Errors, Last failure, and Actions.
 2. `GET /api/v1/admin/networks` returns the same fleet inventory as
    authenticated JSON with stored credentials shown only as presence
    booleans.
