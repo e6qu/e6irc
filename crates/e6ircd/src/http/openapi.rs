@@ -1072,7 +1072,10 @@ fn document() -> serde_json::Value {
                     "description": "Clears the e6irc session, then redirects the browser to the OIDC provider's end-session endpoint (id_token_hint + post_logout_redirect_uri) so the provider's SSO session is ended too. Local-account sessions return directly to e6irc; incomplete OIDC logout configuration fails closed.",
                     "responses": { "303": { "description": "redirect to the provider (or /) after clearing the session" } } },
                 "post": { "summary": "Local logout: clear the e6irc session only",
-                    "responses": { "204": { "description": "session cleared" } } }
+                    "description": "Ends the browser session named by the session cookie. A request that carries a session cookie must also carry that session's `X-E6IRC-CSRF` value, as every cookie-authenticated unsafe method does; a request with no session has nothing to end and answers 204.",
+                    "responses": { "204": { "description": "session cleared, or no session was presented" },
+                        "403": { "description": "session cookie presented without its CSRF value" },
+                        "503": { "description": "database unavailable" } } }
             },
             "/api/v1/auth/oidc/backchannel-logout": {
                 "post": {
@@ -1262,7 +1265,7 @@ fn document() -> serde_json::Value {
                             "additionalProperties": false,
                             "required": ["name"],
                             "properties": {
-                                "name": { "type": "string", "pattern": "^[#&+!]" }
+                                "name": { "type": "string", "pattern": "^#", "minLength": 2, "maxLength": crate::sanitize::CHANNELLEN }
                             }
                         }
                     } } },
@@ -1441,7 +1444,7 @@ fn document() -> serde_json::Value {
                     "responses": { "201": network_created_response["201"],
                         "409": { "description": "duplicate name, or upstream secret with no master key" } } }
             },
-            "/api/v1/me/networks/preflight": {
+            "/api/v1/me/network-preflight": {
                 "post": {
                     "summary": "Qualify an IRC upstream without saving it",
                     "description": "Uses the production DNS-vetting, TCP/TLS, capability negotiation, optional SASL registration, and configured channel-join path. The connection closes after the probe.",
@@ -1477,6 +1480,7 @@ fn document() -> serde_json::Value {
                             } } }
                         },
                         "400": { "description": "invalid address, identity, or incomplete credentials" },
+                        "429": { "description": "this account already has a connection test running, has started six in the last minute, or the server is running as many as it allows at once; Retry-After gives the seconds to wait" },
                         "502": { "description": "typed upstream DNS, transport, TLS, authentication, or registration failure" }
                     }
                 }
@@ -1916,7 +1920,7 @@ fn document() -> serde_json::Value {
                     "security": authenticated,
                     "parameters": [{ "name": "owner", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
                     "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["enabled"], "properties": { "enabled": { "type": "boolean" } } } } } },
-                    "responses": { "200": admin_network_enabled_response["200"], "403": { "description": "not an admin account" }, "404": { "description": "network or bouncer missing" }, "503": { "description": "database unavailable" } } }
+                    "responses": { "200": admin_network_enabled_response["200"], "403": { "description": "not an admin account" }, "404": { "description": "network or bouncer missing" }, "409": { "description": "the owner is suspended, or the stored network cannot start" }, "503": { "description": "database unavailable" } } }
             },
             "/api/v1/admin/observability": {
                 "get": { "summary": "Live telemetry and bounded history (admin only)",
@@ -1947,6 +1951,34 @@ fn document() -> serde_json::Value {
     })
 }
 
+/// Two route patterns that one concrete URL satisfies, if any exist.
+///
+/// The router sends such a URL to the more literal pattern, so the value that
+/// happens to spell a sibling's literal segment can never be addressed through
+/// the template: a network named `preflight` was unreachable while a
+/// `preflight` verb sat beside `{name}`. Patterns collide when they have the
+/// same length and every position holds equal literals or at least one
+/// parameter; resources keep verbs out of the positions their names occupy.
+fn colliding_route_patterns<'a>(
+    patterns: &std::collections::BTreeSet<&'a str>,
+) -> Option<(&'a str, &'a str)> {
+    let is_parameter = |segment: &str| segment.starts_with('{') && segment.ends_with('}');
+    let collides = |left: &str, right: &str| {
+        left.split('/').count() == right.split('/').count()
+            && left
+                .split('/')
+                .zip(right.split('/'))
+                .all(|(left, right)| left == right || is_parameter(left) || is_parameter(right))
+    };
+    patterns.iter().enumerate().find_map(|(index, left)| {
+        patterns
+            .iter()
+            .skip(index + 1)
+            .find(|right| collides(left, right))
+            .map(|right| (*left, *right))
+    })
+}
+
 /// The route macro in `http::mod` is the source of truth for method/path
 /// existence; the OpenAPI document owns schemas and response semantics. Compare
 /// both complete sets so drift is a loud server error and a unit-test failure,
@@ -1968,6 +2000,12 @@ fn validate_documented_operations(spec: &serde_json::Value) -> Result<(), String
         .collect();
     let expected: std::collections::BTreeSet<(&str, &str)> =
         super::DOCUMENTED_ROUTE_OPERATIONS.iter().copied().collect();
+    let patterns = expected.iter().map(|(path, _)| *path).collect();
+    if let Some((left, right)) = colliding_route_patterns(&patterns) {
+        return Err(format!(
+            "route patterns {left} and {right} match the same URL, so one resource name is unreachable"
+        ));
+    }
     if actual != expected {
         let missing: Vec<String> = expected
             .difference(&actual)
@@ -2155,7 +2193,7 @@ mod tests {
         ),
         ("/api/v1/me/credentials", "post", "201"),
         ("/api/v1/me/networks", "post", "201"),
-        ("/api/v1/me/networks/preflight", "post", "200"),
+        ("/api/v1/me/network-preflight", "post", "200"),
         ("/api/v1/me/networks/{name}", "patch", "200"),
         ("/api/v1/me/sessions", "delete", "200"),
         ("/api/v1/me/tokens", "post", "201"),
@@ -2185,7 +2223,7 @@ mod tests {
         ("/api/v1/me/channels/{name}/access/{account}", "put"),
         ("/api/v1/me/credentials", "post"),
         ("/api/v1/me/networks", "post"),
-        ("/api/v1/me/networks/preflight", "post"),
+        ("/api/v1/me/network-preflight", "post"),
         ("/api/v1/me/networks/{name}", "put"),
         ("/api/v1/me/networks/{name}", "patch"),
         ("/api/v1/me/tokens", "post"),
@@ -2202,6 +2240,59 @@ mod tests {
     fn openapi_covers_every_documented_router_operation_exactly() {
         let spec = super::document();
         assert_eq!(super::validate_documented_operations(&spec), Ok(()));
+    }
+
+    #[test]
+    fn a_literal_segment_beside_a_parameter_is_a_route_collision() {
+        let table = |paths: &[&'static str]| paths.iter().copied().collect();
+        assert_eq!(
+            super::colliding_route_patterns(&table(&[
+                "/api/v1/me/networks",
+                "/api/v1/me/networks/preflight",
+                "/api/v1/me/networks/{name}",
+                "/api/v1/me/networks/{name}/buffer",
+            ])),
+            Some((
+                "/api/v1/me/networks/preflight",
+                "/api/v1/me/networks/{name}"
+            ))
+        );
+        assert_eq!(
+            super::colliding_route_patterns(&table(&[
+                "/api/v1/admin/networks/{owner}/{name}",
+                "/api/v1/admin/networks/shared/{name}",
+            ])),
+            Some((
+                "/api/v1/admin/networks/shared/{name}",
+                "/api/v1/admin/networks/{owner}/{name}"
+            ))
+        );
+        // A literal one level above a parameter's subtree shadows nothing: no
+        // URL has both lengths.
+        assert_eq!(
+            super::colliding_route_patterns(&table(&[
+                "/api/v1/auth/oidc/backchannel-logout",
+                "/api/v1/auth/oidc/{provider}/start",
+                "/api/v1/me/network-preflight",
+                "/api/v1/me/networks/{name}",
+            ])),
+            None
+        );
+    }
+
+    /// The server has one channel type (`CHANTYPES=#`); a contract that also
+    /// offers `&`, `+`, and `!` documents requests that can only be refused.
+    #[test]
+    fn channel_registration_documents_the_channel_names_the_server_accepts() {
+        let spec = super::document();
+        let name = &spec["paths"]["/api/v1/me/channels"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["properties"]["name"];
+        let pattern = name["pattern"].as_str().expect("channel name pattern");
+        assert_eq!(pattern, "^#");
+        assert_eq!(name["maxLength"], crate::sanitize::CHANNELLEN);
+        for refused in ["&local", "+modeless", "!safe"] {
+            assert!(!crate::sanitize::valid_channel_name(refused), "{refused}");
+        }
     }
 
     #[test]
@@ -2331,7 +2422,7 @@ mod tests {
             );
         }
         assert_eq!(create[3]["properties"]["sasl_account"]["type"], "string");
-        let preflight = &spec["paths"]["/api/v1/me/networks/preflight"]["post"]["requestBody"]["content"]
+        let preflight = &spec["paths"]["/api/v1/me/network-preflight"]["post"]["requestBody"]["content"]
             ["application/json"]["schema"];
         assert_eq!(preflight["properties"]["realname"]["type"], "string");
         for field in ["sasl_account", "sasl_password"] {

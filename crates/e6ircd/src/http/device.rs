@@ -299,7 +299,7 @@ pub(super) async fn device_start(State(state): State<Arc<AppState>>, _rl: RateLi
     };
     let pool = require_pool!(state);
     match crate::db::create_device_grant(pool).await {
-        Ok((device_code, user_code)) => json_response(DeviceStartResponse {
+        Ok((device_code, user_code)) => json_no_store(DeviceStartResponse {
             device_code,
             user_code,
             verification_uri,
@@ -347,7 +347,7 @@ pub(super) async fn device_token(
     // The grant is consumed and the token minted in one transaction inside
     // `poll_device_grant`, so a mint failure can't destroy an approved grant.
     match crate::db::poll_device_grant(pool, &req.device_code, "device").await {
-        Ok(crate::db::DeviceStatus::Approved(token)) => json_response(DeviceTokenResponse {
+        Ok(crate::db::DeviceStatus::Approved(token)) => json_no_store(DeviceTokenResponse {
             access_token: token,
             token_type: "bearer",
         }),
@@ -452,7 +452,7 @@ mod tests {
 /// Approve a device grant as the signed-in user (cookie-authenticated).
 pub(super) async fn device_approve(
     State(state): State<Arc<AppState>>,
-    SessionMutation(account): SessionMutation,
+    SessionMutation(account, _): SessionMutation,
     JsonBody(req): JsonBody<DeviceApproveReq>,
 ) -> Response {
     match approve_user_code(&state, &account, &req.user_code).await {
@@ -1228,10 +1228,7 @@ pub(super) async fn admin_patch_configuration(
             );
         }
     }
-    let mut restart_comparison = current.settings.clone();
-    restart_comparison.bnc_addr = settings.bnc_addr;
-    restart_comparison.observability = settings.observability.clone();
-    let restart_required = restart_comparison != settings;
+    let restart_required = current.settings.requires_restart_to_reach(&settings);
     let detail = format!(
         "revision {}; BNC listener {}; restart {}",
         current.revision + 1,
@@ -2248,21 +2245,17 @@ mod admin_query_tests {
 
 pub(super) async fn me(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
-    headers: axum::http::HeaderMap,
+    Authenticated(account, credential): Authenticated,
 ) -> Response {
-    // A *valid* session cookie yields the rich OIDC identity (email/role/
-    // provider/logout URL). A stale or absent cookie falls through to Bearer —
-    // the precedence every other route uses — so a valid PAT still works
-    // alongside a stale cookie (previously that combination returned 401). A DB
-    // fault is the one case that does not fall through: it is reported, not
-    // masked as "no session".
-    if let (Some(token), Some(pool)) = (session_token(&headers, state.secure_cookies), &state.pool)
-    {
-        match crate::db::session_identity(pool, &token).await {
+    // The browser session that authenticated this request yields the rich OIDC
+    // identity (email/role/provider/logout URL) and its CSRF value; a bearer
+    // names only the account. A DB fault is reported, not masked as "no
+    // session".
+    if let Some(token) = credential.browser_session() {
+        match crate::db::session_identity(pool_of(&state), token).await {
             Ok(Some(identity)) => {
-                let csrf_token = state.csrf_token(&token);
-                let mut response = json_response(SessionIdentityResponse {
+                let csrf_token = state.csrf_token(token);
+                return json_no_store(SessionIdentityResponse {
                     account: identity.account,
                     email: identity.email,
                     role: identity.role,
@@ -2271,12 +2264,9 @@ pub(super) async fn me(
                     logout_url: format!("/api/v1/auth/logout?csrf={csrf_token}"),
                     csrf_token,
                 });
-                // This body carries the session-bound CSRF token; keep it out of
-                // any shared/proxy cache.
-                no_store(response.headers_mut());
-                return response;
             }
-            Ok(None) => {} // stale cookie: fall through to Bearer
+            // Revoked between authentication and this read.
+            Ok(None) => {}
             Err(error) => {
                 eprintln!("http: identity lookup failed: {error}");
                 return problem(
@@ -2287,7 +2277,7 @@ pub(super) async fn me(
             }
         }
     }
-    json_response(AccountResponse { account })
+    json_no_store(AccountResponse { account })
 }
 
 #[derive(Deserialize)]
@@ -2368,7 +2358,7 @@ mod token_request_tests {
 /// Mint a PAT for the authenticated account (shown once).
 pub(super) async fn create_api_token(
     State(state): State<Arc<AppState>>,
-    SessionMutation(account): SessionMutation,
+    SessionMutation(account, _): SessionMutation,
     body: Result<axum::Json<TokenRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let req = match super::parse_json(body) {
@@ -2397,17 +2387,13 @@ pub(super) async fn create_api_token(
     // (count + insert in one FOR UPDATE transaction), so there is no racy
     // list-then-insert here: two concurrent creates can't both slip past cap-1.
     match crate::db::issue_scoped_api_token(pool, &account, &req.label, scopes, lifetime).await {
-        Ok(token) => (
-            StatusCode::CREATED,
-            axum::Json(ApiTokenCreatedResponse {
-                token,
-                label: req.label,
-                scopes: scopes.iter().collect(),
-                expires_in_days: lifetime.value(),
-                note: "Store this now; it is not retrievable later.",
-            }),
-        )
-            .into_response(),
+        Ok(token) => created_no_store(ApiTokenCreatedResponse {
+            token,
+            label: req.label,
+            scopes: scopes.iter().collect(),
+            expires_in_days: lifetime.value(),
+            note: "Store this now; it is not retrievable later.",
+        }),
         Err(crate::db::DbError::TooManyCredentials) => problem(
             StatusCode::CONFLICT,
             "Too many tokens",
@@ -2424,20 +2410,28 @@ pub(super) async fn create_api_token(
     }
 }
 
+/// End the browser session named by the cookie. This route authenticates
+/// nothing — a request without a session has nothing to end — so the CSRF rule
+/// every cookie-authenticated unsafe method gets from [`Authenticated`] is
+/// applied here by hand: without it any page could sign a visitor out with a
+/// cross-site form.
 pub(super) async fn logout(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
     let pool = require_pool!(state);
-    if let Some(token) = session_token(&headers, state.secure_cookies)
-        && let Err(e) = crate::db::delete_web_session(pool, &token).await
-    {
-        eprintln!("http: logout failed: {e}");
-        return problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Database unavailable",
-            None,
-        );
+    if let Some(token) = session_token(&headers, state.secure_cookies) {
+        if !csrf_header_valid(&state, &token, &headers) {
+            return csrf_refusal();
+        }
+        if let Err(e) = crate::db::delete_web_session(pool, &token).await {
+            eprintln!("http: logout failed: {e}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            );
+        }
     }
     (
         StatusCode::NO_CONTENT,
@@ -2487,7 +2481,7 @@ pub(super) async fn logout_sso(
         .as_deref()
         .is_some_and(|c| state.csrf_valid(&token, c))
     {
-        return problem(StatusCode::FORBIDDEN, "Invalid or missing CSRF token", None);
+        return csrf_refusal();
     }
     let crate::db::SessionLogoutHint { id_token, provider } =
         match crate::db::session_logout_hint(pool, &token).await {

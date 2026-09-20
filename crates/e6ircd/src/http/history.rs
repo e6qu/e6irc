@@ -67,7 +67,7 @@ struct HistoryResponse {
 }
 pub(super) async fn history(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Query(params): Query<HistoryParams>,
 ) -> Response {
     let pool = pool_of(&state);
@@ -120,11 +120,10 @@ pub(super) async fn history(
             body: row.body,
         })
         .collect();
-    axum::Json(HistoryResponse {
+    json_no_store(HistoryResponse {
         target: params.target,
         messages,
     })
-    .into_response()
 }
 
 #[cfg(test)]

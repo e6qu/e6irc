@@ -15,6 +15,37 @@ const MAX_IRC_WS_FRAME: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN;
 /// before deserialization while admitting every wire-sized composer command.
 const MAX_UI_WS_FRAME: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN * 6 + 512;
 
+/// How long one outbound frame may wait for the peer to take it.
+const SOCKET_SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Why an outbound frame was not delivered. Either way the connection is over.
+#[derive(Debug)]
+enum SendFailure {
+    Transport,
+    Stalled,
+}
+
+/// Write one frame, giving up on a peer that has stopped reading.
+///
+/// A peer that keeps the connection open but advertises a zero receive window
+/// parks a bare `send` forever. The task would then never observe its network
+/// being removed or its send queue being closed, and would hold the network
+/// handle and the per-IP connection slot for as long as the peer liked.
+async fn send_frame(socket: &mut WebSocket, frame: WsMessage) -> Result<(), SendFailure> {
+    within_send_deadline(SOCKET_SEND_DEADLINE, socket.send(frame)).await
+}
+
+async fn within_send_deadline<E>(
+    deadline: std::time::Duration,
+    send: impl Future<Output = Result<(), E>>,
+) -> Result<(), SendFailure> {
+    match tokio::time::timeout(deadline, send).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(SendFailure::Transport),
+        Err(_) => Err(SendFailure::Stalled),
+    }
+}
+
 /// Outbound WebSocket frame discipline, fixed for the connection by ircv3
 /// subprotocol negotiation (<https://ircv3.net/specs/extensions/websocket>).
 #[derive(Clone, Copy)]
@@ -148,15 +179,13 @@ pub(super) async fn ws_irc_conn(
                 // than being corrupted by lossy U+FFFD replacement; under the
                 // text subprotocol the client asked for text, so it is replaced.
                 let sent = match mode {
-                    WsFrameMode::Binary => socket.send(WsMessage::binary(line.to_vec())).await,
+                    WsFrameMode::Binary => send_frame(&mut socket, WsMessage::binary(line.to_vec())).await,
                     WsFrameMode::Text => {
-                        socket
-                            .send(WsMessage::text(String::from_utf8_lossy(line).into_owned()))
-                            .await
+                        send_frame(&mut socket, WsMessage::text(String::from_utf8_lossy(line).into_owned())).await
                     }
                     WsFrameMode::Auto => match std::str::from_utf8(line) {
-                        Ok(text) => socket.send(WsMessage::text(text)).await,
-                        Err(_) => socket.send(WsMessage::binary(line.to_vec())).await,
+                        Ok(text) => send_frame(&mut socket, WsMessage::text(text)).await,
+                        Err(_) => send_frame(&mut socket, WsMessage::binary(line.to_vec())).await,
                     },
                 };
                 if sent.is_err() {
@@ -218,6 +247,78 @@ pub(super) struct UiParams {
     pub(super) network: String,
 }
 
+/// Whether composer frames from this socket may reach the upstream.
+///
+/// The upgrade is a `GET`, so the method-to-scope rule admits a `read` token.
+/// Reading the stream is what `read` grants; speaking as the owner on a
+/// third-party network — `/raw` included — is a write.
+#[derive(Clone, Copy)]
+pub(super) enum ComposerAuthority {
+    MaySend,
+    ReadOnly,
+}
+
+impl From<&RequestCredential> for ComposerAuthority {
+    fn from(credential: &RequestCredential) -> Self {
+        if credential.grants_write() {
+            Self::MaySend
+        } else {
+            Self::ReadOnly
+        }
+    }
+}
+
+/// Refuse a browser upgrade from any origin but this application's.
+///
+/// `SameSite=Lax` keeps the session cookie off a cross-*site* handshake, but a
+/// sibling subdomain is same-site: its page could open this socket with the
+/// owner's cookie, read private-message replay, and send `/raw`. The origin to
+/// compare against is the configured public URL; without one it is the
+/// authority the browser itself addressed (`Host`), and an `Origin` that
+/// matches neither is refused rather than waved through. A request with no
+/// `Origin` is not a browser and carries no ambient cookie authority.
+fn require_same_origin_upgrade(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> ResponseResult<()> {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return Ok(());
+    };
+    let verified = origin
+        .to_str()
+        .is_ok_and(|origin| match state.public_url.as_deref() {
+            Some(public) => same_origin(origin, public),
+            None => headers
+                .get(header::HOST)
+                .and_then(|host| host.to_str().ok())
+                .is_some_and(|host| origin_names_host(origin, host)),
+        });
+    if verified {
+        return Ok(());
+    }
+    Err(ResponseRejection::from(problem(
+        StatusCode::FORBIDDEN,
+        "Cross-origin WebSocket rejected",
+        Some(if state.public_url.is_some() {
+            "The Origin header does not match the configured public URL."
+        } else {
+            "The Origin header does not match the Host header. Configure the public URL when a proxy rewrites Host."
+        }),
+    )))
+}
+
+/// Whether a serialized `Origin` (`scheme://host[:port]`) names exactly the
+/// authority in `Host`. Both come from the same browser, which omits a default
+/// port from both, so the comparison needs no knowledge of the scheme — which
+/// the server does not have behind a TLS-terminating proxy.
+fn origin_names_host(origin: &str, host: &str) -> bool {
+    origin.split_once("://").is_some_and(|(scheme, authority)| {
+        matches!(scheme, "http" | "https")
+            && !authority.is_empty()
+            && authority.eq_ignore_ascii_case(host)
+    })
+}
+
 /// The web client's live socket: cookie-authenticated, attaches to one
 /// of the caller's networks, and pushes line, status, and replay-complete JSON
 /// events that the browser client parses into buffers and a member list.
@@ -227,27 +328,14 @@ pub(super) struct UiParams {
 pub(super) async fn ws_ui(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-    Authenticated(account): Authenticated,
+    Authenticated(account, credential): Authenticated,
     Query(params): Query<UiParams>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // Reject a cross-origin WebSocket upgrade when a public_url is configured.
-    // SameSite=Lax already blocks the classic cross-site hijack (a Lax cookie
-    // isn't sent on a cross-site WS handshake); an explicit Origin allowlist
-    // also closes the same-site-subdomain gap. A missing Origin (a non-browser
-    // client) is allowed — it carries no ambient cookie authority.
-    if let Some(public) = state.public_url.as_deref()
-        && let Some(origin) = headers
-            .get(axum::http::header::ORIGIN)
-            .and_then(|v| v.to_str().ok())
-        && !same_origin(origin, public)
-    {
-        return problem(
-            StatusCode::FORBIDDEN,
-            "Cross-origin WebSocket rejected",
-            None,
-        );
+    if let Err(refusal) = require_same_origin_upgrade(&state, &headers) {
+        return refusal.into();
     }
+    let composer = ComposerAuthority::from(&credential);
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
@@ -258,12 +346,13 @@ pub(super) async fn ws_ui(
     };
     ws.max_message_size(MAX_UI_WS_FRAME)
         .max_frame_size(MAX_UI_WS_FRAME)
-        .on_upgrade(move |socket| ws_ui_conn(handle, socket))
+        .on_upgrade(move |socket| ws_ui_conn(handle, socket, composer))
 }
 
 pub(super) async fn ws_ui_conn(
     handle: std::sync::Arc<crate::bouncer::NetworkHandle>,
     mut socket: WebSocket,
+    composer: ComposerAuthority,
 ) {
     use crate::bouncer::DriverEvent;
     use tokio::sync::broadcast::error::RecvError;
@@ -299,8 +388,7 @@ pub(super) async fn ws_ui_conn(
     // exists precisely to close this subscribe-timing gap.
     let runtime = handle.runtime_snapshot();
     let mut status_revision = runtime.status_revision;
-    if socket
-        .send(WsMessage::text(runtime_status_event(&runtime)))
+    if send_frame(&mut socket, WsMessage::text(runtime_status_event(&runtime)))
         .await
         .is_err()
     {
@@ -309,8 +397,7 @@ pub(super) async fn ws_ui_conn(
 
     // Playback: everything buffered while detached, as JSON line events.
     for line in buffer_snapshot {
-        if socket
-            .send(WsMessage::text(line_event(&line)))
+        if send_frame(&mut socket, WsMessage::text(line_event(&line)))
             .await
             .is_err()
         {
@@ -321,8 +408,7 @@ pub(super) async fn ws_ui_conn(
     // authoritative identity and memberships after it so an aged-out JOIN or a
     // stale PART cannot leave the browser attached to the wrong conversations.
     if let Some(session) = session_snapshot
-        && socket
-            .send(WsMessage::text(session_event(&session)))
+        && send_frame(&mut socket, WsMessage::text(session_event(&session)))
             .await
             .is_err()
     {
@@ -331,8 +417,7 @@ pub(super) async fn ws_ui_conn(
     // Delimit replay from live traffic. The browser waits for this typed
     // boundary before requesting authoritative NAMES snapshots, so old NAMES
     // rows in the detached buffer cannot race and overwrite the fresh result.
-    if socket
-        .send(WsMessage::text(snapshot_event()))
+    if send_frame(&mut socket, WsMessage::text(snapshot_event()))
         .await
         .is_err()
     {
@@ -352,9 +437,7 @@ pub(super) async fn ws_ui_conn(
             ev = events.recv() => match ev {
                 Ok(event @ (DriverEvent::Line(_) | DriverEvent::Notice(_))) => {
                     let line = event.display_line().expect("display event carries a line");
-                    if socket
-                        .send(WsMessage::text(line_event(line)))
-                        .await
+                    if send_frame(&mut socket, WsMessage::text(line_event(line))).await
                         .is_err()
                     {
                         break;
@@ -366,9 +449,7 @@ pub(super) async fn ws_ui_conn(
                     // would double-render. Echoes from the account's *other*
                     // sessions are real conversation and render normally.
                     if origin != attach_id
-                        && socket
-                            .send(WsMessage::text(line_event(&line)))
-                            .await
+                        && send_frame(&mut socket, WsMessage::text(line_event(&line))).await
                             .is_err()
                     {
                         break;
@@ -378,18 +459,14 @@ pub(super) async fn ws_ui_conn(
                     if !crate::bouncer::accept_status_revision(&mut status_revision, revision) {
                         continue;
                     }
-                    if socket
-                        .send(WsMessage::text(driver_status_event(status)))
-                        .await
+                    if send_frame(&mut socket, WsMessage::text(driver_status_event(status))).await
                         .is_err()
                     {
                         break;
                     }
                 }
                 Ok(DriverEvent::Session(session)) => {
-                    if socket
-                        .send(WsMessage::text(session_event(&session)))
-                        .await
+                    if send_frame(&mut socket, WsMessage::text(session_event(&session))).await
                         .is_err()
                     {
                         break;
@@ -401,9 +478,7 @@ pub(super) async fn ws_ui_conn(
                 Ok(DriverEvent::ReadMarker { .. }) => {}
                 Err(RecvError::Lagged(n)) => {
                     let notice = format!(":*bnc* NOTICE * :{n} line(s) skipped (slow connection)");
-                    if socket
-                        .send(WsMessage::text(line_event(&notice)))
-                        .await
+                    if send_frame(&mut socket, WsMessage::text(line_event(&notice))).await
                         .is_err()
                     {
                         break;
@@ -428,21 +503,33 @@ pub(super) async fn ws_ui_conn(
                                 request_id: error.request_id.as_ref().map(ComposerRequestId::as_str),
                                 message: error.message,
                             });
-                            if socket.send(WsMessage::text(event)).await.is_err() {
+                            if send_frame(&mut socket, WsMessage::text(event)).await.is_err() {
                                 break;
                             }
                             continue;
                         }
                     };
+                    if let ComposerAuthority::ReadOnly = composer {
+                        let event = composer_result_event(ComposerResult::Rejected {
+                            request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
+                            message: "this token is read-only; sending needs the write scope. Nothing was sent",
+                        });
+                        if send_frame(&mut socket, WsMessage::text(event)).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     match handle.send_from(attach_id, &request.line) {
                         crate::bouncer::SendOutcome::Sent => {
                             if let Some(request_id) = request.request_id
-                                && socket
-                                    .send(WsMessage::text(composer_result_event(
-                                        ComposerResult::Sent(request_id.as_str()),
-                                    )))
-                                    .await
-                                    .is_err()
+                                && send_frame(
+                                    &mut socket,
+                                    WsMessage::text(composer_result_event(ComposerResult::Sent(
+                                        request_id.as_str(),
+                                    ))),
+                                )
+                                .await
+                                .is_err()
                             {
                                 break;
                             }
@@ -452,7 +539,7 @@ pub(super) async fn ws_ui_conn(
                                 request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
                                 message: "upstream busy; line not sent, try again",
                             });
-                            if socket.send(WsMessage::text(event)).await.is_err() {
+                            if send_frame(&mut socket, WsMessage::text(event)).await.is_err() {
                                 break;
                             }
                         }
@@ -465,7 +552,7 @@ pub(super) async fn ws_ui_conn(
                                 request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
                                 message: "upstream registration is parked; reconfigure the network before sending",
                             });
-                            if socket.send(WsMessage::text(event)).await.is_err() {
+                            if send_frame(&mut socket, WsMessage::text(event)).await.is_err() {
                                 break;
                             }
                         }
@@ -474,7 +561,7 @@ pub(super) async fn ws_ui_conn(
                                 request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
                                 message: error.message(),
                             });
-                            if socket.send(WsMessage::text(event)).await.is_err() {
+                            if send_frame(&mut socket, WsMessage::text(event)).await.is_err() {
                                 break;
                             }
                         }
@@ -485,12 +572,12 @@ pub(super) async fn ws_ui_conn(
                         request_id: None,
                         message: "composer requests must be text JSON",
                     });
-                    if socket.send(WsMessage::text(event)).await.is_err() {
+                    if send_frame(&mut socket, WsMessage::text(event)).await.is_err() {
                         break;
                     }
                 }
                 Some(Ok(WsMessage::Ping(payload))) => {
-                    if socket.send(WsMessage::Pong(payload)).await.is_err() {
+                    if send_frame(&mut socket, WsMessage::Pong(payload)).await.is_err() {
                         break;
                     }
                 }
@@ -503,9 +590,11 @@ pub(super) async fn ws_ui_conn(
 
 async fn send_unavailable(socket: &mut WebSocket) {
     drop(
-        socket
-            .send(WsMessage::text(status_event(ConnStatus::Unavailable, None)))
-            .await,
+        send_frame(
+            socket,
+            WsMessage::text(status_event(ConnStatus::Unavailable, None)),
+        )
+        .await,
     );
 }
 
@@ -595,6 +684,26 @@ struct ComposerRequestError {
     message: &'static str,
 }
 
+/// Why the composer will not send `command` upstream, if it will not.
+///
+/// The upstream session belongs to the bouncer: it stays connected while no
+/// browser is open, so a `QUIT` from one tab would end what the product exists
+/// to keep. Liveness, capability negotiation, authentication, history, and read
+/// markers are the attach layer's conversation with its own client — the raw
+/// attach path answers them locally and never forwards them. This is asked of
+/// the command the final line parses to, so `/raw`, `/quote`, tags, a source
+/// prefix, or letter case cannot carry one past it.
+fn composer_command_refusal(command: &str) -> Option<&'static str> {
+    const SESSION: &str = "QUIT would disconnect this always-on network; disable the network instead. Nothing was sent";
+    const ATTACH_LAYER: &str =
+        "e6irc answers this command itself, so the network never sees it. Nothing was sent";
+    match command.to_ascii_uppercase().as_str() {
+        "QUIT" => Some(SESSION),
+        "PING" | "PONG" | "CAP" | "AUTHENTICATE" | "CHATHISTORY" | "MARKREAD" => Some(ATTACH_LAYER),
+        _ => None,
+    }
+}
+
 /// Parse and bound one browser composer frame.
 fn composer_request(frame: &str) -> Result<ComposerRequest, ComposerRequestError> {
     if frame.len() > MAX_UI_WS_FRAME {
@@ -628,10 +737,14 @@ fn composer_request(frame: &str) -> Result<ComposerRequest, ComposerRequestError
             message: "message exceeds the IRC wire limit; nothing was sent",
         });
     }
-    if e6irc_proto::message::Message::parse(&line).is_err() {
+    let refusal = match e6irc_proto::message::Message::parse(&line) {
+        Ok(message) => composer_command_refusal(message.command),
+        Err(_) => Some("message is not a complete IRC command; nothing was sent"),
+    };
+    if let Some(message) = refusal {
         return Err(ComposerRequestError {
             request_id: frame.id,
-            message: "message is not a complete IRC command; nothing was sent",
+            message,
         });
     }
     Ok(ComposerRequest {
@@ -972,7 +1085,7 @@ mod tests {
         let tagged = serde_json::json!({
             "id": "send-tags",
             "target": "",
-            "message": format!("/raw @example={} PING", "a".repeat(600)),
+            "message": format!("/raw @example={} TAGMSG #rust", "a".repeat(600)),
         })
         .to_string();
         assert!(
@@ -1000,6 +1113,40 @@ mod tests {
             let error = composer_request(malformed)
                 .expect_err("an empty IRC command must not be acknowledged as sent");
             assert!(error.message.contains("nothing was sent"), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn composer_refuses_commands_that_are_not_the_upstreams_to_answer() {
+        for message in [
+            "/quit",
+            "/QUIT bye",
+            "/raw QUIT :bye",
+            "/quote quit",
+            "/raw @label=x :nick QUIT",
+            "/ping x",
+            "/raw PONG :x",
+            "/raw CAP LS",
+            "/raw AUTHENTICATE PLAIN",
+            "/chathistory LATEST #rust * 10",
+            "/raw MARKREAD #rust",
+        ] {
+            let frame = serde_json::json!({ "id": "a1", "target": "#rust", "message": message });
+            let error = composer_request(&frame.to_string()).expect_err(message);
+            assert_eq!(
+                error.request_id.as_ref().map(ComposerRequestId::as_str),
+                Some("a1")
+            );
+            assert!(
+                error.message.contains("othing was sent"),
+                "{message}: {}",
+                error.message
+            );
+        }
+        // Text that merely mentions a command is conversation.
+        for message in ["QUIT", "/me will QUIT soon", "/msg friend PING me"] {
+            let frame = serde_json::json!({ "target": "#rust", "message": message });
+            assert!(composer_request(&frame.to_string()).is_ok(), "{message}");
         }
     }
 
@@ -1046,5 +1193,22 @@ mod tests {
         assert_eq!(rejected["t"], "send-error");
         assert_eq!(rejected["v"], "a2");
         assert_eq!(rejected["message"], "not sent");
+    }
+}
+
+#[cfg(test)]
+mod send_deadline_tests {
+    use super::{SendFailure, within_send_deadline};
+
+    #[tokio::test]
+    async fn a_peer_that_never_takes_the_frame_ends_the_send() {
+        let deadline = std::time::Duration::from_millis(20);
+        let stalled =
+            within_send_deadline(deadline, std::future::pending::<Result<(), ()>>()).await;
+        assert!(matches!(stalled, Err(SendFailure::Stalled)));
+        let delivered = within_send_deadline(deadline, async { Ok::<(), ()>(()) }).await;
+        assert!(delivered.is_ok());
+        let failed = within_send_deadline(deadline, async { Err::<(), ()>(()) }).await;
+        assert!(matches!(failed, Err(SendFailure::Transport)));
     }
 }

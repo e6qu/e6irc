@@ -75,7 +75,7 @@ async fn audit_network_mutation(
     )
     .await
     {
-        eprintln!("http: network {action} audit for {account}/{name}: {error}");
+        eprintln!("http: network {action} audit for {account:?}/{name:?}: {error}");
     }
 }
 
@@ -585,7 +585,7 @@ pub(super) fn network_response(
 /// The account's own networks (metadata only — never the secret).
 pub(super) async fn list_networks(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
 ) -> Response {
     // A read of "my networks" with no bouncer is an empty collection, not an
     // error: returning 200 `{networks:[]}` lets the web client's network picker
@@ -624,7 +624,7 @@ pub(super) async fn list_networks(
 /// diagnostics. Secret material is represented only by presence booleans.
 pub(super) async fn get_network(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Path(name): Path<String>,
 ) -> Response {
     let pool = pool_of(&state);
@@ -652,7 +652,7 @@ pub(super) async fn get_network(
 /// driver.
 pub(super) async fn create_network(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     JsonBody(req): JsonBody<CreateNetwork>,
 ) -> Response {
     let Some(registry) = &state.bnc_registry else {
@@ -677,7 +677,7 @@ pub(super) async fn create_network(
 /// the exact production driver path. No row is written and no reconnecting
 /// driver survives the response.
 pub(super) async fn preflight_network(
-    Authenticated(_account): Authenticated,
+    _permit: PreflightPermit,
     JsonBody(req): JsonBody<PreflightNetwork>,
 ) -> Response {
     match preflight_network_core(req).await {
@@ -721,7 +721,9 @@ pub(super) async fn preflight_network_core(
         keepalive_idle: crate::bouncer::KEEPALIVE_IDLE,
         rejection_retry_floor: crate::bouncer::REJECTION_RETRY_FLOOR,
     };
-    crate::bouncer::preflight_irc(&config)
+    // Below the request deadline, so the test's own typed timeout is what the
+    // caller reads rather than a generic "request timed out".
+    crate::bouncer::preflight_irc(&config, REQUEST_DEADLINE - Duration::from_secs(5))
         .await
         .map_err(|failure| {
             network_error(
@@ -740,7 +742,7 @@ pub(super) async fn preflight_network_core(
 /// are visible in the same live/persisted transcript as every other command.
 pub(super) async fn network_account_command(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Path(name): Path<String>,
     JsonBody(request): JsonBody<NetworkAccountCommand>,
 ) -> Response {
@@ -823,8 +825,18 @@ pub(super) async fn network_account_command(
                     Some(&detail),
                 );
             }
+            // NickServ verifies the account named after the nick this session
+            // holds now, which a `/nick` since connecting made different from
+            // the configured one.
+            let Some(session) = handle.irc_session_snapshot() else {
+                return problem(
+                    StatusCode::CONFLICT,
+                    "IRC network is not connected",
+                    Some("wait for the network to reach connected state and try again"),
+                );
+            };
             (
-                format!("PRIVMSG NickServ :VERIFY REGISTER {} {code}", network.nick),
+                format!("PRIVMSG NickServ :VERIFY REGISTER {} {code}", session.nick),
                 "verify",
             )
         }
@@ -1304,11 +1316,82 @@ fn prospective_network_driver(
     if !should_run && !validate_while_stopped {
         return Ok(None);
     }
-    let driver = crate::bouncer::driver_from_row(row, state.secret_key.as_deref(), account)
-        .map_err(|error| {
-            network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error))
-        })?;
+    let driver = stored_network_driver(state, account, row)?;
     Ok(should_run.then_some(driver))
+}
+
+/// The driver a stored row describes, or the conflict that keeps it from
+/// starting (a missing master key, a bridge feature this binary lacks).
+fn stored_network_driver(
+    state: &AppState,
+    account: &str,
+    row: &crate::db::BncNetworkRow,
+) -> Result<Box<dyn crate::bouncer::NetworkDriver>, NetworkMutationError> {
+    crate::bouncer::driver_from_row(row, state.secret_key.as_deref(), account)
+        .map_err(|error| network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error)))
+}
+
+/// The registry mutation lane, entered for an owner whose drivers may run.
+///
+/// Suspension keeps `bnc_networks.enabled` set so that reactivation can restore
+/// the owner's networks, which makes that flag alone the wrong question for
+/// "may this driver start?". Suspension stops the owner's drivers while holding
+/// this same lane, so an owner found active on entry stays active until the
+/// lane is released — and because the lane is the only way this module starts
+/// a driver, a start for a suspended owner has no path: not an administrator
+/// toggling the network, not a create or edit authorized a moment before the
+/// suspension committed.
+struct ActiveOwnerLane<'a> {
+    registry: &'a crate::bouncer::Registry,
+    owner: &'a str,
+    _mutation: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl<'a> ActiveOwnerLane<'a> {
+    async fn enter(
+        state: &AppState,
+        registry: &'a crate::bouncer::Registry,
+        owner: &'a str,
+    ) -> Result<Self, NetworkMutationError> {
+        let mutation = registry.mutation_guard().await;
+        match crate::db::account_flags(pool_of(state), owner).await {
+            Ok(Some(flags)) if flags.is_suspended() => Err(network_error(
+                StatusCode::CONFLICT,
+                "Owner suspended",
+                Some("a suspended account's networks cannot run; reactivate the account first"),
+            )),
+            Ok(Some(_)) => Ok(Self {
+                registry,
+                owner,
+                _mutation: mutation,
+            }),
+            Ok(None) => Err(network_error(
+                StatusCode::NOT_FOUND,
+                "No such network",
+                None,
+            )),
+            Err(error) => {
+                eprintln!("http: network owner posture lookup: {error}");
+                Err(network_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database unavailable",
+                    None,
+                ))
+            }
+        }
+    }
+
+    /// Stop any predecessor, then start `driver` (create and edit).
+    async fn supersede(&self, name: &str, driver: Box<dyn crate::bouncer::NetworkDriver>) {
+        self.registry.replace(Some(self.owner), name, driver).await;
+    }
+
+    /// Start `driver` unless a working one is already registered (enable).
+    async fn ensure_running(&self, name: &str, driver: Box<dyn crate::bouncer::NetworkDriver>) {
+        self.registry
+            .ensure_running(Some(self.owner), name, driver)
+            .await;
+    }
 }
 
 /// Update all mutable configuration of one caller-owned network and replace its
@@ -1327,7 +1410,7 @@ pub(super) async fn update_network_core(
     autojoin: &[String],
     credentials: NetworkCredentialUpdate<'_>,
 ) -> Result<(), NetworkMutationError> {
-    let _mutation = registry.mutation_guard().await;
+    let lane = ActiveOwnerLane::enter(state, registry, account).await?;
     let pool = pool_of(state);
     let mut row = editable_network(state, account, name, "update").await?;
     if row.kind == crate::config::NetworkKind::Irc && realname.is_none() {
@@ -1357,14 +1440,14 @@ pub(super) async fn update_network_core(
         "update failed",
     )?;
     if let Some(driver) = driver {
-        registry.replace(Some(account), name, driver).await;
+        lane.supersede(name, driver).await;
     }
     audit_network_mutation(
         state,
         account,
         "NETWORK_UPDATE",
         account,
-        name,
+        &row.name,
         row.kind.as_db_str(),
     )
     .await;
@@ -1502,7 +1585,7 @@ async fn create_network_core(
     // `create_bnc_network` (count + insert in one FOR UPDATE transaction), so
     // there is no racy list-then-insert here — two concurrent creates can't both
     // slip past cap-1 and each spawn an always-on driver.
-    let _mutation = registry.mutation_guard().await;
+    let lane = ActiveOwnerLane::enter(state, registry, account).await?;
     match crate::db::create_bnc_network(pool, account, &row).await {
         Ok(_) => {}
         Err(crate::db::DbError::TooManyNetworks) => {
@@ -1530,7 +1613,7 @@ async fn create_network_core(
     }
     // The row was just inserted under the uniqueness constraint, so anything
     // already registered under this key has no durable definition: supersede it.
-    registry.replace(Some(account), &req.name, driver).await;
+    lane.supersede(&req.name, driver).await;
     audit_network_mutation(
         state,
         account,
@@ -1568,7 +1651,7 @@ pub(super) struct BufferQuery {
 /// buffer; a stopped driver falls back to persisted history.
 pub(super) async fn network_buffer(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Path(name): Path<String>,
     axum::extract::Query(params): axum::extract::Query<BufferQuery>,
 ) -> Response {
@@ -1659,7 +1742,7 @@ pub(super) enum UpdateNetworkCredentials {
 /// stable name, driver kind, and enabled state are unchanged.
 pub(super) async fn update_network(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Path(name): Path<String>,
     JsonBody(req): JsonBody<UpdateNetwork>,
 ) -> Response {
@@ -1693,9 +1776,11 @@ pub(super) async fn update_network(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Persist a network's enabled flag and start or stop its always-on driver.
-/// Enabling builds from the stored row first, so a missing key/factory failure
-/// cannot require a compensating database rollback.
+/// Persist a network's enabled flag and start or stop its always-on driver,
+/// answering with the network's stored name. Enabling builds from the stored
+/// row first, so a missing key/factory failure cannot require a compensating
+/// database rollback. Disabling needs no active owner: stopping a suspended
+/// account's network is always allowed.
 pub(super) async fn set_network_enabled_core(
     state: &AppState,
     registry: &crate::bouncer::Registry,
@@ -1703,53 +1788,38 @@ pub(super) async fn set_network_enabled_core(
     account: &str,
     name: &str,
     enabled: bool,
-) -> Result<(), NetworkMutationError> {
-    let _mutation = registry.mutation_guard().await;
+) -> Result<String, NetworkMutationError> {
     let pool = pool_of(state);
-
-    let driver = if enabled {
-        let row = match crate::db::get_bnc_network(pool, account, name).await {
-            Ok(Some(row)) => row,
-            Ok(None) => {
-                return Err(network_error(
-                    StatusCode::NOT_FOUND,
-                    "No such network",
-                    None,
-                ));
-            }
-            Err(error) => {
-                eprintln!("http: network enable lookup failed: {error}");
-                return Err(network_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Database unavailable",
-                    None,
-                ));
-            }
-        };
-        prospective_network_driver(state, account, &row, true, false)?
+    let stored_name = if enabled {
+        let lane = ActiveOwnerLane::enter(state, registry, account).await?;
+        let row = editable_network(state, account, name, "enable").await?;
+        let driver = stored_network_driver(state, account, &row)?;
+        require_network_updated(
+            crate::db::set_bnc_network_enabled(pool, account, name, true).await,
+            "enable failed",
+        )?;
+        lane.ensure_running(&row.name, driver).await;
+        row.name
     } else {
-        None
+        let _mutation = registry.mutation_guard().await;
+        let row = editable_network(state, account, name, "disable").await?;
+        require_network_updated(
+            crate::db::set_bnc_network_enabled(pool, account, name, false).await,
+            "disable failed",
+        )?;
+        registry.remove(Some(account), &row.name).await;
+        row.name
     };
-
-    require_network_updated(
-        crate::db::set_bnc_network_enabled(pool, account, name, enabled).await,
-        "enable/disable failed",
-    )?;
-    if let Some(driver) = driver {
-        registry.ensure_running(Some(account), name, driver).await;
-    } else {
-        registry.remove(Some(account), name).await;
-    }
     audit_network_mutation(
         state,
         actor,
         "NETWORK_TOGGLE",
         account,
-        name,
+        &stored_name,
         if enabled { "enabled" } else { "disabled" },
     )
     .await;
-    Ok(())
+    Ok(stored_name)
 }
 
 /// Delete one owner-scoped network and stop its driver under the same mutation
@@ -1762,13 +1832,13 @@ pub(super) async fn delete_network_core(
     name: &str,
 ) -> Result<(), NetworkMutationError> {
     let _mutation = registry.mutation_guard().await;
-    editable_network(state, account, name, "delete").await?;
+    let row = editable_network(state, account, name, "delete").await?;
     require_network_updated(
         crate::db::delete_bnc_network(pool_of(state), account, name).await,
         "delete failed",
     )?;
     registry.remove(Some(account), name).await;
-    audit_network_mutation(state, account, "NETWORK_DELETE", account, name, "").await;
+    audit_network_mutation(state, account, "NETWORK_DELETE", account, &row.name, "").await;
     Ok(())
 }
 
@@ -1776,23 +1846,21 @@ pub(super) async fn delete_network_core(
 /// start/stop its always-on driver.
 pub(super) async fn patch_network(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Path(name): Path<String>,
     JsonBody(req): JsonBody<PatchNetwork>,
 ) -> Response {
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
-    if let Err(error) =
-        set_network_enabled_core(&state, registry, &account, &account, &name, req.enabled).await
-    {
-        return error.into_response();
+    match set_network_enabled_core(&state, registry, &account, &account, &name, req.enabled).await {
+        Ok(name) => axum::Json(NetworkEnabledResponse {
+            name,
+            enabled: req.enabled,
+        })
+        .into_response(),
+        Err(error) => error.into_response(),
     }
-    axum::Json(NetworkEnabledResponse {
-        name,
-        enabled: req.enabled,
-    })
-    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -1812,22 +1880,20 @@ pub(super) async fn patch_admin_network(
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
-    if let Err(error) =
-        set_network_enabled_core(&state, registry, &actor, &owner, &name, req.enabled).await
-    {
-        return error.into_response();
+    match set_network_enabled_core(&state, registry, &actor, &owner, &name, req.enabled).await {
+        Ok(name) => json_no_store(AdminNetworkEnabledResponse {
+            owner,
+            name,
+            enabled: req.enabled,
+        }),
+        Err(error) => error.into_response(),
     }
-    json_no_store(AdminNetworkEnabledResponse {
-        owner,
-        name,
-        enabled: req.enabled,
-    })
 }
 
 /// Delete one of the caller's networks and stop its driver.
 pub(super) async fn delete_network(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Path(name): Path<String>,
 ) -> Response {
     let Some(registry) = &state.bnc_registry else {

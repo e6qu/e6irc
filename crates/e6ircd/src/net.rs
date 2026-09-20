@@ -564,7 +564,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             .map_err(io::Error::other)?,
         );
         if let Some(pool) = &pool {
-            for (owner, row) in crate::db::list_all_bnc_networks(pool)
+            for (owner, row) in crate::db::list_startable_bnc_networks(pool)
                 .await
                 .map_err(io::Error::other)?
             {
@@ -734,6 +734,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             api_rate_burst: config.limits.api_rate_burst,
             administrator_api_rate_burst: config.limits.administrator_api_rate_burst,
             api_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
+            preflight_limiter: crate::http::PreflightLimiter::new(),
             conn_limiter: limiter.clone(),
             request_id_prefix: {
                 use aws_lc_rs::rand::SecureRandom;

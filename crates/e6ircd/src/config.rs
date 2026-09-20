@@ -289,6 +289,22 @@ pub struct ManagedConfig {
 }
 
 impl ManagedConfig {
+    /// Whether reaching `next` from this configuration needs a restart.
+    ///
+    /// The one definition of which settings apply live, so the answer an
+    /// administrator is given cannot drift from what the process does: the BNC
+    /// attach listener is rebound in place, and the observability sampler and
+    /// storage maintenance each re-read their settings every cycle. Everything
+    /// else is read once, at start. (Storage used to be missing here, so a
+    /// retention-only change was reported as needing a restart it did not.)
+    pub fn requires_restart_to_reach(&self, next: &Self) -> bool {
+        let mut reached_live = self.clone();
+        reached_live.bnc_addr = next.bnc_addr;
+        reached_live.observability = next.observability.clone();
+        reached_live.storage = next.storage.clone();
+        reached_live != *next
+    }
+
     pub fn from_config(
         config: &Config,
         key: Option<&crate::secret::SecretKeyring>,
@@ -2694,5 +2710,27 @@ account_claim = "preferred_username"
         std::fs::remove_file(&path).ok();
         assert_eq!(cfg.opers[0].password, "operpass");
         assert_eq!(cfg.oidc_providers[0].client_secret, "oidcsecret");
+    }
+    #[test]
+    fn only_settings_the_process_re_reads_avoid_a_restart() {
+        let current = ManagedConfig::from_config(&Config::default(), None).unwrap();
+        assert!(!current.requires_restart_to_reach(&current));
+
+        // Applied live: storage maintenance and the sampler re-read these every
+        // cycle, and the BNC attach listener is rebound in place.
+        let mut retention = current.clone();
+        retention.storage.history_retention_days += 1;
+        assert!(!current.requires_restart_to_reach(&retention));
+        let mut listener = current.clone();
+        listener.bnc_addr = Some("127.0.0.1:6699".parse().unwrap());
+        assert!(!current.requires_restart_to_reach(&listener));
+
+        // Read once, at start.
+        let mut renamed = retention.clone();
+        renamed.server_name = "irc.other.example".into();
+        assert!(current.requires_restart_to_reach(&renamed));
+        let mut resized = current.clone();
+        resized.sendq += 1;
+        assert!(current.requires_restart_to_reach(&resized));
     }
 }

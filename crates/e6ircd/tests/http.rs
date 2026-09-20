@@ -565,7 +565,7 @@ async fn bnc_network_management_lifecycle() {
     // Missing or wrong-kind fields fail at the HTTP boundary.
     let (status, _) = post_json(
         http,
-        "/api/v1/me/networks/preflight",
+        "/api/v1/me/network-preflight",
         &token,
         &format!(r#"{{"addr":"{up}","nick":"probe","realname":"Preflight"}}"#),
     )
@@ -592,7 +592,7 @@ async fn bnc_network_management_lifecycle() {
     // channel-join path without persisting or starting a driver.
     let (status, body) = post_json(
         http,
-        "/api/v1/me/networks/preflight",
+        "/api/v1/me/network-preflight",
         &token,
         &format!(r##"{{"addr":"{up}","tls":false,"nick":"probe","realname":"Preflight","autojoin":["#preflight"]}}"##),
     )
@@ -613,7 +613,7 @@ async fn bnc_network_management_lifecycle() {
 
     let (status, body) = post_json(
         http,
-        "/api/v1/me/networks/preflight",
+        "/api/v1/me/network-preflight",
         &token,
         &format!(r#"{{"addr":"{up}","tls":false,"nick":"probe","realname":"Preflight","sasl_account":"alice"}}"#),
     )
@@ -1085,7 +1085,7 @@ async fn openapi_spec_is_served() {
     assert_eq!(create_variants[1]["properties"]["kind"]["const"], "matrix");
     assert_eq!(create_variants[2]["properties"]["kind"]["const"], "discord");
     assert_eq!(create_variants[3]["properties"]["kind"]["const"], "slack");
-    let preflight_schema = &v["paths"]["/api/v1/me/networks/preflight"]["post"]["requestBody"]["content"]
+    let preflight_schema = &v["paths"]["/api/v1/me/network-preflight"]["post"]["requestBody"]["content"]
         ["application/json"]["schema"];
     assert_eq!(
         preflight_schema["required"],
@@ -5802,8 +5802,14 @@ async fn account_console_manages_credentials_tokens_and_identities() {
          Connection: close\r\n\r\n{app_body}",
         app_body.len()
     );
-    let (status, _, body) = request(http, &create_app).await;
+    let (status, headers, body) = request(http, &create_app).await;
     assert_eq!(status, 201, "{body}");
+    // The secret is shown exactly once; no cache may keep a second copy.
+    assert_eq!(
+        response_header(&headers, "cache-control"),
+        Some("no-store"),
+        "{headers}"
+    );
     assert!(
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["app_password"]
             .as_str()
@@ -5826,8 +5832,13 @@ async fn account_console_manages_credentials_tokens_and_identities() {
          Connection: close\r\n\r\n{token_body}",
         token_body.len()
     );
-    let (status, _, body) = request(http, &create_token).await;
+    let (status, headers, body) = request(http, &create_token).await;
     assert_eq!(status, 201, "{body}");
+    assert_eq!(
+        response_header(&headers, "cache-control"),
+        Some("no-store"),
+        "{headers}"
+    );
     assert!(
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["token"]
             .as_str()
@@ -7174,4 +7185,626 @@ async fn admin_networks_fleet_view_and_toggle() {
         Some("disabled"),
         "toggle must be audited"
     );
+}
+
+/// A database-backed server with the HTTP listener and nothing else.
+async fn start_with_database(url: &str, administrators: &[&str]) -> net::Running {
+    let config = Config {
+        database: Some(DatabaseConfig { url: url.into() }),
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: administrators.iter().map(|name| (*name).into()).collect(),
+        }),
+        bnc: Some(BncConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+        }),
+        ..test_config()
+    };
+    net::start(config).await.expect("start")
+}
+
+/// One request line plus the credential headers a caller chose, with an
+/// optional JSON body.
+fn api_request(method: &str, path: &str, credential_headers: &str, body: Option<&str>) -> String {
+    let body_headers = body.map_or_else(String::new, |body| {
+        format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        )
+    });
+    format!(
+        "{method} {path} HTTP/1.1\r\nHost: t\r\n{credential_headers}{body_headers}Connection: close\r\n\r\n{}",
+        body.unwrap_or_default()
+    )
+}
+
+fn bearer_headers(token: &str) -> String {
+    format!("Authorization: Bearer {token}\r\n")
+}
+
+/// The cookie plus the session-bound CSRF value `GET /api/v1/me` publishes.
+async fn session_headers(http: std::net::SocketAddr, session: &str) -> String {
+    let cookie = format!("Cookie: e6irc_session={session}\r\n");
+    let (status, _, body) = request(http, &api_request("GET", "/api/v1/me", &cookie, None)).await;
+    assert_eq!(status, 200, "{body}");
+    let identity: serde_json::Value = serde_json::from_str(&body).expect("identity JSON");
+    let csrf = identity["csrf_token"].as_str().expect("CSRF value");
+    format!("{cookie}X-E6IRC-CSRF: {csrf}\r\n")
+}
+
+/// A leaked write-scoped bearer must not be able to become the account: it can
+/// neither install a primary password on an OpenID Connect-only account, nor
+/// remove the owner's login identity, nor start linking a new one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn bearer_cannot_install_a_password_or_change_login_identities() {
+    let url = support::test_db("bearer_cannot_install_a_password_or_change_login_identities").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    let account = e6ircd::db::find_or_create_oidc_account(
+        &pool,
+        "https://issuer.example",
+        "subject-1",
+        "alice",
+    )
+    .await
+    .expect("OpenID Connect account");
+    let token = e6ircd::db::issue_api_token(&pool, &account, "leaked")
+        .await
+        .expect("token");
+    let session = e6ircd::db::create_web_session(&pool, &account, None)
+        .await
+        .expect("session");
+    let identity = e6ircd::db::list_oidc_identities(&pool, &account)
+        .await
+        .expect("identities")[0]
+        .id;
+    let http = start_with_database(&url, &[])
+        .await
+        .http_addr
+        .expect("http");
+
+    let password = r#"{"new_password":"attacker-chosen"}"#;
+    let (status, _, body) = request(
+        http,
+        &api_request(
+            "PUT",
+            "/api/v1/me/password",
+            &bearer_headers(&token),
+            Some(password),
+        ),
+    )
+    .await;
+    assert_eq!(status, 401, "{body}");
+    assert!(body.contains("Browser session required"), "{body}");
+    assert_eq!(
+        e6ircd::db::verify_local_password(&pool, &account, "attacker-chosen")
+            .await
+            .expect("password check"),
+        None,
+        "a bearer installed a primary password"
+    );
+
+    let unlink = format!("/api/v1/me/identities/{identity}");
+    let (status, _, body) = request(
+        http,
+        &api_request("DELETE", &unlink, &bearer_headers(&token), None),
+    )
+    .await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(
+        e6ircd::db::list_oidc_identities(&pool, &account)
+            .await
+            .expect("identities")
+            .len(),
+        1
+    );
+
+    let (status, _, body) = request(
+        http,
+        &api_request(
+            "GET",
+            "/api/v1/auth/oidc/any/link",
+            &bearer_headers(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, 401, "{body}");
+    assert!(body.contains("Browser session required"), "{body}");
+
+    let email = r#"{"contact_email":"attacker@example.test"}"#;
+    let (status, _, body) = request(
+        http,
+        &api_request(
+            "PATCH",
+            "/api/v1/me/profile",
+            &bearer_headers(&token),
+            Some(email),
+        ),
+    )
+    .await;
+    assert_eq!(status, 401, "{body}");
+
+    // The owner's browser session keeps every one of those abilities.
+    let owner = session_headers(http, &session).await;
+    let (status, _, body) = request(
+        http,
+        &api_request("PUT", "/api/v1/me/password", &owner, Some(password)),
+    )
+    .await;
+    assert_eq!(status, 204, "{body}");
+    let (status, _, body) = request(http, &api_request("DELETE", &unlink, &owner, None)).await;
+    assert_eq!(status, 204, "{body}");
+}
+
+/// `except=current` names the browser session that authorized the request. A
+/// bearer beside a cookie nobody verified names nothing, and must not turn the
+/// selector into "every session".
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn bearer_with_an_unverified_cookie_cannot_revoke_browser_sessions() {
+    let url =
+        support::test_db("bearer_with_an_unverified_cookie_cannot_revoke_browser_sessions").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    let token = e6ircd::db::issue_api_token(&pool, "alice", "automation")
+        .await
+        .expect("token");
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("session");
+    let http = start_with_database(&url, &[])
+        .await
+        .http_addr
+        .expect("http");
+
+    let forged = format!("{}Cookie: e6irc_session=x\r\n", bearer_headers(&token));
+    let (status, _, body) = request(
+        http,
+        &api_request(
+            "DELETE",
+            "/api/v1/me/sessions?except=current",
+            &forged,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(
+        e6ircd::db::session_account(&pool, &session)
+            .await
+            .expect("session lookup"),
+        Some("alice".into()),
+        "the owner's browser session was revoked"
+    );
+}
+
+fn preflight_body(addr: std::net::SocketAddr) -> String {
+    serde_json::json!({
+        "addr": addr.to_string(), "tls": false, "nick": "tester", "realname": "Tester",
+    })
+    .to_string()
+}
+
+/// A connection test makes the shared daemon register with a third party, so
+/// one account gets one at a time and a handful per minute.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn connection_tests_are_bounded_per_account() {
+    let url = support::test_db("connection_tests_are_bounded_per_account").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    let mut tokens = Vec::new();
+    for account in ["alice", "bob"] {
+        e6ircd::db::create_account(&pool, account, "pw")
+            .await
+            .expect("account");
+        tokens.push(
+            e6ircd::db::issue_api_token(&pool, account, "automation")
+                .await
+                .expect("token"),
+        );
+    }
+    let http = start_with_database(&url, &[])
+        .await
+        .http_addr
+        .expect("http");
+
+    // An upstream that accepts and then says nothing holds Alice's first test
+    // in its registration phase.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("silent upstream");
+    let silent_addr = silent.local_addr().expect("silent upstream address");
+    let alice = bearer_headers(&tokens[0]);
+    let first = tokio::spawn({
+        let request_text = api_request(
+            "POST",
+            "/api/v1/me/network-preflight",
+            &alice,
+            Some(&preflight_body(silent_addr)),
+        );
+        async move { request(http, &request_text).await }
+    });
+    let _held = tokio::time::timeout(std::time::Duration::from_secs(5), silent.accept())
+        .await
+        .expect("the first connection test never dialed")
+        .expect("accept");
+    let (status, headers, body) = request(
+        http,
+        &api_request(
+            "POST",
+            "/api/v1/me/network-preflight",
+            &alice,
+            Some(&preflight_body(silent_addr)),
+        ),
+    )
+    .await;
+    assert_eq!(status, 429, "{body}");
+    assert!(
+        response_header(&headers, "retry-after").is_some(),
+        "{headers}"
+    );
+    assert_eq!(
+        response_header(&headers, "content-type"),
+        Some("application/problem+json"),
+        "{headers}"
+    );
+    first.abort();
+
+    // Bob's tests finish at once (nothing listens on port 1), so only the
+    // per-minute allowance can refuse him.
+    let bob = bearer_headers(&tokens[1]);
+    let refused: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+    for attempt in 1..=6 {
+        let (status, _, body) = request(
+            http,
+            &api_request(
+                "POST",
+                "/api/v1/me/network-preflight",
+                &bob,
+                Some(&preflight_body(refused)),
+            ),
+        )
+        .await;
+        assert_eq!(status, 502, "attempt {attempt}: {body}");
+        assert!(body.contains("connection_failed"), "{body}");
+    }
+    let (status, headers, body) = request(
+        http,
+        &api_request(
+            "POST",
+            "/api/v1/me/network-preflight",
+            &bob,
+            Some(&preflight_body(refused)),
+        ),
+    )
+    .await;
+    assert_eq!(status, 429, "{body}");
+    assert!(
+        response_header(&headers, "retry-after").is_some(),
+        "{headers}"
+    );
+}
+
+/// Every name `valid_network_name` admits is addressable: no verb shares the
+/// `{name}` position.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_network_named_preflight_is_reachable_on_its_own_url() {
+    let url = support::test_db("a_network_named_preflight_is_reachable_on_its_own_url").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    let token = e6ircd::db::issue_api_token(&pool, "alice", "automation")
+        .await
+        .expect("token");
+    let http = start_with_database(&url, &[])
+        .await
+        .http_addr
+        .expect("http");
+    let alice = bearer_headers(&token);
+
+    let create = r#"{"kind":"irc","name":"Preflight","addr":"127.0.0.1:1","tls":false,"nick":"alice","realname":"Alice","autojoin":[]}"#;
+    let (status, _, body) = request(
+        http,
+        &api_request("POST", "/api/v1/me/networks", &alice, Some(create)),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+
+    let (status, _, body) = request(
+        http,
+        &api_request("GET", "/api/v1/me/networks/preflight", &alice, None),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // The response names the network as stored, not as the URL spelled it.
+    let (status, _, body) = request(
+        http,
+        &api_request(
+            "PATCH",
+            "/api/v1/me/networks/preflight",
+            &alice,
+            Some(r#"{"enabled":false}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let patched: serde_json::Value = serde_json::from_str(&body).expect("patch JSON");
+    assert_eq!(patched["name"], "Preflight", "{body}");
+
+    let (status, _, body) = request(
+        http,
+        &api_request("DELETE", "/api/v1/me/networks/preflight", &alice, None),
+    )
+    .await;
+    assert_eq!(status, 204, "{body}");
+}
+
+/// The `runtime` member of one administrator fleet row; `null` means no driver
+/// is registered for that network.
+async fn fleet_runtime(
+    http: std::net::SocketAddr,
+    administrator: &str,
+    owner: &str,
+    name: &str,
+) -> serde_json::Value {
+    let (status, _, body) = request(
+        http,
+        &api_request("GET", "/api/v1/admin/networks", administrator, None),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let fleet: serde_json::Value = serde_json::from_str(&body).expect("fleet JSON");
+    fleet["networks"]
+        .as_array()
+        .expect("networks")
+        .iter()
+        .find(|row| row["owner"] == owner && row["name"] == name)
+        .unwrap_or_else(|| panic!("{owner}/{name} missing from {body}"))["runtime"]
+        .clone()
+}
+
+async fn account_with_enabled_network(pool: &sqlx::PgPool, owner: &str) -> i64 {
+    e6ircd::db::create_account(pool, owner, "pw")
+        .await
+        .expect("owner");
+    e6ircd::db::create_bnc_network(
+        pool,
+        owner,
+        &e6ircd::db::BncNetworkRow {
+            kind: e6ircd::config::NetworkKind::Irc,
+            name: "work".into(),
+            addr: "127.0.0.1:1".into(),
+            tls: false,
+            nick: "worker".into(),
+            realname: Some("Worker".into()),
+            autojoin: vec![],
+            sasl_account: None,
+            sasl_password_sealed: None,
+            enabled: true,
+        },
+    )
+    .await
+    .expect("network");
+    e6ircd::db::account_id_by_name(pool, owner)
+        .await
+        .expect("owner id lookup")
+        .expect("owner id")
+}
+
+/// Suspension stops an owner's drivers but leaves `enabled` set so that
+/// reactivation restores them. Nothing else may read that flag as "start it".
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_suspended_owners_network_cannot_be_started() {
+    let url = support::test_db("a_suspended_owners_network_cannot_be_started").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    let token = e6ircd::db::issue_api_token(&pool, "alice", "administration")
+        .await
+        .expect("token");
+    let bob = account_with_enabled_network(&pool, "bob").await;
+    let carol = account_with_enabled_network(&pool, "carol").await;
+    // Carol was suspended before this process existed.
+    e6ircd::db::set_account_suspended(&pool, carol, true, "alice", &["alice".into()])
+        .await
+        .expect("suspend carol")
+        .expect("carol exists");
+    let http = start_with_database(&url, &["alice"])
+        .await
+        .http_addr
+        .expect("http");
+    let alice = bearer_headers(&token);
+
+    assert!(
+        !fleet_runtime(http, &alice, "bob", "work").await.is_null(),
+        "an active owner's enabled network runs from boot"
+    );
+    assert!(
+        fleet_runtime(http, &alice, "carol", "work").await.is_null(),
+        "boot started a suspended owner's network"
+    );
+
+    let (status, _, body) = request(
+        http,
+        &api_request(
+            "PATCH",
+            &format!("/api/v1/admin/accounts/{bob}"),
+            &alice,
+            Some(r#"{"suspended":true}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    for owner in ["bob", "carol"] {
+        let path = format!("/api/v1/admin/networks/{owner}/work");
+        let (status, _, body) = request(
+            http,
+            &api_request("PATCH", &path, &alice, Some(r#"{"enabled":false}"#)),
+        )
+        .await;
+        assert_eq!(status, 200, "{owner}: {body}");
+        let (status, _, body) = request(
+            http,
+            &api_request("PATCH", &path, &alice, Some(r#"{"enabled":true}"#)),
+        )
+        .await;
+        assert_eq!(status, 409, "{owner}: {body}");
+        assert!(body.contains("suspended"), "{owner}: {body}");
+        assert!(
+            fleet_runtime(http, &alice, owner, "work").await.is_null(),
+            "{owner}: a suspended owner's driver is running"
+        );
+    }
+}
+
+/// A cross-site form can make a browser POST with its cookie, but cannot set a
+/// custom header: logout asks for the session-bound value like every other
+/// unsafe cookie-authenticated method.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn logout_post_requires_the_session_csrf_value() {
+    let url = support::test_db("logout_post_requires_the_session_csrf_value").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("session");
+    let http = start_with_database(&url, &[])
+        .await
+        .http_addr
+        .expect("http");
+
+    let forged = format!("Cookie: e6irc_session={session}\r\n");
+    let (status, _, body) = request(
+        http,
+        &api_request("POST", "/api/v1/auth/logout", &forged, None),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(
+        e6ircd::db::session_account(&pool, &session)
+            .await
+            .expect("session lookup"),
+        Some("alice".into()),
+        "a request without the CSRF value logged the owner out"
+    );
+
+    let owner = session_headers(http, &session).await;
+    let (status, headers, body) = request(
+        http,
+        &api_request("POST", "/api/v1/auth/logout", &owner, None),
+    )
+    .await;
+    assert_eq!(status, 204, "{body}");
+    assert!(headers.contains("e6irc_session=;"), "{headers}");
+    assert_eq!(
+        e6ircd::db::session_account(&pool, &session)
+            .await
+            .expect("session lookup"),
+        None
+    );
+
+    // With no session there is nothing to forge: clearing the cookie is all
+    // that is left to do.
+    let (status, _, body) =
+        request(http, &api_request("POST", "/api/v1/auth/logout", "", None)).await;
+    assert_eq!(status, 204, "{body}");
+}
+
+/// An identity provider whose discovery document omits `token_endpoint`, which
+/// OpenID Connect Discovery allows for implicit-flow-only providers.
+async fn identity_provider_without_a_token_endpoint() -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("identity provider");
+    let addr = listener.local_addr().expect("identity provider address");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut head = vec![0u8; 4096];
+                let read = stream.read(&mut head).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&head[..read]).to_string();
+                let body = if head.starts_with("GET /.well-known/openid-configuration ") {
+                    serde_json::json!({
+                        "issuer": format!("http://{addr}"),
+                        "authorization_endpoint": format!("http://{addr}/authorize"),
+                        "jwks_uri": format!("http://{addr}/jwks"),
+                        "response_types_supported": ["code"],
+                        "subject_types_supported": ["public"],
+                        "id_token_signing_alg_values_supported": ["RS256"],
+                    })
+                } else {
+                    serde_json::json!({ "keys": [] })
+                }
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.ok();
+            });
+        }
+    });
+    addr
+}
+
+/// A provider that cannot exchange a code cannot complete a login, so the login
+/// is refused where it starts — not by a handler panic when the browser returns.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_provider_without_a_token_endpoint_is_a_bad_gateway() {
+    let provider = identity_provider_without_a_token_endpoint().await;
+    let mut config = test_config();
+    config.http.as_mut().expect("http").public_url = Some("http://e6irc.example".into());
+    config.oidc_providers = vec![e6ircd::config::OidcProviderConfig {
+        name: "implicit".into(),
+        issuer_url: format!("http://{provider}"),
+        client_id: "e6irc".into(),
+        client_secret: "x".repeat(32),
+        account_claim: e6ircd::config::OidcAccountClaim::PreferredUsername,
+        scopes: vec![],
+        allowed_email_domains: vec![],
+        end_session_endpoint: None,
+        token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
+    }];
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    let (status, headers, body) = request(http, &get("/api/v1/auth/oidc/implicit/start")).await;
+    assert_eq!(status, 502, "{headers}\n{body}");
+    assert_eq!(
+        response_header(&headers, "content-type"),
+        Some("application/problem+json"),
+        "{headers}"
+    );
+    assert!(body.contains("OIDC provider unavailable"), "{body}");
 }

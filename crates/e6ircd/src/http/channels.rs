@@ -66,7 +66,7 @@ fn channel_response(channel: crate::db::OwnedChannel) -> OwnedChannelResponse {
 
 pub(super) async fn list_owned_channels(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
 ) -> Response {
     match crate::db::list_owned_channels(pool_of(&state), &account).await {
         Ok(channels) => json_no_store(OwnedChannelListResponse {
@@ -91,7 +91,7 @@ pub(super) struct RegisterChannelBody {
 
 pub(super) async fn register_owned_channel(
     State(state): State<Arc<AppState>>,
-    Authenticated(actor): Authenticated,
+    Authenticated(actor, _): Authenticated,
     JsonBody(body): JsonBody<RegisterChannelBody>,
 ) -> Response {
     let request = crate::core::AdminRequest::RegisterOwnedChannel {
@@ -103,7 +103,7 @@ pub(super) async fn register_owned_channel(
 
 pub(super) async fn get_owned_channel(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Path(name): Path<String>,
 ) -> Response {
     let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&name);
@@ -157,7 +157,7 @@ pub(super) struct AccessBody {
 
 pub(super) async fn patch_owned_channel(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Path(name): Path<String>,
     JsonBody(patch): JsonBody<ChannelPatch>,
 ) -> Response {
@@ -166,7 +166,7 @@ pub(super) async fn patch_owned_channel(
 
 pub(super) async fn delete_owned_channel(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Path(name): Path<String>,
 ) -> Response {
     mutate_response(&state, name, account, crate::core::ChannelMutation::Drop).await
@@ -203,7 +203,7 @@ pub(super) async fn delete_admin_channel(
 
 pub(super) async fn put_channel_access(
     State(state): State<Arc<AppState>>,
-    Authenticated(owner): Authenticated,
+    Authenticated(owner, _): Authenticated,
     Path((name, account)): Path<(String, String)>,
     JsonBody(body): JsonBody<AccessBody>,
 ) -> Response {
@@ -212,7 +212,7 @@ pub(super) async fn put_channel_access(
 
 pub(super) async fn delete_channel_access(
     State(state): State<Arc<AppState>>,
-    Authenticated(owner): Authenticated,
+    Authenticated(owner, _): Authenticated,
     Path((name, account)): Path<(String, String)>,
 ) -> Response {
     access_response(&state, name, owner, account, None).await

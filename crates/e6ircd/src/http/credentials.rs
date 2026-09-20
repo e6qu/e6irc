@@ -108,7 +108,7 @@ pub(super) struct ProfileRequest {
 
 pub(super) async fn me_profile(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
 ) -> Response {
     match crate::db::account_contact_email(pool_of(&state), &account).await {
         Ok(contact_email) => json_no_store(ProfileResponse {
@@ -119,9 +119,12 @@ pub(super) async fn me_profile(
     }
 }
 
+/// Replace the private contact email. It is the account's recovery contact, so
+/// redirecting it is reserved to the browser session like every other change
+/// that could hand the account to someone else.
 pub(super) async fn update_me_profile(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    SessionMutation(account, _): SessionMutation,
     JsonBody(request): JsonBody<ProfileRequest>,
 ) -> Response {
     let contact_email = match super::parse_optional_contact_email(request.contact_email.as_deref())
@@ -141,7 +144,7 @@ pub(super) async fn update_me_profile(
 
 pub(super) async fn export_me(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
 ) -> Response {
     match crate::db::export_account_json(pool_of(&state), &account).await {
         Ok(Some(export)) => {
@@ -173,7 +176,7 @@ pub(super) struct SecurityActivityQuery {
 
 pub(super) async fn me_security_activity(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Query(query): Query<SecurityActivityQuery>,
 ) -> Response {
     let page_size = match query.limit.map_or_else(
@@ -359,15 +362,11 @@ fn app_password_issue_response(
     label: String,
 ) -> Response {
     match result {
-        Ok(secret) => (
-            StatusCode::CREATED,
-            axum::Json(AppPasswordResponse {
-                app_password: secret,
-                label,
-                note: "Store this now; it is not retrievable later.",
-            }),
-        )
-            .into_response(),
+        Ok(secret) => created_no_store(AppPasswordResponse {
+            app_password: secret,
+            label,
+            note: "Store this now; it is not retrievable later.",
+        }),
         Err(crate::db::DbError::BadCredentials) => problem(
             StatusCode::UNAUTHORIZED,
             "Invalid account or password",
@@ -394,7 +393,7 @@ pub(super) struct SessionAppPasswordRequest {
 /// API rather than a rendered mutation handler.
 pub(super) async fn create_session_app_password(
     State(state): State<Arc<AppState>>,
-    SessionMutation(account): SessionMutation,
+    SessionMutation(account, _): SessionMutation,
     JsonBody(request): JsonBody<SessionAppPasswordRequest>,
 ) -> Response {
     if let Some(response) = validate_label(&request.label) {
@@ -414,12 +413,14 @@ pub(super) struct ChangePasswordRequest {
     pub(super) new_password: String,
 }
 
-/// Rotate the authenticated account's primary password. An app password
-/// cannot authorize this operation.
+/// Rotate the authenticated account's primary password. Neither an app
+/// password nor a bearer can authorize this operation: an OpenID Connect-only
+/// account has no current password to demand, so a token admitted here could
+/// install one and sign in as the owner.
 pub(super) async fn change_password(
     State(state): State<Arc<AppState>>,
     _rl: RateLimited,
-    Authenticated(account): Authenticated,
+    SessionMutation(account, _): SessionMutation,
     body: Result<axum::Json<ChangePasswordRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let req = match super::parse_json(body) {
@@ -462,7 +463,7 @@ pub(super) async fn change_password(
 /// List the authenticated account's app passwords by id and label.
 pub(super) async fn list_credentials(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
 ) -> Response {
     let pool = pool_of(&state);
     match crate::db::list_credentials(pool, &account).await {
@@ -487,7 +488,7 @@ pub(super) async fn list_credentials(
 /// added via `GET /api/v1/auth/oidc/{provider}/link`.
 pub(super) async fn me_identities(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
 ) -> Response {
     let pool = pool_of(&state);
     match crate::db::list_oidc_identities(pool, &account).await {
@@ -520,16 +521,12 @@ pub(super) async fn me_identities(
 /// in the same transaction.
 pub(super) async fn me_identity_unlink(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-    Authenticated(account): Authenticated,
+    SessionMutation(account, session): SessionMutation,
     Path(id): Path<i64>,
 ) -> Response {
     let pool = pool_of(&state);
     match crate::db::unlink_oidc_identity(pool, &account, id).await {
         Ok(crate::db::UnlinkIdentityOutcome::Unlinked) => {
-            let Some(session) = session_token(&headers, state.secure_cookies) else {
-                return StatusCode::NO_CONTENT.into_response();
-            };
             match crate::db::session_account(pool, &session).await {
                 Ok(Some(_)) => StatusCode::NO_CONTENT.into_response(),
                 Ok(None) => {
@@ -561,7 +558,7 @@ pub(super) async fn me_identity_unlink(
 /// point they have read in each target, mirrored from MARKREAD.
 pub(super) async fn me_read_markers(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
 ) -> Response {
     let pool = pool_of(&state);
     match crate::db::list_read_markers(pool, &account).await {
@@ -580,7 +577,7 @@ pub(super) async fn me_read_markers(
 /// itself — only its hash is stored).
 pub(super) async fn me_tokens_list(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
 ) -> Response {
     let pool = pool_of(&state);
     match crate::db::list_api_tokens(pool, &account).await {
@@ -604,7 +601,7 @@ pub(super) async fn me_tokens_list(
 /// Revoke one of the authenticated account's PATs by id.
 pub(super) async fn me_tokens_revoke(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Path(id): Path<i64>,
 ) -> Response {
     delete_owner_item(
@@ -621,7 +618,7 @@ pub(super) async fn me_tokens_revoke(
 /// Revoke one of the authenticated account's app passwords by id.
 pub(super) async fn revoke_credential(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Path(id): Path<i64>,
 ) -> Response {
     delete_owner_item(
@@ -643,7 +640,7 @@ pub(super) struct DeleteOwnAccountRequest {
 
 pub(super) async fn delete_own_account(
     State(state): State<Arc<AppState>>,
-    SessionMutation(account): SessionMutation,
+    SessionMutation(account, _): SessionMutation,
     JsonBody(request): JsonBody<DeleteOwnAccountRequest>,
 ) -> Response {
     if request.confirmation != account {

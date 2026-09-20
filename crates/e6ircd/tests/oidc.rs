@@ -133,6 +133,10 @@ async fn full_oidc_login_provisions_account_and_session() {
     // 5. logout kills the session
     let resp = client
         .post(format!("{base}/api/v1/auth/logout"))
+        .header(
+            "X-E6IRC-CSRF",
+            me["csrf_token"].as_str().expect("session CSRF value"),
+        )
         .send()
         .await
         .expect("logout");
