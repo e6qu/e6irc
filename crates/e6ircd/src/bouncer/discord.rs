@@ -21,6 +21,8 @@ pub struct DiscordConfig {
     pub api_base: String,
     pub channels: Vec<String>,
     pub buffer_cap: usize,
+    /// The server's policy on an API base inside its own network.
+    pub internal_upstreams: crate::egress::InternalUpstreams,
 }
 
 pub struct DiscordDriver {
@@ -66,7 +68,11 @@ super::bridge_run!(DiscordConfig);
 async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
     use super::NetworkFailure;
     use super::SessionOutcome::Dropped;
-    let http = match super::bridge_http_or_outcome("discord", Duration::from_secs(30)) {
+    let http = match super::bridge_http_or_outcome(
+        "discord",
+        Duration::from_secs(30),
+        config.internal_upstreams,
+    ) {
         Ok(c) => c,
         Err(outcome) => return outcome,
     };
@@ -103,10 +109,11 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
             return Dropped(NetworkFailure::UpstreamProtocolFailed);
         }
     };
-    let ws = match super::bridge_ws_open(&url, "discord", "gateway").await {
-        Ok(ws) => ws,
-        Err(outcome) => return outcome,
-    };
+    let ws =
+        match super::bridge_ws_open(&url, "discord", "gateway", config.internal_upstreams).await {
+            Ok(ws) => ws,
+            Err(outcome) => return outcome,
+        };
     let (mut write, mut read) = ws.split();
 
     let hb_interval = match tokio::time::timeout(Duration::from_secs(30), read.next()).await {
@@ -664,6 +671,7 @@ mod tests {
             token: "t".into(),
             api_base: String::new(),
             channels: vec![],
+            internal_upstreams: crate::egress::InternalUpstreams::Allow,
             buffer_cap: 10,
         };
         crate::bouncer::assert_bridge_api_base(
@@ -688,6 +696,7 @@ mod tests {
             token: "revoked-token".into(),
             api_base: oracle.api_base.clone(),
             channels: vec!["42".into()],
+            internal_upstreams: crate::egress::InternalUpstreams::Allow,
             buffer_cap: 10,
         };
         let (_handle, mut ends) = NetworkHandle::channels(10);
@@ -708,6 +717,7 @@ mod tests {
             token: "discord-token".into(),
             api_base: oracle.api_base.clone(),
             channels: vec!["42".into()],
+            internal_upstreams: crate::egress::InternalUpstreams::Allow,
             buffer_cap: 10,
         };
         let (handle, mut ends) = NetworkHandle::channels(10);

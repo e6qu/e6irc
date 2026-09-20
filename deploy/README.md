@@ -83,6 +83,13 @@ reverse proxy or an explicit, reviewed service override.
 
 ## Bootstrap configuration (environment)
 
+The daemon refuses to connect a bouncer network to an upstream inside its own
+network — loopback, RFC 1918, carrier-grade NAT, unique-local — at every
+ingress and again at dial time, because an account holder chooses the upstream
+address. The container exposes no variable to change that; a configuration
+file's `internal_upstreams = "allow"` exists for test harnesses whose upstreams
+listen on loopback.
+
 The image is distroless: it contains the daemon, glibc, and CA certificates —
 no shell, no package manager, no script. Its command is `e6ircd
 --config-from-environment`: the daemon builds its bootstrap configuration from

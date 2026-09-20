@@ -1724,6 +1724,20 @@ upstream's.
   results while preserving each family's resolver order, bounds each concrete
   TCP/TLS attempt, and tries the remaining vetted addresses. TLS still validates
   the certificate against the configured hostname rather than the pinned IP.
+  What may be dialled is one rule for every driver (`egress`): addresses that
+  are never a network — link-local with the cloud metadata endpoint, broadcast,
+  documentation, multicast, unspecified — are refused always, and loopback, RFC
+  1918, carrier-grade NAT and unique-local addresses are refused **by
+  default**: an account holder types the upstream address, so allowing them
+  would let any account make the server connect to internal infrastructure and
+  learn what answers. The rule is applied to the literal at every API ingress
+  (create, replace, connection test; the refusal names the rule, never the
+  address) and to every *resolved* address at dial time, so a hostname that
+  resolves — or later rebinds — to an internal address is refused there. The
+  one exception is operator-level: `internal_upstreams = "allow"` in the server
+  configuration, which the test harnesses set because their upstreams are
+  in-process listeners on loopback. It is not exposed through the container's
+  environment.
 - Primary interop target: Libera (tested against the §7.7 docker stack).
 - Account registration remains ordinary IRC services traffic. The console's
   guided email round trip emits `PRIVMSG NickServ :REGISTER password email`
@@ -2274,6 +2288,9 @@ but the CLI, TUI, and BNC must surface the rejection.
   approving browser and the grant stays pending; a grant that loses its slot
   between approval and poll — or whose account was suspended or deleted — is
   consumed, audited, and answered with RFC 8628 `access_denied` once.
+- Upstreams inside the server's own network are refused by default (§10.3,
+  `egress`): a BNC network is an outbound connection an account holder aims,
+  and internal infrastructure is not a target it may aim at.
 - Upstream BNC secrets (SASL passwords, bridge tokens) sealable at rest
   under a **server master keyring** provided via `[secrets].key_file` plus
   optional `previous_key_files`, or the `E6IRC_SECRET_KEY` plus optional
@@ -2487,6 +2504,10 @@ Layers, bottom to top:
   persisted revision before constructing the core or listeners, so the UI is
   authoritative. Writes use compare-and-swap revisions and a same-transaction
   redacted audit entry; stale writers fail visibly.
+- `internal_upstreams` (`refuse` by default, `allow`) is the server's policy on
+  bouncer upstreams inside its own network (§10.3). It is bootstrap
+  configuration, not a console setting, and the environment-stated
+  configuration has no variable for it.
 - A configuration that parses but cannot work is refused at load and at every
   console save. Two listening sockets that cannot both bind — the same nonzero
   port on the same address, or on a wildcard of the same family — are refused

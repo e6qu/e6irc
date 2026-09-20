@@ -214,6 +214,8 @@ pub struct DriverSpec {
     pub buffer_cap: usize,
     pub sasl_account: Option<String>,
     pub sasl_password: Option<String>,
+    /// The server's policy on upstreams inside its own network.
+    pub internal_upstreams: crate::egress::InternalUpstreams,
 }
 
 /// error (never a silent fall-through to IRC), and `local` is not creatable as a
@@ -234,6 +236,7 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
         buffer_cap,
         sasl_account,
         sasl_password,
+        internal_upstreams,
     } = spec;
     let required_field = |value: String, field: &str, maximum: usize| {
         validate_network_credential(&value, maximum)
@@ -289,6 +292,7 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
                 sasl,
                 keepalive_idle: KEEPALIVE_IDLE,
                 rejection_retry_floor: REJECTION_RETRY_FLOOR,
+                internal_upstreams,
             })))
         }
         NetworkKind::Local => {
@@ -315,6 +319,7 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
                     password,
                     rooms: autojoin,
                     buffer_cap,
+                    internal_upstreams,
                 })))
             }
             #[cfg(not(feature = "matrix"))]
@@ -342,6 +347,7 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
                     api_base: addr,
                     channels: autojoin,
                     buffer_cap,
+                    internal_upstreams,
                 })))
             }
             #[cfg(not(feature = "discord"))]
@@ -368,6 +374,7 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
                     api_base: addr,
                     channels: autojoin,
                     buffer_cap,
+                    internal_upstreams,
                 })))
             }
             #[cfg(not(feature = "slack"))]
@@ -387,6 +394,7 @@ pub fn driver_from_row(
     row: &crate::db::BncNetworkRow,
     key: Option<&crate::secret::SecretKeyring>,
     owner: &str,
+    internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<Box<dyn NetworkDriver>, String> {
     if row.kind.is_bridge() && row.realname.is_some() {
         return Err(format!(
@@ -431,6 +439,7 @@ pub fn driver_from_row(
         buffer_cap: DB_NETWORK_BUFFER_CAP,
         sasl_account: account,
         sasl_password: password,
+        internal_upstreams,
     })
 }
 
@@ -907,28 +916,29 @@ pub(crate) async fn relay_routed<F, Fut>(
 }
 
 /// A reqwest DNS resolver that vets every resolved address and drops the ones a
-/// bridge must never dial — the same SSRF control the IRC driver applies at
-/// connect time (`is_blocked_upstream_ip`: cloud-metadata link-local, multicast,
-/// broadcast, documentation, unspecified). Resolution happens per request, so a
-/// host that resolves to an internal address — now or after a DNS rebind — is
-/// refused at dial time, not just at config time.
+/// bridge may not dial — the same control the IRC driver applies at connect
+/// time (`crate::egress`: never an upstream, or internal under the server's
+/// policy). Resolution happens per request, so a host that resolves to a
+/// refused address — now or after a DNS rebind — is refused at dial time, not
+/// just at config time.
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-struct VettingResolver;
+struct VettingResolver(crate::egress::InternalUpstreams);
 
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 impl reqwest::dns::Resolve for VettingResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let policy = self.0;
         Box::pin(async move {
             let host = name.as_str().to_string();
             let resolved = tokio::net::lookup_host((host.as_str(), 0)).await?;
-            let vetted: Vec<std::net::SocketAddr> = resolved
-                .filter(|sa| !crate::http::networks::is_blocked_upstream_ip(sa.ip()))
-                .collect();
+            let vetted: Vec<std::net::SocketAddr> =
+                resolved.filter(|sa| policy.permits(sa.ip())).collect();
             if vetted.is_empty() {
                 // Either DNS returned nothing or every address was blocked; both
                 // are a refusal, not a silent fall-through to the OS resolver.
                 return Err(format!(
-                    "{host}: no permitted address (all resolved addresses are SSRF-blocked)"
+                    "{host}: no permitted address (every resolved address is internal or \
+                     never an upstream)"
                 )
                 .into());
             }
@@ -944,11 +954,14 @@ impl reqwest::dns::Resolve for VettingResolver {
 /// constructor so all three bridges share the discipline rather than each
 /// rebuilding it (and drifting).
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-pub(crate) fn bridge_http_client(timeout: std::time::Duration) -> reqwest::Result<reqwest::Client> {
+pub(crate) fn bridge_http_client(
+    timeout: std::time::Duration,
+    internal_upstreams: crate::egress::InternalUpstreams,
+) -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
-        .dns_resolver(std::sync::Arc::new(VettingResolver))
+        .dns_resolver(std::sync::Arc::new(VettingResolver(internal_upstreams)))
         .build()
 }
 
@@ -981,8 +994,9 @@ pub(crate) fn assert_bridge_api_base(base: &mut String, default: &str, override_
 pub(crate) fn bridge_http_or_outcome(
     tag: &str,
     timeout: std::time::Duration,
+    internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<reqwest::Client, SessionOutcome> {
-    bridge_http_client(timeout).map_err(|e| {
+    bridge_http_client(timeout, internal_upstreams).map_err(|e| {
         eprintln!("{tag}: http client build failed: {e}");
         SessionOutcome::Dropped(NetworkFailure::UpstreamRequestFailed)
     })
@@ -1001,10 +1015,11 @@ pub(crate) async fn bridge_ws_open(
     url: &str,
     tag: &str,
     transport: &str,
+    internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<BridgeWs, SessionOutcome> {
     match tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        bridge_ws_connect(url, bridge_ws_config()),
+        bridge_ws_connect(url, bridge_ws_config(), internal_upstreams),
     )
     .await
     {
@@ -1179,6 +1194,7 @@ pub(crate) use bridge_run;
 pub(crate) async fn bridge_ws_connect(
     url: &str,
     config: tokio_tungstenite::tungstenite::protocol::WebSocketConfig,
+    internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     String,
@@ -1189,8 +1205,8 @@ pub(crate) async fn bridge_ws_connect(
     let vetted = tokio::net::lookup_host((host.as_str(), port))
         .await
         .map_err(|e| e.to_string())?
-        .find(|sa| !crate::http::networks::is_blocked_upstream_ip(sa.ip()))
-        .ok_or_else(|| format!("{host}: no permitted address (SSRF-blocked)"))?;
+        .find(|sa| internal_upstreams.permits(sa.ip()))
+        .ok_or_else(|| format!("{host}: no permitted address (internal or never an upstream)"))?;
     let tcp = tokio::net::TcpStream::connect(vetted)
         .await
         .map_err(|e| e.to_string())?;
@@ -3867,6 +3883,7 @@ mod tests {
             buffer_cap: 16,
             sasl_account: account.map(str::to_string),
             sasl_password: password.map(str::to_string),
+            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
         })
         .err()
         .expect("invalid driver configuration should be rejected")
@@ -3954,9 +3971,14 @@ mod tests {
             sasl_password_sealed: Some("sealed-but-no-key".into()),
             enabled: false,
         };
-        let error = driver_from_row(&row, None, "owner")
-            .err()
-            .expect("noncanonical stored bridge should be rejected");
+        let error = driver_from_row(
+            &row,
+            None,
+            "owner",
+            crate::egress::InternalUpstreams::Refuse,
+        )
+        .err()
+        .expect("noncanonical stored bridge should be rejected");
         assert!(error.contains("real name field"), "{error}");
     }
 
@@ -3975,9 +3997,14 @@ mod tests {
             sasl_password_sealed: None,
             enabled: false,
         };
-        let error = driver_from_row(&row, None, "owner")
-            .err()
-            .expect("stored IRC network without realname should fail");
+        let error = driver_from_row(
+            &row,
+            None,
+            "owner",
+            crate::egress::InternalUpstreams::Refuse,
+        )
+        .err()
+        .expect("stored IRC network without realname should fail");
         assert!(error.contains("no realname"), "{error}");
     }
 
@@ -4413,13 +4440,38 @@ mod tests {
     #[tokio::test]
     #[cfg(any(feature = "discord", feature = "slack"))]
     async fn bridge_ws_connect_refuses_an_ssrf_blocked_gateway() {
-        let err = bridge_ws_connect("wss://169.254.169.254/gateway", bridge_ws_config())
-            .await
-            .expect_err("a link-local gateway must be refused");
-        assert!(
-            err.contains("permitted") || err.contains("SSRF"),
-            "refusal must name the SSRF block, got: {err}"
-        );
+        for policy in [
+            crate::egress::InternalUpstreams::Refuse,
+            crate::egress::InternalUpstreams::Allow,
+        ] {
+            let err =
+                bridge_ws_connect("wss://169.254.169.254/gateway", bridge_ws_config(), policy)
+                    .await
+                    .expect_err("a link-local gateway must be refused");
+            assert!(
+                err.contains("permitted"),
+                "refusal must name the rule, got: {err}"
+            );
+        }
+        // A loopback gateway is internal: refused by default, dialled only
+        // under the operator's explicit allowance (here: nothing listens, so
+        // the refusal gives way to a connection error).
+        let err = bridge_ws_connect(
+            "ws://127.0.0.1:9/gateway",
+            bridge_ws_config(),
+            crate::egress::InternalUpstreams::Refuse,
+        )
+        .await
+        .expect_err("a loopback gateway is refused by default");
+        assert!(err.contains("permitted"), "{err}");
+        let err = bridge_ws_connect(
+            "ws://127.0.0.1:9/gateway",
+            bridge_ws_config(),
+            crate::egress::InternalUpstreams::Allow,
+        )
+        .await
+        .expect_err("nothing listens on port 9");
+        assert!(!err.contains("permitted"), "{err}");
     }
 
     #[test]

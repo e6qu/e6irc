@@ -185,6 +185,13 @@ pub struct Config {
     /// The bouncer listener, where clients attach as nick/network.
     #[serde(default)]
     pub bnc: Option<BncConfig>,
+    /// Whether a network may have an upstream inside this host's own network
+    /// (loopback, RFC 1918, carrier-grade NAT, unique-local). Refused by
+    /// default: an account holder could otherwise make this server connect to
+    /// internal infrastructure and learn what answers. `allow` is for test
+    /// harnesses whose upstreams listen on loopback.
+    #[serde(default)]
+    pub internal_upstreams: crate::egress::InternalUpstreams,
     /// Source of the key that decrypts sealed (`enc:v1:`/`enc:v2:`) secrets. When
     /// absent, the `E6IRC_SECRET_KEY` env var is consulted instead.
     #[serde(default)]
@@ -1040,6 +1047,7 @@ impl Default for Config {
             opers: Vec::new(),
             networks: Vec::new(),
             bnc: None,
+            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
             secrets: None,
             limits: LimitsConfig::default(),
             observability: ObservabilityConfig::default(),

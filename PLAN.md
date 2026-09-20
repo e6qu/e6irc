@@ -257,7 +257,11 @@ change:
   migration 0059) instead of up to 33. `/ws/ui` is capped per account and pings
   a silent browser. A configuration whose listeners collide or whose sizes are
   absurd is refused. `e6ircd recover-administrator` is the explicit, local,
-  audited way back in for an operator who lost every administrator login. Six
+  audited way back in for an operator who lost every administrator login. A
+  bouncer upstream inside the server's own network (loopback, RFC 1918,
+  carrier-grade NAT, unique-local) is refused by default at every ingress and
+  at dial time; `internal_upstreams = "allow"` is the operator-level exception
+  the test harnesses use. Six
   unaudited test-only side doors in the database layer are gone, and shutdown
   flushes held output before the closing `ERROR`.
 - **Delivery.** One `ci-ok` job gates every other; a release is published only

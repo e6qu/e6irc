@@ -26,6 +26,8 @@ pub struct SlackConfig {
     /// Slack channel ids to bridge.
     pub channels: Vec<String>,
     pub buffer_cap: usize,
+    /// The server's policy on an API base inside its own network.
+    pub internal_upstreams: crate::egress::InternalUpstreams,
 }
 
 pub struct SlackDriver {
@@ -51,7 +53,11 @@ super::bridge_run!(SlackConfig);
 async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
     use super::NetworkFailure;
     use super::SessionOutcome::Dropped;
-    let http = match super::bridge_http_or_outcome("slack", Duration::from_secs(30)) {
+    let http = match super::bridge_http_or_outcome(
+        "slack",
+        Duration::from_secs(30),
+        config.internal_upstreams,
+    ) {
         Ok(c) => c,
         Err(outcome) => return outcome,
     };
@@ -80,10 +86,11 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
             return slack_failure("apps.connections.open failed", &e);
         }
     };
-    let ws = match super::bridge_ws_open(&ws_url, "slack", "socket").await {
-        Ok(ws) => ws,
-        Err(outcome) => return outcome,
-    };
+    let ws =
+        match super::bridge_ws_open(&ws_url, "slack", "socket", config.internal_upstreams).await {
+            Ok(ws) => ws,
+            Err(outcome) => return outcome,
+        };
     let (mut write, mut read) = ws.split();
     ends.emit(ConnectionEvent::Connected);
 
@@ -620,6 +627,7 @@ mod tests {
             bot_token: "b".into(),
             app_token: "a".into(),
             api_base: String::new(),
+            internal_upstreams: crate::egress::InternalUpstreams::Allow,
             channels: vec![],
             buffer_cap: 10,
         };
@@ -637,6 +645,7 @@ mod tests {
             bot_token: "xoxb-token".into(),
             app_token: "xapp-token".into(),
             api_base: oracle.api_base.clone(),
+            internal_upstreams: crate::egress::InternalUpstreams::Allow,
             channels: vec!["C1".into()],
             buffer_cap: 10,
         };

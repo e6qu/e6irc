@@ -63,6 +63,9 @@ pub struct Registry {
     mutations: tokio::sync::Mutex<()>,
     pool: Option<PgPool>,
     telemetry: Option<Arc<crate::observability::Telemetry>>,
+    /// The server's policy on upstreams inside its own network, applied to
+    /// every driver this registry builds.
+    internal_upstreams: crate::egress::InternalUpstreams,
 }
 
 /// A registered network: its driver handle plus the persistence task that
@@ -122,12 +125,9 @@ impl Registry {
     /// Start a driver per configured (server-level) network. `pool`, when
     /// present, enables buffer persistence and backlog restore; `core`
     /// (the in-process handles) is required for any `local` network.
-    pub fn start(
-        entries: &[NetworkEntry],
-        pool: Option<PgPool>,
-        core: super::CoreHandles,
-    ) -> Result<Self, String> {
-        Self::start_inner(entries, pool, core, None)
+    /// The server's policy on upstreams inside its own network.
+    pub fn internal_upstreams(&self) -> crate::egress::InternalUpstreams {
+        self.internal_upstreams
     }
 
     pub(crate) fn start_observed(
@@ -135,8 +135,9 @@ impl Registry {
         pool: Option<PgPool>,
         core: super::CoreHandles,
         telemetry: Arc<crate::observability::Telemetry>,
+        internal_upstreams: crate::egress::InternalUpstreams,
     ) -> Result<Self, String> {
-        Self::start_inner(entries, pool, core, Some(telemetry))
+        Self::start_inner(entries, pool, core, Some(telemetry), internal_upstreams)
     }
 
     fn start_inner(
@@ -144,6 +145,7 @@ impl Registry {
         pool: Option<PgPool>,
         core: super::CoreHandles,
         telemetry: Option<Arc<crate::observability::Telemetry>>,
+        internal_upstreams: crate::egress::InternalUpstreams,
     ) -> Result<Self, String> {
         use crate::config::NetworkKind;
         let registry = Self {
@@ -151,6 +153,7 @@ impl Registry {
             mutations: tokio::sync::Mutex::new(()),
             pool,
             telemetry,
+            internal_upstreams,
         };
         for e in entries {
             // `local` needs the in-process core handles, so it stays special; all
@@ -185,6 +188,7 @@ impl Registry {
                     sasl: None,
                     keepalive_idle: super::KEEPALIVE_IDLE,
                     rejection_retry_floor: super::REJECTION_RETRY_FLOOR,
+                    internal_upstreams,
                 };
                 Box::new(super::LocalDriver::new(core.clone(), config))
             } else {
@@ -201,6 +205,7 @@ impl Registry {
                     buffer_cap: e.buffer_cap,
                     sasl_account: e.sasl_account.clone(),
                     sasl_password: e.sasl_password.clone(),
+                    internal_upstreams,
                 })
                 .map_err(|msg| format!("network '{}': {msg}", e.name))?
             };
@@ -1494,6 +1499,7 @@ mod key_tests {
             mutations: tokio::sync::Mutex::new(()),
             pool: None,
             telemetry: None,
+            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
         }
     }
 
@@ -1560,6 +1566,7 @@ mod key_tests {
             mutations: tokio::sync::Mutex::new(()),
             pool: None,
             telemetry: None,
+            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
         };
         registry
             .add(

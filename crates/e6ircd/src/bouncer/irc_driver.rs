@@ -36,6 +36,9 @@ pub struct NetworkConfig {
     /// consecutive refusal. 30s in production; tests shrink it to reach the
     /// parked state in real time.
     pub rejection_retry_floor: Duration,
+    /// Whether the upstream may resolve to an address inside this host's own
+    /// network (§egress). Every resolved address is judged against it at dial.
+    pub internal_upstreams: crate::egress::InternalUpstreams,
 }
 
 impl Default for NetworkConfig {
@@ -53,6 +56,7 @@ impl Default for NetworkConfig {
             sasl: None,
             keepalive_idle: KEEPALIVE_IDLE,
             rejection_retry_floor: super::REJECTION_RETRY_FLOOR,
+            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
         }
     }
 }
@@ -241,13 +245,16 @@ pub async fn preflight_irc(
 
     let dns_started = Instant::now();
     let dns_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(10));
-    let addresses = tokio::time::timeout_at(dns_deadline, resolve_vetted(&config.addr))
-        .await
-        .map_err(|_| IrcPreflightFailure::ConnectionTimedOut)?
-        .map_err(|error| {
-            eprintln!("irc preflight: name resolution failed: {error}");
-            IrcPreflightFailure::NameResolutionFailed
-        })?;
+    let addresses = tokio::time::timeout_at(
+        dns_deadline,
+        resolve_vetted(&config.addr, config.internal_upstreams),
+    )
+    .await
+    .map_err(|_| IrcPreflightFailure::ConnectionTimedOut)?
+    .map_err(|error| {
+        eprintln!("irc preflight: name resolution failed: {error}");
+        IrcPreflightFailure::NameResolutionFailed
+    })?;
     if addresses.is_empty() {
         return Err(IrcPreflightFailure::AddressBlocked);
     }
@@ -784,21 +791,25 @@ async fn connect(config: &NetworkConfig) -> std::io::Result<Connection> {
     // `169.254.169.254` (or a DNS rebind between creation and now) would reach an
     // internal target. Connecting to the specific vetted socket address closes
     // both: resolution can't differ between the check and the connect.
-    let vetted = resolve_vetted(&config.addr).await?;
+    let vetted = resolve_vetted(&config.addr, config.internal_upstreams).await?;
     if vetted.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "upstream address resolves only to blocked/internal targets",
+            "upstream address resolves only to addresses this server does not connect to \
+             (internal or never an upstream)",
         ));
     }
     connect_resolved(config, vetted).await
 }
 
-async fn resolve_vetted(addr: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+async fn resolve_vetted(
+    addr: &str,
+    policy: crate::egress::InternalUpstreams,
+) -> std::io::Result<Vec<std::net::SocketAddr>> {
     Ok(interleave_address_families(
         tokio::net::lookup_host(addr)
             .await?
-            .filter(|address| !crate::http::networks::is_blocked_upstream_ip(address.ip()))
+            .filter(|address| policy.permits(address.ip()))
             .collect(),
     ))
 }
@@ -930,6 +941,30 @@ pub(crate) fn validate_irc_upstream_addr(addr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hostname is judged where it resolves. `localhost` resolves to loopback
+    /// only, which the default policy refuses and the operator's allowance
+    /// admits; the always-refused classes are dropped under both.
+    #[tokio::test]
+    async fn a_hostname_is_judged_by_what_it_resolves_to() {
+        use crate::egress::InternalUpstreams;
+        let refused = resolve_vetted("localhost:6667", InternalUpstreams::Refuse)
+            .await
+            .expect("resolution itself succeeds");
+        assert!(refused.is_empty(), "{refused:?}");
+        let allowed = resolve_vetted("localhost:6667", InternalUpstreams::Allow)
+            .await
+            .expect("resolution itself succeeds");
+        assert!(
+            allowed.iter().all(|address| address.ip().is_loopback()),
+            "{allowed:?}"
+        );
+        assert!(!allowed.is_empty());
+        let never = resolve_vetted("169.254.169.254:80", InternalUpstreams::Allow)
+            .await
+            .expect("a literal resolves to itself");
+        assert!(never.is_empty(), "{never:?}");
+    }
 
     #[test]
     fn upstream_tls_host_handles_dns_and_bracketed_ipv6() {
@@ -1204,6 +1239,7 @@ mod tests {
                     .iter()
                     .map(|channel| channel.parse().expect("probe channel"))
                     .collect(),
+                internal_upstreams: crate::egress::InternalUpstreams::Allow,
                 ..NetworkConfig::default()
             });
             let connected = tokio::time::timeout(Duration::from_secs(35), async {

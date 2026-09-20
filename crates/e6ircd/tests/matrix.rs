@@ -88,6 +88,7 @@ async fn matrix_bridge_relays_both_ways() {
         password: "botpass".into(),
         rooms: vec![alias.clone()],
         buffer_cap: 100,
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
     }))
     .start();
     let mut events = handle.subscribe();

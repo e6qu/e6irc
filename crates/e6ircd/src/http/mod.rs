@@ -105,6 +105,8 @@ pub struct AppState {
     /// Bootstrap HTTP bind; shown with provenance in the configuration console.
     pub http_bind: Option<std::net::SocketAddr>,
     pub secure_cookies: bool,
+    /// The server's policy on upstreams inside its own network (`crate::egress`).
+    pub internal_upstreams: crate::egress::InternalUpstreams,
     pub oidc_providers: Vec<OidcProviderConfig>,
     pub application_release_revision: Option<String>,
     /// SHA-256 of the deployment-owned token for the machine-readable
@@ -551,17 +553,21 @@ pub(super) async fn mutate_account_suspension(
             })?;
         let mut prepared = Vec::new();
         for row in rows.into_iter().filter(|row| row.enabled) {
-            let driver =
-                crate::bouncer::driver_from_row(&row, state.secret_key.as_deref(), &target_name)
-                    .map_err(|error| {
-                        (
-                            StatusCode::CONFLICT,
-                            format!(
-                                "Cannot reactivate while network {} is invalid: {error}",
-                                row.name
-                            ),
-                        )
-                    })?;
+            let driver = crate::bouncer::driver_from_row(
+                &row,
+                state.secret_key.as_deref(),
+                &target_name,
+                state.internal_upstreams,
+            )
+            .map_err(|error| {
+                (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Cannot reactivate while network {} is invalid: {error}",
+                        row.name
+                    ),
+                )
+            })?;
             prepared.push((row.name, driver));
         }
         prepared

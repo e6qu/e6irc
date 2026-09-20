@@ -91,6 +91,7 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -337,6 +338,7 @@ async fn ws_ui_requires_authentication() {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -401,6 +403,7 @@ async fn ws_ui_detaches_when_its_network_is_removed() {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     };
     let http = net::start(config)

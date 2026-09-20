@@ -102,6 +102,9 @@ await writeFile(
   configPath,
   `server_name = "irc.browser.example"
 network_name = "BrowserNet"
+# The journey's mock upstream listens on loopback, which the daemon refuses to
+# dial by default.
+internal_upstreams = "allow"
 
 [[listeners]]
 addr = "127.0.0.1:0"

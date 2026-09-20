@@ -690,10 +690,11 @@ pub(super) async fn create_network(
 /// the exact production driver path. No row is written and no reconnecting
 /// driver survives the response.
 pub(super) async fn preflight_network(
+    State(state): State<Arc<AppState>>,
     _permit: PreflightPermit,
     JsonBody(req): JsonBody<PreflightNetwork>,
 ) -> Response {
-    match preflight_network_core(req).await {
+    match preflight_network_core(req, state.internal_upstreams).await {
         Ok(result) => axum::Json(PreflightNetworkResponse { ok: true, result }).into_response(),
         Err(error) => error.into_response(),
     }
@@ -701,6 +702,7 @@ pub(super) async fn preflight_network(
 
 pub(super) async fn preflight_network_core(
     req: PreflightNetwork,
+    internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<crate::bouncer::IrcPreflight, NetworkMutationError> {
     let identity = validate_irc_upstream(
         &req.addr,
@@ -708,6 +710,7 @@ pub(super) async fn preflight_network_core(
         Some(&req.username),
         Some(&req.realname),
         &req.autojoin,
+        internal_upstreams,
     )?;
     if let Some(account) = req.sasl_account.as_deref()
         && let Err(error) = validate_credential_field(account, 255)
@@ -740,6 +743,7 @@ pub(super) async fn preflight_network_core(
         sasl: req.sasl_account.zip(req.sasl_password),
         keepalive_idle: crate::bouncer::KEEPALIVE_IDLE,
         rejection_retry_floor: crate::bouncer::REJECTION_RETRY_FLOOR,
+        internal_upstreams,
     };
     // Below the request deadline, so the test's own typed timeout is what the
     // caller reads rather than a generic "request timed out".
@@ -908,70 +912,6 @@ fn validate_single_service_token(value: &str, maximum: usize, field: &str) -> Re
     Ok(())
 }
 
-/// Whether `addr` has an IP-literal host that points at a target that is never a
-/// legitimate upstream and that the server must not be tricked into dialing: the
-/// cloud-metadata link-local range (169.254/fe80), unspecified, multicast,
-/// broadcast, and documentation ranges.
-///
-/// Accepts both an IRC `host:port` (IPv6 bracketed) **and** a bridge base URL
-/// (`scheme://host[:port]/path`): a bridge address is a URL, and the bridge HTTP
-/// client only routes *named* hosts through its dial-time vetting resolver — an
-/// IP-literal URL host would otherwise reach an internal target unvetted, the
-/// exact metadata-SSRF this exists to stop. Extracting the host from either form
-/// closes that at the create boundary for every kind.
-///
-/// Loopback and RFC-1918 / unique-local *private* ranges are deliberately
-/// **allowed** — a self-hosted or LAN upstream (including `127.0.0.1`) is a
-/// first-class e6irc use case. A hostname (non-literal) returns `false` here —
-/// the concrete reported vector is the IP literal; hostname resolution is vetted
-/// at dial time.
-fn upstream_addr_is_internal(addr: &str) -> bool {
-    // Strip a URL scheme and any path/query/fragment, leaving `host[:port]`.
-    let hostport = addr.split_once("://").map_or(addr, |(_, rest)| rest);
-    let hostport = hostport.split(['/', '?', '#']).next().unwrap_or(hostport);
-    let host = if let Some(rest) = hostport.strip_prefix('[') {
-        rest.split(']').next().unwrap_or(rest) // [ipv6]:port
-    } else {
-        hostport
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(hostport)
-    };
-    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
-        return false; // hostname — not classifiable without DNS (vetted at dial)
-    };
-    is_blocked_upstream_ip(ip)
-}
-
-/// Is `ip` an SSRF-blocked upstream target — link-local (incl. the cloud
-/// metadata endpoint `169.254.169.254`), broadcast, documentation, unspecified,
-/// or multicast? Loopback and RFC-1918 / unique-local are deliberately *allowed*
-/// (a self-hosted or LAN upstream is a first-class use case).
-///
-/// The address is canonicalized first: a V4-mapped V6 literal like
-/// `::ffff:169.254.169.254` connects, at the kernel, to the V4 address, so it
-/// must be classified by the V4 rules — the V6-only link-local test
-/// (`fe80::/10`) is `false` for a mapped form and would otherwise wave the
-/// metadata endpoint straight through. Used both on the creation-time literal
-/// and, crucially, on every *resolved* address at dial time (`irc_driver`), so a
-/// hostname that resolves — now or after a DNS rebind — to an internal target
-/// cannot be reached.
-pub(crate) fn is_blocked_upstream_ip(ip: std::net::IpAddr) -> bool {
-    let ip = ip.to_canonical();
-    if ip.is_unspecified() || ip.is_multicast() {
-        return true;
-    }
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_link_local() || v4.is_broadcast() || v4.is_documentation()
-        }
-        // Unique-local (fc00::/7) is the private analogue of RFC-1918 and is
-        // allowed, like loopback; `to_canonical` has already mapped any
-        // V4-in-V6 form to V4, so what reaches here is a genuine V6 address.
-        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
-    }
-}
-
 /// A network name is a client-facing `/network` selector that is interpolated
 /// into URL path segments, HTML attributes and JS-string confirm dialogs.
 /// Restricting it to an unambiguous token charset (letters, digits, `-`, `_`,
@@ -993,6 +933,7 @@ pub(super) fn check_upstream_bounds(
     nick: &str,
     realname: Option<&str>,
     autojoin: &[String],
+    internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<(), NetworkMutationError> {
     let overlong = if addr.len() > 255 {
         Some(("addr", "addr is limited to 255 bytes"))
@@ -1031,13 +972,13 @@ pub(super) fn check_upstream_bounds(
         )
         .with_field(field));
     }
-    if upstream_addr_is_internal(addr) {
+    // Judged from the literal here; a hostname is judged, resolved, at dial
+    // time (`crate::egress`).
+    if let Some(refusal) = internal_upstreams.refusal_for_addr(addr) {
         return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Disallowed upstream address",
-            Some(
-                "addr must not be a link-local, unspecified, multicast, broadcast, or documentation IP",
-            ),
+            Some(refusal.reason()),
         )
         .with_field("addr"));
     }
@@ -1073,6 +1014,7 @@ pub(super) fn validate_irc_upstream(
     username: Option<&str>,
     realname: Option<&str>,
     autojoin: &[String],
+    internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<IrcUpstreamIdentity, NetworkMutationError> {
     // Required, and never derived from the nick: a legal nickname (`_bot`) is
     // not a legal user name, and an upstream answers a bad one by closing the
@@ -1106,7 +1048,7 @@ pub(super) fn validate_irc_upstream(
         )
         .with_field("addr"));
     }
-    check_upstream_bounds(addr, nick, realname, autojoin)?;
+    check_upstream_bounds(addr, nick, realname, autojoin, internal_upstreams)?;
     Ok(IrcUpstreamIdentity {
         nick: nick.parse().map_err(identity_problem)?,
         username: username.parse().map_err(identity_problem)?,
@@ -1288,17 +1230,33 @@ fn apply_network_credentials(
     }
 }
 
+/// The connection fields of a bridge network as a request states them, named:
+/// seven positional strings and flags were one transposition from a real name
+/// checked as a user name.
+struct BridgeUpstreamFields<'a> {
+    addr: &'a str,
+    tls: bool,
+    nick: &'a str,
+    username: Option<&'a str>,
+    realname: Option<&'a str>,
+    autojoin: &'a [String],
+}
+
 fn validate_bridge_upstream(
     kind: crate::config::NetworkKind,
-    addr: &str,
-    tls: bool,
-    nick: &str,
-    username: Option<&str>,
-    realname: Option<&str>,
-    autojoin: &[String],
+    fields: BridgeUpstreamFields<'_>,
+    internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<(), NetworkMutationError> {
     use crate::config::NetworkKind;
-    check_upstream_bounds(addr, nick, realname, autojoin)?;
+    let BridgeUpstreamFields {
+        addr,
+        tls,
+        nick,
+        username,
+        realname,
+        autojoin,
+    } = fields;
+    check_upstream_bounds(addr, nick, realname, autojoin, internal_upstreams)?;
     if username.is_some() {
         return Err(network_error(
             StatusCode::BAD_REQUEST,
@@ -1371,8 +1329,13 @@ fn stored_network_driver(
     account: &str,
     row: &crate::db::BncNetworkRow,
 ) -> Result<Box<dyn crate::bouncer::NetworkDriver>, NetworkMutationError> {
-    crate::bouncer::driver_from_row(row, state.secret_key.as_deref(), account)
-        .map_err(|error| network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error)))
+    crate::bouncer::driver_from_row(
+        row,
+        state.secret_key.as_deref(),
+        account,
+        state.internal_upstreams,
+    )
+    .map_err(|error| network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error)))
 }
 
 /// The registry mutation lane, entered for an owner whose drivers may run.
@@ -1467,9 +1430,27 @@ pub(super) async fn update_network_core(
         .with_field("realname"));
     }
     if row.kind == crate::config::NetworkKind::Irc {
-        validate_irc_upstream(addr, nick, username, realname, autojoin)?;
+        validate_irc_upstream(
+            addr,
+            nick,
+            username,
+            realname,
+            autojoin,
+            state.internal_upstreams,
+        )?;
     } else {
-        validate_bridge_upstream(row.kind, addr, tls, nick, username, realname, autojoin)?;
+        validate_bridge_upstream(
+            row.kind,
+            BridgeUpstreamFields {
+                addr,
+                tls,
+                nick,
+                username,
+                realname,
+                autojoin,
+            },
+            state.internal_upstreams,
+        )?;
     }
     row.addr = addr.to_string();
     row.tls = tls;
@@ -1543,16 +1524,20 @@ async fn create_network_core(
             req.username.as_deref(),
             Some(&req.realname),
             &req.autojoin,
+            state.internal_upstreams,
         )?;
     } else {
         validate_bridge_upstream(
             kind,
-            &req.addr,
-            req.tls,
-            &req.nick,
-            req.username.as_deref(),
-            None,
-            &req.autojoin,
+            BridgeUpstreamFields {
+                addr: &req.addr,
+                tls: req.tls,
+                nick: &req.nick,
+                username: req.username.as_deref(),
+                realname: None,
+                autojoin: &req.autojoin,
+            },
+            state.internal_upstreams,
         )?;
     }
     // Fields that are create-only (the name) or SASL-specific (bounds + the NUL
@@ -1628,6 +1613,7 @@ async fn create_network_core(
         buffer_cap: 1000,
         sasl_account: req.sasl_account.clone(),
         sasl_password: req.sasl_password.clone(),
+        internal_upstreams: state.internal_upstreams,
     })
     .map_err(|error| network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error)))?;
 
@@ -1977,9 +1963,9 @@ pub(super) async fn delete_network(
 #[cfg(test)]
 mod tests {
     use super::{
-        BufferQuery, CreateNetwork, IRC_NETWORK_PRESETS, NetworkAccountCommand, PreflightNetwork,
-        network_name_ok, runtime_response, upstream_addr_is_internal, validate_bridge_upstream,
-        validate_irc_upstream, validate_single_service_token,
+        BridgeUpstreamFields, BufferQuery, CreateNetwork, IRC_NETWORK_PRESETS,
+        NetworkAccountCommand, PreflightNetwork, network_name_ok, runtime_response,
+        validate_bridge_upstream, validate_irc_upstream, validate_single_service_token,
     };
 
     #[test]
@@ -2112,7 +2098,14 @@ mod tests {
     #[test]
     fn an_irc_network_states_its_username_and_a_bridge_cannot() {
         let with_username = |username: Option<&str>| {
-            validate_irc_upstream("irc.example:6697", "_bot", username, Some("Bot"), &[])
+            validate_irc_upstream(
+                "irc.example:6697",
+                "_bot",
+                username,
+                Some("Bot"),
+                &[],
+                crate::egress::InternalUpstreams::Refuse,
+            )
         };
         assert_eq!(
             with_username(Some("bot"))
@@ -2142,12 +2135,15 @@ mod tests {
 
         let bridge = validate_bridge_upstream(
             crate::config::NetworkKind::Discord,
-            "",
-            true,
-            "",
-            Some("bot"),
-            None,
-            &[],
+            BridgeUpstreamFields {
+                addr: "",
+                tls: true,
+                nick: "",
+                username: Some("bot"),
+                realname: None,
+                autojoin: &[],
+            },
+            crate::egress::InternalUpstreams::Refuse,
         )
         .expect_err("a bridge has no IRC registration");
         assert_eq!(bridge.field, Some("username"));
@@ -2183,8 +2179,15 @@ mod tests {
     #[test]
     fn malformed_irc_upstream_is_rejected_before_it_can_be_persisted() {
         for addr in ["irc.example", "irc.example:0", "irc.example:not-a-port"] {
-            let error = validate_irc_upstream(addr, "alice", Some("alice"), None, &[])
-                .expect_err("malformed address must fail");
+            let error = validate_irc_upstream(
+                addr,
+                "alice",
+                Some("alice"),
+                None,
+                &[],
+                crate::egress::InternalUpstreams::Refuse,
+            )
+            .expect_err("malformed address must fail");
             assert!(error.message().contains("host:port"), "{addr}: {error:?}");
         }
     }
@@ -2193,7 +2196,14 @@ mod tests {
     fn an_identity_that_would_reshape_a_wire_line_is_refused_at_its_field() {
         let ok = |nick: &str, realname: Option<&str>, autojoin: &[&str]| {
             let autojoin: Vec<String> = autojoin.iter().map(ToString::to_string).collect();
-            validate_irc_upstream("irc.example:6697", nick, Some("ident"), realname, &autojoin)
+            validate_irc_upstream(
+                "irc.example:6697",
+                nick,
+                Some("ident"),
+                realname,
+                &autojoin,
+                crate::egress::InternalUpstreams::Refuse,
+            )
         };
         let identity = ok("alice", Some("Alice Example"), &["#e6irc", "&local"])
             .expect("an ordinary identity");
@@ -2249,57 +2259,5 @@ mod tests {
         // Path-traversal segments.
         assert!(!network_name_ok("."));
         assert!(!network_name_ok(".."));
-    }
-
-    #[test]
-    fn internal_upstream_addresses_are_refused() {
-        // The cloud link-local metadata range, unspecified, multicast, broadcast
-        // and documentation ranges are refused so a tenant can't make the server
-        // dial them — none is ever a legitimate IRC upstream.
-        assert!(upstream_addr_is_internal("169.254.169.254:80")); // cloud metadata
-        assert!(upstream_addr_is_internal("0.0.0.0:6667"));
-        assert!(upstream_addr_is_internal("255.255.255.255:6667")); // broadcast
-        assert!(upstream_addr_is_internal("[fe80::1]:6697")); // v6 link-local
-        assert!(upstream_addr_is_internal("203.0.113.7:6697")); // TEST-NET-3 (documentation)
-        // V4-mapped V6 literals connect to the V4 address at the kernel, so the
-        // mapped spelling of a blocked target must be caught too — the metadata
-        // endpoint written as `::ffff:169.254.169.254` was the SSRF bypass.
-        assert!(upstream_addr_is_internal("[::ffff:169.254.169.254]:80"));
-        assert!(upstream_addr_is_internal("[::ffff:0.0.0.0]:6667"));
-        // The mapped form of an *allowed* address stays allowed (canonicalized to
-        // the V4 loopback/private rules, not the V6 ones).
-        assert!(!upstream_addr_is_internal("[::ffff:127.0.0.1]:6667"));
-        assert!(!upstream_addr_is_internal("[::ffff:10.0.0.5]:6667"));
-        // Loopback and private ranges ARE allowed: a self-hosted / LAN IRC
-        // upstream (including 127.0.0.1) is a first-class use case.
-        assert!(!upstream_addr_is_internal("127.0.0.1:6667"));
-        assert!(!upstream_addr_is_internal("[::1]:6697"));
-        assert!(!upstream_addr_is_internal("10.0.0.5:6667"));
-        assert!(!upstream_addr_is_internal("192.168.1.10:6667"));
-        assert!(!upstream_addr_is_internal("[fc00::1]:6697")); // v6 unique-local (private)
-        // Real public IPs and hostnames are allowed (the dialer resolves names).
-        assert!(!upstream_addr_is_internal("93.184.216.34:6697"));
-        assert!(!upstream_addr_is_internal("irc.libera.chat:6697"));
-    }
-
-    #[test]
-    fn bridge_url_addr_ssrf_is_classified() {
-        // A bridge base is a URL. An IP-literal host in URL form must be
-        // classified the same as `host:port` — the metadata endpoint reached via
-        // `http://169.254.169.254` bypassed the check before (URL didn't parse as
-        // host:port) and was never vetted by the HTTP client's named-host-only
-        // resolver.
-        assert!(upstream_addr_is_internal("http://169.254.169.254"));
-        assert!(upstream_addr_is_internal("https://169.254.169.254/gateway"));
-        assert!(upstream_addr_is_internal(
-            "http://169.254.169.254:8443/x?y=1"
-        ));
-        assert!(upstream_addr_is_internal("https://[fe80::1]/api"));
-        assert!(upstream_addr_is_internal("http://[::ffff:169.254.169.254]"));
-        // A real homeserver / API base (hostname, or an allowed private literal).
-        assert!(!upstream_addr_is_internal("https://matrix.org"));
-        assert!(!upstream_addr_is_internal("https://slack.com/api"));
-        assert!(!upstream_addr_is_internal("http://127.0.0.1:8008")); // self-hosted, allowed
-        assert!(!upstream_addr_is_internal("http://192.168.1.10:8008")); // LAN, allowed
     }
 }

@@ -4,6 +4,7 @@
 
 use e6ircd::bouncer::{IrcNetwork, NetworkConfig, NetworkHandle, attach};
 use e6ircd::config::{Config, ListenerConfig};
+use e6ircd::egress::InternalUpstreams;
 use e6ircd::net;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -56,6 +57,7 @@ async fn attached_client_gets_playback_and_live_and_can_send() {
         addr: addr.to_string(),
         nick: "bnc".parse().expect("test nickname"),
         autojoin: vec!["#room".parse().expect("test channel")],
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     wait_connected(&handle).await;
@@ -172,6 +174,7 @@ async fn two_clients_attach_to_one_always_on_network() {
         addr: addr.to_string(),
         nick: "shared".parse().expect("test nickname"),
         autojoin: vec!["#multi".parse().expect("test channel")],
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     }));
     wait_connected(&handle).await;
@@ -341,6 +344,7 @@ async fn self_echo_excluded_for_originator_but_reaches_others_and_buffer() {
         addr: addr.to_string(),
         nick: "echobot".parse().expect("test nickname"),
         autojoin: vec!["#echo".parse().expect("test channel")],
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     }));
     wait_connected(&handle).await;
@@ -406,6 +410,7 @@ async fn self_echo_delivered_once_when_negotiated() {
         addr: addr.to_string(),
         nick: "echobot".parse().expect("test nickname"),
         autojoin: vec!["#echo".parse().expect("test channel")],
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     }));
     wait_connected(&handle).await;

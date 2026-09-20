@@ -581,6 +581,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                     sendq: config.sendq,
                 },
                 telemetry.clone(),
+                config.internal_upstreams,
             )
             .map_err(io::Error::other)?,
         );
@@ -596,7 +597,12 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 // that one network is down until fixed — rather than brick the
                 // shared daemon for every user. Config-file networks still fail
                 // hard (they are the operator's own, checked at start).
-                match crate::bouncer::driver_from_row(&row, secret_key.as_deref(), &owner) {
+                match crate::bouncer::driver_from_row(
+                    &row,
+                    secret_key.as_deref(),
+                    &owner,
+                    config.internal_upstreams,
+                ) {
                     Ok(driver) => {
                         // A configuration-file network may already hold this
                         // key. The operator's own entry wins; say so rather
@@ -727,6 +733,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             public_url,
             http_bind: config.http.as_ref().map(|http| http.addr),
             secure_cookies,
+            internal_upstreams: config.internal_upstreams,
             oidc_providers: config.oidc_providers.clone(),
             application_release_revision: config.application_release_revision.clone(),
             monitoring_token_digest,

@@ -67,6 +67,7 @@ async fn bouncer(
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     };
     net::start(config)

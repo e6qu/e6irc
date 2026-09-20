@@ -41,6 +41,8 @@ pub struct MatrixConfig {
     /// Room aliases to join and bridge (e.g. `#room:server`).
     pub rooms: Vec<String>,
     pub buffer_cap: usize,
+    /// The server's policy on a homeserver inside its own network.
+    pub internal_upstreams: crate::egress::InternalUpstreams,
 }
 
 pub struct MatrixDriver {
@@ -105,8 +107,11 @@ impl Shared {
         if let Some(login) = cached.as_ref() {
             return Ok(login.clone());
         }
-        let http = super::bridge_http_client(std::time::Duration::from_secs(60))
-            .map_err(|e| e.to_string())?;
+        let http = super::bridge_http_client(
+            std::time::Duration::from_secs(60),
+            self.config.internal_upstreams,
+        )
+        .map_err(|e| e.to_string())?;
         let response: LoginResponse = super::bridge_send_credentials(
             http.post(format!("{}/_matrix/client/v3/login", self.base()))
                 .json(&LoginRequest::password(&self.config)),
@@ -719,6 +724,7 @@ mod tests {
             user: "bot".into(),
             password: "secret".into(),
             rooms: rooms.iter().map(ToString::to_string).collect(),
+            internal_upstreams: crate::egress::InternalUpstreams::Allow,
             buffer_cap: 8,
         }
     }

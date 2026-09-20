@@ -8,6 +8,7 @@ pub mod bouncer;
 pub mod config;
 pub mod core;
 pub mod db;
+pub mod egress;
 pub mod environment_config;
 pub mod http;
 pub mod identity;

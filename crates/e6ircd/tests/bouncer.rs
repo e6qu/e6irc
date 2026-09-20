@@ -7,6 +7,7 @@ use e6ircd::bouncer::{
     NetworkLifecycle, SendOutcome, preflight_irc,
 };
 use e6ircd::config::{Config, ListenerConfig, NetworkKind};
+use e6ircd::egress::InternalUpstreams;
 use e6ircd::net;
 
 mod support;
@@ -86,6 +87,7 @@ async fn preflight_uses_the_real_driver_registration_path_without_starting_a_net
             addr: addr.to_string(),
             nick: "preflight".parse().expect("test nickname"),
             realname: "preflight qualification".parse().expect("test real name"),
+            internal_upstreams: InternalUpstreams::Allow,
             ..NetworkConfig::default()
         },
         std::time::Duration::from_secs(25),
@@ -109,6 +111,7 @@ async fn driver_registers_relays_and_buffers() {
         nick: "bncbot".parse().expect("test nickname"),
         realname: "bnc".parse().expect("test real name"),
         autojoin: vec!["#bnc".parse().expect("test channel")],
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -204,6 +207,7 @@ async fn driver_reconnects_after_upstream_drop() {
     // retrying (doesn't stop) until the handle is dropped.
     let handle = IrcNetwork::start(NetworkConfig {
         addr: "127.0.0.1:1".into(), // nothing listening
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -304,6 +308,7 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
         nick: "bncbot".parse().expect("test nickname"),
         realname: "bnc".parse().expect("test real name"),
         autojoin: vec![],
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -421,6 +426,7 @@ fn bnc_config(up: std::net::SocketAddr, url: String) -> Config {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     }
 }
@@ -719,6 +725,7 @@ async fn driver_authenticates_to_sasl_upstream() {
         nick: "bncacct".parse().expect("test nickname"),
         realname: "bnc".parse().expect("test real name"),
         sasl: Some(("bncacct".into(), "bncpass".into())),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -842,6 +849,7 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     };
     let running_b = net::start(config_b).await.expect("start B");
@@ -923,6 +931,7 @@ async fn local_driver_presents_the_in_process_network() {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -1262,6 +1271,7 @@ async fn a_connection_test_out_of_budget_names_its_stage_and_still_quits() {
         &NetworkConfig {
             addr: addr.to_string(),
             nick: "preflight".parse().expect("test nickname"),
+            internal_upstreams: InternalUpstreams::Allow,
             ..NetworkConfig::default()
         },
         std::time::Duration::from_millis(400),
@@ -1304,6 +1314,7 @@ async fn the_configured_username_is_what_the_upstream_is_sent() {
         nick: "_bot".parse().expect("a legal nickname"),
         username: "botident".parse().expect("test user name"),
         realname: "Real Name".parse().expect("test real name"),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     };
     preflight_irc(&config, std::time::Duration::from_secs(10))
@@ -1349,6 +1360,7 @@ async fn a_connection_test_with_a_refused_channel_still_quits() {
             addr: addr.to_string(),
             nick: "preflight".parse().expect("test nickname"),
             autojoin: vec!["#closed".parse().expect("test channel")],
+            internal_upstreams: InternalUpstreams::Allow,
             ..NetworkConfig::default()
         },
         std::time::Duration::from_secs(10),
@@ -1410,6 +1422,7 @@ async fn a_taken_nickname_is_reported_and_never_replaced() {
         addr: addr.to_string(),
         nick: "bncbot".parse().expect("test nickname"),
         rejection_retry_floor: std::time::Duration::from_millis(200),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -1473,6 +1486,7 @@ async fn driver_tracks_forced_upstream_nick_change() {
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
         nick: "bncbot".parse().expect("test nickname"),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -1550,6 +1564,7 @@ async fn runtime_joined_channels_are_rejoined_after_reconnect() {
         addr: addr.to_string(),
         nick: "bncbot".parse().expect("test nickname"),
         autojoin: vec!["#static".parse().expect("test channel")],
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -1622,6 +1637,7 @@ async fn silent_upstream_trips_keepalive_and_reconnects() {
         addr: addr.to_string(),
         nick: "bncbot".parse().expect("test nickname"),
         keepalive_idle: std::time::Duration::from_millis(150),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -1667,6 +1683,7 @@ async fn a_welcome_under_a_different_nickname_is_a_refusal_not_an_identity() {
         addr: addr.to_string(),
         nick: "averyveryverylongnick".parse().expect("test nickname"),
         rejection_retry_floor: std::time::Duration::from_secs(30),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let snapshot = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -1719,6 +1736,7 @@ async fn upstream_capability_changes_are_not_relayed_to_attached_clients() {
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
         nick: "bncbot".parse().expect("test nickname"),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let lines = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -1762,6 +1780,7 @@ async fn downstream_traffic_does_not_hide_a_silent_upstream() {
         addr: addr.to_string(),
         nick: "bncbot".parse().expect("test nickname"),
         keepalive_idle: std::time::Duration::from_millis(150),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     }));
     let mut events = handle.subscribe();
@@ -1812,6 +1831,7 @@ async fn repeated_registration_rejection_parks_the_driver() {
         addr: addr.to_string(),
         nick: "bncbot".parse().expect("test nickname"),
         rejection_retry_floor: std::time::Duration::from_millis(20),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -1875,6 +1895,7 @@ async fn a_services_outage_is_outlasted_not_parked() {
         nick: "bncbot".parse().expect("test nickname"),
         sasl: Some(("account".into(), "secret".into())),
         rejection_retry_floor: std::time::Duration::from_millis(5),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     for dial in 1..=OUTAGE_DIALS {
@@ -1931,6 +1952,7 @@ async fn rejected_credentials_park_without_a_second_dial() {
         nick: "bncbot".parse().expect("test nickname"),
         sasl: Some(("account".into(), "wrong".into())),
         rejection_retry_floor: std::time::Duration::from_millis(20),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     wait_lifecycle(&handle, NetworkLifecycle::AuthenticationFailed).await;
@@ -1977,6 +1999,7 @@ async fn an_upstream_without_the_sasl_mechanism_is_not_a_credential_rejection() 
         nick: "bncbot".parse().expect("test nickname"),
         sasl: Some(("account".into(), "correct".into())),
         rejection_retry_floor: std::time::Duration::from_millis(20),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     // Wait on exactly what is asserted: the recorded refusal. (It is retried,
@@ -2040,6 +2063,7 @@ async fn a_dropped_dial_between_refusals_does_not_reset_the_park_count() {
         addr: addr.to_string(),
         nick: "bncbot".parse().expect("test nickname"),
         rejection_retry_floor: std::time::Duration::from_millis(20),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     wait_lifecycle(&handle, NetworkLifecycle::RegistrationFailed).await;
@@ -2072,6 +2096,7 @@ async fn a_refused_registration_keeps_its_reason_while_retrying() {
         addr: addr.to_string(),
         nick: "bncbot".parse().expect("test nickname"),
         rejection_retry_floor: std::time::Duration::from_secs(30),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let snapshot = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -2119,6 +2144,7 @@ async fn full_buffer_evicts_oldest() {
         nick: "bncbot".parse().expect("test nickname"),
         autojoin: vec!["#ring".parse().expect("test channel")],
         buffer_cap: 3,
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();

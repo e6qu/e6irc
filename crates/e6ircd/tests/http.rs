@@ -567,6 +567,122 @@ fn first_network_attempts(body: &str) -> u64 {
         .unwrap_or_else(|| panic!("no connection_attempts in {body}"))
 }
 
+/// By default the server connects to no upstream inside its own network: an
+/// account holder could otherwise make it probe internal infrastructure. The
+/// refusal is the same at every ingress -- creating a network, the connection
+/// test -- and a hostname that only resolves internally is refused at dial time.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn internal_upstreams_are_refused_unless_the_operator_allows_them() {
+    let url =
+        support::test_db("internal_upstreams_are_refused_unless_the_operator_allows_them").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "alice", "s3cr3t", None)
+        .await
+        .expect("acct");
+    let token = issue_api_token(&pool, "alice", "test")
+        .await
+        .expect("token");
+    drop(pool);
+    let upstream = upstream_server().await;
+    let up = upstream.addrs[0];
+
+    // The default configuration: `internal_upstreams` is not set.
+    let config = Config {
+        server_name: "irc.internal.example".into(),
+        network_name: "Internal".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        bnc: Some(BncConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+        }),
+        ..Config::default()
+    };
+    assert_eq!(
+        config.internal_upstreams,
+        e6ircd::egress::InternalUpstreams::Refuse
+    );
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    wait_http_ready(http).await;
+
+    for (path, body) in [
+        (
+            "/api/v1/me/networks",
+            format!(r#"{{"kind":"irc","name":"lan","addr":"{up}","tls":false,"nick":"probe","username":"probe","realname":"Probe","autojoin":[]}}"#),
+        ),
+        (
+            "/api/v1/me/network-preflight",
+            format!(r#"{{"addr":"{up}","tls":false,"nick":"probe","username":"probe","realname":"Probe","autojoin":[]}}"#),
+        ),
+        (
+            "/api/v1/me/networks",
+            r#"{"kind":"irc","name":"lan","addr":"10.0.0.5:6667","tls":true,"nick":"probe","username":"probe","realname":"Probe","autojoin":[]}"#.to_string(),
+        ),
+    ] {
+        let (status, answer) = post_json(http, path, &token, &body).await;
+        assert_eq!(status, 400, "{path}: {answer}");
+        let problem: serde_json::Value = serde_json::from_str(&answer).expect("problem json");
+        assert_eq!(problem["title"], "Disallowed upstream address", "{answer}");
+        assert_eq!(problem["field"], "addr", "{answer}");
+        assert!(
+            !answer.contains("127.0.0.1") && !answer.contains("10.0.0.5"),
+            "the refusal must not echo the address: {answer}"
+        );
+    }
+
+    // A hostname passes the literal check and is judged where it resolves.
+    let (status, answer) = post_json(
+        http,
+        "/api/v1/me/network-preflight",
+        &token,
+        &format!(
+            r#"{{"addr":"localhost:{}","tls":false,"nick":"probe","username":"probe","realname":"Probe","autojoin":[]}}"#,
+            up.port()
+        ),
+    )
+    .await;
+    assert_eq!(status, 502, "{answer}");
+    let problem: serde_json::Value = serde_json::from_str(&answer).expect("problem json");
+    assert_eq!(problem["title"], "IRC network preflight failed", "{answer}");
+    assert!(
+        problem["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.ends_with("(address_blocked)")),
+        "the dial-time refusal is the typed address_blocked failure: {answer}"
+    );
+    let (status, _, listed) = request(
+        http,
+        &format!(
+            "GET /api/v1/me/networks HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{listed}");
+    let networks: serde_json::Value = serde_json::from_str(&listed).expect("networks");
+    assert_eq!(
+        networks["networks"],
+        serde_json::json!([]),
+        "nothing was created"
+    );
+    assert_eq!(
+        running.shutdown.run().await,
+        e6ircd::net::ShutdownOutcome::Flushed
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn bnc_network_management_lifecycle() {
@@ -603,6 +719,7 @@ async fn bnc_network_management_lifecycle() {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -966,6 +1083,7 @@ async fn bnc_network_upstream_secret_requires_master_key() {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -3808,6 +3926,7 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     };
     let http = net::start(config)
@@ -5378,6 +5497,7 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     };
     let http = net::start(config)
@@ -5559,6 +5679,7 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
             key_file: key_path,
             previous_key_files: Vec::new(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     })
     .await
@@ -5808,6 +5929,7 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     };
     let http = net::start(config)
@@ -6730,6 +6852,7 @@ async fn network_buffer_read() {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     };
     let http = net::start(config)
@@ -7354,6 +7477,7 @@ async fn admin_networks_fleet_view_and_toggle() {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     };
     let http = net::start(config)
@@ -7432,6 +7556,7 @@ async fn start_with_database(url: &str, administrators: &[&str]) -> net::Running
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..test_config()
     };
     net::start(config).await.expect("start")
