@@ -621,6 +621,7 @@ dialog .field :is(input, select) {
   color: inherit;
   font: inherit;
 }
+dialog .field :is(input, select)[aria-invalid="true"] { border-color: var(--off); box-shadow: 0 0 0 1px var(--off); }
 .dialog-actions button {
   min-height: 2.35rem;
   padding: 0.4rem 1rem;

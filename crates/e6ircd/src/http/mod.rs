@@ -363,15 +363,30 @@ struct ProblemResponse<'a> {
     title: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<&'a str>,
+    /// The request field at fault, when the failure belongs to one, so a form
+    /// can mark and focus that input instead of leaving the person to map a
+    /// sentence onto it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field: Option<&'a str>,
 }
 
 fn problem(status: StatusCode, title: &str, detail: Option<&str>) -> Response {
+    problem_at_field(status, title, detail, None)
+}
+
+fn problem_at_field(
+    status: StatusCode,
+    title: &str,
+    detail: Option<&str>,
+    field: Option<&str>,
+) -> Response {
     let mut response = (
         status,
         axum::Json(ProblemResponse {
             status: status.as_u16(),
             title,
             detail,
+            field,
         }),
     )
         .into_response();
@@ -828,24 +843,26 @@ mod query_limit_tests {
     use super::*;
 
     #[test]
-    fn problem_response_has_one_closed_optional_detail() {
-        let without_detail = serde_json::to_string(&ProblemResponse {
+    fn problem_response_members_are_closed_and_optional_ones_are_omitted() {
+        let bare = serde_json::to_string(&ProblemResponse {
             status: 404,
             title: "Not Found",
             detail: None,
+            field: None,
         })
         .expect("problem response");
-        assert_eq!(without_detail, r#"{"status":404,"title":"Not Found"}"#);
+        assert_eq!(bare, r#"{"status":404,"title":"Not Found"}"#);
 
-        let with_detail = serde_json::to_string(&ProblemResponse {
+        let at_a_field = serde_json::to_string(&ProblemResponse {
             status: 400,
-            title: "Invalid request",
-            detail: Some("unknown field"),
+            title: "Invalid IRC identity",
+            detail: Some("nick must be one word"),
+            field: Some("nick"),
         })
         .expect("problem response");
         assert_eq!(
-            with_detail,
-            r#"{"status":400,"title":"Invalid request","detail":"unknown field"}"#
+            at_a_field,
+            r#"{"status":400,"title":"Invalid IRC identity","detail":"nick must be one word","field":"nick"}"#
         );
     }
 

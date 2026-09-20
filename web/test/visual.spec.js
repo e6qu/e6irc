@@ -669,6 +669,31 @@ test("the network list follows the server instead of the first answer it got", a
   await expect(networks.getByText(/rejected the NickServ account or password/)).toBeVisible();
 });
 
+test("a refused network field is marked, revealed, and focused", async ({ page }) => {
+  await mockSession(page, []);
+  await page.route(/\/api\/v1\/me\/networks$/, (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    return route.fulfill({
+      status: 400,
+      contentType: "application/problem+json",
+      body: JSON.stringify({ status: 400, title: "Invalid upstream address", detail: "addr must be host:port", field: "addr" }),
+    });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Add a network", exact: true }).last().click();
+  const dialog = page.getByRole("dialog", { name: "Add a network" });
+  await expect(dialog.locator("#nf-addr")).toBeHidden();
+  await dialog.getByRole("button", { name: "Save" }).click();
+
+  // The server is under Advanced, so the refusal has to open it to point there.
+  await expect(dialog.getByRole("alert")).toContainText("addr must be host:port");
+  await expect(dialog.locator("#nf-addr")).toBeVisible();
+  await expect(dialog.locator("#nf-addr")).toBeFocused();
+  await expect(dialog.locator("#nf-addr")).toHaveAttribute("aria-invalid", "true");
+  await expect(dialog.locator("#nf-nick")).not.toHaveAttribute("aria-invalid");
+  await expectAccessible(page);
+});
+
 test("adding a network asks only what a known network cannot supply, and carries the session token", async ({ page }) => {
   await mockSession(page, []);
   let created;

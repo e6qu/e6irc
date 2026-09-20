@@ -2509,6 +2509,17 @@ import { loadSettings, saveSettings } from "/console-settings.js";
       return result;
     } catch (error) {
       setOwnerNetworkResult(error instanceof Error ? error.message : "Network request failed.", false);
+      // The API names the field a refusal belongs to: mark and focus it,
+      // opening the disclosure it sits in, instead of leaving a sentence to be
+      // matched to an input by eye.
+      const input = typeof error?.field === "string" ? form.elements.namedItem(error.field) : null;
+      if (input instanceof HTMLInputElement) {
+        const disclosure = input.closest("details");
+        if (disclosure) disclosure.open = true;
+        input.setAttribute("aria-invalid", "true");
+        input.addEventListener("input", () => input.removeAttribute("aria-invalid"), { once: true });
+        input.focus();
+      }
       return undefined;
     }
   }, trigger);

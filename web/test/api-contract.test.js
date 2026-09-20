@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  ApiError,
   ApiSchemaError,
   apiContractLoader,
   getOperationJson,
@@ -511,6 +512,27 @@ test("operation requests preserve an API problem detail", async () => {
     ),
     /Profile storage unavailable/,
   );
+});
+
+test("an API problem carries the request field it belongs to", async () => {
+  const refuse = (problem) => getOperationJson(
+    async () => new Response(JSON.stringify(problem), {
+      status: 400,
+      headers: { "content-type": "application/problem+json" },
+    }),
+    { paths: { "/api/v1/me/profile": { patch: { responses: {} } } } },
+    "PATCH",
+    "/api/v1/me/profile",
+    { csrf: "session-bound" },
+  );
+  await assert.rejects(
+    refuse({ title: "Invalid IRC identity", detail: "nick must be one word", field: "nick" }),
+    (error) => error instanceof ApiError && error.status === 400 && error.field === "nick" && /one word/.test(error.message),
+  );
+  // Absent, or not a string, is "no particular field" -- never a guess.
+  for (const problem of [{ title: "Conflict" }, { title: "Conflict", field: 7 }]) {
+    await assert.rejects(refuse(problem), (error) => error instanceof ApiError && error.field === null);
+  }
 });
 
 test("undeclared operations fail before a request leaves the browser", async () => {

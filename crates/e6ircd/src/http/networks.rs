@@ -43,7 +43,7 @@ impl NetworkMutationError {
     }
 
     pub(super) fn into_response(self) -> Response {
-        problem(self.status, self.title, self.detail.as_deref())
+        problem_at_field(self.status, self.title, self.detail.as_deref(), self.field)
     }
 }
 

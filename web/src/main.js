@@ -1511,6 +1511,35 @@ function setDialogError(message) {
   box.hidden = !message;
 }
 
+// The API names the request field a refusal belongs to. Mark and focus that
+// input -- opening Advanced when it lives there -- so the sentence above does
+// not have to be matched to a box by eye.
+const NETWORK_FIELD_INPUTS = Object.freeze({
+  name: "nf-name",
+  addr: "nf-addr",
+  nick: "nf-nick",
+  realname: "nf-realname",
+  autojoin: "nf-autojoin",
+  sasl_account: "nf-sasl-account",
+  sasl_password: "nf-sasl-password",
+});
+
+function clearFieldMarks() {
+  for (const id of Object.values(NETWORK_FIELD_INPUTS)) {
+    el(id)?.removeAttribute("aria-invalid");
+    el(id)?.removeAttribute("aria-describedby");
+  }
+}
+
+function markFieldAtFault(field) {
+  const input = el(NETWORK_FIELD_INPUTS[field]);
+  if (!input) return;
+  if (el("nf-advanced").contains(input)) el("nf-advanced").open = true;
+  input.setAttribute("aria-invalid", "true");
+  input.setAttribute("aria-describedby", "nf-error");
+  input.focus();
+}
+
 // The curated networks come from the server's one catalog, so the chat client
 // and the console cannot disagree about an endpoint. "Custom" is the client's
 // own entry: it means "I will type the server myself".
@@ -1543,6 +1572,7 @@ el("nf-preset")?.addEventListener("change", applyPreset);
 async function openNetworkDialog(name = null) {
   if (!networkDialog || !networkForm) return;
   setDialogError("");
+  clearFieldMarks();
   networkForm.reset();
   networkForm.dataset.editing = name || "";
   const editing = name !== null;
@@ -1596,6 +1626,7 @@ if (networkForm) {
   networkForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     setDialogError("");
+    clearFieldMarks();
     const editing = networkForm.dataset.editing || "";
     const save = el("nf-save");
     const name = editing || el("nf-name").value.trim();
@@ -1646,6 +1677,7 @@ if (networkForm) {
       addServer(`Saved ${editing}. The connection restarts with the new settings.`);
     } catch (error) {
       setDialogError(errorMessage(editing ? `save ${editing}` : "add the network", error));
+      if (error instanceof ApiError && error.field) markFieldAtFault(error.field);
     } finally {
       save.disabled = false;
     }
