@@ -1717,9 +1717,11 @@ function renderLanding(networks, failure = null) {
   const copy = document.createElement("p");
   copy.textContent = failure
     ? `${errorMessage("load your networks", failure)} This is an API failure, not an empty account.`
-    : networks.length
-      ? "None of your networks is running. Open one from the list to see why, or add another."
-      : "No networks are configured for this account.";
+    : networks.some((item) => item.enabled !== false && item.runtime != null)
+      ? "Choose a network from your list to open it."
+      : networks.length
+        ? "None of your networks is running. Open one from the list to see why, or add another."
+        : "No networks are configured for this account.";
   const actions = document.createElement("div");
   actions.className = "picker-actions";
   const signInRequired = failure instanceof ApiError && failure.status === 401;
@@ -1734,6 +1736,15 @@ function renderLanding(networks, failure = null) {
     retry.textContent = "Retry";
     actions.append(retry);
   } else {
+    // On a phone the list lives in the conversation rail; say how to reach it
+    // rather than opening it unasked. Wider screens already show the list.
+    if (networks.length && sidebarToggle && sidebarToggle.offsetParent !== null) {
+      const show = document.createElement("button");
+      show.type = "button";
+      show.textContent = "Show my networks";
+      show.addEventListener("click", () => sidebarToggle.click());
+      actions.append(show);
+    }
     const add = document.createElement("button");
     add.type = "button";
     add.textContent = "Add a network";
@@ -1921,11 +1932,12 @@ async function boot() {
     networkFailure = error;
   }
   if (!network) {
-    // Nobody should have to pick their only network, or re-pick one on every
-    // visit: open a connected one if there is one, else the first that can run.
+    // Opening a sole network is not a choice, so nobody is asked to make it.
+    // With several, which one to open is the person's decision: the client
+    // does not pick "the first" on their behalf.
     const available = networks.filter((item) => item.enabled !== false && item.runtime != null);
-    const chosen = available.find((item) => item.connected === true) ?? available[0];
-    if (chosen) {
+    if (available.length === 1) {
+      const [chosen] = available;
       network = chosen.name;
       window.history.replaceState(null, "", `/?network=${encodeURIComponent(network)}`);
       renderActive();

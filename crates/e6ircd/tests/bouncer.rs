@@ -1143,68 +1143,92 @@ async fn fake_accept(listener: &tokio::net::TcpListener) -> FakeSession {
     }
 }
 
-/// A ghost holding our configured nick draws a 433; the driver must offer
-/// one replacement nick on the same connection instead of giving up.
+/// A taken nickname is reported, never worked around. The driver does not
+/// invent `bncbot_` on the owner's behalf: it says what the upstream said, waits
+/// on the refusal schedule, and -- when the holder was only a ghost of its own
+/// previous session -- registers under the configured nickname once it is free.
 #[tokio::test(flavor = "multi_thread")]
-async fn nick_conflict_retries_with_alt_nick() {
+async fn a_taken_nickname_is_reported_and_never_replaced() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let (nick_tx, mut nick_rx) = tokio::sync::mpsc::channel(4);
+    let (nick_tx, mut nick_rx) = tokio::sync::mpsc::channel(8);
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
+        // First dial: the nickname is held. Record every NICK the driver
+        // offers on this connection; it must offer exactly the configured one.
         let mut session = fake_accept(&listener).await;
         session.negotiate_capabilities().await;
-        let mut refused = false;
-        // The registration burst is pipelined (NICK, USER, CAP END arrive
-        // together), so the 433 meets the client in await_welcome; the retry
-        // is a second NICK, which is what gets welcomed.
         loop {
             let line = session.read_line().await;
-            if line == "NICK bncbot" && !refused {
-                refused = true;
-                session
-                    .send(":up 433 * bncbot :Nickname is already in use")
-                    .await;
-            } else if let Some(nick) = line.strip_prefix("NICK ") {
+            if let Some(nick) = line.strip_prefix("NICK ") {
                 nick_tx.send(nick.to_string()).await.unwrap();
-                session.send(&format!(":up 001 {nick} :welcome")).await;
-                break;
+                session
+                    .send(&format!(":up 433 * {nick} :Nickname is already in use"))
+                    .await;
             }
-        }
-        // Hold the session open so the driver stays connected.
-        loop {
-            let line = session.read_line().await;
             if line.is_empty() {
                 break;
             }
         }
+        // The ghost times out; the next dial is welcomed under the same nick.
+        release_rx.await.expect("test released the nickname");
+        let mut session = fake_accept(&listener).await;
+        session.negotiate_capabilities().await;
+        loop {
+            let line = session.read_line().await;
+            if let Some(nick) = line.strip_prefix("NICK ") {
+                nick_tx.send(nick.to_string()).await.unwrap();
+            }
+            if line.starts_with("USER ") {
+                session.send(":up 001 bncbot :welcome").await;
+                break;
+            }
+        }
+        while !session.read_line().await.is_empty() {}
     });
 
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
         nick: "bncbot".into(),
+        rejection_retry_floor: std::time::Duration::from_millis(200),
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
-    wait_connected(&handle, &mut events).await;
-    let offered = tokio::time::timeout(std::time::Duration::from_secs(5), nick_rx.recv())
-        .await
-        .expect("no replacement nick")
-        .expect("channel closed");
-    assert_eq!(offered, "bncbot_");
 
-    // The synthesized self-echo uses the confirmed nick, while the ident
-    // stays the originally configured one.
-    assert_eq!(handle.send("PRIVMSG #room :who am i"), SendOutcome::Sent);
-    let echo = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let refused = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            if let Ok(DriverEvent::Echo { line, .. }) = events.recv().await {
-                return line;
+            let snapshot = handle.runtime_snapshot();
+            if snapshot.last_error.is_some() {
+                return snapshot;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("no echo");
-    assert!(echo.contains(":bncbot_!~bncbot@"), "{echo}");
+    .expect("the refusal was never reported");
+    assert_eq!(refused.lifecycle, NetworkLifecycle::Reconnecting);
+    assert_eq!(
+        refused.last_error,
+        Some(e6ircd::bouncer::NetworkFailure::NicknameInUse),
+        "{refused:?}"
+    );
+    assert_eq!(
+        refused.last_error_diagnostic.as_deref(),
+        Some("Nickname is already in use"),
+        "{refused:?}"
+    );
+
+    release_tx.send(()).expect("upstream script is waiting");
+    wait_connected(&handle, &mut events).await;
+    let mut offered = Vec::new();
+    while let Ok(nick) = nick_rx.try_recv() {
+        offered.push(nick);
+    }
+    assert_eq!(
+        offered,
+        ["bncbot", "bncbot"],
+        "only the configured nickname is ever offered"
+    );
 }
 
 /// A forced upstream NICK changes the driver's identity; later self-echoes

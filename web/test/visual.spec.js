@@ -587,8 +587,8 @@ test("the one network list shows typed states and opens a runnable network by it
   ]);
   await page.goto("/");
 
-  // Nobody picks their only runnable network: the disabled one is skipped and
-  // Libera is opened, with the address bar saying so.
+  // Opening the only runnable network is not a choice, so it is not asked:
+  // the disabled one cannot run, and the address bar says what was opened.
   await expect(page).toHaveURL(/\?network=Libera$/);
   const networks = page.getByRole("list", { name: "Networks" });
   await expect(networks.getByRole("link")).toHaveCount(2);
@@ -606,6 +606,41 @@ test("the one network list shows typed states and opens a runnable network by it
     fullPage: true,
     mask: [page.locator("#messages .ts")],
   });
+});
+
+test("with several runnable networks the person chooses; the client does not pick one", async ({ page }) => {
+  let sockets = 0;
+  await page.routeWebSocket(/\/ws\/ui/, () => { sockets += 1; });
+  const runnable = (name, connected) => ({
+    name, kind: "irc", nick: "viewer", enabled: true, connected,
+    runtime: { state: connected ? "connected" : "reconnecting", last_error: null },
+  });
+  await mockSession(page, [runnable("Libera", false), runnable("OFTC", true)]);
+  await page.goto("/");
+
+  await expect(page.getByText("Choose a network from your list to open it.")).toBeVisible();
+  await expect(page).toHaveURL(/\/$/);
+  expect(sockets).toBe(0);
+  const networks = page.getByRole("list", { name: "Networks" });
+  await networks.getByRole("link", { name: "Open OFTC, connected" }).click();
+  await expect(page).toHaveURL(/\?network=OFTC$/);
+  await expectAccessible(page);
+});
+
+test("on a phone the choice says how to reach the list instead of opening it unasked", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const runnable = (name) => ({
+    name, kind: "irc", nick: "viewer", enabled: true, connected: true,
+    runtime: { state: "connected", last_error: null },
+  });
+  await mockSession(page, [runnable("Libera"), runnable("OFTC")]);
+  await page.goto("/");
+
+  const networks = page.getByRole("list", { name: "Networks" });
+  await expect(networks).toBeHidden();
+  await page.getByRole("button", { name: "Show my networks" }).click();
+  await expect(networks.getByRole("link", { name: "Open Libera, connected" })).toBeVisible();
+  await expectAccessible(page);
 });
 
 test("the network list follows the server instead of the first answer it got", async ({ page }) => {

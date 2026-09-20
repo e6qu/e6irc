@@ -107,6 +107,9 @@ joins every configured channel, and says `QUIT` when it is done. It never gates
 - Rejected credentials park the driver on the first rejection: a retry would
   re-send the same password and count against the account on the upstream.
   Saving corrected or removed credentials restarts it.
+- A taken nickname is never replaced with an invented one. The row says the
+  nickname is in use, quotes the network, and offers the two repairs: choose
+  another nickname in settings, or wait for the old session to time out.
 - Any other registration refusal — a ghost holding the nickname, a connection
   throttle, a ban — retries after 30s, 1m, 2m, and 4m, shows the upstream's own
   sanitized reason and the next attempt time for the whole wait, and parks on

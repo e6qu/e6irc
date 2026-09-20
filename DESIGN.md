@@ -1486,10 +1486,16 @@ one implementation shared with the external-network path.
   requests, SASL, and the welcome — so its reason (`Trying to reconnect too
   fast`, `SASL access only`) is typed and kept wherever it arrives.
   Authentication and registration rejection have distinct terminal lifecycle
-  states. On reconnect the driver
-  re-registers under the configured nick — a 433 without SASL earns one
-  replacement-nick retry (`nick_`), since the common cause is a lingering
-  ghost of our own previous session — and re-joins the *configured*
+  states. The driver only ever offers the nickname the owner configured. A
+  433 is a refusal like any other: it is reported with the upstream's text,
+  retried on the refusal schedule — which outlasts the usual cause, a ghost of
+  our own previous session awaiting its ping timeout — and parks if the
+  nickname stays taken. It never substitutes `nick_` or any other invented
+  nickname: ZNC and soju do, and the result is an identity the owner did not
+  choose, holding channel access and a NickServ relationship they did not
+  expect; HexChat, which tries only the alternates its user typed and then
+  stops, is the model (§2, no silent fallbacks). On reconnect the driver
+  re-registers under the configured nick and re-joins the *configured*
   autojoin channels plus every channel the upstream confirmed membership in
   before the drop (runtime JOIN/PART/KICK are tracked as they are
   acknowledged upstream; a forced upstream NICK renames the tracked
@@ -1735,9 +1741,12 @@ It is re-read every ten seconds while the page is visible, because state
 changes on the server (a reconnect, a rejected password) and a list read once
 went stale and contradicted its own copies. A row whose network is not
 connected quotes the upstream's own sanitized reason beside the control that
-repairs it. Opening the page without a `?network=` selector opens a connected
-network, else the first that can run, and rewrites the address to say so;
-only an account with nothing runnable sees the landing panel, whose one action
+repairs it. Opening the page without a `?network=` selector opens the account's
+sole runnable network and rewrites the address to say so, because opening the
+only one is not a choice. With several, the client does not pick "the first"
+on the person's behalf: the landing panel asks them to choose from the list
+(and, on a phone, offers the control that shows it rather than opening it
+unasked). An account with nothing runnable sees the same panel, whose action
 adds a network in place. Adding a network opens it. The preferences menu owns
 validated theme/notification settings, and responsive conversation navigation
 preserves the full chat pane on phones. Every mutation the chat client sends

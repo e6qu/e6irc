@@ -345,59 +345,32 @@ struct SharedDriver {
     joined: std::sync::Arc<JoinedChannels>,
 }
 
-/// The typed outcome of a timed-out registration attempt. Shared between the
-/// first attempt and the 433-retry so the two paths cannot diverge on what
-/// each `io::ErrorKind` means.
-enum RegistrationResult {
-    Ok(String),
-    AuthRejected,
-    NickInUse(e6irc_client::RegistrationRejection),
-    Rejected(e6irc_client::RegistrationRejection),
-    Failed,
-    TimedOut,
-}
-
-fn classify_registration(
+/// What one bounded registration attempt means to the session loop. A refusal
+/// of the configured nickname is a refusal like any other: the driver never
+/// substitutes a nickname the owner did not choose. It reports the upstream's
+/// reason, retries on the slow refusal schedule in case a ghost of its own
+/// previous session times out, and parks if the nickname stays taken.
+fn registration_outcome(
     result: Result<Result<String, std::io::Error>, tokio::time::error::Elapsed>,
-) -> RegistrationResult {
+) -> Result<String, super::SessionOutcome> {
     match result {
-        Ok(Ok(nick)) => RegistrationResult::Ok(nick),
+        Ok(Ok(nick)) => Ok(nick),
         Ok(Err(e)) if let Some(rejection) = e6irc_client::RegistrationRejection::from_error(&e) => {
             eprintln!("irc registration rejected: {e}");
-            match rejection.refusal() {
-                e6irc_client::RegistrationRefusal::NicknameInUse => {
-                    RegistrationResult::NickInUse(rejection)
-                }
-                _ => RegistrationResult::Rejected(rejection),
-            }
+            Err(super::SessionOutcome::RegistrationRejected(rejection))
         }
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            RegistrationResult::AuthRejected
+            Err(super::SessionOutcome::AuthRejected)
         }
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::Unsupported => {
-            RegistrationResult::Rejected(e6irc_client::RegistrationRejection::without_diagnostic(
-                e6irc_client::RegistrationRefusal::NotRegistered,
+            Err(super::SessionOutcome::RegistrationRejected(
+                e6irc_client::RegistrationRejection::without_diagnostic(
+                    e6irc_client::RegistrationRefusal::NotRegistered,
+                ),
             ))
         }
-        Ok(Err(_)) => RegistrationResult::Failed,
-        Err(_) => RegistrationResult::TimedOut,
-    }
-}
-
-/// Map a [`RegistrationResult`] to the session-loop's terminal outcome when
-/// the caller is *not* taking the 433-retry branch.
-fn into_outcome(result: RegistrationResult) -> Result<String, super::SessionOutcome> {
-    match result {
-        RegistrationResult::Ok(nick) => Ok(nick),
-        RegistrationResult::AuthRejected => Err(super::SessionOutcome::AuthRejected),
-        RegistrationResult::NickInUse(rejection) => {
-            Err(super::SessionOutcome::RegistrationRejected(rejection))
-        }
-        RegistrationResult::Rejected(rejection) => {
-            Err(super::SessionOutcome::RegistrationRejected(rejection))
-        }
-        RegistrationResult::Failed => Err(dropped(super::NetworkFailure::RegistrationFailed)),
-        RegistrationResult::TimedOut => Err(dropped(super::NetworkFailure::RegistrationTimedOut)),
+        Ok(Err(_)) => Err(dropped(super::NetworkFailure::RegistrationFailed)),
+        Err(_) => Err(dropped(super::NetworkFailure::RegistrationTimedOut)),
     }
 }
 
@@ -465,28 +438,9 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
         _ = ends.shutdown_signalled() => return super::SessionOutcome::Stopped,
         result = tokio::time::timeout(Duration::from_secs(30), register_fut) => result,
     };
-    let mut current_nick = match classify_registration(registration) {
-        RegistrationResult::NickInUse(_) if config.sasl.is_none() => {
-            // A lingering ghost of our own previous session (not yet timed out
-            // upstream) holds the nick. Offer one replacement rather than
-            // parking a healthy network until an operator intervenes. SASL
-            // registrations skip the retry: their conflict means the account's
-            // nick is genuinely claimed elsewhere, and silently renaming would
-            // mask that.
-            let alt = format!("{}_", config.nick);
-            let retry = tokio::select! {
-                _ = ends.shutdown_signalled() => return super::SessionOutcome::Stopped,
-                result = tokio::time::timeout(Duration::from_secs(30), conn.retry_nick(&alt)) => result,
-            };
-            match into_outcome(classify_registration(retry)) {
-                Ok(nick) => nick,
-                Err(outcome) => return outcome,
-            }
-        }
-        result => match into_outcome(result) {
-            Ok(nick) => nick,
-            Err(outcome) => return outcome,
-        },
+    let mut current_nick = match registration_outcome(registration) {
+        Ok(nick) => nick,
+        Err(outcome) => return outcome,
     };
     // Join the configured autojoin plus every channel the upstream confirmed
     // us in before the drop (runtime joins are tracked in `shared.joined`).
@@ -925,8 +879,10 @@ mod tests {
             "server refused registration",
         );
         assert!(matches!(
-            classify_registration(Ok(Err(error))),
-            RegistrationResult::Failed
+            registration_outcome(Ok(Err(error))),
+            Err(super::super::SessionOutcome::Dropped(
+                super::super::NetworkFailure::RegistrationFailed
+            ))
         ));
     }
 

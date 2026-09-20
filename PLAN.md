@@ -34,8 +34,8 @@ Chat, console, and identity pages share the relay-desk visual system and
 accessible light, dark, and forced-colors palettes. Both network forms read one
 server-side preset catalog (`GET /api/v1/network-presets`), use one vocabulary,
 ask first for what a known network cannot supply, and keep the rest under an
-Advanced disclosure. The chat client opens a runnable network by itself, opens
-a network it has just added, and has one control for each thing: one network
+Advanced disclosure. The chat client opens an account's sole runnable network
+by itself (with several, the person chooses), opens a network it has just added, and has one control for each thing: one network
 list, one Server log switch, one command reference. The console navigation
 leads with the account holder's own pages and groups the administrator's. Browser snapshots cover all
 three shells; interaction tests cover WCAG AA contrast, keyboard focus, Escape
@@ -92,6 +92,12 @@ account never worked from the chat client, and what a rejected account then did:
   let them contradict each other and the server: a network parked on rejected
   credentials kept reading "connected". There is one list, re-read every ten
   seconds, that quotes the upstream's own reason beside the settings control.
+
+The driver no longer answers a taken nickname by silently registering as
+`nick_` (and only when SASL was off). It offers the configured nickname only,
+reports the refusal with the upstream's text, retries on the refusal schedule
+so a ghost of its own session can time out, and parks if the nickname stays
+taken.
 
 Neither browser surface gates saving on a connection test: **Test connection**
 is an optional diagnostic that says `QUIT` when it is done. The console has a bounded,

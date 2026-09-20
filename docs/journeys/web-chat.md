@@ -20,10 +20,12 @@ available; at least one owned/shared network is enabled for chat.
 2. `/api/v1/me/networks` supplies the owner-scoped networks and their state to
    the sidebar list — the one place networks appear — which re-reads it every
    ten seconds while the page is visible.
-3. With no network named in the address, the client opens a connected network,
-   else the first that can run, and rewrites the address to name it. Nobody
-   picks their only network. With no networks, an explicit empty state offers
-   **Add a network**, which opens the dialog in place.
+3. With no network named in the address, the client opens the account's sole
+   runnable network and rewrites the address to name it: opening the only one
+   is not a choice. With several it picks none; the landing panel asks the
+   person to choose from the list, and on a phone offers **Show my networks**.
+   With no networks, an explicit empty state offers **Add a network**, which
+   opens the dialog in place.
 4. Opening a network opens `/ws/ui` for it and renders connection state; it
    never invents “connected” from stored configuration alone. A disabled network
    still opens, says why chat is unavailable, and links to where it is enabled.
@@ -61,7 +63,8 @@ conversation and member controls plus the skip-to-chat focus target. Focused
 client-state fixtures reject malformed, oversized, or contract-drift identity,
 network-list, and backlog responses, and cover loading, empty, populated,
 unavailable, expired-session, and forced-colors states with visual and axe
-checks. Chromium fixtures also prove that a runnable network opens by itself,
+checks. Chromium fixtures also prove that a sole runnable network opens by
+itself while several leave the choice to the person and open no socket,
 that the list follows a state change on the server, and that adding a network
 sends the session token and opens the result.
 The populated fixture proves reflow at a 200% equivalent layout width. The
