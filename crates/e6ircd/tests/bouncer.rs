@@ -81,12 +81,15 @@ async fn wait_connected(
 #[tokio::test(flavor = "multi_thread")]
 async fn preflight_uses_the_real_driver_registration_path_without_starting_a_network() {
     let addr = upstream().await;
-    let result = preflight_irc(&NetworkConfig {
-        addr: addr.to_string(),
-        nick: "preflight".parse().expect("test nickname"),
-        realname: "preflight qualification".parse().expect("test real name"),
-        ..NetworkConfig::default()
-    })
+    let result = preflight_irc(
+        &NetworkConfig {
+            addr: addr.to_string(),
+            nick: "preflight".parse().expect("test nickname"),
+            realname: "preflight qualification".parse().expect("test real name"),
+            ..NetworkConfig::default()
+        },
+        std::time::Duration::from_secs(25),
+    )
     .await
     .expect("local upstream qualifies");
 
@@ -1100,24 +1103,27 @@ impl FakeSession {
             .expect("upstream write failed");
     }
 
+    /// The driver asks once for the whole advertised metadata set.
+    async fn acknowledge_metadata(&mut self) {
+        let metadata = "server-time message-tags account-tag";
+        assert_eq!(self.read_line().await, format!("CAP REQ :{metadata}"));
+        self.send(&format!(":up CAP * ACK :{metadata}")).await;
+    }
+
     async fn negotiate_capabilities(&mut self) {
         assert_eq!(self.read_line().await, "CAP LS 302");
         self.send(":up CAP * LS :server-time message-tags account-tag")
             .await;
-        for capability in ["server-time", "message-tags", "account-tag"] {
-            assert_eq!(self.read_line().await, format!("CAP REQ :{capability}"));
-            self.send(&format!(":up CAP * ACK :{capability}")).await;
-        }
+        self.acknowledge_metadata().await;
     }
 
     async fn negotiate_sasl_capabilities(&mut self) {
         assert_eq!(self.read_line().await, "CAP LS 302");
         self.send(":up CAP * LS :sasl=PLAIN server-time message-tags account-tag")
             .await;
-        for capability in ["sasl", "server-time", "message-tags", "account-tag"] {
-            assert_eq!(self.read_line().await, format!("CAP REQ :{capability}"));
-            self.send(&format!(":up CAP * ACK :{capability}")).await;
-        }
+        assert_eq!(self.read_line().await, "CAP REQ :sasl");
+        self.send(":up CAP * ACK :sasl").await;
+        self.acknowledge_metadata().await;
     }
 
     /// Read until the registration burst (NICK/USER) completes, then welcome
@@ -1141,6 +1147,88 @@ async fn fake_accept(listener: &tokio::net::TcpListener) -> FakeSession {
         reader: tokio::io::BufReader::new(read),
         writer,
     }
+}
+
+/// The connection test's budget belongs to the whole test: the stage that is
+/// running when it ends reports its OWN timeout, and the upstream still hears a
+/// goodbye rather than a dropped socket.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_test_out_of_budget_names_its_stage_and_still_quits() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.negotiate_capabilities().await;
+        // Registration is never answered; record whatever else arrives.
+        loop {
+            let line = session.read_line().await;
+            if line.is_empty() {
+                break;
+            }
+            if line.starts_with("QUIT") {
+                heard_tx.send(line).await.unwrap();
+            }
+        }
+    });
+    let failure = preflight_irc(
+        &NetworkConfig {
+            addr: addr.to_string(),
+            nick: "preflight".parse().expect("test nickname"),
+            ..NetworkConfig::default()
+        },
+        std::time::Duration::from_millis(400),
+    )
+    .await
+    .expect_err("an upstream that never welcomes cannot qualify");
+    assert_eq!(failure.code(), "registration_timed_out");
+    let goodbye = tokio::time::timeout(std::time::Duration::from_secs(5), heard_rx.recv())
+        .await
+        .expect("the upstream never heard a goodbye")
+        .expect("upstream script ended");
+    assert_eq!(goodbye, "QUIT :connection test complete");
+}
+
+/// A refused channel fails the test, and the test still leaves politely.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_test_with_a_refused_channel_still_quits() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.complete_registration("preflight").await;
+        loop {
+            let line = session.read_line().await;
+            if line.is_empty() {
+                break;
+            }
+            if line.starts_with("JOIN ") {
+                session
+                    .send(":up 473 preflight #closed :Cannot join channel (+i)")
+                    .await;
+            }
+            if line.starts_with("QUIT") {
+                heard_tx.send(line).await.unwrap();
+            }
+        }
+    });
+    let failure = preflight_irc(
+        &NetworkConfig {
+            addr: addr.to_string(),
+            nick: "preflight".parse().expect("test nickname"),
+            autojoin: vec!["#closed".parse().expect("test channel")],
+            ..NetworkConfig::default()
+        },
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .expect_err("an invite-only channel cannot be joined");
+    assert_eq!(failure.code(), "channel_join_failed");
+    tokio::time::timeout(std::time::Duration::from_secs(5), heard_rx.recv())
+        .await
+        .expect("the upstream never heard a goodbye")
+        .expect("upstream script ended");
 }
 
 /// A taken nickname is reported, never worked around. The driver does not
@@ -1430,6 +1518,58 @@ async fn silent_upstream_trips_keepalive_and_reconnects() {
     );
 }
 
+/// The idle window measures the *upstream's* silence. A client that keeps
+/// typing into a half-open link must not keep it looking alive: each command
+/// used to restart the window, so the dead upstream was never noticed for as
+/// long as anyone was talking into it.
+#[tokio::test(flavor = "multi_thread")]
+async fn downstream_traffic_does_not_hide_a_silent_upstream() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.complete_registration("bncbot").await;
+        // Read and discard everything, the keepalive PING included.
+        while !session.read_line().await.is_empty() {}
+        let _held = fake_accept(&listener).await;
+        std::future::pending::<()>().await;
+    });
+
+    let handle = std::sync::Arc::new(IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        keepalive_idle: std::time::Duration::from_millis(150),
+        ..NetworkConfig::default()
+    }));
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    let typist = handle.clone();
+    let typing = tokio::spawn(async move {
+        loop {
+            typist.send("PRIVMSG #room :still typing");
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+    });
+    let tripped = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match events.recv().await {
+                Ok(DriverEvent::Status {
+                    status: DriverConnectionStatus::Reconnecting(failure),
+                    ..
+                }) => return failure,
+                Ok(_) => {}
+                Err(_) => panic!("event stream ended before the keepalive trip"),
+            }
+        }
+    })
+    .await;
+    typing.abort();
+    assert_eq!(
+        tripped.expect("a silent upstream stayed connected while a client typed"),
+        e6ircd::bouncer::NetworkFailure::KeepaliveTimedOut
+    );
+}
+
 /// An upstream that rejects registration on every attempt is retried with
 /// backoff and then parked loudly, not hammered forever.
 #[tokio::test(flavor = "multi_thread")]
@@ -1507,7 +1647,56 @@ async fn rejected_credentials_park_without_a_second_dial() {
             .is_err(),
         "a parked driver must not dial the upstream again"
     );
-    assert_eq!(handle.runtime_snapshot().connection_attempts, 1);
+    let snapshot = handle.runtime_snapshot();
+    assert_eq!(snapshot.connection_attempts, 1);
+    assert_eq!(
+        snapshot.last_error_diagnostic.as_deref(),
+        Some("SASL authentication failed"),
+        "the owner reads the upstream's own words: {snapshot:?}"
+    );
+}
+
+/// An upstream that offers SASL but not PLAIN says nothing about the password.
+/// Parking it as rejected credentials sent the owner to retype a correct
+/// password forever; it is a worded registration refusal, and no credential is
+/// ever put on the wire.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_without_the_sasl_mechanism_is_not_a_credential_rejection() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let mut session = fake_accept(&listener).await;
+            assert_eq!(session.read_line().await, "CAP LS 302");
+            session
+                .send(":up CAP * LS :sasl=EXTERNAL,SCRAM-SHA-256 server-time")
+                .await;
+            assert_eq!(
+                session.read_line().await,
+                "",
+                "the driver must hang up without starting a credential exchange"
+            );
+        }
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        sasl: Some(("account".into(), "correct".into())),
+        rejection_retry_floor: std::time::Duration::from_millis(20),
+        ..NetworkConfig::default()
+    });
+    wait_lifecycle(&handle, NetworkLifecycle::RegistrationFailed).await;
+    let snapshot = handle.runtime_snapshot();
+    assert_eq!(
+        snapshot.last_error,
+        Some(e6ircd::bouncer::NetworkFailure::SaslUnavailable),
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.last_error_diagnostic.as_deref(),
+        Some("requested PLAIN; the server offers EXTERNAL,SCRAM-SHA-256"),
+        "{snapshot:?}"
+    );
 }
 
 /// A refusing upstream's own connection throttle shows up as dials that die

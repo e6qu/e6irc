@@ -180,7 +180,11 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
                         }
                         continue;
                     }
-                    ends.emit_line(line);
+                    if ends.emit_session_line(line).is_err() {
+                        return super::SessionOutcome::Dropped(
+                            super::NetworkFailure::ChannelLimitExceeded,
+                        );
+                    }
                 }
                 // Core closed our session: reconnect with a fresh ConnId (and
                 // emit Disconnected via run_with_backoff) rather than die.

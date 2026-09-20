@@ -406,3 +406,72 @@ async fn self_echo_delivered_once_when_negotiated() {
     .await;
     assert!(second.is_err(), "exactly one echo: {second:?}");
 }
+
+/// Wait for the next command the driver receives.
+async fn next_driver_command(ends: &mut e6ircd::bouncer::DriverEnds) -> String {
+    tokio::time::timeout(std::time::Duration::from_secs(5), ends.next_command())
+        .await
+        .expect("driver command timeout")
+        .expect("driver command queue closed")
+        .line
+}
+
+/// Every IRC client sends `QUIT` when it exits. The upstream session is the
+/// account's always-on presence, shared by every other attachment, so one
+/// client leaving ends that client's attachment and nothing else.
+#[tokio::test(flavor = "multi_thread")]
+async fn attached_client_quit_ends_the_attachment_and_never_reaches_the_driver() {
+    let (handle, mut ends) = NetworkHandle::channels(8);
+    let handle = std::sync::Arc::new(handle);
+    let (mut reader, mut writer, task) = attach_client(&handle, Default::default());
+    read_until(&mut reader, "upstream disconnected").await;
+
+    writer.write_all(b"QUIT :leaving\r\n").await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("QUIT did not end the attachment")
+        .expect("attach task panicked");
+
+    let mut rest = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reader.read_to_string(&mut rest),
+    )
+    .await
+    .expect("the attach stream stayed open after QUIT")
+    .unwrap();
+    assert!(rest.contains("ERROR :"), "{rest}");
+
+    // The first command the driver ever sees is this marker: the QUIT was not
+    // queued ahead of it.
+    assert_eq!(
+        handle.send("PRIVMSG #room :marker"),
+        e6ircd::bouncer::SendOutcome::Sent
+    );
+    assert_eq!(
+        next_driver_command(&mut ends).await,
+        "PRIVMSG #room :marker"
+    );
+}
+
+/// A client's lag-check `PING` is answered by the bouncer itself: the upstream
+/// may be reconnecting or parked, and its `PONG` would otherwise be buffered and
+/// broadcast to the account's other clients.
+#[tokio::test(flavor = "multi_thread")]
+async fn attached_client_ping_is_answered_locally_and_pong_is_consumed() {
+    let (handle, mut ends) = NetworkHandle::channels(8);
+    let handle = std::sync::Arc::new(handle);
+    let (mut reader, mut writer, _task) = attach_client(&handle, Default::default());
+    read_until(&mut reader, "upstream disconnected").await;
+
+    writer
+        .write_all(b"PING :lag 1234\r\nPONG :unsolicited\r\nPRIVMSG #room :marker\r\n")
+        .await
+        .unwrap();
+    let pong = read_until(&mut reader, "PONG").await;
+    assert_eq!(pong, ":*bnc* PONG *bnc* :lag 1234\r\n");
+    assert_eq!(
+        next_driver_command(&mut ends).await,
+        "PRIVMSG #room :marker"
+    );
+}

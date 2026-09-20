@@ -1058,12 +1058,8 @@ fn cap_names(caps: Option<super::AttachCaps>) -> String {
 
 fn cap_reply(server_name: &str, target: &str, verb: &str, request: &str) -> (bool, String) {
     let head = format!(":{server_name} CAP {target} {verb} :");
-    let budget = e6irc_proto::message::MAX_LINE_LEN - 2 - head.len();
-    let fitted = request
-        .char_indices()
-        .take_while(|(index, character)| index + character.len_utf8() <= budget)
-        .map(|(_, character)| character)
-        .collect::<String>();
+    let budget = (e6irc_proto::message::MAX_LINE_LEN - 2).saturating_sub(head.len());
+    let fitted = e6irc_proto::message::truncate_on_char_boundary(request, budget);
     (fitted.len() == request.len(), format!("{head}{fitted}\r\n"))
 }
 
@@ -1080,6 +1076,9 @@ pub(super) async fn handle_cap<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    // The nick is the upstream's to choose once attached; every reply below
+    // repeats it, so it is bounded once, as `write_attach_numeric` bounds it.
+    let target = e6irc_proto::message::truncate_on_char_boundary(target, 64);
     match msg
         .params
         .first()
@@ -1213,6 +1212,47 @@ mod cap_tests {
         let (fits, reply) = cap_reply("bnc.example", "*", "ACK", &request);
         assert!(!fits);
         assert!(reply.len() <= e6irc_proto::message::MAX_LINE_LEN);
+    }
+
+    /// The target is the client's nick, which the upstream can change to
+    /// anything after attach. A head longer than the line used to underflow
+    /// the budget: a panic in debug, an over-long line in release.
+    #[tokio::test]
+    async fn a_long_target_cannot_overflow_any_cap_reply() {
+        let target = "n".repeat(e6irc_proto::message::MAX_LINE_LEN);
+        let (fits, _) = cap_reply("bnc.example", &target, "ACK", "server-time");
+        assert!(
+            !fits,
+            "a head that fills the line leaves no room, and says so"
+        );
+
+        for command in [
+            "CAP LS 302",
+            "CAP LIST",
+            "CAP REQ :server-time",
+            "CAP REQ :bogus",
+        ] {
+            let (mut client, mut server) = tokio::io::duplex(8192);
+            handle_cap(
+                &mut server,
+                "bnc.example",
+                &target,
+                &Message::parse(command).expect("CAP command"),
+                false,
+                &mut false,
+                &mut super::super::AttachCaps::default(),
+            )
+            .await
+            .expect("CAP reply");
+            server.shutdown().await.expect("close server half");
+            let mut reply = String::new();
+            client.read_to_string(&mut reply).await.expect("reply");
+            assert!(
+                !reply.is_empty() && reply.len() <= e6irc_proto::message::MAX_LINE_LEN,
+                "{command}: {} bytes",
+                reply.len()
+            );
+        }
     }
 
     #[tokio::test]

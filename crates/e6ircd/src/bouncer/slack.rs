@@ -66,7 +66,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
             let token = &config.bot_token;
             async move { fetch_channel_name(http, base, token, &id).await }
         },
-        |id, error| slack_failure(&format!("channel {id} lookup failed"), error),
+        |id, error: String| slack_failure(&format!("channel {id} lookup failed"), &error),
     )
     .await
     {
@@ -89,10 +89,10 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
 
     let mut user_names: HashMap<String, String> = HashMap::new();
 
-    let read_timeout = Duration::from_secs(90);
+    let mut silence = super::SilenceDeadline::new(Duration::from_secs(90));
     loop {
         tokio::select! {
-            text = super::next_bridge_text(&mut read, &mut write, read_timeout, "slack", "socket", |_| {
+            text = super::next_bridge_text(&mut read, &mut write, &mut silence, "slack", "socket", |_| {
                 Dropped(NetworkFailure::ConnectionLost)
             }) => {
                 let text = match text {
@@ -147,19 +147,19 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                     }
                 }
             }
-            cmd = ends.next_command() => match cmd {
-                Some(cmd) => {
-                    let routed = super::route_privmsg(&cmd.line, &channel_to_id);
-                    super::relay_routed(ends, routed, "Slack", "channel", |id, text| {
-                        let http = http.clone();
-                        let base = base.clone();
-                        let bot_token = config.bot_token.clone();
-                        async move { post_message(&http, &base, &bot_token, &id, &text).await }
-                    })
-                    .await;
+            cmd = ends.next_command() => {
+                let deliver = |id: String, text: String| {
+                    let (http, base) = (http.clone(), base.clone());
+                    let bot_token = config.bot_token.clone();
+                    async move { post_message(&http, &base, &bot_token, &id, &text).await }
+                };
+                if super::relay_channel_command(ends, cmd, &channel_to_id, "Slack", deliver)
+                    .await
+                    .is_none()
+                {
+                    return super::SessionOutcome::Stopped;
                 }
-                None => return super::SessionOutcome::Stopped, // every handle dropped
-            },
+            }
         }
     }
 }
@@ -351,7 +351,7 @@ fn slack_failure(context: &str, err: &str) -> super::SessionOutcome {
     ];
     if AUTH_ERRORS.contains(&err) {
         eprintln!("slack: {context}: {err} (auth rejected; will stop retrying)");
-        super::SessionOutcome::AuthRejected
+        super::SessionOutcome::AuthRejected(None)
     } else {
         eprintln!("slack: {context}: {err}");
         super::SessionOutcome::Dropped(super::NetworkFailure::UpstreamRequestFailed)

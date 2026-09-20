@@ -67,38 +67,28 @@ pub struct IrcNetwork;
 /// falls back to the configured autojoin, which is the operator-declared
 /// floor.
 #[derive(Debug, Default)]
-pub struct JoinedChannels(std::sync::Mutex<std::collections::HashMap<String, String>>);
+pub struct JoinedChannels(
+    std::sync::Mutex<std::collections::HashMap<String, super::upstream_identity::ConfirmedChannel>>,
+);
 
 impl JoinedChannels {
-    fn apply_session_delta(
-        &self,
-        before: &super::IrcSessionSnapshot,
-        after: &super::IrcSessionSnapshot,
-        retain_departures: bool,
-    ) {
+    /// Fold one line's membership change into the reconnect intent. The intent
+    /// outlives sessions, so it carries the tracker's bound itself: successive
+    /// sessions could otherwise each confirm a different full set.
+    fn apply(&self, change: super::SessionChange) -> Result<(), super::ChannelLimitExceeded> {
         let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
-        let before_keys: std::collections::HashSet<String> = before
-            .channels
-            .iter()
-            .map(|channel| casemap.casefold(channel))
-            .collect();
-        let after_by_key: std::collections::HashMap<String, String> = after
-            .channels
-            .iter()
-            .map(|channel| (casemap.casefold(channel), channel.clone()))
-            .collect();
-        let after_keys: std::collections::HashSet<String> = after_by_key.keys().cloned().collect();
         let mut desired = self.0.lock().expect("joined set poisoned");
-        if !retain_departures {
-            for removed in before_keys.difference(&after_keys) {
-                desired.remove(removed);
-            }
+        for left in &change.left {
+            desired.remove(left);
         }
-        for (key, display) in after_by_key {
-            if !before_keys.contains(&key) {
-                desired.insert(key, display);
+        for channel in change.joined {
+            let key = casemap.casefold(channel.as_str());
+            if !desired.contains_key(&key) && desired.len() >= super::MAX_TRACKED_CHANNELS {
+                return Err(super::ChannelLimitExceeded);
             }
+            desired.insert(key, channel);
         }
+        Ok(())
     }
 }
 
@@ -136,13 +126,17 @@ pub enum IrcPreflightFailure {
     ConnectionFailed,
     SecureConnectionFailed,
     ConnectionTimedOut,
-    AuthenticationRejected,
+    /// The upstream rejected the credentials themselves; its own words ride
+    /// along when it gave any.
+    AuthenticationRejected(Option<e6irc_client::SaslRejection>),
     RegistrationRejected(Option<e6irc_client::RegistrationRejection>),
     InvalidNickname(Option<e6irc_client::RegistrationRejection>),
     InvalidUsername(Option<e6irc_client::RegistrationRejection>),
     NicknameInUse(Option<e6irc_client::RegistrationRejection>),
     ServerPasswordRejected(Option<e6irc_client::RegistrationRejection>),
     NetworkBanned(Option<e6irc_client::RegistrationRejection>),
+    SaslUnavailable(e6irc_client::RegistrationRejection),
+    SaslFailed(e6irc_client::RegistrationRejection),
     RegistrationFailed,
     RegistrationTimedOut,
     ChannelJoinFailed,
@@ -158,13 +152,15 @@ impl IrcPreflightFailure {
             Self::ConnectionFailed => "connection_failed",
             Self::SecureConnectionFailed => "secure_connection_failed",
             Self::ConnectionTimedOut => "connection_timed_out",
-            Self::AuthenticationRejected => "authentication_rejected",
+            Self::AuthenticationRejected(_) => "authentication_rejected",
             Self::RegistrationRejected(_) => "registration_rejected",
             Self::InvalidNickname(_) => "invalid_nickname",
             Self::InvalidUsername(_) => "invalid_username",
             Self::NicknameInUse(_) => "nickname_in_use",
             Self::ServerPasswordRejected(_) => "server_password_rejected",
             Self::NetworkBanned(_) => "network_banned",
+            Self::SaslUnavailable(_) => "sasl_unavailable",
+            Self::SaslFailed(_) => "sasl_failed",
             Self::RegistrationFailed => "registration_failed",
             Self::RegistrationTimedOut => "registration_timed_out",
             Self::ChannelJoinFailed => "channel_join_failed",
@@ -184,7 +180,7 @@ impl IrcPreflightFailure {
                 "The TLS connection or certificate verification failed."
             }
             Self::ConnectionTimedOut => "Connecting to the upstream timed out.",
-            Self::AuthenticationRejected => "The upstream rejected the SASL credentials.",
+            Self::AuthenticationRejected(_) => "The upstream rejected the SASL credentials.",
             Self::RegistrationRejected(_) => "The upstream rejected IRC registration.",
             Self::InvalidNickname(_) => "The upstream rejected the configured nickname.",
             Self::InvalidUsername(_) => "The upstream rejected the IRC username.",
@@ -193,6 +189,8 @@ impl IrcPreflightFailure {
                 "The upstream rejected the configured server password."
             }
             Self::NetworkBanned(_) => "The upstream network banned this connection.",
+            Self::SaslUnavailable(_) => super::NetworkFailure::SaslUnavailable.summary(),
+            Self::SaslFailed(_) => super::NetworkFailure::SaslFailed.summary(),
             Self::RegistrationFailed => "IRC registration failed before a welcome was received.",
             Self::RegistrationTimedOut => "IRC registration timed out.",
             Self::ChannelJoinFailed => "The upstream rejected a configured channel join.",
@@ -210,6 +208,12 @@ impl IrcPreflightFailure {
             | Self::NicknameInUse(rejection)
             | Self::ServerPasswordRejected(rejection)
             | Self::NetworkBanned(rejection) => rejection.as_ref().map(|value| value.diagnostic()),
+            Self::SaslUnavailable(rejection) | Self::SaslFailed(rejection) => {
+                Some(rejection.diagnostic())
+            }
+            Self::AuthenticationRejected(rejection) => {
+                rejection.as_ref().map(|value| value.diagnostic())
+            }
             _ => None,
         }
     }
@@ -217,13 +221,24 @@ impl IrcPreflightFailure {
 
 /// Resolve, connect, and register exactly as the always-on IRC driver does,
 /// without persisting configuration or starting a reconnect loop.
-pub async fn preflight_irc(config: &NetworkConfig) -> Result<IrcPreflight, IrcPreflightFailure> {
+///
+/// `budget` bounds the whole test. The stages used to carry 10 + 30 + 30 + 30
+/// seconds per channel of their own, so the caller's own deadline always fired
+/// first: its typed timeouts could never be reported, and the dropped future
+/// skipped the goodbye below. Whichever stage is running when the budget ends
+/// reports its own timeout, and every exit after the socket opens says `QUIT`.
+pub async fn preflight_irc(
+    config: &NetworkConfig,
+    budget: Duration,
+) -> Result<IrcPreflight, IrcPreflightFailure> {
     if upstream_host(&config.addr).is_err() {
         return Err(IrcPreflightFailure::InvalidAddress);
     }
+    let deadline = tokio::time::Instant::now() + budget;
 
     let dns_started = Instant::now();
-    let addresses = tokio::time::timeout(Duration::from_secs(10), resolve_vetted(&config.addr))
+    let dns_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(10));
+    let addresses = tokio::time::timeout_at(dns_deadline, resolve_vetted(&config.addr))
         .await
         .map_err(|_| IrcPreflightFailure::ConnectionTimedOut)?
         .map_err(|error| {
@@ -237,97 +252,103 @@ pub async fn preflight_irc(config: &NetworkConfig) -> Result<IrcPreflight, IrcPr
     let resolved_addresses = addresses.len();
 
     let connect_started = Instant::now();
-    let mut connection =
-        tokio::time::timeout(Duration::from_secs(30), connect_resolved(config, addresses))
-            .await
-            .map_err(|_| IrcPreflightFailure::ConnectionTimedOut)?
-            .map_err(|error| {
-                eprintln!("irc preflight: transport failed: {error}");
-                if config.tls {
-                    IrcPreflightFailure::SecureConnectionFailed
-                } else {
-                    IrcPreflightFailure::ConnectionFailed
-                }
-            })?;
+    let mut connection = tokio::time::timeout_at(deadline, connect_resolved(config, addresses))
+        .await
+        .map_err(|_| IrcPreflightFailure::ConnectionTimedOut)?
+        .map_err(|error| {
+            eprintln!("irc preflight: transport failed: {error}");
+            if config.tls {
+                IrcPreflightFailure::SecureConnectionFailed
+            } else {
+                IrcPreflightFailure::ConnectionFailed
+            }
+        })?;
     let connect_ms = elapsed_millis(connect_started.elapsed());
 
+    // Everything from here talks on an open socket, so it runs as one unit
+    // whose every outcome -- a refusal, a rejected join, the deadline -- is
+    // followed by the goodbye below.
     let registration_started = Instant::now();
-    let registration = async {
-        match &config.sasl {
-            Some((account, password)) => {
-                connection
-                    .register_sasl(
-                        config.nick.as_str(),
-                        config.realname.as_str(),
-                        account,
-                        password,
-                    )
-                    .await
+    let outcome = async {
+        let registration = async {
+            match &config.sasl {
+                Some((account, password)) => {
+                    connection
+                        .register_sasl(
+                            config.nick.as_str(),
+                            config.realname.as_str(),
+                            account,
+                            password,
+                        )
+                        .await
+                }
+                None => {
+                    connection
+                        .register(config.nick.as_str(), config.realname.as_str())
+                        .await
+                }
             }
-            None => {
-                connection
-                    .register(config.nick.as_str(), config.realname.as_str())
-                    .await
-            }
-        }
-    };
-    let confirmed_nick = match tokio::time::timeout(Duration::from_secs(30), registration).await {
-        Ok(Ok(confirmed_nick)) => confirmed_nick,
-        Ok(Err(error))
-            if let Some(rejection) = e6irc_client::RegistrationRejection::from_error(&error) =>
-        {
-            return Err(preflight_refusal(Some(rejection)));
-        }
-        Ok(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err(IrcPreflightFailure::AuthenticationRejected);
-        }
-        Ok(Err(error))
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::AlreadyExists
-                    | std::io::ErrorKind::Other
-                    | std::io::ErrorKind::Unsupported
-            ) =>
-        {
-            return Err(IrcPreflightFailure::RegistrationRejected(None));
-        }
-        Ok(Err(error)) => {
-            eprintln!("irc preflight: registration failed: {error}");
-            return Err(IrcPreflightFailure::RegistrationFailed);
-        }
-        Err(_) => return Err(IrcPreflightFailure::RegistrationTimedOut),
-    };
-
-    let mut joined_channels = Vec::with_capacity(config.autojoin.len());
-    for channel in &config.autojoin {
-        match tokio::time::timeout(
-            Duration::from_secs(30),
-            connection.join_with_latest_history(channel.as_str(), 0),
-        )
-        .await
-        {
-            Ok(Ok(_)) => joined_channels.push(channel.to_string()),
+        };
+        let confirmed_nick = match tokio::time::timeout_at(deadline, registration).await {
+            Ok(Ok(confirmed_nick)) => confirmed_nick,
             Ok(Err(error)) => {
-                eprintln!("irc preflight: channel join failed: {error}");
-                return Err(IrcPreflightFailure::ChannelJoinFailed);
+                return Err(match RegistrationError::classify(error) {
+                    RegistrationError::CredentialsRejected(rejection) => {
+                        IrcPreflightFailure::AuthenticationRejected(Some(rejection))
+                    }
+                    RegistrationError::Refused(rejection) => preflight_refusal(Some(rejection)),
+                    RegistrationError::Failed(error) => {
+                        eprintln!("irc preflight: registration failed: {error}");
+                        IrcPreflightFailure::RegistrationFailed
+                    }
+                });
             }
-            Err(_) => return Err(IrcPreflightFailure::ChannelJoinTimedOut),
+            Err(_) => return Err(IrcPreflightFailure::RegistrationTimedOut),
+        };
+
+        let registration_ms = elapsed_millis(registration_started.elapsed());
+
+        let mut joined_channels = Vec::with_capacity(config.autojoin.len());
+        for channel in &config.autojoin {
+            match tokio::time::timeout_at(
+                deadline,
+                connection.join_with_latest_history(channel.as_str(), 0),
+            )
+            .await
+            {
+                Ok(Ok(_)) => joined_channels.push(channel.to_string()),
+                Ok(Err(error)) => {
+                    eprintln!("irc preflight: channel join failed: {error}");
+                    return Err(IrcPreflightFailure::ChannelJoinFailed);
+                }
+                Err(_) => return Err(IrcPreflightFailure::ChannelJoinTimedOut),
+            }
         }
+        Ok((confirmed_nick, registration_ms, joined_channels))
     }
+    .await;
 
     // Leave as a client would. Dropping the socket instead shows the upstream a
     // read error, and its record of this nick can outlive the test long enough
     // to refuse the driver that starts from the same settings a moment later.
-    // The result is already decided, so a failed goodbye is only logged.
-    if let Err(error) = connection.send_line("QUIT :connection test complete").await {
-        eprintln!("irc preflight: quit failed: {error}");
+    // The result is already decided, so a failed or slow goodbye is only logged.
+    match tokio::time::timeout(
+        Duration::from_secs(2),
+        connection.send_line("QUIT :connection test complete"),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("irc preflight: quit failed: {error}"),
+        Err(_) => eprintln!("irc preflight: quit timed out"),
     }
 
+    let (confirmed_nick, registration_ms, joined_channels) = outcome?;
     Ok(IrcPreflight {
         resolved_addresses,
         dns_ms,
         connect_ms,
-        registration_ms: elapsed_millis(registration_started.elapsed()),
+        registration_ms,
         confirmed_nick,
         joined_channels,
     })
@@ -357,6 +378,37 @@ struct SharedDriver {
     joined: std::sync::Arc<JoinedChannels>,
 }
 
+/// What a failed registration means, read from the typed value the client
+/// attached to its error — never from the error kind, which cannot tell a
+/// rejected password from a server that offers no usable SASL. The driver and
+/// the preflight share this so they cannot classify the same upstream
+/// differently.
+enum RegistrationError {
+    /// The upstream rejected the credentials themselves. Never retried.
+    CredentialsRejected(e6irc_client::SaslRejection),
+    /// The upstream refused registration for a reason it stated.
+    Refused(e6irc_client::RegistrationRejection),
+    /// Anything else: a transport error, or a peer that is not speaking IRC.
+    Failed(std::io::Error),
+}
+
+impl RegistrationError {
+    fn classify(error: std::io::Error) -> Self {
+        if let Some(rejection) = e6irc_client::RegistrationRejection::from_error(&error) {
+            return Self::Refused(rejection);
+        }
+        match e6irc_client::SaslRejection::from_error(&error).map(|sasl| sasl.class()) {
+            Some(e6irc_client::SaslRejectionClass::CredentialsRejected(rejection)) => {
+                Self::CredentialsRejected(rejection)
+            }
+            Some(e6irc_client::SaslRejectionClass::RegistrationRefused(rejection)) => {
+                Self::Refused(rejection)
+            }
+            None => Self::Failed(error),
+        }
+    }
+}
+
 /// What one bounded registration attempt means to the session loop. A refusal
 /// of the configured nickname is a refusal like any other: the driver never
 /// substitutes a nickname the owner did not choose. It reports the upstream's
@@ -367,21 +419,16 @@ fn registration_outcome(
 ) -> Result<String, super::SessionOutcome> {
     match result {
         Ok(Ok(nick)) => Ok(nick),
-        Ok(Err(e)) if let Some(rejection) = e6irc_client::RegistrationRejection::from_error(&e) => {
-            eprintln!("irc registration rejected: {e}");
-            Err(super::SessionOutcome::RegistrationRejected(rejection))
-        }
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            Err(super::SessionOutcome::AuthRejected)
-        }
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::Unsupported => {
-            Err(super::SessionOutcome::RegistrationRejected(
-                e6irc_client::RegistrationRejection::without_diagnostic(
-                    e6irc_client::RegistrationRefusal::NotRegistered,
-                ),
-            ))
-        }
-        Ok(Err(_)) => Err(dropped(super::NetworkFailure::RegistrationFailed)),
+        Ok(Err(error)) => Err(match RegistrationError::classify(error) {
+            RegistrationError::CredentialsRejected(rejection) => {
+                super::SessionOutcome::AuthRejected(Some(rejection))
+            }
+            RegistrationError::Refused(rejection) => {
+                eprintln!("irc registration rejected: {rejection:?}");
+                super::SessionOutcome::RegistrationRejected(rejection)
+            }
+            RegistrationError::Failed(_) => dropped(super::NetworkFailure::RegistrationFailed),
+        }),
         Err(_) => Err(dropped(super::NetworkFailure::RegistrationTimedOut)),
     }
 }
@@ -411,6 +458,10 @@ fn preflight_refusal(
         e6irc_client::RegistrationRefusal::NotRegistered => {
             IrcPreflightFailure::RegistrationRejected(Some(rejection))
         }
+        e6irc_client::RegistrationRefusal::SaslUnavailable => {
+            IrcPreflightFailure::SaslUnavailable(rejection)
+        }
+        e6irc_client::RegistrationRefusal::SaslFailed => IrcPreflightFailure::SaslFailed(rejection),
     }
 }
 
@@ -480,7 +531,7 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
             .expect("joined set poisoned")
             .iter()
             .filter(|(key, _)| !folded.contains(*key))
-            .map(|(_, display)| display.clone())
+            .map(|(_, display)| display.as_str().to_string())
             .collect();
         list.extend(extras);
         list
@@ -501,7 +552,12 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     // gap we send our own PING; if the next gap passes with still no traffic,
     // the link is dead — drop and reconnect. A live server's own PINGs (which
     // we answer) keep a quiet-but-alive connection from ever tripping this.
+    //
+    // The window is measured from the upstream's last sign of life (see
+    // `SilenceDeadline`): a downstream command also ends a turn of this loop,
+    // and must not make a silent upstream look alive while someone types.
     let mut awaiting_keepalive = false;
+    let mut silence = super::SilenceDeadline::new(config.keepalive_idle);
     // The host half of synthesized self-echo prefixes.
     let upstream = upstream_host(&config.addr)
         .expect("IRC driver starts only from a validated upstream address")
@@ -509,9 +565,10 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     loop {
         tokio::select! {
             // Upstream -> buffer + event.
-            msg = tokio::time::timeout(config.keepalive_idle, conn.next_line_relayable()) => match msg {
-                Ok(Ok(Some(RelayEvent::Line { message: parsed, raw }))) => {
+            msg = silence.bound(conn.next_line_relayable()) => match msg {
+                Some(Ok(Some(RelayEvent::Line { message: parsed, raw }))) => {
                     awaiting_keepalive = false;
+                    silence.restart();
                     // Keepalive filtering applies only to lines we could parse;
                     // a line that didn't parse (a non-UTF-8 body, say) is never
                     // a PING and is simply relayed. A bad line must not drop the
@@ -543,27 +600,25 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                     //
                     // A send with zero subscribers is fine — the driver
                     // is always-on regardless of attach.
-                    let before = ends.irc_session_snapshot();
-                    ends.emit_line(raw);
-                    if let (Some(before), Some(session)) =
-                        (before, ends.irc_session_snapshot())
-                    {
-                        // QUIT clears live membership for attached-client state,
-                        // but the reconnect intent survives a transport drop.
-                        // JOIN/PART/KICK deltas update that intent without an
-                        // unrelated numeric erasing channels still awaiting
-                        // confirmation on this new session.
-                        let quit = parsed
-                            .as_ref()
-                            .is_some_and(|message| message.command == "QUIT");
-                        shared
-                            .joined
-                            .apply_session_delta(&before, &session, quit);
-                        current_nick = session.nick;
+                    //
+                    // QUIT clears live membership for attached-client state, but
+                    // the reconnect intent survives a transport drop: only a
+                    // confirmed JOIN/PART/KICK changes it, so an unrelated
+                    // numeric cannot erase channels still awaiting confirmation
+                    // on this new session.
+                    let tracked = ends.emit_session_line(raw).and_then(|mut change| {
+                        if let Some(nick) = change.nick.take() {
+                            current_nick = nick;
+                        }
+                        shared.joined.apply(change)
+                    });
+                    if tracked.is_err() {
+                        return dropped(super::NetworkFailure::ChannelLimitExceeded);
                     }
                 }
-                Ok(Ok(Some(RelayEvent::Rejected(rejected)))) => {
+                Some(Ok(Some(RelayEvent::Rejected(rejected)))) => {
                     awaiting_keepalive = false;
+                    silence.restart();
                     // Keep the upstream connection alive, but make the whole-line
                     // loss visible to attached clients and the detached buffer.
                     // A syntactically valid local NOTICE is bounded independently
@@ -573,15 +628,16 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                     ));
                 }
                 // Only a genuine EOF or a real I/O error ends the session.
-                Ok(Ok(None)) | Ok(Err(_)) => {
+                Some(Ok(None)) | Some(Err(_)) => {
                     return dropped(super::NetworkFailure::ConnectionLost);
                 }
-                Err(_) => {
+                None => {
                     // Idle past the keepalive window.
                     if awaiting_keepalive {
                         return dropped(super::NetworkFailure::KeepaliveTimedOut);
                     }
                     awaiting_keepalive = true;
+                    silence.restart();
                     if conn.send_line("PING :e6bnc-keepalive").await.is_err() {
                         return dropped(super::NetworkFailure::UpstreamWriteFailed);
                     }
@@ -890,6 +946,128 @@ mod tests {
             interleave_address_families(vec![v4a, v4b, v6a, v6b]),
             [v4a, v6a, v4b, v6b]
         );
+    }
+
+    fn confirmed(names: &[String]) -> super::super::SessionChange {
+        super::super::SessionChange {
+            joined: names
+                .iter()
+                .map(|name| {
+                    super::super::upstream_identity::ConfirmedChannel::parse(name)
+                        .expect("test channel")
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The intent is kept across sessions, so a hostile upstream confirming a
+    /// different set on each one must hit the same bound the tracker has.
+    #[test]
+    fn reconnect_intent_is_bounded_across_sessions_and_follows_departures() {
+        let joined = JoinedChannels::default();
+        let first: Vec<String> = (0..super::super::MAX_TRACKED_CHANNELS)
+            .map(|index| format!("#session-one-{index}"))
+            .collect();
+        joined.apply(confirmed(&first)).expect("a full set fits");
+        // Re-confirming a rejoined channel on the next session is not growth.
+        joined
+            .apply(confirmed(&["#SESSION-ONE-0".to_string()]))
+            .expect("already intended");
+        assert_eq!(
+            joined.apply(confirmed(&["#session-two-0".to_string()])),
+            Err(super::super::ChannelLimitExceeded)
+        );
+        assert_eq!(
+            joined.0.lock().expect("joined set").len(),
+            super::super::MAX_TRACKED_CHANNELS
+        );
+
+        joined
+            .apply(super::super::SessionChange {
+                left: vec!["#session-one-1".to_string()],
+                ..Default::default()
+            })
+            .expect("a departure cannot exceed the limit");
+        joined
+            .apply(confirmed(&["#session-two-0".to_string()]))
+            .expect("the departure made room");
+    }
+
+    /// Register the real client, with SASL configured, against an upstream that
+    /// answers each expected line prefix with its scripted reply, and return
+    /// the driver's reading of how that ended.
+    async fn sasl_outcome_against(
+        script: &'static [(&'static str, &'static str)],
+    ) -> Result<String, super::super::SessionOutcome> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let upstream = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            for (expected, reply) in script {
+                let line = lines.next_line().await.unwrap().expect("driver line");
+                assert!(line.starts_with(expected), "{line:?} is not {expected:?}");
+                if !reply.is_empty() {
+                    writer
+                        .write_all(format!("{reply}\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
+            // Hold the socket: the outcome must come from what was said.
+            while lines.next_line().await.unwrap().is_some() {}
+        });
+        let mut connection = Connection::connect(&address).await.unwrap();
+        let outcome = registration_outcome(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                connection.register_sasl("bncbot", "real", "account", "secret"),
+            )
+            .await,
+        );
+        drop(connection);
+        upstream.await.expect("scripted upstream");
+        outcome
+    }
+
+    /// The scenario that parked a correctly configured network: the upstream
+    /// offers SASL, but not the mechanism the driver speaks.
+    #[tokio::test]
+    async fn a_missing_sasl_mechanism_is_a_worded_refusal_not_rejected_credentials() {
+        let outcome =
+            sasl_outcome_against(&[("CAP LS", ":up CAP * LS :sasl=EXTERNAL,SCRAM-SHA-256")]).await;
+        let Err(super::super::SessionOutcome::RegistrationRejected(rejection)) = outcome else {
+            panic!("a mechanism the upstream does not offer is not a credential rejection");
+        };
+        assert_eq!(
+            rejection.refusal(),
+            e6irc_client::RegistrationRefusal::SaslUnavailable
+        );
+        assert_eq!(
+            rejection.diagnostic(),
+            "requested PLAIN; the server offers EXTERNAL,SCRAM-SHA-256"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_credentials_keep_the_upstream_reason() {
+        let outcome = sasl_outcome_against(&[
+            ("CAP LS", ":up CAP * LS :sasl=PLAIN"),
+            ("CAP REQ :sasl", ":up CAP * ACK :sasl"),
+            ("AUTHENTICATE PLAIN", "AUTHENTICATE +"),
+            ("NICK ", ""),
+            ("USER ", ""),
+            ("AUTHENTICATE ", ":up 904 * :Invalid password for account"),
+        ])
+        .await;
+        let Err(super::super::SessionOutcome::AuthRejected(Some(rejection))) = outcome else {
+            panic!("a 904 for an offered mechanism is a credential rejection");
+        };
+        assert_eq!(rejection.diagnostic(), "Invalid password for account");
     }
 
     #[test]

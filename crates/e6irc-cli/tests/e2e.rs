@@ -681,3 +681,76 @@ async fn cli_api_hits_rest_endpoints() {
     .unwrap();
     assert!(!out.status.success(), "404 must be a nonzero exit");
 }
+
+/// A server that welcomes the CLI, confirms whatever it joins, and then drops
+/// the connection. Yields every line the CLI sent.
+async fn server_that_drops_after_the_join() -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let served = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = socket.into_split();
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        let mut seen = Vec::new();
+        // A CLI that never joins must not hold the test open.
+        let join_window = std::time::Duration::from_secs(2);
+        while let Ok(Ok(Some(line))) = tokio::time::timeout(join_window, lines.next_line()).await {
+            let reply = match line.split_once(' ') {
+                Some(("CAP", "LS 302")) => ":srv CAP * LS :\r\n".to_string(),
+                Some(("CAP", "END")) => ":srv 001 tailer :Welcome\r\n".to_string(),
+                Some(("JOIN", channel)) => format!(":srv 366 tailer {channel} :End of NAMES\r\n"),
+                _ => String::new(),
+            };
+            writer.write_all(reply.as_bytes()).await.unwrap();
+            let joined = line.starts_with("JOIN ");
+            seen.push(line);
+            if joined {
+                break;
+            }
+        }
+        seen
+    });
+    (address, served)
+}
+
+async fn tail_forever(address: String, target: &'static str) -> std::process::Output {
+    let bin = env!("CARGO_BIN_EXE_e6irc");
+    tokio::task::spawn_blocking(move || {
+        Command::new(bin)
+            .args(["--server", &address, "--nick", "tailer", "tail", target])
+            .output()
+            .expect("run tail")
+    })
+    .await
+    .expect("join")
+}
+
+/// An unbounded tail has no successful end: the only way it stops by itself is
+/// the server going away, and a supervisor must be able to see that.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_tail_forever_fails_when_the_server_drops_the_connection() {
+    let (address, served) = server_that_drops_after_the_join().await;
+    let output = tail_forever(address, "#room").await;
+    served.await.unwrap();
+    assert!(
+        !output.status.success(),
+        "a dropped connection ended an unbounded tail with success"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("closed"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `&` channels are channels: tailing one must join it, not wait in silence
+/// for messages the server will never relay to a non-member.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_tail_joins_a_local_channel() {
+    let (address, served) = server_that_drops_after_the_join().await;
+    tail_forever(address, "&local").await;
+    let seen = served.await.unwrap();
+    assert!(seen.contains(&"JOIN &local".to_string()), "{seen:?}");
+}

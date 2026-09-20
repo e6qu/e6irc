@@ -312,10 +312,11 @@ pub async fn api(
     let response = request.send().await.map_err(transport_error)?;
     let status = response.status();
     let response_body = bounded_body(response, MAX_API_RESPONSE).await?;
-    use std::io::Write as _;
+    use std::io::{IsTerminal as _, Write as _};
     let mut stdout = io::stdout().lock();
-    stdout.write_all(&response_body)?;
-    if !response_body.ends_with(b"\n") {
+    let shown = body_for_stdout(&response_body, stdout.is_terminal());
+    stdout.write_all(&shown)?;
+    if !shown.ends_with(b"\n") {
         stdout.write_all(b"\n")?;
     }
     if status.is_success() {
@@ -328,9 +329,38 @@ pub async fn api(
     }
 }
 
+/// A response body as stdout should receive it. The body is whatever the
+/// server sent, so on a terminal its control characters are neutralized line by
+/// line (the line breaks of a formatted body are kept). Anywhere else the
+/// reader is a program — `e6irc api … | jq`, a file — and gets the exact bytes:
+/// a replacement character there would silently change the data.
+pub(crate) fn body_for_stdout(body: &[u8], stdout_is_terminal: bool) -> std::borrow::Cow<'_, [u8]> {
+    if !stdout_is_terminal {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let text = String::from_utf8_lossy(body);
+    let safe: Vec<String> = text
+        .split('\n')
+        .map(|line| TerminalSafe::from_untrusted(line).to_string())
+        .collect();
+    std::borrow::Cow::Owned(safe.join("\n").into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_api_body_is_neutralized_for_a_terminal_and_exact_for_a_program() {
+        let body = "{\n  \"name\": \"x\u{1b}[2J\u{9b}y\u{7f}\"\r\n}\n".as_bytes();
+        assert_eq!(&*body_for_stdout(body, false), body);
+        let shown = String::from_utf8(body_for_stdout(body, true).into_owned()).unwrap();
+        assert!(
+            !shown.chars().any(|c| c.is_control() && c != '\n'),
+            "{shown:?}"
+        );
+        assert_eq!(shown.matches('\n').count(), 3, "line structure is kept");
+    }
 
     #[test]
     fn origins_and_paths_are_not_ambiguous() {

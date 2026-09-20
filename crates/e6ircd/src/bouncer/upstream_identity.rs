@@ -175,26 +175,54 @@ impl FromStr for UpstreamChannel {
         if value.len() > Self::MAX_BYTES {
             return Err(error("names are limited to 64 bytes"));
         }
-        // RFC 2811 channel prefixes. Requiring one is what excludes `0`, which
-        // an IRC server reads as "leave every channel".
-        if !value.starts_with(['#', '&', '+', '!']) {
-            return Err(error("names must begin with #, &, + or !"));
-        }
-        if value.chars().count() < 2 {
-            return Err(error("names need at least one character after the prefix"));
-        }
-        if value.chars().any(|c| breaks_a_parameter(c) || c == ',') {
-            return Err(error(
-                "names must be one word each, without spaces, commas, or control characters",
-            ));
-        }
+        channel_shape(value).map_err(error)?;
         Ok(Self(value.to_string()))
     }
+}
+
+/// Whether `value` can be exactly one channel in a `JOIN` line, as a reason
+/// when it cannot. Length is each caller's own bound.
+fn channel_shape(value: &str) -> Result<(), &'static str> {
+    // RFC 2811 channel prefixes. Requiring one is what excludes `0`, which
+    // an IRC server reads as "leave every channel".
+    if !value.starts_with(['#', '&', '+', '!']) {
+        return Err("names must begin with #, &, + or !");
+    }
+    if value.chars().count() < 2 {
+        return Err("names need at least one character after the prefix");
+    }
+    if value.chars().any(|c| breaks_a_parameter(c) || c == ',') {
+        return Err("names must be one word each, without spaces, commas, or control characters");
+    }
+    Ok(())
 }
 
 impl fmt::Display for UpstreamChannel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// A channel an upstream confirmed the driver's membership in. The driver puts
+/// it back into a `JOIN` line after a reconnect, so it has the same one-channel
+/// shape as a configured [`UpstreamChannel`]; its length bound is the
+/// protocol's rather than this project's configuration limit, because the name
+/// was chosen on a network whose `CHANNELLEN` may be anything up to RFC 1459's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedChannel(String);
+
+impl ConfirmedChannel {
+    /// RFC 1459 section 1.3: a channel name is at most 200 characters.
+    pub(crate) const MAX_BYTES: usize = 200;
+
+    /// `None` when no IRC server could have meant `value` as one channel.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        (value.len() <= Self::MAX_BYTES && channel_shape(value).is_ok())
+            .then(|| Self(value.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -286,6 +314,25 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_confirmed_channel_has_the_configured_shape_and_the_protocol_length() {
+        let long = format!("#{}", "c".repeat(199));
+        assert_eq!(
+            ConfirmedChannel::parse(&long)
+                .expect("RFC 1459 length")
+                .as_str(),
+            long
+        );
+        assert!(long.parse::<UpstreamChannel>().is_err());
+        for bad in ["0", "", "#", "nick", "#a,#b", "#a key", "#bell\u{7}"] {
+            assert_eq!(ConfirmedChannel::parse(bad), None, "{bad:?}");
+        }
+        assert_eq!(
+            ConfirmedChannel::parse(&format!("#{}", "c".repeat(200))),
+            None
+        );
     }
 
     #[test]

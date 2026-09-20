@@ -105,24 +105,14 @@ async fn connect(config: &MatrixConfig) -> Result<Session, super::ConnectFail> {
         super::bridge_http_client(std::time::Duration::from_secs(60)).map_err(|e| e.to_string())?;
     let base = config.homeserver.trim_end_matches('/').to_string();
 
-    let resp = http
-        .post(format!("{base}/_matrix/client/v3/login"))
-        .json(&LoginRequest::password(&config.user, &config.password))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let login: LoginResponse = match resp.error_for_status() {
-        Ok(r) => r.bounded_json().await?,
-        Err(e) => {
-            let msg = format!("login rejected: {e}");
-            return Err(if super::is_http_auth_rejection(Some(status)) {
-                super::ConnectFail::Auth(msg)
-            } else {
-                super::ConnectFail::Transient(msg)
-            });
-        }
-    };
+    let login: LoginResponse = super::bridge_send_credentials(
+        http.post(format!("{base}/_matrix/client/v3/login"))
+            .json(&LoginRequest::password(&config.user, &config.password)),
+        "login",
+    )
+    .await?
+    .bounded_json()
+    .await?;
     if login.access_token.is_empty() || login.user_id.is_empty() {
         return Err(super::ConnectFail::Transient(
             "login response had an empty access token or user id".into(),

@@ -81,10 +81,7 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
             let token = &config.token;
             async move { fetch_channel_name(http, base, token, &id).await }
         },
-        |id, error| {
-            eprintln!("discord: channel {id} lookup failed: {error}");
-            Dropped(NetworkFailure::UpstreamRequestFailed)
-        },
+        |id, error: super::ConnectFail| error.into_outcome(&format!("discord channel {id}")),
     )
     .await
     {
@@ -161,7 +158,12 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_seq: Option<u64> = None;
     let mut our_id = String::new();
-    let read_timeout = Duration::from_millis(hb_interval.saturating_mul(2).max(60_000));
+    // Two missed heartbeat intervals of gateway silence. The heartbeat tick
+    // below ends a turn of this loop well inside that window, so the window has
+    // to outlive the turn (see `SilenceDeadline`) to ever be reached.
+    let mut silence = super::SilenceDeadline::new(Duration::from_millis(
+        hb_interval.saturating_mul(2).max(60_000),
+    ));
 
     loop {
         tokio::select! {
@@ -170,13 +172,13 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                     return outcome;
                 }
             }
-            text = super::next_bridge_text(&mut read, &mut write, read_timeout, "discord", "gateway", |code| {
+            text = super::next_bridge_text(&mut read, &mut write, &mut silence, "discord", "gateway", |code| {
                 if matches!(code, Some(4004 | 4013 | 4014)) {
                     eprintln!(
                         "discord: gateway closed with fatal auth/intents code {code:?}; \
                          will stop retrying"
                     );
-                    super::SessionOutcome::AuthRejected
+                    super::SessionOutcome::AuthRejected(None)
                 } else {
                     Dropped(NetworkFailure::ConnectionLost)
                 }
@@ -231,19 +233,19 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                     Event::Hello(_) | Event::Ack | Event::Ignore => {}
                 }
             }
-            cmd = ends.next_command() => match cmd {
-                Some(cmd) => {
-                    let routed = super::route_privmsg(&cmd.line, &channel_to_id);
-                    super::relay_routed(ends, routed, "Discord", "channel", |id, text| {
-                        let http = http.clone();
-                        let base = base.clone();
-                        let token = config.token.clone();
-                        async move { send_message(&http, &base, &token, &id, &text).await }
-                    })
-                    .await;
+            cmd = ends.next_command() => {
+                let deliver = |id: String, text: String| {
+                    let (http, base) = (http.clone(), base.clone());
+                    let token = config.token.clone();
+                    async move { send_message(&http, &base, &token, &id, &text).await }
+                };
+                if super::relay_channel_command(ends, cmd, &channel_to_id, "Discord", deliver)
+                    .await
+                    .is_none()
+                {
+                    return super::SessionOutcome::Stopped;
                 }
-                None => return super::SessionOutcome::Stopped, // every handle dropped
-            },
+            }
         }
     }
 }
@@ -475,21 +477,22 @@ async fn fetch_channel_name(
     base: &str,
     token: &str,
     id: &str,
-) -> Result<String, String> {
+) -> Result<String, super::ConnectFail> {
     #[derive(serde::Deserialize)]
     struct ChannelResponse {
         name: String,
     }
 
-    let response: ChannelResponse = super::bridge_send(
+    let response: ChannelResponse = super::bridge_send_credentials(
         http.get(format!("{base}/channels/{id}"))
             .header("Authorization", format!("Bot {token}")),
+        "channel lookup",
     )
     .await?
     .bounded_json()
     .await?;
     if response.name.is_empty() {
-        Err(format!("channel {id} response had an empty name"))
+        Err(format!("channel {id} response had an empty name").into())
     } else {
         Ok(response.name)
     }
@@ -668,6 +671,30 @@ mod tests {
             DEFAULT_API,
             "http://localhost:8080/",
         );
+    }
+
+    /// The channel lookup is the first request that carries the token, so it
+    /// is where a revoked token is first refused. Reading that 401 as a
+    /// transient request failure re-sent the dead token forever, although the
+    /// gateway's own refusal of the same token (4004) already parks the network.
+    #[tokio::test]
+    #[cfg(feature = "slack")]
+    async fn a_token_refused_at_the_channel_lookup_is_rejected_credentials() {
+        use crate::bouncer::NetworkHandle;
+        use crate::bouncer::bridge_oracle::Provider;
+
+        let oracle = crate::bouncer::bridge_oracle::start(Provider::Discord).await;
+        let config = DiscordConfig {
+            token: "revoked-token".into(),
+            api_base: oracle.api_base.clone(),
+            channels: vec!["42".into()],
+            buffer_cap: 10,
+        };
+        let (_handle, mut ends) = NetworkHandle::channels(10);
+        assert!(matches!(
+            session_once(&config, &mut ends).await,
+            crate::bouncer::SessionOutcome::AuthRejected(None)
+        ));
     }
 
     #[tokio::test]
