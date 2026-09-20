@@ -12,12 +12,10 @@ on:
     branches: [main]
     tags: ["v*"]
 
+# Least privilege: every job reads the repository; a job that publishes,
+# signs, or deletes names the additional scopes itself.
 permissions:
   contents: read
-  packages: write
-  id-token: write
-  attestations: write
-  artifact-metadata: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -59,6 +57,12 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@v7.0.0
       - uses: docker/setup-buildx-action@v4.2.0
@@ -118,6 +122,12 @@ jobs:
     needs: [metadata, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@v7.0.0
       - uses: docker/setup-buildx-action@v4.2.0
@@ -162,6 +172,9 @@ jobs:
     needs: [metadata, manifest]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v7.0.0
       - name: Prune old images (keep newest 20 releases)
@@ -260,5 +273,8 @@ jobs:
       - name: Publish versioned assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This job has no checkout, so gh has no git remote to infer the
+          # repository from.
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: gh release create "$TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS --generate-notes --verify-tag --title "e6irc $TAG"

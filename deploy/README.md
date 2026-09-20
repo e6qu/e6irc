@@ -13,10 +13,11 @@ build step exists in the runtime image. The `.github/workflows/release.yml`
 workflow publishes `ghcr.io/e6qu/e6irc:<short-sha>` plus the direct
 `<short-sha>-amd64` and `<short-sha>-arm64` images on every push to `main`.
 It publishes no mutable branch or `latest` tag and retains the newest 20
-release groups, including their untagged provenance/SBOM referrers.
+release groups, including their untagged provenance and
+software-bill-of-materials referrers.
 
 Each architecture digest carries signed GitHub build provenance and an SPDX
-software bill of materials as OCI referrers; the assembled commit-SHA manifest
+software bill of materials as Open Container Initiative referrers; the assembled commit-SHA manifest
 carries signed assembly provenance. Verify them after authenticating `gh` for
 the repository:
 
@@ -74,9 +75,19 @@ reverse proxy or an explicit, reviewed service override.
 file from environment at container start, validates it with `e6ircd
 check-config`, then starts the daemon (the deployment injects secrets —
 `E6IRC_DATABASE_URL`, `E6IRC_OIDC_CLIENT_SECRET` — from AWS Secrets Manager)
-and then execs the server. The generated file has mode `0600`; when no explicit
-path is supplied its name is unpredictable. Missing required values fail the
-container loudly rather than starting half-configured. On the first database-backed start,
+and then execs the server. The generated file has mode `0600`. Without
+`E6IRC_CONFIG_PATH` it is a fresh `mktemp` file under `TMPDIR` whose name
+cannot be predicted; set `E6IRC_CONFIG_PATH` to a path the `e6irc` user (UID
+10001) can write whenever something else must find the file, as
+`e6ircd rotate-secrets` does below. Missing required values fail the
+container loudly rather than starting half-configured, and so do two kinds of
+unrenderable value, each refused by variable name without printing the value: a
+control character anywhere in a variable (typically the carriage return or
+newline of a line pasted into a secret store), and an `E6IRC_SECURE_COOKIES`
+that is not exactly `true` or `false`. Empty fields in `E6IRC_ADMIN_ACCOUNTS`
+(a trailing or doubled comma) name no account. If the rendered file still does
+not parse, `e6ircd check-config` reports the line, column, and reason and never
+quotes the line, which may hold a secret. On the first database-backed start,
 operational values are imported into the revisioned `server_settings` row.
 After that, administrators manage them at `/console/configuration`; the
 database URL, secrets-key source, HTTP bind, immutable release revision, and
@@ -101,26 +112,35 @@ configured, the next start seals and imports them atomically.
 | `E6IRC_SERVER_NAME` | yes | IRC server name, e.g. `e6irc.dev.e6qu.dev` |
 | `E6IRC_PUBLIC_URL` | yes | External base URL; OIDC redirect + post-logout base |
 | `E6IRC_DATABASE_URL` | yes (secret) | PostgreSQL URL (`fck-rds` tenant) |
+| `APPLICATION_RELEASE_REVISION` | yes | The deployed revision, shown on the console's configuration page and on the authenticated identity page Shauth's browser validator reads. With the `shauth` provider configured it must be 12–64 lowercase hexadecimal digits or `sha256:` plus 64 of them; the image tag's short SHA qualifies |
 | `E6IRC_SECRET_KEY` | for credential storage (secret) | Base64 32-byte primary key; new managed and account-network credentials are sealed with it |
 | `E6IRC_PREVIOUS_SECRET_KEYS` | only during rotation (secret) | Comma-separated old keys accepted for reads until `e6ircd rotate-secrets` commits |
 | `E6IRC_NETWORK_NAME` | no (`e6qu`) | IRC network name |
 | `E6IRC_HTTP_ADDR` | no (`0.0.0.0:8080`) | HTTP/REST/WebSocket listen address |
 | `E6IRC_IRC_ADDR` | no (`127.0.0.1:6667`) | Raw IRC listener — loopback only; IRC is reached over WebSocket (`/ws/irc`) publicly |
-| `E6IRC_SECURE_COOKIES` | no (`true`) | Mark session cookies `Secure` |
-| `E6IRC_ADMIN_ACCOUNTS` | no | Comma-separated admin account names |
+| `E6IRC_SECURE_COOKIES` | no (`true`) | Mark session cookies `Secure`; exactly `true` or `false` |
+| `E6IRC_ADMIN_ACCOUNTS` | no | Comma-separated admin account names; empty fields are ignored |
 | `E6IRC_BOOTSTRAP_TOKEN` | no (secret; 32–512 bytes) | One-time browser token for creating the first durable administrator on an empty account store |
 | `E6IRC_OIDC_ISSUER` | no | Shauth issuer, e.g. `https://auth.dev.e6qu.dev` (enables SSO) |
 | `E6IRC_OIDC_CLIENT_ID` | with issuer | Shauth OIDC client id, e.g. `e6irc-dev` |
 | `E6IRC_OIDC_CLIENT_SECRET` | with issuer (secret) | Shauth OIDC client secret |
 | `E6IRC_OIDC_NAME` | no (`shauth`) | Provider name (URL segment) |
-| `E6IRC_OIDC_END_SESSION` | with issuer | RP-initiated logout endpoint, e.g. `https://auth.dev.e6qu.dev/oauth2/sessions/logout` |
+| `E6IRC_OIDC_END_SESSION` | with issuer | Relying-party-initiated logout endpoint, e.g. `https://auth.dev.e6qu.dev/oauth2/sessions/logout` |
+| `E6IRC_OIDC_ACCOUNT_CLAIM` | no (`preferred_username`) | ID-token claim that names the e6irc account: `preferred_username` or `email` |
+| `E6IRC_OIDC_TOKEN_AUTH` | no (`client_secret_post`) | How the client authenticates at the token endpoint: `client_secret_post` (how Shauth registers managed applications) or `client_secret_basic`. It belongs to the client registration, so discovery cannot report it |
+| `E6IRC_CONFIG_PATH` | no (a fresh `mktemp` file under `TMPDIR`) | Where the rendered configuration is written, mode `0600`; must be writable by the `e6irc` user |
+| `E6IRC_BINARY` | no (`/usr/local/bin/e6ircd`) | The daemon the entrypoint validates the configuration with and then executes; the entrypoint's own test substitutes a probe here |
 
 ### Rotate the credential key
 
 Install a newly generated key as `E6IRC_SECRET_KEY`, retain the old value in
 `E6IRC_PREVIOUS_SECRET_KEYS`, and restart the service. The new process can read
-both generations but writes only with the new primary. With the same
-environment and generated config, run:
+both generations but writes only with the new primary. The command needs the
+same environment and the same rendered configuration as the running daemon, so
+deploy with `E6IRC_CONFIG_PATH` set to a stable path (for example
+`/tmp/e6ircd.toml`; the default name cannot be predicted) and run it inside the
+running container, where a `docker exec` or ECS Exec session inherits that
+environment:
 
 ```sh
 e6ircd rotate-secrets --config "$E6IRC_CONFIG_PATH"
@@ -130,6 +150,15 @@ The command re-seals managed configuration and every account-network
 credential in one PostgreSQL transaction and writes a redacted audit record.
 It exits nonzero and rolls the whole transaction back if any value cannot be
 proven readable. After success, remove `E6IRC_PREVIOUS_SECRET_KEYS` and restart.
+
+## Stop timeout
+
+On SIGTERM the daemon stops accepting work and flushes buffered writes to
+PostgreSQL for at most 30 seconds. Give the container at least 35 seconds
+before it is killed, as `e6ircd.service` does: `stopTimeout: 35` (or more) in
+the ECS container definition, `docker stop --time 35`, or
+`stop_grace_period: 35s` in Compose. The Docker default of 10 seconds and the
+ECS default of 30 can both kill a shutdown that was still flushing cleanly.
 
 ## SSO endpoints (served by e6ircd)
 

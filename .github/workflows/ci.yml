@@ -26,10 +26,21 @@ jobs:
       - run: tools/check-systemd-unit.sh
       - run: tools/test-docker-entrypoint.sh
       - run: tools/test-backup-restore.sh
-      - run: bash -n tools/load/sweep.sh tools/load/qualify-arguments.sh tools/load/qualify-linux.sh tools/test-load-qualification-arguments.sh tools/test-qualification.sh tools/qualification/*.sh
+      # One script per invocation: `-n` parses only its first operand, and the
+      # rest would become that script's positional parameters, unread.
+      - name: Shell syntax
+        run: |
+          for script in tools/*.sh tools/*/*.sh deploy/*.sh; do
+            case "$(head -n 1 "$script")" in
+              '#!/bin/sh'*) sh -n "$script" ;;
+              *) bash -n "$script" ;;
+            esac
+          done
       - run: tools/test-load-qualification-arguments.sh
+      - run: tools/test-load-sweep.sh
       - run: tools/test-qualification.sh
       - run: tools/test-check-migration-integrity.sh
+      - run: tools/test-check-no-defer.sh
       - name: Migration integrity
         run: |
           git fetch --no-tags --depth=1 origin main
@@ -73,11 +84,11 @@ jobs:
       - run: python3 tools/check-api-first-inventory.py
       # No-deferral guard (AGENTS.md): BUGS.md must stay empty and no
       # file-it-for-later idiom may be added to PLAN.md. The checkout is
-      # shallow, so fetch main to diff the PLAN.md additions against; the guard
-      # still checks BUGS.md if the fetch is unavailable.
+      # shallow, so fetch main to diff the PLAN.md additions against. A failed
+      # fetch fails the step: without the base the additions go unexamined.
       - name: No-deferral guard
         run: |
-          git fetch --no-tags --depth=1 origin main 2>/dev/null || true
+          git fetch --no-tags --depth=1 origin main
           tools/check-no-defer.sh FETCH_HEAD
 
   deny:
@@ -179,6 +190,9 @@ jobs:
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
       - run: cargo test -p e6ircd --test ws_ui -- --ignored --test-threads=1
+        env:
+          E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
+      - run: cargo test -p e6ircd --test ws_scope -- --ignored --test-threads=1
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
       - name: Start dex (mock connector)

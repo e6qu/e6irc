@@ -55,6 +55,17 @@ async function expectStatus(page, pattern) {
   assert.match(await banner.innerText(), pattern);
 }
 
+// End only e6irc's session, as the application's own script would: the POST
+// is cookie-authenticated, so it carries the session-bound CSRF value.
+async function endApplicationSession(request) {
+  const identity = await request.get(`${applicationOrigin}/api/v1/me`);
+  assert.equal(identity.status(), 200, await identity.text());
+  const logout = await request.post(`${applicationOrigin}/api/v1/auth/logout`, {
+    headers: { "X-E6IRC-CSRF": (await identity.json()).csrf_token },
+  });
+  assert.equal(logout.status(), 204, await logout.text());
+}
+
 async function waitForConfigurationServerName(page, value) {
   await page.waitForFunction(
     (expected) => document.querySelector('form.settings-form input[name="server_name"]')?.value === expected,
@@ -448,7 +459,7 @@ try {
   ]);
   assert.equal(passwordResponse.status(), 204);
   await expectStatus(page, /Local password added/);
-  assert.equal((await context.request.post(`${applicationOrigin}/api/v1/auth/logout`)).status(), 204);
+  await endApplicationSession(context.request);
   await page.goto(`${applicationOrigin}/login`);
   await page.getByLabel("Account", { exact: true }).fill(accountName);
   await page.getByLabel("Password", { exact: true }).fill("browser-local-password");
@@ -673,6 +684,12 @@ try {
     });
     const row = section.locator("article, .compact-list > div").filter({ hasText: item });
     await row.getByRole("button", { name: "Remove" }).click();
+    // Removing a provider locks out everyone who signs in through it, so the
+    // console asks first, naming what it is about to remove.
+    const removal = page.getByRole("dialog", { name: "Confirm action", exact: true });
+    await removal.waitFor();
+    assert.match(await removal.innerText(), new RegExp(`Remove .*${item}\\?`));
+    await removal.getByRole("button", { name: "Remove", exact: true }).click();
     await expectStatus(page, new RegExp(outcome));
   }
   // The success banner is rendered before the API-hydrated revision text on
@@ -1077,7 +1094,7 @@ try {
   await page.locator('input[name="autojoin"]').fill("#journey");
   await page.locator('input[name="tls"]').uncheck();
   const preflightResponse = page.waitForResponse(
-    (response) => response.url() === `${applicationOrigin}/api/v1/me/networks/preflight`
+    (response) => response.url() === `${applicationOrigin}/api/v1/me/network-preflight`
       && response.request().method() === "POST",
     { timeout: 45_000 },
   );
@@ -1748,7 +1765,7 @@ try {
   await page.getByRole("button", { name: "Retry now" }).waitFor();
   await page.getByRole("button", { name: "Retry now" }).click();
   await manualReconnect;
-  await page.getByText("demo: upstream connected", { exact: true }).waitFor();
+  await page.getByText("demo: connected", { exact: true }).waitFor();
   assert.equal(socketConnections, 2, "manual retry created exactly one replacement socket");
 
   // Inactive conversations distinguish ordinary unread traffic from messages
@@ -1966,7 +1983,7 @@ try {
   // intact. Opening the application entry goes to the login page; clicking
   // the provider link restores access without prompting at the provider
   // (the IdP session is still valid).
-  assert.equal((await context.request.post(`${applicationOrigin}/api/v1/auth/logout`)).status(), 204);
+  await endApplicationSession(context.request);
   assert.equal((await context.request.get(`${applicationOrigin}/api/v1/me`)).status(), 401);
   await page.goto(`${applicationOrigin}/`);
   assert.equal(page.url(), `${applicationOrigin}/login`);
@@ -1981,7 +1998,7 @@ try {
 
   // The provider's registered post-logout return is public, persistent, and
   // recoverable through the application's own OIDC starter after a reload.
-  assert.equal((await context.request.post(`${applicationOrigin}/api/v1/auth/logout`)).status(), 204);
+  await endApplicationSession(context.request);
   await page.goto(`${applicationOrigin}/auth/signed-out`);
   await page.getByRole("heading", { name: "You are signed out" }).waitFor();
   let signIn = page.getByRole("link", { name: "Sign in with dex" });

@@ -2,7 +2,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use e6ircd::config::Config;
+use e6ircd::config::{Config, ConfigError};
 use e6ircd::net;
 use e6ircd::secret::SecretKey;
 
@@ -52,10 +52,55 @@ fn load_config_or_fail(args: &[String], context: &str) -> Result<Config, ExitCod
             return Err(ExitCode::FAILURE);
         }
     };
-    Config::load(&config_path).map_err(|e| {
-        eprintln!("{context}: {e} ({})", config_path.display());
+    Config::load(&config_path).map_err(|error| {
+        let failure = match error {
+            ConfigError::Parse(parse) => {
+                describe_parse_error(parse, std::fs::read_to_string(&config_path).ok().as_deref())
+            }
+            other => other.to_string(),
+        };
+        eprintln!("{context}: {failure} ({})", config_path.display());
         ExitCode::FAILURE
     })
+}
+
+/// Report an unparsable configuration by position and reason. The parser's own
+/// rendering quotes the offending source line, and in this file that line is as
+/// likely to hold the database URL or a client secret as anything else — a
+/// carriage return pasted with the value is enough to make it the failing one.
+fn describe_parse_error(mut error: toml::de::Error, source: Option<&str>) -> String {
+    let position = match (error.span(), source) {
+        (Some(span), Some(source)) => {
+            let (line, column) = line_and_column(source, span.start);
+            format!("line {line}, column {column}: ")
+        }
+        (Some(span), None) => format!("byte {}: ", span.start),
+        (None, _) => String::new(),
+    };
+    // Detached from its input the error renders its reason and, for a value of
+    // the wrong shape, the key it belongs to — and no excerpt.
+    error.set_input(None);
+    let reason = error.to_string();
+    format!(
+        "invalid config: {position}{}",
+        reason.trim_end().replace('\n', " ")
+    )
+}
+
+/// One-based line and column of a byte offset, counting columns in characters.
+/// An offset at or past the end (an unterminated value) lands on the last line.
+fn line_and_column(source: &str, offset: usize) -> (usize, usize) {
+    let before = &source.as_bytes()[..offset.min(source.len())];
+    let line_start = before
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |newline| newline + 1);
+    let line = before.iter().filter(|&&byte| byte == b'\n').count() + 1;
+    let column = String::from_utf8_lossy(&before[line_start..])
+        .chars()
+        .count()
+        + 1;
+    (line, column)
 }
 
 /// Atomically re-seal every database-owned credential with the configured
@@ -249,5 +294,53 @@ async fn wait_for_shutdown_signal() {
         tokio::signal::ctrl_c()
             .await
             .expect("install Ctrl-C handler for graceful shutdown");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_failure(source: &str) -> String {
+        let error = toml::from_str::<Config>(source).expect_err("unparsable configuration");
+        describe_parse_error(error, Some(source))
+    }
+
+    #[test]
+    fn a_parse_failure_names_the_position_and_never_quotes_the_line() {
+        let pasted_with_carriage_return = "server_name = \"irc.example.test\"\n[database]\n\
+             url = \"postgres://user:hunter2@db.example.test/e6irc\r\"\n";
+        let failure = parse_failure(pasted_with_carriage_return);
+        assert!(
+            failure.starts_with("invalid config: line 3, column 53: "),
+            "{failure}"
+        );
+        assert!(!failure.contains("hunter2"), "{failure}");
+        assert!(!failure.contains('\n'), "{failure}");
+
+        let unterminated = "server_name = \"irc.example.test\"\ntoken = \"hunter2";
+        let failure = parse_failure(unterminated);
+        assert!(failure.starts_with("invalid config: line 2, "), "{failure}");
+        assert!(!failure.contains("hunter2"), "{failure}");
+    }
+
+    #[test]
+    fn a_wrongly_shaped_value_names_its_key() {
+        let failure = parse_failure("server_name = \"irc.example.test\"\nnetwork_name = 7\n");
+        assert!(failure.contains("line 2, column 16"), "{failure}");
+        assert!(failure.contains("expected a string"), "{failure}");
+
+        let error = toml::from_str::<Config>("server_name = \"irc.example.test\"\n")
+            .expect_err("a required field is missing");
+        let failure = describe_parse_error(error, None);
+        assert!(failure.contains("missing field"), "{failure}");
+    }
+
+    #[test]
+    fn columns_count_characters_and_offsets_past_the_end_stay_on_the_last_line() {
+        assert_eq!(line_and_column("", 0), (1, 1));
+        assert_eq!(line_and_column("a = 1\nb = 2", 6), (2, 1));
+        assert_eq!(line_and_column("a = \"é\" x", 9), (1, 9));
+        assert_eq!(line_and_column("a = 1\nb = \"", 99), (2, 6));
     }
 }

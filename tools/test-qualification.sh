@@ -34,7 +34,7 @@ run() {
     oidc) target=https://issuer.example.test ;;
     public-irc) target=libera ;;
     scale)
-      local output= argument=
+      local output='' argument=''
       for argument in "$@"; do
         if [[ "$output" == --output ]]; then
           output="$argument"
@@ -129,7 +129,10 @@ if "$bin" verify "$temporary/noncanonical-source.json" --source aaaaaaaaaaaaaaaa
   echo 'noncanonical source revision unexpectedly verified' >&2
   exit 1
 fi
-! find "$temporary" -name '*.probe.json' -print -quit | grep -q .
+if find "$temporary" -name '.e6irc-qualification-*' -print -quit | grep -q .; then
+  echo 'a campaign left its private probe-report directory behind' >&2
+  exit 1
+fi
 
 occupied="$temporary/occupied.json"
 printf '%s' retained >"$occupied"

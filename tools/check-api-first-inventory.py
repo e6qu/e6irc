@@ -50,16 +50,185 @@ def documented_operations(source: str) -> set[tuple[str, str]]:
     }
 
 
-def console_operations(source: str) -> set[tuple[str, str]]:
-    routes = re.findall(r'apiRoute\((?P<args>[^)]*)\)', source)
+METHODS = r"GET|POST|PUT|PATCH|DELETE"
+URL_LITERAL = r'["`](/api/v1[^"`\n]*)["`]'
+CALL_SITE = re.compile(
+    r"\b(?:apiMutation|apiOperation)\((?P<args>[^()]*(?:\([^()]*\)[^()]*)*)\)"
+)
+# The shapes in which console.js states a method and a URL together.
+DIRECT_OPERATION = re.compile(
+    rf'\b(?:apiMutation|apiOperation)\(\s*"({METHODS})"\s*,\s*{URL_LITERAL}\s*\)'
+)
+NAMED_URL_OPERATION = re.compile(
+    rf'\b(?:apiMutation|apiOperation)\(\s*"({METHODS})"\s*,\s*([A-Za-z_$][\w$]*)\s*\)'
+)
+WRAPPED_OPERATION = re.compile(rf'{URL_LITERAL}\s*,\s*"({METHODS})"')
+READ_OPERATION = re.compile(rf"\bapiRead\(\s*{URL_LITERAL}")
+
+# A wrapper whose method is fixed in its body and whose URL is its second
+# argument: `WRAPPER(form, URL, ...)` is that method on URL.
+FIXED_METHOD_WRAPPERS = {"mutateSession": "DELETE"}
+
+# A `${...}` that stands for one of a closed set of literal path segments
+# rather than for a route parameter. Each value must still appear, quoted, in
+# console.js, so renaming one there fails here.
+SEGMENT_VARIABLES = {"route": ("networks", "opers", "oidc-providers")}
+
+# `/api/v1` literals that are not request URLs.
+NON_ROUTE_LITERALS = {
+    "/api/v1/": "the prefix apiOperation requires of every URL before it is sent",
+}
+
+# apiMutation/apiOperation call sites whose method or URL is not a literal at
+# the call, as `arguments: (count, reason)`. The count is exact, so a new site
+# of the same shape fails the gate until its operation is accounted for here.
+UNRESOLVED_CALL_SITES = {
+    '"GET", url': (1, "the body of apiRead; every apiRead(URL) is checked as GET"),
+    '"DELETE", url': (1, "the body of mutateSession; see FIXED_METHOD_WRAPPERS"),
+    "method, url": (
+        4,
+        "the bodies of mutateConfiguration, mutateBan, mutateOwnerNetwork and "
+        "mutateChannel; each caller's literal URL and method are checked as a pair",
+    ),
+    "method, form.action": (
+        2,
+        "the bodies of mutateAccount and mutateAdminAccount; the URL is a "
+        "template form action, which is checked against the mutating routes",
+    ),
+    '"PATCH", form.action': (
+        1,
+        "the administrator network toggle, whose form console.js builds with the "
+        "literal action /api/v1/admin/networks/{owner}/{name}, checked as a path",
+    ),
+}
+
+
+def normalized_path(url: str) -> list[str]:
+    """The documented-route spellings a console URL literal can stand for."""
+
+    path = url.split("?", 1)[0]
+    # `...audit${window.location.search}`: glued to a segment, it is the query.
+    path = re.sub(r"(?<=[^/])\$\{[^}]*\}$", "", path)
+    paths = [path]
+    for variable, values in SEGMENT_VARIABLES.items():
+        marker = "/${" + variable + "}"
+        paths = [
+            candidate.replace(marker, "/" + value) if marker in candidate else candidate
+            for candidate in paths
+            for value in (values if marker in candidate else ("",))
+        ]
+    return [re.sub(r"\$\{[^}]*\}", "{param}", candidate) for candidate in paths]
+
+
+def route_pattern(path: str) -> str:
+    return re.sub(r"\{[^}]*\}", "{param}", path)
+
+
+def named_url(source: str, position: int, name: str) -> str | None:
+    """The literal a `const NAME = URL;` just above `position` binds, if any."""
+
+    preceding = source[:position].splitlines()[-12:]
+    for line in reversed(preceding):
+        if re.search(rf"\(([^()]*\b)?{re.escape(name)}\b[^()]*\)\s*=>", line):
+            return None  # NAME is a parameter here, not a local literal.
+        bound = re.search(rf"\bconst {re.escape(name)} = {URL_LITERAL};", line)
+        if bound:
+            return bound.group(1)
+    return None
+
+
+def console_operations(source: str, errors: list[str]) -> set[tuple[str, str]]:
+    """Every (method, URL) pair console.js states, and every call it does not."""
+
     operations: set[tuple[str, str]] = set()
-    for args in routes:
-        values = re.findall(r'"([^\"]+)"', args)
-        if not values:
-            continue
-        path, *methods = values
-        operations.update((path, method) for method in methods)
+    resolved_sites: set[int] = set()
+    for match in DIRECT_OPERATION.finditer(source):
+        operations.add((match.group(1), match.group(2)))
+        resolved_sites.add(match.start())
+    for match in NAMED_URL_OPERATION.finditer(source):
+        url = named_url(source, match.start(), match.group(2))
+        if url is not None:
+            operations.add((match.group(1), url))
+            resolved_sites.add(match.start())
+    for match in WRAPPED_OPERATION.finditer(source):
+        operations.add((match.group(2), match.group(1)))
+    for match in READ_OPERATION.finditer(source):
+        operations.add(("GET", match.group(1)))
+    for wrapper, method in FIXED_METHOD_WRAPPERS.items():
+        callers = re.finditer(rf"\b{wrapper}\(\s*[\w$]+\s*,\s*{URL_LITERAL}", source)
+        operations.update((method, caller.group(1)) for caller in callers)
+
+    unresolved: dict[str, int] = {}
+    for site in CALL_SITE.finditer(source):
+        if site.start() not in resolved_sites:
+            arguments = " ".join(site.group("args").split())
+            unresolved[arguments] = unresolved.get(arguments, 0) + 1
+    for arguments in sorted(set(unresolved) | set(UNRESOLVED_CALL_SITES)):
+        expected = UNRESOLVED_CALL_SITES.get(arguments, (0, ""))[0]
+        found = unresolved.get(arguments, 0)
+        if found != expected:
+            errors.append(
+                f"console.js has {found} operation call(s) of the form "
+                f"apiMutation({arguments}) that cannot be checked statically; "
+                f"{expected} are accounted for in UNRESOLVED_CALL_SITES"
+            )
     return operations
+
+
+def check_console_contract(source: str, router: str, templates) -> list[str]:
+    """Match what console.js and its forms request against the route table."""
+
+    errors: list[str] = []
+    documented = {
+        (route_pattern(path), method) for path, method in documented_operations(router)
+    }
+    documented_paths = {path for path, _ in documented}
+    mutating_paths = {path for path, method in documented if method != "GET"}
+    if not documented:
+        errors.append("no documented /api/v1 operation was found in the router")
+
+    operations = console_operations(source, errors)
+    if not operations:
+        errors.append("no console operation was extracted: this check would be vacuous")
+    for method, url in sorted(operations):
+        if not any((path, method) in documented for path in normalized_path(url)):
+            errors.append(
+                f"console operation is absent from the public API contract: {method} {url}"
+            )
+        elif len(normalized_path(url)) > 1:
+            for path in normalized_path(url):
+                if (path, method) not in documented:
+                    errors.append(
+                        f"console operation is absent from the public API contract: "
+                        f"{method} {path} (from {url})"
+                    )
+
+    for url in sorted(set(re.findall(URL_LITERAL, source))):
+        if url in NON_ROUTE_LITERALS:
+            continue
+        for path in normalized_path(url):
+            if path not in documented_paths:
+                errors.append(f"console URL is not a documented API route: {url}")
+    for literal in sorted(NON_ROUTE_LITERALS):
+        if f'"{literal}"' not in source:
+            errors.append(f"NON_ROUTE_LITERALS names {literal}, which console.js no longer has")
+    for variable, values in SEGMENT_VARIABLES.items():
+        for value in values:
+            if f'"{value}"' not in source:
+                errors.append(
+                    f'SEGMENT_VARIABLES gives ${{{variable}}} the value "{value}", '
+                    "which console.js no longer names"
+                )
+
+    for template, form in templates:
+        action = form.get("action", "")
+        if api_markers(form) and action.startswith("/api/v1/"):
+            if route_pattern(re.sub(r"\{\{[^}]*\}\}", "{param}", action)) not in mutating_paths:
+                errors.append(
+                    f"console form posts to a route with no documented mutation: "
+                    f"{template.name}: {action}"
+                )
+    return errors
 
 
 def uses_only_declared_mutations(source: str) -> bool:
@@ -97,12 +266,10 @@ def main() -> int:
         print("console mutation bypasses the declared operation boundary", file=sys.stderr)
         failures = True
 
-    documented = documented_operations(ROUTER.read_text(encoding="utf-8"))
-    for path, method in sorted(console_operations(asset) - documented):
-        print(
-            f"console mutation is absent from the public API contract: {method} {path}",
-            file=sys.stderr,
-        )
+    for error in check_console_contract(
+        asset, ROUTER.read_text(encoding="utf-8"), template_mutations()
+    ):
+        print(error, file=sys.stderr)
         failures = True
 
     for template, form in template_mutations():
