@@ -8,7 +8,7 @@
         <form class="network-form" method="post" data-api-owner-network-update hidden>
           <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
           <label class="field field-wide"><span>Nickname</span><input name="nick" autocomplete="nickname" maxlength="64" required /></label>
-          <label class="field"><span>NickServ account <em>optional</em></span><input name="sasl_account" autocomplete="username" maxlength="255" data-sasl-account /></label>
+          <label class="field"><span>NickServ account <em>optional</em></span><input name="sasl_account" autocomplete="off" maxlength="255" data-sasl-account /></label>
           <label class="field"><span>New NickServ password <em>optional</em></span><input type="password" name="sasl_password" autocomplete="new-password" maxlength="512" data-sasl-password /><small>Leave blank to keep the stored password.</small></label>
           <label class="check field-wide"><input type="checkbox" name="clear_sasl" data-sasl-clear /><span><strong>Remove the stored account and password</strong></span></label>
           <label class="field field-wide"><span>Channels to join <em>optional</em></span><input name="autojoin" autocomplete="off" /><small>Comma-separated channel names.</small></label>

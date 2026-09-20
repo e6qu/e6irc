@@ -50,7 +50,7 @@
           </label>
           <label class="field">
             <span>NickServ account <em>optional</em></span>
-            <input name="sasl_account" autocomplete="username" value="{{ form.sasl_account }}" maxlength="255" {% if !can_store_secrets %}disabled{% endif %} />
+            <input name="sasl_account" autocomplete="off" value="{{ form.sasl_account }}" maxlength="255" {% if !can_store_secrets %}disabled{% endif %} />
           </label>
           <label class="field">
             <span>NickServ password <em>optional</em></span>

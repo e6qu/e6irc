@@ -34,7 +34,7 @@
             <input type="hidden" name="kind" value="{{ p.meta.feature }}" />
             <label class="field"><span>Name</span><input name="name" placeholder="{{ p.meta.feature }}-main" required /></label>
             <label class="field"><span>Homeserver / API base {% if !p.meta.addr_required %}<em>optional</em>{% endif %}</span><input name="addr" placeholder="{% if p.meta.addr_required %}https://chat.example.com{% else %}Provider default{% endif %}" {% if p.meta.addr_required %}required{% endif %} /></label>
-            {% if p.meta.needs_nick %}<label class="field"><span>Provider user</span><input name="nick" autocomplete="username" required /></label>{% endif %}
+            {% if p.meta.needs_nick %}<label class="field"><span>Provider user</span><input name="nick" autocomplete="off" required /></label>{% endif %}
             {% if p.meta.needs_account %}<label class="field"><span>{{ p.meta.account_label }}</span><input type="password" name="sasl_account" autocomplete="new-password" required /></label>{% endif %}
             <label class="field"><span>{{ p.meta.password_label }}</span><input type="password" name="sasl_password" autocomplete="new-password" required /></label>
             <label class="field"><span>Rooms / channel IDs</span><input name="autojoin" placeholder="comma-separated" /></label>

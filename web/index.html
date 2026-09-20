@@ -140,7 +140,7 @@
 
           <label class="field">
             <span>Nickname</span>
-            <input id="nf-nick" name="nick" required maxlength="32" autocomplete="username" />
+            <input id="nf-nick" name="nick" required maxlength="64" autocomplete="off" />
           </label>
 
           <fieldset id="nf-credentials">
@@ -152,7 +152,7 @@
 
             <label class="field">
               <span>NickServ account</span>
-              <input id="nf-sasl-account" name="sasl_account" maxlength="255" autocomplete="username" />
+              <input id="nf-sasl-account" name="sasl_account" maxlength="255" autocomplete="off" />
             </label>
 
             <label class="field">
@@ -163,8 +163,11 @@
                   name="sasl_password"
                   type="password"
                   maxlength="512"
-                  autocomplete="current-password"
+                  autocomplete="new-password"
                 />
+                <!-- new-password, not current-password: the only credential a
+                     browser holds for this origin is the e6irc login, and
+                     offering it here would send it to a third-party network. -->
                 <!-- A pasted password cannot be checked any other way, and this
                      is exactly where a silent typo costs a failed SASL round
                      trip that reads as "wrong credentials". -->

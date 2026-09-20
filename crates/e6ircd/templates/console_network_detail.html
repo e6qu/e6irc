@@ -43,8 +43,8 @@
       </div>
       <form class="network-form" method="post" data-api-network-account-save>
         <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-        <label class="field"><span>NickServ account</span><input name="sasl_account" autocomplete="username" maxlength="255" required /></label>
-        <label class="field"><span>NickServ password</span><input type="password" name="sasl_password" autocomplete="current-password" maxlength="200" required /></label>
+        <label class="field"><span>NickServ account</span><input name="sasl_account" autocomplete="off" maxlength="255" required /></label>
+        <label class="field"><span>NickServ password</span><input type="password" name="sasl_password" autocomplete="new-password" maxlength="512" required /></label>
         <div class="form-actions field-wide"><button class="primary" type="submit">Save and reconnect</button></div>
       </form>
       <details class="advanced account-registration" data-network-account-registration>
