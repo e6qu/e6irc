@@ -1494,7 +1494,9 @@ async fn a_dropped_dial_between_refusals_does_not_reset_the_park_count() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        for dial in 1.. {
+        // Five refusals and the one dropped dial between them; the driver parks
+        // after the sixth and never dials again.
+        for dial in 1..=6 {
             let mut session = fake_accept(&listener).await;
             if dial == 3 {
                 // Closed before a single line: a transient drop, not a refusal.
