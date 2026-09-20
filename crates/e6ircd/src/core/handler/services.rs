@@ -359,7 +359,17 @@ pub(crate) fn emit_chanserv_register_result(
     result: crate::core::state::ChanServRegisterResult,
     label: Option<String>,
 ) {
-    state.emit_deferred_labeled(conn, label, |state| match result {
+    state.emit_deferred_labeled(conn, label, |state| {
+        emit_chanserv_register_result_now(state, conn, result)
+    });
+}
+
+fn emit_chanserv_register_result_now(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChanServRegisterResult,
+) {
+    match result {
         crate::core::state::ChanServRegisterResult::NotChannelOperator { channel } => state
             .service_notice(
                 conn,
@@ -390,7 +400,7 @@ pub(crate) fn emit_chanserv_register_result(
             "ChanServ",
             "Services are temporarily unavailable. Try again later.",
         ),
-    });
+    }
 }
 
 pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, args: &[&str]) {
@@ -408,22 +418,25 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
             ) else {
                 return;
             };
+            let owner = state.channel_owner(channel);
+            let label = state.channel_reply_label(conn, &owner);
             let command = crate::core::state::ChannelCommand::new(
-                state.channel_owner(channel),
+                owner,
                 state.channel_actor(conn),
                 channel.to_string(),
                 crate::core::state::ChannelCommandOperation::ChanServRegister,
-                state
-                    .capture
-                    .as_ref()
-                    .and_then(|capture| capture.label.clone()),
+                label,
             );
-            if state.owns_channel(command.owner()) {
-                crate::core::handler::channel_command(state, command);
-            } else {
+            if !state.owns_channel(command.owner()) {
                 state.route_channel_command(command);
+                return;
             }
-            state.defer_captured_reply(conn);
+            // A local refusal is this command's direct reply; only a queued
+            // database write leaves a verdict for the connection to wait on.
+            match chanserv_register_on_owner(state, command) {
+                Some(result) => emit_chanserv_register_result_now(state, conn, result),
+                None => state.defer_captured_reply(conn),
+            }
         }
         "DROP" => {
             // DROP <#channel>: the founder unregisters their channel.
@@ -661,13 +674,7 @@ pub(super) fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str
             .as_ref()
             .and_then(|capture| capture.label.clone()),
     };
-    if state.db_tx.try_push(request).is_err() {
-        state.service_notice(
-            conn,
-            "ChanServ",
-            "Services are temporarily unavailable. Try again later.",
-        );
-    }
+    queue_service_verdict(state, conn, request);
 }
 
 pub(super) fn chanserv_op(state: &mut ServerState, conn: ConnId, args: &[&str]) {
@@ -838,13 +845,7 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
                     .as_ref()
                     .and_then(|capture| capture.label.clone()),
             };
-            if state.db_tx.try_push(request).is_err() {
-                state.service_notice(
-                    conn,
-                    "ChanServ",
-                    "Services are temporarily unavailable. Try again later.",
-                );
-            }
+            queue_service_verdict(state, conn, request);
         }
         "KEEPTOPIC" => {
             let on = match args.get(2).map(|v| v.to_ascii_uppercase()) {
@@ -950,6 +951,9 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
     }
 }
 
+/// Queue a ChanServ write whose verdict is the command's reply. Every verdict
+/// releases one deferred slot, so every queued write must take one here: a bare
+/// push would let the verdict release a slot some other reply is holding.
 fn queue_service_verdict(state: &mut ServerState, conn: ConnId, request: crate::core::DbRequest) {
     if state.db_tx.try_push(request).is_err() {
         state.service_notice(
@@ -1051,7 +1055,7 @@ pub(crate) fn channel_drop_reply(
 
 /// Emit a deferred, labeled ChanServ NOTICE to the connection if it is still
 /// present — the shared shape of the per-field `*_unavailable` replies.
-pub(super) fn chanserv_deferred_notice(
+fn chanserv_deferred_notice(
     state: &mut ServerState,
     conn: ConnId,
     label: Option<String>,
@@ -1409,19 +1413,14 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
     // monotonic.
     let signon = (state.config.clock)();
     let active = (state.config.mono_clock)();
+    state.sessions.complete_registration(&conn);
     {
         let session = state.sessions.get_mut(&conn).expect("checked");
-        session.complete_registration();
         session.signon = signon;
         session.last_active = active;
     }
     state.mark_nick_registered(conn);
-    let registered_now = state
-        .sessions
-        .values()
-        .filter(|s| s.is_registered())
-        .count();
-    state.max_users = state.max_users.max(registered_now);
+    state.max_users = state.max_users.max(state.sessions.registered_len());
     let prefix = state.sessions[&conn].prefix();
     let (server, network) = (
         state.config.server_name.clone(),
@@ -1479,11 +1478,7 @@ pub(super) fn version() -> &'static str {
 }
 
 pub(super) fn send_lusers(state: &mut ServerState, conn: ConnId) {
-    let users = state
-        .sessions
-        .values()
-        .filter(|s| s.is_registered())
-        .count();
+    let users = state.sessions.registered_len();
     let invisible = state
         .sessions
         .values()

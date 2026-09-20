@@ -62,14 +62,7 @@ pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         }
         kicked += 1;
         let owner = state.channel_owner(channel);
-        let label = if state.owns_channel(&owner) {
-            state
-                .capture
-                .as_ref()
-                .and_then(|capture| capture.label.clone())
-        } else {
-            state.defer_channel_reply(conn)
-        };
+        let label = state.channel_reply_label(conn, &owner);
         let kick = crate::core::state::ChannelKick::new(
             owner,
             actor.clone(),
@@ -102,6 +95,12 @@ pub(super) fn kick_on_owner(
     let Some(chan) = state.channels.get(&key) else {
         return crate::core::state::ChannelKickResult::NoSuchChannel { target: channel };
     };
+    if let Some(proof) = chan.hidden_from(conn) {
+        return crate::core::state::ChannelKickResult::Hidden {
+            target: channel,
+            proof,
+        };
+    }
     let display = chan.name.clone();
     if !chan.is_member(conn) {
         return crate::core::state::ChannelKickResult::NotOnChannel { target: channel };
@@ -168,6 +167,9 @@ fn emit_kick_result_now(
         crate::core::state::ChannelKickResult::NoSuchChannel { target } => {
             state.err_nosuchchannel(conn, clip_echo(&target))
         }
+        crate::core::state::ChannelKickResult::Hidden { target, proof } => {
+            deny_hidden(state, conn, &target, proof)
+        }
         crate::core::state::ChannelKickResult::NotOnChannel { target } => {
             state.err_notonchannel(conn, &target)
         }
@@ -228,6 +230,9 @@ pub(super) fn invite_on_owner(
     let Some(chan) = state.channels.get(&key) else {
         return crate::core::state::ChannelInviteResult::NoSuchChannel { target };
     };
+    if let Some(proof) = chan.hidden_from(actor.recipient.conn()) {
+        return crate::core::state::ChannelInviteResult::Hidden { target, proof };
+    }
     let display = chan.name.clone();
     if !chan.is_member(actor.recipient.conn()) {
         return crate::core::state::ChannelInviteResult::NotOnChannel { target };
@@ -251,12 +256,20 @@ pub(super) fn invite_on_owner(
                 && recipient.caps().invite_notify
         })
         .collect();
-    let invited = &mut state.channels.get_mut(&key).expect("checked").invited;
-    while invited.len() >= INVITE_LIMIT && !invited.contains(&invitee.owner().conn()) {
-        let victim = *invited.iter().next().expect("non-empty at invite cap");
-        invited.remove(&victim);
+    // An invitation is a pass through `+i`, so one is recorded only while the
+    // channel is `+i` — which is also exactly when the inviter had to be an
+    // operator. On an open channel any member may INVITE; recording those would
+    // let a member stock passes to be honoured after operators lock the channel,
+    // and spend the operators' own entries through the eviction below.
+    let chan = state.channels.get_mut(&key).expect("checked");
+    if chan.modes.invite_only {
+        let invited = &mut chan.invited;
+        while invited.len() >= INVITE_LIMIT && !invited.contains(&invitee.owner().conn()) {
+            let victim = *invited.iter().next().expect("non-empty at invite cap");
+            invited.remove(&victim);
+        }
+        invited.insert(invitee.owner().conn());
     }
-    invited.insert(invitee.owner().conn());
     for recipient in recipients {
         let body = format!(
             ":{} INVITE {} :{display}",
@@ -317,7 +330,12 @@ pub(super) fn emit_invitation(
         inviter_account,
         channel,
     } = event;
-    let nick = state.sessions[&conn].nick().unwrap_or("*");
+    // The invitee was online when the INVITE was accepted, but the invitation
+    // may have crossed shards since, and they may have disconnected meanwhile.
+    let Some(session) = state.sessions.get(&conn) else {
+        return;
+    };
+    let nick = session.nick().unwrap_or("*");
     let body = format!(":{inviter_prefix} INVITE {nick} :{channel}");
     let recipient = state.local_recipient(conn);
     let line = invite_tags(state, recipient, &inviter_account, &body);
@@ -335,6 +353,9 @@ pub(super) fn emit_invite_result_now(
         }
         crate::core::state::ChannelInviteResult::NoSuchChannel { target } => {
             state.err_nosuchchannel(conn, clip_echo(&target))
+        }
+        crate::core::state::ChannelInviteResult::Hidden { target, proof } => {
+            deny_hidden(state, conn, &target, proof)
         }
         crate::core::state::ChannelInviteResult::NotOnChannel { target } => {
             state.err_notonchannel(conn, &target)
@@ -409,28 +430,34 @@ pub(super) fn cmd_list(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 .map(str::to_string)
                 .collect()
         });
+    if state.has_single_core_shard() {
+        // One worker sees every channel, so the listing is this command's
+        // direct reply: nothing is owed later and nothing is held behind it.
+        let targets: Option<Vec<_>> = targets.map(|targets: Vec<String>| {
+            targets
+                .iter()
+                .map(|target| state.chan_key(target))
+                .collect()
+        });
+        let rows = visible_channel_rows(state, conn, targets.as_deref());
+        emit_channel_list_rows(state, conn, rows);
+        return;
+    }
     let label = state.defer_channel_reply(conn);
     let request = state.start_channel_list(conn, label, targets);
-    if state.has_single_core_shard() {
-        channel_list(state, request);
-    } else {
-        state.route_channel_list(request);
-    }
+    state.route_channel_list(request);
 }
 
-pub(crate) fn channel_list(
-    state: &mut ServerState,
-    request: crate::core::state::ChannelListRequest,
-) {
-    let conn = request.actor().recipient.conn();
-    let rows = state
+/// This shard's channels that `conn` may see, narrowed to `targets` if given.
+fn visible_channel_rows(
+    state: &ServerState,
+    conn: ConnId,
+    targets: Option<&[crate::core::state::ChanKey]>,
+) -> Vec<crate::core::state::ChannelListRow> {
+    state
         .channels
         .iter()
-        .filter(|(key, _)| {
-            request
-                .targets()
-                .is_none_or(|targets| targets.contains(key))
-        })
+        .filter(|(key, _)| targets.is_none_or(|targets| targets.contains(key)))
         .map(|(_, channel)| channel)
         .filter(|channel| channel.hidden_from(conn).is_none())
         .map(|channel| crate::core::state::ChannelListRow {
@@ -442,17 +469,19 @@ pub(crate) fn channel_list(
                 .map(|topic| topic.text.clone())
                 .unwrap_or_default(),
         })
-        .collect();
-    let result = crate::core::state::ChannelListResult {
+        .collect()
+}
+
+pub(crate) fn channel_list(
+    state: &mut ServerState,
+    request: crate::core::state::ChannelListRequest,
+) {
+    let rows = visible_channel_rows(state, request.actor().recipient.conn(), request.targets());
+    state.route_channel_list_result(crate::core::state::ChannelListResult {
         id: request.id(),
         session: request.session(),
         rows,
-    };
-    if state.has_single_core_shard() {
-        channel_list_result(state, result);
-    } else {
-        state.route_channel_list_result(result);
-    }
+    });
 }
 
 pub(crate) fn channel_list_result(
@@ -460,10 +489,9 @@ pub(crate) fn channel_list_result(
     result: crate::core::state::ChannelListResult,
 ) {
     let session = result.session;
-    let Some((label, prefix, mut rows)) = state.take_channel_list(result) else {
+    let Some((label, prefix, rows)) = state.take_channel_list(result) else {
         return;
     };
-    rows.sort_by(|left, right| left.name.cmp(&right.name));
     state.emit_deferred_labeled(session.conn(), label, |state| {
         if !prefix.is_empty() {
             state
@@ -473,16 +501,25 @@ pub(crate) fn channel_list_result(
                 .lines
                 .extend(prefix);
         }
-        for row in rows {
-            state.numeric(
-                session.conn(),
-                RPL_LIST,
-                &[&row.name, &row.members.to_string()],
-                Some(&row.topic),
-            );
-        }
-        state.numeric(session.conn(), RPL_LISTEND, &[], Some("End of /LIST"));
+        emit_channel_list_rows(state, session.conn(), rows);
     });
+}
+
+fn emit_channel_list_rows(
+    state: &mut ServerState,
+    conn: ConnId,
+    mut rows: Vec<crate::core::state::ChannelListRow>,
+) {
+    rows.sort_by(|left, right| left.name.cmp(&right.name));
+    for row in rows {
+        state.numeric(
+            conn,
+            RPL_LIST,
+            &[&row.name, &row.members.to_string()],
+            Some(&row.topic),
+        );
+    }
+    state.numeric(conn, RPL_LISTEND, &[], Some("End of /LIST"));
 }
 
 /// Build the `nick[*]=<+|->user@host` entries shared by USERHOST and USERIP
@@ -607,14 +644,7 @@ pub(super) fn cmd_knock(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     let owner = state.channel_owner(target);
-    let label = if state.owns_channel(&owner) {
-        state
-            .capture
-            .as_ref()
-            .and_then(|capture| capture.label.clone())
-    } else {
-        state.defer_channel_reply(conn)
-    };
+    let label = state.channel_reply_label(conn, &owner);
     let command = crate::core::state::ChannelCommand::new(
         owner,
         state.channel_actor(conn),
@@ -646,8 +676,8 @@ pub(super) fn knock_on_owner(
     };
     let display = chan.name.clone();
     // A secret channel is hidden: look non-existent to a non-member.
-    if chan.hidden_from(actor.recipient.conn()).is_some() {
-        return crate::core::state::ChannelKnockResult::Hidden { target };
+    if let Some(proof) = chan.hidden_from(actor.recipient.conn()) {
+        return crate::core::state::ChannelKnockResult::Hidden { target, proof };
     }
     if chan.is_member(actor.recipient.conn()) {
         return crate::core::state::ChannelKnockResult::AlreadyOnChannel { display };
@@ -701,9 +731,11 @@ fn emit_knock_result_now(
             &[],
             Some("Your KNOCK has been delivered"),
         ),
-        crate::core::state::ChannelKnockResult::NoSuchChannel { target }
-        | crate::core::state::ChannelKnockResult::Hidden { target } => {
+        crate::core::state::ChannelKnockResult::NoSuchChannel { target } => {
             state.err_nosuchchannel(conn, clip_echo(&target));
+        }
+        crate::core::state::ChannelKnockResult::Hidden { target, proof } => {
+            deny_hidden(state, conn, &target, proof);
         }
         crate::core::state::ChannelKnockResult::AlreadyOnChannel { display } => state.numeric(
             conn,

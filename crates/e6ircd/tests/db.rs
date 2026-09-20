@@ -2232,7 +2232,7 @@ async fn bnc_networks_crud() {
     db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
-    db::create_account(&pool, "bob", "pw").await.expect("acct");
+    let bob_id = db::create_account(&pool, "bob", "pw").await.expect("acct");
 
     let libera = db::BncNetworkRow {
         kind: NetworkKind::Irc,
@@ -2347,10 +2347,42 @@ async fn bnc_networks_crud() {
         .expect("cleanup");
 
     // list_all pairs each network with its owner (two rows: alice+bob)
-    let all = db::list_all_bnc_networks(&pool).await.expect("all");
+    let all = db::list_startable_bnc_networks(&pool).await.expect("all");
     assert_eq!(all.len(), 2);
     assert!(all.iter().any(|(o, n)| o == "alice" && n.name == "libera"));
     assert!(all.iter().any(|(o, n)| o == "bob" && n.name == "libera"));
+
+    // Suspension leaves `enabled` set so reactivation restores the network,
+    // which is exactly why the boot list must ask about the owner too.
+    db::set_account_suspended(&pool, bob_id, true, "alice", &[])
+        .await
+        .expect("suspend bob");
+    let startable = db::list_startable_bnc_networks(&pool)
+        .await
+        .expect("startable");
+    assert_eq!(
+        startable.len(),
+        1,
+        "a suspended owner's network would restart at boot"
+    );
+    assert_eq!(startable[0].0, "alice");
+    assert!(
+        db::get_bnc_network(&pool, "bob", "libera")
+            .await
+            .expect("bob's network")
+            .expect("kept")
+            .enabled
+    );
+    db::set_account_suspended(&pool, bob_id, false, "alice", &[])
+        .await
+        .expect("reactivate bob");
+    assert_eq!(
+        db::list_startable_bnc_networks(&pool)
+            .await
+            .expect("startable")
+            .len(),
+        2
+    );
 
     // delete is owner-scoped
     assert!(
@@ -5914,12 +5946,23 @@ async fn permanent_account_deletion_requires_succession_purges_and_retires() {
     .execute(&pool)
     .await
     .expect("buffer");
+    // A BNC MARKREAD leaves a marker row that references the account.
+    sqlx::query(
+        "INSERT INTO bnc_read_markers (account_id, network, target, timestamp)
+         VALUES ($1, 'libera', '#rust', '2026-01-01T00:00:00.000Z')",
+    )
+    .bind(bob_id)
+    .execute(&pool)
+    .await
+    .expect("bouncer read marker");
+    // The core stamps a message with the sender's account as the session
+    // holds it — the display name — while conversation peers are casefolded.
     sqlx::query(
         "INSERT INTO messages
             (msgid, target, sender_prefix, sender_account, kind, body, ts, dm_peers)
          VALUES
-            ('bob-sent', '#test', 'Bob!u@h', 'bob', 'privmsg', 'sent', now(), NULL),
-            ('bob-dm', 'alice!bob', 'Alice!u@h', 'alice', 'privmsg', 'private',
+            ('bob-sent', '#test', 'Bob!u@h', 'Bob', 'privmsg', 'sent', now(), NULL),
+            ('bob-dm', 'alice!bob', 'Alice!u@h', 'Alice', 'privmsg', 'private',
              now(), ARRAY['alice', 'bob'])",
     )
     .execute(&pool)
@@ -5951,17 +5994,19 @@ async fn permanent_account_deletion_requires_succession_purges_and_retires() {
             .expect("token"),
         None
     );
-    let residues: (i64, i64, i64) = sqlx::query_as(
+    let residues: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
             (SELECT count(*) FROM bnc_buffer WHERE owner = 'bob'),
             (SELECT count(*) FROM messages
-             WHERE sender_account = 'bob' OR dm_peers @> ARRAY['bob']),
-            (SELECT count(*) FROM device_grants WHERE account = 'Bob')",
+             WHERE sender_account IN ('Bob', 'bob') OR dm_peers @> ARRAY['bob']),
+            (SELECT count(*) FROM device_grants WHERE account = 'Bob'),
+            (SELECT count(*) FROM bnc_read_markers WHERE account_id = $1)",
     )
+    .bind(bob_id)
     .fetch_one(&pool)
     .await
     .expect("residues");
-    assert_eq!(residues, (0, 0, 0));
+    assert_eq!(residues, (0, 0, 0, 0));
     assert!(matches!(
         db::create_account(&pool, "bOB", "new owner").await,
         Err(db::DbError::DuplicateAccount(_))
@@ -6036,6 +6081,22 @@ async fn account_export_and_security_activity_are_owner_scoped_and_secret_free()
     .execute(&pool)
     .await
     .expect("network");
+    sqlx::query(
+        "INSERT INTO bnc_read_markers (account_id, network, target, timestamp)
+         VALUES ($1, 'libera', '#rust', '2026-01-01T00:00:00.000Z')",
+    )
+    .bind(alice_id)
+    .execute(&pool)
+    .await
+    .expect("bouncer read marker");
+    // Stored as the core stores it: the sender's display name.
+    sqlx::query(
+        "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts)
+         VALUES ('alice-sent', '#test', 'Alice!u@h', 'Alice', 'privmsg', 'hello room', now())",
+    )
+    .execute(&pool)
+    .await
+    .expect("message");
     db::insert_audit_log(&pool, "bob", "ACCOUNT_SUSPEND", "alice", "")
         .await
         .expect("admin event");
@@ -6052,6 +6113,18 @@ async fn account_export_and_security_activity_are_owner_scoped_and_secret_free()
     assert_eq!(value["account"]["name"], "Alice");
     assert_eq!(value["account"]["contact_email"], "Alice@example.com");
     assert_eq!(value["networks"][0]["has_sasl_password"], true);
+    assert_eq!(
+        value["messages"][0]["message_id"], "alice-sent",
+        "a channel message is stored under the display name and is still the account's"
+    );
+    assert_eq!(
+        value["bouncer_read_markers"][0],
+        serde_json::json!({
+            "network": "libera",
+            "target": "#rust",
+            "timestamp": "2026-01-01T00:00:00.000Z",
+        })
+    );
     assert!(
         !export.contains("enc:v1:must-not-export")
             && !export.contains("highly confidential password")
@@ -6191,4 +6264,105 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
         (1, 1, 1, 1, 1, 1, 0),
         "every collection retained only its live/recent row"
     );
+}
+
+/// Two administrators demoting each other at the same moment must not both
+/// succeed: each transaction alone sees the other as the remaining
+/// administrator, so without one ordering of authority changes both commit and
+/// no durable administrator is left.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn concurrent_mutual_demotion_keeps_one_administrator() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("concurrent_mutual_demotion_keeps_one_administrator").await,
+    )
+    .await
+    .expect("connect");
+    let alice_id = db::bootstrap_first_admin(&pool, "Alice", "administrator password")
+        .await
+        .expect("Alice");
+    let bob_id = db::create_account(&pool, "Bob", "second administrator")
+        .await
+        .expect("Bob");
+    db::set_account_administrator(&pool, bob_id, true, "Alice", &[])
+        .await
+        .expect("grant")
+        .expect("Bob");
+
+    // Hold both rows so the two demotions are in flight together, then let
+    // them go at once.
+    let mut gate = pool.begin().await.expect("gate");
+    sqlx::query("SELECT id FROM accounts WHERE id = ANY($1) FOR UPDATE")
+        .bind(&[alice_id, bob_id][..])
+        .execute(&mut *gate)
+        .await
+        .expect("hold both rows");
+    let demote = |target: i64, actor: &'static str| {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            db::set_account_administrator(&pool, target, false, actor, &[]).await
+        })
+    };
+    let alice_demotes_bob = demote(bob_id, "Alice");
+    let bob_demotes_alice = demote(alice_id, "Bob");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    gate.commit().await.expect("release");
+
+    let outcomes = [
+        alice_demotes_bob.await.expect("task"),
+        bob_demotes_alice.await.expect("task"),
+    ];
+    let refused = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, Err(db::DbError::LastAdministrator)))
+        .count();
+    let administrators: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM accounts WHERE (flags & 1) = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(
+        (refused, administrators),
+        (1, 1),
+        "exactly one demotion is refused and one administrator remains: {outcomes:?}"
+    );
+}
+
+/// A stored hash that no longer parses is damaged data, not a wrong password:
+/// the login still fails, but as a loud store fault an operator will see, not
+/// as a credential rejection indistinguishable from a typo.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn corrupt_stored_password_hash_is_a_store_fault_not_a_wrong_password() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("corrupt_stored_password_hash_is_a_store_fault_not_a_wrong_password")
+            .await,
+    )
+    .await
+    .expect("connect");
+    let alice_id = db::create_account(&pool, "Alice", "correct password")
+        .await
+        .expect("Alice");
+    sqlx::query("UPDATE account_credentials SET argon2_hash = 'not-a-hash' WHERE account_id = $1")
+        .bind(alice_id)
+        .execute(&pool)
+        .await
+        .expect("corrupt the stored hash");
+
+    for password in ["correct password", "wrong password"] {
+        assert!(
+            matches!(
+                db::verify_credentials(&pool, "Alice", password).await,
+                Err(db::DbError::Hash(_))
+            ),
+            "SASL/IDENTIFY verification must report the damaged hash"
+        );
+        assert!(
+            matches!(
+                db::verify_local_password(&pool, "Alice", password).await,
+                Err(db::DbError::Hash(_))
+            ),
+            "primary-password verification must report the damaged hash"
+        );
+    }
 }

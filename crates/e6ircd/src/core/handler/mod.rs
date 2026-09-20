@@ -185,11 +185,7 @@ pub(crate) fn channel_command(
         }
     };
     if let Some(result) = result {
-        if state.owns_session(session) {
-            channel_command_result(state, session.conn(), result, label);
-        } else {
-            state.route_channel_command_result(session, result, label);
-        }
+        state.route_channel_command_result(session, result, label);
     }
 }
 

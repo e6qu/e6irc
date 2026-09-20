@@ -17,6 +17,7 @@ pub(crate) use timer::TimerWheel;
 
 pub use state::{ChannelOwner, ConnId, CoreConfig, dm_conversation_key};
 
+use std::collections::VecDeque;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -161,67 +162,7 @@ impl CoreIngress {
     }
 
     pub async fn push(&self, input: Input) -> Result<u64, Box<Input>> {
-        let shard = match &input {
-            Input::Open { conn, .. }
-            | Input::Line { conn, .. }
-            | Input::OverlongLine { conn }
-            | Input::Closed { conn, .. }
-            | Input::Delivery { conn, .. }
-            | Input::DbReply { conn, .. }
-            | Input::HistoryPage { conn, .. }
-            | Input::TargetsPage { conn, .. } => self.count.session_owner(*conn).shard(),
-            Input::ChannelJoin { owner, .. } => owner.shard(),
-            Input::ChannelJoinResult { session, .. } => session.shard(),
-            Input::ChannelPart { owner, .. } => owner.shard(),
-            Input::ChannelPartResult { session, .. } => session.shard(),
-            Input::ChannelQuit { quit } => quit.owner().shard(),
-            Input::ChannelTopic { topic } => topic.owner().shard(),
-            Input::ChannelTopicResult { session, .. } => session.shard(),
-            Input::ChannelTopicPersisted { owner, .. } => owner.shard(),
-            Input::ChannelServicePersisted { owner, .. } => owner.shard(),
-            Input::ChannelServiceResult { session, .. } => session.shard(),
-            Input::ChannelCommand { command } => command.owner().shard(),
-            Input::ChannelCommandResult { session, .. } => session.shard(),
-            Input::ChannelRegistrationPersisted { owner, .. } => owner.shard(),
-            Input::ChannelListResult { result } => result.session.shard(),
-            Input::ChannelList { .. } => panic!("whole-network LIST must be broadcast"),
-            Input::ChannelSessionEvent { session, .. } => session.shard(),
-            Input::ChannelMemberUpdate { update } => update.owner().shard(),
-            Input::ChannelKick { kick } => kick.owner().shard(),
-            Input::ChannelKickResult { session, .. } => session.shard(),
-            Input::SessionChannelRemoved { session, .. } => session.shard(),
-            Input::ChannelMessage { message } => message.owner().shard(),
-            Input::ChannelMessageResult { session, .. } => session.shard(),
-            Input::ChannelMultiline { message } => message.owner().shard(),
-            Input::ChannelMultilineResult { session, .. } => session.shard(),
-            Input::ChannelTagmsg { tagmsg } => tagmsg.owner().shard(),
-            Input::ChannelTagmsgResult { session, .. } => session.shard(),
-            Input::Tick { .. } | Input::Shutdown => {
-                panic!("broadcast core event must use its dedicated ingress method")
-            }
-            Input::ServerBanResult { requester, .. } => match requester {
-                ServerBanRequester::Oper { session, .. } => session.shard(),
-                ServerBanRequester::Admin { .. } => CoreShardId(0),
-            },
-            Input::ServerBanApplied { .. } => {
-                panic!("committed server-ban event must be broadcast by a core worker")
-            }
-            Input::AccountSuspensionApplied { .. } => {
-                panic!("account-suspension event must be broadcast by a core worker")
-            }
-            Input::ReadMarkerApplied { .. } => {
-                panic!("read-marker event must be broadcast by a core worker")
-            }
-            Input::AdminConnectionList { .. } => {
-                panic!("connection-list event must be broadcast by a core worker")
-            }
-            Input::AdminConnectionListResult { .. } => CoreShardId(0),
-            Input::Admin { req, .. } => req.shard(self.count),
-            Input::ChannelDropResult { owner, .. } => owner.shard(),
-            Input::ChannelDropReply { session, .. } => session.shard(),
-            Input::ChannelControlResult { owner, .. }
-            | Input::OwnedChannelRegistrationResult { owner, .. } => owner.shard(),
-        };
+        let shard = input.owner_shard(self.count);
         self.shards[shard.0].push(input).await.map_err(Box::new)
     }
 
@@ -264,6 +205,77 @@ impl CoreIngress {
 
     pub(crate) fn directories(&self) -> CoreDirectories {
         self.directories.clone()
+    }
+}
+
+impl Input {
+    /// The one shard whose worker may handle this event. Ingress routes by it
+    /// and a worker uses it to tell an effect for another shard from one it
+    /// must handle itself, so the two can never disagree about an owner.
+    ///
+    /// Panics on an event that has no single owner: those are broadcast.
+    pub(crate) fn owner_shard(&self, shards: CoreShardCount) -> CoreShardId {
+        match self {
+            Input::Open { conn, .. }
+            | Input::Line { conn, .. }
+            | Input::OverlongLine { conn }
+            | Input::Closed { conn, .. }
+            | Input::Delivery { conn, .. }
+            | Input::DbReply { conn, .. }
+            | Input::HistoryPage { conn, .. }
+            | Input::TargetsPage { conn, .. } => shards.session_owner(*conn).shard(),
+            Input::ChannelJoin { owner, .. } => owner.shard(),
+            Input::ChannelJoinResult { session, .. } => session.shard(),
+            Input::ChannelPart { owner, .. } => owner.shard(),
+            Input::ChannelPartResult { session, .. } => session.shard(),
+            Input::ChannelQuit { quit } => quit.shard(),
+            Input::ChannelTopic { topic } => topic.owner().shard(),
+            Input::ChannelTopicResult { session, .. } => session.shard(),
+            Input::ChannelTopicPersisted { owner, .. } => owner.shard(),
+            Input::ChannelServicePersisted { owner, .. } => owner.shard(),
+            Input::ChannelServiceResult { session, .. } => session.shard(),
+            Input::ChannelCommand { command } => command.owner().shard(),
+            Input::ChannelCommandResult { session, .. } => session.shard(),
+            Input::ChannelRegistrationPersisted { owner, .. } => owner.shard(),
+            Input::ChannelListResult { result } => result.session.shard(),
+            Input::ChannelList { .. } => panic!("whole-network LIST must be broadcast"),
+            Input::ChannelSessionEvent { session, .. } => session.shard(),
+            Input::ChannelMemberUpdate { update } => update.shard(),
+            Input::ChannelKick { kick } => kick.owner().shard(),
+            Input::ChannelKickResult { session, .. } => session.shard(),
+            Input::SessionChannelRemoved { session, .. } => session.shard(),
+            Input::ChannelMessage { message } => message.owner().shard(),
+            Input::ChannelMessageResult { session, .. } => session.shard(),
+            Input::ChannelMultiline { message } => message.owner().shard(),
+            Input::ChannelMultilineResult { session, .. } => session.shard(),
+            Input::ChannelTagmsg { tagmsg } => tagmsg.owner().shard(),
+            Input::ChannelTagmsgResult { session, .. } => session.shard(),
+            Input::Tick { .. } | Input::Shutdown => {
+                panic!("broadcast core event must use its dedicated ingress method")
+            }
+            Input::ServerBanResult { requester, .. } => match requester {
+                ServerBanRequester::Oper { session, .. } => session.shard(),
+                ServerBanRequester::Admin { .. } => CoreShardId(0),
+            },
+            Input::ServerBanApplied { .. } => {
+                panic!("committed server-ban event must be broadcast by a core worker")
+            }
+            Input::AccountSuspensionApplied { .. } => {
+                panic!("account-suspension event must be broadcast by a core worker")
+            }
+            Input::ReadMarkerApplied { .. } => {
+                panic!("read-marker event must be broadcast by a core worker")
+            }
+            Input::AdminConnectionList { .. } => {
+                panic!("connection-list event must be broadcast by a core worker")
+            }
+            Input::AdminConnectionListResult { .. } => CoreShardId(0),
+            Input::Admin { req, .. } => req.shard(shards),
+            Input::ChannelDropResult { owner, .. } => owner.shard(),
+            Input::ChannelDropReply { session, .. } => session.shard(),
+            Input::ChannelControlResult { owner, .. }
+            | Input::OwnedChannelRegistrationResult { owner, .. } => owner.shard(),
+        }
     }
 }
 
@@ -519,6 +531,11 @@ pub enum Input {
         result: ChannelCommandResult,
         label: Option<String>,
     },
+    /// The database's verdict on a ChanServ REGISTER, for the channel's owner.
+    /// `founder_account` is echoed from the request (the account the row was
+    /// written with), not re-read from the session when the verdict arrives: a
+    /// LOGOUT or IDENTIFY in between would otherwise put the wrong account, or
+    /// none, into the hot founder map until restart.
     ChannelRegistrationPersisted {
         owner: ChannelOwner,
         session: SessionOwner,
@@ -1636,31 +1653,11 @@ pub enum DbReply {
     AccountExists {
         origin: AccountOrigin,
     },
-    /// A channel was registered. `founder_account` is echoed from the request
-    /// (the account the DB row was actually written with), not re-read from the
-    /// session at reply time — a mid-flight LOGOUT/IDENTIFY would otherwise put
-    /// the wrong account (or none) into the hot founder map, diverging it from
-    /// the DB until restart.
-    ChannelRegistered {
-        channel: String,
-        founder_account: String,
-        topic: Option<(String, String, u64)>,
-        label: Option<String>,
-    },
-    ChannelExists {
-        channel: String,
-        label: Option<String>,
-    },
     /// A NickServ/REGISTER-command account registration could not be persisted
     /// (DB down/errored). Carries the origin so the client gets the loud
     /// failure appropriate to how it asked, never a silent hang.
     AccountRegisterUnavailable {
         origin: AccountOrigin,
-    },
-    /// A ChanServ channel registration could not be persisted (DB down/errored).
-    ChannelRegisterUnavailable {
-        channel: String,
-        label: Option<String>,
     },
     /// A TOPIC request reached the registered-channel row. `retained` is the
     /// row's KEEPTOPIC value: the live topic is valid either way, while only a
@@ -1742,10 +1739,16 @@ impl WireLine {
 pub struct Core {
     state: ServerState,
     shard: CoreShardId,
+    shards: CoreShardCount,
+    /// Effects for other shards, waiting for the worker to route them.
+    outbound: Vec<CoreEffect>,
     next_sequence: u64,
     reported_gauges: (usize, usize, usize),
 }
 
+/// Work a core hands to its worker for OTHER shards. An effect addressed to
+/// the emitting shard never appears here: [`Core::handle`] runs it inline, so
+/// a worker is never asked to push into the queue only it can drain.
 pub(crate) enum CoreEffect {
     /// A typed event for another core owner.
     Input(Input),
@@ -1753,18 +1756,15 @@ pub(crate) enum CoreEffect {
         request: ChannelListRequest,
     },
     BroadcastServerBan {
-        source: CoreShardId,
         mutation: ServerBanMutation,
     },
     BroadcastAccountSuspension {
-        source: CoreShardId,
         account: String,
         suspended: bool,
         reason: String,
         actor: String,
     },
     BroadcastReadMarker {
-        source: CoreShardId,
         account: String,
         target: String,
         display: String,
@@ -1804,108 +1804,71 @@ impl CoreWorker {
                 sequence: envelope.seq,
                 input: envelope.payload,
             });
+            let own = self.core.shard;
             for effect in self.core.take_effects() {
-                if let CoreEffect::BroadcastChannelList { request } = effect {
-                    if self
-                        .ingress
-                        .broadcast(None, || Input::ChannelList {
-                            request: request.clone(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        panic!("cross-shard target closed");
+                let routed = match effect {
+                    CoreEffect::Input(input) => Self::route(&self.ingress, own, input).await,
+                    CoreEffect::Delivery { owner, line } => {
+                        let input = Input::Delivery {
+                            conn: owner.conn(),
+                            line,
+                        };
+                        Self::route(&self.ingress, own, input).await
                     }
-                    continue;
-                }
-                if let CoreEffect::BroadcastServerBan { source, mutation } = effect {
-                    if self
-                        .ingress
-                        .broadcast(Some(source), || Input::ServerBanApplied {
-                            mutation: mutation.clone(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        panic!("cross-shard target closed");
+                    CoreEffect::BroadcastChannelList { request } => {
+                        self.ingress
+                            .broadcast(Some(own), || Input::ChannelList {
+                                request: request.clone(),
+                            })
+                            .await
                     }
-                    continue;
-                }
-                if let CoreEffect::BroadcastAccountSuspension {
-                    source,
-                    account,
-                    suspended,
-                    reason,
-                    actor,
-                } = effect
-                {
-                    if self
-                        .ingress
-                        .broadcast(Some(source), || Input::AccountSuspensionApplied {
-                            account: account.clone(),
-                            suspended,
-                            reason: reason.clone(),
-                            actor: actor.clone(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        panic!("cross-shard target closed");
+                    CoreEffect::BroadcastServerBan { mutation } => {
+                        self.ingress
+                            .broadcast(Some(own), || Input::ServerBanApplied {
+                                mutation: mutation.clone(),
+                            })
+                            .await
                     }
-                    continue;
-                }
-                if let CoreEffect::BroadcastReadMarker {
-                    source,
-                    account,
-                    target,
-                    display,
-                    marker_ms,
-                } = effect
-                {
-                    if self
-                        .ingress
-                        .broadcast(Some(source), || Input::ReadMarkerApplied {
-                            account: account.clone(),
-                            target: target.clone(),
-                            display: display.clone(),
-                            marker_ms,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        panic!("cross-shard target closed");
+                    CoreEffect::BroadcastAccountSuspension {
+                        account,
+                        suspended,
+                        reason,
+                        actor,
+                    } => {
+                        self.ingress
+                            .broadcast(Some(own), || Input::AccountSuspensionApplied {
+                                account: account.clone(),
+                                suspended,
+                                reason: reason.clone(),
+                                actor: actor.clone(),
+                            })
+                            .await
                     }
-                    continue;
-                }
-                if let CoreEffect::BroadcastAdminConnectionList { request_id, query } = effect {
-                    if self
-                        .ingress
-                        .broadcast(None, || Input::AdminConnectionList {
-                            request_id,
-                            query: query.clone(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        panic!("cross-shard target closed");
+                    CoreEffect::BroadcastReadMarker {
+                        account,
+                        target,
+                        display,
+                        marker_ms,
+                    } => {
+                        self.ingress
+                            .broadcast(Some(own), || Input::ReadMarkerApplied {
+                                account: account.clone(),
+                                target: target.clone(),
+                                display: display.clone(),
+                                marker_ms,
+                            })
+                            .await
                     }
-                    continue;
-                }
-                let input = match effect {
-                    CoreEffect::Input(input) => input,
-                    CoreEffect::Delivery { owner, line } => Input::Delivery {
-                        conn: owner.conn(),
-                        line,
-                    },
-                    CoreEffect::BroadcastChannelList { .. }
-                    | CoreEffect::BroadcastServerBan { .. }
-                    | CoreEffect::BroadcastAccountSuspension { .. }
-                    | CoreEffect::BroadcastReadMarker { .. }
-                    | CoreEffect::BroadcastAdminConnectionList { .. } => {
-                        unreachable!("handled above")
+                    CoreEffect::BroadcastAdminConnectionList { request_id, query } => {
+                        self.ingress
+                            .broadcast(Some(own), || Input::AdminConnectionList {
+                                request_id,
+                                query: query.clone(),
+                            })
+                            .await
                     }
                 };
-                if self.ingress.push(input).await.is_err() {
+                if routed.is_err() {
                     panic!("cross-shard target closed");
                 }
             }
@@ -1913,6 +1876,18 @@ impl CoreWorker {
                 return;
             }
         }
+    }
+
+    /// Push an event to the shard that owns it. That shard is never this
+    /// one — [`Core::handle`] keeps its own shard's effects — so the await
+    /// can only ever wait on a queue some other worker drains.
+    async fn route(ingress: &CoreIngress, own: CoreShardId, input: Input) -> Result<(), ()> {
+        debug_assert_ne!(
+            input.owner_shard(ingress.shard_count()),
+            own,
+            "a worker was asked to await its own queue"
+        );
+        ingress.push(input).await.map(drop).map_err(drop)
     }
 }
 
@@ -1956,6 +1931,8 @@ impl Core {
         Self {
             state: ServerState::new(shard, shards, config, db_tx, telemetry, directories),
             shard,
+            shards,
+            outbound: Vec::new(),
             next_sequence: 0,
             reported_gauges: (0, 0, 0),
         }
@@ -1990,8 +1967,43 @@ impl Core {
         self.handle(event.input);
     }
 
+    /// The effects of the events handled so far that belong to other shards.
     fn take_effects(&mut self) -> Vec<CoreEffect> {
-        self.state.take_effects()
+        std::mem::take(&mut self.outbound)
+    }
+
+    /// Keep what this shard must handle itself; queue the rest for routing.
+    /// A broadcast reaches every shard, so it does both.
+    fn sort_effect(&mut self, effect: CoreEffect, local: &mut VecDeque<Input>) {
+        match effect {
+            CoreEffect::Input(input) if input.owner_shard(self.shards) == self.shard => {
+                local.push_back(input);
+            }
+            CoreEffect::Delivery { owner, line } if owner.shard() == self.shard => {
+                local.push_back(Input::Delivery {
+                    conn: owner.conn(),
+                    line,
+                });
+            }
+            CoreEffect::BroadcastChannelList { request } => {
+                local.push_back(Input::ChannelList {
+                    request: request.clone(),
+                });
+                self.outbound
+                    .push(CoreEffect::BroadcastChannelList { request });
+            }
+            CoreEffect::BroadcastAdminConnectionList { request_id, query } => {
+                local.push_back(Input::AdminConnectionList {
+                    request_id,
+                    query: query.clone(),
+                });
+                self.outbound
+                    .push(CoreEffect::BroadcastAdminConnectionList { request_id, query });
+            }
+            // The remaining broadcasts were applied to this shard by the code
+            // that emitted them.
+            effect => self.outbound.push(effect),
+        }
     }
 
     /// Seed the hot channel-ownership map from persisted rows before the
@@ -2042,9 +2054,24 @@ impl Core {
         self.state.preload_suspended_accounts(accounts);
     }
 
-    /// Process one event. All state transitions happen here, on one
-    /// thread, in queue order.
+    /// Process one event and everything it causes on this shard. All state
+    /// transitions happen here, on one thread, in queue order.
+    ///
+    /// An effect addressed to this shard runs here, before the next queued
+    /// event, and is never pushed back through the queue: this worker is the
+    /// only task that drains that queue, so awaiting room in it would park the
+    /// worker — and every tick and the shutdown flush behind it — forever.
     pub fn handle(&mut self, input: Input) {
+        let mut local = VecDeque::from([input]);
+        while let Some(input) = local.pop_front() {
+            self.handle_one(input);
+            for effect in self.state.take_effects() {
+                self.sort_effect(effect, &mut local);
+            }
+        }
+    }
+
+    fn handle_one(&mut self, input: Input) {
         let started = Instant::now();
         let sessions_before = self.state.sessions.len();
         let opened = matches!(input, Input::Open { .. });
@@ -2116,10 +2143,7 @@ impl Core {
                 );
                 handler::channel_part_result(&mut self.state, session.conn(), result, label);
             }
-            Input::ChannelQuit { quit } => {
-                self.state
-                    .quit_channel_member(quit.owner(), quit.conn(), quit.line());
-            }
+            Input::ChannelQuit { quit } => self.state.quit_channel_member(quit),
             Input::ChannelTopic { topic } => {
                 assert_eq!(
                     topic.owner().shard(),
@@ -2237,11 +2261,6 @@ impl Core {
                 handler::channel_session_event(&mut self.state, session.conn(), event);
             }
             Input::ChannelMemberUpdate { update } => {
-                assert_eq!(
-                    update.owner().shard(),
-                    self.shard,
-                    "member update reached wrong channel shard"
-                );
                 self.state.apply_channel_member_update(update);
             }
             Input::SessionChannelRemoved { session, key } => {
@@ -2507,13 +2526,11 @@ impl Core {
         self.state.telemetry.record_connections_closed(
             (sessions_before + usize::from(opened)).saturating_sub(sessions_after),
         );
-        let registered = self
-            .state
-            .sessions
-            .values()
-            .filter(|session| session.is_registered())
-            .count();
-        let gauges = (sessions_after, registered, self.state.channels.len());
+        let gauges = (
+            sessions_after,
+            self.state.sessions.registered_len(),
+            self.state.channels.len(),
+        );
         self.state
             .telemetry
             .adjust_core_gauges(self.reported_gauges, gauges);
@@ -3020,6 +3037,211 @@ mod ingress_tests {
                 .expect("wire output")
                 .contains("temporarily unavailable")
         );
+    }
+
+    /// Carry every routed event one core produced to the other core.
+    fn relay(from: &mut Core, to: &mut Core) {
+        for effect in from.take_effects() {
+            match effect {
+                super::CoreEffect::Input(input) => to.handle(input),
+                super::CoreEffect::Delivery { owner, line } => to.handle(Input::Delivery {
+                    conn: owner.conn(),
+                    line,
+                }),
+                _ => panic!("unexpected broadcast"),
+            }
+        }
+    }
+
+    #[test]
+    fn remote_chathistory_with_nothing_to_send_releases_the_requester() {
+        let TwoWorkerHarness {
+            mut first,
+            mut second,
+            ..
+        } = two_worker_harness();
+        let channel = channel_on_second(&second);
+        let (alice, mut alice_rx) = register_on_first(&mut first, "alice");
+        // draft/chathistory without batch: an empty page is no lines at all.
+        first
+            .state
+            .sessions
+            .get_mut(&alice)
+            .expect("alice session")
+            .caps
+            .chathistory = true;
+        first.handle(Input::Line {
+            conn: alice,
+            line: format!("JOIN {channel}").into_bytes(),
+        });
+        relay(&mut first, &mut second);
+        relay(&mut second, &mut first);
+        first.handle(Input::Line {
+            conn: alice,
+            line: format!("CHATHISTORY LATEST {channel} * 10").into_bytes(),
+        });
+        relay(&mut first, &mut second);
+        relay(&mut second, &mut first);
+        while alice_rx.try_pop().is_some() {}
+
+        first.handle(Input::Line {
+            conn: alice,
+            line: b"PING after-history".to_vec(),
+        });
+        let pong = alice_rx
+            .try_pop()
+            .expect("the connection is held behind a history page that will never come");
+        assert!(pong.payload.0.ends_with(b"after-history\r\n"));
+    }
+
+    /// Open and register `nick` as connection 2 on the first shard.
+    fn register_on_first(first: &mut Core, nick: &str) -> (ConnId, Receiver<Output>) {
+        let (tx, rx) = queue(Config {
+            name: "registered-on-first-output",
+            capacity: 64,
+            policy: Policy::Fifo,
+        });
+        let conn = ConnId(2);
+        first
+            .state
+            .open(conn, tx, "host.test".into(), ConnectionTransport::Tcp);
+        for line in [format!("NICK {nick}"), format!("USER {nick} 0 * :{nick}")] {
+            first.handle(Input::Line {
+                conn,
+                line: line.into_bytes(),
+            });
+        }
+        (conn, rx)
+    }
+
+    #[test]
+    fn invitation_for_a_session_that_has_closed_is_dropped() {
+        let mut core = single_core();
+        // The invitee disconnected while the invitation crossed shards.
+        core.handle(Input::ChannelSessionEvent {
+            session: SessionOwner::new(ConnId(2), CoreShardId(0)),
+            event: crate::core::state::ChannelSessionEvent::Invitation {
+                inviter_prefix: "alice!alice@host.test".into(),
+                inviter_account: None,
+                channel: "#chat".into(),
+            },
+        });
+    }
+
+    #[test]
+    fn remote_member_setting_a_registered_channel_topic_is_answered() {
+        let TwoWorkerHarness {
+            mut first,
+            mut second,
+            ..
+        } = two_worker_harness();
+        let channel = channel_on_second(&second);
+        second.preload_founders(vec![(channel.into(), "founder".into())]);
+        let (alice, mut alice_rx) = register_on_first(&mut first, "alice");
+        first.handle(Input::Line {
+            conn: alice,
+            line: format!("JOIN {channel}").into_bytes(),
+        });
+        relay(&mut first, &mut second);
+        relay(&mut second, &mut first);
+        while alice_rx.try_pop().is_some() {}
+
+        // The channel's owner builds the persistence request for a requester
+        // whose session lives on the other shard.
+        first.handle(Input::Line {
+            conn: alice,
+            line: format!("TOPIC {channel} :from another shard").into_bytes(),
+        });
+        relay(&mut first, &mut second);
+        relay(&mut second, &mut first);
+        let answer = alice_rx.try_pop().expect("the TOPIC is answered");
+        // The harness has no database worker, so the honest answer is a refusal.
+        assert!(
+            std::str::from_utf8(&answer.payload.0)
+                .expect("wire output")
+                .contains("Topic could not be persisted")
+        );
+    }
+
+    fn single_core() -> Core {
+        let (db, _db_rx) = queue(Config {
+            name: "single-core-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        Core::new(core_config(), db)
+    }
+
+    fn unavailable_verdict_for(core: &Core, session: SessionOwner) -> Input {
+        Input::ChannelServicePersisted {
+            owner: core.state.channel_owner("#chat"),
+            session,
+            result: super::ChannelServicePersistence::AccessUnavailable {
+                channel: "#chat".into(),
+                display: "#chat".into(),
+                label: None,
+            },
+        }
+    }
+
+    #[test]
+    fn an_effect_for_this_shard_is_handled_inline_and_never_returned_for_routing() {
+        let mut core = single_core();
+        let (session, mut output_rx) = open_session_on_first(&mut core, "inline-effect-output");
+        let verdict = unavailable_verdict_for(&core, session);
+        core.handle(verdict);
+        let output = output_rx
+            .try_pop()
+            .expect("the requester on this shard is answered by the same event");
+        assert!(
+            std::str::from_utf8(&output.payload.0)
+                .expect("wire output")
+                .contains("temporarily unavailable")
+        );
+        assert!(
+            core.take_effects().is_empty(),
+            "a worker was handed an effect addressed to its own queue"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_answers_a_verdict_for_its_own_session_while_its_queue_stays_full() {
+        let (tx, rx) = queue(Config {
+            name: "self-targeted-verdict",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let ingress = CoreIngress::single(tx.clone());
+        let mut core = single_core();
+        let (session, mut output_rx) = open_session_on_first(&mut core, "full-queue-output");
+        let verdict = unavailable_verdict_for(&core, session);
+        tx.push(verdict).await.expect("verdict queued");
+
+        // A producer that refills the only slot the instant the worker frees
+        // it: the queue is full whenever the worker finishes an event.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let filler = {
+            let tx = tx.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // A full queue hands the event back; the loop offers it again.
+                    drop(tx.try_push(Input::OverlongLine { conn: ConnId(99) }));
+                }
+            })
+        };
+        let worker = tokio::spawn(CoreWorker::new(core, rx, ingress.clone()).run());
+
+        let output = next_output(&mut output_rx).await;
+        assert!(
+            std::str::from_utf8(&output.payload.0)
+                .expect("wire output")
+                .contains("temporarily unavailable")
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        filler.join().expect("filler thread");
+        ingress.broadcast_shutdown().await.expect("worker alive");
+        worker.await.expect("worker stops on shutdown");
     }
 
     #[tokio::test]

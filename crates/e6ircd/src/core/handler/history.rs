@@ -435,15 +435,9 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
             );
         } else {
             // Queued: hold this connection's later output behind the batch so
-            // the reply order matches the command order.
-            state.defer_reply(conn);
-            if let Some(cap) = state.capture.as_mut() {
-                // The labeled batch is emitted when the DB replies, so tell the
-                // framer not to ACK this command as an empty response.
-                if cap.label.is_some() {
-                    cap.deferred = true;
-                }
-            }
+            // the reply order matches the command order. The batch answers the
+            // command when the DB replies; nothing here may answer it as empty.
+            state.defer_captured_reply(conn);
         }
         return;
     }
@@ -490,7 +484,10 @@ pub(super) fn history_on_owner(
     let parameters: Vec<&str> = request.parameters.iter().map(String::as_str).collect();
     cmd_chathistory(state, conn, &parameters);
     let capture = state.capture.take().expect("CHATHISTORY capture installed");
-    if capture.lines.is_empty() {
+    // Only a queued database page leaves the requester waiting. An answer
+    // with no lines (an empty page for a client without `batch`) is still the
+    // answer, and must release the requester like any other.
+    if capture.deferred {
         crate::core::state::ChannelHistoryResult::Deferred
     } else {
         crate::core::state::ChannelHistoryResult::Replies(
@@ -606,14 +603,8 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
                 "History temporarily unavailable",
             );
         } else {
-            state.defer_reply(conn);
-            if let Some(cap) = state.capture.as_mut() {
-                // The labeled batch is emitted when the DB replies, so don't
-                // ACK this command as an empty response.
-                if cap.label.is_some() {
-                    cap.deferred = true;
-                }
-            }
+            // The batch answers the command when the DB replies.
+            state.defer_captured_reply(conn);
         }
         return;
     }

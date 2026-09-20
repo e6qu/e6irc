@@ -314,7 +314,9 @@ impl<T> Sender<T> {
 ///
 /// A full queue registers this future once in FIFO waiter order. Dropping the
 /// future removes that registration, so a cancelled producer cannot consume a
-/// later wakeup and leave a live producer parked.
+/// later wakeup and leave a live producer parked; dropping it after a wakeup
+/// it never acted on passes that wakeup to the next producer, for the same
+/// reason.
 pub struct Push<'a, T> {
     sender: &'a Sender<T>,
     payload: Option<T>,
@@ -383,19 +385,41 @@ impl<T> Future for Push<'_, T> {
 
 impl<T> Drop for Push<'_, T> {
     fn drop(&mut self) {
-        if self.payload.is_some() {
+        if self.payload.is_none() {
+            return;
+        }
+        let next;
+        {
             let mut state = self.sender.shared.lock();
-            remove_push_waiter(&mut state, self.waiter.take());
+            let Some(waiter) = self.waiter.take() else {
+                return;
+            };
+            let still_parked = remove_push_waiter(&mut state, Some(waiter));
+            // Parked once and no longer listed: a pop took this registration
+            // and spent the freed slot's only wakeup on this future. It will
+            // never use the slot, so the next parked producer must be told —
+            // nothing else will wake it while the consumer waits on an empty
+            // queue.
+            next = (!still_parked && state.buf.len() < self.sender.shared.config.capacity)
+                .then(|| state.push_wakers.pop_front())
+                .flatten();
+        }
+        if let Some((_, waker)) = next {
+            waker.wake();
         }
     }
 }
 
-fn remove_push_waiter<T>(state: &mut State<T>, waiter: Option<u64>) {
-    if let Some(waiter) = waiter {
-        state
-            .push_wakers
-            .retain(|(candidate, _)| *candidate != waiter);
-    }
+/// Remove `waiter`'s registration; whether it was still registered.
+fn remove_push_waiter<T>(state: &mut State<T>, waiter: Option<u64>) -> bool {
+    let Some(waiter) = waiter else {
+        return false;
+    };
+    let parked = state.push_wakers.len();
+    state
+        .push_wakers
+        .retain(|(candidate, _)| *candidate != waiter);
+    state.push_wakers.len() != parked
 }
 
 impl<T> Receiver<T> {
@@ -790,42 +814,79 @@ mod tests {
         assert_eq!(rx.try_pop().unwrap().payload, 7);
     }
 
-    #[test]
-    fn one_free_slot_wakes_one_live_producer_and_cancelled_waiters_leave() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CountWakes(std::sync::atomic::AtomicUsize);
 
-        struct CountWakes(AtomicUsize);
-        impl Wake for CountWakes {
-            fn wake(self: StdArc<Self>) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
+    impl Wake for CountWakes {
+        fn wake(self: StdArc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl CountWakes {
+        fn count(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A producer parked on a full queue, with a count of its wakeups.
+    struct Parked<'a> {
+        push: Pin<Box<Push<'a, u32>>>,
+        wakes: StdArc<CountWakes>,
+    }
+
+    impl<'a> Parked<'a> {
+        fn on(sender: &'a Sender<u32>, payload: u32) -> Self {
+            let mut parked = Self {
+                push: Box::pin(sender.push(payload)),
+                wakes: StdArc::new(CountWakes(Default::default())),
+            };
+            assert!(parked.poll().is_pending(), "the queue is full");
+            parked
         }
 
+        fn poll(&mut self) -> Poll<Result<u64, u32>> {
+            let waker = Waker::from(self.wakes.clone());
+            self.push.as_mut().poll(&mut Context::from_waker(&waker))
+        }
+    }
+
+    #[test]
+    fn one_free_slot_wakes_one_live_producer_and_cancelled_waiters_leave() {
         let (tx, mut rx) = fifo(1);
         tx.try_push(0).unwrap();
-        let tx2 = tx.clone();
-        let mut cancelled = Box::pin(tx.push(1));
-        let mut live = Box::pin(tx2.push(2));
-        let cancelled_wakes = StdArc::new(CountWakes(AtomicUsize::new(0)));
-        let live_wakes = StdArc::new(CountWakes(AtomicUsize::new(0)));
-        let cancelled_waker = Waker::from(cancelled_wakes.clone());
-        let live_waker = Waker::from(live_wakes.clone());
-        assert!(
-            cancelled
-                .as_mut()
-                .poll(&mut Context::from_waker(&cancelled_waker))
-                .is_pending()
-        );
-        assert!(
-            live.as_mut()
-                .poll(&mut Context::from_waker(&live_waker))
-                .is_pending()
-        );
+        let cancelled = Parked::on(&tx, 1);
+        let live = Parked::on(&tx, 2);
+        let cancelled_wakes = cancelled.wakes.clone();
 
         drop(cancelled);
         assert_eq!(rx.try_pop().unwrap().payload, 0);
-        assert_eq!(cancelled_wakes.0.load(Ordering::SeqCst), 0);
-        assert_eq!(live_wakes.0.load(Ordering::SeqCst), 1);
+        assert_eq!(cancelled_wakes.count(), 0);
+        assert_eq!(live.wakes.count(), 1);
+    }
+
+    /// The cancellation the test above misses: a producer dropped *after* the
+    /// pop chose it. The pop already took its registration and spent the one
+    /// wakeup on it, so dropping it then must pass the free slot on — otherwise
+    /// the next producer stays parked beside an empty slot until some later
+    /// pop, which on a queue the consumer has drained never comes.
+    #[test]
+    fn a_producer_dropped_after_its_wakeup_hands_the_slot_to_the_next() {
+        let (tx, mut rx) = fifo(1);
+        tx.try_push(0).unwrap();
+        let woken_then_dropped = Parked::on(&tx, 1);
+        let mut next = Parked::on(&tx, 2);
+
+        assert_eq!(rx.try_pop().unwrap().payload, 0);
+        assert_eq!(woken_then_dropped.wakes.count(), 1);
+        assert_eq!(next.wakes.count(), 0);
+        drop(woken_then_dropped);
+        assert_eq!(
+            next.wakes.count(),
+            1,
+            "the free slot was not offered to the next producer"
+        );
+        assert!(next.poll().is_ready());
+        assert_eq!(rx.try_pop().unwrap().payload, 2);
     }
 
     #[test]

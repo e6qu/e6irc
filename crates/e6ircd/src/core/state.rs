@@ -640,7 +640,7 @@ pub(crate) struct Session {
     pub transport: crate::core::ConnectionTransport,
     /// Registration state and the identity fields, as one sum type (see
     /// [`Registration`]): a registered connection *has* a nick/user/realname.
-    pub reg: Registration,
+    reg: Registration,
     /// Mid-CAP-negotiation: registration is held until CAP END.
     pub cap_negotiating: bool,
     pub caps: Caps,
@@ -754,6 +754,12 @@ pub(crate) struct SessionStore {
     slots: Vec<SessionSlot>,
     free: Vec<usize>,
     len: usize,
+    /// How many stored sessions are registered. Kept at the only two places
+    /// that number can change — a session completing registration, and a
+    /// registered session leaving the store — because the core reports it after
+    /// every event, and counting every session each time is O(sessions) per
+    /// event.
+    registered: usize,
 }
 
 pub(crate) struct SessionIter<'a> {
@@ -782,6 +788,30 @@ impl SessionStore {
             slots: Vec::new(),
             free: Vec::new(),
             len: 0,
+            registered: 0,
+        }
+    }
+
+    /// The number of registered sessions.
+    pub(crate) fn registered_len(&self) -> usize {
+        debug_assert_eq!(
+            self.registered,
+            self.values().filter(|s| s.is_registered()).count(),
+            "registered-session count drifted from the sessions it counts"
+        );
+        self.registered
+    }
+
+    /// Complete `conn`'s registration if its nick and user are both present.
+    /// The only way a session becomes registered, so the count cannot miss it.
+    pub(crate) fn complete_registration(&mut self, conn: &ConnId) {
+        let Some(session) = self.get_mut(conn) else {
+            return;
+        };
+        let was_registered = session.is_registered();
+        session.complete_registration();
+        if !was_registered && session.is_registered() {
+            self.registered += 1;
         }
     }
 
@@ -832,6 +862,7 @@ impl SessionStore {
                 (self.slots.len() - 1, 0)
             }
         };
+        self.registered += usize::from(session.is_registered());
         self.slots[slot_index].session = Some(session);
         self.by_conn.insert(
             conn,
@@ -852,6 +883,7 @@ impl SessionStore {
         }
         let session = slot.session.take()?;
         self.len -= 1;
+        self.registered -= usize::from(session.is_registered());
         if let Some(next) = slot.generation.checked_add(1) {
             slot.generation = next;
             self.free.push(handle.slot);
@@ -934,8 +966,9 @@ impl Session {
     /// Transition `Registering → Registered` once a nick and user are present.
     /// The caller (`maybe_complete_registration`) verifies both first; realname is
     /// set alongside user, so it defaults to empty only defensively. A no-op if
-    /// already registered or the identity is incomplete.
-    pub fn complete_registration(&mut self) {
+    /// already registered or the identity is incomplete. Reached only through
+    /// [`SessionStore::complete_registration`], which keeps the registered count.
+    fn complete_registration(&mut self) {
         let placeholder = Registration::Registering {
             nick: None,
             user: None,
@@ -1109,10 +1142,54 @@ pub enum ChannelPartResult {
     NotOnChannel { name: String },
 }
 
-/// A complete QUIT request for one channel owner.
+/// Everyone who shares a channel with one user, each counted once: the
+/// audience of a change to the user rather than to any one channel.
+struct Peers {
+    subject: ConnId,
+    recipients: HashMap<ConnId, Recipient>,
+}
+
+impl Peers {
+    fn of(subject: ConnId) -> Self {
+        Self {
+            subject,
+            recipients: HashMap::new(),
+        }
+    }
+
+    fn extend(&mut self, members: &[Recipient]) {
+        for recipient in members {
+            if recipient.conn() != self.subject {
+                self.recipients.insert(recipient.conn(), *recipient);
+            }
+        }
+    }
+
+    fn into_recipients(self) -> impl Iterator<Item = Recipient> {
+        self.recipients.into_values()
+    }
+}
+
+/// A session's channels that one shard owns. A change to the user — a QUIT,
+/// a new nick — is one event per owning shard rather than one per channel, so
+/// the shard can tell each peer once however many of those channels they share.
+#[derive(Debug, Clone)]
+pub struct ShardChannels(Vec<ChannelOwner>);
+
+impl ShardChannels {
+    pub(crate) fn shard(&self) -> CoreShardId {
+        self.0[0].shard()
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &ChanKey> {
+        self.0.iter().map(ChannelOwner::key)
+    }
+}
+
+/// A complete QUIT request for one owning shard.
 #[derive(Debug)]
 pub struct ChannelQuit {
-    owner: ChannelOwner,
+    channels: ShardChannels,
     conn: ConnId,
     line: String,
 }
@@ -1336,7 +1413,7 @@ pub enum ChannelHistoryResult {
 pub enum ChannelKnockResult {
     KnockDelivered,
     NoSuchChannel { target: String },
-    Hidden { target: String },
+    Hidden { target: String, proof: Hidden },
     AlreadyOnChannel { display: String },
     ChannelOpen { display: String },
     CannotSend { display: String },
@@ -1346,6 +1423,7 @@ pub enum ChannelKnockResult {
 pub enum ChannelInviteResult {
     Invited { invitee: String, channel: String },
     NoSuchChannel { target: String },
+    Hidden { target: String, proof: Hidden },
     NotOnChannel { target: String },
     NotOperator { target: String },
     UserOnChannel { invitee: String, channel: String },
@@ -1368,6 +1446,7 @@ pub enum ChannelModeQueryResult {
     },
     Hidden {
         target: String,
+        proof: Hidden,
     },
     Modes {
         display: String,
@@ -1383,6 +1462,7 @@ pub enum ChannelModeListQueryResult {
     },
     Hidden {
         target: String,
+        proof: Hidden,
     },
     NotOperator {
         target: String,
@@ -1411,7 +1491,7 @@ pub enum ChannelSessionEvent {
 /// A current session snapshot applied by the owner of one of its channels.
 #[derive(Debug, Clone)]
 pub struct ChannelMemberUpdate {
-    owner: ChannelOwner,
+    channels: ShardChannels,
     recipient: Recipient,
     identity: MemberIdentity,
     profile: ChannelMemberProfile,
@@ -1426,14 +1506,14 @@ pub enum ChannelMemberChange {
 
 impl ChannelMemberUpdate {
     fn new(
-        owner: ChannelOwner,
+        channels: ShardChannels,
         recipient: Recipient,
         identity: MemberIdentity,
         profile: ChannelMemberProfile,
         change: ChannelMemberChange,
     ) -> Self {
         Self {
-            owner,
+            channels,
             recipient,
             identity,
             profile,
@@ -1441,8 +1521,8 @@ impl ChannelMemberUpdate {
         }
     }
 
-    pub(crate) fn owner(&self) -> &ChannelOwner {
-        &self.owner
+    pub(crate) fn shard(&self) -> CoreShardId {
+        self.channels.shard()
     }
 }
 
@@ -1461,6 +1541,7 @@ pub enum ChannelTopicResult {
     },
     Hidden {
         target: String,
+        proof: Hidden,
     },
     Topic {
         display: String,
@@ -1540,6 +1621,7 @@ impl ChannelKick {
 pub enum ChannelKickResult {
     Kicked,
     NoSuchChannel { target: String },
+    Hidden { target: String, proof: Hidden },
     NotOnChannel { target: String },
     NotOperator { target: String },
     UserNotInChannel { victim: String, channel: String },
@@ -1688,20 +1770,16 @@ pub enum ChannelTagmsgResult {
 }
 
 impl ChannelQuit {
-    pub(crate) fn new(owner: ChannelOwner, conn: ConnId, line: String) -> Self {
-        Self { owner, conn, line }
+    fn new(channels: ShardChannels, conn: ConnId, line: String) -> Self {
+        Self {
+            channels,
+            conn,
+            line,
+        }
     }
 
-    pub(crate) fn owner(&self) -> &ChannelOwner {
-        &self.owner
-    }
-
-    pub(crate) fn conn(&self) -> ConnId {
-        self.conn
-    }
-
-    pub(crate) fn line(&self) -> &str {
-        &self.line
+    pub(crate) fn shard(&self) -> CoreShardId {
+        self.channels.shard()
     }
 }
 
@@ -2016,7 +2094,8 @@ pub(crate) struct Channel {
     pub ban_exceptions: Vec<MaskKey>,
     pub invite_exceptions: Vec<MaskKey>,
     /// Connections holding a pending INVITE into this channel (consumed on
-    /// join). Lives on the channel — not the invitee's session — so channel
+    /// join). Recorded only while the channel is `+i`, when only an operator
+    /// may invite. Lives on the channel — not the invitee's session — so channel
     /// teardown revokes it: an invite is a grant by an op of *this* channel
     /// incarnation, and a session-side set keyed by name would let it
     /// authorize entry into an unrelated later channel reusing the name
@@ -2033,8 +2112,10 @@ pub(crate) struct Channel {
 /// that denies access to a hidden channel reports the *same* "no such channel"
 /// — none can hand-pick a numeric (like 442 `ERR_NOTONCHANNEL`) that would
 /// instead confirm the channel exists, which is exactly how a `TOPIC`-query
-/// existence oracle slipped in.
-pub(crate) struct Hidden(());
+/// existence oracle slipped in. A channel owner's `Hidden` answer carries the
+/// proof to the requester's shard, so the rule holds across that hop too.
+#[derive(Debug)]
+pub struct Hidden(());
 
 impl Channel {
     pub fn new(name: String, topic: Option<Topic>, modes: ChanModes, created_at_secs: u64) -> Self {
@@ -2222,7 +2303,8 @@ impl Channel {
     /// Is this secret channel invisible to `conn`? A `+s` channel is hidden from
     /// non-members on every query surface — its existence, modes, topic, and
     /// member lists all. The single source of that predicate: deny surfaces
-    /// (`MODE`/`KNOCK`/`TOPIC`) take the returned [`Hidden`] to `deny_hidden`;
+    /// (`MODE`/`KNOCK`/`TOPIC`/`KICK`/`INVITE`) take the returned [`Hidden`] to
+    /// `deny_hidden`;
     /// content-listing surfaces (`NAMES`/`WHO`/`WHOIS`/`LIST`) test `.is_some()`
     /// and simply omit the channel's rows.
     pub(crate) fn hidden_from(&self, conn: ConnId) -> Option<Hidden> {
@@ -2515,9 +2597,10 @@ pub(crate) struct Capture {
     /// asynchronously (CHATHISTORY falling back to PostgreSQL) can carry the
     /// label into that deferred reply instead of losing it.
     pub label: Option<String>,
-    /// Set by a handler that defers its response to an async path; tells the
-    /// labeled-response framer not to ACK the command as empty — the deferred
-    /// reply will emit the labeled batch itself.
+    /// Set by a handler that defers its response to an async path. Whoever
+    /// reads the capture must not take "no lines" for the answer: the
+    /// labeled-response framer must not ACK the command as empty, and a channel
+    /// owner must not release the requester — the deferred reply does both.
     pub deferred: bool,
 }
 
@@ -2956,16 +3039,15 @@ impl ServerState {
         let recipient = self.local_recipient(conn);
         let identity = self.local_member_identity(conn);
         let profile = self.local_member_profile(conn);
-        let channels: Vec<_> = self.sessions[&conn].channels.iter().cloned().collect();
-        for key in channels {
+        for channels in self.session_channels_by_shard(conn) {
             let update = ChannelMemberUpdate::new(
-                self.channels.owner(&key),
+                channels,
                 recipient,
                 identity.clone(),
                 profile.clone(),
                 change.clone(),
             );
-            if self.owns_channel(update.owner()) {
+            if update.shard() == self.shard {
                 self.apply_channel_member_update(update);
             } else {
                 self.effects
@@ -2976,32 +3058,41 @@ impl ServerState {
         }
     }
 
+    /// The session's channels, grouped by the shard that owns them.
+    fn session_channels_by_shard(&self, conn: ConnId) -> Vec<ShardChannels> {
+        let mut by_shard: std::collections::BTreeMap<usize, Vec<ChannelOwner>> =
+            std::collections::BTreeMap::new();
+        for key in &self.sessions[&conn].channels {
+            let owner = self.channels.owner(key);
+            by_shard.entry(owner.shard().0).or_default().push(owner);
+        }
+        by_shard.into_values().map(ShardChannels).collect()
+    }
+
     pub fn apply_channel_member_update(&mut self, update: ChannelMemberUpdate) {
         assert_eq!(
-            update.owner.shard(),
+            update.shard(),
             self.shard,
             "member update reached wrong shard"
         );
-        let key = update.owner.key().clone();
-        let updated = self.channels.get_mut(&key).is_some_and(|channel| {
-            channel.update_member(
-                update.recipient,
-                update.identity.clone(),
-                update.profile.clone(),
-            )
-        });
-        if !updated {
-            return;
+        let mut peers = Peers::of(update.recipient.conn());
+        for key in update.channels.keys() {
+            let updated = self.channels.get_mut(key).is_some_and(|channel| {
+                channel.update_member(
+                    update.recipient,
+                    update.identity.clone(),
+                    update.profile.clone(),
+                )
+            });
+            if updated {
+                peers.extend(&self.channels[key].recipients());
+            }
         }
         let ChannelMemberChange::Nick { previous_prefix } = update.change else {
             return;
         };
         let line = format!(":{previous_prefix} NICK {}", update.identity.nick);
-        for recipient in self.channels[&key].recipients().iter().copied() {
-            if recipient.conn() != update.recipient.conn() {
-                self.send_timed_recipient(recipient, &line);
-            }
-        }
+        self.broadcast_recipients(peers.into_recipients(), &line);
     }
 
     pub(crate) fn take_effects(&mut self) -> Vec<CoreEffect> {
@@ -3012,10 +3103,8 @@ impl ServerState {
         &mut self,
         mutation: super::ServerBanMutation,
     ) {
-        self.effects.push(CoreEffect::BroadcastServerBan {
-            source: self.shard,
-            mutation,
-        });
+        self.effects
+            .push(CoreEffect::BroadcastServerBan { mutation });
     }
 
     pub(crate) fn broadcast_account_suspension(
@@ -3026,7 +3115,6 @@ impl ServerState {
         actor: String,
     ) {
         self.effects.push(CoreEffect::BroadcastAccountSuspension {
-            source: self.shard,
             account,
             suspended,
             reason,
@@ -3042,7 +3130,6 @@ impl ServerState {
         marker_ms: e6irc_proto::time::Millis,
     ) {
         self.effects.push(CoreEffect::BroadcastReadMarker {
-            source: self.shard,
             account,
             target,
             display,
@@ -3802,12 +3889,12 @@ impl ServerState {
         }
     }
 
-    /// Hold later output behind an asynchronous verdict and tell the active
-    /// labeled-response capture that its reply will be emitted by that verdict.
+    /// Hold later output behind an asynchronous verdict and tell the capture
+    /// collecting this command's replies that the verdict will answer it.
     pub fn defer_captured_reply(&mut self, conn: ConnId) {
         self.defer_reply(conn);
         if let Some(capture) = self.capture.as_mut()
-            && capture.label.is_some()
+            && capture.conn == conn
         {
             capture.deferred = true;
         }
@@ -4156,14 +4243,25 @@ impl ServerState {
         };
         debug_assert_eq!(self.channels.owner(chan_key).shard(), self.shard);
         let members = chan.recipients();
+        self.broadcast_recipients(
+            members
+                .iter()
+                .copied()
+                .filter(|recipient| Some(recipient.conn()) != except),
+            line,
+        );
+    }
+
+    /// Serialize once per capability variant, deliver to each recipient.
+    fn broadcast_recipients(
+        &mut self,
+        recipients: impl IntoIterator<Item = Recipient>,
+        line: &str,
+    ) {
         let plain = Bytes::from(format!("{line}\r\n"));
-        // Built lazily: channels with no server-time member pay nothing.
+        // Built lazily: an audience with no server-time member pays nothing.
         let mut timed: Option<Bytes> = None;
-        for recipient in members
-            .iter()
-            .copied()
-            .filter(|recipient| Some(recipient.conn()) != except)
-        {
+        for recipient in recipients {
             let bytes = if recipient.caps().server_time {
                 timed
                     .get_or_insert_with(|| {
@@ -4285,15 +4383,13 @@ impl ServerState {
             let reason = crate::core::handler::fit_trailing(&head, reason);
             format!("{head}{reason}")
         });
-        let joined: Vec<ChanKey> = session.channels.iter().cloned().collect();
-
         if let Some(line) = quit_line {
-            for key in joined {
-                let owner = self.channels.owner(&key);
-                if self.owns_channel(&owner) {
-                    self.quit_channel_member(&owner, conn, &line);
+            for channels in self.session_channels_by_shard(conn) {
+                let quit = ChannelQuit::new(channels, conn, line.clone());
+                if quit.shard() == self.shard {
+                    self.quit_channel_member(quit);
                 } else {
-                    self.route_quit(ChannelQuit::new(owner, conn, line.clone()));
+                    self.route_quit(quit);
                 }
             }
         }
@@ -4343,25 +4439,25 @@ impl ServerState {
 
     /// Apply a registered session's departure on the channel-owning shard.
     /// A preceding PART can have removed the member while its response was in
-    /// flight to the closing session; that makes this departure already applied.
-    pub fn quit_channel_member(&mut self, owner: &ChannelOwner, conn: ConnId, line: &str) {
-        assert_eq!(
-            owner.shard(),
-            self.shard,
-            "QUIT reached wrong channel shard"
-        );
-        let key = owner.key();
-        let removed = self
-            .channels
-            .get_mut(key)
-            .and_then(|channel| channel.remove_member(conn));
-        let Some(_) = removed else {
-            return;
-        };
-        self.broadcast_channel(key, line, Some(conn));
-        if !self.channels[key].has_members() {
-            self.remove_channel(key);
+    /// flight to the closing session; that makes this departure already applied
+    /// to that channel.
+    pub fn quit_channel_member(&mut self, quit: ChannelQuit) {
+        assert_eq!(quit.shard(), self.shard, "QUIT reached wrong channel shard");
+        let mut peers = Peers::of(quit.conn);
+        for key in quit.channels.keys() {
+            let removed = self
+                .channels
+                .get_mut(key)
+                .and_then(|channel| channel.remove_member(quit.conn));
+            if removed.is_none() {
+                continue;
+            }
+            peers.extend(&self.channels[key].recipients());
+            if !self.channels[key].has_members() {
+                self.remove_channel(key);
+            }
         }
+        self.broadcast_recipients(peers.into_recipients(), &quit.line);
     }
 }
 
@@ -4557,6 +4653,43 @@ mod session_store_tests {
             Arc::new(Telemetry::new()),
             CoreDirectories::default(),
         )
+    }
+
+    fn register(state: &mut ServerState, conn: ConnId, nick: &str) {
+        open(state, conn);
+        for line in [format!("NICK {nick}"), format!("USER {nick} 0 * :{nick}")] {
+            crate::core::handler::dispatch(state, conn, line.as_bytes());
+        }
+    }
+
+    /// The count the core reports after every event follows each way a session
+    /// starts or stops being registered. (`registered_len` also checks itself
+    /// against a full count in debug builds, so every other test checks it too.)
+    #[test]
+    fn registered_count_follows_registration_close_and_kill() {
+        let mut state = state();
+        open(&mut state, ConnId(1));
+        assert_eq!(state.sessions.registered_len(), 0, "open, not registered");
+
+        register(&mut state, ConnId(2), "alice");
+        register(&mut state, ConnId(3), "bob");
+        assert_eq!(state.sessions.registered_len(), 2);
+        // Completing a registration twice counts it once.
+        state.sessions.complete_registration(&ConnId(2));
+        assert_eq!(state.sessions.registered_len(), 2);
+
+        state.close(ConnId(1), "never registered");
+        assert_eq!(state.sessions.registered_len(), 2);
+        state.close(ConnId(2), "Client Quit");
+        assert_eq!(state.sessions.registered_len(), 1);
+        register(&mut state, ConnId(5), "oper");
+        state.sessions.get_mut(&ConnId(5)).expect("oper").oper = true;
+        crate::core::handler::dispatch(&mut state, ConnId(5), b"KILL bob :bye");
+        assert!(state.sessions.get(&ConnId(3)).is_none(), "bob was killed");
+        assert_eq!(state.sessions.registered_len(), 1, "only the operator");
+        // A reused slot starts unregistered again.
+        open(&mut state, ConnId(4));
+        assert_eq!(state.sessions.registered_len(), 1);
     }
 
     #[test]

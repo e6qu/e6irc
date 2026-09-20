@@ -91,7 +91,7 @@ impl std::fmt::Display for DbError {
             Self::Connect(e) => write!(f, "database connect failed: {e}"),
             Self::Migrate(e) => write!(f, "database migration failed: {e}"),
             Self::Query(e) => write!(f, "database query failed: {e}"),
-            Self::Hash(e) => write!(f, "password hashing failed: {e}"),
+            Self::Hash(e) => write!(f, "password hash operation failed: {e}"),
             Self::DuplicateAccount(n) => write!(f, "account already exists: {n}"),
             Self::DuplicateNetwork(n) => write!(f, "network already exists: {n}"),
             Self::InvalidNetworkKind(kind) => {
@@ -1229,11 +1229,16 @@ pub async fn delete_account_permanently(
     .execute(&mut *transaction)
     .await
     .map_err(DbError::Query)?;
+    // `sender_account` holds the account as the sender's session named it —
+    // the display name — while `dm_peers` holds casefolded identities. An
+    // account's name never changes and no other account can fold to it, so the
+    // two spellings together are exactly this account's messages.
     sqlx::query(
         "DELETE FROM messages
-         WHERE sender_account = $1 OR dm_peers @> ARRAY[$1::text]",
+         WHERE sender_account IN ($1, $2) OR dm_peers @> ARRAY[$1::text]",
     )
     .bind(&folded)
+    .bind(&name)
     .execute(&mut *transaction)
     .await
     .map_err(DbError::Query)?;
@@ -1340,10 +1345,26 @@ struct LockedAccountState {
     flags: i64,
 }
 
+const ACCOUNT_AUTHORITY_ADVISORY_LOCK_KEY: i64 = 0x6536_6972_6300_0003;
+
+/// Lock one account for a change to its authority: administrator rights,
+/// suspension, or deletion.
+///
+/// The row lock alone is not enough. Whether a change may go ahead depends on
+/// *other* rows — is another active administrator left? — and two transactions
+/// that each lock a different account both answer yes from their own snapshot,
+/// then both commit, leaving none. So every authority change first takes one
+/// transaction-scoped advisory lock: they run one at a time, and each counts
+/// the administrators the previous one left behind.
 async fn lock_account_state(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: i64,
 ) -> Result<Option<LockedAccountState>, DbError> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(ACCOUNT_AUTHORITY_ADVISORY_LOCK_KEY)
+        .execute(&mut **transaction)
+        .await
+        .map_err(DbError::Query)?;
     sqlx::query_as(
         "SELECT name, name_folded AS folded, flags FROM accounts WHERE id = $1 FOR UPDATE",
     )
@@ -1589,24 +1610,48 @@ struct CredentialHash {
 }
 
 /// Verify every supplied credential without short-circuiting.
-async fn matching_credential_id(credentials: Vec<CredentialHash>, password: String) -> Option<i64> {
+///
+/// A stored hash that does not parse is damaged data, not a wrong password:
+/// it can never verify, and answering "rejected" would hide the damage behind
+/// what looks like a typo. It is logged by credential id — never the hash —
+/// and, unless another credential matches, the verification fails as a store
+/// fault so every caller's error path reports and counts it. The login still
+/// fails closed either way.
+async fn matching_credential_id(
+    credentials: Vec<CredentialHash>,
+    password: String,
+) -> Result<Option<i64>, DbError> {
     let _permit = ARGON2_PERMITS
         .acquire()
         .await
         .expect("argon2 semaphore never closed");
     tokio::task::spawn_blocking(move || {
         let mut matched_id = None;
+        let mut unreadable = None;
         for credential in &credentials {
-            let matches = PasswordHash::new(&credential.argon2_hash).is_ok_and(|parsed| {
-                hasher()
-                    .verify_password(password.as_bytes(), &parsed)
-                    .is_ok()
-            });
-            if matches {
-                matched_id = Some(credential.credential_id);
+            match PasswordHash::new(&credential.argon2_hash) {
+                Ok(parsed) => {
+                    if hasher()
+                        .verify_password(password.as_bytes(), &parsed)
+                        .is_ok()
+                    {
+                        matched_id = Some(credential.credential_id);
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "db: stored password hash of credential {} is unreadable ({error}); \
+                         it can never verify until it is reset",
+                        credential.credential_id
+                    );
+                    unreadable = Some(error);
+                }
             }
         }
-        matched_id
+        match (matched_id, unreadable) {
+            (None, Some(error)) => Err(DbError::Hash(error)),
+            (matched_id, _) => Ok(matched_id),
+        }
     })
     .await
     .expect("verification task panicked")
@@ -2040,11 +2085,13 @@ async fn handle_request(
             {
                 Ok(result) => result,
                 Err(error) => {
-                    record_database_error(telemetry);
                     eprintln!("db: channel registration failed: {error}");
                     crate::core::ChannelRegistrationResult::Unavailable
                 }
             };
+            // Counted here, once, for both ways of being unavailable: the
+            // error arm above used to count it too, so every failed
+            // registration was recorded as two database errors.
             if matches!(result, crate::core::ChannelRegistrationResult::Unavailable) {
                 record_database_error(telemetry);
             }
@@ -3957,6 +4004,14 @@ pub async fn export_account_json(pool: &PgPool, account: &str) -> Result<Option<
                 ) ORDER BY r.target)
                 FROM read_markers r WHERE r.account_id = a.id
             ), '[]'::jsonb),
+            'bouncer_read_markers', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                    'network', r.network,
+                    'target', r.target,
+                    'timestamp', r.timestamp
+                ) ORDER BY r.network, r.target)
+                FROM bnc_read_markers r WHERE r.account_id = a.id
+            ), '[]'::jsonb),
             'founded_channels', COALESCE((
                 SELECT jsonb_agg(jsonb_build_object(
                     'name', c.name,
@@ -3995,7 +4050,7 @@ pub async fn export_account_json(pool: &PgPool, account: &str) -> Result<Option<
                     'multiline', m.multiline
                 ) ORDER BY m.id)
                 FROM messages m
-                WHERE m.sender_account = a.name_folded
+                WHERE m.sender_account IN (a.name, a.name_folded)
                    OR m.dm_peers @> ARRAY[a.name_folded]
             ), '[]'::jsonb),
             'bouncer_buffer', COALESCE((
@@ -4668,7 +4723,7 @@ pub async fn verify_credentials(
             argon2_hash: row.argon2_hash,
         })
         .collect();
-    let matched_id = matching_credential_id(creds, password.to_string()).await;
+    let matched_id = matching_credential_id(creds, password.to_string()).await?;
     if let Some(id) = matched_id {
         // Record the use so the credential list can show it. Best-effort: a
         // failure here must not fail an otherwise-successful authentication, so
@@ -4720,7 +4775,7 @@ pub async fn verify_local_password(
         }],
         password.to_string(),
     )
-    .await;
+    .await?;
     if matched.is_some() {
         sqlx::query("UPDATE account_credentials SET last_used_at = now() WHERE id = $1")
             .bind(credential_id)
@@ -4818,7 +4873,7 @@ pub async fn change_local_password(
         }],
         current_password.to_string(),
     )
-    .await
+    .await?
     .is_none()
     {
         return Err(DbError::BadCredentials);
@@ -5124,17 +5179,22 @@ pub async fn update_bnc_network(
     Ok(done.rows_affected() > 0)
 }
 
-/// Every *enabled* network across all accounts, paired with its owner's
-/// display name — used to start always-on drivers at boot. Disabled
-/// networks are intentionally skipped: they run no driver.
-pub async fn list_all_bnc_networks(pool: &PgPool) -> Result<Vec<(String, BncNetworkRow)>, DbError> {
+/// Every network whose driver runs at boot, paired with its owner's display
+/// name: enabled, and owned by an account that is not suspended. Suspension
+/// leaves `enabled` set so reactivation can restore the owner's networks, so
+/// the flag alone would restart every suspended account's upstream sessions —
+/// with their stored credentials — on the next process start.
+pub async fn list_startable_bnc_networks(
+    pool: &PgPool,
+) -> Result<Vec<(String, BncNetworkRow)>, DbError> {
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT a.name AS owner, n.name, n.addr, n.tls, n.nick, n.realname,
                 n.autojoin, n.sasl_account, n.sasl_password_sealed, n.enabled, n.kind
          FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
-         WHERE n.enabled",
+         WHERE n.enabled AND (a.flags & $1) = 0",
     )
+    .bind(ACCOUNT_FLAG_SUSPENDED)
     .fetch_all(pool)
     .await
     .map_err(DbError::Query)?;
@@ -5474,7 +5534,7 @@ fn bnc_line_target(line: &str, own_nick: Option<&str>) -> Option<String> {
     let msg = e6irc_proto::message::Message::parse(line).ok()?;
     match msg.command.to_ascii_uppercase().as_str() {
         "PRIVMSG" | "NOTICE" | "TAGMSG" => {
-            let addressed = *msg.params.first()?;
+            let addressed = crate::bouncer::conversation_target(msg.params.first()?);
             if addressed.starts_with(['#', '&']) {
                 return Some(addressed.to_string());
             }
@@ -6765,6 +6825,38 @@ mod history_sql_tests {
         assert_eq!(
             bnc_line_target(":Bob!u@h PRIVMSG #Room :channel", Some("alice")),
             Some("#Room".to_string())
+        );
+    }
+
+    /// A STATUSMSG is channel conversation with a narrower audience. Filed
+    /// under its sender it became a direct message from someone who never sent
+    /// one, and vanished from the channel history it belongs to.
+    #[test]
+    fn bnc_statusmsg_lines_belong_to_their_channel() {
+        for (addressed, channel) in [
+            ("@#Room", "#Room"),
+            ("+#Room", "#Room"),
+            ("@&local", "&local"),
+        ] {
+            assert_eq!(
+                bnc_line_target(
+                    &format!(":Bob!u@h PRIVMSG {addressed} :ops only"),
+                    Some("alice")
+                ),
+                Some(channel.to_string()),
+                "{addressed}"
+            );
+        }
+        assert_eq!(
+            bnc_line_target(":alice!u@h NOTICE @#Room :from us", Some("alice")),
+            Some("#Room".to_string())
+        );
+        assert_eq!(
+            bnc_line_target(
+                ":Bob!u@h PRIVMSG +alice :a nick, not a STATUSMSG",
+                Some("+alice")
+            ),
+            Some("Bob".to_string())
         );
     }
 

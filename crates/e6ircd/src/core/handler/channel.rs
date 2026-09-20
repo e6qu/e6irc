@@ -856,17 +856,11 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
     } else {
         crate::core::state::ChannelTopicOperation::Set(p.get(1).copied().unwrap_or("").to_string())
     };
-    let local = state.owns_channel(&state.channel_owner(target));
-    let label = if local {
-        state
-            .capture
-            .as_ref()
-            .and_then(|capture| capture.label.clone())
-    } else {
-        state.defer_channel_reply(conn)
-    };
+    let owner = state.channel_owner(target);
+    let local = state.owns_channel(&owner);
+    let label = state.channel_reply_label(conn, &owner);
     let request = crate::core::state::ChannelTopic::new(
-        state.channel_owner(target),
+        owner,
         state.channel_actor(conn),
         target.to_string(),
         operation,
@@ -890,11 +884,17 @@ fn topic_set_on_owner(
     label: Option<String>,
 ) -> Option<crate::core::state::ChannelTopicResult> {
     let conn = actor.recipient.conn();
+    // From the actor, never from this shard's sessions: the requester may live
+    // on another shard, where this one has no session to look up.
+    let session = actor.session_owner();
     let key = state.chan_key(&target);
     assert_eq!(owner.key(), &key, "TOPIC owner does not match target");
     let Some(chan) = state.channels.get(&key) else {
         return Some(crate::core::state::ChannelTopicResult::NoSuchChannel { target });
     };
+    if let Some(proof) = chan.hidden_from(conn) {
+        return Some(crate::core::state::ChannelTopicResult::Hidden { target, proof });
+    }
     let display = chan.name.clone();
     let Some(member) = chan.member(conn) else {
         return Some(crate::core::state::ChannelTopicResult::NotOnChannel { target });
@@ -963,7 +963,7 @@ fn topic_set_on_owner(
         .map(|t| (t.text.clone(), t.set_by.clone(), t.set_at_secs));
     let request = crate::core::DbRequest::SetChannelTopic {
         owner: state.channel_owner(key.as_str()),
-        session: state.channel_actor(conn).session_owner(),
+        session,
         channel: key.as_str().to_string(),
         display: display.clone(),
         prefix,
@@ -1000,8 +1000,8 @@ pub(super) fn topic_on_owner(
     let Some(channel) = state.channels.get(&key) else {
         return Some(crate::core::state::ChannelTopicResult::NoSuchChannel { target });
     };
-    if channel.hidden_from(actor.recipient.conn()).is_some() {
-        return Some(crate::core::state::ChannelTopicResult::Hidden { target });
+    if let Some(proof) = channel.hidden_from(actor.recipient.conn()) {
+        return Some(crate::core::state::ChannelTopicResult::Hidden { target, proof });
     }
     Some(crate::core::state::ChannelTopicResult::Topic {
         display: channel.name.clone(),
@@ -1026,9 +1026,11 @@ fn emit_topic_result_now(
     result: crate::core::state::ChannelTopicResult,
 ) {
     match result {
-        crate::core::state::ChannelTopicResult::NoSuchChannel { target }
-        | crate::core::state::ChannelTopicResult::Hidden { target } => {
+        crate::core::state::ChannelTopicResult::NoSuchChannel { target } => {
             state.err_nosuchchannel(conn, clip_echo(&target));
+        }
+        crate::core::state::ChannelTopicResult::Hidden { target, proof } => {
+            super::deny_hidden(state, conn, &target, proof);
         }
         crate::core::state::ChannelTopicResult::Topic { display, topic } => match topic {
             Some(topic) => {
@@ -1368,8 +1370,8 @@ pub(super) fn mode_query_on_owner(
     let Some(chan) = state.channels.get(&key) else {
         return crate::core::state::ChannelModeQueryResult::NoSuchChannel { target };
     };
-    if chan.hidden_from(actor.recipient.conn()).is_some() {
-        return crate::core::state::ChannelModeQueryResult::Hidden { target };
+    if let Some(proof) = chan.hidden_from(actor.recipient.conn()) {
+        return crate::core::state::ChannelModeQueryResult::Hidden { target, proof };
     }
     crate::core::state::ChannelModeQueryResult::Modes {
         display: chan.name.clone(),
@@ -1394,8 +1396,8 @@ pub(super) fn mode_list_query_on_owner(
         return crate::core::state::ChannelModeListQueryResult::NoSuchChannel { target };
     };
     let conn = actor.recipient.conn();
-    if chan.hidden_from(conn).is_some() {
-        return crate::core::state::ChannelModeListQueryResult::Hidden { target };
+    if let Some(proof) = chan.hidden_from(conn) {
+        return crate::core::state::ChannelModeListQueryResult::Hidden { target, proof };
     }
     let is_op = chan.member(conn).is_some_and(|member| member.op);
     if !is_op && modes.chars().any(|mode| matches!(mode, 'e' | 'I')) {
@@ -1431,9 +1433,11 @@ fn emit_mode_query_result_now(
     result: crate::core::state::ChannelModeQueryResult,
 ) {
     match result {
-        crate::core::state::ChannelModeQueryResult::NoSuchChannel { target }
-        | crate::core::state::ChannelModeQueryResult::Hidden { target } => {
+        crate::core::state::ChannelModeQueryResult::NoSuchChannel { target } => {
             state.err_nosuchchannel(conn, super::clip_echo(&target))
+        }
+        crate::core::state::ChannelModeQueryResult::Hidden { target, proof } => {
+            super::deny_hidden(state, conn, &target, proof)
         }
         crate::core::state::ChannelModeQueryResult::Modes {
             display,
@@ -1512,9 +1516,11 @@ fn emit_mode_list_query_result_now(
     result: crate::core::state::ChannelModeListQueryResult,
 ) {
     match result {
-        crate::core::state::ChannelModeListQueryResult::NoSuchChannel { target }
-        | crate::core::state::ChannelModeListQueryResult::Hidden { target } => {
+        crate::core::state::ChannelModeListQueryResult::NoSuchChannel { target } => {
             state.err_nosuchchannel(conn, super::clip_echo(&target))
+        }
+        crate::core::state::ChannelModeListQueryResult::Hidden { target, proof } => {
+            super::deny_hidden(state, conn, &target, proof)
         }
         crate::core::state::ChannelModeListQueryResult::NotOperator { target } => state.numeric(
             conn,

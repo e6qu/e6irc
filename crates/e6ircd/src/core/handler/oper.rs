@@ -9,6 +9,12 @@ pub(super) fn cmd_oper(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.err_needmoreparams(conn, "OPER");
         return;
     };
+    // OPER is a password check like SASL and IDENTIFY, so every attempt spends
+    // the same per-connection budget: a registered client cannot pipeline
+    // guesses at line rate, and the link closes when the budget runs out.
+    if !credential_attempt_ok(state, conn) {
+        return;
+    }
     // Always run the constant-time compare — against a dummy secret when the
     // operator name is unknown — so response timing is name-independent and can't
     // be used to enumerate valid operator names. Short-circuiting on an unknown
@@ -20,6 +26,17 @@ pub(super) fn cmd_oper(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .unwrap_or(b"\0no-such-oper\0");
     let matched = constant_time_eq(candidate_pw, password.as_bytes()) && stored.is_some();
     if !matched {
+        // A security event, logged like a failed SASL attempt (one bounded
+        // line per denial; the budget above caps how many one socket makes).
+        // The offered operator name is client text, so it is logged escaped.
+        let (nick, host) = {
+            let session = &state.sessions[&conn];
+            (
+                session.nick().unwrap_or("*").to_string(),
+                session.host.clone(),
+            )
+        };
+        eprintln!("ircd: OPER authentication failed for {nick} from {host} as {name:?}");
         state.numeric(conn, ERR_PASSWDMISMATCH, &[], Some("Password incorrect"));
         return;
     }
@@ -537,13 +554,14 @@ pub(crate) fn remove_server_ban_hot(
     state.server_bans.len() < before
 }
 
-fn acknowledge_server_ban_oper(
+/// Answer the operator whose server-ban command has been waiting on its
+/// database verdict. Every verdict for an operator requester ends here, so the
+/// reply the connection's output is held behind always arrives.
+fn server_ban_oper_verdict(
     state: &mut ServerState,
     conn: ConnId,
     response_label: Option<String>,
-    action: &str,
-    kind_label: &str,
-    mask: &crate::core::state::MaskKey,
+    text: &str,
 ) {
     if !state.sessions.contains_key(&conn) {
         return;
@@ -551,13 +569,7 @@ fn acknowledge_server_ban_oper(
     let server = state.config.server_name.clone();
     let nick = state.sessions[&conn].nick().unwrap_or("*").to_string();
     state.emit_deferred_labeled(conn, response_label, |state| {
-        state.send(
-            conn,
-            &format!(
-                ":{server} NOTICE {nick} :{action} {kind_label} for {}",
-                mask.as_str()
-            ),
-        );
+        state.send(conn, &format!(":{server} NOTICE {nick} :{text}"));
     });
 }
 
@@ -581,17 +593,29 @@ pub(crate) fn server_ban_result(
         return None;
     }
     if result == crate::core::ServerBanResult::Missing {
-        if let crate::core::ServerBanRequester::Admin { request_id, .. } = requester {
-            finish_admin_server_ban(
-                state,
-                request_id,
-                crate::core::AdminReply::BanErr {
-                    kind: crate::core::BanControlError::NotFound,
-                    message: "server ban no longer exists".into(),
-                },
-            );
-        }
-        return None;
+        // A removal keyed only by (mask, kind) found no row, so the database
+        // holds no such ban and the hot list must stop enforcing one. A removal
+        // pinned to a row id proves only that *that* row is gone — the mask may
+        // have been banned again under a new id — so it reconciles nothing.
+        let unstored = matches!(
+            &mutation,
+            crate::core::ServerBanMutation::Remove {
+                expected_id: None,
+                ..
+            }
+        );
+        let (crate::core::ServerBanMutation::Add { mask_display, .. }
+        | crate::core::ServerBanMutation::Remove { mask_display, .. }) = &mutation;
+        finish_server_ban(
+            state,
+            requester,
+            &format!("No stored {} for {mask_display}", kind.label()),
+            crate::core::AdminReply::BanErr {
+                kind: crate::core::BanControlError::NotFound,
+                message: "server ban no longer exists".into(),
+            },
+        );
+        return unstored.then_some(mutation);
     }
 
     let (mask_display, action) = match &mutation {
@@ -599,27 +623,30 @@ pub(crate) fn server_ban_result(
         crate::core::ServerBanMutation::Remove { mask_display, .. } => (mask_display, "Removed"),
     };
     let mask = crate::core::state::MaskKey::new(mask_display, state.casemap);
-    finish_server_ban_success(state, requester, action, kind.label(), &mask);
+    let text = format!("{action} {} for {}", kind.label(), mask.as_str());
+    finish_server_ban(
+        state,
+        requester,
+        &text,
+        crate::core::AdminReply::Ok(text.clone()),
+    );
     Some(mutation)
 }
 
-fn finish_server_ban_success(
+/// Deliver one server-ban verdict to whoever asked for the change: the
+/// operator's NOTICE, or the administrative request's reply.
+fn finish_server_ban(
     state: &mut ServerState,
     requester: crate::core::ServerBanRequester,
-    action: &str,
-    kind_label: &str,
-    mask: &crate::core::state::MaskKey,
+    operator_text: &str,
+    admin_reply: crate::core::AdminReply,
 ) {
     match requester {
         crate::core::ServerBanRequester::Oper { session, label } => {
-            acknowledge_server_ban_oper(state, session.conn(), label, action, kind_label, mask);
+            server_ban_oper_verdict(state, session.conn(), label, operator_text);
         }
         crate::core::ServerBanRequester::Admin { request_id, .. } => {
-            finish_admin_server_ban(
-                state,
-                request_id,
-                crate::core::AdminReply::Ok(format!("{action} {kind_label} for {}", mask.as_str())),
-            );
+            finish_admin_server_ban(state, request_id, admin_reply);
         }
     }
 }
@@ -679,31 +706,15 @@ fn finish_server_ban_unavailable(
     requester: crate::core::ServerBanRequester,
     reason: &str,
 ) {
-    match requester {
-        crate::core::ServerBanRequester::Oper { session, label } => {
-            let conn = session.conn();
-            if state.sessions.contains_key(&conn) {
-                let server = state.config.server_name.clone();
-                let nick = state.sessions[&conn].nick().unwrap_or("*").to_string();
-                state.emit_deferred_labeled(conn, label, |state| {
-                    state.send(
-                        conn,
-                        &format!(":{server} NOTICE {nick} :Server-ban change failed: {reason}"),
-                    );
-                });
-            }
-        }
-        crate::core::ServerBanRequester::Admin { request_id, .. } => {
-            finish_admin_server_ban(
-                state,
-                request_id,
-                crate::core::AdminReply::BanErr {
-                    kind: crate::core::BanControlError::Unavailable,
-                    message: format!("server-ban change failed: {reason}"),
-                },
-            );
-        }
-    }
+    finish_server_ban(
+        state,
+        requester,
+        &format!("Server-ban change failed: {reason}"),
+        crate::core::AdminReply::BanErr {
+            kind: crate::core::BanControlError::Unavailable,
+            message: format!("server-ban change failed: {reason}"),
+        },
+    );
 }
 
 fn finish_admin_server_ban(
