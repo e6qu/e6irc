@@ -423,7 +423,7 @@ function ensureBuffer(name, kind) {
   if (buffers.size >= MAX_BUFFERS) {
     showAlert(
       "buffers",
-      `The ${MAX_BUFFERS}-conversation display limit was reached. New conversation lines are being shown in the server buffer.`,
+      `The ${MAX_BUFFERS}-conversation display limit was reached. New conversations are being shown under "server".`,
     );
     return buffers.get(SERVER);
   }
@@ -1169,7 +1169,7 @@ function scheduleReconnect() {
   );
   showAlert(
     "socket",
-    `The live connection to ${network} closed. e6irc will retry with bounded backoff.`,
+    `The live connection to ${network} closed. e6irc keeps retrying, waiting longer each time.`,
     "error",
     { label: "Retry now", onClick: retryConnectionNow },
   );
@@ -1199,7 +1199,7 @@ async function reconcileUnavailableNetwork() {
     if (replacement && replacement.enabled !== false && replacement.runtime != null) {
       terminalSocket = false;
       clearAlert("network-unavailable");
-      setStatus(`${replacement.name}: reconfigured, reattaching…`, "connecting");
+      setStatus(`${replacement.name}: settings changed, reconnecting…`, "connecting");
       if (!reconnectTimer) {
         reconnectTimer = window.setTimeout(() => {
           reconnectTimer = null;
@@ -1234,7 +1234,7 @@ function connect() {
   upstreamConnected = false;
   snapshotComplete = false;
   setComposerAvailable(false);
-  setStatus(`attaching to ${network}…`, "connecting");
+  setStatus(`opening ${network}…`, "connecting");
   rejectAllPendingSends("the connection was replaced");
   // Drop any previous socket so overlapping connections can't both feed events.
   if (socket) {
@@ -1255,7 +1255,7 @@ function connect() {
     reconnectDelay = 0; // healthy connection: reset backoff
     reconnectAttempt = 0;
     setComposerAvailable(true);
-    setStatus(`attached to ${network}`, "ok");
+    setStatus(`${network}: open`, "ok");
     clearAlert("socket");
     clearAlert("send");
     clearAlert("socket-close");
@@ -1265,7 +1265,7 @@ function connect() {
     if (socket !== liveSocket) return;
     showAlert(
       "socket",
-      `The live connection to ${network} failed. e6irc will keep retrying with bounded backoff.`,
+      `The live connection to ${network} failed. e6irc keeps retrying, waiting longer each time.`,
       "error",
       { label: "Retry now", onClick: retryConnectionNow },
     );
@@ -1302,23 +1302,23 @@ function connect() {
     }
     else if (event.type === "sent") {
       if (!acceptPendingSend(event.value)) {
-        showAlert("protocol", "The server acknowledged an unknown composer request.", "error");
+        showAlert("protocol", "The server confirmed a message this page did not send.", "error");
       }
     } else if (event.type === "send-error") {
       if (!rejectPendingSend(event.value, event.message)) {
-        showAlert("protocol", "The server rejected an unknown composer request.", "error");
+        showAlert("protocol", "The server rejected a message this page did not send.", "error");
       }
     } else if (event.type === "status" && event.value === "connected") {
       const becameConnected = !upstreamConnected;
       upstreamConnected = true;
-      setStatus(`${network}: upstream connected`, "ok");
+      setStatus(`${network}: connected`, "ok");
       if (becameConnected && snapshotComplete) resyncMemberships();
     } else if (event.type === "status" && event.value === "disconnected") {
       upstreamConnected = false;
       // The server includes the classified failure summary when it knows why
       // the upstream dropped — say it, don't leave the user guessing.
       const why = event.reason ? ` — ${event.reason}` : "";
-      setStatus(`${network}: upstream reconnecting${why}`, "error");
+      setStatus(`${network}: reconnecting${why}`, "error");
     } else if (event.type === "snapshot") {
       snapshotComplete = true;
       if (upstreamConnected) resyncMemberships();
@@ -1409,7 +1409,7 @@ composer.addEventListener("submit", (e) => {
   // raw IRC line and bounce back as "421 Unknown command". Require a /command
   // (e.g. /join #chan) there instead of emitting a bogus line.
   if (!b && !text.startsWith("/")) {
-    addServer("No active channel/query — use a /command here (e.g. /join #chan) or pick a buffer.");
+    addServer("There is no conversation open to send that to — use a command here (for example /join #channel) or pick a conversation.");
     messageInput.focus();
     return;
   }
@@ -1417,7 +1417,7 @@ composer.addEventListener("submit", (e) => {
     addServer(`Not sending more than ${MAX_PENDING_SENDS} messages without server confirmation.`);
     showAlert(
       "send",
-      `The outbound confirmation queue is full (${MAX_PENDING_SENDS}); wait or reconnect before retrying.`,
+      `${MAX_PENDING_SENDS} messages are still waiting to be confirmed; wait or reconnect before sending more.`,
       "error",
     );
     return;
