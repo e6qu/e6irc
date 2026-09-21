@@ -15,6 +15,7 @@ import struct
 import subprocess
 import tempfile
 import termios
+import threading
 import time
 
 
@@ -86,6 +87,69 @@ class IrcPeer:
         self.socket.close()
 
 
+class LineProxy:
+    """A TCP relay between the TUI and e6ircd that records every line the TUI
+    sends, so the journey can prove what reached the server — a read marker
+    is private to the connection that set it, and no other client sees it."""
+
+    def __init__(self, upstream_port: int) -> None:
+        self.upstream_port = upstream_port
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(1)
+        self.port = self.listener.getsockname()[1]
+        self.lock = threading.Lock()
+        self.client_lines: list[str] = []
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def run(self) -> None:
+        client, _ = self.listener.accept()
+        upstream = socket.create_connection(("127.0.0.1", self.upstream_port))
+        threading.Thread(
+            target=self.pump, args=(upstream, client, False), daemon=True
+        ).start()
+        self.pump(client, upstream, True)
+
+    def pump(self, source: socket.socket, sink: socket.socket, record: bool) -> None:
+        pending = b""
+        try:
+            while True:
+                chunk = source.recv(65536)
+                if not chunk:
+                    break
+                if record:
+                    pending += chunk
+                    while b"\n" in pending:
+                        raw, pending = pending.split(b"\n", 1)
+                        with self.lock:
+                            self.client_lines.append(
+                                raw.rstrip(b"\r").decode("utf-8", "replace")
+                            )
+                sink.sendall(chunk)
+        except OSError:
+            pass
+        finally:
+            try:
+                sink.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    def lines(self) -> list[str]:
+        with self.lock:
+            return list(self.client_lines)
+
+    def wait_line(self, predicate, description: str) -> None:
+        deadline = time.monotonic() + TIMEOUT
+        while time.monotonic() < deadline:
+            if any(predicate(line) for line in self.lines()):
+                return
+            time.sleep(0.05)
+        raise TimeoutError(f"the TUI never sent {description}; sent {self.lines()!r}")
+
+    def close(self) -> None:
+        self.listener.close()
+
+
 def read_pty_until(master: int, output: bytearray, needle: bytes) -> None:
     deadline = time.monotonic() + TIMEOUT
     while time.monotonic() < deadline:
@@ -153,6 +217,7 @@ def main() -> None:
         master = -1
         tui: subprocess.Popen[bytes] | None = None
         peer: IrcPeer | None = None
+        proxy: LineProxy | None = None
         output = bytearray()
         try:
             wait_for_server(port, server)
@@ -163,6 +228,7 @@ def main() -> None:
             peer.send("JOIN #pty")
             peer.wait_line(lambda line: " 366 observer #pty " in line, "observer JOIN")
 
+            proxy = LineProxy(port)
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
 
@@ -176,7 +242,7 @@ def main() -> None:
                 [
                     str(TUI),
                     "--server",
-                    f"127.0.0.1:{port}",
+                    f"127.0.0.1:{proxy.port}",
                     "--nick",
                     "ptyclient",
                     "--username",
@@ -224,15 +290,54 @@ def main() -> None:
                 and " PRIVMSG #pty :hello from pty" in line,
                 "TUI outbound PRIVMSG",
             )
+            # A bracketed paste with a line break is refused whole: sent line by
+            # line it would be messages the user never saw separately.
+            os.write(master, b"\x1b[200~pasted-a\rpasted-b\x1b[201~")
+            read_pty_until(master, output, b"inserted")
+            if any("pasted-" in line for line in proxy.lines()):
+                raise AssertionError(f"a multi-line paste was sent: {proxy.lines()!r}")
+
+            # A resize redraws at the new size at once, not at the next event.
+            mark = len(output)
+            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 140, 0, 0))
+            os.kill(tui.pid, signal.SIGWINCH)
+            deadline = time.monotonic() + TIMEOUT
+            while b"\x1b[2J" not in output[mark:]:
+                if time.monotonic() > deadline:
+                    raise AssertionError("TUI did not redraw after a resize")
+                drain_pty(master, output, 0.1)
+            read_pty_until(master, output, b"Ctrl-C")
+            if b"Ctrl-C" not in visible_text(output[mark:]):
+                raise AssertionError("the redraw did not use the new width")
+
+            # Quitting sends what is queued — the read marker for the last
+            # line shown — and then QUIT, instead of dropping both.
+            peer.send("PRIVMSG #pty :read me before quitting")
+            read_pty_until(master, output, b"quitting")
             os.write(master, b"/quit\r")
             wait_process_and_drain(tui, master, output, TIMEOUT)
             if tui.returncode != 0:
                 raise RuntimeError(f"TUI exited {tui.returncode}")
             if b"\x1b[?1049l" not in output:
                 raise AssertionError("TUI did not restore the alternate screen")
+            proxy.wait_line(lambda line: line.startswith("QUIT"), "QUIT")
+            sent = proxy.lines()
+            markers = [
+                index
+                for index, line in enumerate(sent)
+                if line.startswith("MARKREAD #pty timestamp=")
+            ]
+            quit_at = next(i for i, line in enumerate(sent) if line.startswith("QUIT"))
+            if not markers or markers[-1] > quit_at:
+                raise AssertionError(f"no read marker before QUIT: {sent!r}")
+            peer.wait_line(
+                lambda line: line.startswith(":ptyclient!") and " QUIT " in line,
+                "the TUI's QUIT relayed to the channel",
+            )
             print(
                 "TUI PTY journey passed: product state, help, inbound, outbound, "
-                "clean restore"
+                "multi-line paste refused, resize redraw, read marker and QUIT on "
+                "exit, clean restore"
             )
         except Exception:
             print(output.decode("utf-8", "replace"))
@@ -242,6 +347,8 @@ def main() -> None:
         finally:
             if peer is not None:
                 peer.close()
+            if proxy is not None:
+                proxy.close()
             if tui is not None and tui.poll() is None:
                 tui.terminate()
                 try:

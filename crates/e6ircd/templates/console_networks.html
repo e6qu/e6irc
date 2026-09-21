@@ -14,7 +14,7 @@
               <span class="status-label"><span class="dot on"></span>Attach listener online</span>
               <strong>{{ addr }}</strong>
             </div>
-            <p>Sign in with SASL PLAIN using <code>{{ shell.account }}/&lt;network&gt;</code> as the account name and your e6irc app password.</p>
+            <p>{% if attach_tls %}Connect with TLS and sign{% else %}This listener is plaintext on this machine's loopback address only; connect from this machine and sign{% endif %} in with SASL PLAIN using <code>{{ shell.account }}/&lt;network&gt;</code> as the account name and your e6irc app password.</p>
           </div>
         {% else %}
           <div class="banner-info">
@@ -92,6 +92,11 @@
                 <span>Real name <em>optional</em></span>
                 <input name="realname" autocomplete="name" value="{{ form.realname }}" maxlength="128" />
                 <small>Your nickname is used when this is blank.</small>
+              </label>
+              <label class="field field-wide">
+                <span>Server password <em>optional</em></span>
+                <input type="password" name="server_password" autocomplete="new-password" maxlength="504" {% if !can_store_secrets %}disabled{% endif %} />
+                <small>{% if can_store_secrets %}Only for private servers that require one. Stored encrypted; never shown again.{% else %}Unavailable: this deployment has no master key to store it encrypted.{% endif %}</small>
               </label>
             </div>
           </details>

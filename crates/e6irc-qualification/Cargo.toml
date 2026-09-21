@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 e6irc-client = { path = "../e6irc-client" }
+e6irc-proto = { path = "../e6irc-proto" }
 futures-util = "0.3"
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 serde = { version = "1.0", features = ["derive"] }

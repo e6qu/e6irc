@@ -86,7 +86,7 @@ impl std::error::Error for NetworkAlreadyRunning {}
 
 struct Slot {
     handle: Arc<NetworkHandle>,
-    persistence: Option<tokio::task::JoinHandle<()>>,
+    persistence: Option<Persistence>,
     /// The driver's stable kind (`irc`, `matrix`, `discord`, `slack`, …),
     /// captured before `start()` consumes the driver — for status views.
     kind: &'static str,
@@ -102,6 +102,30 @@ pub struct NetworkStatus {
     pub runtime: super::NetworkRuntimeSnapshot,
 }
 
+/// A network's persistence task and the signal that ends it.
+struct Persistence {
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Persistence {
+    /// End the task between two writes and wait until it has: when this
+    /// returns, no statement of this task is in flight or still to come. An
+    /// abort cancelled the task wherever it was — possibly with an INSERT
+    /// already sent — so a caller deleting the network's rows next could race
+    /// the task's last line.
+    async fn stop(self) {
+        // A task that already ended (its event stream closed) cannot take
+        // the signal; the join below still reports how it ended.
+        if self.stop.send(()).is_err() {
+            eprintln!("bnc: persistence task had already stopped");
+        }
+        if let Err(error) = self.task.await {
+            eprintln!("bnc: persistence task ended abnormally: {error}");
+        }
+    }
+}
+
 impl Slot {
     /// Stop the driver authoritatively and the persistence task with it.
     ///
@@ -109,11 +133,13 @@ impl Slot {
     /// command sender — an attached client clones `commands`, so relying on
     /// refcount alone would keep the upstream connection (and its decrypted
     /// SASL password) alive until the last client detached. The persistence
-    /// task is aborted too so it stops writing for a network that is gone.
+    /// task then finishes the line it is writing and ends, so a caller that
+    /// deletes the network's rows after this returns cannot be overtaken by a
+    /// late line.
     async fn stop(self) {
         self.handle.shutdown_and_wait().await;
-        if let Some(task) = self.persistence {
-            task.abort();
+        if let Some(persistence) = self.persistence {
+            persistence.stop().await;
         }
     }
 }
@@ -186,6 +212,7 @@ impl Registry {
                         .map_err(identity_error)?,
                     buffer_cap: e.buffer_cap,
                     sasl: None,
+                    server_password: None,
                     keepalive_idle: super::KEEPALIVE_IDLE,
                     rejection_retry_floor: super::REJECTION_RETRY_FLOOR,
                     internal_upstreams,
@@ -206,13 +233,19 @@ impl Registry {
                     buffer_cap: e.buffer_cap,
                     sasl_account: e.sasl_account.clone(),
                     sasl_password: e.sasl_password.clone(),
+                    server_password: e.server_password.clone(),
                     internal_upstreams,
                     first_dial: super::FirstDial::Immediate,
                 })
                 .map_err(|msg| format!("network '{}': {msg}", e.name))?
             };
             registry
-                .add(e.owner.as_deref(), &e.name, driver)
+                .add(
+                    e.owner.as_deref(),
+                    &e.name,
+                    crate::db::BncNetworkDefinition::Configured,
+                    driver,
+                )
                 .map_err(|error| error.to_string())?;
         }
         Ok(registry)
@@ -225,7 +258,9 @@ impl Registry {
     }
 
     /// Start a driver for `(owner, name)` and register it. With a database,
-    /// restore recent backlog and persist new lines.
+    /// restore recent backlog and persist new lines; `definition` says whether
+    /// those lines belong to a stored network's row (see
+    /// [`crate::db::open_bnc_buffer`]).
     ///
     /// A key that already holds a live driver is refused *before* the new
     /// driver starts, so a caller can never leave two upstream sessions racing
@@ -235,6 +270,7 @@ impl Registry {
         &self,
         owner: Option<&str>,
         name: &str,
+        definition: crate::db::BncNetworkDefinition,
         driver: Box<dyn super::NetworkDriver>,
     ) -> Result<(), NetworkAlreadyRunning> {
         let key = NetworkKey::new(owner, name);
@@ -258,7 +294,13 @@ impl Registry {
         // spelling and looked up under another.
         let persistence = self.pool.clone().map(|pool| {
             handle.set_history(pool.clone(), key.owner.clone(), key.name.clone());
-            spawn_persistence(pool, key.owner.clone(), key.name.clone(), handle.clone())
+            spawn_persistence(
+                pool,
+                key.owner.clone(),
+                key.name.clone(),
+                definition,
+                handle.clone(),
+            )
         });
         networks.insert(
             key,
@@ -271,7 +313,8 @@ impl Registry {
         Ok(())
     }
 
-    /// Replace one live driver only after its predecessor has disconnected.
+    /// Replace one live driver of a stored network only after its predecessor
+    /// has disconnected.
     pub async fn replace(
         &self,
         owner: Option<&str>,
@@ -286,11 +329,11 @@ impl Registry {
         if let Some(old) = old {
             old.stop().await;
         }
-        self.add(owner, name, driver)
+        self.add(owner, name, crate::db::BncNetworkDefinition::Stored, driver)
             .expect("the mutation guard serializes registry writers");
     }
 
-    /// Make `(owner, name)` run: start `driver` when nothing is registered,
+    /// Make the stored network `(owner, name)` run: start `driver` when nothing is registered,
     /// supersede a driver the upstream parked, and leave a working or still
     /// retrying one alone. Enabling an already-enabled network therefore never
     /// drops a healthy upstream session. Returns whether `driver` was started.
@@ -358,8 +401,10 @@ impl Registry {
         for slot in slots {
             stops.spawn(async move {
                 let released = slot.handle.shutdown_and_wait_within(deadline).await;
-                if let Some(task) = slot.persistence {
-                    task.abort();
+                // The process is exiting and nothing deletes rows after this,
+                // so the task need not finish its line.
+                if let Some(persistence) = slot.persistence {
+                    persistence.task.abort();
                 }
                 released
             });
@@ -440,18 +485,21 @@ impl Registry {
     }
 }
 
-/// Restore a network's persisted backlog into its buffer, then persist
-/// every new upstream line. Subscribes before the backlog read so no
-/// line broadcast during the read is lost (up to the channel's backlog).
+/// Restore a network's persisted backlog into its buffer, trim it to the
+/// cap, then persist every new upstream line until stopped. Subscribes before
+/// the backlog read so no line broadcast during the read is lost (up to the
+/// channel's backlog).
 fn spawn_persistence(
     pool: PgPool,
     owner: Option<String>,
     network: String,
+    definition: crate::db::BncNetworkDefinition,
     handle: Arc<NetworkHandle>,
-) -> tokio::task::JoinHandle<()> {
+) -> Persistence {
     use super::DriverEvent;
-    let owner_key = owner.unwrap_or_else(|| "*".to_string());
-    tokio::spawn(async move {
+    let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+    let owner_key = owner.clone().unwrap_or_else(|| "*".to_string());
+    let task = tokio::spawn(async move {
         let mut events = handle.subscribe();
         match crate::db::recent_bnc_lines(&pool, &owner_key, &network, PRELOAD_LIMIT).await {
             Ok(lines) => handle.preload_front(lines),
@@ -461,12 +509,40 @@ fn spawn_persistence(
             }
         }
         handle.history_restored();
+        let buffer =
+            match crate::db::open_bnc_buffer(&pool, owner.as_deref(), &network, definition).await {
+                Ok(buffer) => buffer,
+                Err(e) => {
+                    // Without its row a stored network's lines would belong to
+                    // nothing; none are written, and the failure is visible on the
+                    // network's runtime state as well as here.
+                    handle.record_error(super::NetworkFailure::BacklogStorageFailed);
+                    eprintln!(
+                        "bnc: backlog of {owner_key}/{network} cannot be stored, so none is: {e}"
+                    );
+                    return;
+                }
+            };
+        // The amortized trim below counts only this task's own appends, and a
+        // network restarted before its thousandth line would never reach it:
+        // each start trims once, so the cap holds across restarts.
+        if let Err(e) = crate::db::trim_bnc_buffer(&pool, &buffer).await {
+            handle.record_error(super::NetworkFailure::BacklogStorageFailed);
+            eprintln!("bnc: backlog trim at start failed for {owner_key}/{network}: {e}");
+        }
         // This task is the only writer for this network, so counting its own
         // appends is what makes the amortized trim reach every network — see
         // `db::BNC_TRIM_INTERVAL`.
         let mut since_trim = 0u64;
         loop {
-            let (line, own_nick) = match events.recv().await {
+            // A stop is honoured only here, between two writes: a write in
+            // progress always completes (or fails) before the task ends.
+            let event = tokio::select! {
+                biased;
+                _ = &mut stopped => break,
+                event = events.recv() => event,
+            };
+            let (line, own_nick) = match event {
                 // A synthesized self-echo is part of the conversation record:
                 // persist it like an upstream line so a reattached client sees
                 // both sides after a restart.
@@ -502,36 +578,29 @@ fn spawn_persistence(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
-            if let Err(e) = persist_and_trim(
-                &pool,
-                &owner_key,
-                &network,
-                own_nick.as_deref(),
-                &line,
-                &mut since_trim,
-            )
-            .await
+            if let Err(e) =
+                persist_and_trim(&pool, &buffer, own_nick.as_deref(), &line, &mut since_trim).await
             {
                 handle.record_error(super::NetworkFailure::BacklogStorageFailed);
                 eprintln!("bnc: buffer persist or trim failed for {owner_key}/{network}: {e}");
             }
         }
-    })
+    });
+    Persistence { stop, task }
 }
 
 async fn persist_and_trim(
     pool: &PgPool,
-    owner: &str,
-    network: &str,
+    buffer: &crate::db::BncBuffer,
     own_nick: Option<&str>,
     line: &str,
     since_trim: &mut u64,
 ) -> Result<(), crate::db::DbError> {
-    crate::db::persist_bnc_line(pool, owner, network, own_nick, line).await?;
+    crate::db::persist_bnc_line(pool, buffer, own_nick, line).await?;
     *since_trim += 1;
     if *since_trim >= crate::db::BNC_TRIM_INTERVAL {
         *since_trim = 0;
-        crate::db::trim_bnc_buffer(pool, owner, network).await?;
+        crate::db::trim_bnc_buffer(pool, buffer).await?;
     }
     Ok(())
 }
@@ -1567,6 +1636,7 @@ mod key_tests {
             .add(
                 Some("alice"),
                 "libera",
+                crate::db::BncNetworkDefinition::Configured,
                 Box::new(crate::bouncer::LoopbackDriver::new(16)),
             )
             .expect("a fresh key");
@@ -1576,6 +1646,7 @@ mod key_tests {
             .add(
                 Some("ALICE"),
                 "Libera",
+                crate::db::BncNetworkDefinition::Configured,
                 Box::new(crate::bouncer::LoopbackDriver::new(16)),
             )
             .expect_err("the casefolded key is occupied");
@@ -1629,6 +1700,7 @@ mod key_tests {
             .add(
                 Some("Alice"),
                 "libera",
+                crate::db::BncNetworkDefinition::Configured,
                 Box::new(crate::bouncer::LoopbackDriver::new(16)),
             )
             .expect("a fresh key");
@@ -1636,6 +1708,7 @@ mod key_tests {
             .add(
                 Some("alice"),
                 "oftc",
+                crate::db::BncNetworkDefinition::Configured,
                 Box::new(crate::bouncer::LoopbackDriver::new(16)),
             )
             .expect("a fresh key");
@@ -1643,6 +1716,7 @@ mod key_tests {
             .add(
                 Some("Bob"),
                 "libera",
+                crate::db::BncNetworkDefinition::Configured,
                 Box::new(crate::bouncer::LoopbackDriver::new(16)),
             )
             .expect("a fresh key");
@@ -1650,6 +1724,7 @@ mod key_tests {
             .add(
                 None,
                 "shared",
+                crate::db::BncNetworkDefinition::Configured,
                 Box::new(crate::bouncer::LoopbackDriver::new(16)),
             )
             .expect("a fresh key");

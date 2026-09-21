@@ -126,6 +126,84 @@ impl InternalUpstreams {
     }
 }
 
+/// A credential an IRC upstream would be sent in cleartext, named by the field
+/// that carries it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleartextCredential {
+    SaslPassword,
+    ServerPassword,
+}
+
+impl CleartextCredential {
+    pub const fn field(self) -> &'static str {
+        match self {
+            Self::SaslPassword => "sasl_password",
+            Self::ServerPassword => "server_password",
+        }
+    }
+
+    /// The sentence a refusal shows.
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::SaslPassword => {
+                "sasl_password requires tls=true: without TLS the upstream password is readable by \
+                 everything on the path"
+            }
+            Self::ServerPassword => {
+                "server_password requires tls=true: without TLS the server password is readable by \
+                 everything on the path"
+            }
+        }
+    }
+}
+
+impl InternalUpstreams {
+    /// The credential an IRC upstream at `addr` would carry in cleartext, or
+    /// `None` when it may carry what it has.
+    ///
+    /// Credentials cross only TLS — or a plaintext connection to this
+    /// machine's loopback address, when the operator allows internal upstreams
+    /// (the test harnesses, whose upstreams are in-process listeners). Judged
+    /// from the address literal: a name is never trusted to mean loopback. The
+    /// connection enforces the same rule again by the address it actually
+    /// dialled (`e6irc_client::Connection` writes no credential to a plaintext
+    /// peer off loopback), so this is the refusal a person reads, not the only
+    /// guard.
+    pub fn cleartext_credential(
+        self,
+        addr: &str,
+        tls: bool,
+        sasl_password: bool,
+        server_password: bool,
+    ) -> Option<CleartextCredential> {
+        let credential = if sasl_password {
+            CleartextCredential::SaslPassword
+        } else if server_password {
+            CleartextCredential::ServerPassword
+        } else {
+            return None;
+        };
+        if tls || (self == Self::Allow && is_loopback_literal(addr)) {
+            None
+        } else {
+            Some(credential)
+        }
+    }
+}
+
+/// Whether `addr` (`host:port`, `[v6]:port`) names a loopback address as a
+/// literal, read as the URL parser (and so the kernel) reads it.
+fn is_loopback_literal(addr: &str) -> bool {
+    url::Url::parse(&format!("http://{addr}"))
+        .ok()
+        .and_then(|url| match url.host()? {
+            url::Host::Ipv4(ip) => Some(ip.is_loopback()),
+            url::Host::Ipv6(ip) => Some(ip.to_canonical().is_loopback()),
+            url::Host::Domain(_) => Some(false),
+        })
+        .unwrap_or(false)
+}
+
 /// RFC 6598 shared address space, `100.64.0.0/10`: the inside of a carrier or
 /// cloud provider's NAT, which is internal for this purpose.
 fn is_carrier_grade_nat(ip: Ipv4Addr) -> bool {
@@ -136,6 +214,55 @@ fn is_carrier_grade_nat(ip: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credentials_cross_only_tls_or_an_allowed_loopback_literal() {
+        use CleartextCredential::{SaslPassword, ServerPassword};
+        let refuse = InternalUpstreams::Refuse;
+        let allow = InternalUpstreams::Allow;
+        assert_eq!(
+            refuse.cleartext_credential("irc.example:6667", true, true, true),
+            None
+        );
+        assert_eq!(
+            refuse.cleartext_credential("irc.example:6667", false, false, false),
+            None
+        );
+        assert_eq!(
+            refuse.cleartext_credential("irc.example:6667", false, true, false),
+            Some(SaslPassword)
+        );
+        assert_eq!(
+            allow.cleartext_credential("irc.example:6667", false, false, true),
+            Some(ServerPassword)
+        );
+        // A name is never taken to mean this machine.
+        assert_eq!(
+            allow.cleartext_credential("localhost:6667", false, true, false),
+            Some(SaslPassword)
+        );
+        for loopback in [
+            "127.0.0.1:6667",
+            "[::1]:6667",
+            "[::ffff:127.0.0.1]:6667",
+            "2130706433:6667",
+        ] {
+            assert_eq!(
+                allow.cleartext_credential(loopback, false, true, true),
+                None,
+                "{loopback}"
+            );
+            assert_eq!(
+                refuse.cleartext_credential(loopback, false, true, false),
+                Some(SaslPassword),
+                "{loopback}"
+            );
+        }
+        assert_eq!(
+            allow.cleartext_credential("10.0.0.5:6667", false, true, false),
+            Some(SaslPassword)
+        );
+    }
 
     fn refusal(policy: InternalUpstreams, addr: &str) -> Option<UpstreamRefusal> {
         policy.refusal_for_addr(addr)

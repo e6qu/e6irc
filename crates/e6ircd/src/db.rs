@@ -91,8 +91,18 @@ pub enum DbError {
     AccountOwnsChannels(usize),
     /// An administrator already holds the maximum number of live invitations.
     TooManyInvitations,
-    /// A bearer invitation is unknown, expired, revoked, or already consumed.
+    /// A bearer invitation is unknown, expired, revoked, or already consumed —
+    /// or grants administrator authority its issuer no longer holds.
     InvitationUnavailable,
+    /// A stored network named by owner and name has no row: its backlog has
+    /// nothing to belong to.
+    UnknownNetwork(String),
+    /// One or more storage-maintenance collections failed; the others
+    /// committed their batches (`completed`).
+    MaintenanceFailed {
+        completed: StorageMaintenanceReport,
+        failures: Vec<MaintenanceFailure>,
+    },
 }
 
 impl std::fmt::Display for DbError {
@@ -162,11 +172,46 @@ impl std::fmt::Display for DbError {
             Self::InvitationUnavailable => {
                 write!(f, "account invitation is unavailable")
             }
+            Self::UnknownNetwork(network) => write!(f, "no such stored network: {network}"),
+            Self::MaintenanceFailed {
+                completed: _,
+                failures,
+            } => {
+                write!(f, "storage maintenance failed for")?;
+                for (index, failure) in failures.iter().enumerate() {
+                    let separator = if index == 0 { " " } else { "; " };
+                    write!(
+                        f,
+                        "{separator}{} ({})",
+                        failure.collection.table(),
+                        failure.error
+                    )?;
+                }
+                write!(f, "; every other collection committed its batch")
+            }
         }
     }
 }
 
 impl std::error::Error for DbError {}
+
+/// Acquires from the shared pool that waited the whole acquire timeout for a
+/// connection and gave up — the pool was exhausted for that long. Read by
+/// telemetry as `e6irc_database_pool_acquire_timeouts_total`.
+static POOL_ACQUIRE_TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Every query failure in this module passes through here on its way into a
+/// [`DbError`], so an exhausted pool is counted wherever it is met.
+fn query_error(error: sqlx::Error) -> DbError {
+    if matches!(error, sqlx::Error::PoolTimedOut) {
+        POOL_ACQUIRE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    DbError::Query(error)
+}
+
+pub(crate) fn pool_acquire_timeouts() -> u64 {
+    POOL_ACQUIRE_TIMEOUTS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 fn millis_from_database(value: i64, column: &str) -> Result<e6irc_proto::time::Millis, DbError> {
     let value = u64::try_from(value).map_err(|_| {
@@ -200,14 +245,88 @@ fn seconds_for_database(value: u64, column: &str) -> Result<f64, DbError> {
     )
 }
 
-pub async fn connect_and_migrate(url: &str) -> Result<PgPool, DbError> {
-    // One plain connection first. The pool's own `connect` retries inside its
-    // acquire timeout and then reports only "pool timed out", which hides the
-    // reason — refused, wrong password, "the database system is starting up" —
-    // that the operator (and the startup retry) must see. The probe fails at
-    // once with that reason, bounded by the same timeout so an unroutable
-    // address cannot hang startup on the operating system's connect timeout.
-    let probe = tokio::time::timeout(
+/// How long a pooled session may sit inside an open transaction without
+/// sending anything before PostgreSQL ends it. A transaction left open by a
+/// stalled task holds its row locks and pins the xmin horizon (so vacuum
+/// cannot reclaim anything newer); this bounds both instead of leaving them to
+/// whoever notices.
+const DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS: i64 = 60_000;
+
+/// How long one migration statement may wait for a lock (the migrator's own
+/// advisory lock included — another replica migrating — or a table lock held
+/// by a live server) before the attempt is abandoned and retried.
+const MIGRATION_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Attempts [`run_migrations`] makes when a migration keeps timing out on a
+/// lock; the pause between two of them doubles from one second.
+const MIGRATION_LOCK_ATTEMPTS: u32 = 6;
+
+/// How many connections the shared pool may open. Constructed only through
+/// [`DatabasePoolSize::new`] (the configured value, bounded) or
+/// [`DatabasePoolSize::for_this_host`] (the default), so the pool can never be
+/// asked for zero connections or for more than a PostgreSQL server's default
+/// `max_connections` can serve alongside anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(try_from = "u32")]
+pub struct DatabasePoolSize(u32);
+
+impl DatabasePoolSize {
+    pub const MIN: u32 = 2;
+    pub const MAX: u32 = 200;
+
+    pub fn new(value: u32) -> Result<Self, String> {
+        if (Self::MIN..=Self::MAX).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(format!(
+                "database.max_connections must be between {} and {} (got {value})",
+                Self::MIN,
+                Self::MAX
+            ))
+        }
+    }
+
+    /// The default, sized to what can hold a connection at once: the serial
+    /// database worker (one), every Argon2 verification or hash offloaded from
+    /// it ([`MAX_CONCURRENT_ARGON2`]), and two per runtime worker thread for
+    /// the tasks that run on them — HTTP handlers, bouncer persistence tasks,
+    /// maintenance — one running and one about to. Bounded to
+    /// [`Self::MIN`]`..=`[`Self::MAX`].
+    pub fn for_this_host() -> Self {
+        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        Self::for_runtime_threads(threads)
+    }
+
+    fn for_runtime_threads(threads: usize) -> Self {
+        let wanted = 1 + MAX_CONCURRENT_ARGON2 + threads.saturating_mul(2);
+        Self(
+            u32::try_from(wanted)
+                .unwrap_or(Self::MAX)
+                .clamp(Self::MIN, Self::MAX),
+        )
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl TryFrom<u32> for DatabasePoolSize {
+    type Error = String;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+/// One plain connection, bounded by [`DATABASE_ACQUIRE_TIMEOUT`]. The pool's
+/// own `connect` retries inside its acquire timeout and then reports only
+/// "pool timed out", which hides the reason — refused, wrong password, "the
+/// database system is starting up" — that the operator (and the startup retry)
+/// must see. This fails at once with that reason, and the bound keeps an
+/// unroutable address from hanging startup on the operating system's connect
+/// timeout.
+async fn connect_directly(url: &str) -> Result<sqlx::PgConnection, DbError> {
+    tokio::time::timeout(
         DATABASE_ACQUIRE_TIMEOUT,
         <sqlx::PgConnection as sqlx::Connection>::connect(url),
     )
@@ -218,34 +337,113 @@ pub async fn connect_and_migrate(url: &str) -> Result<PgPool, DbError> {
             format!("no answer within {}s", DATABASE_ACQUIRE_TIMEOUT.as_secs()),
         )))
     })?
-    .map_err(DbError::Connect)?;
-    <sqlx::PgConnection as sqlx::Connection>::close(probe)
-        .await
-        .map_err(DbError::Connect)?;
+    .map_err(DbError::Connect)
+}
+
+/// Whether a migration failed because a statement waited out
+/// [`MIGRATION_LOCK_TIMEOUT`] (SQLSTATE 55P03, `lock_not_available`).
+fn migration_waited_on_a_lock(error: &sqlx::migrate::MigrateError) -> bool {
+    let (sqlx::migrate::MigrateError::Execute(error)
+    | sqlx::migrate::MigrateError::ExecuteMigration(error, _)) = error
+    else {
+        return false;
+    };
+    error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .is_some_and(|code| code == "55P03")
+}
+
+/// Apply `migrator` on a connection of its own.
+///
+/// Not a pooled connection: the pool's 15-second statement timeout is right for
+/// a request and wrong for a migration, which may rewrite or index a table
+/// that has grown for months — a deployment that large would crash-loop on
+/// every upgrade. Here there is no statement timeout, and a bounded lock
+/// timeout instead: a migration stuck behind a lock (another replica
+/// migrating, a long transaction on a live server) gives up after
+/// [`MIGRATION_LOCK_TIMEOUT`], says so on stderr, and is retried on a fresh
+/// connection with a doubling pause, [`MIGRATION_LOCK_ATTEMPTS`] times in all.
+/// Every other migration failure is a fact about the schema and is returned at
+/// once.
+pub async fn run_migrations(url: &str, migrator: &sqlx::migrate::Migrator) -> Result<(), DbError> {
+    let mut pause = Duration::from_secs(1);
+    for attempt in 1..=MIGRATION_LOCK_ATTEMPTS {
+        let mut connection = connect_directly(url).await?;
+        sqlx::query("SET statement_timeout = 0")
+            .execute(&mut connection)
+            .await
+            .map_err(DbError::Connect)?;
+        sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+            .bind(MIGRATION_LOCK_TIMEOUT.as_millis().to_string())
+            .execute(&mut connection)
+            .await
+            .map_err(DbError::Connect)?;
+        let outcome = migrator.run(&mut connection).await;
+        // Closing ends the session, which releases the migrator's advisory
+        // lock whatever state a failed attempt left it in.
+        <sqlx::PgConnection as sqlx::Connection>::close(connection)
+            .await
+            .map_err(DbError::Connect)?;
+        match outcome {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if migration_waited_on_a_lock(&error) && attempt < MIGRATION_LOCK_ATTEMPTS =>
+            {
+                eprintln!(
+                    "db: migration attempt {attempt} of {MIGRATION_LOCK_ATTEMPTS} waited more \
+                     than {}s for a lock ({error}); retrying in {}s",
+                    MIGRATION_LOCK_TIMEOUT.as_secs(),
+                    pause.as_secs()
+                );
+                tokio::time::sleep(pause).await;
+                pause *= 2;
+            }
+            Err(error) => return Err(DbError::Migrate(error)),
+        }
+    }
+    unreachable!("the final attempt returns its outcome")
+}
+
+/// Migrate, then open a pool of the default size — for a one-shot command
+/// (`recover-administrator`, secret rotation), which opens connections only as
+/// it uses them. The daemon opens its pool through
+/// [`connect_and_migrate_with_retry`], at its configured size.
+pub async fn connect_and_migrate(url: &str) -> Result<PgPool, DbError> {
+    connect_and_migrate_sized(url, DatabasePoolSize::for_this_host()).await
+}
+
+async fn connect_and_migrate_sized(url: &str, size: DatabasePoolSize) -> Result<PgPool, DbError> {
+    run_migrations(url, &MIGRATOR).await?;
     // Every caller shares this pool, including HTTP handlers and the database
     // worker. A dependency interruption must therefore produce a bounded,
     // typed query failure instead of parking unrelated requests on SQLx's
     // longer default acquisition timeout.
-    let pool = PgPoolOptions::new()
+    PgPoolOptions::new()
+        .max_connections(size.get())
         .acquire_timeout(DATABASE_ACQUIRE_TIMEOUT)
         .after_connect(|connection, _metadata| {
             Box::pin(async move {
-                sqlx::query("SELECT set_config('statement_timeout', $1, false)")
-                    .bind(DATABASE_STATEMENT_TIMEOUT_MS.to_string())
-                    .execute(&mut *connection)
-                    .await?;
-                sqlx::query("SELECT set_config('lock_timeout', $1, false)")
-                    .bind(DATABASE_LOCK_TIMEOUT_MS.to_string())
-                    .execute(&mut *connection)
-                    .await?;
+                for (setting, value) in [
+                    ("statement_timeout", DATABASE_STATEMENT_TIMEOUT_MS),
+                    ("lock_timeout", DATABASE_LOCK_TIMEOUT_MS),
+                    (
+                        "idle_in_transaction_session_timeout",
+                        DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+                    ),
+                ] {
+                    sqlx::query("SELECT set_config($1, $2, false)")
+                        .bind(setting)
+                        .bind(value.to_string())
+                        .execute(&mut *connection)
+                        .await?;
+                }
                 Ok(())
             })
         })
         .connect(url)
         .await
-        .map_err(DbError::Connect)?;
-    MIGRATOR.run(&pool).await.map_err(DbError::Migrate)?;
-    Ok(pool)
+        .map_err(DbError::Connect)
 }
 
 /// How long startup keeps retrying the first database connection before the
@@ -300,6 +498,7 @@ pub struct StartupDatabaseAttempt<'a> {
 pub async fn connect_and_migrate_with_retry(
     url: &str,
     wait: StartupDatabaseWait,
+    size: DatabasePoolSize,
     mut report: impl FnMut(StartupDatabaseAttempt<'_>),
 ) -> Result<PgPool, DbError> {
     let started = std::time::Instant::now();
@@ -307,7 +506,7 @@ pub async fn connect_and_migrate_with_retry(
     let mut attempts: u32 = 0;
     loop {
         attempts = attempts.saturating_add(1);
-        let error = match connect_and_migrate(url).await {
+        let error = match connect_and_migrate_sized(url, size).await {
             Ok(pool) => return Ok(pool),
             Err(error @ DbError::Connect(_)) => error,
             Err(error) => return Err(error),
@@ -372,6 +571,20 @@ impl StorageMaintenanceReport {
         self.observability_samples += other.observability_samples;
         self.saturated = other.saturated;
     }
+
+    fn slot(&mut self, collection: MaintenanceCollection) -> &mut u64 {
+        match collection {
+            MaintenanceCollection::Messages => &mut self.messages,
+            MaintenanceCollection::BncBuffer => &mut self.bnc_buffer,
+            MaintenanceCollection::AuditLog => &mut self.audit_events,
+            MaintenanceCollection::WebSessions => &mut self.web_sessions,
+            MaintenanceCollection::ApiTokens => &mut self.api_tokens,
+            MaintenanceCollection::DeviceGrants => &mut self.device_grants,
+            MaintenanceCollection::LogoutTokens => &mut self.logout_tokens,
+            MaintenanceCollection::AccountInvitations => &mut self.account_invitations,
+            MaintenanceCollection::ObservabilitySamples => &mut self.observability_samples,
+        }
+    }
 }
 
 /// The time bounds maintenance applies, taken from the managed configuration.
@@ -409,23 +622,122 @@ enum RetentionBound {
     None,
 }
 
-async fn execute_maintenance_delete(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    statement: &'static str,
-    bound: RetentionBound,
-    limit: i64,
-) -> Result<u64, DbError> {
-    let query = sqlx::query(statement);
-    let query = match bound {
-        RetentionBound::Days(days) => query.bind(days).bind(limit),
-        RetentionBound::Millis(millis) => query.bind(millis).bind(limit),
-        RetentionBound::None => query.bind(limit),
-    };
-    query
-        .execute(&mut **transaction)
-        .await
-        .map(|result| result.rows_affected())
-        .map_err(DbError::Query)
+/// One table storage maintenance keeps bounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceCollection {
+    Messages,
+    BncBuffer,
+    AuditLog,
+    WebSessions,
+    ApiTokens,
+    DeviceGrants,
+    LogoutTokens,
+    AccountInvitations,
+    ObservabilitySamples,
+}
+
+impl MaintenanceCollection {
+    const ALL: [Self; 9] = [
+        Self::Messages,
+        Self::BncBuffer,
+        Self::AuditLog,
+        Self::WebSessions,
+        Self::ApiTokens,
+        Self::DeviceGrants,
+        Self::LogoutTokens,
+        Self::AccountInvitations,
+        Self::ObservabilitySamples,
+    ];
+
+    pub fn table(self) -> &'static str {
+        match self {
+            Self::Messages => "messages",
+            Self::BncBuffer => "bnc_buffer",
+            Self::AuditLog => "audit_log",
+            Self::WebSessions => "web_sessions",
+            Self::ApiTokens => "api_tokens",
+            Self::DeviceGrants => "device_grants",
+            Self::LogoutTokens => "oidc_logout_tokens",
+            Self::AccountInvitations => "account_invitations",
+            Self::ObservabilitySamples => "observability_samples",
+        }
+    }
+
+    /// One bounded, oldest-first batch. Each statement names the rows it
+    /// deletes by primary key (`= ANY(ARRAY(...))`): the candidate set comes
+    /// from the time-ordered index, and the delete itself is a primary-key
+    /// probe per row — never a hash join over the whole table, which is what
+    /// `DELETE ... USING (candidates)` planned into.
+    fn statement(self) -> &'static str {
+        match self {
+            Self::Messages => {
+                "DELETE FROM messages WHERE id = ANY(ARRAY(
+                     SELECT id FROM messages
+                     WHERE ts < now() - make_interval(days => $1)
+                     ORDER BY ts, id LIMIT $2))"
+            }
+            // Storage age (`created_at`), not the upstream's `sent_at`, which a
+            // peer controls and may omit: the bound is on what this server
+            // keeps, and the index from migration 0060 is on that column.
+            Self::BncBuffer => {
+                "DELETE FROM bnc_buffer WHERE id = ANY(ARRAY(
+                     SELECT id FROM bnc_buffer
+                     WHERE created_at < now() - make_interval(days => $1)
+                     ORDER BY created_at, id LIMIT $2))"
+            }
+            Self::AuditLog => {
+                "DELETE FROM audit_log WHERE id = ANY(ARRAY(
+                     SELECT id FROM audit_log
+                     WHERE created_at < now() - make_interval(days => $1)
+                     ORDER BY created_at, id LIMIT $2))"
+            }
+            Self::WebSessions => {
+                "DELETE FROM web_sessions WHERE token_hash = ANY(ARRAY(
+                     SELECT token_hash FROM web_sessions
+                     WHERE expires_at <= now()
+                     ORDER BY expires_at LIMIT $1))"
+            }
+            Self::ApiTokens => {
+                "DELETE FROM api_tokens WHERE token_hash = ANY(ARRAY(
+                     SELECT token_hash FROM api_tokens
+                     WHERE expires_at <= now()
+                     ORDER BY expires_at LIMIT $1))"
+            }
+            Self::DeviceGrants => {
+                "DELETE FROM device_grants WHERE id = ANY(ARRAY(
+                     SELECT id FROM device_grants
+                     WHERE expires_at <= now()
+                     ORDER BY expires_at, id LIMIT $1))"
+            }
+            // A composite key: the candidates are named by their row
+            // position, which the same statement's snapshot keeps valid.
+            Self::LogoutTokens => {
+                "DELETE FROM oidc_logout_tokens WHERE ctid = ANY(ARRAY(
+                     SELECT ctid FROM oidc_logout_tokens
+                     WHERE expires_at <= now()
+                     ORDER BY expires_at, issuer, jti LIMIT $1))"
+            }
+            Self::AccountInvitations => {
+                "DELETE FROM account_invitations WHERE id = ANY(ARRAY(
+                     SELECT id FROM account_invitations
+                     WHERE consumed_at IS NOT NULL OR expires_at <= now()
+                     ORDER BY COALESCE(consumed_at, expires_at), id LIMIT $1))"
+            }
+            Self::ObservabilitySamples => {
+                "DELETE FROM observability_samples WHERE sampled_at_ms = ANY(ARRAY(
+                     SELECT sampled_at_ms FROM observability_samples
+                     WHERE sampled_at_ms < $1
+                     ORDER BY sampled_at_ms LIMIT $2))"
+            }
+        }
+    }
+}
+
+/// A collection whose batch failed during one [`run_storage_maintenance`].
+#[derive(Debug)]
+pub struct MaintenanceFailure {
+    pub collection: MaintenanceCollection,
+    pub error: Box<DbError>,
 }
 
 /// Run [`run_storage_maintenance`] until a batch comes back unsaturated or
@@ -455,9 +767,14 @@ pub async fn drain_storage_maintenance(
 }
 
 /// Delete one bounded batch from every time-retained/expiring collection.
-/// Each statement uses an indexed or time-ordered candidate set and every
-/// pooled statement still has the global PostgreSQL deadline, so maintenance
-/// cannot monopolize the database or grow one unbounded transaction.
+///
+/// Each collection is its own statement and its own transaction: nothing
+/// needs the collections to disappear together, and one transaction across
+/// all of them took each table's row locks in a fixed order that no other
+/// writer shares, holding every one until the slowest finished. A collection
+/// that fails is reported (by table, with its error) after the others have
+/// committed their batches; the call then fails so the failure is counted and
+/// logged, never absorbed.
 pub async fn run_storage_maintenance(
     pool: &PgPool,
     retention: StorageRetention,
@@ -475,153 +792,99 @@ pub async fn run_storage_maintenance(
     )
     .map_err(|_| DbError::InvalidServerSettings("sample retention cutoff exceeds BIGINT".into()))?;
     let limit = STORAGE_MAINTENANCE_BATCH as i64;
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
-    let messages = execute_maintenance_delete(
-        &mut transaction,
-        "WITH expired AS (
-             SELECT id FROM messages
-             WHERE ts < now() - make_interval(days => $1)
-             ORDER BY ts, id
-             LIMIT $2
-         )
-         DELETE FROM messages m USING expired e WHERE m.id = e.id",
-        RetentionBound::Days(history_days),
-        limit,
-    )
-    .await?;
-    // Storage age (`created_at`), not the upstream's `sent_at`, which a peer
-    // controls and may omit: the bound is on what this server keeps, and the
-    // index from migration 0060 is on that column.
-    let bnc_buffer = execute_maintenance_delete(
-        &mut transaction,
-        "WITH expired AS (
-             SELECT id FROM bnc_buffer
-             WHERE created_at < now() - make_interval(days => $1)
-             ORDER BY created_at, id
-             LIMIT $2
-         )
-         DELETE FROM bnc_buffer b USING expired e WHERE b.id = e.id",
-        RetentionBound::Days(history_days),
-        limit,
-    )
-    .await?;
-    let audit_events = execute_maintenance_delete(
-        &mut transaction,
-        "WITH expired AS (
-             SELECT id FROM audit_log
-             WHERE created_at < now() - make_interval(days => $1)
-             ORDER BY created_at, id
-             LIMIT $2
-         )
-         DELETE FROM audit_log a USING expired e WHERE a.id = e.id",
-        RetentionBound::Days(audit_days),
-        limit,
-    )
-    .await?;
-    let web_sessions = execute_maintenance_delete(
-        &mut transaction,
-        "DELETE FROM web_sessions
-         WHERE token_hash IN (
-             SELECT token_hash FROM web_sessions
-             WHERE expires_at <= now()
-             ORDER BY expires_at
-             LIMIT $1
-         )",
-        RetentionBound::None,
-        limit,
-    )
-    .await?;
-    let api_tokens = execute_maintenance_delete(
-        &mut transaction,
-        "DELETE FROM api_tokens
-         WHERE token_hash IN (
-             SELECT token_hash FROM api_tokens
-             WHERE expires_at <= now()
-             ORDER BY expires_at
-             LIMIT $1
-         )",
-        RetentionBound::None,
-        limit,
-    )
-    .await?;
-    let device_grants = execute_maintenance_delete(
-        &mut transaction,
-        "DELETE FROM device_grants
-         WHERE id IN (
-             SELECT id FROM device_grants
-             WHERE expires_at <= now()
-             ORDER BY expires_at, id
-             LIMIT $1
-         )",
-        RetentionBound::None,
-        limit,
-    )
-    .await?;
-    let logout_tokens = execute_maintenance_delete(
-        &mut transaction,
-        "DELETE FROM oidc_logout_tokens o
-         WHERE (o.issuer, o.jti) IN (
-             SELECT issuer, jti FROM oidc_logout_tokens
-             WHERE expires_at <= now()
-             ORDER BY expires_at, issuer, jti
-             LIMIT $1
-         )",
-        RetentionBound::None,
-        limit,
-    )
-    .await?;
-    let account_invitations = execute_maintenance_delete(
-        &mut transaction,
-        "DELETE FROM account_invitations
-         WHERE id IN (
-             SELECT id FROM account_invitations
-             WHERE consumed_at IS NOT NULL OR expires_at <= now()
-             ORDER BY COALESCE(consumed_at, expires_at), id
-             LIMIT $1
-         )",
-        RetentionBound::None,
-        limit,
-    )
-    .await?;
-    let observability_samples = execute_maintenance_delete(
-        &mut transaction,
-        "DELETE FROM observability_samples
-         WHERE sampled_at_ms IN (
-             SELECT sampled_at_ms FROM observability_samples
-             WHERE sampled_at_ms < $1
-             ORDER BY sampled_at_ms
-             LIMIT $2
-         )",
-        RetentionBound::Millis(observability_cutoff_ms),
-        limit,
-    )
-    .await?;
-    transaction.commit().await.map_err(DbError::Query)?;
-    let saturated = [
-        messages,
-        bnc_buffer,
-        audit_events,
-        web_sessions,
-        api_tokens,
-        device_grants,
-        logout_tokens,
-        account_invitations,
-        observability_samples,
-    ]
-    .into_iter()
-    .any(|deleted| deleted == STORAGE_MAINTENANCE_BATCH);
-    Ok(StorageMaintenanceReport {
-        messages,
-        bnc_buffer,
-        audit_events,
-        web_sessions,
-        api_tokens,
-        device_grants,
-        logout_tokens,
-        account_invitations,
-        observability_samples,
-        saturated,
-    })
+    let mut report = StorageMaintenanceReport::default();
+    let mut failures = Vec::new();
+    for collection in MaintenanceCollection::ALL {
+        let bound = match collection {
+            MaintenanceCollection::Messages | MaintenanceCollection::BncBuffer => {
+                RetentionBound::Days(history_days)
+            }
+            MaintenanceCollection::AuditLog => RetentionBound::Days(audit_days),
+            MaintenanceCollection::ObservabilitySamples => {
+                RetentionBound::Millis(observability_cutoff_ms)
+            }
+            _ => RetentionBound::None,
+        };
+        let query = sqlx::query(collection.statement());
+        let query = match bound {
+            RetentionBound::Days(days) => query.bind(days).bind(limit),
+            RetentionBound::Millis(millis) => query.bind(millis).bind(limit),
+            RetentionBound::None => query.bind(limit),
+        };
+        match query.execute(pool).await {
+            Ok(result) => {
+                let deleted = result.rows_affected();
+                *report.slot(collection) = deleted;
+                report.saturated |= deleted == STORAGE_MAINTENANCE_BATCH;
+            }
+            Err(error) => failures.push(MaintenanceFailure {
+                collection,
+                error: Box::new(query_error(error)),
+            }),
+        }
+    }
+    if failures.is_empty() {
+        Ok(report)
+    } else {
+        Err(DbError::MaintenanceFailed {
+            completed: report,
+            failures,
+        })
+    }
+}
+
+/// Where the backlog-cap sweep resumes: the last (owner, network) buffer it
+/// checked. Held by the maintenance task across ticks, so every buffer is
+/// visited in turn however many there are.
+#[derive(Debug, Default)]
+pub struct BncCapSweep {
+    after: Option<(String, String)>,
+}
+
+/// Buffers one sweep step checks against [`BNC_BUFFER_CAP`].
+const BNC_CAP_SWEEP_BUFFERS: usize = 64;
+
+/// Trim buffers that exceed [`BNC_BUFFER_CAP`], [`BNC_CAP_SWEEP_BUFFERS`] of
+/// them per call, resuming where the previous call stopped and wrapping around
+/// at the end. Each buffer loses at most one bounded batch per call. A running
+/// network trims itself (at start and every [`BNC_TRIM_INTERVAL`] lines); this
+/// catches whatever that leaves over — a buffer written before a restart that
+/// never reached the interval, lines from a stopped network — without a whole
+/// table `GROUP BY`: each step is an index probe for the next buffer key and
+/// one for its cap boundary. Returns the rows deleted.
+pub async fn trim_bnc_buffers_over_cap(
+    pool: &PgPool,
+    sweep: &mut BncCapSweep,
+) -> Result<u64, DbError> {
+    let mut deleted = 0;
+    for _ in 0..BNC_CAP_SWEEP_BUFFERS {
+        let next: Option<(String, String)> = match &sweep.after {
+            None => sqlx::query_as(
+                "SELECT owner, network FROM bnc_buffer ORDER BY owner, network LIMIT 1",
+            )
+            .fetch_optional(pool)
+            .await
+            .map_err(query_error)?,
+            Some((owner, network)) => sqlx::query_as(
+                "SELECT owner, network FROM bnc_buffer
+                 WHERE (owner, network) > ($1, $2)
+                 ORDER BY owner, network LIMIT 1",
+            )
+            .bind(owner)
+            .bind(network)
+            .fetch_optional(pool)
+            .await
+            .map_err(query_error)?,
+        };
+        let Some((owner, network)) = next else {
+            // The end of the key space: the next call starts over.
+            sweep.after = None;
+            break;
+        };
+        deleted += trim_bnc_buffer_batch(pool, &owner, &network, STORAGE_MAINTENANCE_BATCH).await?;
+        sweep.after = Some((owner, network));
+    }
+    Ok(deleted)
 }
 
 /// Persist one monitoring sample. Expired samples are pruned by storage
@@ -645,7 +908,7 @@ pub(crate) async fn store_observability_sample(
     .bind(value)
     .execute(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     Ok(())
 }
 
@@ -679,7 +942,7 @@ pub(crate) async fn list_observability_samples(
     .bind(limit)
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     rows.into_iter()
         .map(|row| {
             serde_json::from_value(row.get("snapshot"))
@@ -719,7 +982,7 @@ pub async fn load_or_initialize_managed_config(
     .bind(value)
     .execute(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     load_managed_config(pool).await
 }
 
@@ -732,7 +995,7 @@ pub async fn load_managed_config(pool: &PgPool) -> Result<ManagedConfigSnapshot,
     )
     .fetch_optional(pool)
     .await
-    .map_err(DbError::Query)?
+    .map_err(query_error)?
     .ok_or_else(|| DbError::InvalidServerSettings("settings row is missing".into()))?;
     Ok(ManagedConfigSnapshot {
         revision: row.get("revision"),
@@ -754,7 +1017,7 @@ pub async fn save_managed_config(
 ) -> Result<ManagedConfigSnapshot, DbError> {
     let value = serde_json::to_value(settings)
         .map_err(|error| DbError::InvalidServerSettings(error.to_string()))?;
-    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let mut tx = pool.begin().await.map_err(query_error)?;
     let next: Option<(i64, String)> = sqlx::query_as(
         "UPDATE server_settings
          SET revision = revision + 1, settings = $2, updated_by = $3, updated_at = now()
@@ -768,12 +1031,12 @@ pub async fn save_managed_config(
     .bind(actor)
     .fetch_optional(&mut *tx)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     let Some((revision, updated_at)) = next else {
         return Err(DbError::StaleServerSettings);
     };
     insert_audit_log_with(&mut *tx, actor, "CONFIG", "server", audit_detail).await?;
-    tx.commit().await.map_err(DbError::Query)?;
+    tx.commit().await.map_err(query_error)?;
     Ok(ManagedConfigSnapshot {
         revision,
         settings: settings.clone(),
@@ -796,7 +1059,7 @@ async fn insert_primary_password(
     .execute(&mut **transaction)
     .await
     .map(|_| ())
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 /// Insert the account row inside a transaction, returning its id — or `None`
@@ -823,7 +1086,7 @@ async fn insert_account(
     .bind(flags)
     .fetch_optional(&mut **transaction)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 const ACCOUNT_NAME_ADVISORY_LOCK_NAMESPACE: i64 = 0x6536_6972_6300_0001;
@@ -838,7 +1101,7 @@ async fn lock_account_name(
         .execute(&mut **transaction)
         .await
         .map(|_| ())
-        .map_err(DbError::Query)
+        .map_err(query_error)
 }
 
 async fn account_name_is_retired(
@@ -853,7 +1116,7 @@ async fn account_name_is_retired(
     .bind(folded)
     .fetch_one(&mut **transaction)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 /// Create an account with an optional validated contact email.
@@ -865,7 +1128,7 @@ pub async fn create_account_with_contact(
 ) -> Result<i64, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(name);
     let hash = hash_password(password.to_string()).await?;
-    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let mut tx = pool.begin().await.map_err(query_error)?;
     lock_account_name(&mut tx, &folded).await?;
     if account_name_is_retired(&mut tx, &folded).await? {
         return Err(DbError::DuplicateAccount(name.to_string()));
@@ -879,7 +1142,7 @@ pub async fn create_account_with_contact(
     .bind(contact_email.map(crate::identity::ContactEmail::as_str))
     .fetch_optional(&mut *tx)
     .await
-    .map_err(DbError::Query)?
+    .map_err(query_error)?
     .ok_or_else(|| DbError::DuplicateAccount(name.to_string()))?;
     insert_primary_password(&mut tx, id, &hash).await?;
     // Self-service creation is audited like every other way an account comes
@@ -892,7 +1155,7 @@ pub async fn create_account_with_contact(
         "self-registered over IRC",
     )
     .await?;
-    tx.commit().await.map_err(DbError::Query)?;
+    tx.commit().await.map_err(query_error)?;
     Ok(id)
 }
 
@@ -911,7 +1174,7 @@ pub async fn create_account_by_administrator(
     let folded = CaseMapping::Rfc1459.casefold(name);
     let actor_folded = CaseMapping::Rfc1459.casefold(actor);
     let hash = hash_password(password.to_string()).await?;
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     lock_account_name(&mut transaction, &folded).await?;
     if account_name_is_retired(&mut transaction, &folded).await? {
         return Err(DbError::DuplicateAccount(name.to_string()));
@@ -938,7 +1201,7 @@ pub async fn create_account_by_administrator(
         },
     )
     .await?;
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(account_id)
 }
 
@@ -997,24 +1260,17 @@ pub async fn issue_account_invitation(
     lifetime: crate::identity::AccountInvitationLifetimeDays,
     actor: &str,
 ) -> Result<String, DbError> {
-    use argon2::password_hash::rand_core::RngCore;
-
     let folded = CaseMapping::Rfc1459.casefold(name);
     let actor_folded = CaseMapping::Rfc1459.casefold(actor);
-    let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
-    let token = format!(
-        "e6i_{}",
-        e6irc_proto::base64::encode(&bytes).replace(['+', '/'], "-")
-    );
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let token = format!("e6i_{}", crate::secret::random_url_safe_token());
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     lock_account_name(&mut transaction, &folded).await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
         .bind(&actor_folded)
         .bind(INVITATION_ACTOR_ADVISORY_LOCK_NAMESPACE)
         .execute(&mut *transaction)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
     sqlx::query(
         "UPDATE account_invitations
          SET consumed_at = expires_at
@@ -1024,7 +1280,7 @@ pub async fn issue_account_invitation(
     .bind(&folded)
     .execute(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     if account_name_is_retired(&mut transaction, &folded).await? {
         return Err(DbError::DuplicateAccount(name.to_string()));
     }
@@ -1038,18 +1294,18 @@ pub async fn issue_account_invitation(
     .bind(&folded)
     .fetch_one(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     if unavailable {
         return Err(DbError::DuplicateAccount(name.to_string()));
     }
     let pending: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM account_invitations
-         WHERE created_by = $1 AND consumed_at IS NULL",
+         WHERE created_by = $1 AND consumed_at IS NULL AND expires_at > now()",
     )
     .bind(&actor_folded)
     .fetch_one(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     if pending >= MAX_PENDING_ACCOUNT_INVITATIONS_PER_ADMINISTRATOR {
         return Err(DbError::TooManyInvitations);
     }
@@ -1068,7 +1324,7 @@ pub async fn issue_account_invitation(
     .bind(i32::from(lifetime.value()))
     .execute(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     insert_audit_log_with(
         &mut *transaction,
         &actor_folded,
@@ -1081,7 +1337,7 @@ pub async fn issue_account_invitation(
         },
     )
     .await?;
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(token)
 }
 
@@ -1108,7 +1364,7 @@ pub async fn list_account_invitations(
     .bind(fetch_limit as i64)
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     let next_before_id =
         (entries.len() > page_size.value()).then(|| entries[page_size.value() - 1].id);
     entries.truncate(page_size.value());
@@ -1125,7 +1381,7 @@ pub async fn revoke_account_invitation(
     actor: &str,
 ) -> Result<bool, DbError> {
     let actor_folded = CaseMapping::Rfc1459.casefold(actor);
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     let target: Option<String> = sqlx::query_scalar(
         "UPDATE account_invitations
          SET consumed_at = now()
@@ -1135,7 +1391,7 @@ pub async fn revoke_account_invitation(
     .bind(invitation_id)
     .fetch_optional(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     let Some(target) = target else {
         return Ok(false);
     };
@@ -1147,7 +1403,7 @@ pub async fn revoke_account_invitation(
         "",
     )
     .await?;
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(true)
 }
 
@@ -1165,17 +1421,25 @@ pub async fn account_invitation_preview(
     .bind(token_hash(token))
     .fetch_optional(pool)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 /// Consume an invitation and create its account/password in one transaction.
+///
+/// An invitation that grants administrator authority is honoured only while
+/// its issuer still holds that authority — durably, or through
+/// `configured_administrators` — and is not suspended. Suspension, demotion,
+/// and host recovery revoke the issuer's invitations as they happen; this
+/// re-check covers authority removed by any other path, so an invitation can
+/// never confer more than its issuer holds at the moment it is used.
 pub async fn accept_account_invitation(
     pool: &PgPool,
     token: &str,
     password: &str,
+    configured_administrators: &[String],
 ) -> Result<String, DbError> {
     let hash = hash_password(password.to_string()).await?;
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     #[derive(sqlx::FromRow)]
     struct Invitation {
         id: i64,
@@ -1183,10 +1447,12 @@ pub async fn accept_account_invitation(
         folded: String,
         contact_email: Option<String>,
         administrator: bool,
+        issuer: String,
     }
 
     let invitation: Option<Invitation> = sqlx::query_as(
-        "SELECT id, account_name AS name, name_folded AS folded, contact_email, administrator
+        "SELECT id, account_name AS name, name_folded AS folded, contact_email, administrator,
+                created_by AS issuer
          FROM account_invitations
          WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > now()
          FOR UPDATE",
@@ -1194,17 +1460,38 @@ pub async fn accept_account_invitation(
     .bind(token_hash(token))
     .fetch_optional(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     let Some(Invitation {
         id: invitation_id,
         name,
         folded,
         contact_email,
         administrator,
+        issuer,
     }) = invitation
     else {
         return Err(DbError::InvitationUnavailable);
     };
+    if administrator {
+        let issuer_is_active_administrator: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM accounts
+                 WHERE name_folded = $1
+                   AND (flags & $3) = 0
+                   AND ((flags & $2) = $2 OR name_folded = ANY($4))
+             )",
+        )
+        .bind(&issuer)
+        .bind(ACCOUNT_FLAG_ADMIN)
+        .bind(ACCOUNT_FLAG_SUSPENDED)
+        .bind(configured_administrators)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(query_error)?;
+        if !issuer_is_active_administrator {
+            return Err(DbError::InvitationUnavailable);
+        }
+    }
     lock_account_name(&mut transaction, &folded).await?;
     if account_name_is_retired(&mut transaction, &folded).await? {
         return Err(DbError::InvitationUnavailable);
@@ -1228,7 +1515,7 @@ pub async fn accept_account_invitation(
     .bind(account_id)
     .execute(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     insert_audit_log_with(
         &mut *transaction,
         &folded,
@@ -1241,7 +1528,7 @@ pub async fn accept_account_invitation(
         },
     )
     .await?;
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(name)
 }
 
@@ -1256,7 +1543,7 @@ pub async fn account_contact_email(
             .bind(folded)
             .fetch_optional(pool)
             .await
-            .map_err(DbError::Query)?;
+            .map_err(query_error)?;
     Ok(row.and_then(|(email,)| email))
 }
 
@@ -1268,7 +1555,7 @@ pub async fn set_account_contact_email(
     contact_email: Option<&crate::identity::ContactEmail>,
 ) -> Result<(), DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     let updated = sqlx::query(
         "UPDATE accounts SET contact_email = $2
          WHERE name_folded = $1 AND (flags & $3) = 0",
@@ -1278,7 +1565,7 @@ pub async fn set_account_contact_email(
     .bind(ACCOUNT_FLAG_SUSPENDED)
     .execute(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     if updated.rows_affected() == 0 {
         return Err(DbError::UnknownAccount(account.to_string()));
     }
@@ -1294,7 +1581,7 @@ pub async fn set_account_contact_email(
         },
     )
     .await?;
-    transaction.commit().await.map_err(DbError::Query)
+    transaction.commit().await.map_err(query_error)
 }
 
 /// Whether the one-time first-account bootstrap has already been consumed.
@@ -1305,7 +1592,7 @@ pub async fn has_accounts(pool: &PgPool) -> Result<bool, DbError> {
     )
     .fetch_one(pool)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 /// Create the only possible first account and make it an administrator in the
@@ -1319,18 +1606,18 @@ pub async fn bootstrap_first_admin(
 ) -> Result<i64, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(name);
     let hash = hash_password(password.to_string()).await?;
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     sqlx::query("LOCK TABLE accounts IN SHARE ROW EXCLUSIVE MODE")
         .execute(&mut *transaction)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
     let initialized: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM accounts)
              OR EXISTS (SELECT 1 FROM retired_account_names)",
     )
     .fetch_one(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     if initialized {
         return Err(DbError::AlreadyInitialized);
     }
@@ -1344,7 +1631,7 @@ pub async fn bootstrap_first_admin(
     .bind(ACCOUNT_FLAG_ADMIN)
     .fetch_one(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     insert_primary_password(&mut transaction, account_id, &hash).await?;
     insert_audit_log_with(
         &mut *transaction,
@@ -1354,7 +1641,7 @@ pub async fn bootstrap_first_admin(
         "first administrator created through one-time browser bootstrap",
     )
     .await?;
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(account_id)
 }
 
@@ -1404,13 +1691,14 @@ pub async fn recover_administrator(
     let password = e6irc_proto::base64::encode(&secret);
     // Hashed before the transaction, so the account row is not locked for it.
     let hash = hash_password(password.clone()).await?;
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
-    let row: Option<(i64, String, i64)> =
-        sqlx::query_as("SELECT id, name, flags FROM accounts WHERE name_folded = $1 FOR UPDATE")
-            .bind(&folded)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    let row: Option<(i64, String, i64)> = sqlx::query_as(
+        "SELECT id, name, flags FROM accounts WHERE name_folded = $1 FOR NO KEY UPDATE",
+    )
+    .bind(&folded)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(query_error)?;
     let Some((account_id, name, flags)) = row else {
         return Err(DbError::UnknownAccount(account.to_string()));
     };
@@ -1421,24 +1709,31 @@ pub async fn recover_administrator(
         .bind(account_id)
         .execute(&mut *transaction)
         .await
-        .map_err(DbError::Query)?;
-    revoke_account_bearers(&mut transaction, account_id, &name).await?;
+        .map_err(query_error)?;
+    revoke_account_bearers(&mut transaction, account_id).await?;
+    revoke_issued_invitations(
+        &mut transaction,
+        &folded,
+        ADMINISTRATOR_RECOVERY_ACTOR,
+        "issuer's credentials were recovered from the host",
+    )
+    .await?;
     insert_primary_password(&mut transaction, account_id, &hash).await?;
     sqlx::query("UPDATE accounts SET flags = flags | $2 WHERE id = $1")
         .bind(account_id)
         .bind(ACCOUNT_FLAG_ADMIN)
         .execute(&mut *transaction)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
     insert_audit_log_with(
         &mut *transaction,
         ADMINISTRATOR_RECOVERY_ACTOR,
         "ADMINISTRATOR_RECOVERY",
         &folded,
-        "every credential revoked (local and app passwords, personal access tokens, device grants, browser sessions), local password replaced, and administrator authority granted from the host",
+        "every credential revoked (local and app passwords, personal access tokens, device grants, browser sessions) with every invitation the account issued, local password replaced, and administrator authority granted from the host",
     )
     .await?;
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(AdministratorRecovery {
         account: name,
         password,
@@ -1475,7 +1770,7 @@ pub async fn account_deletion_target(
     .bind(account_id)
     .fetch_optional(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     let Some(AccountDeletionTargetRow {
         name,
         folded,
@@ -1500,6 +1795,29 @@ pub async fn account_deletion_target(
     }))
 }
 
+/// The messages that are an account's: `$1` is its folded name, `$2` its
+/// display name. `sender_account` holds the account as the sender's session
+/// named it — the display name — while `dm_peers` holds casefolded identities.
+/// An account's name never changes and no other account can fold to it, so the
+/// two spellings together are exactly this account's messages. Each half has
+/// its own index (`messages_sender_account_idx`, `messages_dm_peers_idx`), so
+/// the predicate is a BitmapOr of two index scans. Deletion and export both
+/// select with it; it is written once.
+macro_rules! account_messages_predicate {
+    () => {
+        "(sender_account IN ($1, $2) OR dm_peers @> ARRAY[$1::text])"
+    };
+}
+
+/// [`account_messages_predicate!`], for callers outside this module that plan
+/// or inspect the same selection.
+pub const ACCOUNT_MESSAGES_PREDICATE: &str = account_messages_predicate!();
+
+/// Messages one account-deletion statement removes: each batch is a bounded
+/// statement under the pool's statement timeout, however much history the
+/// account has.
+const ACCOUNT_PURGE_BATCH: i64 = 5_000;
+
 /// Permanently remove one account after the live core has denied new
 /// authentication. The retired-name reservation, privacy purge, account
 /// cascade, and durable audit event commit together.
@@ -1510,7 +1828,7 @@ pub async fn delete_account_permanently(
     configured_administrators: &[String],
 ) -> Result<Option<AccountDeletionTarget>, DbError> {
     let actor_folded = CaseMapping::Rfc1459.casefold(actor);
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     let Some(LockedAccountState {
         name,
         folded,
@@ -1525,7 +1843,7 @@ pub async fn delete_account_permanently(
             .bind(account_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(DbError::Query)?;
+            .map_err(query_error)?;
     if founded_channels != 0 {
         return Err(DbError::AccountOwnsChannels(
             usize::try_from(founded_channels).unwrap_or(usize::MAX),
@@ -1546,17 +1864,38 @@ pub async fn delete_account_permanently(
     .bind(&folded)
     .execute(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
+    // Account-owned rows go in one fixed table order — messages, bouncer
+    // backlog, device grants, invitations, then the account (whose cascade
+    // takes the rest) — the order every other multi-table writer uses, so two
+    // of them can never each hold a lock the other waits for.
+    loop {
+        let deleted = sqlx::query(concat!(
+            "DELETE FROM messages WHERE id = ANY(ARRAY(SELECT id FROM messages WHERE ",
+            account_messages_predicate!(),
+            " LIMIT $3))"
+        ))
+        .bind(&folded)
+        .bind(&name)
+        .bind(ACCOUNT_PURGE_BATCH)
+        .execute(&mut *transaction)
+        .await
+        .map_err(query_error)?
+        .rows_affected();
+        if deleted < ACCOUNT_PURGE_BATCH as u64 {
+            break;
+        }
+    }
     sqlx::query("DELETE FROM bnc_buffer WHERE owner = $1")
         .bind(&folded)
         .execute(&mut *transaction)
         .await
-        .map_err(DbError::Query)?;
-    sqlx::query("DELETE FROM device_grants WHERE account = $1")
-        .bind(&name)
+        .map_err(query_error)?;
+    sqlx::query("DELETE FROM device_grants WHERE account_id = $1")
+        .bind(account_id)
         .execute(&mut *transaction)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
     sqlx::query(
         "DELETE FROM account_invitations
          WHERE name_folded = $1 OR created_by = $1",
@@ -1564,20 +1903,7 @@ pub async fn delete_account_permanently(
     .bind(&folded)
     .execute(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
-    // `sender_account` holds the account as the sender's session named it —
-    // the display name — while `dm_peers` holds casefolded identities. An
-    // account's name never changes and no other account can fold to it, so the
-    // two spellings together are exactly this account's messages.
-    sqlx::query(
-        "DELETE FROM messages
-         WHERE sender_account IN ($1, $2) OR dm_peers @> ARRAY[$1::text]",
-    )
-    .bind(&folded)
-    .bind(&name)
-    .execute(&mut *transaction)
-    .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     insert_audit_log_with(
         &mut *transaction,
         &actor_folded,
@@ -1590,8 +1916,8 @@ pub async fn delete_account_permanently(
         .bind(account_id)
         .execute(&mut *transaction)
         .await
-        .map_err(DbError::Query)?;
-    transaction.commit().await.map_err(DbError::Query)?;
+        .map_err(query_error)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(Some(AccountDeletionTarget {
         id: account_id,
         name,
@@ -1620,7 +1946,7 @@ pub async fn account_flags(pool: &PgPool, account: &str) -> Result<Option<Accoun
         .fetch_optional(pool)
         .await
         .map(|flags| flags.map(AccountFlags))
-        .map_err(DbError::Query)
+        .map_err(query_error)
 }
 
 pub async fn account_id_by_name(pool: &PgPool, account: &str) -> Result<Option<i64>, DbError> {
@@ -1629,7 +1955,7 @@ pub async fn account_id_by_name(pool: &PgPool, account: &str) -> Result<Option<i
         .bind(folded)
         .fetch_optional(pool)
         .await
-        .map_err(DbError::Query)
+        .map_err(query_error)
 }
 
 /// Folded account keys whose durable suspension must be seeded into the core
@@ -1639,7 +1965,7 @@ pub async fn list_suspended_accounts(pool: &PgPool) -> Result<Vec<String>, DbErr
         .bind(ACCOUNT_FLAG_SUSPENDED)
         .fetch_all(pool)
         .await
-        .map_err(DbError::Query)
+        .map_err(query_error)
 }
 
 pub async fn account_name_by_id(pool: &PgPool, account_id: i64) -> Result<Option<String>, DbError> {
@@ -1647,7 +1973,7 @@ pub async fn account_name_by_id(pool: &PgPool, account_id: i64) -> Result<Option
         .bind(account_id)
         .fetch_optional(pool)
         .await
-        .map_err(DbError::Query)
+        .map_err(query_error)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1690,14 +2016,15 @@ async fn lock_account_state(
         .bind(ACCOUNT_AUTHORITY_ADVISORY_LOCK_KEY)
         .execute(&mut **transaction)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
     sqlx::query_as(
-        "SELECT name, name_folded AS folded, flags FROM accounts WHERE id = $1 FOR UPDATE",
+        "SELECT name, name_folded AS folded, flags FROM accounts WHERE id = $1
+         FOR NO KEY UPDATE",
     )
     .bind(account_id)
     .fetch_optional(&mut **transaction)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 /// Preserve the system-wide invariant that an account mutation cannot remove
@@ -1723,7 +2050,7 @@ where
     .bind(configured_administrators)
     .fetch_one(executor)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     if other_active_administrators == 0 {
         return Err(DbError::LastAdministrator);
     }
@@ -1741,7 +2068,7 @@ async fn write_account_flags(
         .execute(&mut **transaction)
         .await
         .map(|_| ())
-        .map_err(DbError::Query)
+        .map_err(query_error)
 }
 
 /// Lock one active account row for a credential/session issuance transaction.
@@ -1754,13 +2081,13 @@ async fn lock_active_account_id(
     let account_id: Option<i64> = sqlx::query_scalar(
         "SELECT id FROM accounts
          WHERE name_folded = $1 AND (flags & $2) = 0
-         FOR UPDATE",
+         FOR NO KEY UPDATE",
     )
     .bind(folded)
     .bind(ACCOUNT_FLAG_SUSPENDED)
     .fetch_optional(&mut **transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     account_id.ok_or(DbError::BadCredentials)
 }
 
@@ -1776,7 +2103,7 @@ pub async fn set_account_administrator(
     configured_administrators: &[String],
 ) -> Result<Option<AccountAuthorityChange>, DbError> {
     let actor_folded = CaseMapping::Rfc1459.casefold(actor);
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     let Some(LockedAccountState {
         name,
         folded,
@@ -1805,13 +2132,24 @@ pub async fn set_account_administrator(
         flags & !ACCOUNT_FLAG_ADMIN
     };
     write_account_flags(&mut transaction, account_id, next_flags).await?;
+    // Invitations are issued on administrator authority; losing it ends them,
+    // unless configuration still grants the account that authority.
+    if !administrator && !configured_administrators.contains(&folded) {
+        revoke_issued_invitations(
+            &mut transaction,
+            &folded,
+            &actor_folded,
+            "issuer's administrator authority was revoked",
+        )
+        .await?;
+    }
     let action = if administrator {
         "ACCOUNT_ADMIN_GRANT"
     } else {
         "ACCOUNT_ADMIN_REVOKE"
     };
     insert_audit_log_with(&mut *transaction, &actor_folded, action, &folded, "").await?;
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(Some(AccountAuthorityChange {
         name,
         folded,
@@ -1830,7 +2168,7 @@ pub async fn set_account_suspended(
     configured_administrators: &[String],
 ) -> Result<Option<AccountStateChange>, DbError> {
     let actor_folded = CaseMapping::Rfc1459.casefold(actor);
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     let Some(LockedAccountState {
         name,
         folded,
@@ -1858,7 +2196,14 @@ pub async fn set_account_suspended(
     };
     write_account_flags(&mut transaction, account_id, next_flags).await?;
     if suspended {
-        revoke_account_bearers(&mut transaction, account_id, &name).await?;
+        revoke_account_bearers(&mut transaction, account_id).await?;
+        revoke_issued_invitations(
+            &mut transaction,
+            &folded,
+            &actor_folded,
+            "issuer was suspended",
+        )
+        .await?;
     }
     let action = if suspended {
         "ACCOUNT_SUSPEND"
@@ -1866,7 +2211,7 @@ pub async fn set_account_suspended(
         "ACCOUNT_REACTIVATE"
     };
     insert_audit_log_with(&mut *transaction, &actor_folded, action, &folded, "").await?;
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(Some(AccountStateChange {
         name,
         folded,
@@ -1882,23 +2227,57 @@ pub async fn set_account_suspended(
 async fn revoke_account_bearers(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: i64,
-    account_name: &str,
 ) -> Result<(), DbError> {
     sqlx::query("DELETE FROM web_sessions WHERE account_id = $1")
         .bind(account_id)
         .execute(&mut **transaction)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
     sqlx::query("DELETE FROM api_tokens WHERE account_id = $1")
         .bind(account_id)
         .execute(&mut **transaction)
         .await
-        .map_err(DbError::Query)?;
-    sqlx::query("DELETE FROM device_grants WHERE account = $1")
-        .bind(account_name)
+        .map_err(query_error)?;
+    sqlx::query("DELETE FROM device_grants WHERE account_id = $1")
+        .bind(account_id)
         .execute(&mut **transaction)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
+    Ok(())
+}
+
+/// End every live invitation `issuer` minted, inside the caller's
+/// transaction, with one `ACCOUNT_INVITATION_REVOKE` audit row each naming
+/// `actor` and `reason`. An invitation is a deferred use of its issuer's
+/// administrator authority; when that authority ends — suspension, demotion,
+/// or a recovery that presumes the issuer's credentials were in someone else's
+/// hands — so do they.
+async fn revoke_issued_invitations(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    issuer: &str,
+    actor: &str,
+    reason: &str,
+) -> Result<(), DbError> {
+    let revoked: Vec<String> = sqlx::query_scalar(
+        "UPDATE account_invitations
+         SET consumed_at = now()
+         WHERE created_by = $1 AND consumed_at IS NULL AND expires_at > now()
+         RETURNING name_folded",
+    )
+    .bind(issuer)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(query_error)?;
+    for invited in revoked {
+        insert_audit_log_with(
+            &mut **transaction,
+            actor,
+            "ACCOUNT_INVITATION_REVOKE",
+            &invited,
+            reason,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -2124,12 +2503,13 @@ pub async fn issue_app_password_for_account(
     // Cap per-account app passwords so an authenticated account can't flood the
     // credential table (mirrors the network cap). `local_password` is excluded —
     // this bounds only the app passwords a user mints. The count and the insert
-    // run inside one transaction with the account row locked FOR UPDATE:
+    // run inside one transaction with the account row locked (FOR NO KEY
+    // UPDATE: it serializes the cap without blocking foreign-key inserts):
     // separate pool statements would each see a pre-insert snapshot, so two
     // concurrent requests reading cap-1 would both insert and overshoot the
     // cap the comment promises (this endpoint runs on the concurrent REST
     // layer, not the serial worker).
-    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let mut tx = pool.begin().await.map_err(query_error)?;
     // The account row was gone (deleted since authentication): reject rather
     // than hand back an app password that was never stored.
     let account_id = lock_active_account_id(&mut tx, &folded).await?;
@@ -2140,7 +2520,7 @@ pub async fn issue_app_password_for_account(
     .bind(account_id)
     .fetch_one(&mut *tx)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     if app_pw_count >= MAX_APP_PASSWORDS_PER_ACCOUNT {
         return Err(DbError::TooManyCredentials);
     }
@@ -2154,7 +2534,7 @@ pub async fn issue_app_password_for_account(
     .bind(app_password_lookup(&secret))
     .execute(&mut *tx)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     insert_audit_log_with(
         &mut *tx,
         &folded,
@@ -2163,7 +2543,7 @@ pub async fn issue_app_password_for_account(
         "app password created",
     )
     .await?;
-    tx.commit().await.map_err(DbError::Query)?;
+    tx.commit().await.map_err(query_error)?;
     Ok(secret)
 }
 
@@ -2560,10 +2940,10 @@ async fn handle_request(
         } => {
             let dropped = match &requester {
                 crate::core::ChannelDropRequester::Admin { actor, .. } => {
-                    drop_channel_audited(pool, &channel, actor).await
+                    drop_channel(pool, &channel, ChannelDropper::Administrator(actor)).await
                 }
-                crate::core::ChannelDropRequester::ChanServ { .. } => {
-                    drop_channel(pool, &channel).await
+                crate::core::ChannelDropRequester::ChanServ { actor, .. } => {
+                    drop_channel(pool, &channel, ChannelDropper::Founder(actor)).await
                 }
             };
             let result = match dropped {
@@ -2591,9 +2971,10 @@ async fn handle_request(
             channel,
             new_founder,
             label,
+            actor,
         } => {
             let display = channel.clone();
-            let result = match set_channel_founder(pool, &channel, &new_founder).await {
+            let result = match set_channel_founder(pool, &channel, &new_founder, &actor).await {
                 Ok(true) => crate::core::ChannelServicePersistence::FounderChanged {
                     channel,
                     account: new_founder,
@@ -2701,11 +3082,17 @@ async fn handle_request(
             label,
         } => {
             let reply = match set_read_marker(pool, &account, &target, marker_ms).await {
-                Ok(marker_ms) => crate::core::DbReply::ReadMarkerStored {
+                Ok(ReadMarkerWrite::Stored(marker_ms)) => crate::core::DbReply::ReadMarkerStored {
                     account,
                     target,
                     display,
                     marker_ms,
+                    label,
+                },
+                Ok(ReadMarkerWrite::LimitReached) => crate::core::DbReply::ReadMarkerLimitReached {
+                    account,
+                    target,
+                    display,
                     label,
                 },
                 Err(e) => {
@@ -2778,27 +3165,29 @@ async fn handle_request(
             keeptopic,
             topic,
             label,
+            actor,
         } => {
-            let result = match set_channel_keeptopic(pool, &channel, keeptopic, topic.clone()).await
-            {
-                Ok(applied) => crate::core::ChannelServicePersistence::KeeptopicSet {
-                    channel,
-                    display,
-                    keeptopic,
-                    topic,
-                    applied,
-                    label,
-                },
-                Err(e) => {
-                    record_database_error(telemetry);
-                    eprintln!("db: channel keeptopic persistence failed: {e}");
-                    crate::core::ChannelServicePersistence::KeeptopicUnavailable {
+            let result =
+                match set_channel_keeptopic(pool, &channel, keeptopic, topic.clone(), &actor).await
+                {
+                    Ok(applied) => crate::core::ChannelServicePersistence::KeeptopicSet {
                         channel,
                         display,
+                        keeptopic,
+                        topic,
+                        applied,
                         label,
+                    },
+                    Err(e) => {
+                        record_database_error(telemetry);
+                        eprintln!("db: channel keeptopic persistence failed: {e}");
+                        crate::core::ChannelServicePersistence::KeeptopicUnavailable {
+                            channel,
+                            display,
+                            label,
+                        }
                     }
-                }
-            };
+                };
             push_channel_service_persisted(core_tx, owner, session, result).await
         }
         DbRequest::SetChannelMlock {
@@ -2808,8 +3197,9 @@ async fn handle_request(
             display,
             mlock,
             label,
+            actor,
         } => {
-            let result = match set_channel_mlock(pool, &channel, mlock.clone()).await {
+            let result = match set_channel_mlock(pool, &channel, mlock.clone(), &actor).await {
                 Ok(applied) => crate::core::ChannelServicePersistence::MlockSet {
                     channel,
                     display,
@@ -2837,36 +3227,38 @@ async fn handle_request(
             account,
             flags,
             label,
+            actor,
         } => {
             // A store fault is not "account is not registered" — those are
             // different replies, so the operator is never told a definitive
             // negative that was really a transient DB failure.
-            let result = match set_channel_access(pool, &channel, &account, flags.clone()).await {
-                Ok(applied) => crate::core::ChannelServicePersistence::AccessSet {
-                    channel,
-                    display,
-                    account,
-                    flags,
-                    applied,
-                    label,
-                },
-                Err(DbError::TooManyAccessEntries) => {
-                    crate::core::ChannelServicePersistence::AccessLimitReached {
+            let result =
+                match set_channel_access(pool, &channel, &account, flags.clone(), &actor).await {
+                    Ok(applied) => crate::core::ChannelServicePersistence::AccessSet {
                         channel,
                         display,
+                        account,
+                        flags,
+                        applied,
                         label,
+                    },
+                    Err(DbError::TooManyAccessEntries) => {
+                        crate::core::ChannelServicePersistence::AccessLimitReached {
+                            channel,
+                            display,
+                            label,
+                        }
                     }
-                }
-                Err(e) => {
-                    record_database_error(telemetry);
-                    eprintln!("db: channel access persistence failed: {e}");
-                    crate::core::ChannelServicePersistence::AccessUnavailable {
-                        channel,
-                        display,
-                        label,
+                    Err(e) => {
+                        record_database_error(telemetry);
+                        eprintln!("db: channel access persistence failed: {e}");
+                        crate::core::ChannelServicePersistence::AccessUnavailable {
+                            channel,
+                            display,
+                            label,
+                        }
                     }
-                }
-            };
+                };
             push_channel_service_persisted(core_tx, owner, session, result).await
         }
         DbRequest::MutateOwnedChannel {
@@ -2948,7 +3340,7 @@ pub async fn list_read_markers(
     .bind(&folded)
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 /// Every stored read marker as (account display name, target, epoch-millis),
@@ -2964,7 +3356,7 @@ pub async fn list_all_read_markers(
     )
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     rows.into_iter()
         .map(|(account, target, millis)| {
             Ok((
@@ -2976,33 +3368,65 @@ pub async fn list_all_read_markers(
         .collect()
 }
 
+/// Most durable read markers one account may hold. Each core shard also keeps
+/// the count in memory, but a shard only sees its own sessions' writes: with
+/// several shards, only the database — where every write lands — can hold an
+/// account to one cap.
+pub const READ_MARKER_LIMIT: i64 = 256;
+
+/// What became of one read-marker write.
+enum ReadMarkerWrite {
+    /// The marker PostgreSQL holds after the monotonic `GREATEST`.
+    Stored(e6irc_proto::time::Millis),
+    /// A new target, and the account already holds [`READ_MARKER_LIMIT`].
+    LimitReached,
+}
+
 async fn set_read_marker(
     pool: &PgPool,
     account: &str,
     target: &str,
     marker_ms: e6irc_proto::time::Millis,
-) -> Result<e6irc_proto::time::Millis, DbError> {
+) -> Result<ReadMarkerWrite, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let stored: Option<i64> = sqlx::query_scalar(
+    let marker = millis_for_database(marker_ms, "read_markers.marker_ts")?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    // The account row lock serializes this account's writers across shards, so
+    // two cannot both count 255 and both insert. NO KEY UPDATE: the marker's
+    // own foreign-key check (and any other account-referencing insert) takes
+    // a KEY SHARE lock, which this does not block.
+    let Some(account_id) = lock_account_id(&mut transaction, &folded).await? else {
+        // The account name no longer resolves: an unavailable verdict, never a
+        // false success.
+        return Err(DbError::UnknownAccount(account.to_string()));
+    };
+    let (held, count): (bool, i64) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM read_markers WHERE account_id = $1 AND target = $2),
+                (SELECT count(*) FROM read_markers WHERE account_id = $1)",
+    )
+    .bind(account_id)
+    .bind(target)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    if !held && count >= READ_MARKER_LIMIT {
+        return Ok(ReadMarkerWrite::LimitReached);
+    }
+    let stored: i64 = sqlx::query_scalar(
         "INSERT INTO read_markers (account_id, target, marker_ts)
-         SELECT a.id, $1, to_timestamp($2::double precision / 1000)
-         FROM accounts a WHERE a.name_folded = $3
+         VALUES ($1, $2, to_timestamp($3::double precision / 1000))
          ON CONFLICT (account_id, target)
          DO UPDATE SET marker_ts = GREATEST(read_markers.marker_ts, EXCLUDED.marker_ts)
          RETURNING (EXTRACT(EPOCH FROM marker_ts) * 1000)::bigint",
     )
+    .bind(account_id)
     .bind(target)
-    .bind(millis_for_database(marker_ms, "read_markers.marker_ts")?)
-    .bind(&folded)
-    .fetch_optional(pool)
+    .bind(marker)
+    .fetch_one(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
-    // The SELECT matches no row if the account name no longer resolves.
-    // Surface that as an unavailable verdict rather than a false success.
-    let Some(stored) = stored else {
-        return Err(DbError::UnknownAccount(account.to_string()));
-    };
-    millis_from_database(stored, "read_markers.marker_ts")
+    .map_err(query_error)?;
+    transaction.commit().await.map_err(query_error)?;
+    millis_from_database(stored, "read_markers.marker_ts").map(ReadMarkerWrite::Stored)
 }
 
 /// Outcome of linking an OIDC identity to an account.
@@ -3040,7 +3464,7 @@ pub async fn list_oidc_identities(
     .bind(&folded)
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3069,13 +3493,13 @@ pub async fn unlink_oidc_identity(
     identity_id: i64,
 ) -> Result<UnlinkIdentityOutcome, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let mut tx = pool.begin().await.map_err(query_error)?;
     let account_id: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR UPDATE")
+        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR NO KEY UPDATE")
             .bind(&folded)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(DbError::Query)?;
+            .map_err(query_error)?;
     let Some(account_id) = account_id else {
         return Ok(UnlinkIdentityOutcome::NotFound);
     };
@@ -3087,7 +3511,7 @@ pub async fn unlink_oidc_identity(
     .bind(account_id)
     .fetch_optional(&mut *tx)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     let Some(OidcIdentityReference { issuer, subject }) = identity else {
         return Ok(UnlinkIdentityOutcome::NotFound);
     };
@@ -3105,7 +3529,7 @@ pub async fn unlink_oidc_identity(
     .bind(account_id)
     .fetch_one(&mut *tx)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     if identity_count <= 1 && !has_local_password {
         return Ok(UnlinkIdentityOutcome::LastLoginMethod);
     }
@@ -3114,7 +3538,7 @@ pub async fn unlink_oidc_identity(
         .bind(account_id)
         .execute(&mut *tx)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
     sqlx::query(
         "DELETE FROM web_sessions
          WHERE account_id = $1 AND oidc_issuer = $2 AND oidc_subject = $3",
@@ -3124,7 +3548,7 @@ pub async fn unlink_oidc_identity(
     .bind(subject)
     .execute(&mut *tx)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     insert_audit_log_with(
         &mut *tx,
         &folded,
@@ -3133,7 +3557,7 @@ pub async fn unlink_oidc_identity(
         "OpenID Connect identity unlinked and correlated sessions revoked",
     )
     .await?;
-    tx.commit().await.map_err(DbError::Query)?;
+    tx.commit().await.map_err(query_error)?;
     Ok(UnlinkIdentityOutcome::Unlinked)
 }
 
@@ -3149,7 +3573,7 @@ pub async fn link_oidc_identity(
     subject: &str,
 ) -> Result<LinkOutcome, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     let account_id = lock_active_account_id(&mut transaction, &folded).await?;
     let inserted: Option<i64> = sqlx::query_scalar(
         "INSERT INTO oidc_identities (account_id, issuer, subject) VALUES ($1, $2, $3)
@@ -3160,7 +3584,7 @@ pub async fn link_oidc_identity(
     .bind(subject)
     .fetch_optional(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     if inserted.is_some() {
         insert_audit_log_with(
             &mut *transaction,
@@ -3170,7 +3594,7 @@ pub async fn link_oidc_identity(
             "OpenID Connect identity linked",
         )
         .await?;
-        transaction.commit().await.map_err(DbError::Query)?;
+        transaction.commit().await.map_err(query_error)?;
         return Ok(LinkOutcome::Linked);
     }
     // The pair already exists; whose is it?
@@ -3181,7 +3605,7 @@ pub async fn link_oidc_identity(
     .bind(subject)
     .fetch_one(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     if owner == account_id {
         Ok(LinkOutcome::AlreadyYours)
     } else {
@@ -3222,7 +3646,7 @@ pub async fn set_channel_topic(
     .bind(set_at)
     .fetch_optional(pool)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 /// One history row decoded from PostgreSQL. `#[derive(sqlx::FromRow)]` binds
@@ -3318,7 +3742,7 @@ pub(crate) async fn positioned_by_unknown_msgid(
         .bind(target)
         .fetch_one(pool)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
         if !known {
             return Ok(true);
         }
@@ -3472,7 +3896,7 @@ pub async fn query_history(
         // Returned early above.
         HistoryQuery::BetweenSelectors { .. } => unreachable!("handled before the match"),
     };
-    let mut rows = rows.map_err(DbError::Query)?;
+    let mut rows = rows.map_err(query_error)?;
     if newest_first {
         rows.reverse();
     }
@@ -3540,7 +3964,7 @@ async fn query_between_selectors(
                 .bind(target)
                 .fetch_optional(pool)
                 .await
-                .map_err(DbError::Query)?;
+                .map_err(query_error)?;
                 Ok(row.map(|row| HistoryMarker {
                     ts_millis: row.ts_millis,
                     id: row.id,
@@ -3608,7 +4032,7 @@ async fn query_between_selectors(
         .bind(limit as i64)
         .fetch_all(pool)
         .await;
-    let mut rows = rows.map_err(DbError::Query)?;
+    let mut rows = rows.map_err(query_error)?;
     if newest_first {
         rows.reverse();
     }
@@ -3633,11 +4057,18 @@ pub async fn query_targets(
     let min_ts = millis_for_database(min_ts, "history target minimum")?;
     let max_ts = millis_for_database(max_ts, "history target maximum")?;
     let rows: Result<Vec<HistoryTargetRow>, sqlx::Error> = sqlx::query_as(
+        // A channel's newest message is one backward probe of
+        // `messages_target_ts_id_idx` per requested channel (a LATERAL
+        // `max(ts)` becomes `Index Only Scan Backward ... Limit 1`); grouping
+        // `WHERE target = ANY(..)` instead read every row of every joined
+        // channel to find each maximum.
         "SELECT name, (EXTRACT(EPOCH FROM MAX(latest)) * 1000)::bigint AS latest FROM (
-             SELECT target AS name, MAX(ts) AS latest
-             FROM messages
-             WHERE target = ANY($1)
-             GROUP BY target
+             SELECT requested.name, newest.latest
+             FROM unnest($1::text[]) AS requested(name)
+             CROSS JOIN LATERAL (
+                 SELECT max(ts) AS latest FROM messages WHERE target = requested.name
+             ) newest
+             WHERE newest.latest IS NOT NULL
              UNION ALL
              SELECT COALESCE(
                         (SELECT p FROM UNNEST(dm_peers) p WHERE p <> $5 LIMIT 1),
@@ -3662,7 +4093,7 @@ pub async fn query_targets(
     .bind(me)
     .fetch_all(pool)
     .await;
-    rows.map_err(DbError::Query)?
+    rows.map_err(query_error)?
         .into_iter()
         .map(|row| {
             Ok((
@@ -3683,35 +4114,43 @@ const MAX_ACCESS_ENTRIES_PER_CHANNEL: i64 = 256;
 /// registered), so the caller can refuse to record a phantom grant in its hot
 /// map. A removal is always considered applied — dropping a (possibly stale)
 /// entry is idempotent cleanup.
+///
+/// An applied change is audited (`CHANNEL_ACCESS`, as the owner console
+/// records it) in its own transaction, with the founder `actor`.
 pub async fn set_channel_access(
     pool: &PgPool,
     channel: &str,
     account: &str,
     flags: Option<String>,
+    actor: &str,
 ) -> Result<bool, DbError> {
     let channel_folded = CaseMapping::Rfc1459.casefold(channel);
     let account_folded = CaseMapping::Rfc1459.casefold(account);
+    let detail = format!(
+        "account={account_folded} flags={}",
+        flags.as_deref().unwrap_or("-")
+    );
     match flags {
         Some(flags) => {
             // Cap the access list per channel, like every sibling grant collection
             // (app passwords, PATs, BNC networks): count + insert in one
-            // transaction with the channel row locked FOR UPDATE, so two founders
+            // transaction with the channel row locked FOR NO KEY UPDATE, so two founders
             // granting concurrently can't both slip past the cap. Without it the
             // map — and its persisted rows, re-loaded into RAM on every boot by
             // `preload_access` — grow without bound. Only a *new* (channel,
             // account) pair counts against the cap; re-flagging an existing entry
             // is always allowed (it replaces, it doesn't grow).
-            let mut tx = pool.begin().await.map_err(DbError::Query)?;
+            let mut tx = pool.begin().await.map_err(query_error)?;
             let ids: Option<(i64, i64)> = sqlx::query_as(
                 "SELECT c.id, a.id FROM channels c, accounts a
                  WHERE c.name_folded = $1 AND a.name_folded = $2
-                 FOR UPDATE OF c",
+                 FOR NO KEY UPDATE OF c",
             )
             .bind(&channel_folded)
             .bind(&account_folded)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(DbError::Query)?;
+            .map_err(query_error)?;
             // No match → the account isn't registered (or the channel is gone);
             // nothing granted, same as before.
             let Some((channel_id, account_id)) = ids else {
@@ -3724,14 +4163,14 @@ pub async fn set_channel_access(
             .bind(account_id)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(DbError::Query)?;
+            .map_err(query_error)?;
             if already.is_none() {
                 let count: i64 =
                     sqlx::query_scalar("SELECT COUNT(*) FROM channel_access WHERE channel_id = $1")
                         .bind(channel_id)
                         .fetch_one(&mut *tx)
                         .await
-                        .map_err(DbError::Query)?;
+                        .map_err(query_error)?;
                 if count >= MAX_ACCESS_ENTRIES_PER_CHANNEL {
                     return Err(DbError::TooManyAccessEntries);
                 }
@@ -3746,24 +4185,52 @@ pub async fn set_channel_access(
             .bind(flags)
             .execute(&mut *tx)
             .await
-            .map_err(DbError::Query)?;
-            tx.commit().await.map_err(DbError::Query)?;
+            .map_err(query_error)?;
+            audit_channel_service(&mut tx, actor, "CHANNEL_ACCESS", &channel_folded, &detail)
+                .await?;
+            tx.commit().await.map_err(query_error)?;
             Ok(true)
         }
         None => {
-            sqlx::query(
+            let mut tx = pool.begin().await.map_err(query_error)?;
+            let removed = sqlx::query(
                 "DELETE FROM channel_access ca USING channels c, accounts a
                  WHERE ca.channel_id = c.id AND ca.account_id = a.id
                    AND c.name_folded = $1 AND a.name_folded = $2",
             )
             .bind(&channel_folded)
             .bind(&account_folded)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
-            .map_err(DbError::Query)?;
+            .map_err(query_error)?;
+            if removed.rows_affected() > 0 {
+                audit_channel_service(&mut tx, actor, "CHANNEL_ACCESS", &channel_folded, &detail)
+                    .await?;
+            }
+            tx.commit().await.map_err(query_error)?;
             Ok(true)
         }
     }
+}
+
+/// Record one change of a registered channel inside its transaction — target
+/// the folded channel, actor the acting account folded. ChanServ's changes use
+/// the vocabulary the owner console's use (`CHANNEL_*`).
+async fn audit_channel_service(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    actor: &str,
+    action: &str,
+    channel_folded: &str,
+    detail: &str,
+) -> Result<(), DbError> {
+    insert_audit_log_with(
+        &mut **transaction,
+        &CaseMapping::Rfc1459.casefold(actor),
+        action,
+        channel_folded,
+        detail,
+    )
+    .await
 }
 
 #[derive(sqlx::FromRow)]
@@ -3784,17 +4251,17 @@ pub async fn persist_owned_channel_mutation(
 
     let channel_folded = CaseMapping::Rfc1459.casefold(channel);
     let actor_folded = CaseMapping::Rfc1459.casefold(actor);
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     let row: Option<ChannelMutationOwnerRow> = sqlx::query_as(
         "SELECT c.id AS channel_id, a.name_folded AS founder, c.keeptopic
          FROM channels c JOIN accounts a ON a.id = c.founder_account_id
          WHERE c.name_folded = $1
-         FOR UPDATE OF c",
+         FOR NO KEY UPDATE OF c",
     )
     .bind(&channel_folded)
     .fetch_optional(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     let Some(ChannelMutationOwnerRow {
         channel_id,
         founder,
@@ -3836,7 +4303,7 @@ pub async fn persist_owned_channel_mutation(
             .bind(set_at)
             .execute(&mut *transaction)
             .await
-            .map_err(DbError::Query)?;
+            .map_err(query_error)?;
             (
                 "CHANNEL_TOPIC",
                 if topic.is_some() { "set" } else { "cleared" }.to_string(),
@@ -3869,7 +4336,7 @@ pub async fn persist_owned_channel_mutation(
             .bind(set_at)
             .execute(&mut *transaction)
             .await
-            .map_err(DbError::Query)?;
+            .map_err(query_error)?;
             (
                 "CHANNEL_KEEPTOPIC",
                 if *enabled { "on" } else { "off" }.to_string(),
@@ -3881,7 +4348,7 @@ pub async fn persist_owned_channel_mutation(
                 .bind(mlock)
                 .execute(&mut *transaction)
                 .await
-                .map_err(DbError::Query)?;
+                .map_err(query_error)?;
             (
                 "CHANNEL_MLOCK",
                 mlock.as_deref().unwrap_or("cleared").to_string(),
@@ -3895,7 +4362,7 @@ pub async fn persist_owned_channel_mutation(
                         .bind(&account_folded)
                         .fetch_optional(&mut *transaction)
                         .await
-                        .map_err(DbError::Query)?;
+                        .map_err(query_error)?;
                 let Some(account_id) = account_id else {
                     return Ok(ChannelControlResult::AccountMissing);
                 };
@@ -3907,7 +4374,7 @@ pub async fn persist_owned_channel_mutation(
                 .bind(account_id)
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(DbError::Query)?;
+                .map_err(query_error)?;
                 if already.is_none() {
                     let count: i64 = sqlx::query_scalar(
                         "SELECT COUNT(*) FROM channel_access WHERE channel_id = $1",
@@ -3915,7 +4382,7 @@ pub async fn persist_owned_channel_mutation(
                     .bind(channel_id)
                     .fetch_one(&mut *transaction)
                     .await
-                    .map_err(DbError::Query)?;
+                    .map_err(query_error)?;
                     if count >= MAX_ACCESS_ENTRIES_PER_CHANNEL {
                         return Ok(ChannelControlResult::AccessLimitReached);
                     }
@@ -3931,7 +4398,7 @@ pub async fn persist_owned_channel_mutation(
                 .bind(flags)
                 .execute(&mut *transaction)
                 .await
-                .map_err(DbError::Query)?;
+                .map_err(query_error)?;
             } else {
                 sqlx::query(
                     "DELETE FROM channel_access ca USING accounts a
@@ -3942,7 +4409,7 @@ pub async fn persist_owned_channel_mutation(
                 .bind(&account_folded)
                 .execute(&mut *transaction)
                 .await
-                .map_err(DbError::Query)?;
+                .map_err(query_error)?;
             }
             (
                 "CHANNEL_ACCESS",
@@ -3958,7 +4425,7 @@ pub async fn persist_owned_channel_mutation(
                     .bind(account)
                     .fetch_optional(&mut *transaction)
                     .await
-                    .map_err(DbError::Query)?;
+                    .map_err(query_error)?;
             let Some(account_id) = account_id else {
                 return Ok(ChannelControlResult::AccountMissing);
             };
@@ -3967,7 +4434,7 @@ pub async fn persist_owned_channel_mutation(
                 .bind(account_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(DbError::Query)?;
+                .map_err(query_error)?;
             ("CHANNEL_FOUNDER", account.clone())
         }
         PersistedChannelMutation::Drop => {
@@ -3975,7 +4442,7 @@ pub async fn persist_owned_channel_mutation(
                 .bind(channel_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(DbError::Query)?;
+                .map_err(query_error)?;
             ("CHANNEL_DROP", String::new())
         }
     };
@@ -3987,7 +4454,7 @@ pub async fn persist_owned_channel_mutation(
         &detail,
     )
     .await?;
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(ChannelControlResult::Applied)
 }
 
@@ -4013,7 +4480,7 @@ pub async fn account_may_read_channel(
     .bind(account_folded)
     .fetch_optional(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     Ok(found.is_some())
 }
 
@@ -4028,7 +4495,7 @@ pub async fn list_channel_access(pool: &PgPool) -> Result<Vec<(String, String, S
     )
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 /// Transfer a channel's founder to `new_founder_folded`. Returns whether
@@ -4037,12 +4504,16 @@ pub async fn list_channel_access(pool: &PgPool) -> Result<Vec<(String, String, S
 /// no such channel/account (a definitive negative), `Err` = the store failed.
 /// The caller must keep these distinct: reporting a DB fault as "no such
 /// account" would tell the founder a lie they might act on.
+/// A transfer is audited (`CHANNEL_FOUNDER`) in its own transaction, with the
+/// outgoing founder `actor`.
 pub async fn set_channel_founder(
     pool: &PgPool,
     channel: &str,
     new_founder_folded: &str,
+    actor: &str,
 ) -> Result<bool, DbError> {
     let channel_folded = CaseMapping::Rfc1459.casefold(channel);
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     let res = sqlx::query(
         "UPDATE channels SET founder_account_id = a.id
          FROM accounts a
@@ -4050,10 +4521,22 @@ pub async fn set_channel_founder(
     )
     .bind(&channel_folded)
     .bind(new_founder_folded)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
-    Ok(res.rows_affected() > 0)
+    .map_err(query_error)?;
+    if res.rows_affected() == 0 {
+        return Ok(false);
+    }
+    audit_channel_service(
+        &mut transaction,
+        actor,
+        "CHANNEL_FOUNDER",
+        &channel_folded,
+        new_founder_folded,
+    )
+    .await?;
+    transaction.commit().await.map_err(query_error)?;
+    Ok(true)
 }
 
 /// Add or remove a server ban (KLINE/DLINE/XLINE) together with its audit
@@ -4065,7 +4548,7 @@ pub async fn mutate_server_ban_audited(
     pool: &PgPool,
     mutation: &crate::core::ServerBanMutation,
 ) -> Result<bool, DbError> {
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     let (actor, action, target, detail) = match mutation {
         crate::core::ServerBanMutation::Add {
             mask,
@@ -4089,7 +4572,7 @@ pub async fn mutate_server_ban_audited(
             .bind(kind)
             .execute(&mut *transaction)
             .await
-            .map_err(DbError::Query)?;
+            .map_err(query_error)?;
             (
                 set_by.as_str(),
                 kind.to_ascii_uppercase(),
@@ -4114,9 +4597,9 @@ pub async fn mutate_server_ban_audited(
                 .build()
                 .execute(&mut *transaction)
                 .await
-                .map_err(DbError::Query)?;
+                .map_err(query_error)?;
             if deleted.rows_affected() == 0 {
-                transaction.rollback().await.map_err(DbError::Query)?;
+                transaction.rollback().await.map_err(query_error)?;
                 return Ok(false);
             }
             (
@@ -4128,7 +4611,7 @@ pub async fn mutate_server_ban_audited(
         }
     };
     insert_audit_log_with(&mut *transaction, actor, &action, target, detail).await?;
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(true)
 }
 
@@ -4146,7 +4629,7 @@ async fn insert_audit_log_with<'executor>(
         .bind(detail)
         .execute(executor)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
     Ok(())
 }
 
@@ -4227,7 +4710,7 @@ macro_rules! fetch_keyset_page {
             .build_query_as()
             .fetch_all($pool)
             .await
-            .map_err(DbError::Query)?;
+            .map_err(query_error)?;
         keyset_page(entries, $page_size, |entry| entry.id)
     }};
 }
@@ -4306,20 +4789,62 @@ pub async fn query_account_security_activity(
     })
 }
 
-/// Build a versioned JSON export of one account's retained data. Secret
-/// digests, password hashes, sealed upstream passwords, session identity
-/// tokens, device codes, and invitation bearers are deliberately absent.
-/// PostgreSQL constructs this in one statement so every section observes one
-/// statement snapshot.
-pub async fn export_account_json(pool: &PgPool, account: &str) -> Result<Option<String>, DbError> {
+/// Rows one export page fetches from a section's cursor.
+macro_rules! export_page {
+    () => {
+        "500"
+    };
+}
+
+/// A versioned JSON export of one account's retained data, produced a page at
+/// a time. Secret digests, password hashes, sealed upstream passwords, session
+/// identity tokens, device codes, and invitation bearers are deliberately
+/// absent.
+///
+/// Every section observes one snapshot: the export runs in a
+/// `REPEATABLE READ READ ONLY` transaction. The bounded sections are built in
+/// one statement; the two that grow with the account's history — its messages
+/// and its bouncer backlog — are read through server-side cursors,
+/// [`export_page!`] rows at a time, so neither the database nor this process
+/// ever holds the whole of either as one value. The transaction is held for as
+/// long as the reader keeps reading; a reader that stalls past the pool's idle
+/// transaction timeout ends it, and the export fails loudly.
+pub struct AccountExport {
+    transaction: sqlx::Transaction<'static, sqlx::Postgres>,
+    stage: AccountExportStage,
+}
+
+enum AccountExportStage {
+    /// The bounded sections, as one JSON object's text.
+    Head(String),
+    Messages {
+        first: bool,
+    },
+    Backlog {
+        first: bool,
+    },
+    Done,
+}
+
+/// Open an account's export, or `None` when no such account exists. The first
+/// [`AccountExport::next_chunk`] is the start of the document.
+pub async fn begin_account_export(
+    pool: &PgPool,
+    account: &str,
+) -> Result<Option<AccountExport>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    sqlx::query_scalar(
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *transaction)
+        .await
+        .map_err(query_error)?;
+    let head: Option<(String, String)> = sqlx::query_as(
         r#"
         WITH owner AS (
             SELECT id, name, name_folded, contact_email, flags, created_at
             FROM accounts WHERE name_folded = $1
         )
-        SELECT jsonb_pretty(jsonb_build_object(
+        SELECT a.name, jsonb_build_object(
             'schema_version', 1,
             'exported_at', to_char(now() AT TIME ZONE 'UTC',
                 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
@@ -4387,6 +4912,7 @@ pub async fn export_account_json(pool: &PgPool, account: &str) -> Result<Option<
                     'autojoin', n.autojoin,
                     'sasl_account', n.sasl_account,
                     'has_sasl_password', n.sasl_password_sealed IS NOT NULL,
+                    'has_server_password', n.server_password_sealed IS NOT NULL,
                     'enabled', n.enabled,
                     'created_at', to_char(n.created_at AT TIME ZONE 'UTC',
                         'YYYY-MM-DD"T"HH24:MI:SS"Z"')
@@ -4432,33 +4958,6 @@ pub async fn export_account_json(pool: &PgPool, account: &str) -> Result<Option<
                 ) ORDER BY c.id)
                 FROM channels c WHERE c.founder_account_id = a.id
             ), '[]'::jsonb),
-            'messages', COALESCE((
-                SELECT jsonb_agg(jsonb_build_object(
-                    'message_id', m.msgid,
-                    'target', m.target,
-                    'sender_prefix', m.sender_prefix,
-                    'sender_account', m.sender_account,
-                    'kind', m.kind,
-                    'body', m.body,
-                    'timestamp', to_char(m.ts AT TIME ZONE 'UTC',
-                        'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
-                    'direct_message_peers', m.dm_peers,
-                    'sender_is_bot', m.sender_is_bot,
-                    'multiline', m.multiline
-                ) ORDER BY m.id)
-                FROM messages m
-                WHERE m.sender_account IN (a.name, a.name_folded)
-                   OR m.dm_peers @> ARRAY[a.name_folded]
-            ), '[]'::jsonb),
-            'bouncer_buffer', COALESCE((
-                SELECT jsonb_agg(jsonb_build_object(
-                    'network', b.network,
-                    'line', b.line,
-                    'created_at', to_char(b.created_at AT TIME ZONE 'UTC',
-                        'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-                ) ORDER BY b.id)
-                FROM bnc_buffer b WHERE b.owner = a.name_folded
-            ), '[]'::jsonb),
             'security_activity', COALESCE((
                 SELECT jsonb_agg(jsonb_build_object(
                     'id', log.id,
@@ -4472,14 +4971,124 @@ pub async fn export_account_json(pool: &PgPool, account: &str) -> Result<Option<
                 FROM audit_log log
                 WHERE log.actor = a.name_folded OR log.target = a.name_folded
             ), '[]'::jsonb)
-        ))::text
+        )::text
         FROM owner a
         "#,
     )
-    .bind(folded)
-    .fetch_optional(pool)
+    .bind(&folded)
+    .fetch_optional(&mut *transaction)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)?;
+    let Some((name, head)) = head else {
+        return Ok(None);
+    };
+    // Built from the one predicate deletion uses, so the two can never select
+    // different rows. Every interpolated piece is a constant of this module.
+    let predicate = ACCOUNT_MESSAGES_PREDICATE;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DECLARE export_messages NO SCROLL CURSOR FOR
+         SELECT jsonb_build_object(
+             'message_id', m.msgid,
+             'target', m.target,
+             'sender_prefix', m.sender_prefix,
+             'sender_account', m.sender_account,
+             'kind', m.kind,
+             'body', m.body,
+             'timestamp', to_char(m.ts AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+             'direct_message_peers', m.dm_peers,
+             'sender_is_bot', m.sender_is_bot,
+             'multiline', m.multiline
+         )::text
+         FROM messages m WHERE {predicate} ORDER BY m.id"
+    )))
+    .bind(&folded)
+    .bind(&name)
+    .execute(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    sqlx::query(
+        "DECLARE export_backlog NO SCROLL CURSOR FOR
+         SELECT jsonb_build_object(
+             'network', b.network,
+             'line', b.line,
+             'created_at', to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+         )::text
+         FROM bnc_buffer b WHERE b.owner = $1 ORDER BY b.id",
+    )
+    .bind(&folded)
+    .execute(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    Ok(Some(AccountExport {
+        transaction,
+        stage: AccountExportStage::Head(head),
+    }))
+}
+
+impl AccountExport {
+    /// The next piece of the document, or `None` once it is complete. Pieces
+    /// concatenate into one JSON object: the bounded sections, then
+    /// `"messages"` and `"bouncer_buffer"` arrays filled page by page.
+    pub async fn next_chunk(&mut self) -> Result<Option<String>, DbError> {
+        let (chunk, next) = match std::mem::replace(&mut self.stage, AccountExportStage::Done) {
+            AccountExportStage::Head(head) => {
+                let Some(open) = head.strip_suffix('}') else {
+                    return Err(DbError::Query(sqlx::Error::Protocol(
+                        "account export head is not a JSON object".into(),
+                    )));
+                };
+                (
+                    format!("{open}, \"messages\": ["),
+                    AccountExportStage::Messages { first: true },
+                )
+            }
+            AccountExportStage::Messages { first } => {
+                let page = self
+                    .fetch(concat!("FETCH ", export_page!(), " FROM export_messages"))
+                    .await?;
+                if page.is_empty() {
+                    (
+                        "], \"bouncer_buffer\": [".to_string(),
+                        AccountExportStage::Backlog { first: true },
+                    )
+                } else {
+                    (
+                        join_page(first, &page),
+                        AccountExportStage::Messages { first: false },
+                    )
+                }
+            }
+            AccountExportStage::Backlog { first } => {
+                let page = self
+                    .fetch(concat!("FETCH ", export_page!(), " FROM export_backlog"))
+                    .await?;
+                if page.is_empty() {
+                    ("]}".to_string(), AccountExportStage::Done)
+                } else {
+                    (
+                        join_page(first, &page),
+                        AccountExportStage::Backlog { first: false },
+                    )
+                }
+            }
+            AccountExportStage::Done => return Ok(None),
+        };
+        self.stage = next;
+        Ok(Some(chunk))
+    }
+
+    async fn fetch(&mut self, statement: &'static str) -> Result<Vec<String>, DbError> {
+        sqlx::query_scalar(statement)
+            .fetch_all(&mut *self.transaction)
+            .await
+            .map_err(query_error)
+    }
+}
+
+/// One page of JSON array elements, comma-separated from the page before.
+fn join_page(first: bool, page: &[String]) -> String {
+    let body = page.join(", ");
+    if first { body } else { format!(", {body}") }
 }
 
 /// Every server ban as `(mask_display, reason, set_by, kind)` — boot-loaded
@@ -4494,37 +5103,44 @@ pub async fn list_server_bans(
     )
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
-/// Unregister a channel by its casefolded name (ChanServ DROP).
-pub async fn drop_channel(pool: &PgPool, channel_folded: &str) -> Result<bool, DbError> {
-    sqlx::query("DELETE FROM channels WHERE name_folded = $1")
-        .bind(channel_folded)
-        .execute(pool)
-        .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(DbError::Query)
+/// Who unregisters a channel, which names the audit row's vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelDropper<'a> {
+    /// The founder, through ChanServ DROP: `CHANNEL_DROP`, as the owner
+    /// console records the same change.
+    Founder(&'a str),
+    /// An administrator, through the console: `DROPCHAN`.
+    Administrator(&'a str),
 }
 
-async fn drop_channel_audited(
+/// Unregister a channel by its casefolded name, audited in the same
+/// transaction with the dropping account as the actor. Returns whether a row
+/// was removed (nothing is recorded when none was).
+pub async fn drop_channel(
     pool: &PgPool,
     channel_folded: &str,
-    actor: &str,
+    dropper: ChannelDropper<'_>,
 ) -> Result<bool, DbError> {
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
-    let deleted = sqlx::query("DELETE FROM channels WHERE name_folded = $1")
+    let (actor, action) = match dropper {
+        ChannelDropper::Founder(actor) => (actor, "CHANNEL_DROP"),
+        ChannelDropper::Administrator(actor) => (actor, "DROPCHAN"),
+    };
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    let dropped = sqlx::query("DELETE FROM channels WHERE name_folded = $1")
         .bind(channel_folded)
         .execute(&mut *transaction)
         .await
-        .map_err(DbError::Query)?
+        .map_err(query_error)?
         .rows_affected()
         == 1;
-    if deleted {
-        insert_audit_log_with(&mut *transaction, actor, "DROPCHAN", channel_folded, "").await?;
+    if dropped {
+        audit_channel_service(&mut transaction, actor, action, channel_folded, "").await?;
     }
-    transaction.commit().await.map_err(DbError::Query)?;
-    Ok(deleted)
+    transaction.commit().await.map_err(query_error)?;
+    Ok(dropped)
 }
 
 /// Insert one registered channel with its initial retained topic and audit
@@ -4548,7 +5164,7 @@ pub async fn persist_channel_registration(
         ),
         None => (None, None, None),
     };
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     let inserted: Option<i64> = sqlx::query_scalar(
         "INSERT INTO channels (
              name, name_folded, founder_account_id,
@@ -4570,7 +5186,7 @@ pub async fn persist_channel_registration(
     .bind(topic_set_at)
     .fetch_optional(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     let result = if inserted.is_some() {
         insert_audit_log_with(
             &mut *transaction,
@@ -4587,14 +5203,14 @@ pub async fn persist_channel_registration(
                 .bind(&chan_folded)
                 .fetch_one(&mut *transaction)
                 .await
-                .map_err(DbError::Query)?;
+                .map_err(query_error)?;
         if exists {
             ChannelRegistrationResult::Exists
         } else {
             ChannelRegistrationResult::AccountMissing
         }
     };
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(result)
 }
 
@@ -4686,9 +5302,9 @@ pub enum DeviceStatus {
 /// a short `user_code` the user enters to approve. Valid for 10 minutes.
 pub async fn create_device_grant(pool: &PgPool) -> Result<(String, String), DbError> {
     use argon2::password_hash::rand_core::RngCore;
-    let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
-    let device_code = e6irc_proto::base64::encode(&bytes);
+    // URL-safe: a device code in a form body spelled with `+` would arrive as
+    // a space from any client that does not percent-encode it.
+    let device_code = crate::secret::random_url_safe_token();
     // 8 chars from an unambiguous alphabet (no 0/O/1/I/L). The length (31) does
     // not divide 256, so a plain `byte % len` would make the first `256 % 31`
     // characters more likely — a small but real bias in a human-entered
@@ -4711,7 +5327,7 @@ pub async fn create_device_grant(pool: &PgPool) -> Result<(String, String), DbEr
     sqlx::query("DELETE FROM device_grants WHERE expires_at <= now()")
         .execute(pool)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
     sqlx::query(
         "INSERT INTO device_grants (device_code, user_code, expires_at)
          VALUES ($1, $2, now() + interval '10 minutes')",
@@ -4720,7 +5336,7 @@ pub async fn create_device_grant(pool: &PgPool) -> Result<(String, String), DbEr
     .bind(&user_code)
     .execute(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     Ok((device_code, user_code))
 }
 
@@ -4747,21 +5363,21 @@ pub async fn approve_device_grant(
     account: &str,
 ) -> Result<DeviceApproval, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let mut tx = pool.begin().await.map_err(query_error)?;
     let account_id = lock_active_account_id(&mut tx, &folded).await?;
     if api_token_count(&mut tx, account_id).await? >= MAX_API_TOKENS_PER_ACCOUNT {
         return Ok(DeviceApproval::TokenLimitReached);
     }
     let res = sqlx::query(
-        "UPDATE device_grants SET account = $2
-         WHERE user_code = $1 AND account IS NULL AND expires_at > now()",
+        "UPDATE device_grants SET account_id = $2
+         WHERE user_code = $1 AND account_id IS NULL AND expires_at > now()",
     )
     .bind(user_code)
-    .bind(account)
+    .bind(account_id)
     .execute(&mut *tx)
     .await
-    .map_err(DbError::Query)?;
-    tx.commit().await.map_err(DbError::Query)?;
+    .map_err(query_error)?;
+    tx.commit().await.map_err(query_error)?;
     Ok(if res.rows_affected() > 0 {
         DeviceApproval::Approved
     } else {
@@ -4787,16 +5403,16 @@ pub async fn poll_device_grant(
     device_code: &str,
     token_label: &str,
 ) -> Result<DeviceStatus, DbError> {
-    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let mut tx = pool.begin().await.map_err(query_error)?;
     let approved: Option<String> = sqlx::query_scalar(
-        "DELETE FROM device_grants
-         WHERE device_code = $1 AND account IS NOT NULL AND expires_at > now()
-         RETURNING account",
+        "DELETE FROM device_grants g USING accounts a
+         WHERE g.device_code = $1 AND g.account_id = a.id AND g.expires_at > now()
+         RETURNING a.name",
     )
     .bind(device_code)
     .fetch_optional(&mut *tx)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     if let Some(account) = approved {
         let folded = CaseMapping::Rfc1459.casefold(&account);
         // Mint in the same transaction: on a transient error `tx` drops without
@@ -4825,7 +5441,7 @@ pub async fn poll_device_grant(
                     },
                 )
                 .await?;
-                tx.commit().await.map_err(DbError::Query)?;
+                tx.commit().await.map_err(query_error)?;
                 return Ok(DeviceStatus::Denied);
             }
             Err(error) => return Err(error),
@@ -4838,7 +5454,7 @@ pub async fn poll_device_grant(
             "personal access token created from an approved device grant",
         )
         .await?;
-        tx.commit().await.map_err(DbError::Query)?;
+        tx.commit().await.map_err(query_error)?;
         return Ok(DeviceStatus::Approved(token));
     }
     let row: Option<(bool,)> =
@@ -4846,8 +5462,8 @@ pub async fn poll_device_grant(
             .bind(device_code)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(DbError::Query)?;
-    tx.commit().await.map_err(DbError::Query)?;
+            .map_err(query_error)?;
+    tx.commit().await.map_err(query_error)?;
     Ok(match row {
         Some((true,)) => DeviceStatus::Pending,
         Some((false,)) => DeviceStatus::Expired,
@@ -4865,7 +5481,7 @@ pub async fn server_stats(pool: &PgPool) -> Result<(i64, i64, i64), DbError> {
     )
     .fetch_one(pool)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -5078,7 +5694,7 @@ pub async fn server_ban_directory_entry(
     .bind(id)
     .fetch_optional(pool)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 bounded_page_size!(
@@ -5162,7 +5778,7 @@ pub async fn verify_credentials(
             .bind(ACCOUNT_FLAG_SUSPENDED)
             .fetch_optional(pool)
             .await
-            .map_err(DbError::Query)?;
+            .map_err(query_error)?;
     let stored: Vec<StoredCredential> = sqlx::query_as(
         "SELECT c.id AS credential_id, c.argon2_hash,
                 c.secret_lookup AS app_password_lookup
@@ -5175,7 +5791,7 @@ pub async fn verify_credentials(
     .bind(ACCOUNT_FLAG_SUSPENDED)
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     let plan = plan_credential_verification(stored, password);
     let matched_id =
         matching_credential_id(plan.candidates, plan.dummies, password.to_string()).await?;
@@ -5213,7 +5829,7 @@ pub async fn verify_local_password(
     .bind(ACCOUNT_FLAG_SUSPENDED)
     .fetch_optional(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     let Some(CredentialVerificationRow {
         display_name,
         argon2_hash,
@@ -5237,7 +5853,7 @@ pub async fn verify_local_password(
             .bind(credential_id)
             .execute(pool)
             .await
-            .map_err(DbError::Query)?;
+            .map_err(query_error)?;
         Ok(Some(display_name))
     } else {
         Ok(None)
@@ -5248,11 +5864,11 @@ async fn lock_account_id(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     folded_account: &str,
 ) -> Result<Option<i64>, DbError> {
-    sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR UPDATE")
+    sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR NO KEY UPDATE")
         .bind(folded_account)
         .fetch_optional(&mut **transaction)
         .await
-        .map_err(DbError::Query)
+        .map_err(query_error)
 }
 
 struct PasswordMutation<'a> {
@@ -5270,7 +5886,7 @@ async fn begin_password_mutation<'a>(
 ) -> Result<PasswordMutation<'a>, DbError> {
     let new_hash = hash_password(new_password.to_string()).await?;
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let mut tx = pool.begin().await.map_err(query_error)?;
     let account_id = lock_account_id(&mut tx, &folded).await?;
     Ok(PasswordMutation {
         transaction: tx,
@@ -5287,8 +5903,17 @@ struct LocalCredentialRow {
 }
 
 /// Replace an account's primary password after verifying the current primary
-/// credential. The credential row is locked across verify-and-update so two
-/// concurrent rotations cannot both authorize against the same old password.
+/// credential.
+///
+/// Both Argon2 computations — verifying the current password, hashing the new
+/// one — run before any transaction begins: each may wait for one of the few
+/// process-wide Argon2 permits, and a row lock held across that wait blocked
+/// every foreign-key insert that referenced the account (a read marker, a
+/// session) for as long as the queue took. The commit is instead a
+/// compare-and-swap on the hash that was verified: a concurrent rotation that
+/// committed first leaves no row matching it, and this one fails as
+/// [`DbError::BadCredentials`] rather than overwriting a password it never
+/// authorized against.
 ///
 /// Every browser session other than `current_session` — the one that made the
 /// change — ends in the same transaction: a password is changed because the old
@@ -5302,25 +5927,16 @@ pub async fn change_local_password(
     new_password: &str,
     current_session: &str,
 ) -> Result<(), DbError> {
-    let PasswordMutation {
-        mut transaction,
-        folded,
-        new_hash,
-        account_id,
-    } = begin_password_mutation(pool, account, new_password).await?;
-    let Some(account_id) = account_id else {
-        spend_dummy_verification(current_password.to_string()).await;
-        return Err(DbError::BadCredentials);
-    };
+    let folded = CaseMapping::Rfc1459.casefold(account);
     let row: Option<LocalCredentialRow> = sqlx::query_as(
-        "SELECT c.id AS credential_id, c.argon2_hash FROM account_credentials c
-         WHERE c.account_id = $1 AND c.kind = 'local_password'
-         FOR UPDATE OF c",
+        "SELECT c.id AS credential_id, c.argon2_hash
+         FROM account_credentials c JOIN accounts a ON a.id = c.account_id
+         WHERE a.name_folded = $1 AND c.kind = 'local_password'",
     )
-    .bind(account_id)
-    .fetch_optional(&mut *transaction)
+    .bind(&folded)
+    .fetch_optional(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     let Some(LocalCredentialRow {
         credential_id,
         argon2_hash,
@@ -5332,7 +5948,7 @@ pub async fn change_local_password(
     if matching_credential_id(
         vec![CredentialHash {
             credential_id,
-            argon2_hash,
+            argon2_hash: argon2_hash.clone(),
         }],
         0,
         current_password.to_string(),
@@ -5342,16 +5958,22 @@ pub async fn change_local_password(
     {
         return Err(DbError::BadCredentials);
     }
-    sqlx::query(
+    let new_hash = hash_password(new_password.to_string()).await?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    let swapped = sqlx::query(
         "UPDATE account_credentials
          SET argon2_hash = $1, last_used_at = now()
-         WHERE id = $2",
+         WHERE id = $2 AND argon2_hash = $3",
     )
     .bind(new_hash)
     .bind(credential_id)
+    .bind(&argon2_hash)
     .execute(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
+    if swapped.rows_affected() == 0 {
+        return Err(DbError::BadCredentials);
+    }
     delete_other_web_sessions_in(&mut transaction, &folded, current_session).await?;
     insert_audit_log_with(
         &mut *transaction,
@@ -5361,7 +5983,7 @@ pub async fn change_local_password(
         "primary password changed; other browser sessions ended",
     )
     .await?;
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(())
 }
 
@@ -5395,7 +6017,7 @@ pub async fn set_local_password(
     .bind(account_id)
     .fetch_one(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     if exists {
         return Err(DbError::LocalPasswordExists);
     }
@@ -5409,15 +6031,15 @@ pub async fn set_local_password(
         "primary password added; other browser sessions ended",
     )
     .await?;
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(())
 }
 
 // ---- per-account BNC networks (DESIGN §10.3) ----------------------------
 
-/// A stored per-account BNC network. `sasl_password_sealed` is an
-/// `enc:v1:` blob (or `None`); the caller decrypts it with the master
-/// key before starting the driver.
+/// A stored per-account BNC network. `sasl_password_sealed` and
+/// `server_password_sealed` are sealed blobs (or `None`); the caller opens
+/// them with the master key before starting the driver.
 #[derive(Debug, Clone)]
 pub struct BncNetworkRow {
     /// Which driver backs this network (`irc` for a plain upstream, or a
@@ -5433,6 +6055,9 @@ pub struct BncNetworkRow {
     pub autojoin: Vec<String>,
     pub sasl_account: Option<String>,
     pub sasl_password_sealed: Option<String>,
+    /// The sealed IRC server password (`PASS`). Only `kind = irc` carries one
+    /// (a table CHECK).
+    pub server_password_sealed: Option<String>,
     /// Whether an always-on driver runs for this network. A disabled
     /// network keeps its config/buffers but is skipped at boot.
     pub enabled: bool,
@@ -5460,7 +6085,48 @@ fn bnc_row(row: &sqlx::postgres::PgRow) -> Result<BncNetworkRow, DbError> {
         autojoin: row.get("autojoin"),
         sasl_account: row.get("sasl_account"),
         sasl_password_sealed: row.get("sasl_password_sealed"),
+        server_password_sealed: row.get("server_password_sealed"),
     })
+}
+
+/// The columns [`bnc_row`] decodes, qualified by the `n` alias every network
+/// query gives `bnc_networks`. One list, so a column added to the row cannot
+/// be read by one query and missed by another.
+macro_rules! bnc_network_columns {
+    () => {
+        "n.name, n.addr, n.tls, n.nick, n.username, n.realname, n.autojoin, \
+         n.sasl_account, n.sasl_password_sealed, n.server_password_sealed, n.enabled, n.kind"
+    };
+}
+
+/// Who changed a network, and what the audit row says about it. The audit row
+/// is written inside the mutation's own transaction: a network change nobody
+/// is on record for cannot commit, and a recorded change always happened.
+#[derive(Debug, Clone, Copy)]
+pub struct NetworkAudit<'a> {
+    /// The account that acted (folded before it is recorded) — the owner, or
+    /// an administrator acting on the owner's network.
+    pub actor: &'a str,
+    pub detail: &'a str,
+}
+
+/// Record one network mutation inside its transaction, targeting
+/// `owner/network` by the owner's folded name and the stored network name.
+async fn audit_network_mutation(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    audit: NetworkAudit<'_>,
+    action: &str,
+    owner_folded: &str,
+    network: &str,
+) -> Result<(), DbError> {
+    insert_audit_log_with(
+        &mut **transaction,
+        &CaseMapping::Rfc1459.casefold(audit.actor),
+        action,
+        &format!("{owner_folded}/{network}"),
+        audit.detail,
+    )
+    .await
 }
 
 /// Create a network owned by `account`. Errors with `DuplicateNetwork`
@@ -5470,34 +6136,36 @@ pub async fn create_bnc_network(
     pool: &PgPool,
     account: &str,
     net: &BncNetworkRow,
+    audit: NetworkAudit<'_>,
 ) -> Result<i64, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     // Cap the count and insert in one transaction with the account row locked
-    // FOR UPDATE. A count-then-insert across two pool statements (which is what
+    // FOR NO KEY UPDATE. A count-then-insert across two pool statements (which is what
     // the REST handler used to do) lets two concurrent creates each read cap-1
     // and both insert, overshooting the cap — and each network spawns an
     // always-on outbound driver, the very amplifier this cap exists to bound.
-    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let mut tx = pool.begin().await.map_err(query_error)?;
     let account_id: i64 =
-        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR UPDATE")
+        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR NO KEY UPDATE")
             .bind(&folded)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(DbError::Query)?
+            .map_err(query_error)?
             .ok_or(DbError::BadCredentials)?;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bnc_networks WHERE account_id = $1")
         .bind(account_id)
         .fetch_one(&mut *tx)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
     if count >= MAX_BNC_NETWORKS_PER_ACCOUNT {
         return Err(DbError::TooManyNetworks);
     }
     let id = sqlx::query_scalar(
         "INSERT INTO bnc_networks
            (account_id, name, addr, tls, nick, realname, autojoin,
-            sasl_account, sasl_password_sealed, kind, enabled, username)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            sasl_account, sasl_password_sealed, kind, enabled, username,
+            server_password_sealed)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          ON CONFLICT (account_id, lower(name)) DO NOTHING
          RETURNING id",
     )
@@ -5513,11 +6181,13 @@ pub async fn create_bnc_network(
     .bind(net.kind.as_db_str())
     .bind(net.enabled)
     .bind(&net.username)
+    .bind(&net.server_password_sealed)
     .fetch_optional(&mut *tx)
     .await
-    .map_err(DbError::Query)?
+    .map_err(query_error)?
     .ok_or_else(|| DbError::DuplicateNetwork(net.name.clone()))?;
-    tx.commit().await.map_err(DbError::Query)?;
+    audit_network_mutation(&mut tx, audit, "NETWORK_CREATE", &folded, &net.name).await?;
+    tx.commit().await.map_err(query_error)?;
     Ok(id)
 }
 
@@ -5532,16 +6202,16 @@ pub async fn list_bnc_networks(
     account: &str,
 ) -> Result<Vec<BncNetworkRow>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let rows = sqlx::query(
-        "SELECT n.name, n.addr, n.tls, n.nick, n.username, n.realname, n.autojoin,
-                n.sasl_account, n.sasl_password_sealed, n.enabled, n.kind
-         FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
-         WHERE a.name_folded = $1 ORDER BY n.name",
-    )
+    let rows = sqlx::query(concat!(
+        "SELECT ",
+        bnc_network_columns!(),
+        " FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
+         WHERE a.name_folded = $1 ORDER BY n.name"
+    ))
     .bind(&folded)
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     rows.iter().map(bnc_row).collect()
 }
 
@@ -5555,15 +6225,15 @@ pub struct OwnedBncNetworkRow {
 /// only behind the HTTP administrator gate.
 pub async fn list_bnc_network_inventory(pool: &PgPool) -> Result<Vec<OwnedBncNetworkRow>, DbError> {
     use sqlx::Row;
-    let rows = sqlx::query(
-        "SELECT a.name AS owner, n.name, n.addr, n.tls, n.nick, n.username, n.realname, n.autojoin,
-                n.sasl_account, n.sasl_password_sealed, n.enabled, n.kind
-         FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
-         ORDER BY a.name_folded, lower(n.name)",
-    )
+    let rows = sqlx::query(concat!(
+        "SELECT a.name AS owner, ",
+        bnc_network_columns!(),
+        " FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
+         ORDER BY a.name_folded, lower(n.name)"
+    ))
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     rows.iter()
         .map(|row| {
             Ok(OwnedBncNetworkRow {
@@ -5583,60 +6253,74 @@ pub async fn get_bnc_network(
     name: &str,
 ) -> Result<Option<BncNetworkRow>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let row = sqlx::query(
-        "SELECT n.name, n.addr, n.tls, n.nick, n.username, n.realname, n.autojoin,
-                n.sasl_account, n.sasl_password_sealed, n.enabled, n.kind
-         FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
-         WHERE a.name_folded = $1 AND lower(n.name) = lower($2)",
-    )
+    let row = sqlx::query(concat!(
+        "SELECT ",
+        bnc_network_columns!(),
+        " FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
+         WHERE a.name_folded = $1 AND lower(n.name) = lower($2)"
+    ))
     .bind(&folded)
     .bind(name)
     .fetch_optional(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     row.as_ref().map(bnc_row).transpose()
 }
 
-/// Enable or disable `account`'s network `name`. Returns whether a row
-/// matched (false ⇒ no such network for that owner).
+/// Enable or disable `account`'s network `name`, audited in the same
+/// transaction. Returns whether a row matched (false ⇒ no such network for
+/// that owner, and nothing is recorded).
 pub async fn set_bnc_network_enabled(
     pool: &PgPool,
     account: &str,
     name: &str,
     enabled: bool,
+    audit: NetworkAudit<'_>,
 ) -> Result<bool, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let done = sqlx::query(
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    let stored: Option<String> = sqlx::query_scalar(
         "UPDATE bnc_networks n SET enabled = $3
          FROM accounts a
-         WHERE n.account_id = a.id AND a.name_folded = $1 AND lower(n.name) = lower($2)",
+         WHERE n.account_id = a.id AND a.name_folded = $1 AND lower(n.name) = lower($2)
+         RETURNING n.name",
     )
     .bind(&folded)
     .bind(name)
     .bind(enabled)
-    .execute(pool)
+    .fetch_optional(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
-    Ok(done.rows_affected() > 0)
+    .map_err(query_error)?;
+    let Some(stored) = stored else {
+        return Ok(false);
+    };
+    audit_network_mutation(&mut transaction, audit, "NETWORK_TOGGLE", &folded, &stored).await?;
+    transaction.commit().await.map_err(query_error)?;
+    Ok(true)
 }
 
 /// Update all mutable fields of `account`'s network `name`. Secret values in
 /// `network` are already sealed; this storage edge never receives plaintext.
 /// The kind, stable name, and enabled state are deliberately immutable here.
-/// Returns whether a row matched (false ⇒ no such network for that owner).
+/// Returns whether a row matched (false ⇒ no such network for that owner, and
+/// nothing is recorded); the audit row commits with the change.
 pub async fn update_bnc_network(
     pool: &PgPool,
     account: &str,
     name: &str,
     network: &BncNetworkRow,
+    audit: NetworkAudit<'_>,
 ) -> Result<bool, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let done = sqlx::query(
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    let stored: Option<String> = sqlx::query_scalar(
         "UPDATE bnc_networks n
          SET addr = $3, tls = $4, nick = $5, realname = $6, autojoin = $7,
-             sasl_account = $8, sasl_password_sealed = $9, username = $10
+             sasl_account = $8, sasl_password_sealed = $9, username = $10,
+             server_password_sealed = $11
          FROM accounts a
-         WHERE n.account_id = a.id AND a.name_folded = $1 AND lower(n.name) = lower($2)",
+         WHERE n.account_id = a.id AND a.name_folded = $1 AND lower(n.name) = lower($2)
+         RETURNING n.name",
     )
     .bind(&folded)
     .bind(name)
@@ -5648,10 +6332,16 @@ pub async fn update_bnc_network(
     .bind(&network.sasl_account)
     .bind(&network.sasl_password_sealed)
     .bind(&network.username)
-    .execute(pool)
+    .bind(&network.server_password_sealed)
+    .fetch_optional(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
-    Ok(done.rows_affected() > 0)
+    .map_err(query_error)?;
+    let Some(stored) = stored else {
+        return Ok(false);
+    };
+    audit_network_mutation(&mut transaction, audit, "NETWORK_UPDATE", &folded, &stored).await?;
+    transaction.commit().await.map_err(query_error)?;
+    Ok(true)
 }
 
 /// Every network whose driver runs at boot, paired with its owner's display
@@ -5663,16 +6353,16 @@ pub async fn list_startable_bnc_networks(
     pool: &PgPool,
 ) -> Result<Vec<(String, BncNetworkRow)>, DbError> {
     use sqlx::Row;
-    let rows = sqlx::query(
-        "SELECT a.name AS owner, n.name, n.addr, n.tls, n.nick, n.username, n.realname,
-                n.autojoin, n.sasl_account, n.sasl_password_sealed, n.enabled, n.kind
-         FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
-         WHERE n.enabled AND (a.flags & $1) = 0",
-    )
+    let rows = sqlx::query(concat!(
+        "SELECT a.name AS owner, ",
+        bnc_network_columns!(),
+        " FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
+         WHERE n.enabled AND (a.flags & $1) = 0"
+    ))
     .bind(ACCOUNT_FLAG_SUSPENDED)
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     rows.iter()
         .map(|r| Ok((r.get::<String, _>("owner"), bnc_row(r)?)))
         .collect()
@@ -5687,7 +6377,7 @@ pub async fn list_registered_channels(pool: &PgPool) -> Result<Vec<(String, Stri
     )
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     Ok(rows)
 }
 
@@ -5752,7 +6442,7 @@ pub async fn list_owned_channels(
     .bind(account_folded)
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
 
     let mut channels: Vec<OwnedChannel> = Vec::new();
     for row in rows {
@@ -5801,7 +6491,7 @@ pub async fn list_channel_topics(
     )
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     rows.into_iter()
         .map(|(name, topic, setter, seconds)| {
             let millis = seconds.checked_mul(1000).ok_or_else(|| {
@@ -5820,11 +6510,15 @@ pub async fn list_channel_topics(
 }
 
 /// Persist a registered channel's KEEPTOPIC option on its `channels` row.
+///
+/// An applied change is audited (`CHANNEL_KEEPTOPIC`) in the same transaction
+/// with the founder `actor`.
 pub async fn set_channel_keeptopic(
     pool: &PgPool,
     channel_folded: &str,
     keeptopic: bool,
     topic: Option<(String, String, u64)>,
+    actor: &str,
 ) -> Result<bool, DbError> {
     let (text, setter, set_at) = match topic {
         Some((text, setter, set_at)) if keeptopic => (
@@ -5834,7 +6528,8 @@ pub async fn set_channel_keeptopic(
         ),
         _ => (None, None, None),
     };
-    sqlx::query(
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    let applied = sqlx::query(
         "UPDATE channels
          SET keeptopic = $2,
              topic = $3,
@@ -5851,10 +6546,23 @@ pub async fn set_channel_keeptopic(
     .bind(text)
     .bind(setter)
     .bind(set_at)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
-    .map(|result| result.rows_affected() == 1)
-    .map_err(DbError::Query)
+    .map_err(query_error)?
+    .rows_affected()
+        == 1;
+    if applied {
+        audit_channel_service(
+            &mut transaction,
+            actor,
+            "CHANNEL_KEEPTOPIC",
+            channel_folded,
+            if keeptopic { "on" } else { "off" },
+        )
+        .await?;
+    }
+    transaction.commit().await.map_err(query_error)?;
+    Ok(applied)
 }
 
 /// The folded names of registered channels whose KEEPTOPIC is OFF — the
@@ -5863,23 +6571,39 @@ pub async fn list_keeptopic_off(pool: &PgPool) -> Result<Vec<String>, DbError> {
     sqlx::query_scalar("SELECT name_folded FROM channels WHERE NOT keeptopic")
         .fetch_all(pool)
         .await
-        .map_err(DbError::Query)
+        .map_err(query_error)
 }
 
 /// Persist a registered channel's mode lock on its `channels` row (`None`
-/// clears it).
+/// clears it), audited (`CHANNEL_MLOCK`) in the same transaction with the
+/// founder `actor`.
 pub async fn set_channel_mlock(
     pool: &PgPool,
     channel_folded: &str,
     mlock: Option<String>,
+    actor: &str,
 ) -> Result<bool, DbError> {
-    sqlx::query("UPDATE channels SET mlock = $2 WHERE name_folded = $1")
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    let applied = sqlx::query("UPDATE channels SET mlock = $2 WHERE name_folded = $1")
         .bind(channel_folded)
-        .bind(mlock)
-        .execute(pool)
+        .bind(&mlock)
+        .execute(&mut *transaction)
         .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(DbError::Query)
+        .map_err(query_error)?
+        .rows_affected()
+        == 1;
+    if applied {
+        audit_channel_service(
+            &mut transaction,
+            actor,
+            "CHANNEL_MLOCK",
+            channel_folded,
+            mlock.as_deref().unwrap_or("cleared"),
+        )
+        .await?;
+    }
+    transaction.commit().await.map_err(query_error)?;
+    Ok(applied)
 }
 
 /// Registered channels with a mode lock, as `(name_folded, spec)` —
@@ -5888,40 +6612,46 @@ pub async fn list_channel_mlock(pool: &PgPool) -> Result<Vec<(String, String)>, 
     sqlx::query_as("SELECT name_folded, mlock FROM channels WHERE mlock IS NOT NULL")
         .fetch_all(pool)
         .await
-        .map_err(DbError::Query)
+        .map_err(query_error)
 }
 
-/// Delete `account`'s network `name`. Returns whether a row was removed.
+/// Delete `account`'s network `name`, audited in the same transaction.
+/// Returns whether a row was removed.
 ///
-/// The network row, buffer rows, and read markers are removed in one transaction: they
-/// commit or roll back together. Done as two standalone statements, a failure
-/// (or a crash) after the network delete committed would orphan the buffer
-/// rows — and because a later same-named network for the same owner replays
-/// `recent_bnc_lines`, that stale backlog would surface in the new network. The
-/// caller would also have seen the network vanish yet gotten an `Err`, so a
-/// retry returns `Ok(false)` ("no such network") while the cleanup limped along
-/// as a side effect. One transaction removes both hazards.
-pub async fn delete_bnc_network(pool: &PgPool, account: &str, name: &str) -> Result<bool, DbError> {
+/// The caller stops the network's driver — and with it the persistence task —
+/// first. The backlog goes with the row by the `bnc_buffer.network_id`
+/// cascade (migration 0062), so a late line cannot outlive it: an insert that
+/// still names the deleted row fails its foreign key. Rows stored under the
+/// same (owner, network) key without an id — a configuration network of that
+/// name — are removed too, so a later network of the same name never replays
+/// them. Read markers go in the same transaction.
+pub async fn delete_bnc_network(
+    pool: &PgPool,
+    account: &str,
+    name: &str,
+    audit: NetworkAudit<'_>,
+) -> Result<bool, DbError> {
     let key = BncBufferKey::new(account, name);
-    let mut tx = pool.begin().await.map_err(DbError::Query)?;
-    let res = sqlx::query(
+    let mut tx = pool.begin().await.map_err(query_error)?;
+    let stored: Option<String> = sqlx::query_scalar(
         "DELETE FROM bnc_networks n USING accounts a
-         WHERE n.account_id = a.id AND a.name_folded = $1 AND lower(n.name) = lower($2)",
+         WHERE n.account_id = a.id AND a.name_folded = $1 AND lower(n.name) = lower($2)
+         RETURNING n.name",
     )
     .bind(&key.owner)
     .bind(name)
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await
-    .map_err(DbError::Query)?;
-    // `bnc_buffer` has no FK to `bnc_networks`; use the same canonical composite
-    // key as every buffer read/write so a case-variant delete cannot orphan rows
-    // that a later same-named network would replay.
+    .map_err(query_error)?;
+    let Some(stored) = stored else {
+        return Ok(false);
+    };
     sqlx::query("DELETE FROM bnc_buffer WHERE owner = $1 AND network = $2")
         .bind(&key.owner)
         .bind(&key.network)
         .execute(&mut *tx)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
     sqlx::query(
         "DELETE FROM bnc_read_markers
          WHERE account_id = (SELECT id FROM accounts WHERE name_folded = $1)
@@ -5931,9 +6661,10 @@ pub async fn delete_bnc_network(pool: &PgPool, account: &str, name: &str) -> Res
     .bind(&key.network)
     .execute(&mut *tx)
     .await
-    .map_err(DbError::Query)?;
-    tx.commit().await.map_err(DbError::Query)?;
-    Ok(res.rows_affected() > 0)
+    .map_err(query_error)?;
+    audit_network_mutation(&mut tx, audit, "NETWORK_DELETE", &key.owner, &stored).await?;
+    tx.commit().await.map_err(query_error)?;
+    Ok(true)
 }
 
 /// Rows to retain per (owner, network) in `bnc_buffer`. Only the newest are
@@ -5956,6 +6687,7 @@ pub const BNC_TRIM_INTERVAL: u64 = 1000;
 /// The live registry folds both account and network selectors. Constructing the
 /// database key here as well means no buffer API can accidentally bind a
 /// display/request spelling and miss rows written by the registry.
+#[derive(Debug, Clone)]
 struct BncBufferKey {
     owner: String,
     network: String,
@@ -5971,33 +6703,87 @@ impl BncBufferKey {
     }
 }
 
+/// Where a network's backlog is defined, which decides what its stored lines
+/// may name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BncNetworkDefinition {
+    /// A `[[network]]` in the configuration file: no `bnc_networks` row.
+    Configured,
+    /// A `bnc_networks` row an account created.
+    Stored,
+}
+
+/// The backlog one persistence task writes: its canonical key and, for a
+/// stored network, the row id resolved once when the task started. Every line
+/// the task writes names that id, so a line written after the network was
+/// deleted fails its foreign key instead of outliving it — and cannot slip into
+/// a network re-created under the same name, which has a different id.
+/// Constructed only by [`open_bnc_buffer`].
+#[derive(Debug, Clone)]
+pub struct BncBuffer {
+    key: BncBufferKey,
+    network_id: Option<i64>,
+}
+
+/// Resolve the backlog of `(owner, network)`. A stored network must have its
+/// row — [`DbError::UnknownNetwork`] otherwise, never a line stored without
+/// one — and is always account-owned; a configured one carries no row.
+pub async fn open_bnc_buffer(
+    pool: &PgPool,
+    owner: Option<&str>,
+    network: &str,
+    definition: BncNetworkDefinition,
+) -> Result<BncBuffer, DbError> {
+    let key = BncBufferKey::new(owner.unwrap_or("*"), network);
+    let network_id = match (definition, owner) {
+        (BncNetworkDefinition::Configured, _) => None,
+        (BncNetworkDefinition::Stored, None) => {
+            return Err(DbError::UnknownNetwork(format!(
+                "*/{network}: a stored network always has an owner"
+            )));
+        }
+        (BncNetworkDefinition::Stored, Some(_)) => Some(
+            sqlx::query_scalar(
+                "SELECT n.id FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
+                 WHERE a.name_folded = $1 AND lower(n.name) = $2",
+            )
+            .bind(&key.owner)
+            .bind(&key.network)
+            .fetch_optional(pool)
+            .await
+            .map_err(query_error)?
+            .ok_or_else(|| DbError::UnknownNetwork(format!("{}/{}", key.owner, key.network)))?,
+        ),
+    };
+    Ok(BncBuffer { key, network_id })
+}
+
 /// Append one upstream line to a network's persisted buffer, extracting the
 /// conversation target for CHATHISTORY queries.
 pub async fn persist_bnc_line(
     pool: &PgPool,
-    owner: &str,
-    network: &str,
+    buffer: &BncBuffer,
     own_nick: Option<&str>,
     line: &str,
 ) -> Result<(), DbError> {
-    let key = BncBufferKey::new(owner, network);
     let target =
         bnc_line_target(line, own_nick).map(|target| CaseMapping::Rfc1459.casefold(&target));
     let msgid = bnc_line_msgid(line);
     let sent_at = bnc_line_sent_at(line);
     sqlx::query(
-        "INSERT INTO bnc_buffer (owner, network, line, target, msgid, sent_at)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO bnc_buffer (owner, network, network_id, line, target, msgid, sent_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
-    .bind(&key.owner)
-    .bind(&key.network)
+    .bind(&buffer.key.owner)
+    .bind(&buffer.key.network)
+    .bind(buffer.network_id)
     .bind(line)
     .bind(target)
     .bind(msgid)
     .bind(sent_at)
     .execute(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     Ok(())
 }
 
@@ -6067,26 +6853,47 @@ fn bnc_line_sent_at(line: &str) -> String {
 }
 
 /// Drop all but the newest [`BNC_BUFFER_CAP`] lines of one network's buffer,
-/// so an always-on network cannot grow the table forever.
-pub async fn trim_bnc_buffer(pool: &PgPool, owner: &str, network: &str) -> Result<(), DbError> {
-    let key = BncBufferKey::new(owner, network);
+/// so an always-on network cannot grow the table forever. The persistence task
+/// calls this once when it starts (after restoring the backlog) and every
+/// [`BNC_TRIM_INTERVAL`] lines after; maintenance sweeps whatever that leaves
+/// ([`trim_bnc_buffers_over_cap`]). Deletes in bounded batches until the
+/// buffer is within the cap.
+pub async fn trim_bnc_buffer(pool: &PgPool, buffer: &BncBuffer) -> Result<(), DbError> {
+    let key = &buffer.key;
+    while trim_bnc_buffer_batch(pool, &key.owner, &key.network, STORAGE_MAINTENANCE_BATCH).await?
+        == STORAGE_MAINTENANCE_BATCH
+    {}
+    Ok(())
+}
+
+/// Delete up to `limit` of the oldest lines beyond the cap of one canonical
+/// (owner, network) buffer; returns how many went. The cap boundary is one
+/// index probe (`OFFSET cap` into `bnc_buffer_lookup_idx`, newest first) and
+/// the batch is named by primary key.
+async fn trim_bnc_buffer_batch(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+    limit: u64,
+) -> Result<u64, DbError> {
     sqlx::query(
-        "DELETE FROM bnc_buffer
-         WHERE owner = $1 AND network = $2 AND id < (
-             SELECT min(id) FROM (
+        "DELETE FROM bnc_buffer WHERE id = ANY(ARRAY(
+             SELECT id FROM bnc_buffer
+             WHERE owner = $1 AND network = $2 AND id <= (
                  SELECT id FROM bnc_buffer
                  WHERE owner = $1 AND network = $2
-                 ORDER BY id DESC LIMIT $3
-             ) keep
-         )",
+                 ORDER BY id DESC OFFSET $3 LIMIT 1
+             )
+             ORDER BY id LIMIT $4))",
     )
-    .bind(&key.owner)
-    .bind(&key.network)
+    .bind(owner)
+    .bind(network)
     .bind(BNC_BUFFER_CAP)
+    .bind(limit as i64)
     .execute(pool)
     .await
-    .map_err(DbError::Query)?;
-    Ok(())
+    .map(|result| result.rows_affected())
+    .map_err(query_error)
 }
 
 /// The most recent `limit` persisted lines for `(owner, network)`,
@@ -6098,19 +6905,24 @@ pub async fn recent_bnc_lines(
     limit: i64,
 ) -> Result<Vec<String>, DbError> {
     let key = BncBufferKey::new(owner, network);
-    let mut rows: Vec<String> = sqlx::query_scalar(
+    // The ids come from an index-only probe of `bnc_buffer_lookup_idx`. Written
+    // as one `ORDER BY id DESC LIMIT`, the planner walks the primary key
+    // backward and filters out every other buffer's newer lines, so a quiet
+    // buffer's replay cost grew with everyone else's traffic.
+    sqlx::query_scalar(
         "SELECT line FROM bnc_buffer
-         WHERE owner = $1 AND network = $2
-         ORDER BY id DESC LIMIT $3",
+         WHERE id = ANY(ARRAY(
+             SELECT id FROM bnc_buffer
+             WHERE owner = $1 AND network = $2
+             ORDER BY id DESC LIMIT $3))
+         ORDER BY id",
     )
     .bind(&key.owner)
     .bind(&key.network)
     .bind(limit)
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)?;
-    rows.reverse(); // DESC fetch -> oldest-first for playback
-    Ok(rows)
+    .map_err(query_error)
 }
 
 // ---- BNC CHATHISTORY queries ---------------------------------------------
@@ -6124,30 +6936,218 @@ pub struct BncHistoryLine {
     pub sent_at: String,
 }
 
-/// Every retained line for one target in protocol order. The per-network
-/// buffer is independently capped, so resolving a CHATHISTORY window over this
-/// closed set cannot produce an unbounded database read. Returning the stored
-/// message id and canonical timestamp lets one pure resolver implement every
-/// selector/subcommand without subtly different SQL boundary semantics.
-pub async fn bnc_history_lines(
+/// A CHATHISTORY position on the attach listener: `*`, a message id, or a
+/// canonical timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BncHistorySelector {
+    Star,
+    Msgid(String),
+    Timestamp(String),
+}
+
+/// Which window a CHATHISTORY subcommand asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BncHistoryPaging {
+    Latest,
+    Before,
+    After,
+    Around,
+    Between,
+}
+
+/// A `msgid=` selector that names no message in the buffer being paged.
+#[derive(Debug, PartialEq, Eq)]
+pub struct UnknownBncMsgid;
+
+/// A position in a target's `(sent_at, id)` order.
+type BncPosition = (String, i64);
+
+/// One target's lines in a `(sent_at, id)` range, at most `limit` of them:
+/// the oldest when `newest` is false, the newest otherwise — returned
+/// oldest-first either way. `after` is exclusive unless its flag says
+/// inclusive; `before` is exclusive. Served by `bnc_buffer_sent_at_idx`
+/// `(owner, network, target, sent_at, id)` as an index range scan under the
+/// LIMIT.
+async fn bnc_history_range(
+    pool: &PgPool,
+    key: &BncBufferKey,
+    target: &str,
+    after: Option<(&BncPosition, bool)>,
+    before: Option<&BncPosition>,
+    newest: bool,
+    limit: i64,
+) -> Result<Vec<BncHistoryLine>, DbError> {
+    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "SELECT id, line, msgid, sent_at FROM bnc_buffer WHERE owner = ",
+    );
+    query
+        .push_bind(&key.owner)
+        .push(" AND network = ")
+        .push_bind(&key.network)
+        .push(" AND target = ")
+        .push_bind(target);
+    if let Some(((sent_at, id), inclusive)) = after {
+        query
+            .push(if inclusive {
+                " AND (sent_at, id) >= ("
+            } else {
+                " AND (sent_at, id) > ("
+            })
+            .push_bind(sent_at)
+            .push(", ")
+            .push_bind(*id)
+            .push(")");
+    }
+    if let Some((sent_at, id)) = before {
+        query
+            .push(" AND (sent_at, id) < (")
+            .push_bind(sent_at)
+            .push(", ")
+            .push_bind(*id)
+            .push(")");
+    }
+    query
+        .push(if newest {
+            " ORDER BY sent_at DESC, id DESC LIMIT "
+        } else {
+            " ORDER BY sent_at ASC, id ASC LIMIT "
+        })
+        .push_bind(limit);
+    let mut rows: Vec<BncHistoryLine> = query
+        .build_query_as()
+        .fetch_all(pool)
+        .await
+        .map_err(query_error)?;
+    if newest {
+        rows.reverse();
+    }
+    Ok(rows)
+}
+
+/// One CHATHISTORY window of one target on the attach listener, resolved in
+/// PostgreSQL under a LIMIT — never a load of every retained line for the
+/// target. Boundaries follow the draft/chathistory specification: a msgid
+/// selector names its message (exclusive, except AROUND's pivot); a timestamp
+/// names the gap before the first message at or after it. `*` is valid only for
+/// an unbounded LATEST (the caller refuses it elsewhere). A msgid the target
+/// does not hold is [`UnknownBncMsgid`], not an empty page.
+#[allow(clippy::too_many_arguments)]
+pub async fn bnc_history_window(
     pool: &PgPool,
     owner: &str,
     network: &str,
     target: &str,
-) -> Result<Vec<BncHistoryLine>, DbError> {
+    paging: BncHistoryPaging,
+    first: &BncHistorySelector,
+    second: &BncHistorySelector,
+    limit: i64,
+) -> Result<Result<Vec<BncHistoryLine>, UnknownBncMsgid>, DbError> {
     let key = BncBufferKey::new(owner, network);
-    let folded = CaseMapping::Rfc1459.casefold(target);
-    sqlx::query_as(
-        "SELECT id, line, msgid, sent_at FROM bnc_buffer
-         WHERE owner = $1 AND network = $2 AND target = $3
-         ORDER BY sent_at ASC, id ASC",
-    )
-    .bind(&key.owner)
-    .bind(&key.network)
-    .bind(&folded)
-    .fetch_all(pool)
-    .await
-    .map_err(DbError::Query)
+    let target = CaseMapping::Rfc1459.casefold(target);
+    // Where a selector sits: `after` bounds the lines strictly after it,
+    // `before` the lines strictly before it. A message id names one row; a
+    // timestamp sorts before (`before`) or after (`after`) every row carrying
+    // exactly that timestamp, whatever its id. `*` bounds nothing.
+    struct Bounds {
+        after: Option<BncPosition>,
+        before: Option<BncPosition>,
+    }
+    async fn bounds(
+        pool: &PgPool,
+        key: &BncBufferKey,
+        target: &str,
+        selector: &BncHistorySelector,
+    ) -> Result<Result<Bounds, UnknownBncMsgid>, DbError> {
+        Ok(Ok(match selector {
+            BncHistorySelector::Star => Bounds {
+                after: None,
+                before: None,
+            },
+            BncHistorySelector::Timestamp(timestamp) => Bounds {
+                after: Some((timestamp.clone(), i64::MAX)),
+                before: Some((timestamp.clone(), i64::MIN)),
+            },
+            BncHistorySelector::Msgid(msgid) => {
+                let pivot: Option<BncPosition> = sqlx::query_as(
+                    "SELECT sent_at, id FROM bnc_buffer
+                     WHERE owner = $1 AND network = $2 AND target = $3 AND msgid = $4
+                     ORDER BY sent_at, id LIMIT 1",
+                )
+                .bind(&key.owner)
+                .bind(&key.network)
+                .bind(target)
+                .bind(msgid)
+                .fetch_optional(pool)
+                .await
+                .map_err(query_error)?;
+                let Some(pivot) = pivot else {
+                    return Ok(Err(UnknownBncMsgid));
+                };
+                Bounds {
+                    after: Some(pivot.clone()),
+                    before: Some(pivot),
+                }
+            }
+        }))
+    }
+    let first = match bounds(pool, &key, &target, first).await? {
+        Ok(bounds) => bounds,
+        Err(unknown) => return Ok(Err(unknown)),
+    };
+    let (key, target) = (&key, target.as_str());
+    let rows = match paging {
+        BncHistoryPaging::Latest => {
+            let after = first.after.as_ref().map(|p| (p, false));
+            bnc_history_range(pool, key, target, after, None, true, limit).await?
+        }
+        BncHistoryPaging::Before => {
+            bnc_history_range(pool, key, target, None, first.before.as_ref(), true, limit).await?
+        }
+        BncHistoryPaging::After => {
+            let after = first.after.as_ref().map(|p| (p, false));
+            bnc_history_range(pool, key, target, after, None, false, limit).await?
+        }
+        BncHistoryPaging::Around => {
+            let older = limit / 2;
+            let mut rows = if older > 0 {
+                bnc_history_range(pool, key, target, None, first.before.as_ref(), true, older)
+                    .await?
+            } else {
+                Vec::new()
+            };
+            let from_pivot = first.before.as_ref().map(|p| (p, true));
+            rows.extend(
+                bnc_history_range(pool, key, target, from_pivot, None, false, limit - older)
+                    .await?,
+            );
+            rows
+        }
+        BncHistoryPaging::Between => {
+            let second = match bounds(pool, key, target, second).await? {
+                Ok(bounds) => bounds,
+                Err(unknown) => return Ok(Err(unknown)),
+            };
+            // The older endpoint bounds from below, the newer from above; the
+            // LIMIT cuts from the end the first selector names.
+            let first_is_newer = first.before > second.before;
+            let (older, newer) = if first_is_newer {
+                (&second, &first)
+            } else {
+                (&first, &second)
+            };
+            bnc_history_range(
+                pool,
+                key,
+                target,
+                older.after.as_ref().map(|p| (p, false)),
+                newer.before.as_ref(),
+                first_is_newer,
+                limit,
+            )
+            .await?
+        }
+    };
+    Ok(Ok(rows))
 }
 
 /// The distinct conversation targets that still have backlog for one network,
@@ -6179,7 +7179,7 @@ pub async fn bnc_history_targets(
     .bind(limit)
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 // ---- BNC read markers -----------------------------------------------------
@@ -6204,7 +7204,7 @@ pub async fn get_bnc_read_marker(
     .bind(&target_folded)
     .fetch_optional(pool)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 /// Set (upsert) one per-network, per-target read marker.
@@ -6228,16 +7228,16 @@ pub async fn set_bnc_read_marker(
     let folded = CaseMapping::Rfc1459.casefold(account);
     let net_folded = CaseMapping::Rfc1459.casefold(network);
     let target_folded = CaseMapping::Rfc1459.casefold(target);
-    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let mut tx = pool.begin().await.map_err(query_error)?;
     // Lock the durable account row while checking and consuming marker
     // capacity. This both serializes concurrent writers for the same account
     // and keeps the identifier at its schema-native BIGINT width.
     let account_id: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR UPDATE")
+        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR NO KEY UPDATE")
             .bind(&folded)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(DbError::Query)?;
+            .map_err(query_error)?;
     let Some(account_id) = account_id else {
         return Err(DbError::UnknownAccount(account.to_string()));
     };
@@ -6254,14 +7254,14 @@ pub async fn set_bnc_read_marker(
     .bind(&target_folded)
     .fetch_one(&mut *tx)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     if !exists {
         let count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM bnc_read_markers WHERE account_id = $1")
                 .bind(account_id)
                 .fetch_one(&mut *tx)
                 .await
-                .map_err(DbError::Query)?;
+                .map_err(query_error)?;
         if count >= BNC_READ_MARKER_LIMIT {
             return Ok(BncReadMarkerWrite::LimitReached);
         }
@@ -6279,8 +7279,8 @@ pub async fn set_bnc_read_marker(
     .bind(timestamp)
     .fetch_one(&mut *tx)
     .await
-    .map_err(DbError::Query)?;
-    tx.commit().await.map_err(DbError::Query)?;
+    .map_err(query_error)?;
+    tx.commit().await.map_err(query_error)?;
     Ok(BncReadMarkerWrite::Stored(stored))
 }
 pub struct BncBufferSummary {
@@ -6306,7 +7306,7 @@ pub async fn bnc_buffer_summary(
     .bind(&key.network)
     .fetch_one(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     let timestamp = |value: Option<i64>| {
         value
             .map(|millis| millis_from_database(millis, "bnc_buffer.created_at"))
@@ -6341,13 +7341,13 @@ pub async fn find_or_create_oidc_account(
     .bind(subject)
     .fetch_optional(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     if let Some(name) = existing {
         return Ok(name);
     }
 
     let folded = CaseMapping::Rfc1459.casefold(account_name);
-    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let mut tx = pool.begin().await.map_err(query_error)?;
     lock_account_name(&mut tx, &folded).await?;
     if account_name_is_retired(&mut tx, &folded).await? {
         return Err(DbError::DuplicateAccount(account_name.to_string()));
@@ -6360,7 +7360,7 @@ pub async fn find_or_create_oidc_account(
     .bind(&folded)
     .fetch_optional(&mut *tx)
     .await
-    .map_err(DbError::Query)?
+    .map_err(query_error)?
     .ok_or_else(|| DbError::DuplicateAccount(account_name.to_string()))?;
     let name = account_name.to_string();
     let inserted = sqlx::query(
@@ -6372,7 +7372,7 @@ pub async fn find_or_create_oidc_account(
     .bind(subject)
     .execute(&mut *tx)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     if inserted.rows_affected() == 0 {
         // A concurrent first-login for the same (issuer, subject) committed
         // first. Return the winner's account rather than a spurious 503, and do
@@ -6388,7 +7388,7 @@ pub async fn find_or_create_oidc_account(
         .bind(subject)
         .fetch_one(pool)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
         return Ok(winner);
     }
     insert_audit_log_with(
@@ -6399,7 +7399,7 @@ pub async fn find_or_create_oidc_account(
         "provisioned from OpenID Connect",
     )
     .await?;
-    tx.commit().await.map_err(DbError::Query)?;
+    tx.commit().await.map_err(query_error)?;
     Ok(name)
 }
 
@@ -6506,12 +7506,9 @@ pub async fn create_web_session_with_identity(
         email,
         role,
     } = identity;
-    use argon2::password_hash::rand_core::RngCore;
-    let mut bytes = [0u8; 32];
-    argon2::password_hash::rand_core::OsRng.fill_bytes(&mut bytes);
-    let token = e6irc_proto::base64::encode(&bytes).replace(['+', '/'], "-");
+    let token = crate::secret::random_url_safe_token();
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let mut tx = pool.begin().await.map_err(query_error)?;
     // Serialize issuance per account, then retain only the newest cap-1 active
     // rows before inserting. A count followed by an insert without this lock
     // lets concurrent logins exceed the cap. Rolling out the oldest login keeps
@@ -6522,7 +7519,7 @@ pub async fn create_web_session_with_identity(
         .bind(account_id)
         .execute(&mut *tx)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
     sqlx::query(
         "DELETE FROM web_sessions
          WHERE account_id = $1 AND id IN (
@@ -6536,7 +7533,7 @@ pub async fn create_web_session_with_identity(
     .bind((MAX_BROWSER_SESSIONS_PER_ACCOUNT - 1) as i64)
     .execute(&mut *tx)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     sqlx::query(
         "INSERT INTO web_sessions (token_hash, account_id, expires_at, id_token, oidc_provider,
                                    oidc_issuer, oidc_subject, oidc_sid, oidc_email, oidc_role,
@@ -6555,7 +7552,7 @@ pub async fn create_web_session_with_identity(
     .bind(user_agent.map(SessionUserAgent::as_str))
     .execute(&mut *tx)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     insert_audit_log_with(
         &mut *tx,
         &folded,
@@ -6568,7 +7565,7 @@ pub async fn create_web_session_with_identity(
         },
     )
     .await?;
-    tx.commit().await.map_err(DbError::Query)?;
+    tx.commit().await.map_err(query_error)?;
     Ok(token)
 }
 
@@ -6592,7 +7589,7 @@ pub async fn session_identity(
     .bind(token_hash(token))
     .fetch_optional(pool)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 /// Atomically consumes a signed back-channel logout token and revokes only
@@ -6605,11 +7602,11 @@ pub async fn consume_oidc_backchannel_logout(
     jti: &str,
     expires_at: i64,
 ) -> Result<u64, DbError> {
-    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let mut tx = pool.begin().await.map_err(query_error)?;
     sqlx::query("DELETE FROM oidc_logout_tokens WHERE expires_at <= now()")
         .execute(&mut *tx)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
     let inserted = sqlx::query(
         "INSERT INTO oidc_logout_tokens (issuer, jti, expires_at)
          VALUES ($1, $2, to_timestamp($3)) ON CONFLICT DO NOTHING",
@@ -6619,7 +7616,7 @@ pub async fn consume_oidc_backchannel_logout(
     .bind(expires_at)
     .execute(&mut *tx)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     if inserted.rows_affected() != 1 {
         return Err(DbError::ReplayedLogoutToken);
     }
@@ -6635,7 +7632,7 @@ pub async fn consume_oidc_backchannel_logout(
         .bind(subject)
         .fetch_all(&mut *tx)
         .await
-        .map_err(DbError::Query)?,
+        .map_err(query_error)?,
         None => sqlx::query_scalar(
             "SELECT DISTINCT a.name_folded
              FROM web_sessions s JOIN accounts a ON a.id = s.account_id
@@ -6645,7 +7642,7 @@ pub async fn consume_oidc_backchannel_logout(
         .bind(subject.expect("validated logout token has sid or sub"))
         .fetch_all(&mut *tx)
         .await
-        .map_err(DbError::Query)?,
+        .map_err(query_error)?,
     };
     let deleted = match sid {
         Some(sid) => sqlx::query(
@@ -6658,14 +7655,14 @@ pub async fn consume_oidc_backchannel_logout(
         .bind(subject)
         .execute(&mut *tx)
         .await
-        .map_err(DbError::Query)?,
+        .map_err(query_error)?,
         None => {
             sqlx::query("DELETE FROM web_sessions WHERE oidc_issuer = $1 AND oidc_subject = $2")
                 .bind(issuer)
                 .bind(subject.expect("validated logout token has sid or sub"))
                 .execute(&mut *tx)
                 .await
-                .map_err(DbError::Query)?
+                .map_err(query_error)?
         }
     };
     for account in affected_accounts {
@@ -6678,7 +7675,7 @@ pub async fn consume_oidc_backchannel_logout(
         )
         .await?;
     }
-    tx.commit().await.map_err(DbError::Query)?;
+    tx.commit().await.map_err(query_error)?;
     Ok(deleted.rows_affected())
 }
 
@@ -6688,7 +7685,7 @@ pub async fn revoke_oidc_frontchannel_sessions(
     issuer: &str,
     sid: &str,
 ) -> Result<u64, DbError> {
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     let affected_accounts: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT a.name_folded
          FROM web_sessions s JOIN accounts a ON a.id = s.account_id
@@ -6698,13 +7695,13 @@ pub async fn revoke_oidc_frontchannel_sessions(
     .bind(sid)
     .fetch_all(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     let deleted = sqlx::query("DELETE FROM web_sessions WHERE oidc_issuer = $1 AND oidc_sid = $2")
         .bind(issuer)
         .bind(sid)
         .execute(&mut *transaction)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
     for account in affected_accounts {
         insert_audit_log_with(
             &mut *transaction,
@@ -6715,7 +7712,7 @@ pub async fn revoke_oidc_frontchannel_sessions(
         )
         .await?;
     }
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(deleted.rows_affected())
 }
 
@@ -6734,7 +7731,7 @@ pub async fn session_logout_hint(pool: &PgPool, token: &str) -> Result<SessionLo
     .bind(token_hash(token))
     .fetch_optional(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     Ok(row.unwrap_or(SessionLogoutHint {
         id_token: None,
         provider: None,
@@ -6747,13 +7744,13 @@ pub async fn session_account(pool: &PgPool, token: &str) -> Result<Option<String
         .bind(token_hash(token))
         .fetch_optional(pool)
         .await
-        .map_err(DbError::Query)
+        .map_err(query_error)
 }
 
 /// Delete a session (logout). Deleting an unknown token is not an
 /// error: logout must be idempotent.
 pub async fn delete_web_session(pool: &PgPool, token: &str) -> Result<(), DbError> {
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     let owner: Option<String> = sqlx::query_scalar(
         "SELECT a.name_folded
          FROM web_sessions s JOIN accounts a ON a.id = s.account_id
@@ -6762,12 +7759,12 @@ pub async fn delete_web_session(pool: &PgPool, token: &str) -> Result<(), DbErro
     .bind(token_hash(token))
     .fetch_optional(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     sqlx::query("DELETE FROM web_sessions WHERE token_hash = $1")
         .bind(token_hash(token))
         .execute(&mut *transaction)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
     if let Some(owner) = owner {
         insert_audit_log_with(
             &mut *transaction,
@@ -6778,7 +7775,7 @@ pub async fn delete_web_session(pool: &PgPool, token: &str) -> Result<(), DbErro
         )
         .await?;
     }
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(())
 }
 
@@ -6822,7 +7819,7 @@ pub async fn list_web_sessions(
     .bind(MAX_BROWSER_SESSIONS_PER_ACCOUNT as i64)
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 /// Revoke one owner-scoped browser session. The returned boolean says whether
@@ -6835,7 +7832,7 @@ pub async fn delete_web_session_by_id(
 ) -> Result<Option<bool>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let current_hash = current_token.map(token_hash);
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     let deleted = sqlx::query_scalar(
         "DELETE FROM web_sessions s USING accounts a
          WHERE s.account_id = a.id AND a.name_folded = $1 AND s.id = $2
@@ -6849,7 +7846,7 @@ pub async fn delete_web_session_by_id(
     .bind(current_hash)
     .fetch_optional(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     if deleted.is_some() {
         let folded = CaseMapping::Rfc1459.casefold(account);
         insert_audit_log_with(
@@ -6861,7 +7858,7 @@ pub async fn delete_web_session_by_id(
         )
         .await?;
     }
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(deleted)
 }
 
@@ -6882,7 +7879,7 @@ async fn delete_other_web_sessions_in(
     .execute(&mut **transaction)
     .await
     .map(|result| result.rows_affected())
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 /// Revoke every other browser session owned by `account`, preserving the
@@ -6893,7 +7890,7 @@ pub async fn delete_other_web_sessions(
     current_token: &str,
 ) -> Result<u64, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     let deleted = delete_other_web_sessions_in(&mut transaction, &folded, current_token).await?;
     if deleted != 0 {
         insert_audit_log_with(
@@ -6905,7 +7902,7 @@ pub async fn delete_other_web_sessions(
         )
         .await?;
     }
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(deleted)
 }
 
@@ -6925,7 +7922,7 @@ pub async fn issue_scoped_api_token(
     lifetime: crate::identity::ApiTokenLifetimeDays,
 ) -> Result<String, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let mut tx = pool.begin().await.map_err(query_error)?;
     let token = mint_api_token_under_cap(&mut tx, account, label, scopes, lifetime).await?;
     insert_audit_log_with(
         &mut *tx,
@@ -6935,7 +7932,7 @@ pub async fn issue_scoped_api_token(
         "personal access token created",
     )
     .await?;
-    tx.commit().await.map_err(DbError::Query)?;
+    tx.commit().await.map_err(query_error)?;
     Ok(token)
 }
 
@@ -6949,13 +7946,13 @@ async fn api_token_count(
         .bind(account_id)
         .fetch_one(&mut **transaction)
         .await
-        .map_err(DbError::Query)
+        .map_err(query_error)
 }
 
 /// The one way a personal access token comes to exist: mint it for `account`
 /// inside the caller's transaction and return the plaintext, shown once.
 ///
-/// The cap and the insert run with the account row locked `FOR UPDATE`. A
+/// The cap and the insert run with the account row locked `FOR NO KEY UPDATE`. A
 /// count-then-insert across two pool statements lets two concurrent requests
 /// each read cap-1 and both insert, overshooting the cap — the same race
 /// `issue_app_password` closes. Taking the caller's transaction lets the
@@ -6969,18 +7966,12 @@ async fn mint_api_token_under_cap(
     scopes: crate::identity::ApiTokenScopes,
     lifetime: crate::identity::ApiTokenLifetimeDays,
 ) -> Result<String, DbError> {
-    use argon2::password_hash::rand_core::RngCore;
     let folded = CaseMapping::Rfc1459.casefold(account);
     let account_id = lock_active_account_id(transaction, &folded).await?;
     if api_token_count(transaction, account_id).await? >= MAX_API_TOKENS_PER_ACCOUNT {
         return Err(DbError::TooManyCredentials);
     }
-    let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
-    let token = format!(
-        "e6p_{}",
-        e6irc_proto::base64::encode(&bytes).replace(['+', '/'], "-")
-    );
+    let token = format!("e6p_{}", crate::secret::random_url_safe_token());
     sqlx::query(
         "INSERT INTO api_tokens (token_hash, account_id, label, scopes, expires_at)
          VALUES ($1, $2, $3, $4, now() + make_interval(days => $5))",
@@ -6992,7 +7983,7 @@ async fn mint_api_token_under_cap(
     .bind(i32::from(lifetime.value()))
     .execute(&mut **transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     Ok(token)
 }
 
@@ -7010,7 +8001,7 @@ pub async fn api_token_account(pool: &PgPool, token: &str) -> Result<Option<Stri
     .bind(ACCOUNT_FLAG_SUSPENDED)
     .fetch_optional(pool)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7042,7 +8033,7 @@ pub async fn api_token_principal(
     .bind(ACCOUNT_FLAG_SUSPENDED)
     .fetch_optional(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     row.map(|row| {
         Ok(ApiTokenPrincipal {
             account: row.account,
@@ -7091,7 +8082,7 @@ pub async fn list_api_tokens(
     .bind(&folded)
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(query_error)?;
     rows.into_iter()
         .map(|row| {
             Ok(ApiTokenMetadata {
@@ -7120,7 +8111,7 @@ async fn commit_credential_revocation(
         return Ok(false);
     }
     insert_audit_log_with(&mut *transaction, folded, action, folded, detail).await?;
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(query_error)?;
     Ok(true)
 }
 
@@ -7153,13 +8144,13 @@ async fn delete_scoped_credential(
     message: &str,
 ) -> Result<bool, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(query_error)?;
     let result = sqlx::query(delete_sql)
         .bind(&folded)
         .bind(id)
         .execute(&mut *transaction)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(query_error)?;
     commit_credential_revocation(transaction, &folded, result, action, message).await
 }
 
@@ -7189,7 +8180,7 @@ pub async fn list_credentials(pool: &PgPool, account: &str) -> Result<Vec<Creden
     .bind(&folded)
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)
+    .map_err(query_error)
 }
 
 /// Revoke one *app password* owned by `account`. Returns whether a row was
@@ -7213,6 +8204,31 @@ pub async fn revoke_credential(pool: &PgPool, account: &str, id: i64) -> Result<
         "app password revoked",
     )
     .await
+}
+
+#[cfg(test)]
+mod pool_size_tests {
+    use super::{DatabasePoolSize, MAX_CONCURRENT_ARGON2};
+
+    #[test]
+    fn the_pool_size_is_bounded_and_defaults_to_the_host() {
+        assert!(DatabasePoolSize::new(1).is_err());
+        assert!(DatabasePoolSize::new(201).is_err());
+        assert_eq!(DatabasePoolSize::new(2).map(DatabasePoolSize::get), Ok(2));
+        assert_eq!(
+            DatabasePoolSize::new(200).map(DatabasePoolSize::get),
+            Ok(200)
+        );
+        // One serial worker, the Argon2 offloads, two per runtime thread.
+        assert_eq!(
+            DatabasePoolSize::for_runtime_threads(8).get() as usize,
+            1 + MAX_CONCURRENT_ARGON2 + 16
+        );
+        assert_eq!(DatabasePoolSize::for_runtime_threads(1_000).get(), 200);
+        let parsed: DatabasePoolSize = serde_json::from_str("48").expect("in bounds");
+        assert_eq!(parsed.get(), 48);
+        assert!(serde_json::from_str::<DatabasePoolSize>("0").is_err());
+    }
 }
 
 #[cfg(test)]

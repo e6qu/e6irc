@@ -131,7 +131,7 @@ pub(super) async fn ws_irc_conn(
     state: Arc<AppState>,
     mut socket: WebSocket,
     _conn_guard: crate::net::ConnGuard,
-    ip: std::net::IpAddr,
+    ip: crate::net::ClientIp,
     mode: WsFrameMode,
     conn: crate::core::ConnId,
 ) {

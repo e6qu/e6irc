@@ -30,6 +30,15 @@ grep -qx 'StartLimitIntervalSec=0' "$unit" || {
   exit 1
 }
 
+# A core file is a copy of the process's memory, which holds the master key,
+# opened upstream credentials, and session tokens. The daemon also marks itself
+# non-dumpable at start (PR_SET_DUMPABLE); the unit refuses core files so the
+# kernel writes none even before that call or if it fails.
+grep -qx 'LimitCORE=0' "$unit" || {
+  echo "$unit must set LimitCORE=0: a core file would carry the master key and opened credentials" >&2
+  exit 1
+}
+
 # The daemon's clean shutdown is sequential: the bouncer drivers say goodbye
 # for up to SHUTDOWN_DRIVER_STOP_TIMEOUT, THEN the core shards drain for up to
 # SHUTDOWN_CORE_STOP_TIMEOUT, THEN the database flushes for up to

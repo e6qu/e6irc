@@ -79,7 +79,13 @@ fn permanent_refusal(error: &io::Error) -> Option<String> {
     let rejection = RegistrationRejection::from_error(error)?;
     let what = match rejection.refusal() {
         RegistrationRefusal::NetworkBanned => "the server banned this connection",
-        RegistrationRefusal::ServerPasswordRejected => "the server rejected the password",
+        RegistrationRefusal::ServerPasswordRejected => {
+            "the network rejected the configured server password"
+        }
+        RegistrationRefusal::ServerPasswordRequired => {
+            "the network requires a server password; give one with --server-password-file, \
+             E6IRC_SERVER_PASSWORD, or --server-password"
+        }
         RegistrationRefusal::InvalidNickname
         | RegistrationRefusal::InvalidUsername
         | RegistrationRefusal::NicknameInUse
@@ -101,6 +107,14 @@ mod tests {
     /// starts with a scripted prefix with the scripted reply.
     async fn registration_error(
         authentication: Authentication,
+        script: &'static [(&'static str, &'static str)],
+    ) -> io::Error {
+        registration_error_with(authentication, None, script).await
+    }
+
+    async fn registration_error_with(
+        authentication: Authentication,
+        server_password: Option<e6irc_client::ServerPassword>,
         script: &'static [(&'static str, &'static str)],
     ) -> io::Error {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -131,6 +145,7 @@ mod tests {
             authentication,
             response_deadline: Duration::from_secs(5),
             cleartext_credentials: e6irc_client::CleartextCredentials::Refuse,
+            server_password,
         }
         .connect_registered()
         .await
@@ -173,6 +188,31 @@ mod tests {
             panic!("a ban was scheduled for another attempt");
         };
         assert!(status.contains("You are banned"), "{status}");
+    }
+
+    /// A 464 is a configuration fault either way — a password the network
+    /// wants and was not given, or one it rejected — and says which.
+    #[tokio::test]
+    async fn a_missing_or_rejected_server_password_is_never_retried() {
+        let mut policy = ReconnectPolicy::new(Duration::from_secs(2));
+        let script: &[(&str, &str)] = &[("CAP LS", ":srv 464 * :Password required")];
+        let missing = registration_error(Authentication::None, script).await;
+        let AfterFailure::Stop(status) = policy.after(&missing) else {
+            panic!("a missing server password was scheduled for another attempt");
+        };
+        assert!(status.contains("requires a server password"), "{status}");
+        assert!(status.contains("--server-password-file"), "{status}");
+
+        let password = e6irc_client::ServerPassword::parse("wrong-pass".into()).expect("valid");
+        let rejected = registration_error_with(Authentication::None, Some(password), script).await;
+        let AfterFailure::Stop(status) = policy.after(&rejected) else {
+            panic!("a rejected server password was scheduled for another attempt");
+        };
+        assert!(
+            status.contains("rejected the configured server password"),
+            "{status}"
+        );
+        assert!(!status.contains("wrong-pass"), "{status}");
     }
 
     /// A server that offers no usable SASL says nothing about the password, and

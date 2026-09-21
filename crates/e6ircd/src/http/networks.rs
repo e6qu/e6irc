@@ -34,7 +34,6 @@ impl NetworkMutationError {
         self
     }
 
-    #[cfg(test)]
     pub(super) fn message(&self) -> String {
         match &self.detail {
             Some(detail) => format!("{}: {detail}", self.title),
@@ -55,28 +54,25 @@ fn network_error(
     NetworkMutationError::new(status, title, detail)
 }
 
-/// Record one network mutation in the audit trail. The mutation itself is
-/// already committed (audit is a trail, not a gate), so a failed insert
-/// cannot roll it back — but it is logged, never silently lost.
-async fn audit_network_mutation(
+/// Record a command about to be sent to a network's upstream on the owner's
+/// behalf. The command is not a database mutation, so there is no transaction
+/// to share: the record is written first, and a command that cannot be
+/// recorded is not sent.
+async fn audit_network_command(
     state: &AppState,
-    actor: &str,
-    action: &'static str,
     account: &str,
-    name: &str,
-    detail: &str,
-) {
-    if let Err(error) = crate::db::insert_audit_log(
+    network: &str,
+    command: &str,
+) -> Result<(), crate::db::DbError> {
+    let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account);
+    crate::db::insert_audit_log(
         pool_of(state),
-        actor,
-        action,
-        &format!("{account}/{name}"),
-        detail,
+        &folded,
+        "NETWORK_ACCOUNT_COMMAND",
+        &format!("{folded}/{network}"),
+        command,
     )
     .await
-    {
-        eprintln!("http: network {action} audit for {account:?}/{name:?}: {error}");
-    }
 }
 
 /// Normalize the shared result contract of owner-scoped network updates. This
@@ -194,6 +190,10 @@ pub(super) enum CreateNetwork {
         sasl_account: Option<String>,
         #[serde(default)]
         sasl_password: Option<String>,
+        /// The network's connection password (`PASS`), for a private server
+        /// that requires one. IRC only: a bridge variant has no such field.
+        #[serde(default)]
+        server_password: Option<String>,
     },
     Matrix {
         name: String,
@@ -232,6 +232,8 @@ struct NetworkCreation {
     autojoin: Vec<String>,
     sasl_account: Option<String>,
     sasl_password: Option<String>,
+    /// `None` for every bridge: only an IRC request can carry one.
+    server_password: Option<String>,
 }
 
 impl From<CreateNetwork> for NetworkCreation {
@@ -248,6 +250,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 autojoin,
                 sasl_account,
                 sasl_password,
+                server_password,
             } => Self {
                 kind: NetworkKind::Irc,
                 name,
@@ -259,6 +262,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 autojoin,
                 sasl_account,
                 sasl_password,
+                server_password,
             },
             CreateNetwork::Matrix {
                 name,
@@ -278,6 +282,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 autojoin,
                 sasl_account: None,
                 sasl_password: Some(sasl_password),
+                server_password: None,
             },
             CreateNetwork::Discord {
                 name,
@@ -296,6 +301,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 autojoin,
                 sasl_account: None,
                 sasl_password: Some(sasl_password),
+                server_password: None,
             },
             CreateNetwork::Slack {
                 name,
@@ -315,6 +321,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 autojoin,
                 sasl_account: Some(sasl_account),
                 sasl_password: Some(sasl_password),
+                server_password: None,
             },
         }
     }
@@ -337,6 +344,8 @@ pub(super) struct PreflightNetwork {
     pub(super) sasl_account: Option<String>,
     #[serde(default)]
     pub(super) sasl_password: Option<String>,
+    #[serde(default)]
+    pub(super) server_password: Option<String>,
 }
 
 /// One closed NickServ account-registration action. These are ordinary IRC
@@ -466,6 +475,8 @@ pub(super) struct NetworkResponse {
     sasl_account: Option<String>,
     has_sasl_account: bool,
     has_sasl_password: bool,
+    /// Whether a sealed server password is stored. The value is never shown.
+    has_server_password: bool,
     enabled: bool,
     connected: Option<bool>,
     runtime: Option<NetworkRuntimeResponse>,
@@ -572,6 +583,7 @@ pub(super) fn network_response(
 ) -> NetworkResponse {
     let has_sasl_account = network.sasl_account.is_some();
     let has_sasl_password = network.sasl_password_sealed.is_some();
+    let has_server_password = network.server_password_sealed.is_some();
     let account = if network.kind.account_is_secret() {
         None
     } else {
@@ -589,6 +601,7 @@ pub(super) fn network_response(
         sasl_account: account,
         has_sasl_account,
         has_sasl_password,
+        has_server_password,
         enabled: network.enabled,
         connected: runtime.map(|r| r.lifecycle == crate::bouncer::NetworkLifecycle::Connected),
         runtime: runtime.map(runtime_response),
@@ -757,23 +770,28 @@ pub(super) async fn preflight_network_core(
         &req.autojoin,
         internal_upstreams,
     )?;
-    if let Some(account) = req.sasl_account.as_deref()
-        && let Err(error) = validate_credential_field(account, 255)
-    {
-        return Err(error);
+    refuse_cleartext_credentials(
+        &req.addr,
+        req.tls,
+        req.sasl_password.is_some(),
+        req.server_password.is_some(),
+        internal_upstreams,
+    )?;
+    if let Some(account) = req.sasl_account.as_deref() {
+        validate_credential_field(account, 255).map_err(|e| e.with_field("sasl_account"))?;
     }
-    if let Some(password) = req.sasl_password.as_deref()
-        && let Err(error) = validate_credential_field(password, 512)
-    {
-        return Err(error);
+    if let Some(password) = req.sasl_password.as_deref() {
+        validate_credential_field(password, 512).map_err(|e| e.with_field("sasl_password"))?;
     }
     if req.sasl_account.is_some() != req.sasl_password.is_some() {
         return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Incomplete upstream SASL",
             Some("provide both sasl_account and sasl_password, or neither"),
-        ));
+        )
+        .with_field("sasl_password"));
     }
+    let server_password = req.server_password.map(parse_server_password).transpose()?;
 
     let config = crate::bouncer::NetworkConfig {
         addr: req.addr,
@@ -786,6 +804,7 @@ pub(super) async fn preflight_network_core(
         autojoin: identity.autojoin,
         buffer_cap: 1,
         sasl: req.sasl_account.zip(req.sasl_password),
+        server_password,
         keepalive_idle: crate::bouncer::KEEPALIVE_IDLE,
         rejection_retry_floor: crate::bouncer::REJECTION_RETRY_FLOOR,
         internal_upstreams,
@@ -911,27 +930,24 @@ pub(super) async fn network_account_command(
             )
         }
     };
+    if let Err(error) = audit_network_command(&state, &account, &network.name, kind).await {
+        eprintln!("http: network account command audit failed: {error}");
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Database unavailable",
+            Some("nothing was sent: the command could not be recorded"),
+        );
+    }
     match handle.send(&command) {
-        crate::bouncer::SendOutcome::Sent => {
-            audit_network_mutation(
-                &state,
-                &account,
-                "NETWORK_ACCOUNT_COMMAND",
-                &account,
-                &network.name,
-                kind,
-            )
-            .await;
-            (
-                StatusCode::ACCEPTED,
-                axum::Json(NetworkAccountCommandResponse {
-                    queued: true,
-                    command: kind,
-                    transcript: format!("/console/networks/{}", network.name),
-                }),
-            )
-                .into_response()
-        }
+        crate::bouncer::SendOutcome::Sent => (
+            StatusCode::ACCEPTED,
+            axum::Json(NetworkAccountCommandResponse {
+                queued: true,
+                command: kind,
+                transcript: format!("/console/networks/{}", network.name),
+            }),
+        )
+            .into_response(),
         crate::bouncer::SendOutcome::Full => problem(
             StatusCode::TOO_MANY_REQUESTS,
             "Upstream command queue is full",
@@ -1029,6 +1045,26 @@ pub(super) fn check_upstream_bounds(
         .with_field("addr"));
     }
     Ok(())
+}
+
+/// Refuse, by field, a SASL password or server password an IRC upstream would
+/// carry in cleartext ([`crate::egress::InternalUpstreams::cleartext_credential`]).
+pub(super) fn refuse_cleartext_credentials(
+    addr: &str,
+    tls: bool,
+    sasl_password: bool,
+    server_password: bool,
+    internal_upstreams: crate::egress::InternalUpstreams,
+) -> Result<(), NetworkMutationError> {
+    match internal_upstreams.cleartext_credential(addr, tls, sasl_password, server_password) {
+        Some(credential) => Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Credentials require TLS",
+            Some(credential.reason()),
+        )
+        .with_field(credential.field())),
+        None => Ok(()),
+    }
 }
 
 /// The identity fields of an IRC upstream, parsed. Holding the parsed values is
@@ -1139,7 +1175,7 @@ async fn editable_network(
 /// `Set` mean "preserve this one secret", while `Keep` preserves the complete
 /// credential set and `Remove` is supported only by IRC (bridges require their
 /// credentials to remain constructible).
-pub(super) enum NetworkCredentialUpdate<'a> {
+enum NetworkCredentialUpdate<'a> {
     Keep,
     Remove,
     Set {
@@ -1163,6 +1199,55 @@ fn seal_network_secret(
     Ok(key.seal(value, &crate::bouncer::bnc_secret_context(owner)))
 }
 
+/// Parse a submitted server password at its field: the one rule for create,
+/// replace, and the connection test, so none of them can store or send a value
+/// the `PASS` line cannot carry. The refusal names the rule, never the value.
+fn parse_server_password(
+    password: String,
+) -> Result<e6irc_client::ServerPassword, NetworkMutationError> {
+    e6irc_client::ServerPassword::parse(password).map_err(|error| {
+        network_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid server password",
+            Some(&error.to_string()),
+        )
+        .with_field("server_password")
+    })
+}
+
+/// Apply a replace's explicit server-password action. Only an IRC network
+/// sends `PASS`, so a bridge can only keep the none it has.
+fn apply_server_password(
+    state: &AppState,
+    owner: &str,
+    row: &mut crate::db::BncNetworkRow,
+    update: UpdateServerPassword,
+) -> Result<(), NetworkMutationError> {
+    match (row.kind, update) {
+        (_, UpdateServerPassword::Keep {}) => Ok(()),
+        (crate::config::NetworkKind::Irc, UpdateServerPassword::Remove {}) => {
+            row.server_password_sealed = None;
+            Ok(())
+        }
+        (crate::config::NetworkKind::Irc, UpdateServerPassword::Set { password }) => {
+            let password = parse_server_password(password)?;
+            row.server_password_sealed = Some(
+                seal_network_secret(state, owner, password.as_str())
+                    .map_err(|error| error.with_field("server_password"))?,
+            );
+            Ok(())
+        }
+        (_, UpdateServerPassword::Remove {} | UpdateServerPassword::Set { .. }) => {
+            Err(network_error(
+                StatusCode::BAD_REQUEST,
+                "Unsupported credential field",
+                Some("only an IRC network has a server password; send {\"action\":\"keep\"}"),
+            )
+            .with_field("server_password"))
+        }
+    }
+}
+
 fn validate_credential_field(value: &str, maximum: usize) -> Result<(), NetworkMutationError> {
     crate::bouncer::validate_network_credential(value, maximum).map_err(|error| {
         network_error(
@@ -1177,9 +1262,17 @@ fn apply_network_credentials(
     state: &AppState,
     owner: &str,
     row: &mut crate::db::BncNetworkRow,
-    update: NetworkCredentialUpdate<'_>,
+    update: UpdateNetworkCredentials,
 ) -> Result<(), NetworkMutationError> {
     use crate::config::NetworkKind;
+    let update = match &update {
+        UpdateNetworkCredentials::Keep {} => NetworkCredentialUpdate::Keep,
+        UpdateNetworkCredentials::Remove {} => NetworkCredentialUpdate::Remove,
+        UpdateNetworkCredentials::Set { account, password } => NetworkCredentialUpdate::Set {
+            account: account.as_deref(),
+            password: password.as_deref(),
+        },
+    };
     match (row.kind, update) {
         (_, NetworkCredentialUpdate::Keep) => Ok(()),
         (NetworkKind::Irc, NetworkCredentialUpdate::Remove) => {
@@ -1457,14 +1550,25 @@ pub(super) async fn update_network_core(
     registry: &crate::bouncer::Registry,
     account: &str,
     name: &str,
-    addr: &str,
-    tls: bool,
-    nick: &str,
-    username: Option<&str>,
-    realname: Option<&str>,
-    autojoin: &[String],
-    credentials: NetworkCredentialUpdate<'_>,
+    req: UpdateNetwork,
 ) -> Result<(), NetworkMutationError> {
+    let UpdateNetwork {
+        addr,
+        tls,
+        nick,
+        username,
+        realname,
+        autojoin,
+        credentials,
+        server_password,
+    } = req;
+    let (addr, nick, username, realname, autojoin) = (
+        addr.as_str(),
+        nick.as_str(),
+        username.as_deref(),
+        realname.as_deref(),
+        autojoin.as_slice(),
+    );
     let lane = ActiveOwnerLane::enter(state, registry, account).await?;
     let pool = pool_of(state);
     let mut row = editable_network(state, account, name, "update").await?;
@@ -1507,25 +1611,39 @@ pub(super) async fn update_network_core(
     row.realname = realname.map(str::to_string);
     row.autojoin = autojoin.to_vec();
     apply_network_credentials(state, account, &mut row, credentials)?;
+    apply_server_password(state, account, &mut row, server_password)?;
+    // Judged on the row as it will be stored: a kept credential on a network
+    // edited to tls=false is refused like a new one.
+    if row.kind == crate::config::NetworkKind::Irc {
+        refuse_cleartext_credentials(
+            &row.addr,
+            row.tls,
+            row.sasl_password_sealed.is_some(),
+            row.server_password_sealed.is_some(),
+            state.internal_upstreams,
+        )?;
+    }
     let driver =
         prospective_network_driver(state, account, &row, row.enabled, row.kind.is_bridge())?;
 
+    let detail = network_audit_detail(row.kind, "changed", &changed_network_fields(&before, &row));
     require_network_updated(
-        crate::db::update_bnc_network(pool, account, name, &row).await,
+        crate::db::update_bnc_network(
+            pool,
+            account,
+            name,
+            &row,
+            crate::db::NetworkAudit {
+                actor: account,
+                detail: &detail,
+            },
+        )
+        .await,
         "update failed",
     )?;
     if let Some(driver) = driver {
         lane.supersede(name, driver).await;
     }
-    audit_network_mutation(
-        state,
-        account,
-        "NETWORK_UPDATE",
-        account,
-        &row.name,
-        &network_audit_detail(row.kind, "changed", &changed_network_fields(&before, &row)),
-    )
-    .await;
     Ok(())
 }
 
@@ -1554,6 +1672,10 @@ fn changed_network_fields(
         "sasl_password",
         before.sasl_password_sealed != after.sasl_password_sealed,
     );
+    note(
+        "server_password",
+        before.server_password_sealed != after.server_password_sealed,
+    );
     note("enabled", before.enabled != after.enabled);
     changed
 }
@@ -1575,6 +1697,9 @@ fn present_network_fields(row: &crate::db::BncNetworkRow) -> Vec<&'static str> {
     }
     if row.sasl_password_sealed.is_some() {
         present.push("sasl_password");
+    }
+    if row.server_password_sealed.is_some() {
+        present.push("server_password");
     }
     present
 }
@@ -1612,6 +1737,7 @@ mod audit_detail_tests {
             autojoin: vec!["#work".into()],
             sasl_account: None,
             sasl_password_sealed: None,
+            server_password_sealed: None,
             enabled: true,
         }
     }
@@ -1641,9 +1767,17 @@ mod audit_detail_tests {
         let mut created = row();
         created.sasl_account = Some("alice".into());
         created.sasl_password_sealed = Some("sealed".into());
+        created.server_password_sealed = Some("sealed".into());
         assert_eq!(
             network_audit_detail(created.kind, "fields", &present_network_fields(&created)),
-            "irc; fields: addr, tls, nick, username, realname, autojoin, sasl_account, sasl_password"
+            "irc; fields: addr, tls, nick, username, realname, autojoin, sasl_account, \
+             sasl_password, server_password"
+        );
+        let mut replaced = created.clone();
+        replaced.server_password_sealed = Some("resealed".into());
+        assert_eq!(
+            changed_network_fields(&created, &replaced),
+            ["server_password"]
         );
     }
 }
@@ -1693,6 +1827,13 @@ async fn create_network_core(
             &req.autojoin,
             state.internal_upstreams,
         )?;
+        refuse_cleartext_credentials(
+            &req.addr,
+            req.tls,
+            req.sasl_password.is_some(),
+            req.server_password.is_some(),
+            state.internal_upstreams,
+        )?;
     } else {
         validate_bridge_upstream(
             kind,
@@ -1727,6 +1868,11 @@ async fn create_network_core(
         )
         .with_field("sasl_password"));
     }
+    let server_password = req
+        .server_password
+        .clone()
+        .map(parse_server_password)
+        .transpose()?;
     if matches!(kind, NetworkKind::Matrix | NetworkKind::Discord) && req.sasl_account.is_some() {
         return Err(network_error(
             StatusCode::BAD_REQUEST,
@@ -1739,8 +1885,9 @@ async fn create_network_core(
     // it is sealed there too; an IRC `sasl_account` is a public login name and is
     // stored in the clear (and read back verbatim). Sealing binds to the owning
     // account so a blob can never be opened for a different account's row.
-    let need_key =
-        req.sasl_password.is_some() || (kind.account_is_secret() && req.sasl_account.is_some());
+    let need_key = req.sasl_password.is_some()
+        || server_password.is_some()
+        || (kind.account_is_secret() && req.sasl_account.is_some());
     let key = match (&state.secret_key, need_key) {
         (Some(k), _) => Some(k),
         (None, false) => None,
@@ -1764,6 +1911,10 @@ async fn create_network_core(
         ),
         other => other.clone(),
     };
+    let sealed_server_password = server_password.as_ref().map(|password| {
+        key.expect("key present when a server password is")
+            .seal(password.as_str(), &context)
+    });
 
     // Build before inserting. A factory rejection must not create durable state
     // that then depends on a best-effort compensating delete.
@@ -1780,6 +1931,7 @@ async fn create_network_core(
         buffer_cap: 1000,
         sasl_account: req.sasl_account.clone(),
         sasl_password: req.sasl_password.clone(),
+        server_password: server_password.map(|password| password.as_str().to_owned()),
         internal_upstreams: state.internal_upstreams,
         first_dial: crate::bouncer::FirstDial::Immediate,
     })
@@ -1796,15 +1948,27 @@ async fn create_network_core(
         autojoin: req.autojoin.clone(),
         sasl_account: stored_account,
         sasl_password_sealed: sealed_password,
+        server_password_sealed: sealed_server_password,
         enabled: true,
     };
     let pool = state.pool.as_ref().expect("caller checked the pool");
     // The per-account network cap is enforced atomically inside
-    // `create_bnc_network` (count + insert in one FOR UPDATE transaction), so
+    // `create_bnc_network` (count + insert in one locked transaction), so
     // there is no racy list-then-insert here — two concurrent creates can't both
     // slip past cap-1 and each spawn an always-on driver.
     let lane = ActiveOwnerLane::enter(state, registry, account).await?;
-    match crate::db::create_bnc_network(pool, account, &row).await {
+    let detail = network_audit_detail(kind, "fields", &present_network_fields(&row));
+    match crate::db::create_bnc_network(
+        pool,
+        account,
+        &row,
+        crate::db::NetworkAudit {
+            actor: account,
+            detail: &detail,
+        },
+    )
+    .await
+    {
         Ok(_) => {}
         Err(crate::db::DbError::TooManyNetworks) => {
             return Err(network_error(
@@ -1832,15 +1996,6 @@ async fn create_network_core(
     // The row was just inserted under the uniqueness constraint, so anything
     // already registered under this key has no durable definition: supersede it.
     lane.supersede(&req.name, driver).await;
-    audit_network_mutation(
-        state,
-        account,
-        "NETWORK_CREATE",
-        account,
-        &req.name,
-        &network_audit_detail(kind, "fields", &present_network_fields(&row)),
-    )
-    .await;
     Ok(())
 }
 
@@ -1948,13 +2103,29 @@ pub(super) struct UpdateNetwork {
     #[serde(default)]
     pub(super) autojoin: Vec<String>,
     pub(super) credentials: UpdateNetworkCredentials,
+    /// Required for the same reason as `credentials`: an omitted field would
+    /// have to mean either keep or erase a write-only secret.
+    pub(super) server_password: UpdateServerPassword,
+}
+
+/// What a replace does with the stored server password (`PASS`).
+#[derive(serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum UpdateServerPassword {
+    // Braced for the reason given on `UpdateNetworkCredentials`.
+    Keep {},
+    Remove {},
+    Set { password: String },
 }
 
 #[derive(serde::Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum UpdateNetworkCredentials {
-    Keep,
-    Remove,
+    // Empty braces, not unit variants: serde lets a unit variant of an
+    // internally tagged enum ignore stray fields, so `{"action":"keep",
+    // "password":"…"}` would silently drop a typed password.
+    Keep {},
+    Remove {},
     Set {
         #[serde(default)]
         account: Option<String>,
@@ -1975,29 +2146,7 @@ pub(super) async fn update_network(
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
-    let credentials = match &req.credentials {
-        UpdateNetworkCredentials::Keep => NetworkCredentialUpdate::Keep,
-        UpdateNetworkCredentials::Remove => NetworkCredentialUpdate::Remove,
-        UpdateNetworkCredentials::Set { account, password } => NetworkCredentialUpdate::Set {
-            account: account.as_deref(),
-            password: password.as_deref(),
-        },
-    };
-    if let Err(error) = update_network_core(
-        &state,
-        registry,
-        &account,
-        &name,
-        &req.addr,
-        req.tls,
-        &req.nick,
-        req.username.as_deref(),
-        req.realname.as_deref(),
-        &req.autojoin,
-        credentials,
-    )
-    .await
-    {
+    if let Err(error) = update_network_core(&state, registry, &account, &name, req).await {
         return error.into_response();
     }
     StatusCode::NO_CONTENT.into_response()
@@ -2017,12 +2166,16 @@ pub(super) async fn set_network_enabled_core(
     enabled: bool,
 ) -> Result<String, NetworkMutationError> {
     let pool = pool_of(state);
+    let audit = crate::db::NetworkAudit {
+        actor,
+        detail: if enabled { "enabled" } else { "disabled" },
+    };
     let stored_name = if enabled {
         let lane = ActiveOwnerLane::enter(state, registry, account).await?;
         let row = editable_network(state, account, name, "enable").await?;
         let driver = stored_network_driver(state, account, &row)?;
         require_network_updated(
-            crate::db::set_bnc_network_enabled(pool, account, name, true).await,
+            crate::db::set_bnc_network_enabled(pool, account, name, true, audit).await,
             "enable failed",
         )?;
         lane.ensure_running(&row.name, driver).await;
@@ -2031,27 +2184,24 @@ pub(super) async fn set_network_enabled_core(
         let _mutation = registry.mutation_guard().await;
         let row = editable_network(state, account, name, "disable").await?;
         require_network_updated(
-            crate::db::set_bnc_network_enabled(pool, account, name, false).await,
+            crate::db::set_bnc_network_enabled(pool, account, name, false, audit).await,
             "disable failed",
         )?;
         registry.remove(Some(account), &row.name).await;
         row.name
     };
-    audit_network_mutation(
-        state,
-        actor,
-        "NETWORK_TOGGLE",
-        account,
-        &stored_name,
-        if enabled { "enabled" } else { "disabled" },
-    )
-    .await;
     Ok(stored_name)
 }
 
 /// Delete one owner-scoped network and stop its driver under the same mutation
 /// gate used by create/edit/toggle, so concurrent control-plane operations
 /// cannot resurrect a driver whose durable row was removed.
+///
+/// The driver stops first — and its persistence task with it, between two
+/// writes — so nothing it was about to write can land after the rows are gone
+/// (the `bnc_buffer.network_id` foreign key makes such a line fail rather
+/// than orphan). If the database then refuses the deletion, the network is
+/// restarted from its stored row, so a failed delete leaves it as it was.
 pub(super) async fn delete_network_core(
     state: &AppState,
     registry: &crate::bouncer::Registry,
@@ -2060,13 +2210,46 @@ pub(super) async fn delete_network_core(
 ) -> Result<(), NetworkMutationError> {
     let _mutation = registry.mutation_guard().await;
     let row = editable_network(state, account, name, "delete").await?;
-    require_network_updated(
-        crate::db::delete_bnc_network(pool_of(state), account, name).await,
-        "delete failed",
-    )?;
-    registry.remove(Some(account), name).await;
-    audit_network_mutation(state, account, "NETWORK_DELETE", account, &row.name, "").await;
-    Ok(())
+    // Built before anything stops, so a restart after a refused delete does
+    // not depend on anything that could change meanwhile. A running network
+    // whose row no longer builds (a rotated master key) can still be deleted;
+    // it is said here that a refused delete would leave it stopped.
+    let running = registry.get_owned(account, &row.name).is_some();
+    let restart = if running {
+        match stored_network_driver(state, account, &row) {
+            Ok(driver) => Some(driver),
+            Err(error) => {
+                eprintln!(
+                    "http: network {account}/{} cannot be rebuilt ({}); if the delete is \
+                     refused it stays stopped",
+                    row.name,
+                    error.message()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    registry.remove(Some(account), &row.name).await;
+    let deleted = crate::db::delete_bnc_network(
+        pool_of(state),
+        account,
+        name,
+        crate::db::NetworkAudit {
+            actor: account,
+            detail: "",
+        },
+    )
+    .await;
+    // Only a refusal restarts it: `Ok(false)` means the row is already gone,
+    // and a network with no row must not run.
+    if deleted.is_err()
+        && let Some(driver) = restart
+    {
+        registry.replace(Some(account), &row.name, driver).await;
+    }
+    require_network_updated(deleted, "delete failed")
 }
 
 /// Enable or disable one of the caller's networks (REST): persist the flag and
@@ -2136,8 +2319,9 @@ pub(super) async fn delete_network(
 mod tests {
     use super::{
         BridgeUpstreamFields, BufferQuery, CreateNetwork, IRC_NETWORK_PRESETS,
-        NetworkAccountCommand, PreflightNetwork, network_name_ok, runtime_response,
-        validate_bridge_upstream, validate_irc_upstream, validate_single_service_token,
+        NetworkAccountCommand, PreflightNetwork, UpdateNetwork, UpdateServerPassword,
+        network_name_ok, parse_server_password, runtime_response, validate_bridge_upstream,
+        validate_irc_upstream, validate_single_service_token,
     };
 
     #[test]
@@ -2156,6 +2340,51 @@ mod tests {
             r#"{"kind":"discord","name":"wrong","addr":"","tls":true,"nick":"alice","autojoin":[],"sasl_password":"token"}"#
         )
         .is_err());
+    }
+
+    /// A replace states what happens to the server password, as it does for
+    /// the SASL credentials: an omitted field would have to mean keep or
+    /// erase, and a `set` without a password is not a set.
+    #[test]
+    fn a_replace_states_its_server_password_action() {
+        let replace = |server_password: &str| {
+            serde_json::from_str::<UpdateNetwork>(&format!(
+                r#"{{"addr":"irc.example:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice","autojoin":[],"credentials":{{"action":"keep"}}{server_password}}}"#
+            ))
+            .map(|request| request.server_password)
+        };
+        assert!(replace("").is_err(), "omitted");
+        assert!(matches!(
+            replace(r#","server_password":{"action":"keep"}"#),
+            Ok(UpdateServerPassword::Keep {})
+        ));
+        assert!(matches!(
+            replace(r#","server_password":{"action":"remove"}"#),
+            Ok(UpdateServerPassword::Remove {})
+        ));
+        assert!(matches!(
+            replace(r#","server_password":{"action":"set","password":"open sesame"}"#),
+            Ok(UpdateServerPassword::Set { password }) if password == "open sesame"
+        ));
+        for refused in [
+            r#","server_password":{"action":"set"}"#,
+            r#","server_password":null"#,
+            r#","server_password":"open sesame""#,
+            r#","server_password":{"action":"keep","password":"x"}"#,
+        ] {
+            assert!(replace(refused).is_err(), "{refused}");
+        }
+        // The same holds for the credential action: a stray password beside
+        // `keep` is refused, not dropped.
+        assert!(
+            serde_json::from_str::<UpdateNetwork>(
+                r#"{"addr":"irc.example:6697","tls":true,"nick":"alice","credentials":{"action":"keep","password":"typed"},"server_password":{"action":"keep"}}"#
+            )
+            .is_err()
+        );
+        let error = parse_server_password("a\r\nQUIT".into()).expect_err("a delimiter");
+        assert_eq!(error.field, Some("server_password"));
+        assert!(!error.message().contains("QUIT"), "{}", error.message());
     }
 
     #[test]

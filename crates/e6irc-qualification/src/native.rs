@@ -58,17 +58,6 @@ fn not_run(kind: TargetKind) -> ProbeReport {
     ProbeReport::not_run(kind)
 }
 
-fn failed(kind: TargetKind) -> ProbeReport {
-    report(
-        kind,
-        PhaseOutcome::Failed,
-        PhaseOutcome::NotRun,
-        PhaseOutcome::NotRun,
-        PhaseOutcome::NotRun,
-        PhaseOutcome::NotRun,
-    )
-}
-
 struct Secret(String);
 
 impl Secret {
@@ -227,15 +216,32 @@ enum EndpointScope {
     External,
 }
 
-impl EndpointScope {
-    fn parse_host(host: &str) -> Option<Self> {
-        if is_loopback_host(host) {
-            return Some(Self::Loopback);
-        }
-        host.trim_matches(['[', ']'])
-            .parse::<std::net::IpAddr>()
-            .is_err()
-            .then_some(Self::External)
+/// An endpoint's scope and, for a loopback one, the addresses to dial.
+///
+/// "This machine" is decided by address, with the native clients' own rule
+/// ([`e6irc_client::loopback_addresses`]): every address the host resolves to
+/// must be loopback, and the connection then goes to exactly those addresses,
+/// so the name cannot be resolved again, differently, afterwards. Anything
+/// else is external and must be reached over TLS, which authenticates it by
+/// certificate. An external endpoint is named: an address literal outside
+/// loopback (a private or public IP) proves no identity and is refused.
+async fn endpoint_scope(url: &Url) -> Option<(EndpointScope, Vec<std::net::SocketAddr>)> {
+    let host = url.host_str()?;
+    let port = url.port_or_known_default()?;
+    if let Ok(address) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        return address.to_canonical().is_loopback().then(|| {
+            (
+                EndpointScope::Loopback,
+                vec![std::net::SocketAddr::new(address, port)],
+            )
+        });
+    }
+    // `host_str` keeps an IPv6 address's brackets, so this is `host:port`. A
+    // name that does not resolve here is not proven loopback, so it is held to
+    // the external rule (TLS) rather than refused outright.
+    match e6irc_client::loopback_addresses(&format!("{host}:{port}")).await {
+        Ok(Some(addresses)) => Some((EndpointScope::Loopback, addresses)),
+        Ok(None) | Err(_) => Some((EndpointScope::External, Vec::new())),
     }
 }
 
@@ -244,9 +250,36 @@ impl EndpointScope {
 struct CampaignUrl {
     url: Url,
     scope: EndpointScope,
+    /// The loopback addresses a plaintext request is dialled to; empty for a
+    /// TLS endpoint.
+    pinned: Vec<std::net::SocketAddr>,
+    /// The client requests to this endpoint go through: pinned to `pinned`
+    /// for a loopback endpoint, resolving by name (and authenticating by
+    /// certificate) for a TLS one.
+    client: Client,
 }
 
 impl CampaignUrl {
+    fn new(url: Url, scope: EndpointScope, pinned: Vec<std::net::SocketAddr>) -> Option<Self> {
+        let mut builder = Client::builder()
+            .timeout(TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none());
+        if !pinned.is_empty() {
+            builder = builder.resolve_to_addrs(url.host_str()?.trim_matches(['[', ']']), &pinned);
+        }
+        // As `reqwest::Client::new` does: the builder fails only when the TLS
+        // backend cannot initialise, which no campaign can recover from.
+        let client = builder
+            .build()
+            .expect("the HTTP client's TLS backend initialises");
+        Some(Self {
+            url,
+            scope,
+            pinned,
+            client,
+        })
+    }
+
     fn as_url(&self) -> &Url {
         &self.url
     }
@@ -255,43 +288,70 @@ impl CampaignUrl {
         self.url.as_str()
     }
 
-    fn into_url(self) -> Url {
-        self.url
-    }
-
     fn has_scope(&self, scope: EndpointScope) -> bool {
         self.scope == scope
     }
+
+    /// The same endpoint's origin with another path: keeps the scope, the
+    /// pinned addresses and the client, which belong to the origin.
+    fn with_url(&self, url: Url) -> Option<Self> {
+        (url.origin() == self.url.origin()).then(|| Self {
+            url,
+            scope: self.scope,
+            pinned: self.pinned.clone(),
+            client: self.client.clone(),
+        })
+    }
+
+    fn get(&self) -> RequestBuilder {
+        self.client.get(self.url.clone())
+    }
+
+    fn post(&self) -> RequestBuilder {
+        self.client.post(self.url.clone())
+    }
+
+    fn delete(&self) -> RequestBuilder {
+        self.client.delete(self.url.clone())
+    }
 }
 
-fn safe_url(value: &str) -> Option<CampaignUrl> {
-    let url = Url::parse(value).ok()?;
-    let scope = url.host_str().and_then(EndpointScope::parse_host)?;
-    ((url.scheme() == "https" || (url.scheme() == "http" && scope == EndpointScope::Loopback))
-        && url.host_str().is_some()
+fn credential_free(url: &Url) -> bool {
+    url.host_str().is_some()
         && url.username().is_empty()
         && url.password().is_none()
-        && url.query().is_none()
-        && url.fragment().is_none())
-    .then_some(CampaignUrl { url, scope })
+        && url.fragment().is_none()
+}
+
+async fn safe_url(value: &str) -> Option<CampaignUrl> {
+    let url = Url::parse(value).ok()?;
+    if !credential_free(&url) || url.query().is_some() {
+        return None;
+    }
+    let (scope, pinned) = endpoint_scope(&url).await?;
+    if url.scheme() == "https" || (url.scheme() == "http" && scope == EndpointScope::Loopback) {
+        CampaignUrl::new(url, scope, pinned)
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
 struct CampaignSocketUrl {
     url: Url,
     scope: EndpointScope,
+    pinned: Vec<std::net::SocketAddr>,
 }
 
 impl CampaignSocketUrl {
-    fn parse(value: &str) -> Option<Self> {
+    async fn parse(value: &str) -> Option<Self> {
         let url = Url::parse(value).ok()?;
-        let scope = url.host_str().and_then(EndpointScope::parse_host)?;
-        ((url.scheme() == "wss" || (url.scheme() == "ws" && scope == EndpointScope::Loopback))
-            && url.host_str().is_some()
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.fragment().is_none())
-        .then_some(Self { url, scope })
+        if !credential_free(&url) {
+            return None;
+        }
+        let (scope, pinned) = endpoint_scope(&url).await?;
+        (url.scheme() == "wss" || (url.scheme() == "ws" && scope == EndpointScope::Loopback))
+            .then_some(Self { url, scope, pinned })
     }
 
     fn with_query(&self, values: &[(&str, &str)]) -> String {
@@ -307,43 +367,37 @@ impl CampaignSocketUrl {
     fn has_scope(&self, scope: EndpointScope) -> bool {
         self.scope == scope
     }
+
+    /// Open the socket: a plaintext one to exactly its pinned loopback
+    /// addresses, a TLS one by name.
+    async fn connect(&self, request: String) -> Result<CampaignSocket, ()> {
+        if self.pinned.is_empty() {
+            return connect_async(request)
+                .await
+                .map(|(socket, _)| socket)
+                .map_err(|_| ());
+        }
+        let stream = tokio::net::TcpStream::connect(self.pinned.as_slice())
+            .await
+            .map_err(|_| ())?;
+        tokio_tungstenite::client_async(request, tokio_tungstenite::MaybeTlsStream::Plain(stream))
+            .await
+            .map(|(socket, _)| socket)
+            .map_err(|_| ())
+    }
 }
 
-fn oidc_endpoint(issuer: &CampaignUrl, value: &str) -> Option<CampaignUrl> {
-    let endpoint = safe_url(value)?;
+async fn oidc_endpoint(issuer: &CampaignUrl, value: &str) -> Option<CampaignUrl> {
+    let endpoint = safe_url(value).await?;
     endpoint.has_scope(issuer.scope).then_some(endpoint)
-}
-
-/// The project's one rule for "this machine", shared with the native clients'
-/// refusal to send credentials over plaintext to anywhere else.
-pub(super) use e6irc_client::is_loopback_host;
-
-pub(super) fn is_external_host(host: &str) -> bool {
-    EndpointScope::parse_host(host) == Some(EndpointScope::External)
 }
 
 fn endpoint(base: &CampaignUrl, path: &str) -> Option<CampaignUrl> {
     base.as_url()
         .join(path)
         .ok()
-        .filter(|url| {
-            url.username().is_empty()
-                && url.password().is_none()
-                && url.query().is_none()
-                && url.fragment().is_none()
-        })
-        .and_then(|url| {
-            let scope = url.host_str().and_then(EndpointScope::parse_host)?;
-            (scope == base.scope).then_some(CampaignUrl { url, scope })
-        })
-}
-
-fn client() -> Result<Client, ()> {
-    Client::builder()
-        .timeout(TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| ())
+        .filter(|url| credential_free(url) && url.query().is_none())
+        .and_then(|url| base.with_url(url))
 }
 
 fn classified(status: StatusCode) -> PhaseOutcome {
@@ -423,7 +477,7 @@ struct DiscordIdentify<'a> {
 #[derive(Serialize)]
 struct DiscordIdentifyData<'a> {
     token: &'a str,
-    intents: u8,
+    intents: u64,
     properties: DiscordIdentifyProperties,
 }
 
@@ -526,24 +580,17 @@ async fn discord(_target: &str) -> ProbeReport {
     };
     let base = environment_value("E6IRC_DISCORD_API_BASE")
         .unwrap_or_else(|| "https://discord.com/api/v10".into());
-    let Some(base) = safe_url(&base) else {
+    let Some(base) = safe_url(&base).await else {
         return not_run(TargetKind::Discord);
     };
     let Some(gateway) = endpoint(&base, "gateway") else {
         return not_run(TargetKind::Discord);
     };
-    let Ok(http) = client() else {
-        return failed(TargetKind::Discord);
-    };
     let authorization = format!("Bot {}", token.as_str());
     let Some(channel_url) = endpoint(&base, &format!("channels/{}", channel.as_str())) else {
         return not_run(TargetKind::Discord);
     };
-    let auth = request_outcome(
-        http.get(channel_url.clone().into_url())
-            .header("Authorization", &authorization),
-    )
-    .await;
+    let auth = request_outcome(channel_url.get().header("Authorization", &authorization)).await;
     if auth != PhaseOutcome::Passed {
         return report(
             TargetKind::Discord,
@@ -554,7 +601,7 @@ async fn discord(_target: &str) -> ProbeReport {
             PhaseOutcome::NotRun,
         );
     }
-    let gateway_url = match success_json::<DiscordGateway>(http.get(gateway.into_url())).await {
+    let gateway_url = match success_json::<DiscordGateway>(gateway.get()).await {
         Ok(json) => Some(json.url),
         Err(outcome) => {
             return report(
@@ -567,7 +614,11 @@ async fn discord(_target: &str) -> ProbeReport {
             );
         }
     };
-    let Some(gateway_url) = gateway_url.and_then(|url| CampaignSocketUrl::parse(&url)) else {
+    let gateway_url = match gateway_url {
+        Some(url) => CampaignSocketUrl::parse(&url).await,
+        None => None,
+    };
+    let Some(gateway_url) = gateway_url else {
         return report(
             TargetKind::Discord,
             PhaseOutcome::Passed,
@@ -608,7 +659,8 @@ async fn discord(_target: &str) -> ProbeReport {
             None => return not_run(TargetKind::Discord),
         };
     let posted = match success_json::<DiscordMessageCreated>(
-        http.post(message_collection.into_url())
+        message_collection
+            .post()
             .header("Authorization", &authorization)
             .json(&DiscordMessageCreate { content: &message }),
     )
@@ -650,16 +702,12 @@ async fn discord(_target: &str) -> ProbeReport {
         );
     };
     let persistence = json_outcome(
-        http.get(message_url.clone().into_url())
-            .header("Authorization", &authorization),
+        message_url.get().header("Authorization", &authorization),
         |json: &DiscordMessage| discord_readback_matches(json, &id, &message),
     )
     .await;
-    let cleanup = request_outcome(
-        http.delete(message_url.into_url())
-            .header("Authorization", &authorization),
-    )
-    .await;
+    let cleanup =
+        request_outcome(message_url.delete().header("Authorization", &authorization)).await;
     report(
         TargetKind::Discord,
         PhaseOutcome::Passed,
@@ -679,9 +727,9 @@ fn discord_readback_matches(
 }
 
 async fn discord_connect(url: &CampaignSocketUrl, token: &Secret) -> PhaseOutcome {
-    let Ok(mut socket) = connect_async(url.with_query(&[("v", "10"), ("encoding", "json")]))
+    let Ok(mut socket) = url
+        .connect(url.with_query(&[("v", "10"), ("encoding", "json")]))
         .await
-        .map(|(socket, _)| socket)
     else {
         return PhaseOutcome::Failed;
     };
@@ -702,7 +750,10 @@ async fn discord_connect(url: &CampaignSocketUrl, token: &Secret) -> PhaseOutcom
         op: 2,
         d: DiscordIdentifyData {
             token: token.as_str(),
-            intents: 0,
+            // What the driver identifies with: a campaign that asked for
+            // fewer intents proved a session the driver never opens (the
+            // Message Content intent is privileged and can be refused).
+            intents: e6irc_proto::provider::DISCORD_GATEWAY_INTENTS,
             properties: DiscordIdentifyProperties {
                 os: "linux",
                 browser: "e6irc",
@@ -758,19 +809,15 @@ async fn slack(_target: &str) -> ProbeReport {
     };
     let base = environment_value("E6IRC_SLACK_API_BASE")
         .unwrap_or_else(|| "https://slack.com/api/".into());
-    let Some(base) = safe_url(&base) else {
+    let Some(base) = safe_url(&base).await else {
         return not_run(TargetKind::Slack);
-    };
-    let Ok(http) = client() else {
-        return failed(TargetKind::Slack);
     };
     let authorization = format!("Bearer {}", bot.as_str());
     let Some(auth_url) = endpoint(&base, "auth.test") else {
         return not_run(TargetKind::Slack);
     };
     let auth = json_outcome(
-        http.post(auth_url.into_url())
-            .header("Authorization", &authorization),
+        auth_url.post().header("Authorization", &authorization),
         |response: &SlackResult| response.ok,
     )
     .await;
@@ -784,8 +831,8 @@ async fn slack(_target: &str) -> ProbeReport {
             PhaseOutcome::NotRun,
         );
     }
-    let reconnect = match slack_connect(&http, &base, &app).await {
-        PhaseOutcome::Passed => slack_connect(&http, &base, &app).await,
+    let reconnect = match slack_connect(&base, &app).await {
+        PhaseOutcome::Passed => slack_connect(&base, &app).await,
         outcome => outcome,
     };
     if reconnect != PhaseOutcome::Passed {
@@ -801,9 +848,26 @@ async fn slack(_target: &str) -> ProbeReport {
     let Some(post_url) = endpoint(&base, "chat.postMessage") else {
         return not_run(TargetKind::Slack);
     };
+    // Listen before posting: delivery is proven by the marker's own event
+    // arriving on a Socket Mode connection and being acked — the path the
+    // driver relays through — not by the post's HTTP answer alone.
+    let mut listener = match slack_listen(&base, &app).await {
+        Ok(listener) => listener,
+        Err(outcome) => {
+            return report(
+                TargetKind::Slack,
+                auth,
+                outcome,
+                reconnect,
+                PhaseOutcome::NotRun,
+                PhaseOutcome::NotRun,
+            );
+        }
+    };
     let message = marker("slack");
     let posted = match success_json::<SlackMessagePost>(
-        http.post(post_url.into_url())
+        post_url
+            .post()
             .header("Authorization", &authorization)
             .json(&SlackMessageCreate {
                 channel: channel.as_str(),
@@ -814,6 +878,7 @@ async fn slack(_target: &str) -> ProbeReport {
     {
         Ok(json) => Some(json),
         Err(outcome) => {
+            drop(listener.close(None).await);
             return report(
                 TargetKind::Slack,
                 auth,
@@ -829,6 +894,7 @@ async fn slack(_target: &str) -> ProbeReport {
             .then(|| json.ts.or_else(|| json.message.map(|message| message.ts)))
             .flatten()
     }) else {
+        drop(listener.close(None).await);
         return report(
             TargetKind::Slack,
             auth,
@@ -838,11 +904,14 @@ async fn slack(_target: &str) -> ProbeReport {
             PhaseOutcome::NotRun,
         );
     };
+    let delivery = slack_await_marker(&mut listener, &message, TIMEOUT).await;
+    drop(listener.close(None).await);
     let Some(replies_url) = endpoint(&base, "conversations.replies") else {
         return not_run(TargetKind::Slack);
     };
     let persistence = json_outcome(
-        http.get(replies_url.into_url())
+        replies_url
+            .get()
             .header("Authorization", &authorization)
             .query(&[("channel", channel.as_str()), ("ts", timestamp.as_str())]),
         |json: &SlackReplies| slack_readback_contains(json, &timestamp),
@@ -852,7 +921,8 @@ async fn slack(_target: &str) -> ProbeReport {
         return not_run(TargetKind::Slack);
     };
     let cleanup = json_outcome(
-        http.post(delete_url.into_url())
+        delete_url
+            .post()
             .header("Authorization", &authorization)
             .json(&SlackMessageDelete {
                 channel: channel.as_str(),
@@ -864,11 +934,98 @@ async fn slack(_target: &str) -> ProbeReport {
     report(
         TargetKind::Slack,
         auth,
-        PhaseOutcome::Passed,
+        delivery,
         reconnect,
         cleanup,
         persistence,
     )
+}
+
+type CampaignSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Open a Socket Mode connection and wait for its `hello`, keeping it open.
+async fn slack_listen(base: &CampaignUrl, app: &Secret) -> Result<CampaignSocket, PhaseOutcome> {
+    let url = slack_socket(base, app).await?;
+    let mut socket = url
+        .connect(url.as_str().to_owned())
+        .await
+        .map_err(|()| PhaseOutcome::Failed)?;
+    match tokio::time::timeout(TIMEOUT, socket.next()).await {
+        Ok(Some(Ok(Message::Text(frame)))) if slack_hello(&frame) => Ok(socket),
+        _ => {
+            drop(socket.close(None).await);
+            Err(PhaseOutcome::Failed)
+        }
+    }
+}
+
+/// Wait for the `events_api` envelope carrying `marker` and ack it (and
+/// every other envelope on the way, as the driver does). `Passed` once the
+/// marker's envelope is acked; `Failed` when it does not arrive `within`.
+async fn slack_await_marker(
+    socket: &mut CampaignSocket,
+    marker: &str,
+    within: Duration,
+) -> PhaseOutcome {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let frame = match tokio::time::timeout_at(deadline, socket.next()).await {
+            Ok(Some(Ok(Message::Text(frame)))) => frame,
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(_)) | None) | Err(_) => return PhaseOutcome::Failed,
+        };
+        let Some((envelope_id, carries_marker)) = slack_envelope(&frame, marker) else {
+            continue;
+        };
+        let Ok(ack) = serde_json::to_string(&SlackAck {
+            envelope_id: &envelope_id,
+        }) else {
+            return PhaseOutcome::Failed;
+        };
+        if socket.send(Message::Text(ack.into())).await.is_err() {
+            return PhaseOutcome::Failed;
+        }
+        if carries_marker {
+            return PhaseOutcome::Passed;
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SlackAck<'a> {
+    envelope_id: &'a str,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SlackEnvelope {
+    envelope_id: String,
+    #[serde(default)]
+    payload: Option<SlackEnvelopePayload>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SlackEnvelopePayload {
+    #[serde(default)]
+    event: Option<SlackEnvelopeEvent>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SlackEnvelopeEvent {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+/// An envelope's id and whether its event's text is `marker`; `None` for a
+/// frame that is not an envelope (`hello`, `disconnect` without one).
+fn slack_envelope(frame: &str, marker: &str) -> Option<(String, bool)> {
+    let envelope: SlackEnvelope = serde_json::from_str(frame).ok()?;
+    let carries_marker = envelope
+        .payload
+        .and_then(|payload| payload.event)
+        .and_then(|event| event.text)
+        .is_some_and(|text| text == marker);
+    Some((envelope.envelope_id, carries_marker))
 }
 
 fn slack_readback_contains(response: &SlackReplies, timestamp: &SlackTimestamp) -> bool {
@@ -879,40 +1036,36 @@ fn slack_readback_contains(response: &SlackReplies, timestamp: &SlackTimestamp) 
             .any(|message| message.ts.0 == timestamp.0)
 }
 
-async fn slack_socket(
-    http: &Client,
-    base: &CampaignUrl,
-    app: &Secret,
-) -> Result<CampaignSocketUrl, PhaseOutcome> {
+async fn slack_socket(base: &CampaignUrl, app: &Secret) -> Result<CampaignSocketUrl, PhaseOutcome> {
     let Some(url) = endpoint(base, "apps.connections.open") else {
         return Err(PhaseOutcome::Rejected);
     };
     let response = success_json::<SlackSocketOpen>(
-        http.post(url.into_url())
+        url.post()
             .header("Authorization", format!("Bearer {}", app.as_str())),
     )
     .await?;
     if !response.ok {
         return Err(PhaseOutcome::Rejected);
     }
-    let socket = response
-        .url
-        .as_deref()
-        .and_then(CampaignSocketUrl::parse)
-        .ok_or(PhaseOutcome::Rejected)?;
+    let socket = match response.url.as_deref() {
+        Some(url) => CampaignSocketUrl::parse(url).await,
+        None => None,
+    }
+    .ok_or(PhaseOutcome::Rejected)?;
     socket
         .has_scope(base.scope)
         .then_some(socket)
         .ok_or(PhaseOutcome::Rejected)
 }
 
-async fn slack_connect(http: &Client, base: &CampaignUrl, app: &Secret) -> PhaseOutcome {
-    let url = match slack_socket(http, base, app).await {
+async fn slack_connect(base: &CampaignUrl, app: &Secret) -> PhaseOutcome {
+    let url = match slack_socket(base, app).await {
         Ok(url) => url,
         Err(outcome) => return outcome,
     };
-    match connect_async(url.as_str()).await {
-        Ok((mut socket, _)) => {
+    match url.connect(url.as_str().to_owned()).await {
+        Ok(mut socket) => {
             let hello = tokio::time::timeout(TIMEOUT, socket.next())
                 .await
                 .ok()
@@ -960,16 +1113,13 @@ async fn oidc(target: &str) -> ProbeReport {
     ) else {
         return not_run(TargetKind::Oidc);
     };
-    let Some(issuer) = safe_url(target) else {
+    let Some(issuer) = safe_url(target).await else {
         return not_run(TargetKind::Oidc);
     };
     let Some(discovery) = oidc_discovery_url(&issuer) else {
         return not_run(TargetKind::Oidc);
     };
-    let Ok(http) = client() else {
-        return failed(TargetKind::Oidc);
-    };
-    let configuration = match success_json::<OidcDiscovery>(http.get(discovery.into_url())).await {
+    let configuration = match success_json::<OidcDiscovery>(discovery.get()).await {
         Ok(json) => json,
         Err(outcome) => {
             return report(
@@ -985,19 +1135,20 @@ async fn oidc(target: &str) -> ProbeReport {
     if !oidc_issuer_matches(&configuration, &issuer) {
         return not_run(TargetKind::Oidc);
     }
-    let Some(token_endpoint) = oidc_endpoint(&issuer, &configuration.token_endpoint) else {
+    let Some(token_endpoint) = oidc_endpoint(&issuer, &configuration.token_endpoint).await else {
         return not_run(TargetKind::Oidc);
     };
     let Some(introspection_endpoint) =
-        oidc_endpoint(&issuer, &configuration.introspection_endpoint)
+        oidc_endpoint(&issuer, &configuration.introspection_endpoint).await
     else {
         return not_run(TargetKind::Oidc);
     };
-    let Some(revocation_endpoint) = oidc_endpoint(&issuer, &configuration.revocation_endpoint)
+    let Some(revocation_endpoint) =
+        oidc_endpoint(&issuer, &configuration.revocation_endpoint).await
     else {
         return not_run(TargetKind::Oidc);
     };
-    let token = match oidc_token(&http, &token_endpoint, &client_id, &secret).await {
+    let token = match oidc_token(&token_endpoint, &client_id, &secret).await {
         Ok(token) => token,
         Err(outcome) => {
             return report(
@@ -1010,26 +1161,29 @@ async fn oidc(target: &str) -> ProbeReport {
             );
         }
     };
-    let reconnect = match oidc_token(&http, &token_endpoint, &client_id, &secret).await {
+    let reconnect = match oidc_token(&token_endpoint, &client_id, &secret).await {
         Ok(_) => PhaseOutcome::Passed,
         Err(outcome) => outcome,
     };
     let persistence = json_outcome(
-        http.post(introspection_endpoint.clone().into_url())
+        introspection_endpoint
+            .post()
             .basic_auth(client_id.as_str(), Some(secret.as_str()))
             .form(&[("token", token.as_str())]),
         |response: &OidcIntrospection| response.active,
     )
     .await;
     let revoked = request_outcome(
-        http.post(revocation_endpoint.into_url())
+        revocation_endpoint
+            .post()
             .basic_auth(client_id.as_str(), Some(secret.as_str()))
             .form(&[("token", token.as_str())]),
     )
     .await;
     let cleanup = if revoked == PhaseOutcome::Passed {
         json_outcome(
-            http.post(introspection_endpoint.into_url())
+            introspection_endpoint
+                .post()
                 .basic_auth(client_id.as_str(), Some(secret.as_str()))
                 .form(&[("token", token.as_str())]),
             |response: &OidcIntrospection| !response.active,
@@ -1053,25 +1207,23 @@ fn oidc_issuer_matches(configuration: &OidcDiscovery, issuer: &CampaignUrl) -> b
 }
 
 fn oidc_discovery_url(issuer: &CampaignUrl) -> Option<CampaignUrl> {
-    let scope = issuer.scope;
-    let mut issuer = issuer.as_url().clone();
-    if !issuer.path().ends_with('/') {
-        issuer.set_path(&format!("{}/", issuer.path()));
+    let mut base = issuer.as_url().clone();
+    if !base.path().ends_with('/') {
+        base.set_path(&format!("{}/", base.path()));
     }
-    issuer
-        .join(".well-known/openid-configuration")
+    base.join(".well-known/openid-configuration")
         .ok()
-        .map(|url| CampaignUrl { url, scope })
+        .and_then(|url| issuer.with_url(url))
 }
 
 async fn oidc_token(
-    http: &Client,
     endpoint: &CampaignUrl,
     client_id: &Secret,
     secret: &Secret,
 ) -> Result<Secret, PhaseOutcome> {
     let response = success_json::<OidcToken>(
-        http.post(endpoint.clone().into_url())
+        endpoint
+            .post()
             .basic_auth(client_id.as_str(), Some(secret.as_str()))
             .form(&[("grant_type", "client_credentials")]),
     )

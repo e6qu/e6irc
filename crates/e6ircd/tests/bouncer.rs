@@ -133,6 +133,7 @@ async fn driver_registers_relays_and_buffers() {
             nick: "speaker",
             username: "speaker",
             realname: "speaker",
+            server_password: None,
         })
         .await
         .expect("register");
@@ -396,6 +397,19 @@ async fn bnc_account_db(test: &str, account: &str, password: &str) -> String {
     url
 }
 
+/// A pool for the test's own observation queries on an already-migrated
+/// database. Not `db::connect_and_migrate`: that is the daemon's pool, whose
+/// 2 s acquire timeout is a production bound, and on a loaded test host it
+/// turned a slow poll into `count: PoolTimedOut`.
+async fn observer_pool(url: &str) -> sqlx::PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .connect(url)
+        .await
+        .expect("observer pool")
+}
+
 fn bnc_config(up: std::net::SocketAddr, url: String) -> Config {
     use e6ircd::config::{BncConfig, DatabaseConfig, NetworkEntry};
     Config {
@@ -409,6 +423,7 @@ fn bnc_config(up: std::net::SocketAddr, url: String) -> Config {
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         networks: vec![
             NetworkEntry {
@@ -424,6 +439,7 @@ fn bnc_config(up: std::net::SocketAddr, url: String) -> Config {
                 buffer_cap: 1000,
                 sasl_account: None,
                 sasl_password: None,
+                server_password: None,
             },
             // A network owned by a different account: alice must not see it.
             NetworkEntry {
@@ -439,10 +455,12 @@ fn bnc_config(up: std::net::SocketAddr, url: String) -> Config {
                 buffer_cap: 1000,
                 sasl_account: None,
                 sasl_password: None,
+                server_password: None,
             },
         ],
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
         }),
         internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
@@ -473,6 +491,7 @@ async fn bnc_listener_authenticates_and_routes_client_to_network() {
         nick: "uppeer",
         username: "uppeer",
         realname: "peer",
+        server_password: None,
     })
     .await
     .unwrap();
@@ -494,6 +513,7 @@ async fn bnc_listener_authenticates_and_routes_client_to_network() {
                 nick: "alice/up",
                 username: "aliceup",
                 realname: "Me",
+                server_password: None,
             },
             "alice",
             "s3cr3t",
@@ -543,6 +563,72 @@ async fn bnc_listener_authenticates_and_routes_client_to_network() {
     assert_eq!(live.params.first().map(String::as_str), Some("#lobby"));
 }
 
+/// Off loopback the attach listener must be TLS, because attaching clients
+/// send their account password. A TLS listener serves its certificate, a
+/// client that verifies it attaches with SASL PLAIN inside the tunnel, and a
+/// plaintext client is never answered in cleartext.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn bnc_listener_attaches_over_tls() {
+    let url = bnc_account_db("bnc_listener_attaches_over_tls", "alice", "s3cr3t").await;
+    let up = upstream().await;
+    let certificate =
+        rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("certificate");
+    let dir = std::env::temp_dir().join(format!("e6irc-bnc-tls-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("directory");
+    let tls = e6ircd::config::TlsConfig {
+        cert_path: dir.join("cert.pem"),
+        key_path: dir.join("key.pem"),
+    };
+    std::fs::write(&tls.cert_path, certificate.cert.pem()).expect("write certificate");
+    std::fs::write(&tls.key_path, certificate.signing_key.serialize_pem()).expect("write key");
+    let mut config = bnc_config(up, url);
+    config.bnc.as_mut().expect("bnc").tls = Some(tls);
+    let running = net::start(config).await.expect("start");
+    let bnc = running.bnc_addr.expect("bnc bound");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(certificate.cert.der().clone())
+        .expect("trust the test certificate");
+    let mut client = e6irc_client::Connection::connect_tls(&bnc.to_string(), "localhost", roots)
+        .await
+        .expect("TLS handshake with the attach listener");
+    let confirmed = client
+        .register_sasl(
+            &e6irc_client::Identity {
+                nick: "alice/up",
+                username: "aliceup",
+                realname: "Me",
+                server_password: None,
+            },
+            "alice",
+            "s3cr3t",
+        )
+        .await
+        .expect("SASL attach over TLS");
+    assert_eq!(confirmed, "bncnick");
+
+    // A plaintext client speaks to a TLS endpoint: it is never registered.
+    let mut plain = e6irc_client::Connection::connect(&bnc.to_string())
+        .await
+        .expect("TCP connect");
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        plain.register(&e6irc_client::Identity {
+            nick: "alice/up",
+            username: "aliceup",
+            realname: "Me",
+            server_password: None,
+        }),
+    )
+    .await
+    .expect("the listener closes a plaintext client");
+    assert!(refused.is_err(), "{refused:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn bnc_listener_rejects_unauthenticated_and_wrong_password() {
@@ -566,7 +652,8 @@ async fn bnc_listener_rejects_unauthenticated_and_wrong_password() {
         anon.register(&e6irc_client::Identity {
             nick: "alice/up",
             username: "aliceup",
-            realname: "Me"
+            realname: "Me",
+            server_password: None,
         })
         .await
         .is_err(),
@@ -582,7 +669,8 @@ async fn bnc_listener_rejects_unauthenticated_and_wrong_password() {
             &e6irc_client::Identity {
                 nick: "alice/up",
                 username: "aliceup",
-                realname: "Me"
+                realname: "Me",
+                server_password: None,
             },
             "alice",
             "wrong"
@@ -605,7 +693,8 @@ async fn bnc_listener_rejects_unauthenticated_and_wrong_password() {
                 &e6irc_client::Identity {
                     nick: "alice/bobnet",
                     username: "alicebobne",
-                    realname: "Me"
+                    realname: "Me",
+                    server_password: None,
                 },
                 "alice",
                 "s3cr3t"
@@ -735,6 +824,7 @@ async fn driver_authenticates_to_sasl_upstream() {
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         ..Config::default()
     };
@@ -763,6 +853,7 @@ async fn driver_authenticates_to_sasl_upstream() {
             nick: "obs",
             username: "obs",
             realname: "obs",
+            server_password: None,
         })
         .await
         .unwrap();
@@ -809,6 +900,7 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
         nick: "uppeer",
         username: "uppeer",
         realname: "peer",
+        server_password: None,
     })
     .await
     .unwrap();
@@ -823,7 +915,7 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
         .unwrap();
 
     // Wait until the line is in the persisted buffer.
-    let pool = e6ircd::db::connect_and_migrate(&url).await.expect("pool");
+    let pool = observer_pool(&url).await;
     let persisted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let lines = e6ircd::db::recent_bnc_lines(&pool, "alice", "up", 100)
@@ -855,6 +947,7 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
         database: Some(DatabaseConfig {
             url: url.clone(),
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         networks: vec![NetworkEntry {
             kind: NetworkKind::Irc,
@@ -869,9 +962,11 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
             buffer_cap: 1000,
             sasl_account: None,
             sasl_password: None,
+            server_password: None,
         }],
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
         }),
         internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
@@ -890,6 +985,7 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
                 nick: "alice/up",
                 username: "aliceup",
                 realname: "Me",
+                server_password: None,
             },
             "alice",
             "s3cr3t",
@@ -940,6 +1036,7 @@ async fn local_driver_presents_the_in_process_network() {
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         networks: vec![NetworkEntry {
             name: "home".into(),
@@ -954,9 +1051,11 @@ async fn local_driver_presents_the_in_process_network() {
             buffer_cap: 1000,
             sasl_account: None,
             sasl_password: None,
+            server_password: None,
         }],
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
         }),
         internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
@@ -976,6 +1075,7 @@ async fn local_driver_presents_the_in_process_network() {
         nick: "peer",
         username: "peer",
         realname: "peer",
+        server_password: None,
     })
     .await
     .unwrap();
@@ -997,6 +1097,7 @@ async fn local_driver_presents_the_in_process_network() {
                 nick: "alice/home",
                 username: "alicehome",
                 realname: "Me",
+                server_password: None,
             },
             "alice",
             "s3cr3t",
@@ -1058,6 +1159,7 @@ async fn persisted_bnc_buffer_is_trimmed_by_its_own_traffic() {
         nick: "uppeer",
         username: "uppeer",
         realname: "peer",
+        server_password: None,
     })
     .await
     .expect("peer register");
@@ -1068,7 +1170,7 @@ async fn persisted_bnc_buffer_is_trimmed_by_its_own_traffic() {
         }
     }
 
-    let pool = e6ircd::db::connect_and_migrate(&url).await.expect("pool");
+    let pool = observer_pool(&url).await;
     let rows = || {
         let pool = pool.clone();
         async move {
@@ -1157,6 +1259,7 @@ async fn buffered_upstream_lines_keep_their_wire_form() {
         nick: "uppeer",
         username: "uppeer",
         realname: "peer",
+        server_password: None,
     })
     .await
     .expect("peer register");
@@ -1170,7 +1273,7 @@ async fn buffered_upstream_lines_keep_their_wire_form() {
     // and exactly where a re-serializer diverges from the sender.
     peer.send_line("PRIVMSG #lobby :hi").await.expect("send");
 
-    let pool = e6ircd::db::connect_and_migrate(&url).await.expect("pool");
+    let pool = observer_pool(&url).await;
     let line = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let lines = e6ircd::db::recent_bnc_lines(&pool, "alice", "up", 100)
@@ -1247,6 +1350,24 @@ impl FakeSession {
         assert_eq!(self.read_line().await, "CAP REQ :sasl");
         self.send(":up CAP * ACK :sasl").await;
         self.acknowledge_metadata().await;
+    }
+
+    /// Registration with an upstream that offers `echo-message`: the driver
+    /// asks for it on its own, after the metadata set, and is acknowledged.
+    async fn complete_registration_with_echo_message(&mut self, nick: &str) {
+        assert_eq!(self.read_line().await, "CAP LS 302");
+        self.send(":up CAP * LS :server-time message-tags account-tag echo-message")
+            .await;
+        self.acknowledge_metadata().await;
+        assert_eq!(self.read_line().await, "CAP REQ :echo-message");
+        self.send(":up CAP * ACK :echo-message").await;
+        loop {
+            let line = self.read_line().await;
+            if line.starts_with("USER ") {
+                self.send(&format!(":up 001 {nick} :welcome")).await;
+                return;
+            }
+        }
     }
 
     /// Read until the registration burst (NICK/USER) completes, then welcome
@@ -1356,6 +1477,120 @@ async fn the_configured_username_is_what_the_upstream_is_sent() {
         assert_eq!(user, "USER botident 0 * :Real Name", "{registration}");
     }
     drop(handle);
+}
+
+/// A private upstream that wants `PASS :right` before anything else, and
+/// answers `464` to a wrong password or to none. Every line each connection
+/// opened with goes to `first_lines`.
+fn private_upstream(
+    listener: tokio::net::TcpListener,
+    first_lines: tokio::sync::mpsc::Sender<String>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let mut session = fake_accept(&listener).await;
+            let first_lines = first_lines.clone();
+            tokio::spawn(async move {
+                let first = session.read_line().await;
+                first_lines.send(first.clone()).await.ok();
+                match first.as_str() {
+                    "PASS :right" => {
+                        session.complete_registration("private").await;
+                    }
+                    "CAP LS 302" => session.send(":up 464 * :Password required").await,
+                    _ => session.send(":up 464 * :Password incorrect").await,
+                }
+                while !session.read_line().await.is_empty() {}
+            });
+        }
+    });
+}
+
+/// A private server's password goes out as the first line, before `CAP LS`,
+/// from the connection test and the driver alike. A missing one and a
+/// rejected one are told apart; a rejected one waits on the refusal schedule
+/// like any configuration the server will not take, and the right one
+/// connects.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_password_is_sent_first_and_its_refusals_are_told_apart() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (first_tx, mut first_rx) = tokio::sync::mpsc::channel(64);
+    private_upstream(listener, first_tx);
+    let config = |server_password: Option<&str>| NetworkConfig {
+        addr: addr.to_string(),
+        nick: "private".parse().expect("test nickname"),
+        server_password: server_password
+            .map(|value| e6irc_client::ServerPassword::parse(value.into()).expect("valid")),
+        rejection_retry_floor: std::time::Duration::from_millis(200),
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    };
+    let budget = std::time::Duration::from_secs(10);
+    let mut first_line = async || {
+        tokio::time::timeout(budget, first_rx.recv())
+            .await
+            .expect("the upstream heard nothing")
+            .expect("upstream script ended")
+    };
+
+    let missing = preflight_irc(&config(None), budget)
+        .await
+        .expect_err("no password");
+    assert_eq!(missing.code(), "server_password_required");
+    assert!(
+        missing.summary().contains("does not supply"),
+        "{}",
+        missing.summary()
+    );
+    assert_eq!(first_line().await, "CAP LS 302");
+
+    let rejected = preflight_irc(&config(Some("wrong")), budget)
+        .await
+        .expect_err("a wrong password");
+    assert_eq!(rejected.code(), "server_password_rejected");
+    assert!(
+        rejected
+            .summary()
+            .contains("rejected the configured server password"),
+        "{}",
+        rejected.summary()
+    );
+    assert!(!rejected.summary().contains("wrong"));
+    assert_eq!(first_line().await, "PASS :wrong");
+
+    preflight_irc(&config(Some("right")), budget)
+        .await
+        .expect("the right password qualifies");
+    assert_eq!(first_line().await, "PASS :right");
+
+    // The driver: a rejected password is reported and retried on the refusal
+    // schedule, not hammered and not parked at once.
+    let wrong = IrcNetwork::start(config(Some("wrong")));
+    for attempt in ["first", "second"] {
+        assert_eq!(first_line().await, "PASS :wrong", "{attempt} attempt");
+    }
+    let snapshot = wrong.runtime_snapshot();
+    assert_eq!(
+        snapshot.last_error,
+        Some(e6ircd::bouncer::NetworkFailure::ServerPasswordRejected),
+        "{snapshot:?}"
+    );
+    assert_ne!(
+        snapshot.lifecycle,
+        NetworkLifecycle::Connected,
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.last_error_diagnostic.as_deref(),
+        Some("Password incorrect")
+    );
+    drop(wrong);
+
+    let right = IrcNetwork::start(config(Some("right")));
+    let mut events = right.subscribe();
+    wait_connected(&right, &mut events).await;
+    drop(right);
 }
 
 /// Registration is the qualification. The test joins none of the configured
@@ -1612,6 +1847,165 @@ async fn driver_tracks_forced_upstream_nick_change() {
     .expect("no echo");
     // The NICK echo also revealed the user and host the upstream shows.
     assert!(echo.contains(":renamed!~bncbot@up PRIVMSG"), "{echo}");
+}
+
+/// Start a driver against a scripted upstream that offers `echo-message` and
+/// answers the first `PRIVMSG` it reads with `answer` (its lines, `{line}`
+/// replaced by what it read).
+async fn echo_message_upstream(answer: &'static [&'static str]) -> NetworkHandle {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session
+            .complete_registration_with_echo_message("bncbot")
+            .await;
+        loop {
+            let line = session.read_line().await;
+            if line.starts_with("PRIVMSG ") {
+                for reply in answer {
+                    session.send(&reply.replace("{line}", &line)).await;
+                }
+            }
+        }
+    });
+    IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    })
+}
+
+/// Every event the driver emits within `window`.
+async fn events_within(
+    events: &mut tokio::sync::broadcast::Receiver<DriverEvent>,
+    window: std::time::Duration,
+) -> Vec<DriverEvent> {
+    let mut seen = Vec::new();
+    let _ = tokio::time::timeout(window, async {
+        while let Ok(event) = events.recv().await {
+            seen.push(event);
+        }
+    })
+    .await;
+    seen
+}
+
+/// An upstream that offers `echo-message` is asked for it, and its echo is
+/// the one the originator sees: an upstream that refuses the message (404)
+/// sends no echo, so the refusal — not a bouncer-made echo written before the
+/// upstream answered — is the verdict an attached `e6irc send` reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_refusal_is_not_preceded_by_a_synthesized_echo() {
+    let handle = echo_message_upstream(&[":up 404 bncbot #room :Cannot send to channel"]).await;
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    assert_eq!(
+        handle.send_from(7, "PRIVMSG #room :hello"),
+        SendOutcome::Sent
+    );
+    let seen = events_within(&mut events, std::time::Duration::from_secs(2)).await;
+    assert!(
+        !seen
+            .iter()
+            .any(|event| matches!(event, DriverEvent::Echo { .. })),
+        "a refused message was echoed: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|event| matches!(
+            event,
+            DriverEvent::Line(e6ircd::bouncer::BufferedLine { line, .. }) if line.contains(" 404 ")
+        )),
+        "the refusal reaches the attached clients: {seen:?}"
+    );
+}
+
+/// The upstream's own echo of an accepted message is relayed as the one echo
+/// of that line, routed to its originator — never doubled by a synthesized one.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_echo_is_the_only_echo_and_keeps_its_originator() {
+    let handle = echo_message_upstream(&[
+        "@time=2026-09-21T10:00:00.000Z :bncbot!~bncbot@up.example PRIVMSG #room :hello",
+    ])
+    .await;
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    assert_eq!(
+        handle.send_from(7, "PRIVMSG #room :hello"),
+        SendOutcome::Sent
+    );
+    let seen = events_within(&mut events, std::time::Duration::from_secs(2)).await;
+    let echoes: Vec<(String, u64)> = seen
+        .iter()
+        .filter_map(|event| match event {
+            DriverEvent::Echo {
+                line: e6ircd::bouncer::BufferedLine { line, .. },
+                origin,
+            } => Some((line.clone(), *origin)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(echoes.len(), 1, "exactly one echo: {seen:?}");
+    assert_eq!(echoes[0].1, 7, "routed to the attachment that sent it");
+    assert!(
+        echoes[0].0.contains("2026-09-21T10:00:00.000Z")
+            && echoes[0]
+                .0
+                .contains(":bncbot!~bncbot@up.example PRIVMSG #room :hello"),
+        "the upstream's own echo, with its provenance: {}",
+        echoes[0].0
+    );
+    assert!(
+        !seen.iter().any(|event| matches!(
+            event,
+            DriverEvent::Line(e6ircd::bouncer::BufferedLine { line, .. }) if line.contains("PRIVMSG #room")
+        )),
+        "the echo is not also relayed as an ordinary line: {seen:?}"
+    );
+    let buffered = handle
+        .buffer_snapshot()
+        .into_iter()
+        .filter(|line| line.contains("PRIVMSG #room :hello"))
+        .count();
+    assert_eq!(buffered, 1, "the backlog holds the line once");
+}
+
+/// A NickServ password echoed by the upstream is redacted before it reaches
+/// the backlog, as the bouncer's own echo always was.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_echo_of_a_nickserv_password_is_redacted() {
+    let handle =
+        echo_message_upstream(&[":bncbot!~bncbot@up PRIVMSG NickServ :IDENTIFY hunter2"]).await;
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    assert_eq!(
+        handle.send_from(7, "PRIVMSG NickServ :IDENTIFY hunter2"),
+        SendOutcome::Sent
+    );
+    let seen = events_within(&mut events, std::time::Duration::from_secs(2)).await;
+    let echo = seen
+        .iter()
+        .find_map(|event| match event {
+            DriverEvent::Echo {
+                line: e6ircd::bouncer::BufferedLine { line, .. },
+                ..
+            } => Some(line.clone()),
+            _ => None,
+        })
+        .expect("the echo is relayed");
+    assert!(!echo.contains("hunter2"), "{echo}");
+    assert!(
+        echo.contains("[sensitive NickServ command redacted]"),
+        "{echo}"
+    );
+    assert!(
+        handle
+            .buffer_snapshot()
+            .iter()
+            .all(|line| !line.contains("hunter2")),
+        "the backlog never holds the password"
+    );
 }
 
 /// Channels joined at runtime (not in the configured autojoin) are rejoined
@@ -2295,6 +2689,7 @@ async fn full_buffer_evicts_oldest() {
         nick: "speaker",
         username: "speaker",
         realname: "speaker",
+        server_password: None,
     })
     .await
     .unwrap();
@@ -2382,6 +2777,7 @@ async fn self_echo_is_persisted_to_the_backlog() {
                 nick: "alice/up",
                 username: "aliceup",
                 realname: "Me",
+                server_password: None,
             },
             "alice",
             "s3cr3t",
@@ -2393,7 +2789,7 @@ async fn self_echo_is_persisted_to_the_backlog() {
         .await
         .unwrap();
 
-    let pool = e6ircd::db::connect_and_migrate(&url).await.expect("pool");
+    let pool = observer_pool(&url).await;
     let line = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let lines = e6ircd::db::recent_bnc_lines(&pool, "alice", "up", 100)
@@ -2515,6 +2911,7 @@ async fn bnc_listener_serves_chathistory_and_markread() {
         nick: "uppeer",
         username: "uppeer",
         realname: "peer",
+        server_password: None,
     })
     .await
     .unwrap();
@@ -3150,4 +3547,129 @@ async fn a_server_answering_451_to_capability_discovery_connects_at_once() {
     let snapshot = handle.runtime_snapshot();
     assert_eq!(snapshot.connection_attempts, 1, "{snapshot:?}");
     assert_eq!(snapshot.last_error, None, "{snapshot:?}");
+}
+
+/// The per-network backlog cap holds across restarts. The amortized trim used
+/// to count only the lines one persistence task wrote since it started, so a
+/// network restarted before every thousandth line was never trimmed at all.
+/// Each start now trims once, after the preload.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn the_backlog_cap_holds_across_restarts() {
+    const CAP: i64 = 5_000;
+    let url = bnc_account_db("the_backlog_cap_holds_across_restarts", "alice", "s3cr3t").await;
+    let pool = observer_pool(&url).await;
+    // A buffer already at the cap, as a long-running network leaves it.
+    sqlx::query(
+        "INSERT INTO bnc_buffer (owner, network, line, sent_at)
+         SELECT 'alice', 'up', ':s NOTICE * :seed ' || n, '2026-01-01T00:00:00.000Z'
+         FROM generate_series(1, $1) n",
+    )
+    .bind(CAP as i32)
+    .execute(&pool)
+    .await
+    .expect("seed backlog");
+    // Rows that existed before a start: the start's trim must bring them
+    // within the cap (lines the new driver writes afterwards are not its
+    // business — the amortized trim bounds those).
+    let newest_id = || {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<i64>>("SELECT max(id) FROM bnc_buffer")
+                .fetch_one(&pool)
+                .await
+                .expect("max id")
+                .unwrap_or(0)
+        }
+    };
+    let rows_through = |through: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM bnc_buffer
+                 WHERE owner = 'alice' AND network = 'up' AND id <= $1",
+            )
+            .bind(through)
+            .fetch_one(&pool)
+            .await
+            .expect("count")
+        }
+    };
+    let batch_rows = |batch: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM bnc_buffer
+                 WHERE owner = 'alice' AND network = 'up' AND line LIKE $1",
+            )
+            .bind(format!("%:{batch} %"))
+            .fetch_one(&pool)
+            .await
+            .expect("count batch")
+        }
+    };
+    let up = upstream().await;
+    let mut peer = e6irc_client::Connection::connect(&up.to_string())
+        .await
+        .expect("peer connect");
+    peer.register(&e6irc_client::Identity {
+        nick: "uppeer",
+        username: "uppeer",
+        realname: "peer",
+        server_password: None,
+    })
+    .await
+    .expect("peer register");
+    peer.send_line("JOIN #lobby").await.expect("join");
+    loop {
+        if peer.next_message().await.unwrap().unwrap().command == "366" {
+            break;
+        }
+    }
+    for batch in ["first", "second"] {
+        let before = newest_id().await;
+        let running = net::start(bnc_config(up, url.clone()))
+            .await
+            .expect("start");
+        // The start trims the buffer back to the cap.
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while rows_through(before).await > CAP {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the {batch} start left the backlog over the cap"));
+        // Wait until the driver has joined and persists the peer's lines.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        for n in 0..600 {
+            peer.send_line(&format!("PRIVMSG #lobby :{batch} {n}"))
+                .await
+                .expect("send");
+            if n % 100 == 99 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while batch_rows(batch).await < 600 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the {batch} batch was never fully persisted"));
+        running.shutdown.run().await;
+    }
+    // A third start trims again.
+    let before = newest_id().await;
+    let running = net::start(bnc_config(up, url.clone()))
+        .await
+        .expect("start");
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while rows_through(before).await > CAP {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the final start left the backlog over the cap");
+    assert_eq!(batch_rows("second").await, 600, "the newest lines are kept");
+    running.shutdown.run().await;
 }

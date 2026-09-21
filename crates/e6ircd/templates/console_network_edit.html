@@ -19,6 +19,8 @@
               <label class="check field-wide"><input type="checkbox" name="tls" /><span><strong>Use TLS</strong><small>Recommended for public IRC networks.</small></span></label>
               <label class="field field-wide"><span>Username <em>optional</em></span><input name="username" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="10" pattern="[A-Za-z0-9][A-Za-z0-9_\-]{0,9}" title="Letters, digits, - and _ only, starting with a letter or digit, at most 10 characters" /><small>The ident shown before the @ in your address. Your nickname is used when this is blank.</small></label>
               <label class="field field-wide"><span>Real name <em>optional</em></span><input name="realname" autocomplete="name" maxlength="128" /></label>
+              <label class="field field-wide"><span>New server password <em>optional</em></span><input type="password" name="server_password" autocomplete="new-password" maxlength="504" data-server-password /><small>Only for private servers that require one. Leave blank to keep the stored one.</small></label>
+              <label class="check field-wide"><input type="checkbox" name="clear_server_password" data-server-password-clear /><span><strong>Remove the stored server password</strong></span></label>
             </div>
           </details>
           <div class="form-actions field-wide"><button class="primary" type="submit">Save changes</button><a class="rowlink" href="/console/networks">Cancel</a></div>

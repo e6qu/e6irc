@@ -192,11 +192,12 @@ async fn discord_session(mut socket: WebSocket) {
     let Some(Ok(AxumMessage::Text(identify))) = socket.next().await else {
         return;
     };
+    let identify = serde_json::from_str::<serde_json::Value>(&identify).expect("IDENTIFY JSON");
+    assert_eq!(identify["op"], 2);
+    // The campaign identifies with exactly the driver's intents.
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&identify)
-            .ok()
-            .and_then(|frame| frame.get("op").and_then(serde_json::Value::as_u64)),
-        Some(2)
+        identify["d"]["intents"].as_u64(),
+        Some(e6irc_proto::provider::DISCORD_GATEWAY_INTENTS)
     );
     socket
         .send(AxumMessage::Text("{\"op\":1}".into()))
@@ -221,6 +222,11 @@ async fn discord_session(mut socket: WebSocket) {
 struct SlackOracle {
     websocket: String,
     sends_hello: bool,
+    /// Whether a post's event is delivered on the open socket.
+    delivers_events: bool,
+    /// The newest socket's writer: a post's event goes there.
+    socket: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    acks: Arc<Mutex<Vec<String>>>,
     opens: Arc<AtomicUsize>,
     posts: Arc<AtomicUsize>,
     reads: Arc<AtomicUsize>,
@@ -228,16 +234,23 @@ struct SlackOracle {
 }
 
 async fn start_slack_oracle() -> SlackOracle {
-    start_slack_oracle_with_hello(true).await
+    start_slack_oracle_with(true, true).await
 }
 
 async fn start_slack_oracle_with_hello(sends_hello: bool) -> SlackOracle {
+    start_slack_oracle_with(sends_hello, true).await
+}
+
+async fn start_slack_oracle_with(sends_hello: bool, delivers_events: bool) -> SlackOracle {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind oracle");
     let state = SlackOracle {
         websocket: format!("ws://{}/socket", listener.local_addr().expect("address")),
         sends_hello,
+        delivers_events,
+        socket: Arc::new(Mutex::new(None)),
+        acks: Arc::new(Mutex::new(Vec::new())),
         opens: Arc::new(AtomicUsize::new(0)),
         posts: Arc::new(AtomicUsize::new(0)),
         reads: Arc::new(AtomicUsize::new(0)),
@@ -301,6 +314,26 @@ async fn slack_post(
 ) -> impl IntoResponse {
     if slack_authorized(&headers, "bot") && body.channel == "C42" && !body.text.is_empty() {
         state.posts.fetch_add(1, Ordering::SeqCst);
+        if state.delivers_events
+            && let Some(socket) = state.socket.lock().expect("socket lock").as_ref()
+        {
+            // An unrelated envelope first: the campaign acks it and waits on.
+            for (id, text) in [
+                ("env-other", "someone else"),
+                ("env-marker", body.text.as_str()),
+            ] {
+                drop(
+                    socket.send(
+                        serde_json::json!({
+                            "envelope_id": id, "type": "events_api",
+                            "payload": { "event": { "type": "message", "channel": "C42",
+                                                    "bot_id": "B1", "text": text } },
+                        })
+                        .to_string(),
+                    ),
+                );
+            }
+        }
         (
             StatusCode::OK,
             Json(SlackMessagePost {
@@ -386,7 +419,28 @@ async fn slack_socket(
             ))
             .await
             .expect("send hello");
-        while socket.recv().await.is_some() {}
+        let (writer, mut frames) = tokio::sync::mpsc::unbounded_channel();
+        *state.socket.lock().expect("socket lock") = Some(writer);
+        loop {
+            tokio::select! {
+                frame = frames.recv() => {
+                    let Some(frame) = frame else { return };
+                    if socket.send(AxumMessage::Text(frame.into())).await.is_err() {
+                        return;
+                    }
+                }
+                incoming = socket.recv() => match incoming {
+                    Some(Ok(AxumMessage::Text(text))) => {
+                        let ack: serde_json::Value = serde_json::from_str(&text).expect("ack JSON");
+                        state.acks.lock().expect("acks lock").push(
+                            ack["envelope_id"].as_str().expect("ack envelope id").to_string(),
+                        );
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => return,
+                },
+            }
+        }
     })
 }
 
@@ -502,28 +556,105 @@ async fn oidc_revoke(
     }
 }
 
-#[test]
-fn endpoint_urls_cannot_carry_credentials_or_tokens() {
-    assert!(safe_url("https://issuer.example/api").is_some());
-    assert!(safe_url("http://127.0.0.1/api").is_some());
-    assert!(safe_url("http://[::1]/api").is_some());
-    assert!(safe_url("http://issuer.example/api").is_none());
-    assert!(safe_url("https://user:secret@issuer.example/api").is_none());
-    assert!(safe_url("https://issuer.example/api?token=secret").is_none());
-    assert!(safe_url("https://issuer.example/api#secret").is_none());
-    assert!(safe_url("https://10.0.0.1/api").is_none());
-    assert!(safe_url("https://[fd00::1]/api").is_none());
+#[tokio::test]
+async fn endpoint_urls_cannot_carry_credentials_or_tokens() {
+    assert!(safe_url("https://issuer.example/api").await.is_some());
+    assert!(safe_url("http://127.0.0.1/api").await.is_some());
+    assert!(safe_url("http://[::1]/api").await.is_some());
+    assert!(safe_url("http://issuer.example/api").await.is_none());
+    assert!(
+        safe_url("https://user:secret@issuer.example/api")
+            .await
+            .is_none()
+    );
+    assert!(
+        safe_url("https://issuer.example/api?token=secret")
+            .await
+            .is_none()
+    );
+    assert!(
+        safe_url("https://issuer.example/api#secret")
+            .await
+            .is_none()
+    );
+    assert!(safe_url("https://10.0.0.1/api").await.is_none());
+    assert!(safe_url("https://[fd00::1]/api").await.is_none());
 }
 
-#[test]
-fn provider_socket_urls_require_secure_or_loopback_transport() {
-    assert!(CampaignSocketUrl::parse("wss://gateway.example/socket").is_some());
-    assert!(CampaignSocketUrl::parse("wss://gateway.example/socket?ticket=secret").is_some());
-    assert!(CampaignSocketUrl::parse("ws://127.0.0.1/socket").is_some());
-    assert!(CampaignSocketUrl::parse("ws://gateway.example/socket").is_none());
-    assert!(CampaignSocketUrl::parse("wss://user:secret@gateway.example/socket").is_none());
-    assert!(CampaignSocketUrl::parse("wss://gateway.example/socket#fragment").is_none());
-    assert!(CampaignSocketUrl::parse("wss://10.0.0.1/socket").is_none());
+/// "This machine" is decided by the addresses a host resolves to, never by how
+/// its name is spelled, and a plaintext request then goes to exactly those
+/// addresses: the name cannot be resolved again, differently, afterwards.
+#[tokio::test]
+async fn a_plaintext_endpoint_is_loopback_by_address_and_pinned_to_it() {
+    let literal = safe_url("http://127.0.0.1:8080/api")
+        .await
+        .expect("loopback");
+    assert_eq!(literal.pinned, vec!["127.0.0.1:8080".parse().unwrap()]);
+    let named = safe_url("http://localhost:8080/api")
+        .await
+        .expect("localhost resolves to loopback here");
+    assert!(!named.pinned.is_empty());
+    assert!(
+        named
+            .pinned
+            .iter()
+            .all(|address| address.ip().is_loopback())
+    );
+    let external = safe_url("https://issuer.example/api")
+        .await
+        .expect("external");
+    assert!(
+        external.pinned.is_empty(),
+        "a TLS endpoint is authenticated by its certificate, not pinned"
+    );
+    // An endpoint joined onto a base keeps the base's addresses; one that
+    // would leave the base's origin is refused.
+    assert_eq!(
+        endpoint(&literal, "channels/42")
+            .expect("same origin")
+            .pinned,
+        literal.pinned
+    );
+    assert!(endpoint(&literal, "http://127.0.0.2:8080/other").is_none());
+}
+
+#[tokio::test]
+async fn provider_socket_urls_require_secure_or_loopback_transport() {
+    assert!(
+        CampaignSocketUrl::parse("wss://gateway.example/socket")
+            .await
+            .is_some()
+    );
+    assert!(
+        CampaignSocketUrl::parse("wss://gateway.example/socket?ticket=secret")
+            .await
+            .is_some()
+    );
+    assert!(
+        CampaignSocketUrl::parse("ws://127.0.0.1/socket")
+            .await
+            .is_some()
+    );
+    assert!(
+        CampaignSocketUrl::parse("ws://gateway.example/socket")
+            .await
+            .is_none()
+    );
+    assert!(
+        CampaignSocketUrl::parse("wss://user:secret@gateway.example/socket")
+            .await
+            .is_none()
+    );
+    assert!(
+        CampaignSocketUrl::parse("wss://gateway.example/socket#fragment")
+            .await
+            .is_none()
+    );
+    assert!(
+        CampaignSocketUrl::parse("wss://10.0.0.1/socket")
+            .await
+            .is_none()
+    );
 }
 
 #[test]
@@ -538,47 +669,78 @@ fn provider_identifiers_have_distinct_closed_syntaxes() {
     assert!(SlackTimestamp::parse("1?token=secret".into()).is_none());
 }
 
-#[test]
-fn oidc_metadata_endpoints_cannot_cross_the_loopback_boundary() {
-    let external = safe_url("https://issuer.example").expect("issuer");
-    let loopback = safe_url("http://127.0.0.1/issuer").expect("issuer");
-    assert!(oidc_endpoint(&external, "https://tokens.example/token").is_some());
-    assert!(oidc_endpoint(&external, "http://127.0.0.1/token").is_none());
-    assert!(oidc_endpoint(&loopback, "http://127.0.0.1/token").is_some());
-    assert!(oidc_endpoint(&loopback, "https://tokens.example/token").is_none());
-    assert!(oidc_endpoint(&external, "https://10.0.0.1/token").is_none());
+#[tokio::test]
+async fn oidc_metadata_endpoints_cannot_cross_the_loopback_boundary() {
+    let external = safe_url("https://issuer.example").await.expect("issuer");
+    let loopback = safe_url("http://127.0.0.1/issuer").await.expect("issuer");
+    assert!(
+        oidc_endpoint(&external, "https://tokens.example/token")
+            .await
+            .is_some()
+    );
+    assert!(
+        oidc_endpoint(&external, "http://127.0.0.1/token")
+            .await
+            .is_none()
+    );
+    assert!(
+        oidc_endpoint(&loopback, "http://127.0.0.1/token")
+            .await
+            .is_some()
+    );
+    assert!(
+        oidc_endpoint(&loopback, "https://tokens.example/token")
+            .await
+            .is_none()
+    );
+    assert!(
+        oidc_endpoint(&external, "https://10.0.0.1/token")
+            .await
+            .is_none()
+    );
 }
 
-#[test]
-fn provider_sockets_stay_in_their_endpoint_scope() {
-    let external = safe_url("https://provider.example").expect("provider");
-    let loopback = safe_url("http://127.0.0.1/provider").expect("provider");
+#[tokio::test]
+async fn provider_sockets_stay_in_their_endpoint_scope() {
+    let external = safe_url("https://provider.example")
+        .await
+        .expect("provider");
+    let loopback = safe_url("http://127.0.0.1/provider")
+        .await
+        .expect("provider");
     assert!(
         CampaignSocketUrl::parse("wss://gateway.example/socket")
+            .await
             .is_some_and(|url| url.has_scope(external.scope))
     );
     assert!(
         !CampaignSocketUrl::parse("ws://127.0.0.1/socket")
+            .await
             .is_some_and(|url| url.has_scope(external.scope))
     );
     assert!(
         CampaignSocketUrl::parse("ws://127.0.0.1/socket")
+            .await
             .is_some_and(|url| url.has_scope(loopback.scope))
     );
 }
 
-#[test]
-fn oidc_discovery_keeps_the_issuer_path() {
-    let issuer = safe_url("https://issuer.example/realms/e6").expect("issuer");
+#[tokio::test]
+async fn oidc_discovery_keeps_the_issuer_path() {
+    let issuer = safe_url("https://issuer.example/realms/e6")
+        .await
+        .expect("issuer");
     assert_eq!(
         oidc_discovery_url(&issuer).expect("discovery URL").as_str(),
         "https://issuer.example/realms/e6/.well-known/openid-configuration"
     );
 }
 
-#[test]
-fn oidc_discovery_metadata_must_name_the_requested_issuer() {
-    let issuer = safe_url("https://issuer.example/realms/e6").expect("issuer");
+#[tokio::test]
+async fn oidc_discovery_metadata_must_name_the_requested_issuer() {
+    let issuer = safe_url("https://issuer.example/realms/e6")
+        .await
+        .expect("issuer");
     assert!(oidc_issuer_matches(
         &OidcDiscovery {
             issuer: "https://issuer.example/realms/e6".into(),
@@ -689,16 +851,12 @@ async fn discord_oracle_proves_all_required_phases_and_cleanup() {
         environment_value("E6IRC_DISCORD_CHANNEL_ID").as_deref(),
         Some("42")
     );
-    assert!(safe_url(&environment_value("E6IRC_DISCORD_API_BASE").expect("base")).is_some());
-    let base =
-        safe_url(&environment_value("E6IRC_DISCORD_API_BASE").expect("base")).expect("safe base");
-    let status = client()
-        .expect("client")
-        .get(
-            endpoint(&base, "channels/42")
-                .expect("channel endpoint")
-                .into_url(),
-        )
+    let base = safe_url(&environment_value("E6IRC_DISCORD_API_BASE").expect("base"))
+        .await
+        .expect("safe base");
+    let status = endpoint(&base, "channels/42")
+        .expect("channel endpoint")
+        .get()
         .header("Authorization", "Bot token")
         .send()
         .await
@@ -740,10 +898,63 @@ async fn slack_oracle_proves_all_required_phases_and_cleanup() {
         super::super::ClosedOutcome::Passed,
         "{result:?}"
     );
-    assert_eq!(oracle.opens.load(Ordering::SeqCst), 2);
+    // Two sessions for the reconnect phase, and the one the marker's event
+    // arrived on.
+    assert_eq!(oracle.opens.load(Ordering::SeqCst), 3);
     assert_eq!(oracle.posts.load(Ordering::SeqCst), 1);
+    // The campaign returns once its ack is written; the oracle reads that frame
+    // on its own task, so wait for it rather than race it.
+    let acks = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let acks = oracle.acks.lock().expect("acks lock").clone();
+            if acks.len() >= 2 {
+                return acks;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| oracle.acks.lock().expect("acks lock").clone());
+    assert_eq!(acks, ["env-other", "env-marker"]);
     assert_eq!(oracle.reads.load(Ordering::SeqCst), 1);
     assert_eq!(oracle.deletes.load(Ordering::SeqCst), 1);
+}
+
+/// A post whose event never reaches the socket is not a proven delivery,
+/// whatever the HTTP answer said.
+#[tokio::test]
+async fn slack_delivery_requires_the_markers_event_on_the_socket() {
+    let oracle = start_slack_oracle_with(true, false).await;
+    let base = format!(
+        "http://{}/",
+        oracle
+            .websocket
+            .trim_start_matches("ws://")
+            .trim_end_matches("/socket")
+    );
+    let base = safe_url(&base).await.expect("safe base");
+    let mut listener = slack_listen(&base, &Secret::parse("app".into()).expect("app token"))
+        .await
+        .unwrap_or_else(|_| panic!("the oracle socket said hello"));
+    assert_eq!(
+        slack_await_marker(&mut listener, "marker", Duration::from_millis(300)).await,
+        PhaseOutcome::Failed
+    );
+}
+
+#[test]
+fn slack_envelopes_are_read_for_their_id_and_marker() {
+    let frame = |text: &str| {
+        serde_json::json!({ "envelope_id": "e1", "type": "events_api",
+                            "payload": { "event": { "type": "message", "text": text } } })
+        .to_string()
+    };
+    assert_eq!(slack_envelope(&frame("m"), "m"), Some(("e1".into(), true)));
+    assert_eq!(
+        slack_envelope(&frame("other"), "m"),
+        Some(("e1".into(), false))
+    );
+    assert_eq!(slack_envelope(r#"{"type":"hello"}"#, "m"), None);
 }
 
 #[tokio::test]
@@ -756,14 +967,9 @@ async fn slack_connection_requires_the_hello_frame() {
             .trim_start_matches("ws://")
             .trim_end_matches("/socket")
     );
-    let base = safe_url(&base).expect("safe base");
+    let base = safe_url(&base).await.expect("safe base");
     assert_eq!(
-        slack_connect(
-            &client().expect("client"),
-            &base,
-            &Secret::parse("app".into()).expect("app token")
-        )
-        .await,
+        slack_connect(&base, &Secret::parse("app".into()).expect("app token")).await,
         PhaseOutcome::Failed
     );
 }

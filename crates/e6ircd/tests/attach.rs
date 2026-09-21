@@ -70,6 +70,7 @@ async fn attached_client_gets_playback_and_live_and_can_send() {
         nick: "peer",
         username: "peer",
         realname: "peer",
+        server_password: None,
     })
     .await
     .unwrap();
@@ -206,6 +207,7 @@ async fn two_clients_attach_to_one_always_on_network() {
         nick: "mpeer",
         username: "mpeer",
         realname: "mpeer",
+        server_password: None,
     })
     .await
     .unwrap();

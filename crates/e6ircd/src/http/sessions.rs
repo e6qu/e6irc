@@ -397,6 +397,11 @@ async fn disconnect_response(state: &AppState, request: crate::core::AdminReques
         Ok(crate::core::AdminReply::ConnectionMissing) => {
             problem(StatusCode::NOT_FOUND, "No such live connection", None)
         }
+        Ok(crate::core::AdminReply::AuditUnavailable) => problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Audit trail unavailable",
+            Some("the connection was not disconnected because the action could not be recorded"),
+        ),
         Ok(crate::core::AdminReply::Err(message)) => problem(
             StatusCode::BAD_REQUEST,
             "Disconnect rejected",

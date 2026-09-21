@@ -7,6 +7,7 @@ import {
   autojoinList,
   createNetworkBody,
   credentialAction,
+  serverPasswordAction,
   updateNetworkBody,
 } from "../src/network-request.js";
 
@@ -169,4 +170,35 @@ test("an emptied stored account is not silently kept", () => {
   // Renaming or re-entering the stored account is a set, as before.
   assert.deepEqual(credentialAction({ account: "ada", storedAccount: "ada" }), { action: "set", account: "ada" });
   assert.deepEqual(updateNetworkBody({ addr: "irc.libera.chat:6697", tls: true, nick: "ada", account: "ada", storedAccount: "ada" }).credentials, { action: "set", account: "ada" });
+});
+
+// A server password (IRC PASS) is a second write-only secret with its own
+// action on replace, and is omitted -- never sent as null -- on create.
+
+test("creating a network omits a blank server password and sends a typed one verbatim", () => {
+  const base = { name: "private", addr: "irc.example.org:6697", tls: true, nick: "ada" };
+  assert.ok(!("server_password" in createNetworkBody(base)), "blank is omitted, not null");
+  assert.equal(createNetworkBody({ ...base, serverPassword: " open sesame " }).server_password, " open sesame ");
+});
+
+test("replacing a network states its server-password action", () => {
+  const base = { addr: "irc.example.org:6697", tls: true, nick: "ada" };
+  assert.deepEqual(updateNetworkBody(base).server_password, { action: "keep" });
+  assert.deepEqual(updateNetworkBody({ ...base, serverPassword: "rotated" }).server_password, { action: "set", password: "rotated" });
+  assert.deepEqual(updateNetworkBody({ ...base, clearingServerPassword: true }).server_password, { action: "remove" });
+  assert.deepEqual(serverPasswordAction({}), { action: "keep" });
+});
+
+test("a server password typed under a ticked Remove, or one no PASS line can carry, is refused at its box", () => {
+  assert.throws(
+    () => serverPasswordAction({ clearingServerPassword: true, serverPassword: "typed" }),
+    (error) => error instanceof NetworkRequestError && error.field === "server_password" && /Remove the stored server password/.test(error.message),
+  );
+  for (const serverPassword of ["a\r\nQUIT", "a\u0000b", "é".repeat(253)]) {
+    assert.throws(
+      () => createNetworkBody({ name: "private", addr: "irc.example.org:6697", tls: true, nick: "ada", serverPassword }),
+      (error) => error instanceof NetworkRequestError && error.field === "server_password" && !error.message.includes("QUIT"),
+    );
+  }
+  assert.equal(serverPasswordAction({ serverPassword: "x".repeat(504) }).password.length, 504);
 });

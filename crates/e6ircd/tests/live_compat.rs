@@ -20,6 +20,7 @@ async fn probe(addr: &str, server_name: &str) -> std::io::Result<(bool, HashMap<
         nick: &nick,
         username: "tester",
         realname: "e6irc interop probe",
+        server_password: None,
     })
     .await?;
 

@@ -58,7 +58,7 @@ jobs:
           toolchain: stable
 
       - name: Build qualification runner
-        run: cargo build --release -p e6irc-qualification
+        run: cargo build --locked --release -p e6irc-qualification
 
       - id: campaign
         name: Run external campaign

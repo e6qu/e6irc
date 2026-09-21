@@ -986,9 +986,14 @@ Vanilla PostgreSQL 18 (current stable) via sqlx; migrations embedded and run
 on startup (refusing to start on drift, loudly). CI provisions `postgres:18`
 for every database-backed suite — legacy majors are deliberately not a
 support target, so "it happens to work on an older server" is not a claim
-this project makes or tests. The shared application pool has a two-second
-acquisition deadline, a 15-second PostgreSQL statement deadline, and a
-five-second lock-acquisition deadline on every pooled connection. Dependency
+this project makes or tests. The shared application pool is sized by
+`[database] max_connections` (2–200; default 1 + 4 + 2 × CPU threads) and has a
+two-second acquisition deadline, a 15-second PostgreSQL statement deadline, and a
+five-second lock-acquisition deadline and a 60-second
+`idle_in_transaction_session_timeout` on every pooled connection. Migrations
+run on a dedicated connection with no statement deadline and a ten-second lock
+deadline, retried up to six times with a stderr line per attempt, so a long
+migration is not cancelled by the pool's bound. Dependency
 loss, pool exhaustion, a wedged query, or a contended lock therefore becomes a
 typed database failure instead of parking an HTTP or worker caller indefinitely.
 
@@ -1017,7 +1022,10 @@ Principal tables (columns abridged):
 - `channel_access` (channel_id, account_id, flags) — Atheme-style FLAGS
 - `messages` — append-only history log; columns (id, msgid, target,
   sender_prefix, sender_account, kind, body, ts), indexed `(target, ts)`
-  btree + BRIN on `ts`. The live storage policy retains 1–3650 days
+  and `(ts, id)`; `messages_sender_account_idx` (migration 0063) together with
+  the direct-message peers index makes the account-message predicate (account
+  deletion and export) a BitmapOr of two index scans. Migration 0064 dropped the
+  unused BRIN on `ts`. The live storage policy retains 1–3650 days
   (30 by default) and removes expired rows in bounded 10,000-row batches.
   Native monthly range partitions remain the target representation at the
   scale qualification boundary; retention semantics do not depend on that
@@ -1025,9 +1033,10 @@ Principal tables (columns abridged):
   and `sender_account`, so no separate tags column is stored.
 - `bnc_networks` (account_id, name, addr, tls, nick, realname, autojoin,
   sasl_account, `sasl_password_sealed` — **sealed** (`enc:v1:`) with the
-  server master key (§15), enabled)
-- `bnc_buffer` (id, owner, network, line, created_at, target, msgid,
-  sent_at) — persisted
+  server master key (§15), `server_password_sealed` (IRC only, a table CHECK;
+  sealed like the SASL password), enabled)
+- `bnc_buffer` (id, owner, network, network_id, line, created_at, target,
+  msgid, sent_at) — persisted
   detached-buffer lines replayed on attach after a restart; `owner` is `*`
   for a shared/server-level network; `owner` is the RFC1459-casefolded account,
   matching the registry key. The `/network` selector is likewise folded for
@@ -1050,7 +1059,20 @@ Principal tables (columns abridged):
   `bnc_buffer_created_at_idx`, migration 0060) — "history retention" means
   bouncer history, direct messages included, not only the server's own. The count belongs to that task, not to the table's `id`
   sequence — one sequence is shared by every network, so triggering off it
-  makes retention depend on the interleaving between them
+  makes retention depend on the interleaving between them. Each persistence
+  task also trims once when it starts (after restoring the backlog), in batches
+  of at most 10,000 rows, and maintenance sweeps any buffer still over the cap,
+  64 per tick. `network_id` (nullable foreign key to `bnc_networks` ON DELETE
+  CASCADE, migration 0062) is resolved once when a database network's
+  persistence task starts and written on every line, so a line for a deleted
+  network fails loudly and a re-created network never inherits backlog.
+  Server-level (`*`) lines never carry one (a CHECK); configuration-file
+  networks carry none, including account-owned ones, which have no
+  `bnc_networks` row. Migration 0064 dropped `bnc_buffer_target_idx` and
+  `bnc_buffer_msgid_idx` as unused: `bnc_buffer_sent_at_idx` serves every
+  per-target read and `bnc_buffer_lookup_idx` the replay.
+- `device_grants` — device-authorization approvals; `account_id` references
+  `accounts(id)` ON DELETE CASCADE (migration 0065).
 - `bnc_read_markers` (BIGINT account_id, network, target, timestamp) —
   per-account, per-BNC-network read position, the source for
   `draft/read-marker` on the attach listener. Distinct from `read_markers`
@@ -1067,7 +1089,9 @@ Principal tables (columns abridged):
   of the same account. Deleting a BNC network deletes its markers, so
   recreating the same name cannot inherit stale read state.
 - `read_markers` (account_id, target, marker_ts) — per-account read
-  position, the source for `draft/read-marker`. Updates are monotonic
+  position, the source for `draft/read-marker`. The 256-target cap is enforced
+  in PostgreSQL under an account-row lock, so several core shards cannot exceed
+  it together; a refusal is `FAIL MARKREAD INVALID_PARAMS`. Updates are monotonic
   (`GREATEST`) and the returned committed value drives the core mirror and
   client acknowledgement; an enqueue or PostgreSQL failure is never reported
   as success. Anonymous connections use explicitly session-local markers.
@@ -1085,13 +1109,15 @@ hashes, bearer/session hashes, OpenID Connect subjects, and sealed upstream
 secrets are not selected at all.
 
 A supervised five-minute storage-maintenance worker applies the live
-UI-managed `[storage]` policy independently of monitoring. Each transaction
-removes at most 10,000 expired message-history rows, audit events, browser
-sessions, personal access tokens, device grants, and consumed OpenID Connect
-logout tokens, plus expired/revoked/consumed account invitations, from each
-collection. Time-order indexes and the global
-acquisition/statement/lock deadlines bound both the selection and the
-transaction. Filling any batch is logged with per-collection provenance and
+UI-managed `[storage]` policy independently of monitoring. Each collection —
+expired message-history rows, audit events, browser sessions, personal access
+tokens, device grants, consumed OpenID Connect logout tokens, and
+expired/revoked/consumed account invitations — is its own statement and
+transaction, deleting at most 10,000 rows named by primary key
+(`= ANY(ARRAY(… ORDER BY … LIMIT))`). A failing collection is reported by table
+after the others commit, so one refused delete cannot roll back another.
+Time-order indexes and the global acquisition/statement/lock deadlines bound
+both the selection and the transaction. Filling any batch is logged with per-collection provenance and
 the next fixed cycle continues draining it; database failure is counted and
 logged. The worker's unexpected return or panic is a critical runtime failure,
 not an invisible loss of retention.
@@ -1170,8 +1196,13 @@ registry immediately.
 Administrators can also provision a local account immediately or issue a
 1–30-day single-use invitation. Invitation issuance validates the same account
 name and typed private contact email as direct creation, takes the shared
-  per-name advisory lock, enforces a per-administrator pending cap, and stores
-  only the SHA-256 digest of a 256-bit bearer. The administrator directory is
+  per-name advisory lock, enforces a per-administrator pending cap (counting
+  only unexpired invitations), and stores only the SHA-256 digest of a 256-bit
+  bearer. Suspension, demotion (unless configuration still grants authority)
+  and host recovery revoke the issuer's live invitations in the same
+  transaction, one `ACCOUNT_INVITATION_REVOKE` row each, and accepting an
+  administrator invitation re-checks that its issuer is still an active durable
+  or configured administrator. The administrator directory is
   a bounded, stable newest-first cursor page. Acceptance is rate-limited and
 bound to a short-lived `HttpOnly; SameSite=Strict` browser cookie; password
 hashing, account/contact/authority creation, invitation consumption, and audit
@@ -1183,10 +1214,13 @@ Permanent deletion is a succession operation rather than a cascading accident.
 The target must found no registered channel and cannot be the last active
 effective administrator, including authority supplied by deployment
 configuration. The shared account/network mutation lane first installs a
-folded authentication deny key in the ordered core. The final transaction
+folded authentication deny key in the ordered core, then stops the account's
+drivers, so no persistence task can write backlog behind the deletion (they
+are restarted only if the database refuses). The final transaction
 rechecks every invariant, reserves the name permanently, purges pending/
 consumed invitation contact data, device grants, owned BNC buffer, sent and
-direct-message history, and then deletes the account so credentials, sessions,
+direct-message history (in batches of 5,000, in the fixed order messages →
+bnc_buffer → device_grants → invitations → account), and then deletes the account so credentials, sessions,
 identity links, networks, markers (the bouncer's `bnc_read_markers` included,
 which lacked the cascade until migration 0056 and made deletion fail for anyone
 who had sent one MARKREAD), and access rows cascade. An account's own messages
@@ -1301,7 +1335,12 @@ also enforces a 1 MiB request-body limit, 1,024-request aggregate concurrency
 limit, and 30-second request deadline before work can consume unbounded
 process resources. The concurrency bound is one semaphore for the whole
 service, not one per route, and a request abandoned at the deadline answers a
-`408` problem document. A connection test dials a host the caller chose from
+`408` problem document. Connections are served with a timer: a request's
+headers must arrive within 10 s, and the same bound closes an idle kept-alive
+connection (axum's default server has no timer, which silently drops hyper's
+header timeout). One address may hold 128 connections (trusted proxies
+exempt) and 32 requests in flight (429 beyond); `/healthz` and `/readyz`
+bypass the admission bounds, so one client cannot starve the health check. A connection test dials a host the caller chose from
 the address every tenant shares, so it has its own admission: one running test
 per account, six started per account per minute, and eight running in the
 process; a refusal is a `429` with `Retry-After` and costs the account nothing.
@@ -1582,11 +1621,19 @@ above the trait, provides for every network kind:
 - **Always-on presence**: driver stays up while zero clients are attached.
 - **Multi-client attach/detach**: any number of the user's IRC connections
   (native clients, web client, TUI) attach to a network; joins/parts/msgs
-  are mirrored to all attached clients. A sender's own messages are
-  synthesized into the stream by the driver (the upstream is never asked
-  for `echo-message`, so there is exactly one echo, never two); the
-  originator receives its echo only when it negotiated `echo-message` on
-  attach, the same contract a real server has. Synthesized echoes retain only
+  are mirrored to all attached clients. A sender's own messages reach the
+  stream exactly once. When the upstream offers `echo-message`, the driver
+  requests it and relays the upstream's echo, which arrives only for a line the
+  upstream accepted — a refused line (404, 486) is answered by the refusal
+  alone, so a client that waits for its echo (as `e6irc send` does) learns the
+  truth; the echo is routed to the attachment that sent the line by matching
+  command, target and text against the lines awaiting one (at most 256; a
+  refused line's entry ages out). An upstream without `echo-message` gets the
+  echo synthesized when the line is written. Either way the originator
+  receives its echo only when it negotiated `echo-message` on attach, the same
+  contract a real server has, and a NickServ command that can carry a secret
+  is redacted in the upstream's echo exactly as in a synthesized one.
+  Synthesized echoes retain only
   validated client-only tags and mint their own `time` provenance; a downstream
   cannot forge or duplicate server `time`/`msgid` tags in persisted history.
   What belongs to the attachment itself never reaches the upstream: a client's
@@ -1625,8 +1672,10 @@ above the trait, provides for every network kind:
   the ircd core (§11) for the local network; on the BNC attach listener it
   pages the persisted `bnc_buffer` ring directly (LATEST/BEFORE/AFTER/AROUND/
   BETWEEN by `msgid=` or `timestamp=` selector, plus the two-timestamp TARGETS
-  window), intercepted on attach and never forwarded upstream. One pure
-  oldest-first resolver owns every boundary and direction. Bounded LATEST keeps
+  window), intercepted on attach and never forwarded upstream. Each window is
+  resolved in PostgreSQL under its LIMIT over `bnc_buffer_sent_at_idx`
+  (`db::bnc_history_window`), never by loading a target's rows; an unknown
+  msgid is `MESSAGE_ERROR`. Bounded LATEST keeps
   the newest rows *after* its selector; reverse BETWEEN limits from its first
   endpoint; TARGETS uses the dedicated `draft/chathistory-targets` batch.
   Stored timestamps are validated and canonicalized before they become sort
@@ -1666,9 +1715,16 @@ upstream's.
 
 - Full IRCv3 *client* implementation reusing `e6irc-proto` + the same SASL
   machinery; requests `server-time`, `message-tags`, and `account-tag`
-  from upstream when available (Libera: yes). It deliberately does not
-  request `echo-message`: the driver synthesizes self-echoes itself
-  (§10.1), and requesting it would produce every echo twice.
+  from upstream when available (Libera: yes), and `echo-message`, in a
+  capability request of its own, when the upstream offers it (§10.1). An
+  upstream's SASL password or server password crosses only TLS, or a plaintext
+  connection to a loopback address *literal* under
+  `internal_upstreams = "allow"` (the test harness): every ingress refuses
+  anything else by field (create, replace, connection test, static and managed
+  configuration, driver construction), and `e6irc_client::Connection` writes no
+  credential to a plaintext peer off loopback — the peer is judged by the
+  address actually connected, and only the CLI's explicit
+  `--allow-cleartext-credentials` lifts it.
   Synthesized message echoes carry the prefix the upstream shows for this
   session — `nick!user@host`, with the configured user name (tilde included
   when the upstream adds one) and the server's name until the first self-echo
@@ -1775,7 +1831,18 @@ upstream's.
   as `channel_limit_exceeded`; a confirmed name e6irc cannot track is announced
   live and not rejoined. A process restart falls back to the configured
   autojoin, which is the operator-declared floor. Upstream SASL PLAIN uses
-  credentials stored encrypted (§15). The client records what the server
+  credentials stored encrypted (§15). A network may also carry a server
+  password — the `PASS` a private server requires before `CAP LS`, `NICK` and
+  `USER`; the driver and the connection test send it as the first line
+  through the one `register()`. It is a `ServerPassword` (at most 504 bytes,
+  no CR, LF or NUL) refused before a byte leaves, stored sealed, and resealed
+  by `rotate-secrets`. A 464 after a `PASS` is `server_password_rejected`; one
+  with no `PASS` configured is `server_password_required`; both are
+  configuration faults that take the refusal schedule and park, never
+  hammering the network. e6ircd itself has no connection password: it accepts
+  a `PASS` before registration without reply and answers 462 after it, so a
+  client's `PASS` is never answered with a 451 that would read as a refusal
+  of `CAP LS`. The client records what the server
   advertises and requests only that, the metadata capabilities in one
   `CAP REQ`. Only a verdict on the credentials themselves — a 904 for a
   mechanism the server offers — is an authentication failure, which parks at
@@ -1847,7 +1914,10 @@ Downstream clients select a network with the ZNC/soju username convention:
 The selector's nick and network components are independently validated; the
 slash-bearing selector is routing input, never the downstream IRC identity.
 Registration and later session reconciliation use the actual upstream nick (or
-the validated nick component while no upstream session exists). Attach SASL
+the validated nick component while no upstream session exists). Off loopback
+the attach listener requires `[bnc].tls` (console: `bnc_tls`), because
+attaching clients send their account password; the configuration file and
+every console save refuse a cleartext non-loopback bind. Attach SASL
 PLAIN accepts an empty authorization identity or the same RFC1459-folded
 identity as its authentication identity; it cannot authenticate one account
 while requesting authorization as another. The web client and REST API address
@@ -1873,7 +1943,11 @@ unless the configured API base is itself a loopback `http://` under
 `internal_upstreams = "allow"`. Every bridge HTTP request is built through
 `BridgeHttp`, which judges the parsed URL host against the egress rule before
 the HTTP client sees it (IP-literal hosts never reach the vetting resolver),
-and any 3xx answer is a failed request, never a delivery. OIDC metadata
+and any 3xx answer is a failed request, never a delivery. Bridge REST bases are
+HTTPS too: `validate_bridge_base` and `BridgeHttp::request` admit `http://`
+only for a loopback test oracle under `internal_upstreams = "allow"`, where
+Matrix passwords, access tokens and bot tokens used to be able to travel in
+cleartext while the gateway already required `wss://`. OIDC metadata
 cannot cross between the external and loopback trust domains. Signed provider
 WebSocket query parameters stay inside the typed endpoint and never enter
 evidence.
@@ -1899,8 +1973,13 @@ Design constraints recorded now:
   included); an answer about the configuration itself (Matrix: a 403 on a room
   join, which is "not invited"; any bridge: a room or channel name that is not
   a safe IRC channel name, or two that fold to one channel) is a
-  `ConfigurationRejected` outcome on the refusal schedule, which parks until
-  the owner changes the network. The diagnostic is e6irc's own sentence naming
+  `ConfigurationRejected` outcome whose policy is decided in one place,
+  `ConfigurationRefusal::retry_policy`, by the same rule as a registration
+  refusal: what only the owner can clear parks at once (a Discord gateway
+  configuration close 4010–4014, Slack `link_disabled`, an encrypted Matrix
+  room); what the upstream may clear on its own takes the refusal schedule and
+  then parks (a room join refused before an invitation arrives, a channel name
+  the provider side can rename). The diagnostic is e6irc's own sentence naming
   the room or channel; provider response text is deliberately never carried.
   A 401/403 on Discord's channel lookup is about the token, so it is
   `AuthRejected` and parks at once.
@@ -1918,13 +1997,58 @@ Design constraints recorded now:
   re-uses its device instead of leaving one behind. Transaction ids are minted
   per driver (a counter prefixed with the driver's start time), never per
   session: the device, and so the id scope, outlives sessions and processes,
-  and a repeated id is silently deduplicated by the homeserver. The Slack
+  and a repeated id is silently deduplicated by the homeserver. The sync
+  position is kept beside the login too: `since` and the joined rooms survive
+  a reconnect (cleared with the login, on a configuration refusal, or when the
+  homeserver refuses a resumed sync), so an outage's messages are delivered or
+  a `limited` timeline announces the gap; a 429 on `/sync` waits the requested
+  time and re-asks from the same position instead of reconnecting. A bridged
+  room with `m.room.encryption` state (checked after each join) or an
+  encrypted event mid-session is `ConfigurationRejected(room_encrypted)`: the
+  bridge holds no device keys and would otherwise relay nothing, silently.
+  `m.emote` becomes a CTCP ACTION, `m.notice` a NOTICE, media its body plus the
+  spec's `/_matrix/media/v3/download` link (homeservers that enforce
+  authenticated media will not open it), `m.location` its body plus a geo URI;
+  any other msgtype produces one bounded "not relayed" notice.
+- Discord keeps its gateway session per driver and RESUMEs on
+  `resume_gateway_url` after a drop, so the gap is replayed and the daily
+  IDENTIFY budget is not spent; op 9 (invalid session) ends the session — it
+  used to be ignored while the gateway kept ACKing heartbeats, leaving the
+  network "connected" and deaf — and op 9 `d:false` and close codes
+  4004/4007/4009/4010–4014 forget the session. A heartbeat that finds the
+  previous one unacknowledged drops the zombie connection; op 7 reconnects
+  without recording a failure. 4004 is `AuthRejected`; 4010–4014 are
+  configuration refusals that park at once with a code-specific diagnostic
+  (4014 names the Message Content intent). Posts send
+  `allowed_mentions: {parse: []}`, so an IRC line can never page a guild.
+- Slack reads `disconnect.reason`: `warning` and `refresh_requested` open the
+  next socket inside the session while the retiring one is still read and
+  acked (no failure recorded); `link_disabled` is a configuration refusal.
+  Envelopes are acked before any HTTP work, deliveries and name lookups run in
+  bounded serial queues beside the socket, a re-delivered envelope id is acked
+  and not relayed twice, and the socket is pinged every 30 s. Outbound text
+  escapes `& < >` (which also neutralises `<!channel>`); inbound entities and
+  markup are decoded (`<@U…>` to `@name`, `<#C…|n>` to `#n`, links to
+  `label (url)`). Message subtypes are a whitelist (file shares, thread
+  broadcasts, `/me`, edits as `* text`, other bots); housekeeping subtypes and
+  deletions (IRC has no deletion) are dropped by name, and an unknown subtype
+  produces a bounded notice. A failed name lookup is not cached. The
   display-name cache is bounded at 4096 upstream ids; overflow clears it,
   counted and logged.
-- Reverse bridge delivery accepts `PRIVMSG` only. Unmapped targets, malformed
-  messages, unsupported commands, and per-target provider failures each emit a
-  bounded `*bnc*` refusal notice; queue admission can never become a silent
-  bridge no-op.
+- Reverse bridge delivery accepts `PRIVMSG` only. A CTCP ACTION becomes the
+  provider's emote (Matrix `m.emote`, Discord/Slack italics) and any other CTCP
+  is refused; IRC formatting is stripped outbound; inbound provider text loses
+  every C0 control but tab and newline, so remote text can never reach an IRC
+  client as a CTCP request (`\x01VERSION\x01` used to be delivered as one).
+  One shared `BridgeText` does both directions for all three drivers. A 429 is
+  waited out once (at most 10 s) before the undelivered notice names the rate
+  limit. Unmapped targets, malformed messages, unsupported commands, and
+  per-target provider failures each emit a bounded `*bnc*` refusal notice;
+  queue admission can never become a silent bridge no-op.
+- The Discord qualification campaign identifies with the driver's own intents
+  (`e6irc_proto::provider::DISCORD_GATEWAY_INTENTS`), so a pass proves the
+  application may receive them; the Slack campaign proves delivery by acking
+  the marker's own `events_api` envelope before cleanup.
 
 ---
 
@@ -1962,7 +2086,9 @@ Design constraints recorded now:
   the next holder. `ServerState::set_account` is the one path by which a
   session gains an account — the field is write-private — and it performs the
   release. An authenticated participant keeps such a conversation for
-  exactly as long as the other party holds the nick; CHATHISTORY TARGETS lists
+  exactly as long as the other party holds the nick; CHATHISTORY TARGETS finds
+  each channel's newest message with one backward index probe (LATERAL
+  `max(ts)`), and lists
   it from the ring alongside what the database returns. Only a conversation
   between two accounts is stored, and a stored conversation is always addressed
   by one exact key. Migration 0058 deleted the `~` conversations stored before
@@ -2039,8 +2165,15 @@ Surface (initial):
 - `networks`: BNC network CRUD (+ enable/disable, status), buffers list,
   read-marker get/set. Full IRC updates use `PUT /me/networks/{name}` with a
   required credential action (`keep`, `set`, or `remove`), so a write-only
-  secret is never changed through an ambiguous omitted-field convention. Both
-  browser clients omit a blank credential field rather than sending null; an
+  secret is never changed through an ambiguous omitted-field convention. The
+  server password has its own required action beside it (`keep`, `set` with
+  `password`, or `remove`; only an IRC network accepts `set` or `remove`);
+  create and the connection test take an optional `server_password`, a value
+  that cannot travel in one `PASS` line is a 400 naming `server_password`, and
+  responses report `has_server_password`, never the value. The tagged actions
+  refuse stray fields, so a password typed beside `keep` is refused rather than
+  silently dropped. Both browser clients omit a blank credential field rather
+  than sending null; an
   account box emptied against a stored account, or a value typed under a
   ticked Remove, is refused at the box rather than resolved one way or the
   other.
@@ -2290,11 +2423,21 @@ Non-interactive, pipe-friendly: `e6irc send '#chan' 'msg'`,
 IRC commands support plaintext or public-CA TLS and anonymous, paired SASL
 PLAIN, or SASL OAUTHBEARER registration. `tail --json` emits one complete JSON
 object per message, including structured tags, for safe automation. An
-unbounded `tail` that loses its server exits nonzero, and `&` channels are
-joined like `#` ones. Every wait on the server — connecting and registering,
-a capability request, a join with its history — is bounded by
-`--response-timeout` (30 s by default), so a peer that holds the socket open
-with irrelevant lines cannot hang a script.
+unbounded `tail` that loses its server — closed, or silent through two
+three-minute liveness windows, the first ending in `PING :e6irc-keepalive`
+(the shared `e6irc_client::liveness` the TUI also uses) — exits nonzero, and a
+reader that goes away (a broken pipe) ends `tail`/`history` output cleanly.
+`&` channels are joined like `#` ones. Every wait on the server — connecting
+and registering, a capability request, a join with its history, and every
+wait after `QUIT` — is bounded by `--response-timeout` (30 s by default), so
+a peer that holds the socket open with irrelevant lines cannot hang a script.
+`send` confirms delivery: it requires `echo-message` and, without it, fails
+with "delivery cannot be confirmed" before sending anything; it gets past the
+registration burst with a PING round trip and exits 0 only on its own echo,
+while a refusal (`e6irc_client::is_refusal`: a 400–599 numeric or `FAIL`,
+shared with the TUI) or no verdict within the timeout is a nonzero exit. `raw`
+prints every server line to stdout and each refusal to stderr, and exits
+nonzero if any line was refused. `--tls-name` requires `--tls`.
 Every authentication mode requests the same optional server-time,
 message-tags, and account-tag metadata capabilities, so changing credentials
 cannot silently reduce the information delivered to the caller.
@@ -2321,15 +2464,32 @@ must not be empty or missing. `e6irc-client::credentials` is the one resolver
 the CLI and the TUI share, so the two cannot disagree.
 
 Neither client sends a credential over a connection that is neither TLS nor
-loopback: the request is refused before the socket is opened, naming
+loopback — decided by address, not by name: every address the host resolves
+to must be loopback, and exactly those addresses are dialled
+(`e6irc_client::loopback_addresses`), so a `*.localhost` name that DNS answers
+with a public address is refused. The request is refused before the socket is
+opened, naming
 `--allow-cleartext-credentials` as the explicit override. The refusal lives in
 `e6irc-client` (`CleartextCredentials::{Refuse, Allow}` on
 `ConnectionOptions`), not in each binary's argument handling, so a new caller
 cannot forget it. The same holds for the HTTP commands: `e6irc login` (which
 exists to obtain a token) and an `e6irc api` call that carries one are refused
 over `http://` to any host but this machine before a request is made, with the
-same override and the same definition of loopback; an `api` call that carries
-no token is not refused.
+same override and the same definition of loopback; they pin their HTTP client
+to the vetted addresses and ignore proxy environment variables (an
+`HTTP_PROXY` would otherwise receive the bearer token in cleartext), and the
+CLI runs one TLS stack (aws-lc-rs; reqwest is built without its `ring`
+provider). An `api` call that carries no token is not refused.
+`--oauth-from-cache` sends the cached token only to an IRC server on the host
+of the origin that issued it; `--allow-oauth-token-for-other-server` is the
+explicit override. Both native clients take a server password from
+`--server-password-file`, `E6IRC_SERVER_PASSWORD`, or `--server-password`
+(visible in the process list), through the same resolver and precedence as the
+SASL secrets; it is sent as the first line, falls under the same cleartext
+refusal, and a 464 tells a missing password from a rejected one. A server
+that refuses and closes can make the client's next registration write fail
+first; the client then reads what the server sent before it left (for at most
+two seconds) and reports that refusal, not the broken pipe.
 
 `e6irc login` implements the RFC 8628 device flow: it prints the verification
 URI and user code, honors the server's polling interval/slow-down/expiry
@@ -2346,14 +2506,16 @@ can use the same cache for SASL OAUTHBEARER with `--oauth-from-cache`.
 The shipped ratatui client uses one owned `e6irc-client::ConnectionOptions`
 request for plaintext/public-CA TLS and anonymous, SASL PLAIN, or SASL
 OAUTHBEARER registration. An `account/network` SASL account selects an owned
-BNC network. It has bounded channel/query buffers, Alt-Left/Right switching,
+BNC network. It has bounded channel/query buffers, Alt-Left/Right, Alt-b/f
+(macOS Option-arrows arrive as ESC b/f) and Ctrl-P/N switching (other Alt/Ctrl
+letters are ignored rather than typed),
 bounded scrollback, a relay/status strip, an active-first conversation rail,
 a visible horizontally-following composer caret, `/help`, `/join`, `/msg`,
 `/win`, `/raw`, literal-slash escape with `//`, `/quit`, Ctrl-End return to the
-latest message, Ctrl-C exit, automatic reconnect with the same explicit
+latest message, Ctrl-C exit (Esc clears the composer; it does not quit), automatic reconnect with the same explicit
 request, and loud disconnect/write/drop state. The steady-state read is
 bounded by a three-minute liveness window measured from the server's last
-line: one silent window sends `PING :e6irc-tui`, a second ends the session
+line: one silent window sends `PING :e6irc-keepalive`, a second ends the session
 with "server stopped responding" and runs the reconnect path; the answer to
 its own probe stays out of the log. Reconnection is not a fixed
 two-second loop: rejected credentials, a rejected server password, and a ban
@@ -2371,9 +2533,24 @@ closed: malformed
 or unknown commands remain in the composer with an explanation instead of
 silently doing nothing or leaking into a conversation. On initial
 connect and reconnect it requires the history/read-marker capabilities it
-uses, rejoins every channel confirmed for the client, loads bounded
-CHATHISTORY after the server's marker (or the latest bounded window), and
-coalesces shared read-marker writes as buffer focus advances. While the current
+uses, rejoins every channel confirmed for the client, pages `CHATHISTORY AFTER`
+the server's marker forward (by msgid, else time) until a short page — at most
+ten pages and never more than the scrollback — or loads the latest bounded
+window, and coalesces shared read-marker writes as buffer focus advances. A
+channel with unread lines beyond what was loaded says "more unread lines were
+not loaded", and its read marker is held at the last contiguously loaded line
+until a later session loads every unread line: loading the oldest page and
+then marking "now" as read used to mark the unloaded middle read on every
+device. Other numerics and unmodelled commands are shown beside the
+conversation they name or in a `*server*` buffer that refuses message text;
+INVITE, TOPIC and MODE are rendered; `/me` renders as `* nick …` and mIRC
+formatting is stripped; long lines wrap by display width; a resize redraws at
+once. A multi-line bracketed paste is refused whole rather than sent line by
+line. Quitting sends the queued lines and the last read marker, then `QUIT`,
+within five seconds, and says so if it could not. A read marker is never
+flushed while disconnected, so one that meets a disconnect is sent after
+reconnecting rather than reported as a lost message. Startup failures print
+`e6irc-tui: <message>` and exit 1. While the current
 buffer is in scrollback, new messages increase its unread count and cannot
 advance its marker; returning to the live edge clears that count and queues the
 latest marker. Unread counts are visible and history/live overlap is
@@ -2391,6 +2568,12 @@ one connection, not several simultaneous networks; the BNC is the
 cross-network multiplexer.
 
 ### 14.3 A client's input is untrusted too
+
+`TerminalSafe` also neutralises the invisible Unicode format characters
+(U+061C, U+200B–200F, U+202A–202E, U+2060–2069, U+FEFF), so a nick
+`alice\u{200B}` cannot pass for `alice` and bidi overrides cannot reorder a
+line; human-readable output strips IRC formatting first
+(`TerminalSafe::from_irc_text`).
 
 Every clause of §7.2's bounded-buffer rule applies here in reverse. A client's
 state — buffers, scrollback, the queue between the socket and the renderer — is
@@ -2422,7 +2605,18 @@ but the CLI, TUI, and BNC must surface the rejection.
   credentials. A CHECK constraint makes the lookup present on exactly the app
   passwords, so none can exist that would have to be tried blind; the ones
   minted before 0059, whose secrets were never stored, were revoked by it with
-  an audit record each.
+  an audit record each. A password change verifies and hashes before opening
+  any transaction and commits with a compare-and-swap on the verified hash, so
+  no Argon2 computation runs while a row lock is held; account- and
+  channel-row locks taken only to serialize a cap are `FOR NO KEY UPDATE`.
+- Audit rows are written inside the mutation's own transaction for network
+  create/update/toggle/delete, ChanServ DROP/SET FOUNDER/FLAGS/KEEPTOPIC/MLOCK
+  and server bans; an upstream account command is recorded before it is sent,
+  and a 503 answers when it cannot be. OPER, KILL and SETHOST are recorded under
+  the operator name and refused with a NOTICE when the audit row cannot be
+  queued; an HTTP disconnect whose audit cannot be written is a 503. A
+  suspension's disconnect is not refusable, because `ACCOUNT_SUSPEND` has
+  already committed.
 - Administrator authority is read from the account row on every request
   (`is_effective_admin`: the durable flag or a configured grant); no process
   holds a registry, so `e6ircd recover-administrator` and any out-of-process
@@ -2464,9 +2658,43 @@ but the CLI, TUI, and BNC must surface the rejection.
   in one PostgreSQL transaction, with a redacted audit record. The old key is
   removed only after that command commits. A corrupt, plaintext, or unreadable
   value rolls the entire operation back.
-- TLS ≥ 1.2 everywhere (rustls); responses carry HSTS whenever the validated
-  public origin is HTTPS (and never on an explicitly plain development
-  origin); WS upgrades check Origin.
+- TLS ≥ 1.2 everywhere (rustls). Server certificates are reloaded on SIGHUP
+  and when their files change; a failed reload keeps the served certificate
+  and logs an error once per broken file state, and a key that does not match
+  its certificate is refused. Responses carry HSTS (`max-age=31536000`)
+  whenever the validated public origin is HTTPS (never on an explicitly plain
+  development origin); `includeSubDomains` only with
+  `[http].hsts_include_subdomains`, which forces every sibling host of the
+  domain onto HTTPS for a year; never `preload`. `/ws/ui` upgrades check
+  Origin; `/ws/irc` does not — IRCv3 WebSocket permits cross-origin clients and
+  the endpoint carries no cookie authority (it authenticates in-band with
+  SASL).
+- Every response carries `nosniff`, a deny-all `Permissions-Policy`,
+  `Cross-Origin-Resource-Policy: same-origin` and a default
+  `Cache-Control: no-store`; pages add `Cross-Origin-Opener-Policy:
+  same-origin`; JSON, problem documents and `/api/` responses add
+  `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`. Each is
+  added by one baseline layer only where the handler set none. The one
+  frameable answer is OpenID Connect front-channel logout, which the provider
+  loads in an iframe: it sets `frame-ancestors` to that issuer's origin alone
+  (`tools/test-shauth-sso.mjs` proves the provider's iframes reach it). The console's
+  CSP admits no inline style (`style-src 'self'`, stylesheet at
+  `/console.css`).
+- A client address is canonicalised once (`ClientIp`): IPv4-mapped IPv6
+  becomes IPv4 for limiter keys, ban hosts, trusted-proxy matching and each
+  forwarded entry, so a D-line on an IPv4 address matches a `/ws/irc` user on a
+  dual-stack listener and a proxy in a trusted IPv4 range is trusted.
+- The master key is zeroized when dropped, and key text read from files or
+  the environment is wiped; the process is non-dumpable on Linux
+  (`PR_SET_DUMPABLE`) and the systemd unit sets `LimitCORE=0`, so an abort
+  cannot write keys or passwords to a core file.
+- Not provided, stated rather than implied: TLS client certificates, ALPN and
+  multiple certificates by SNI on IRC listeners (one certificate per
+  listener); OCSP or CRL checks on outbound TLS, whose roots are the
+  compiled-in webpki set; hiding the server version (`/api/v1/server` exposes
+  it, as IRC `VERSION` does). Concurrent password verification is bounded
+  process-wide by the Argon2 permits, which is what bounds a distributed login
+  flood's CPU cost; the per-address auth buckets bound a single source.
 - Rate limits: per-IP connection/registration throttle, per-session command
   token bucket, per-account API limits (tower middleware), SASL attempt
   limits with backoff.
@@ -2502,6 +2730,11 @@ console does not plot version-1 raw-socket gauges as authenticated attachment
 history, while unaffected version-1 counters remain usable.
 Queue pressure is snapshot schema version 3. Schema-v2 samples deserialize
 with an empty queue map, so an upgrade preserves the rest of their history.
+Schema version 4 adds `database_pool` (size, idle, max, acquire timeouts); the
+same values are exported as `e6irc_database_pool_connections{state}`,
+`e6irc_database_pool_max_connections` and
+`e6irc_database_pool_acquire_timeouts_total`, the last counted wherever a
+query error is mapped.
 Only the statically registered `core` and `db` queues become Prometheus labels;
 per-connection SendQs remain aggregated through bounded kill/error counters.
 Each running BNC handle additionally keeps owner-scoped per-network counters
@@ -2630,7 +2863,10 @@ Layers, bottom to top:
    over real sockets, including TLS.
 8. **UI tests**: Playwright drives real OIDC and local-password authentication
    through Chromium, Firefox, and WebKit; exact Shauth qualification uses
-   Chromium. Focused replay/race/membership cases use
+   Chromium. Firefox runs with `browser.tabs.remote.useCrossOriginOpenerPolicy`
+   off: pages send `Cross-Origin-Opener-Policy: same-origin`, and the context
+   swap it causes makes Playwright's Firefox driver lose a page's events
+   (microsoft/playwright#42731), so a reload hung about one run in five. Focused replay/race/membership cases use
    browser-side network/history/WebSocket doubles. A separate full-stack case
    edits every managed-configuration subsection and credential collection,
    proves persisted themes and the desktop-notification boundary, creates a
@@ -2662,6 +2898,10 @@ Layers, bottom to top:
   than the daemon is a loud wait rather than a crash loop; the first probe is
   one plain connection, so the reason (refused, authentication, "starting up")
   is reported instead of the pool's "timed out".
+- `[database] max_connections` / `E6IRC_DATABASE_MAX_CONNECTIONS` sizes the
+  shared pool (2–200; default 1 serial worker + 4 Argon2 permits + 2 × CPU
+  threads) and is logged at startup. Database settings are bootstrap-only; the
+  console does not edit them.
 - A minimal `e6irc.toml`/environment bootstrap supplies the PostgreSQL URL,
   secrets-key source, HTTP bind, immutable release revision, and either
   existing administrator authority or a one-time first-administrator token.
@@ -2689,9 +2929,10 @@ Layers, bottom to top:
 - A configuration that parses but cannot work is refused at load and at every
   console save. Two listening sockets that cannot both bind — the same nonzero
   port on the same address, or on a wildcard of the same family — are refused
-  naming both sections (`[[listeners]] #n`, `[http]`, `[bnc]`); a cross-family
-  wildcard is not judged, because whether `[::]` also takes IPv4 is the host's
-  `bindv6only`. Sizes have upper bounds as well as lower ones: `core_workers`
+  naming both sections (`[[listeners]] #n`, `[http]`, `[bnc]`). Every listener
+  binds `[::]` dual-stack on every platform (Linux defaults a v6 socket to
+  dual-stack, Windows and several BSDs to v6-only), so `[::]` also collides
+  with any IPv4 address on its port. Sizes have upper bounds as well as lower ones: `core_workers`
   ≤ 64, `core_queue` ≤ 1,048,576, `sendq` ≤ 65,536, `max_hot_channels` ≤
   1,048,576, a network's `buffer_cap` ≤ 100,000. `usize::MAX` workers used to
   validate.
@@ -2731,7 +2972,12 @@ Layers, bottom to top:
   (linux/amd64 and linux/arm64) whose runtime base is the distroless
   `gcr.io/distroless/cc-debian12` — glibc, libgcc and CA certificates, with no
   shell, package manager or script — pinned by digest like every other base. Each architecture digest has signed build-provenance
-  and SPDX software-bill-of-materials attestations; the assembled manifest has signed provenance,
+  and SPDX software-bill-of-materials attestations — the binary is built with
+  `cargo auditable`, so the SBOM names its Rust crates and CI requires
+  `rustls` in it — and every shipped build passes `--locked`
+  (`tools/check-locked-builds.sh`); native releases build with the image's
+  pinned Rust (`tools/check-release-toolchain.sh`) and no restored cache. The
+  assembled manifest has signed provenance,
   and the release workflow verifies them after publication. A hardened,
   CI-validated systemd unit is shipped for native Linux installation.
   The container daemon is built with every bridge plus the embedded web

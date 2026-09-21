@@ -239,9 +239,16 @@ fn operations() -> serde_json::Value {
             }
         } } }
     });
+    // The one description of a server password wherever one is accepted: the
+    // create, connection-test, and managed-network requests.
+    let server_password_schema = serde_json::json!({
+        "type": ["string", "null"], "minLength": 1,
+        "maxLength": e6irc_client::ServerPassword::MAX_LEN, "writeOnly": true,
+        "description": "The network's connection password, sent as PASS before registration; only for a private server that requires one. Stored sealed; never returned."
+    });
     let network_response_schema = serde_json::json!({
         "type": "object", "additionalProperties": false,
-        "required": ["name", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "sasl_account", "has_sasl_account", "has_sasl_password", "enabled", "connected", "runtime"],
+        "required": ["name", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "sasl_account", "has_sasl_account", "has_sasl_password", "has_server_password", "enabled", "connected", "runtime"],
         "properties": {
             "name": { "type": "string", "minLength": 1 },
             "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] },
@@ -250,7 +257,7 @@ fn operations() -> serde_json::Value {
             "realname": { "type": ["string", "null"] },
             "autojoin": { "type": "array", "items": { "type": "string" } },
             "sasl_account": { "type": ["string", "null"] },
-            "has_sasl_account": { "type": "boolean" }, "has_sasl_password": { "type": "boolean" },
+            "has_sasl_account": { "type": "boolean" }, "has_sasl_password": { "type": "boolean" }, "has_server_password": { "type": "boolean" },
             "enabled": { "type": "boolean" }, "connected": { "type": ["boolean", "null"] },
             "runtime": { "oneOf": [
                 { "type": "null" },
@@ -723,7 +730,7 @@ fn operations() -> serde_json::Value {
         "required": [
             "server_name", "network_name", "description", "motd", "nicklen", "sendq",
             "core_queue", "core_workers", "max_hot_channels", "listeners", "registration", "limits",
-            "observability", "storage", "bnc_addr", "public_url", "secure_cookies",
+            "observability", "storage", "bnc_addr", "bnc_tls", "public_url", "secure_cookies",
             "admin_accounts"
         ],
         "properties": {
@@ -742,6 +749,10 @@ fn operations() -> serde_json::Value {
             "observability": observability_schema,
             "storage": storage_schema,
             "bnc_addr": { "type": ["string", "null"] },
+            "bnc_tls": {
+                "oneOf": [tls_schema, { "type": "null" }],
+                "description": "The attach listener's certificate. Required unless bnc_addr is a loopback address: attaching clients send their account password."
+            },
             "public_url": { "type": ["string", "null"] },
             "secure_cookies": { "type": "boolean" },
             "admin_accounts": { "type": "array", "items": { "type": "string" } }
@@ -762,8 +773,8 @@ fn operations() -> serde_json::Value {
     }));
     configuration_properties.insert("networks".into(), serde_json::json!({
         "type": "array", "items": { "type": "object", "additionalProperties": false,
-            "required": ["name", "owner", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "buffer_cap", "sasl_account", "sasl_password"],
-            "properties": { "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": ["string", "null"] }, "realname": { "type": ["string", "null"] }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] } } }
+            "required": ["name", "owner", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "buffer_cap", "sasl_account", "sasl_password", "server_password"],
+            "properties": { "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": ["string", "null"] }, "realname": { "type": ["string", "null"] }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] }, "server_password": { "type": "null", "description": "Always null on read: a stored server password is never returned." } } }
     }));
     configuration_properties.insert(
         "credentials_from_bootstrap".into(),
@@ -793,7 +804,7 @@ fn operations() -> serde_json::Value {
         schema
     };
     let managed_network_request_schema = serde_json::json!({ "oneOf": [
-        managed_network_variant("irc", &["revision", "name", "addr", "tls", "nick", "username", "realname", "autojoin", "buffer_cap"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": ["string", "null"], "writeOnly": true }, "sasl_password": { "type": ["string", "null"], "writeOnly": true } } })),
+        managed_network_variant("irc", &["revision", "name", "addr", "tls", "nick", "username", "realname", "autojoin", "buffer_cap"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": ["string", "null"], "writeOnly": true }, "sasl_password": { "type": ["string", "null"], "writeOnly": true }, "server_password": server_password_schema.clone() } })),
         managed_network_variant("local", &["revision", "name", "addr", "tls", "nick", "username", "realname", "autojoin", "buffer_cap"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 } } })),
         managed_network_variant("matrix", &["revision", "name", "addr", "tls", "nick", "autojoin", "buffer_cap", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_password": { "type": "string", "writeOnly": true } } })),
         managed_network_variant("discord", &["revision", "name", "addr", "tls", "autojoin", "buffer_cap", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_password": { "type": "string", "writeOnly": true } } })),
@@ -829,7 +840,7 @@ fn operations() -> serde_json::Value {
     });
     let snapshot_schema = serde_json::json!({
         "type": "object", "additionalProperties": false,
-        "required": ["schema_version", "sampled_at_ms", "uptime_seconds", "core_heartbeat_age_ms", "active_connections", "registered_connections", "unregistered_connections", "channels", "connections_opened_total", "connections_closed_total", "connections_rejected_total", "irc_lines_in_total", "irc_bytes_in_total", "irc_lines_out_total", "irc_bytes_out_total", "bnc_lines_in_total", "bnc_bytes_in_total", "bnc_lines_out_total", "bnc_bytes_out_total", "bnc_client_connections", "bnc_client_connections_opened_total", "sendq_kills_total", "http_requests_total", "http_server_errors_total", "database_requests_total", "bnc_networks", "bnc_connected", "queues", "errors", "error_last_seen_ms", "core_latency", "database_latency", "http_latency"],
+        "required": ["schema_version", "sampled_at_ms", "uptime_seconds", "core_heartbeat_age_ms", "active_connections", "registered_connections", "unregistered_connections", "channels", "connections_opened_total", "connections_closed_total", "connections_rejected_total", "irc_lines_in_total", "irc_bytes_in_total", "irc_lines_out_total", "irc_bytes_out_total", "bnc_lines_in_total", "bnc_bytes_in_total", "bnc_lines_out_total", "bnc_bytes_out_total", "bnc_client_connections", "bnc_client_connections_opened_total", "sendq_kills_total", "http_requests_total", "http_server_errors_total", "database_requests_total", "bnc_networks", "bnc_connected", "queues", "database_pool", "errors", "error_last_seen_ms", "core_latency", "database_latency", "http_latency"],
         "properties": {
             "schema_version": { "type": "integer", "const": crate::observability::SNAPSHOT_SCHEMA_VERSION }, "sampled_at_ms": { "type": "integer", "minimum": 0 }, "uptime_seconds": { "type": "integer", "minimum": 0 }, "core_heartbeat_age_ms": { "type": "integer", "minimum": 0 },
             "active_connections": { "type": "integer", "minimum": 0 }, "registered_connections": { "type": "integer", "minimum": 0 }, "unregistered_connections": { "type": "integer", "minimum": 0 }, "channels": { "type": "integer", "minimum": 0 },
@@ -837,6 +848,18 @@ fn operations() -> serde_json::Value {
             "irc_lines_in_total": { "type": "integer", "minimum": 0 }, "irc_bytes_in_total": { "type": "integer", "minimum": 0 }, "irc_lines_out_total": { "type": "integer", "minimum": 0 }, "irc_bytes_out_total": { "type": "integer", "minimum": 0 },
             "bnc_lines_in_total": { "type": "integer", "minimum": 0 }, "bnc_bytes_in_total": { "type": "integer", "minimum": 0 }, "bnc_lines_out_total": { "type": "integer", "minimum": 0 }, "bnc_bytes_out_total": { "type": "integer", "minimum": 0 },
             "bnc_client_connections": { "type": "integer", "minimum": 0 }, "bnc_client_connections_opened_total": { "type": "integer", "minimum": 0 }, "sendq_kills_total": { "type": "integer", "minimum": 0 }, "http_requests_total": { "type": "integer", "minimum": 0 }, "http_server_errors_total": { "type": "integer", "minimum": 0 }, "database_requests_total": { "type": "integer", "minimum": 0 }, "bnc_networks": { "type": "integer", "minimum": 0 }, "bnc_connected": { "type": "integer", "minimum": 0 },
+            "database_pool": {
+                "type": ["object", "null"],
+                "description": "The shared PostgreSQL pool; null on a server without a database.",
+                "additionalProperties": false,
+                "required": ["size", "idle", "max", "acquire_timeouts_total"],
+                "properties": {
+                    "size": { "type": "integer", "minimum": 0, "description": "Connections open now, idle or in use." },
+                    "idle": { "type": "integer", "minimum": 0 },
+                    "max": { "type": "integer", "minimum": 2, "maximum": 200, "description": "database.max_connections, or its host-sized default." },
+                    "acquire_timeouts_total": { "type": "integer", "minimum": 0, "description": "Pool acquires that waited the whole acquire timeout and failed." }
+                }
+            },
             "queues": { "type": "object", "additionalProperties": queue_snapshot_schema, "properties": {} },
             "errors": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 }, "properties": {} },
             "error_last_seen_ms": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 }, "properties": {} },
@@ -1537,13 +1560,13 @@ fn operations() -> serde_json::Value {
                     "description": "Each network includes stored configuration, `connected` (true/false, or null with no running handle), and an owner-safe `runtime` object when its driver is active: lifecycle/timestamps, a credential-safe last-error code and summary, connect latency, attempts/errors, attached clients, traffic, and in-memory buffer usage.",
                     "security": authenticated, "responses": network_list_response },
                 "post": { "summary": "Create a BNC network and start its driver",
-                    "description": "Every request explicitly selects one driver and its complete connection intent. IRC requires addr, tls, nick, username, realname, and autojoin, with paired optional SASL credentials; username is the IRC user name sent in USER, is never derived from the nick, and is refused for every other kind. Matrix requires an HTTP(S) homeserver, tls=true, provider user, autojoin, and password. Discord requires tls=true, autojoin, and a bot token. Slack requires tls=true, autojoin, bot token, and app token. An empty bridge addr explicitly selects that provider's built-in endpoint.",
+                    "description": "Every request explicitly selects one driver and its complete connection intent. IRC requires addr, tls, nick, username, realname, and autojoin, with paired optional SASL credentials and an optional server_password (PASS, 400 with field=server_password when it cannot travel in one line); username is the IRC user name sent in USER, is never derived from the nick, and is refused for every other kind. Matrix requires an HTTP(S) homeserver, tls=true, provider user, autojoin, and password. Discord requires tls=true, autojoin, and a bot token. Slack requires tls=true, autojoin, bot token, and app token. An empty bridge addr explicitly selects that provider's built-in endpoint.",
                     "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "oneOf": [
                             { "type": "object", "additionalProperties": false,
                                 "required": ["kind", "name", "addr", "tls", "nick", "username", "realname", "autojoin"],
-                                "properties": { "kind": { "const": "irc" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] } } },
+                                "properties": { "kind": { "const": "irc" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] }, "server_password": server_password_schema.clone() } },
                             { "type": "object", "additionalProperties": false,
                                 "required": ["kind", "name", "addr", "tls", "nick", "autojoin", "sasl_password"],
                                 "properties": { "kind": { "const": "matrix" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "const": true }, "nick": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "sasl_password": { "type": "string", "writeOnly": true } } },
@@ -1563,7 +1586,7 @@ fn operations() -> serde_json::Value {
             "/api/v1/me/network-preflight": {
                 "post": {
                     "summary": "Qualify an IRC upstream without saving it",
-                    "description": "Uses the production DNS-vetting, TCP/TLS, capability negotiation, optional SASL registration, and configured channel-join path. The connection closes after the probe.",
+                    "description": "Uses the production DNS-vetting, TCP/TLS, optional server password (PASS), capability negotiation, optional SASL registration, and configured channel-join path. The connection closes after the probe.",
                     "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "type": "object", "additionalProperties": false,
@@ -1576,7 +1599,8 @@ fn operations() -> serde_json::Value {
                                 "realname": { "type": "string", "minLength": 1, "maxLength": 128 },
                                 "autojoin": { "type": "array", "items": { "type": "string" } },
                                 "sasl_account": { "type": ["string", "null"], "minLength": 1, "maxLength": 255, "writeOnly": true },
-                                "sasl_password": { "type": ["string", "null"], "minLength": 1, "maxLength": 512, "writeOnly": true }
+                                "sasl_password": { "type": ["string", "null"], "minLength": 1, "maxLength": 512, "writeOnly": true },
+                                "server_password": server_password_schema.clone()
                             } } } } },
                     "responses": {
                         "200": {
@@ -1653,12 +1677,12 @@ fn operations() -> serde_json::Value {
                     "responses": { "200": network_response["200"],
                         "404": { "description": "no such network" } } },
                 "put": { "summary": "Replace a BNC network's mutable configuration and restart its driver",
-                    "description": "The stored kind selects the same IRC/Matrix/Discord/Slack field contract documented on create. The credential action is required and explicit: `keep` preserves write-only values; `remove` clears paired IRC SASL and is rejected for bridges; `set` replaces supplied values. IRC requires account and may omit password to preserve it. Matrix/Discord accept only password. Slack accepts account, password, or both and preserves an omitted token.",
+                    "description": "The stored kind selects the same IRC/Matrix/Discord/Slack field contract documented on create. The credential action is required and explicit: `keep` preserves write-only values; `remove` clears paired IRC SASL and is rejected for bridges; `set` replaces supplied values. IRC requires account and may omit password to preserve it. Matrix/Discord accept only password. Slack accepts account, password, or both and preserves an omitted token. The server-password action is required and explicit too: `keep` preserves the stored value, `remove` clears it, `set` replaces it; only an IRC network accepts `remove` or `set` (400 with field=server_password otherwise).",
                     "security": authenticated,
                     "parameters": network_name_parameter,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "type": "object", "additionalProperties": false,
-                            "required": ["addr", "tls", "nick", "credentials"],
+                            "required": ["addr", "tls", "nick", "credentials", "server_password"],
                             "properties": {
                                 "addr": { "type": "string" },
                                 "tls": { "type": "boolean" },
@@ -1680,6 +1704,22 @@ fn operations() -> serde_json::Value {
                                                 "action": { "const": "set" },
                                                 "account": { "type": "string" },
                                                 "password": { "type": "string" }
+                                            } }
+                                    ]
+                                },
+                                "server_password": {
+                                    "oneOf": [
+                                        { "type": "object", "additionalProperties": false,
+                                            "required": ["action"],
+                                            "properties": { "action": { "const": "keep" } } },
+                                        { "type": "object", "additionalProperties": false,
+                                            "required": ["action"],
+                                            "properties": { "action": { "const": "remove" } } },
+                                        { "type": "object", "additionalProperties": false,
+                                            "required": ["action", "password"],
+                                            "properties": {
+                                                "action": { "const": "set" },
+                                                "password": { "type": "string", "minLength": 1, "maxLength": e6irc_client::ServerPassword::MAX_LEN, "writeOnly": true }
                                             } }
                                     ]
                                 }
@@ -2589,6 +2629,68 @@ mod tests {
                 preflight["properties"][field]["type"],
                 serde_json::json!(["string", "null"]),
                 "preflight {field}",
+            );
+        }
+    }
+
+    /// The server password is write-only everywhere it is accepted, a boolean
+    /// wherever it is reported, and an explicit action on replace — never an
+    /// omitted field that would have to mean keep or erase.
+    #[test]
+    fn the_server_password_is_write_only_and_replaced_by_an_explicit_action() {
+        let spec = super::document();
+        let create = &spec["paths"]["/api/v1/me/networks"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["oneOf"];
+        let pass = &create[0]["properties"]["server_password"];
+        assert_eq!(pass["type"], serde_json::json!(["string", "null"]));
+        assert_eq!(pass["writeOnly"], true);
+        assert_eq!(pass["maxLength"], e6irc_client::ServerPassword::MAX_LEN);
+        for variant in [1, 2, 3] {
+            assert!(
+                create[variant]["properties"]
+                    .get("server_password")
+                    .is_none()
+            );
+        }
+        let preflight = &spec["paths"]["/api/v1/me/network-preflight"]["post"]["requestBody"]["content"]
+            ["application/json"]["schema"];
+        assert_eq!(
+            preflight["properties"]["server_password"]["writeOnly"],
+            true
+        );
+        let replace = &spec["paths"]["/api/v1/me/networks/{name}"]["put"]["requestBody"]["content"]
+            ["application/json"]["schema"];
+        assert!(
+            replace["required"]
+                .as_array()
+                .expect("required")
+                .contains(&serde_json::json!("server_password"))
+        );
+        let actions: Vec<_> = replace["properties"]["server_password"]["oneOf"]
+            .as_array()
+            .expect("tagged actions")
+            .iter()
+            .map(|branch| branch["properties"]["action"]["const"].clone())
+            .collect();
+        assert_eq!(actions, ["keep", "remove", "set"]);
+        let network = &spec["paths"]["/api/v1/me/networks/{name}"]["get"]["responses"]["200"]["content"]
+            ["application/json"]["schema"];
+        assert_eq!(
+            network["properties"]["has_server_password"]["type"],
+            "boolean"
+        );
+        assert!(network["properties"].get("server_password").is_none());
+        let managed = &spec["paths"]["/api/v1/admin/configuration/networks"]["post"]["requestBody"]
+            ["content"]["application/json"]["schema"]["oneOf"];
+        assert_eq!(
+            managed[0]["properties"]["server_password"]["writeOnly"],
+            true
+        );
+        for variant in [1, 2, 3, 4] {
+            assert!(
+                managed[variant]["properties"]
+                    .get("server_password")
+                    .is_none()
             );
         }
     }

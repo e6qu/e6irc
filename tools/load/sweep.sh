@@ -40,7 +40,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="$ROOT/target/release/e6irc-load"
 if [[ ! -x "$BIN" ]]; then
   echo "building e6irc-load (release)..." >&2
-  (cd "$ROOT" && cargo build --release -p e6irc-load >&2)
+  (cd "$ROOT" && cargo build --locked --release -p e6irc-load >&2)
 fi
 if [[ -n "$REPORT_DIR" ]]; then
   [[ ! -e "$REPORT_DIR" ]] || { echo "report directory already exists: $REPORT_DIR" >&2; exit 2; }

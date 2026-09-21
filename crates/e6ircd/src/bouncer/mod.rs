@@ -171,7 +171,7 @@ pub(crate) fn validate_bridge_base(
             Ok(())
         };
     }
-    let parsed = openidconnect::url::Url::parse(value).map_err(|_| {
+    let parsed = url::Url::parse(value).map_err(|_| {
         format!(
             "kind={} requires a valid HTTP(S) base URL",
             kind.as_db_str()
@@ -189,12 +189,20 @@ pub(crate) fn validate_bridge_base(
             kind.as_db_str()
         ));
     }
+    // The Matrix password and access token, and the Discord and Slack bot
+    // tokens, cross this base on every request; the gateway sockets already
+    // refuse cleartext. Only the loopback test oracle may speak `http://`,
+    // and only under `internal_upstreams = "allow"` does anything dial it.
+    if parsed.scheme() == "http" && !parsed.host().is_some_and(is_loopback_host) {
+        return Err(format!(
+            "kind={} base URL must be https://: the network's credentials cross it, and only \
+             a loopback http:// test oracle may speak cleartext",
+            kind.as_db_str()
+        ));
+    }
     Ok(())
 }
 
-/// Build the driver for a network of `kind` from its *plaintext* fields — the
-/// one feature-gated factory that maps the generic network fields onto each
-/// backend's config. A bridge kind whose build feature is absent is a loud
 /// Everything a driver is built from, as named fields: the factory's callers
 /// (static configuration, stored rows, the API) each hold these under their own
 /// names, and a positional list of nine strings and options is one
@@ -216,6 +224,9 @@ pub struct DriverSpec {
     pub buffer_cap: usize,
     pub sasl_account: Option<String>,
     pub sasl_password: Option<String>,
+    /// The IRC connection password (`PASS`), plaintext. Accepted for
+    /// `kind=irc` only; refused for a bridge.
+    pub server_password: Option<String>,
     /// The server's policy on upstreams inside its own network.
     pub internal_upstreams: crate::egress::InternalUpstreams,
     /// Whether the driver dials at once or holds its first dial back as one of
@@ -224,6 +235,9 @@ pub struct DriverSpec {
     pub first_dial: FirstDial,
 }
 
+/// Build the driver for a network of `kind` from its *plaintext* fields — the
+/// one feature-gated factory that maps the generic network fields onto each
+/// backend's config. A bridge kind whose build feature is absent is a loud
 /// error (never a silent fall-through to IRC), and `local` is not creatable as a
 /// bouncer network. Used by config-network startup, DB-network boot, runtime
 /// create, and re-enable, so no site can construct a driver by kind differently.
@@ -242,6 +256,7 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
         buffer_cap,
         sasl_account,
         sasl_password,
+        server_password,
         internal_upstreams,
         first_dial,
     } = spec;
@@ -263,6 +278,12 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
             kind.as_db_str()
         ));
     }
+    if kind.is_bridge() && server_password.is_some() {
+        return Err(format!(
+            "kind={} does not accept a server password; it applies only to IRC networks",
+            kind.as_db_str()
+        ));
+    }
     match kind {
         // The Irc arm uses every parameter but the network's identity, so they
         // are never "unused" even in a build with no bridge features — the
@@ -272,6 +293,18 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
                 return Err(
                     "kind=irc requires addr as host:port with a nonzero numeric port".into(),
                 );
+            }
+            // Every driver is built here — static configuration, stored rows,
+            // the API — so a network whose credentials would cross cleartext
+            // never gets a driver (a row stored before the rule existed says
+            // so at boot instead of failing on every dial).
+            if let Some(credential) = internal_upstreams.cleartext_credential(
+                &addr,
+                tls,
+                sasl_password.is_some(),
+                server_password.is_some(),
+            ) {
+                return Err(credential.reason().to_string());
             }
             let sasl = match (sasl_account, sasl_password) {
                 (Some(account), Some(password)) => Some((
@@ -288,6 +321,10 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
             let identity_error =
                 |error: UpstreamIdentityError| format!("kind=irc has invalid {error}");
             let username = username.ok_or("kind=irc requires a username")?;
+            let server_password = server_password
+                .map(e6irc_client::ServerPassword::parse)
+                .transpose()
+                .map_err(|error| format!("kind=irc has an invalid server password: {error}"))?;
             Ok(Box::new(IrcDriver::new(NetworkConfig {
                 addr,
                 tls,
@@ -297,6 +334,7 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
                 autojoin: UpstreamChannel::parse_list(&autojoin).map_err(identity_error)?,
                 buffer_cap,
                 sasl,
+                server_password,
                 keepalive_idle: KEEPALIVE_IDLE,
                 rejection_retry_floor: REJECTION_RETRY_FLOOR,
                 internal_upstreams,
@@ -395,7 +433,8 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
 }
 
 /// Build the driver for a persisted network row, unsealing its stored secrets
-/// per kind: the password (`sasl_password_sealed`) is always sealed, and for a
+/// per kind: the password (`sasl_password_sealed`) and the IRC server password
+/// (`server_password_sealed`) are always sealed, and for a
 /// kind whose *account* field carries a secret (Slack's bot token) that is
 /// sealed too — an IRC `sasl_account` is a public name and stays plaintext.
 pub fn driver_from_row(
@@ -424,6 +463,10 @@ pub fn driver_from_row(
         Some(account) if row.kind.account_is_secret() => Some(unseal(account)?),
         other => other.clone(),
     };
+    let server_password = match &row.server_password_sealed {
+        Some(sealed) => Some(unseal(sealed)?),
+        None => None,
+    };
     let realname = match row.kind {
         crate::config::NetworkKind::Irc => row.realname.clone().ok_or_else(|| {
             "kind=irc stored network has no realname; update the network configuration".to_string()
@@ -448,6 +491,7 @@ pub fn driver_from_row(
         buffer_cap: DB_NETWORK_BUFFER_CAP,
         sasl_account: account,
         sasl_password: password,
+        server_password,
         internal_upstreams,
         first_dial,
     })
@@ -588,10 +632,11 @@ pub(crate) fn rotate_addresses(
 /// Outcome of one driver session attempt, for the always-on drivers'
 /// reconnect loops: the owner dropped the handle (stop for good), or the
 /// upstream connection dropped and the driver should reconnect with backoff.
-/// Reconnecting from scratch is intentionally simple (it re-syncs/re-joins
-/// rather than resuming); losing that optimization is far better than the
-/// task dying on the first disconnect and silently dropping all later
-/// upstream traffic.
+/// A session never ends the driver: the task dying on the first disconnect
+/// would silently drop all later upstream traffic. What a driver carries
+/// across sessions is its own (Matrix its login and sync position, Discord
+/// its resumable gateway session), so an outage's messages are delivered
+/// after it rather than skipped.
 pub(crate) enum SessionOutcome {
     Stopped,
     /// A transient session failure that is safe to retry. Carrying the closed,
@@ -621,7 +666,19 @@ pub(crate) enum SessionOutcome {
     /// Retrying changes nothing, so it takes the same slow schedule and parks.
     #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
     ConfigurationRejected(ConfigurationRefusal),
+    /// The upstream asked for this connection to be replaced (Discord's op 7
+    /// Reconnect). Nothing failed, so nothing is recorded: the runner dials
+    /// again after [`RECONNECT_REQUEST_PAUSE`], without the failure schedule.
+    #[cfg(feature = "discord")]
+    ReconnectRequested,
 }
+
+/// How long the runner waits before answering an upstream's request to
+/// reconnect. Nothing failed, so it is not the backoff schedule; it only
+/// bounds how fast an upstream that asks on every connection can make the
+/// driver dial.
+#[cfg(feature = "discord")]
+pub(crate) const RECONNECT_REQUEST_PAUSE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Why a bridge cannot serve its configuration, in the closed vocabulary plus a
 /// bounded, control-free detail that names the offending room or channel. It
@@ -642,6 +699,33 @@ impl ConfigurationRefusal {
 
     pub const fn failure(&self) -> NetworkFailure {
         self.failure
+    }
+
+    /// What the runner may do about this refusal, decided by its kind. The
+    /// rule: a refusal that nothing but the owner acting can clear parks at
+    /// once, since each retry only repeats it; one the upstream can clear by
+    /// itself takes the refusal schedule and then parks.
+    ///
+    /// - [`NetworkFailure::GatewayConfigurationRefused`]: a gateway's answer
+    ///   about the bot itself (Discord's shard, sharding, API version and
+    ///   intent close codes; Slack's Socket Mode switched off). The owner
+    ///   must change the bot or the app — park now.
+    /// - [`NetworkFailure::RoomEncrypted`]: a Matrix room cannot turn
+    ///   encryption off again — park now.
+    /// - [`NetworkFailure::ChannelJoinRefused`]: "not invited" ends when an
+    ///   invitation arrives upstream, which the homeserver may be catching up
+    ///   on — the schedule.
+    /// - [`NetworkFailure::ChannelMappingFailed`]: a Discord or Slack channel
+    ///   name comes from the upstream, and renaming it there clears the
+    ///   refusal — the schedule.
+    pub fn retry_policy(&self) -> e6irc_client::RefusalRetry {
+        use e6irc_client::RefusalRetry;
+        match self.failure {
+            NetworkFailure::GatewayConfigurationRefused | NetworkFailure::RoomEncrypted => {
+                RefusalRetry::ParkNow
+            }
+            _ => RefusalRetry::ScheduleThenPark,
+        }
     }
 
     pub fn diagnostic(&self) -> &str {
@@ -696,14 +780,14 @@ impl Refusal {
     /// What the runner may do about this refusal. Parking waits for the owner
     /// to change something: a refusal that ends by itself gives them nothing to
     /// change and is retried at the schedule's last step for as long as it
-    /// lasts; one that only a change can end is parked on at once. A bridge's
-    /// configuration refusal takes the schedule and then parks, as it always
-    /// has: its upstream may be catching up on a room it was just invited to.
+    /// lasts; one that only a change can end is parked on at once. Each kind
+    /// states its own policy in one place: [`e6irc_client::RegistrationRefusal::retry_policy`]
+    /// and [`ConfigurationRefusal::retry_policy`].
     fn retry(&self) -> e6irc_client::RefusalRetry {
         match self {
             Self::Registration(rejection) => rejection.refusal().retry_policy(),
             #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-            Self::Configuration(_) => e6irc_client::RefusalRetry::ScheduleThenPark,
+            Self::Configuration(refusal) => refusal.retry_policy(),
         }
     }
 
@@ -938,6 +1022,14 @@ pub(crate) async fn run_with_backoff<C>(
                     RefusalHandled::Ended => return,
                 }
             }
+            #[cfg(feature = "discord")]
+            SessionOutcome::ReconnectRequested => {
+                tokio::select! {
+                    biased;
+                    _ = ends.shutdown_signalled() => return,
+                    _ = tokio::time::sleep(RECONNECT_REQUEST_PAUSE) => continue,
+                }
+            }
             SessionOutcome::Dropped(failure) => (failure, None),
             SessionOutcome::ClosedByUpstream(closed) => {
                 (NetworkFailure::ConnectionLost, Some(closed))
@@ -1018,13 +1110,147 @@ async fn retry_refusal(
     }
 }
 
+/// What an IRC client's message becomes on a bridge: plain text, or a CTCP
+/// `ACTION` (`/me`), which each provider renders its own way (Matrix
+/// `m.emote`, Discord and Slack italics). IRC formatting is gone from both:
+/// the providers have their own markup, and a `\x02` or `\x03` color code
+/// arrives there as noise.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BridgeText {
+    Text(String),
+    Action(String),
+}
+
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+impl BridgeText {
+    /// An IRC client's message text as a bridge sends it. `None` is a CTCP
+    /// other than `ACTION` (`\x01VERSION\x01`): no provider has anything to
+    /// answer it with, so the caller refuses it rather than posting the raw
+    /// bytes as a message.
+    pub(crate) fn outbound(text: &str) -> Option<Self> {
+        if let Some(action) = crate::sanitize::ctcp_action(text) {
+            return Some(Self::Action(strip_irc_formatting(action)));
+        }
+        if text.starts_with('\u{1}') {
+            return None;
+        }
+        Some(Self::Text(strip_irc_formatting(text)))
+    }
+
+    /// The text with the `/me` rendered as the Markdown italics Discord and
+    /// Slack both read (`_waves_`). `escape` is applied to the text first.
+    #[cfg(any(feature = "discord", feature = "slack"))]
+    pub(crate) fn italic_markdown(&self, escape: impl Fn(&str) -> String) -> String {
+        match self {
+            Self::Text(text) => escape(text),
+            Self::Action(text) => format!("_{}_", escape(text)),
+        }
+    }
+}
+
+/// `text` without IRC formatting: bold `\x02`, color `\x03[fg[,bg]]`, hex
+/// color `\x04[rrggbb[,rrggbb]]`, reset `\x0F`, monospace `\x11`, reverse
+/// `\x16`, italics `\x1D`, strikethrough `\x1E`, underline `\x1F`. Any other
+/// C0 control but tab goes too: none of them means anything to a provider.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+fn strip_irc_formatting(text: &str) -> String {
+    /// Consume up to `max` characters matching `accept` from `chars`.
+    fn take(
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+        max: usize,
+        accept: fn(char) -> bool,
+    ) -> bool {
+        let mut taken = 0;
+        while taken < max && chars.peek().is_some_and(|c| accept(*c)) {
+            chars.next();
+            taken += 1;
+        }
+        taken > 0
+    }
+    /// A color argument: `fg`, then optionally `,bg` — the comma only when a
+    /// background actually follows, or it is the message's own comma.
+    fn color(
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+        max: usize,
+        accept: fn(char) -> bool,
+    ) {
+        if take(chars, max, accept) {
+            let mut ahead = chars.clone();
+            if ahead.next() == Some(',') && ahead.peek().is_some_and(|c| accept(*c)) {
+                chars.next();
+                take(chars, max, accept);
+            }
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{3}' => color(&mut chars, 2, |c| c.is_ascii_digit()),
+            '\u{4}' => color(&mut chars, 6, |c| c.is_ascii_hexdigit()),
+            '\t' => out.push(c),
+            c if c.is_ascii_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// How an inbound bridged message is shown to IRC clients.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InboundKind {
+    /// A `PRIVMSG`.
+    Message,
+    /// A `PRIVMSG` carrying a CTCP `ACTION` (`/me`): Matrix `m.emote`, Slack
+    /// `me_message`. (Discord has no action of its own; the `lint` job builds
+    /// each bridge alone, so a variant one build never makes is gated out.)
+    #[cfg(any(feature = "matrix", feature = "slack"))]
+    Action,
+    /// A `NOTICE`: Matrix `m.notice`, a bot's message by convention.
+    #[cfg(feature = "matrix")]
+    Notice,
+}
+
+/// Remote text on its way to IRC clients. Built only through
+/// [`Inbound::new`], which drops every C0 control but tab and line breaks: a
+/// provider message can therefore never reach an attached client as a CTCP
+/// request (`\x01VERSION\x01`, which clients answer), nor carry IRC
+/// formatting it did not mean. The one `\x01` an inbound line can hold is the
+/// `ACTION` wrapper [`render_bridged`] adds itself.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Inbound {
+    kind: InboundKind,
+    body: String,
+}
+
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+impl Inbound {
+    pub(crate) fn new(kind: InboundKind, body: &str) -> Self {
+        Self {
+            kind,
+            body: body
+                .chars()
+                .filter(|c| !c.is_ascii_control() || matches!(c, '\t' | '\n'))
+                .collect(),
+        }
+    }
+
+    #[cfg(any(feature = "discord", feature = "slack"))]
+    pub(crate) fn message(body: &str) -> Self {
+        Self::new(InboundKind::Message, body)
+    }
+}
+
 /// Classification of a downstream client command by a bridge, so a message
 /// that can't be delivered upstream is surfaced rather than silently dropped.
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RouteResult {
     /// A PRIVMSG mapped to `(upstream_id, text)`; deliver it.
-    Deliver(String, String),
+    Deliver(String, BridgeText),
     /// A PRIVMSG to `target` that maps to no bridged channel — surface loss.
     Unmapped(String),
     /// The bridge cannot execute this command; surface a fixed safe reason.
@@ -1036,6 +1262,8 @@ pub(crate) enum RouteResult {
 pub(crate) enum BridgeCommandRejection {
     MalformedMessage,
     UnsupportedCommand,
+    /// A CTCP other than `ACTION`: nothing on the provider can answer it.
+    UnsupportedCtcp,
 }
 
 /// Classify a downstream client line for a bridge: the single choke point all
@@ -1048,7 +1276,8 @@ pub(crate) enum BridgeCommandRejection {
 /// server splits — so this splits it and routes each independently. A single
 /// STATUSMSG prefix (`@#chan`/`+#chan`) is stripped before the lookup: a bridge
 /// has no op/voice-only concept, so it delivers to the channel itself. An empty
-/// or non-PRIVMSG line yields one explicit rejection.
+/// or non-PRIVMSG line yields one explicit rejection, and so does a CTCP other
+/// than `ACTION` (see [`BridgeText::outbound`]).
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 pub(crate) fn route_privmsg(
     line: &str,
@@ -1069,6 +1298,11 @@ pub(crate) fn route_privmsg(
             BridgeCommandRejection::MalformedMessage,
         )];
     };
+    let Some(text) = BridgeText::outbound(text) else {
+        return vec![RouteResult::Rejected(
+            BridgeCommandRejection::UnsupportedCtcp,
+        )];
+    };
     let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
     let mut out: Vec<RouteResult> = target
         .split(',')
@@ -1076,7 +1310,7 @@ pub(crate) fn route_privmsg(
         .map(|t| {
             let bare = conversation_target(t);
             match targets.get(&casemap.casefold(bare)) {
-                Some(id) => RouteResult::Deliver(id.clone(), text.to_string()),
+                Some(id) => RouteResult::Deliver(id.clone(), text.clone()),
                 None => RouteResult::Unmapped(bare.to_string()),
             }
         })
@@ -1089,6 +1323,84 @@ pub(crate) fn route_privmsg(
     out
 }
 
+/// The longest provider rate-limit wait a delivery sits out before retrying
+/// once. Past it the message is reported undelivered, naming the limit: a
+/// client told nothing for minutes would think it was sent.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) const RATE_LIMIT_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How one routed delivery ended, for [`report_delivery`].
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+#[derive(Debug)]
+pub(crate) enum DeliveryOutcome {
+    Delivered,
+    Failed {
+        id: String,
+        detail: String,
+    },
+    /// Still rate-limited after the one retry, or asked to wait past
+    /// [`RATE_LIMIT_WAIT_CAP`].
+    RateLimited {
+        id: String,
+        retry_after: std::time::Duration,
+    },
+}
+
+/// Send one routed message, sitting out one provider rate limit of at most
+/// [`RATE_LIMIT_WAIT_CAP`] and retrying once. Owns everything it needs, so a
+/// WebSocket bridge can run it beside its socket instead of in front of it.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) async fn deliver_with_retry<F, Fut>(
+    mut deliver: F,
+    id: String,
+    text: BridgeText,
+) -> DeliveryOutcome
+where
+    F: FnMut(String, BridgeText) -> Fut,
+    Fut: Future<Output = Result<(), BridgeFailure>>,
+{
+    let failed = |id: String, failure: BridgeFailure| match failure {
+        BridgeFailure::RateLimited(retry_after) => DeliveryOutcome::RateLimited { id, retry_after },
+        BridgeFailure::Failed(detail) => DeliveryOutcome::Failed { id, detail },
+    };
+    match deliver(id.clone(), text.clone()).await {
+        Ok(()) => DeliveryOutcome::Delivered,
+        Err(BridgeFailure::RateLimited(wait)) if wait <= RATE_LIMIT_WAIT_CAP => {
+            tokio::time::sleep(wait).await;
+            match deliver(id.clone(), text).await {
+                Ok(()) => DeliveryOutcome::Delivered,
+                Err(failure) => failed(id, failure),
+            }
+        }
+        Err(failure) => failed(id, failure),
+    }
+}
+
+/// Say what became of one delivery: nothing for a delivered message, and for
+/// a lost one a counted failure plus a `*bnc*` notice naming the target (and
+/// the limit, when it was a rate limit) — never a silent drop (DESIGN §2).
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) fn report_delivery(
+    ends: &DriverEnds,
+    platform: &str,
+    kind: &str,
+    outcome: DeliveryOutcome,
+) {
+    match outcome {
+        DeliveryOutcome::Delivered => {}
+        DeliveryOutcome::Failed { id, detail } => {
+            eprintln!("{platform}: send to {id} failed: {detail}");
+            ends.record_error(NetworkFailure::UpstreamWriteFailed);
+            ends.emit_line(undelivered_notice(platform, kind, &id));
+        }
+        DeliveryOutcome::RateLimited { id, retry_after } => {
+            eprintln!("{platform}: send to {id} rate-limited; retry after {retry_after:?}");
+            ends.record_error(NetworkFailure::UpstreamWriteFailed);
+            ends.emit_line(rate_limited_notice(platform, kind, &id, retry_after));
+        }
+    }
+}
+
 /// Deliver one already-routed batch of PRIVMSG targets and surface the outcome
 /// of **each** one to the attached client. `route_privmsg` yields one
 /// `RouteResult` per comma-separated target; this consumes the whole list, so a
@@ -1098,10 +1410,12 @@ pub(crate) fn route_privmsg(
 /// (DESIGN §2) is exactly what the Matrix bridge did before this was shared:
 /// every bridge now routes its per-target outcome through one definition that
 /// cannot collapse the list. `deliver` performs the platform's upstream send for
-/// a mapped `(id, text)` and returns `Ok(())` or an error string; it does its
-/// session-touching work synchronously and moves owned data into the returned
-/// future, so no borrow of the caller's session outlives a single send.
-#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+/// a mapped `(id, text)`; it does its session-touching work synchronously and
+/// moves owned data into the returned future, so no borrow of the caller's
+/// session outlives a single send. The WebSocket bridges queue the same
+/// [`deliver_with_retry`] instead of awaiting it (`queue_channel_command`);
+/// only Matrix, which has no socket to keep answering, awaits it here.
+#[cfg(feature = "matrix")]
 pub(crate) async fn relay_routed<F, Fut>(
     ends: &DriverEnds,
     routed: Vec<RouteResult>,
@@ -1109,18 +1423,14 @@ pub(crate) async fn relay_routed<F, Fut>(
     kind: &str,
     mut deliver: F,
 ) where
-    F: FnMut(String, String) -> Fut,
-    Fut: std::future::Future<Output = Result<(), String>>,
+    F: FnMut(String, BridgeText) -> Fut,
+    Fut: std::future::Future<Output = Result<(), BridgeFailure>>,
 {
     for routed in routed {
         match routed {
             RouteResult::Deliver(id, text) => {
-                if let Err(e) = deliver(id.clone(), text).await {
-                    eprintln!("{platform}: send to {id} failed: {e}");
-                    // A delivery failure is not a silent drop (DESIGN §2).
-                    ends.record_error(NetworkFailure::UpstreamWriteFailed);
-                    ends.emit_line(undelivered_notice(platform, kind, &id));
-                }
+                let outcome = deliver_with_retry(&mut deliver, id, text).await;
+                report_delivery(ends, platform, kind, outcome);
             }
             RouteResult::Unmapped(target) => {
                 ends.emit_line(unmapped_target_notice(platform, kind, &target));
@@ -1131,6 +1441,74 @@ pub(crate) async fn relay_routed<F, Fut>(
         }
     }
 }
+
+/// Work a WebSocket bridge runs beside its socket, one item at a time, in the
+/// order it was queued: a REST delivery or a name lookup can take the whole
+/// request timeout, and awaited inside the socket loop it held every ack and
+/// heartbeat behind it — Slack re-sent the envelopes it had not seen acked,
+/// and they were relayed twice. Serial, because two messages to one channel
+/// must arrive in the order they were written; bounded, because a queue that
+/// only grows is a leak with a delay.
+///
+/// [`SerialQueue::next`] is cancel-safe: the item in progress lives in the
+/// queue, not in the future `next` returns, so a `select!` that abandons it
+/// loses nothing.
+#[cfg(any(feature = "discord", feature = "slack"))]
+pub(crate) struct SerialQueue<T> {
+    capacity: usize,
+    waiting: std::collections::VecDeque<std::pin::Pin<Box<dyn Future<Output = T> + Send>>>,
+    running: Option<std::pin::Pin<Box<dyn Future<Output = T> + Send>>>,
+}
+
+/// The queue already holds its capacity; the item was not queued.
+#[cfg(any(feature = "discord", feature = "slack"))]
+#[derive(Debug)]
+pub(crate) struct QueueFull;
+
+#[cfg(any(feature = "discord", feature = "slack"))]
+impl<T> SerialQueue<T> {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            waiting: std::collections::VecDeque::new(),
+            running: None,
+        }
+    }
+
+    pub(crate) fn push(
+        &mut self,
+        work: impl Future<Output = T> + Send + 'static,
+    ) -> Result<(), QueueFull> {
+        if self.waiting.len() + usize::from(self.running.is_some()) >= self.capacity {
+            return Err(QueueFull);
+        }
+        self.waiting.push_back(Box::pin(work));
+        Ok(())
+    }
+
+    /// The next finished item; pending forever while the queue is empty.
+    pub(crate) async fn next(&mut self) -> T {
+        if self.running.is_none() {
+            match self.waiting.pop_front() {
+                Some(work) => self.running = Some(work),
+                None => return std::future::pending().await,
+            }
+        }
+        let running = self.running.as_mut().expect("an item is running");
+        let output = running.await;
+        self.running = None;
+        output
+    }
+}
+
+/// Outbound deliveries a WebSocket bridge has accepted and not yet finished.
+/// More than this in flight is a provider that has stopped answering; a
+/// message past it is refused with the undelivered notice at once.
+#[cfg(any(feature = "discord", feature = "slack"))]
+pub(crate) const DELIVERY_QUEUE_CAPACITY: usize = 8;
+
+#[cfg(any(feature = "discord", feature = "slack"))]
+pub(crate) type DeliveryQueue = SerialQueue<DeliveryOutcome>;
 
 /// A reqwest DNS resolver that vets every resolved address and drops the ones a
 /// bridge may not dial — the same control the IRC driver applies at connect
@@ -1194,6 +1572,10 @@ impl BridgeHttp {
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
+            // Under the default policy nothing a bridge may dial speaks
+            // cleartext (see `BridgeHttp::request`), so the client refuses it
+            // outright as well.
+            .https_only(internal_upstreams == crate::egress::InternalUpstreams::Refuse)
             .dns_resolver(std::sync::Arc::new(VettingResolver(internal_upstreams)))
             .build()?;
         Ok(Self {
@@ -1212,6 +1594,14 @@ impl BridgeHttp {
         let url = reqwest::Url::parse(url).map_err(|e| format!("bridge request URL: {e}"))?;
         if let Some(refusal) = self.internal_upstreams.refusal_for_url(&url) {
             return Err(refusal.reason().to_string());
+        }
+        if url.scheme() != "https" && !cleartext_oracle(&url, self.internal_upstreams) {
+            return Err(
+                "bridge requests must be https://: the network's credentials cross them, and \
+                 only a loopback http:// test oracle under internal_upstreams = \"allow\" may \
+                 speak cleartext"
+                    .into(),
+            );
         }
         Ok(self.client.request(method, url))
     }
@@ -1271,7 +1661,7 @@ pub(crate) fn bridge_http_or_outcome(
 
 /// The gateway WebSocket stream type both WebSocket bridges run over.
 #[cfg(any(feature = "discord", feature = "slack"))]
-type BridgeWs =
+pub(crate) type BridgeWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Open a bridge gateway WebSocket with a bounded handshake, mapping failure
@@ -1391,12 +1781,12 @@ pub(crate) async fn next_bridge_frame(
     }
 }
 
-/// Read the next text frame from a bridge gateway socket, mapping the
-/// terminal outcomes (idle, close, read/write failure) to the session
+/// Read the next text frame from a one-socket gateway (Discord's), mapping
+/// the terminal outcomes (idle, close, read/write failure) to the session
 /// outcome. `on_close` decides what a protocol close code means for the
-/// provider (Discord's fatal auth/intents codes; Slack treats every close as
-/// a plain drop).
-#[cfg(any(feature = "discord", feature = "slack"))]
+/// provider. Slack reads [`next_bridge_frame`] itself: it holds two sockets
+/// across a handover, and one retiring is not the session's end.
+#[cfg(feature = "discord")]
 pub(crate) async fn next_bridge_text(
     read: &mut futures_util::stream::SplitStream<BridgeWs>,
     write: &mut futures_util::stream::SplitSink<BridgeWs, tokio_tungstenite::tungstenite::Message>,
@@ -1432,24 +1822,6 @@ macro_rules! bridge_start {
 }
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 pub(crate) use bridge_start;
-
-/// The `run` loop for a bridge driver: reconnect from scratch with backoff on
-/// any session drop rather than dying and silently dropping all later
-/// messages; only a dropped handle stops the driver. (Matrix writes its own:
-/// it keeps a login across reconnects and logs it out when the loop ends.)
-#[cfg(any(feature = "discord", feature = "slack"))]
-macro_rules! bridge_run {
-    ($config:ty) => {
-        async fn run(config: $config, mut ends: DriverEnds) {
-            super::run_with_backoff(config, &mut ends, |config, ends| {
-                Box::pin(session_once(config, ends))
-            })
-            .await;
-        }
-    };
-}
-#[cfg(any(feature = "discord", feature = "slack"))]
-pub(crate) use bridge_run;
 
 /// Open a bridge gateway WebSocket to `url`, vetting the resolved IP the same way
 /// [`VettingResolver`] vets HTTP dials. The gateway URL comes from an upstream
@@ -1588,9 +1960,8 @@ fn require_secure_gateway(
     if gateway.scheme() == "wss" {
         return Ok(());
     }
-    let oracle = internal_upstreams == crate::egress::InternalUpstreams::Allow
-        && url::Url::parse(api_base)
-            .is_ok_and(|base| base.scheme() == "http" && base.host().is_some_and(is_loopback_host));
+    let oracle =
+        url::Url::parse(api_base).is_ok_and(|base| cleartext_oracle(&base, internal_upstreams));
     if oracle {
         Ok(())
     } else {
@@ -1602,12 +1973,25 @@ fn require_secure_gateway(
     }
 }
 
-#[cfg(any(feature = "discord", feature = "slack"))]
+/// Whether `url` is the one place a bridge may speak cleartext: an `http://`
+/// loopback test oracle, under the operator's `internal_upstreams = "allow"`.
+/// The REST client and the gateway dialer both ask this, so the two
+/// transports cannot disagree about when credentials may travel unencrypted.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+fn cleartext_oracle(url: &url::Url, internal_upstreams: crate::egress::InternalUpstreams) -> bool {
+    internal_upstreams == crate::egress::InternalUpstreams::Allow
+        && url.scheme() == "http"
+        && url.host().is_some_and(is_loopback_host)
+}
+
+/// Whether a URL's host is a loopback address, as a literal. A name —
+/// `localhost` included — is never taken to mean this machine: it is whatever
+/// a resolver answers, and a bridge's credentials would follow the answer.
 fn is_loopback_host(host: url::Host<&str>) -> bool {
     match host {
         url::Host::Ipv4(ip) => ip.is_loopback(),
         url::Host::Ipv6(ip) => ip.to_canonical().is_loopback(),
-        url::Host::Domain(name) => name.eq_ignore_ascii_case("localhost"),
+        url::Host::Domain(_) => false,
     }
 }
 
@@ -1634,6 +2018,90 @@ fn bridge_gateway_authority(url: &str) -> Result<(String, u16), String> {
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 pub(crate) const MAX_BRIDGE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// How a bridge request failed.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BridgeFailure {
+    /// `429`: the upstream asks for this long before the next request. Kept
+    /// apart from every other failure so a caller can wait instead of losing
+    /// the message, and a sync loop can pause instead of reconnecting — the
+    /// reconnect re-did every join, the very writes being limited.
+    RateLimited(std::time::Duration),
+    /// Anything else, in e6irc's own words (never the provider's body).
+    Failed(String),
+}
+
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+impl std::fmt::Display for BridgeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RateLimited(wait) => write!(f, "upstream rate limit; retry after {wait:?}"),
+            Self::Failed(detail) => f.write_str(detail),
+        }
+    }
+}
+
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+impl From<String> for BridgeFailure {
+    fn from(detail: String) -> Self {
+        Self::Failed(detail)
+    }
+}
+
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+impl From<BridgeFailure> for String {
+    fn from(failure: BridgeFailure) -> Self {
+        failure.to_string()
+    }
+}
+
+/// The wait a `429` names when it names none a bridge can read (no
+/// `Retry-After` header, no `retry_after` / `retry_after_ms` body field).
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) const RATE_LIMIT_UNSTATED_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The longest rate-limit wait a bridge believes. An upstream's number past
+/// it is clamped: the wait is still honoured for an hour, and a nonsense
+/// value cannot park a driver for good or overflow the timer.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+const RATE_LIMIT_WAIT_CEILING: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The wait a `429` asks for: the body's `retry_after` (Discord, seconds) or
+/// `retry_after_ms` (Matrix), else the `Retry-After` header in seconds (every
+/// provider), else [`RATE_LIMIT_UNSTATED_WAIT`]; clamped to
+/// [`RATE_LIMIT_WAIT_CEILING`].
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+async fn rate_limit_wait(response: reqwest::Response) -> std::time::Duration {
+    #[derive(serde::Deserialize)]
+    struct RateLimitBody {
+        #[serde(default)]
+        retry_after: Option<f64>,
+        #[serde(default)]
+        retry_after_ms: Option<u64>,
+    }
+    let seconds = |value: f64| {
+        (value.is_finite() && value >= 0.0).then(|| {
+            std::time::Duration::from_secs_f64(value.min(RATE_LIMIT_WAIT_CEILING.as_secs_f64()))
+        })
+    };
+    let header = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .and_then(seconds);
+    let body = response.bounded_json::<RateLimitBody>().await.ok();
+    let from_body = body.and_then(|body| {
+        body.retry_after
+            .and_then(seconds)
+            .or_else(|| body.retry_after_ms.map(std::time::Duration::from_millis))
+    });
+    from_body
+        .or(header)
+        .unwrap_or(RATE_LIMIT_UNSTATED_WAIT)
+        .min(RATE_LIMIT_WAIT_CEILING)
+}
+
 /// Send an outbound bridge HTTP request and reject any non-2xx response. Every
 /// reverse-direction (IRC→upstream) send whose failure is signalled by HTTP
 /// status funnels through here so the raw `reqwest::Response` never reaches
@@ -1643,30 +2111,38 @@ pub(crate) const MAX_BRIDGE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// success" unwritable. (Slack signals failure in the 200 body via `ok:false`,
 /// an application-level check its `check_ok` still performs on top of this.)
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-pub(crate) async fn bridge_send(req: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
-    bridge_response_status(req.send().await.map_err(|e| e.to_string())?)
+pub(crate) async fn bridge_send(
+    req: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, BridgeFailure> {
+    bridge_response_status(req.send().await.map_err(|e| e.to_string())?).await
 }
 
 /// A bridge response that is not a success is a failed request. A 3xx is
 /// named as such: the client never follows one (an upstream cannot re-target
 /// a request at an internal address), and `error_for_status` alone let it
 /// through — a message "sent" with a 302 was reported delivered and never
-/// posted.
+/// posted. A `429` is [`BridgeFailure::RateLimited`] with the wait it asks for.
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-pub(crate) fn bridge_response_status(
+pub(crate) async fn bridge_response_status(
     response: reqwest::Response,
-) -> Result<reqwest::Response, String> {
+) -> Result<reqwest::Response, BridgeFailure> {
     let status = response.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(BridgeFailure::RateLimited(rate_limit_wait(response).await));
+    }
     if status.is_redirection() {
-        return Err(format!(
+        return Err(BridgeFailure::Failed(format!(
             "upstream answered HTTP {status}; a bridge never follows a redirect"
-        ));
+        )));
     }
     let response = response.error_for_status().map_err(|e| e.to_string())?;
     if response.status().is_success() {
         Ok(response)
     } else {
-        Err(format!("upstream answered HTTP {}", response.status()))
+        Err(BridgeFailure::Failed(format!(
+            "upstream answered HTTP {}",
+            response.status()
+        )))
     }
 }
 
@@ -1682,8 +2158,8 @@ pub(crate) async fn bridge_send_credentials(
 ) -> Result<reqwest::Response, ConnectFail> {
     let response = req.send().await.map_err(|e| e.to_string())?;
     let status = response.status();
-    bridge_response_status(response).map_err(|detail| {
-        let detail = format!("{what} rejected: {detail}");
+    bridge_response_status(response).await.map_err(|failure| {
+        let detail = format!("{what} rejected: {failure}");
         if matches!(
             status,
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
@@ -1696,23 +2172,45 @@ pub(crate) async fn bridge_send_credentials(
 }
 
 /// A WebSocket bridge's whole downstream arm: route the client's command to its
-/// bridged channels and relay each outcome. `None` means every handle was
-/// dropped (or the network was shut down) and the session must stop. Discord
-/// and Slack differ only in how one message is sent, which is `deliver`.
+/// bridged channels, refuse what cannot be routed at once, and queue each
+/// delivery on `queue` — never awaited here, so the socket keeps being read.
+/// `None` means every handle was dropped (or the network was shut down) and
+/// the session must stop. Discord and Slack differ only in how one message is
+/// sent, which is `deliver`; the loop reports each finished delivery with
+/// [`report_delivery`].
 #[cfg(any(feature = "discord", feature = "slack"))]
-pub(crate) async fn relay_channel_command<F, Fut>(
+pub(crate) fn queue_channel_command<F, Fut>(
     ends: &DriverEnds,
     command: Option<ClientCommand>,
     channel_to_id: &HashMap<String, String>,
     platform: &str,
+    queue: &mut DeliveryQueue,
     deliver: F,
 ) -> Option<()>
 where
-    F: FnMut(String, String) -> Fut,
-    Fut: Future<Output = Result<(), String>>,
+    F: FnMut(String, BridgeText) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<(), BridgeFailure>> + Send + 'static,
 {
-    let routed = route_privmsg(&command?.line, channel_to_id);
-    relay_routed(ends, routed, platform, "channel", deliver).await;
+    for routed in route_privmsg(&command?.line, channel_to_id) {
+        match routed {
+            RouteResult::Deliver(id, text) => {
+                let work = deliver_with_retry(deliver.clone(), id.clone(), text);
+                if queue.push(work).is_err() {
+                    eprintln!(
+                        "{platform}: {DELIVERY_QUEUE_CAPACITY} sends in flight; refused one to {id}"
+                    );
+                    ends.record_error(NetworkFailure::CommandQueueFull);
+                    ends.emit_line(undelivered_notice(platform, "channel", &id));
+                }
+            }
+            RouteResult::Unmapped(target) => {
+                ends.emit_line(unmapped_target_notice(platform, "channel", &target));
+            }
+            RouteResult::Rejected(rejection) => {
+                ends.emit_line(rejected_bridge_command_notice(platform, rejection));
+            }
+        }
+    }
     Some(())
 }
 
@@ -1731,8 +2229,7 @@ pub(crate) fn bridge_ws_config() -> tokio_tungstenite::tungstenite::protocol::We
 
 /// JSON-parse an upstream HTTP response body under a size cap. `reqwest`'s
 /// `.json()`/`.bytes()` buffer the *whole* body first, so a hostile or
-/// compromised upstream (the Matrix example config even permits plaintext
-/// `http://…`, MITM-able) can return a multi-GB body and OOM the shared daemon —
+/// compromised upstream can return a multi-GB body and OOM the shared daemon —
 /// a cross-tenant DoS, since one process serves every user. This reads chunk by
 /// chunk and rejects a body past `MAX_BRIDGE_RESPONSE_BYTES` before buffering it.
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
@@ -2317,7 +2814,10 @@ pub enum NetworkFailure {
     InvalidNickname,
     InvalidUsername,
     NicknameInUse,
+    /// 464 after the configured server password was sent.
     ServerPasswordRejected,
+    /// 464 with no server password configured.
+    ServerPasswordRequired,
     NetworkBanned,
     AuthenticationRejected,
     SaslUnavailable,
@@ -2336,6 +2836,14 @@ pub enum NetworkFailure {
     UpstreamProtocolFailed,
     ChannelMappingFailed,
     ChannelJoinRefused,
+    /// A bridged Matrix room is end-to-end encrypted, which the bridge cannot
+    /// read (it holds no device keys).
+    RoomEncrypted,
+    /// A chat gateway refused the bot's own configuration: Discord's close
+    /// codes for an invalid shard, required sharding, an unsupported API
+    /// version, or intents the application may not use; Slack's Socket Mode
+    /// switched off. No retry fixes it; the diagnostic names which.
+    GatewayConfigurationRefused,
     BacklogStorageFailed,
     BacklogStorageLagged,
     CommandQueueFull,
@@ -2357,6 +2865,7 @@ impl NetworkFailure {
             Self::InvalidUsername => "invalid_username",
             Self::NicknameInUse => "nickname_in_use",
             Self::ServerPasswordRejected => "server_password_rejected",
+            Self::ServerPasswordRequired => "server_password_required",
             Self::NetworkBanned => "network_banned",
             Self::AuthenticationRejected => "authentication_rejected",
             Self::SaslUnavailable => "sasl_unavailable",
@@ -2371,6 +2880,8 @@ impl NetworkFailure {
             Self::UpstreamProtocolFailed => "upstream_protocol_failed",
             Self::ChannelMappingFailed => "channel_mapping_failed",
             Self::ChannelJoinRefused => "channel_join_refused",
+            Self::RoomEncrypted => "room_encrypted",
+            Self::GatewayConfigurationRefused => "gateway_configuration_refused",
             Self::BacklogStorageFailed => "backlog_storage_failed",
             Self::BacklogStorageLagged => "backlog_storage_lagged",
             Self::CommandQueueFull => "command_queue_full",
@@ -2393,7 +2904,8 @@ impl NetworkFailure {
             Self::InvalidNickname => "The upstream rejected the configured nickname.",
             Self::InvalidUsername => "The upstream rejected the IRC username.",
             Self::NicknameInUse => "The configured nickname is already in use.",
-            Self::ServerPasswordRejected => {
+            Self::ServerPasswordRejected => "The network rejected the configured server password.",
+            Self::ServerPasswordRequired => {
                 "The network requires a server password, which this network configuration does not supply."
             }
             Self::NetworkBanned => "The upstream network banned this connection.",
@@ -2421,6 +2933,12 @@ impl NetworkFailure {
             }
             Self::ChannelJoinRefused => {
                 "The upstream refused to let this network join a configured channel."
+            }
+            Self::RoomEncrypted => {
+                "A configured room is end-to-end encrypted, which the bridge cannot read."
+            }
+            Self::GatewayConfigurationRefused => {
+                "The chat gateway refused this bot's configuration; no retry can fix it."
             }
             Self::BacklogStorageFailed => "The detached backlog could not be stored.",
             Self::BacklogStorageLagged => {
@@ -2989,24 +3507,47 @@ pub(crate) fn undelivered_notice(platform: &str, kind: &str, target: &str) -> St
     format!(":*bnc* NOTICE * :not delivered: {platform} send to {kind} {shown} failed")
 }
 
+/// A `*bnc*` NOTICE telling the client its message was not delivered because
+/// the provider rate-limited it past what a delivery waits out; bounded like
+/// [`undelivered_notice`].
+#[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+pub(crate) fn rate_limited_notice(
+    platform: &str,
+    kind: &str,
+    target: &str,
+    retry_after: std::time::Duration,
+) -> String {
+    let shown = e6irc_proto::message::truncate_on_char_boundary(target, 64);
+    format!(
+        ":*bnc* NOTICE * :not delivered: {platform} rate-limited sends to {kind} {shown} \
+         (it asked for {}s)",
+        retry_after.as_secs_f64().ceil()
+    )
+}
+
 #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
 fn rejected_bridge_command_notice(platform: &str, rejection: BridgeCommandRejection) -> String {
     let reason = match rejection {
         BridgeCommandRejection::MalformedMessage => "malformed PRIVMSG",
         BridgeCommandRejection::UnsupportedCommand => "the bridge supports PRIVMSG only",
+        BridgeCommandRejection::UnsupportedCtcp => {
+            "the bridge relays CTCP ACTION only; nothing there can answer another CTCP"
+        }
     };
     format!(":*bnc* NOTICE * :not delivered to {platform}: {reason}")
 }
 
-/// Render a bridged message as one or more IRC `PRIVMSG` lines: the sender is
-/// reduced to a safe nick token and the body is split to fit the line limit.
+/// Render a bridged message as one or more IRC lines — `PRIVMSG`, a CTCP
+/// `ACTION`, or a `NOTICE`, as the [`Inbound`] says: the sender is reduced to
+/// a safe nick token and the body is split to fit the line limit.
 ///
 /// The body is free-form remote text of arbitrary length — Slack alone allows
 /// 40,000 characters — while an IRC line is [`MAX_LINE_LEN`] bytes including
 /// its CRLF. Emitting one over-long line does not merely bend the protocol: the
 /// receiving client's framing discards an over-long line *whole*, so the
 /// message vanishes with nothing said. It is split instead, because a bridged
-/// message must not disappear for being long.
+/// message must not disappear for being long. Each piece of an action is its
+/// own complete `ACTION`.
 ///
 /// Embedded newlines split too. They are line breaks in the source medium, and
 /// [`crate::sanitize::upstream_line`] flattens them to spaces further down, which would
@@ -3015,29 +3556,37 @@ fn rejected_bridge_command_notice(platform: &str, rejection: BridgeCommandReject
 /// An empty body still yields one line: a message was sent, and saying nothing
 /// about it would be the silent drop this exists to prevent.
 #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
-pub(crate) fn render_bridged_privmsg(
+pub(crate) fn render_bridged(
     host: &str,
     sender: &str,
     channel: &str,
-    body: &str,
+    message: &Inbound,
 ) -> Vec<String> {
     use e6irc_proto::message::MAX_LINE_LEN;
     let nick = crate::sanitize::nick_token(sender);
-    let prefix = format!(":{nick}!{nick}@{host} PRIVMSG {channel} :");
+    let (command, open, close) = match message.kind {
+        InboundKind::Message => ("PRIVMSG", "", ""),
+        #[cfg(any(feature = "matrix", feature = "slack"))]
+        InboundKind::Action => ("PRIVMSG", "\u{1}ACTION ", "\u{1}"),
+        #[cfg(feature = "matrix")]
+        InboundKind::Notice => ("NOTICE", "", ""),
+    };
+    let prefix = format!(":{nick}!{nick}@{host} {command} {channel} :{open}");
     // `nick_token` bounds the nick and `host` is one of three literals, so only
     // a pathologically long configured channel name can exhaust the line. The
     // floor keeps the split making progress if one ever does; the resulting
     // lines would still be over-long, which is a configuration error and not
     // something this function can paper over.
-    let budget = (MAX_LINE_LEN - 2).saturating_sub(prefix.len()).max(1);
+    let budget = (MAX_LINE_LEN - 2)
+        .saturating_sub(prefix.len() + close.len())
+        .max(1);
 
     let mut out = Vec::new();
-    for piece in body.split('\n') {
-        let piece = piece.strip_suffix('\r').unwrap_or(piece);
+    for piece in message.body.split('\n') {
         let mut rest = piece;
         loop {
             if rest.len() <= budget {
-                out.push(format!("{prefix}{rest}"));
+                out.push(format!("{prefix}{rest}{close}"));
                 break;
             }
             // Split on a character boundary — `budget` is a byte count, and
@@ -3051,11 +3600,31 @@ pub(crate) fn render_bridged_privmsg(
             if cut == 0 {
                 cut = rest.char_indices().nth(1).map_or(rest.len(), |(i, _)| i);
             }
-            out.push(format!("{prefix}{}", &rest[..cut]));
+            out.push(format!("{prefix}{}{close}", &rest[..cut]));
             rest = &rest[cut..];
         }
     }
     out
+}
+
+/// A `*bnc*` NOTICE to `channel` saying a message from `sender` of a kind the
+/// bridge cannot show (`what`, the provider's own type name) was not relayed.
+/// `what` is upstream text: it is reduced to a bounded token of type-name
+/// characters, so it can carry neither controls nor a line's worth of bytes.
+#[cfg(any(feature = "matrix", feature = "slack"))]
+pub(crate) fn unrelayed_notice(platform: &str, channel: &str, what: &str, sender: &str) -> String {
+    let what: String = what
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .take(64)
+        .collect();
+    let what = if what.is_empty() {
+        "unnamed"
+    } else {
+        what.as_str()
+    };
+    let sender = crate::sanitize::nick_token(sender);
+    format!(":*bnc* NOTICE {channel} :{platform}: a {what} message from {sender} was not relayed")
 }
 
 /// Outcome of a non-blocking send to a network's shared upstream command queue.
@@ -3554,11 +4123,42 @@ impl DriverEnds {
     /// Public because [`DriverEnds::begin_irc_session`] is: a driver that can
     /// begin a session through the SPI must be able to feed it.
     pub fn emit_session_line(&self, line: String) -> Result<SessionChange, ChannelLimitExceeded> {
+        self.emit_session_line_from(line, None)
+    }
+
+    /// [`DriverEnds::emit_session_line`] for the upstream's echo of a line an
+    /// attached client sent (the upstream acknowledged `echo-message`):
+    /// tracked and buffered like any session line, but broadcast as
+    /// [`DriverEvent::Echo`] so the originator receives it only when it
+    /// negotiated echo-message — one echo per line, never two.
+    pub fn emit_session_echo(
+        &self,
+        line: String,
+        origin: u64,
+    ) -> Result<SessionChange, ChannelLimitExceeded> {
+        self.emit_session_line_from(line, Some(origin))
+    }
+
+    fn emit_session_line_from(
+        &self,
+        line: String,
+        origin: Option<u64>,
+    ) -> Result<SessionChange, ChannelLimitExceeded> {
         let line = crate::sanitize::upstream_line(line);
         let mut irc_session = self.irc_session.lock().expect("IRC session state poisoned");
         let change = irc_session.observe(&line)?;
         self.record_input(line.len());
-        self.publish_buffered(line);
+        match origin {
+            None => self.publish_buffered(line),
+            Some(origin) => {
+                let mut buffer = self.buffer.lock().expect("buffer poisoned");
+                let seq = buffer.push(line.clone());
+                drop(self.events.send(DriverEvent::Echo {
+                    line: BufferedLine { seq, line },
+                    origin,
+                }));
+            }
+        }
         // The raw line was delivered, so the client believes in a membership
         // this session does not hold and will not restore. Say so to whoever is
         // attached; it is not conversation, so it stays out of the backlog.
@@ -3796,6 +4396,14 @@ impl DriverEnds {
     /// lifecycle failure, and said once to attached clients and the backlog.
     pub fn record_error_with_upstream_detail(&self, failure: NetworkFailure, diagnostic: &str) {
         let diagnostic = e6irc_client::bounded_diagnostic(diagnostic);
+        // Announce first, record second: the notice is written to the buffer
+        // synchronously, so anyone who sees the failure in the runtime
+        // snapshot is guaranteed to find its notice in the backlog too. The
+        // other order let an observer read the snapshot between the two.
+        self.emit_line(format!(
+            "{}; upstream: {diagnostic}",
+            failure_notice(failure)
+        ));
         self.runtime
             .operational_error_with_diagnostic(failure, &diagnostic);
         if let Some(telemetry) = self
@@ -3806,10 +4414,6 @@ impl DriverEnds {
         {
             telemetry.record_error(crate::observability::ErrorKind::Bouncer);
         }
-        self.emit_line(format!(
-            "{}; upstream: {diagnostic}",
-            failure_notice(failure)
-        ));
     }
 
     /// Await the next downstream command; `None` when every handle is dropped
@@ -3881,6 +4485,9 @@ const fn registration_failure(refusal: e6irc_client::RegistrationRefusal) -> Net
         e6irc_client::RegistrationRefusal::NicknameInUse => NetworkFailure::NicknameInUse,
         e6irc_client::RegistrationRefusal::ServerPasswordRejected => {
             NetworkFailure::ServerPasswordRejected
+        }
+        e6irc_client::RegistrationRefusal::ServerPasswordRequired => {
+            NetworkFailure::ServerPasswordRequired
         }
         e6irc_client::RegistrationRefusal::NetworkBanned => NetworkFailure::NetworkBanned,
         e6irc_client::RegistrationRefusal::NotRegistered => NetworkFailure::RegistrationRejected,
@@ -4576,11 +5183,76 @@ mod tests {
             buffer_cap: 16,
             sasl_account: account.map(str::to_string),
             sasl_password: password.map(str::to_string),
+            server_password: None,
             internal_upstreams: crate::egress::InternalUpstreams::Refuse,
             first_dial: FirstDial::Immediate,
         })
         .err()
         .expect("invalid driver configuration should be rejected")
+    }
+
+    /// A server password is an IRC connection's `PASS`: a bridge has no such
+    /// line, and a value that cannot travel in one is refused before a driver
+    /// exists, naming the field and never the value.
+    #[test]
+    fn a_server_password_is_irc_only_and_fits_one_line() {
+        use crate::config::NetworkKind;
+        let spec = |kind: NetworkKind,
+                    addr: &str,
+                    nick: &str,
+                    password: Option<&str>,
+                    server_password: &str| DriverSpec {
+            kind,
+            owner: Some("owner".into()),
+            name: "network".into(),
+            addr: addr.into(),
+            tls: true,
+            nick: nick.into(),
+            username: (kind == NetworkKind::Irc).then(|| "ident".into()),
+            realname: nick.into(),
+            autojoin: vec![],
+            buffer_cap: 16,
+            sasl_account: None,
+            sasl_password: password.map(str::to_string),
+            server_password: Some(server_password.into()),
+            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
+            first_dial: FirstDial::Immediate,
+        };
+        for (kind, addr, nick) in [
+            (
+                NetworkKind::Matrix,
+                "https://matrix.example",
+                "@bot:example",
+            ),
+            (NetworkKind::Discord, "https://discord.com/api", ""),
+            (NetworkKind::Slack, "https://slack.com/api", ""),
+        ] {
+            let error = build_driver(spec(kind, addr, nick, Some("secret"), "pass"))
+                .err()
+                .expect("a bridge takes no server password");
+            assert!(error.contains("server password"), "{error}");
+        }
+        let error = build_driver(spec(
+            NetworkKind::Irc,
+            "irc.example:6697",
+            "nick",
+            None,
+            "open\r\nQUIT",
+        ))
+        .err()
+        .expect("a delimiter cannot travel in PASS");
+        assert!(error.contains("server password"), "{error}");
+        assert!(!error.contains("QUIT"), "{error}");
+        assert!(
+            build_driver(spec(
+                NetworkKind::Irc,
+                "irc.example:6697",
+                "nick",
+                None,
+                "open sesame"
+            ))
+            .is_ok()
+        );
     }
 
     #[test]
@@ -4664,6 +5336,7 @@ mod tests {
             sasl_account: None,
             sasl_password_sealed: Some("sealed-but-no-key".into()),
             enabled: false,
+            server_password_sealed: None,
         };
         let error = driver_from_row(
             &row,
@@ -4691,6 +5364,7 @@ mod tests {
             sasl_account: None,
             sasl_password_sealed: None,
             enabled: false,
+            server_password_sealed: None,
         };
         let error = driver_from_row(
             &row,
@@ -5203,7 +5877,16 @@ mod tests {
                 .expect_err("a cleartext gateway must be refused");
             assert!(err.contains("wss"), "{api_base} under {policy:?}: {err}");
         }
-        for api_base in ["http://127.0.0.1:9", "http://localhost:9", "http://[::1]:9"] {
+        let err = bridge_ws_connect(
+            cleartext,
+            bridge_ws_config(),
+            "http://localhost:9",
+            InternalUpstreams::Allow,
+        )
+        .await
+        .expect_err("a name is not taken to mean loopback");
+        assert!(err.contains("wss"), "{err}");
+        for api_base in ["http://127.0.0.1:9", "http://[::1]:9"] {
             let err = bridge_ws_connect(
                 cleartext,
                 bridge_ws_config(),
@@ -5298,7 +5981,8 @@ mod tests {
         .unwrap();
         let err = bridge_send(http.get(&format!("http://127.0.0.1:{port}/")).unwrap())
             .await
-            .expect_err("a redirect is not a delivered request");
+            .expect_err("a redirect is not a delivered request")
+            .to_string();
         assert!(err.contains("302"), "{err}");
         assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -5617,7 +6301,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+    #[cfg(feature = "matrix")]
     async fn relay_routed_surfaces_every_target_outcome() {
         let (handle, ends) = NetworkHandle::channels(64);
         let mut map = std::collections::HashMap::new();
@@ -5629,7 +6313,7 @@ mod tests {
             let failed = id == "id_b"; // #b's upstream send fails; #a succeeds.
             async move {
                 if failed {
-                    Err("boom".to_string())
+                    Err(BridgeFailure::Failed("boom".to_string()))
                 } else {
                     Ok(())
                 }
@@ -5732,7 +6416,12 @@ mod tests {
         // Slack allows 40,000 characters. Emitted as one line, the receiving
         // client's framing discards it whole and the message is simply gone.
         let body = "x".repeat(40_000);
-        let lines = render_bridged_privmsg("slack", "U1", "#general", &body);
+        let lines = render_bridged(
+            "slack",
+            "U1",
+            "#general",
+            &Inbound::new(InboundKind::Message, &body),
+        );
         assert!(lines.len() > 1, "a 40k body must not be one line");
         for line in &lines {
             assert!(
@@ -5750,12 +6439,231 @@ mod tests {
         assert_eq!(rejoined, body);
     }
 
+    /// An IRC `/me` is an action on every provider, IRC formatting never
+    /// reaches one, and a CTCP nothing there can answer is refused.
+    #[test]
+    #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+    fn outbound_text_recognises_actions_and_strips_irc_formatting() {
+        assert_eq!(
+            BridgeText::outbound("\u{1}ACTION waves\u{1}"),
+            Some(BridgeText::Action("waves".into()))
+        );
+        assert_eq!(
+            BridgeText::outbound("\u{1}ACTION \u{2}loudly\u{2}"),
+            Some(BridgeText::Action("loudly".into()))
+        );
+        assert_eq!(BridgeText::outbound("\u{1}VERSION\u{1}"), None);
+        assert_eq!(BridgeText::outbound("\u{1}ACTIONX\u{1}"), None);
+        for (irc, plain) in [
+            (
+                "\u{2}bold\u{2} \u{1d}it\u{1d} \u{1f}u\u{1f} \u{1e}s\u{1e} \u{11}m\u{11}",
+                "bold it u s m",
+            ),
+            ("\u{3}4red\u{3} \u{3}04,12both\u{3} \u{3}9,x", "red both ,x"),
+            ("\u{3}12,5 after, a comma", " after, a comma"),
+            ("\u{3}3, not a background", ", not a background"),
+            (
+                "\u{4}ff0000hex\u{4}00FF00,0000ffboth\u{f} \u{16}rev",
+                "hexboth rev",
+            ),
+            ("tab\tstays, bell\u{7} goes", "tab\tstays, bell goes"),
+            ("1\u{3}2", "1"),
+        ] {
+            assert_eq!(
+                BridgeText::outbound(irc),
+                Some(BridgeText::Text(plain.into())),
+                "{irc:?}"
+            );
+        }
+    }
+
+    /// Remote text can never deliver a CTCP request to an attached client:
+    /// the only `\x01` an inbound line carries is the ACTION wrapper, and an
+    /// action split over several lines is a complete ACTION on each.
+    #[test]
+    #[cfg(feature = "matrix")]
+    fn inbound_text_drops_controls_and_wraps_actions() {
+        assert_eq!(
+            render_bridged(
+                "slack",
+                "U1",
+                "#c",
+                &Inbound::new(InboundKind::Message, "\u{1}VERSION\u{1}\u{2}\t!")
+            ),
+            vec![":U1!U1@slack PRIVMSG #c :VERSION\t!"]
+        );
+        assert_eq!(
+            render_bridged(
+                "matrix",
+                "u",
+                "#c",
+                &Inbound::new(InboundKind::Action, "waves\u{1}")
+            ),
+            vec![":u!u@matrix PRIVMSG #c :\u{1}ACTION waves\u{1}"]
+        );
+        assert_eq!(
+            render_bridged(
+                "matrix",
+                "u",
+                "#c",
+                &Inbound::new(InboundKind::Notice, "a bot")
+            ),
+            vec![":u!u@matrix NOTICE #c :a bot"]
+        );
+        let long = "y".repeat(2_000);
+        let lines = render_bridged(
+            "matrix",
+            "u",
+            "#c",
+            &Inbound::new(InboundKind::Action, &long),
+        );
+        assert!(lines.len() > 1);
+        let mut rejoined = String::new();
+        for line in &lines {
+            assert!(line.len() + 2 <= e6irc_proto::message::MAX_LINE_LEN);
+            let body = line
+                .strip_prefix(":u!u@matrix PRIVMSG #c :\u{1}ACTION ")
+                .and_then(|rest| rest.strip_suffix('\u{1}'))
+                .expect("each piece is a whole ACTION");
+            rejoined.push_str(body);
+        }
+        assert_eq!(rejoined, long);
+        // The unrelayed-message notice is bounded and control-free whatever
+        // the provider names its message type.
+        let notice = unrelayed_notice(
+            "matrix",
+            "#c",
+            "m.\u{1}evil type ".repeat(40).as_str(),
+            "bob",
+        );
+        assert!(
+            notice.starts_with(":*bnc* NOTICE #c :matrix: a m.eviltypem.eviltype"),
+            "{notice}"
+        );
+        assert!(!notice.bytes().any(|b| b.is_ascii_control()), "{notice}");
+        assert!(notice.len() < 200, "{notice}");
+    }
+
+    /// A 429's wait comes from the body when it has one, else the header.
+    #[tokio::test]
+    #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+    async fn a_rate_limit_is_typed_with_the_wait_it_asks_for() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        let cases: Vec<(Option<&'static str>, serde_json::Value, std::time::Duration)> = vec![
+            (
+                Some("3"),
+                serde_json::json!({}),
+                std::time::Duration::from_secs(3),
+            ),
+            (
+                Some("5"),
+                serde_json::json!({ "retry_after": 0.25, "global": false }),
+                std::time::Duration::from_millis(250),
+            ),
+            (
+                None,
+                serde_json::json!({ "errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": 1500 }),
+                std::time::Duration::from_millis(1500),
+            ),
+            (None, serde_json::json!({}), RATE_LIMIT_UNSTATED_WAIT),
+            (
+                Some("99999999"),
+                serde_json::json!({}),
+                std::time::Duration::from_secs(3600),
+            ),
+        ];
+        for (header, body, expected) in cases {
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::get(move || {
+                    let body = body.clone();
+                    async move {
+                        let mut response =
+                            (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
+                        if let Some(header) = header {
+                            response
+                                .headers_mut()
+                                .insert("Retry-After", header.parse().unwrap());
+                        }
+                        response
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let http = BridgeHttp::new(
+                std::time::Duration::from_secs(5),
+                crate::egress::InternalUpstreams::Allow,
+            )
+            .unwrap();
+            assert_eq!(
+                bridge_send(http.get(&format!("{base}/")).unwrap())
+                    .await
+                    .unwrap_err(),
+                BridgeFailure::RateLimited(expected),
+                "{header:?}"
+            );
+        }
+    }
+
+    /// The Matrix password and every bot token cross the REST base, so it is
+    /// HTTPS like the gateways — cleartext only for the loopback oracle.
+    #[tokio::test]
+    #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+    async fn bridge_rest_refuses_cleartext_outside_the_loopback_oracle() {
+        use crate::config::NetworkKind;
+        use crate::egress::InternalUpstreams;
+        for kind in [
+            NetworkKind::Matrix,
+            NetworkKind::Discord,
+            NetworkKind::Slack,
+        ] {
+            for base in [
+                "http://matrix.example.org",
+                "http://10.0.0.5:8008",
+                "http://api.example/",
+                // A name is whatever a resolver answers; only a loopback
+                // address literal may speak cleartext.
+                "http://localhost:1",
+            ] {
+                let err = validate_bridge_base(kind, base).expect_err(base);
+                assert!(err.contains("https"), "{err}");
+            }
+            for base in [
+                "https://matrix.example.org",
+                "http://127.0.0.1:8008",
+                "http://[::1]:9",
+            ] {
+                validate_bridge_base(kind, base).unwrap_or_else(|err| panic!("{base}: {err}"));
+            }
+        }
+        let allowed =
+            BridgeHttp::new(std::time::Duration::from_secs(1), InternalUpstreams::Allow).unwrap();
+        let err = allowed
+            .get("http://matrix.example.org/_matrix/client/v3/login")
+            .expect_err("cleartext");
+        assert!(err.contains("https"), "{err}");
+        drop(
+            allowed
+                .get("http://127.0.0.1:9/")
+                .expect("the loopback oracle under allow"),
+        );
+        drop(allowed.get("https://matrix.example.org/").expect("https"));
+    }
+
     #[test]
     #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
     fn bridged_message_splits_on_newlines() {
         // A newline is a line break in the source medium. Left in, it is
         // flattened to a space downstream and the message reads as a run-on.
-        let lines = render_bridged_privmsg("discord", "bob", "#c", "one\ntwo\r\nthree");
+        let lines = render_bridged(
+            "discord",
+            "bob",
+            "#c",
+            &Inbound::new(InboundKind::Message, "one\ntwo\r\nthree"),
+        );
         assert_eq!(
             lines,
             vec![
@@ -5778,7 +6686,12 @@ mod tests {
                 _ => '𝄞',
             };
             let body: String = std::iter::repeat_n(ch, 40_000).collect();
-            let lines = render_bridged_privmsg("matrix", "u", "#c", &body);
+            let lines = render_bridged(
+                "matrix",
+                "u",
+                "#c",
+                &Inbound::new(InboundKind::Message, &body),
+            );
             let prefix = ":u!u@matrix PRIVMSG #c :";
             let rejoined: String = lines
                 .iter()
@@ -5794,7 +6707,7 @@ mod tests {
         // A message was sent. Emitting nothing would be the silent drop this
         // whole function exists to prevent.
         assert_eq!(
-            render_bridged_privmsg("slack", "U1", "#c", ""),
+            render_bridged("slack", "U1", "#c", &Inbound::new(InboundKind::Message, "")),
             vec![":U1!U1@slack PRIVMSG #c :"]
         );
     }

@@ -5,6 +5,7 @@
 #![recursion_limit = "512"]
 
 pub mod bouncer;
+pub(crate) mod certificate;
 pub mod config;
 pub mod core;
 pub mod db;

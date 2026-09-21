@@ -25,10 +25,12 @@ fn dex_login_config(db_url: String, dex_url: String, http_addr: std::net::Socket
             public_url: Some(format!("http://{http_addr}")),
             secure_cookies: false,
             admin_accounts: vec![],
+            hsts_include_subdomains: false,
         }),
         database: Some(DatabaseConfig {
             url: db_url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         oidc_providers: vec![OidcProviderConfig {
             name: "dex".into(),
@@ -229,10 +231,12 @@ async fn pat_bearer_auth_works() {
             public_url: None,
             secure_cookies: false,
             admin_accounts: vec![],
+            hsts_include_subdomains: false,
         }),
         database: Some(DatabaseConfig {
             url: db_url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         ..Config::default()
     };
@@ -328,10 +332,12 @@ async fn oidc_identity_link_flow_and_conflict() {
             public_url: Some(format!("http://{http_addr}")),
             secure_cookies: false,
             admin_accounts: vec![],
+            hsts_include_subdomains: false,
         }),
         database: Some(DatabaseConfig {
             url: db_url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         oidc_providers: vec![OidcProviderConfig {
             name: "dex".into(),
@@ -458,10 +464,12 @@ async fn oidc_silent_sso_reuses_provider_session() {
             public_url: Some(format!("http://{http_addr}")),
             secure_cookies: false,
             admin_accounts: vec![],
+            hsts_include_subdomains: false,
         }),
         database: Some(DatabaseConfig {
             url: db_url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         oidc_providers: vec![OidcProviderConfig {
             name: "dex".into(),

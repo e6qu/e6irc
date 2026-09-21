@@ -18,7 +18,7 @@ function ratio(a, b) {
 test("shared relay-desk palette keeps text and actions above WCAG AA contrast", async () => {
   const [chat, console, identity] = await Promise.all([
     readFile(new URL("../src/style.css", import.meta.url), "utf8"),
-    readFile(new URL("../../crates/e6ircd/templates/console_base.html", import.meta.url), "utf8"),
+    readFile(new URL("../../crates/e6ircd/assets/console.css", import.meta.url), "utf8"),
     readFile(new URL("../../crates/e6ircd/assets/auth.css", import.meta.url), "utf8"),
   ]);
   for (const stylesheet of [chat, console, identity]) {

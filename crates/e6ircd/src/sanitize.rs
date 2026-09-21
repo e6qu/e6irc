@@ -72,6 +72,25 @@ pub(crate) fn nick_token(raw: &str) -> String {
     out
 }
 
+/// The text of a CTCP `ACTION` (`/me`), or `None` when `text` is not one.
+///
+/// The tag ends at the first space or the closing `\x01`, so a prefix test
+/// (`starts_with("\x01ACTION")`) would wrongly accept `\x01ACTIONX\x01` or
+/// `\x01ACTIONVERSION\x01` — crafted CTCP that would then slip through a `+C`
+/// (no-CTCP) channel, or reach a bridge as a `/me`. The closing `\x01` is
+/// optional, as it is for every CTCP. One predicate, read by the core's `+C`
+/// check and by the bridges' outbound translation, so the two cannot disagree
+/// about what an ACTION is.
+pub(crate) fn ctcp_action(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("\u{1}ACTION")?;
+    let rest = match rest.strip_prefix(' ') {
+        Some(body) => body,
+        None if rest.is_empty() || rest.starts_with('\u{1}') => rest,
+        None => return None,
+    };
+    Some(rest.strip_suffix('\u{1}').unwrap_or(rest))
+}
+
 /// Make one upstream line safe to buffer or broadcast.
 pub(crate) fn upstream_line(line: String) -> String {
     let line = if line.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
@@ -351,6 +370,18 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn ctcp_action_reads_exactly_the_action_tag() {
+        assert_eq!(ctcp_action("\u{1}ACTION waves\u{1}"), Some("waves"));
+        assert_eq!(ctcp_action("\u{1}ACTION waves"), Some("waves"));
+        assert_eq!(ctcp_action("\u{1}ACTION\u{1}"), Some(""));
+        assert_eq!(ctcp_action("\u{1}ACTION"), Some(""));
+        assert_eq!(ctcp_action("\u{1}ACTIONX\u{1}"), None);
+        assert_eq!(ctcp_action("\u{1}ACTIONVERSION\u{1}"), None);
+        assert_eq!(ctcp_action("\u{1}VERSION\u{1}"), None);
+        assert_eq!(ctcp_action("ACTION waves"), None);
     }
 
     #[test]

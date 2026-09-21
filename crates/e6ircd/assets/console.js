@@ -184,6 +184,17 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     tls.addEventListener("change", markCustom);
   }
 
+  // The server password's Remove, likewise: ticked, its box is cleared and
+  // disabled, since a value typed there would not be saved.
+  for (const clear of document.querySelectorAll("[data-server-password-clear]")) {
+    const password = clear.closest("form")?.querySelector("[data-server-password]");
+    if (!(clear instanceof HTMLInputElement) || !(password instanceof HTMLInputElement)) continue;
+    clear.addEventListener("change", () => {
+      if (clear.checked) password.value = "";
+      password.disabled = clear.checked;
+    });
+  }
+
   for (const clear of document.querySelectorAll("[data-sasl-clear]")) {
     const form = clear.closest("form");
     const account = form?.querySelector("[data-sasl-account]");
@@ -569,7 +580,10 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const first = samples[0];
     const elapsed = Math.max(1, Math.floor((current.sampled_at_ms - first.sampled_at_ms) / 1000));
     const errorTotal = Object.values(current.errors).reduce((sum, count) => sum + count, 0);
-    const connectionPeak = Math.max(1, ...samples.map((sample) => Math.max(sample.active_connections, sample.bnc_client_connections)));
+    // Schema 2 made connection counts mean authenticated attachments; later
+    // versions only added fields, so their samples stay comparable.
+    const connectionSamples = samples.filter((sample) => sample.schema_version >= 2);
+    const connectionPeak = Math.max(1, ...connectionSamples.map((sample) => Math.max(sample.active_connections, sample.bnc_client_connections)));
     const latencyPeak = Math.max(1, ...samples.map((sample) => Math.max(sample.core_latency.p95_us, sample.database_latency.p95_us, sample.http_latency.p95_us)));
     const queuePressure = (queue) => Math.floor(queue.depth * 100 / queue.capacity);
     const corePressure = (sample) => Math.max(...monitoringCoreQueues(sample).map(queuePressure));
@@ -583,7 +597,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       http_requests: current.http_requests_total, database_requests: current.database_requests_total, bnc_connected: current.bnc_connected, bnc_networks: current.bnc_networks, upstreams_ready: current.bnc_networks > 0 && current.bnc_connected === current.bnc_networks, upstreams_degraded: current.bnc_connected > 0 && current.bnc_connected < current.bnc_networks, bnc_clients: current.bnc_client_connections, error_total: errorTotal, sendq_kills: current.sendq_kills_total,
       core_p50: monitoringLatency(current.core_latency.p50_us), core_p95: monitoringLatency(current.core_latency.p95_us), core_p99: monitoringLatency(current.core_latency.p99_us), database_p50: monitoringLatency(current.database_latency.p50_us), database_p95: monitoringLatency(current.database_latency.p95_us), database_p99: monitoringLatency(current.database_latency.p99_us), http_p50: monitoringLatency(current.http_latency.p50_us), http_p95: monitoringLatency(current.http_latency.p95_us), http_p99: monitoringLatency(current.http_latency.p99_us),
       traffic_bars: monitoringDeltaBars(samples, (sample) => sample.irc_bytes_in_total, (sample) => sample.irc_bytes_out_total, "inbound", "outbound", current.sampled_at_ms), upstream_traffic_bars: monitoringDeltaBars(samples, (sample) => sample.bnc_bytes_in_total, (sample) => sample.bnc_bytes_out_total, "received", "sent", current.sampled_at_ms),
-      connection_bars: samples.filter((sample) => sample.schema_version === current.schema_version).map((sample) => ({ irc_height: monitoringHeight(sample.active_connections, connectionPeak), bnc_height: monitoringHeight(sample.bnc_client_connections, connectionPeak), title: `${sample.active_connections} IRC · ${sample.bnc_client_connections} BNC · ${monitoringAge(current.sampled_at_ms, sample.sampled_at_ms)}` })),
+      connection_bars: connectionSamples.map((sample) => ({ irc_height: monitoringHeight(sample.active_connections, connectionPeak), bnc_height: monitoringHeight(sample.bnc_client_connections, connectionPeak), title: `${sample.active_connections} IRC · ${sample.bnc_client_connections} BNC · ${monitoringAge(current.sampled_at_ms, sample.sampled_at_ms)}` })),
       upstream_bars: samples.map((sample) => ({ height: sample.bnc_networks === 0 ? 0 : Math.floor(sample.bnc_connected * 100 / sample.bnc_networks), status_class: sample.bnc_networks === 0 || sample.bnc_connected === 0 ? "bar-off" : sample.bnc_connected === sample.bnc_networks ? "bar-ok" : "bar-warn", title: `${sample.bnc_connected} of ${sample.bnc_networks} connected · ${monitoringAge(current.sampled_at_ms, sample.sampled_at_ms)}` })),
       error_bars: errorBars.map((bar) => ({ height: monitoringHeight(bar.count, errorPeak), title: `${bar.count} new errors · ${monitoringAge(current.sampled_at_ms, bar.at)}` })), latency_bars: samples.map((sample) => ({ core_height: monitoringHeight(sample.core_latency.p95_us, latencyPeak), database_height: monitoringHeight(sample.database_latency.p95_us, latencyPeak), http_height: monitoringHeight(sample.http_latency.p95_us, latencyPeak), title: `Core ${monitoringLatency(sample.core_latency.p95_us)} · PostgreSQL ${monitoringLatency(sample.database_latency.p95_us)} · HTTP ${monitoringLatency(sample.http_latency.p95_us)} · ${monitoringAge(current.sampled_at_ms, sample.sampled_at_ms)}` })), queue_bars: samples.map((sample) => {
         const core = corePressure(sample);
@@ -1010,6 +1024,12 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     if (fields.has("bnc_enabled") && !bnc_addr) {
       throw new Error("BNC listen address must be host:port when the listener is enabled.");
     }
+    const bncCertificate = optionalValue(String(fields.get("bnc_tls_cert_path") || ""));
+    const bncKey = optionalValue(String(fields.get("bnc_tls_key_path") || ""));
+    if (Boolean(bncCertificate) !== Boolean(bncKey)) {
+      throw new Error("The BNC listener's TLS certificate and private-key paths go together: give both, or neither.");
+    }
+    const bnc_tls = bnc_addr && bncCertificate ? { cert_path: bncCertificate, key_path: bncKey } : null;
     return {
       revision,
       settings: {
@@ -1050,6 +1070,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           audit_retention_days: positiveInteger(fields, "storage_audit_retention_days", "Audit retention"),
         },
         bnc_addr,
+        bnc_tls,
         public_url: optionalValue(String(fields.get("public_url") || "")),
         secure_cookies: fields.has("secure_cookies"),
         admin_accounts: String(fields.get("admin_accounts") || "")
@@ -1063,7 +1084,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   // One field carries a different value for each network type, so its label
   // and its "is required" message both come from here.
   const serverNetworkKinds = {
-    irc: { required: ["addr", "nick", "username", "realname"], labels: { addr: "Server", nick: "Nickname", username: "Username", realname: "Real name", sasl_account: "NickServ account", sasl_password: "NickServ password" } },
+    irc: { required: ["addr", "nick", "username", "realname"], labels: { addr: "Server", nick: "Nickname", username: "Username", realname: "Real name", sasl_account: "NickServ account", sasl_password: "NickServ password", server_password: "Server password" } },
     local: { required: ["nick", "username", "realname"], labels: { addr: "Server", nick: "Nickname", username: "Username", realname: "Real name" } },
     matrix: { required: ["nick", "sasl_password"], labels: { addr: "Homeserver", nick: "Provider user", sasl_password: "Login password" } },
     discord: { required: ["sasl_password"], labels: { addr: "API base", sasl_password: "Bot token" } },
@@ -1082,15 +1103,15 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     // and kept out of the browser's form history like any other secret.
     const changedType = form.dataset.syncedKind !== undefined && form.dataset.syncedKind !== type.value;
     form.dataset.syncedKind = type.value;
-    for (const name of ["sasl_account", "sasl_password"]) {
+    for (const name of ["sasl_account", "sasl_password", "server_password"]) {
       const input = form.elements.namedItem(name);
       if (!(input instanceof HTMLInputElement)) continue;
       if (changedType) input.value = "";
-      const secret = name === "sasl_password" || (requirements.secret ?? []).includes(name);
+      const secret = name !== "sasl_account" || (requirements.secret ?? []).includes(name);
       input.type = secret ? "password" : "text";
       input.autocomplete = secret ? "new-password" : "off";
     }
-    for (const name of ["addr", "nick", "username", "realname", "sasl_account", "sasl_password"]) {
+    for (const name of ["addr", "nick", "username", "realname", "sasl_account", "sasl_password", "server_password"]) {
       const input = form.elements.namedItem(name);
       if (!(input instanceof HTMLInputElement)) throw new Error(`Network form has no ${name} input.`);
       const text = requirements.labels[name];
@@ -1127,6 +1148,12 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     const requirements = serverNetworkKinds[kind];
     if (!requirements) throw new Error(`Unsupported network type: ${kind}.`);
     const labelled = (name) => required(name, requirements.labels[name]);
+    // Verbatim, like every secret: trimming would store another one.
+    const secret = (name) => {
+      const value = String(fields.get(name) || "");
+      if (!value) throw new Error(`${requirements.labels[name]} is required.`);
+      return value;
+    };
     const common = {
       revision,
       name: required("name", "Name"),
@@ -1140,10 +1167,12 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     switch (kind) {
       case "irc": {
         const saslAccount = optional("sasl_account");
-        const saslPassword = optional("sasl_password");
+        const saslPasswordValue = String(fields.get("sasl_password") || "");
+        const saslPassword = saslPasswordValue ? { sasl_password: saslPasswordValue } : {};
         if (Boolean(saslAccount.sasl_account) !== Boolean(saslPassword.sasl_password)) {
           throw new Error("NickServ account and password must be provided together.");
         }
+        const serverPassword = String(fields.get("server_password") || "");
         return {
           ...common,
           addr: labelled("addr"),
@@ -1152,16 +1181,17 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           realname: labelled("realname"),
           ...saslAccount,
           ...saslPassword,
+          ...(serverPassword ? { server_password: serverPassword } : {}),
         };
       }
       case "local":
         return { ...common, addr, nick: labelled("nick"), username: labelled("username"), realname: labelled("realname") };
       case "matrix":
-        return { ...common, addr, nick: labelled("nick"), sasl_password: labelled("sasl_password") };
+        return { ...common, addr, nick: labelled("nick"), sasl_password: secret("sasl_password") };
       case "discord":
-        return { ...common, addr, sasl_password: labelled("sasl_password") };
+        return { ...common, addr, sasl_password: secret("sasl_password") };
       case "slack":
-        return { ...common, addr, sasl_account: labelled("sasl_account"), sasl_password: labelled("sasl_password") };
+        return { ...common, addr, sasl_account: secret("sasl_account"), sasl_password: secret("sasl_password") };
       default:
         throw new Error(`No request shape is defined for network type ${kind}.`);
     }
@@ -1381,6 +1411,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     configurationValue(form, "storage_audit_retention_days", settings.storage.audit_retention_days);
     configurationChecked(form, "bnc_enabled", settings.bnc_addr !== null);
     configurationValue(form, "bnc_addr", settings.bnc_addr);
+    configurationValue(form, "bnc_tls_cert_path", settings.bnc_tls ? settings.bnc_tls.cert_path : null);
+    configurationValue(form, "bnc_tls_key_path", settings.bnc_tls ? settings.bnc_tls.key_path : null);
     configurationValue(form, "listeners", configurationListeners(apiCollection(settings, "listeners", "configuration")));
     configurationValue(form, "public_url", settings.public_url);
     configurationChecked(form, "secure_cookies", settings.secure_cookies);
@@ -2574,6 +2606,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     // here stored a different secret than the one typed (the editor and the
     // chat client never trimmed).
     sasl_password: String(fields.get("sasl_password") || "") || null,
+    // Verbatim for the same reason, and omitted when blank: only a private
+    // server wants one.
+    ...(String(fields.get("server_password") || "") ? { server_password: String(fields.get("server_password")) } : {}),
   });
 
   for (const form of document.querySelectorAll("[data-api-owner-network-create]")) {
@@ -2658,9 +2693,27 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     return { action: "set", ...(account ? { account } : {}), ...(password ? { password } : {}) };
   };
 
+  // The server password's action on a replace: an empty box keeps what is
+  // sealed, a typed one replaces it, Remove clears it. A bridge has none.
+  const ownerServerPasswordAction = (fields, bridge) => {
+    if (bridge) return { action: "keep" };
+    const password = String(fields.get("server_password") || "");
+    if (fields.has("clear_server_password")) {
+      if (password) {
+        throw Object.assign(
+          new Error("“Remove the stored server password” is ticked, so the typed server password would not be saved. Untick it to save it, or clear it to remove the stored one."),
+          { field: "server_password" },
+        );
+      }
+      return { action: "remove" };
+    }
+    return password ? { action: "set", password } : { action: "keep" };
+  };
+
   const ownerNetworkUpdate = (form, bridge) => {
     const fields = new FormData(form);
     const credentials = ownerCredentialAction(form, fields);
+    const serverPassword = ownerServerPasswordAction(fields, bridge);
     if (!bridge && (!fieldValue(fields, "addr") || !fieldValue(fields, "nick"))) {
       throw new Error("Enter the server and nickname.");
     }
@@ -2672,6 +2725,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       // real name: a blank box means the nickname, on edit exactly as on create.
       ...(bridge ? {} : { username: userNameFor(fields), realname: fieldValue(fields, "realname") || fieldValue(fields, "nick") }),
       autojoin: splitValues(String(fields.get("autojoin") || ""), bridge ? "," : /[\s,]+/), credentials,
+      server_password: serverPassword,
     };
     return body;
   };
@@ -2830,7 +2884,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const title = ownerNetworkDetail.querySelector("[data-network-title]"); if (title) title.textContent = network.name;
       const kind = ownerNetworkDetail.querySelector("[data-network-kind]"); if (kind) kind.textContent = `${network.kind} network`;
       const provider = network.addr || "Provider API";
-      setField("kind", network.kind); setField("addr", provider); setField("transport", network.tls ? "TLS" : network.addr ? "Plaintext" : "Provider-managed"); setField("nick", network.nick || "Provider account"); setField("username", network.username || "Not used"); setField("realname", network.realname || "Not set"); setField("autojoin", network.autojoin.length ? network.autojoin.join(", ") : "None"); setField("account-credential", network.has_sasl_account ? "Stored" : "Not set"); setField("secret-credential", network.has_sasl_password ? "Stored encrypted" : "Not set"); setField("enabled", network.enabled ? "Enabled" : "Disabled");
+      setField("kind", network.kind); setField("addr", provider); setField("transport", network.tls ? "TLS" : network.addr ? "Plaintext" : "Provider-managed"); setField("nick", network.nick || "Provider account"); setField("username", network.username || "Not used"); setField("realname", network.realname || "Not set"); setField("autojoin", network.autojoin.length ? network.autojoin.join(", ") : "None"); setField("account-credential", network.has_sasl_account ? "Stored" : "Not set"); setField("secret-credential", network.has_sasl_password ? "Stored encrypted" : "Not set"); setField("server-password", network.kind !== "irc" ? "Not used" : network.has_server_password ? "Stored encrypted" : "Not set"); setField("enabled", network.enabled ? "Enabled" : "Disabled");
       // A bridge stores provider tokens and room identifiers in the same fields.
       const bridgeLabels = { nick: "Identity", autojoin: "Rooms / channel IDs", "account-credential": "Account credential", "secret-credential": "Secret credential" };
       if (network.kind !== "irc") for (const [field, label] of Object.entries(bridgeLabels)) { const node = ownerNetworkDetail.querySelector(`[data-network-label="${field}"]`); if (node) node.textContent = label; }
@@ -2921,6 +2975,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         realname: currentNetwork.realname,
         autojoin: currentNetwork.autojoin,
         credentials: { action: "set", account, password },
+        server_password: { action: "keep" },
       };
       const url = `/api/v1/me/networks/${encodeURIComponent(name)}`;
       const enabling = !currentNetwork.enabled;

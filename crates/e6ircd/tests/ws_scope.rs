@@ -48,10 +48,12 @@ async fn bouncer(
             public_url: public_url.map(Into::into),
             secure_cookies: false,
             admin_accounts: vec![],
+            hsts_include_subdomains: false,
         }),
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         networks: vec![NetworkEntry {
             kind: e6ircd::config::NetworkKind::Irc,
@@ -66,9 +68,11 @@ async fn bouncer(
             buffer_cap: 1000,
             sasl_account: None,
             sasl_password: None,
+            server_password: None,
         }],
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
         }),
         internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
@@ -175,6 +179,7 @@ async fn ui_socket_sending_requires_write_authority() {
         nick: "peer",
         username: "peer",
         realname: "peer",
+        server_password: None,
     })
     .await
     .unwrap();
@@ -241,6 +246,7 @@ async fn the_composer_cannot_end_or_renegotiate_the_upstream_session() {
         nick: "peer",
         username: "peer",
         realname: "peer",
+        server_password: None,
     })
     .await
     .unwrap();

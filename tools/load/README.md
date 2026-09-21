@@ -7,7 +7,7 @@ into a shared channel and every other client counts and times its
 deliveries.
 
 ```
-cargo build --release -p e6irc-load -p e6ircd
+cargo build --locked --release -p e6irc-load -p e6ircd
 target/release/e6irc-load --addr 127.0.0.1:6667 --clients 1000 --burst 20
 ```
 

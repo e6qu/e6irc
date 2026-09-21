@@ -50,12 +50,12 @@ pub async fn rotate_database_secrets(
         ));
     }
 
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let mut transaction = pool.begin().await.map_err(super::query_error)?;
     let settings_row =
         sqlx::query("SELECT revision, settings FROM server_settings WHERE singleton FOR UPDATE")
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(DbError::Query)?
+            .map_err(super::query_error)?
             .ok_or_else(|| {
                 DbError::SecretRotation(
                     "server settings are not initialized; start e6ircd once before rotation".into(),
@@ -89,6 +89,14 @@ pub async fn rotate_database_secrets(
                 &format!("managed network {:?} password", network.name),
             )? as usize;
         }
+        if let Some(server_password) = &mut network.server_password {
+            managed_config_secrets += reseal(
+                server_password,
+                crate::secret::CONFIG_CONTEXT,
+                keys,
+                &format!("managed network {:?} server password", network.name),
+            )? as usize;
+        }
         if network.kind.account_is_secret()
             && let Some(account) = &mut network.sasl_account
         {
@@ -112,11 +120,11 @@ pub async fn rotate_database_secrets(
     .bind(actor)
     .execute(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(super::query_error)?;
 
     let network_rows = sqlx::query(
         "SELECT n.id, a.name AS owner, n.name, n.kind, n.sasl_account,
-                n.sasl_password_sealed
+                n.sasl_password_sealed, n.server_password_sealed
          FROM bnc_networks n
          JOIN accounts a ON a.id = n.account_id
          ORDER BY n.id
@@ -124,7 +132,7 @@ pub async fn rotate_database_secrets(
     )
     .fetch_all(&mut *transaction)
     .await
-    .map_err(DbError::Query)?;
+    .map_err(super::query_error)?;
     let mut account_network_secrets = 0usize;
     for row in network_rows {
         let id: i64 = row.get("id");
@@ -134,6 +142,7 @@ pub async fn rotate_database_secrets(
         let context = crate::bouncer::bnc_secret_context(&owner);
         let mut account: Option<String> = row.get("sasl_account");
         let mut password: Option<String> = row.get("sasl_password_sealed");
+        let mut server_password: Option<String> = row.get("server_password_sealed");
         if kind.account_is_secret()
             && let Some(value) = &mut account
         {
@@ -152,17 +161,26 @@ pub async fn rotate_database_secrets(
                 &format!("account {owner:?} network {name:?} password"),
             )? as usize;
         }
+        if let Some(value) = &mut server_password {
+            account_network_secrets += reseal(
+                value,
+                &context,
+                keys,
+                &format!("account {owner:?} network {name:?} server password"),
+            )? as usize;
+        }
         sqlx::query(
             "UPDATE bnc_networks
-             SET sasl_account = $2, sasl_password_sealed = $3
+             SET sasl_account = $2, sasl_password_sealed = $3, server_password_sealed = $4
              WHERE id = $1",
         )
         .bind(id)
         .bind(account)
         .bind(password)
+        .bind(server_password)
         .execute(&mut *transaction)
         .await
-        .map_err(DbError::Query)?;
+        .map_err(super::query_error)?;
     }
 
     insert_audit_log_with(
@@ -176,7 +194,7 @@ pub async fn rotate_database_secrets(
         ),
     )
     .await?;
-    transaction.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(super::query_error)?;
     Ok(SecretRotationReport {
         managed_config_secrets,
         account_network_secrets,

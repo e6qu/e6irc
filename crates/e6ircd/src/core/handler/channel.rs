@@ -66,8 +66,9 @@ fn capped_channel_targets(
 }
 
 /// Cap on stored read markers per account. Markers persist across parts, so
-/// without a cap a client could seed the marker map without bound.
-pub(super) const MAX_READ_MARKERS_PER_ACCOUNT: usize = 256;
+/// without a cap a client could seed the marker map without bound. The
+/// database enforces the same cap where every core shard's writes meet.
+pub(super) const MAX_READ_MARKERS_PER_ACCOUNT: usize = crate::db::READ_MARKER_LIMIT as usize;
 
 /// Cap on channels a single account may register (found). A channel
 /// registration inserts a permanent `registered_founders` (and possibly
@@ -1699,7 +1700,7 @@ pub(super) fn user_mode(state: &mut ServerState, conn: ConnId, target: &str, res
         if state.sessions[&conn].invisible {
             modes.push('i');
         }
-        if state.sessions[&conn].oper {
+        if state.sessions[&conn].oper.is_some() {
             modes.push('o');
         }
         if state.sessions[&conn].wallops {
@@ -1737,7 +1738,7 @@ pub(super) fn user_mode(state: &mut ServerState, conn: ConnId, target: &str, res
                 member_profile_changed = true;
             }
             'o' if !adding => {
-                state.sessions.get_mut(&conn).expect("registered").oper = false;
+                state.sessions.get_mut(&conn).expect("registered").oper = None;
                 push_mode(&mut applied, &mut last_sign, false, 'o');
                 member_profile_changed = true;
             }

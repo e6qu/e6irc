@@ -7,23 +7,16 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use e6irc_client::credentials::{CredentialArguments, SecretSources, process_environment};
+use e6irc_client::credentials::{
+    CredentialArguments, SecretSources, process_environment, resolve_server_password,
+};
+use e6irc_client::liveness::{LIVENESS_WINDOW, Liveness};
 use e6irc_client::token_cache::default_token_path;
 use e6irc_client::{
-    CleartextCredentials, ClientEvent, Connection, ConnectionOptions, OwnedMessage, TerminalSafe,
-    is_channel_target,
+    CleartextCredentials, ClientEvent, Connection, ConnectionOptions, OwnedMessage, RelayEvent,
+    TerminalSafe, is_channel_target, is_refusal,
 };
 use serde::Serialize;
-
-/// IRC numerics that mean a PRIVMSG was not delivered — `send` exists to
-/// deliver one message, so any of these arriving during the post-send drain
-/// must fail the command instead of exiting 0 on a message nobody received.
-fn is_send_error(command: &str) -> bool {
-    matches!(
-        command,
-        "400" | "401" | "402" | "404" | "407" | "411" | "412"
-    )
-}
 
 /// Server-supplied text is untrusted (terminal control bytes retitle the
 /// window / spoof output), so text printed for a person runs through the shared
@@ -49,20 +42,44 @@ fn reported(event: ClientEvent) -> Option<OwnedMessage> {
     }
 }
 
-/// Read the next actionable message, reporting rejected input on the way.
-async fn next_interactive_message(
-    connection: &mut Connection,
-) -> std::io::Result<Option<OwnedMessage>> {
-    loop {
-        match connection.next_event_lossy().await? {
-            Some(event) => {
-                if let Some(message) = reported(event) {
-                    return Ok(Some(message));
-                }
-            }
-            None => return Ok(None),
+/// Whether the reader of an output is still there. A pipe whose reader went
+/// away (`e6irc tail … | head -1`) is the end of the output, not a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reader {
+    Present,
+    Gone,
+}
+
+/// Write one line to `out` (flushed, since each line is a unit a script may be
+/// waiting on), reading a broken pipe as the reader going away.
+fn emit(out: &mut impl std::io::Write, line: std::fmt::Arguments<'_>) -> std::io::Result<Reader> {
+    match out
+        .write_fmt(line)
+        .and_then(|()| out.write_all(b"\n"))
+        .and_then(|()| out.flush())
+    {
+        Ok(()) => Ok(Reader::Present),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(Reader::Gone),
+        Err(error) => Err(error),
+    }
+}
+
+/// `event`'s text for stdout: the raw line, neutralised for a terminal.
+fn event_text(event: &RelayEvent) -> Option<(TerminalSafe, Option<&OwnedMessage>)> {
+    match event {
+        RelayEvent::Line { message, raw } => Some((terminal_safe(raw), message.as_ref())),
+        RelayEvent::Rejected(rejected) => {
+            eprintln!("warning: server input rejected: {rejected}");
+            None
         }
     }
+}
+
+/// A refusal as one line for a person: what was refused and why, and the
+/// numeric or `FAIL` that said so.
+fn refusal_text(message: &OwnedMessage) -> TerminalSafe {
+    let detail = message.params.get(1..).unwrap_or_default().join(" ");
+    TerminalSafe::from_irc_text(&format!("{detail} ({})", message.command))
 }
 
 #[derive(Parser)]
@@ -102,26 +119,46 @@ struct Cli {
     /// --password-file.
     #[arg(long, global = true)]
     oauth_token_file: Option<PathBuf>,
-    /// Load the SASL OAUTHBEARER token created by `e6irc login`.
+    /// Load the SASL OAUTHBEARER token created by `e6irc login`. It is sent
+    /// only to an IRC server on the host of the API origin that issued it.
     #[arg(long, global = true)]
     oauth_from_cache: bool,
+    /// Send the cached token to an IRC server on another host than the API
+    /// origin that issued it. That server receives the account's API
+    /// credential and can use it against the API.
+    #[arg(long, global = true, requires = "oauth_from_cache")]
+    allow_oauth_token_for_other_server: bool,
     /// Token-cache path for login, API authentication, or --oauth-from-cache.
     /// Defaults to the current platform's private application-data directory.
     #[arg(long, global = true)]
     token_file: Option<PathBuf>,
-    /// Send SASL credentials over a connection without --tls to a server that
-    /// is not this machine. Without this flag that is refused: the password or
-    /// token would cross the network readable by anyone on the path.
+    /// The network's server password, sent as PASS before registration: only
+    /// for a private server that requires one. A value typed here is visible
+    /// to every local user in the process list and is kept by the shell's
+    /// history: prefer --server-password-file or E6IRC_SERVER_PASSWORD.
+    #[arg(long, global = true, conflicts_with = "server_password_file")]
+    server_password: Option<String>,
+    /// File holding the server password, under the same rules as
+    /// --password-file.
+    #[arg(long, global = true)]
+    server_password_file: Option<PathBuf>,
+    /// Send SASL credentials or a server password over a connection without
+    /// --tls to a server that is not this machine. Without this flag that is
+    /// refused: the password or token would cross the network readable by
+    /// anyone on the path.
     #[arg(long, global = true)]
     allow_cleartext_credentials: bool,
     /// Connect over TLS (validating against the public CA set).
     #[arg(long, global = true)]
     tls: bool,
-    /// TLS server name (defaults to the host part of --server).
-    #[arg(long, global = true)]
+    /// TLS server name (defaults to the host part of --server). Only with
+    /// --tls: a name for a plaintext connection would verify nothing.
+    #[arg(long, global = true, requires = "tls")]
     tls_name: Option<String>,
     /// Seconds the server may take to finish registration, and afterwards to
-    /// confirm a JOIN or answer a history request, before the command fails.
+    /// answer each request a command waits on — a JOIN, a history request,
+    /// the verdict on a sent message, closing the connection after QUIT —
+    /// before the command fails.
     #[arg(
         long,
         global = true,
@@ -135,9 +172,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Send one PRIVMSG to a target and exit.
+    /// Send one PRIVMSG to a target and exit once the server has confirmed
+    /// it (by echo-message) or refused it. A server without echo-message
+    /// cannot confirm delivery, and the command fails before sending.
     Send { target: String, message: String },
-    /// Follow messages sent to a channel/nick, printing one per line.
+    /// Follow messages sent to a channel/nick, printing one per line. A server
+    /// silent for three minutes is sent a PING; one silent for three more ends
+    /// the command with a failure.
     Tail {
         target: String,
         /// Stop after N messages (0 = forever).
@@ -147,7 +188,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Send raw lines read from stdin, then exit.
+    /// Send raw lines read from stdin, printing every line the server sends
+    /// to stdout, and each refusal (an error numeric or FAIL) to stderr. Exits
+    /// nonzero when any line was refused.
     Raw,
     /// Print the most recent history of a channel via CHATHISTORY.
     History {
@@ -189,6 +232,9 @@ enum Command {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // One TLS stack for the process: the IRC transport and the HTTP client
+    // both take this provider.
+    e6irc_client::install_crypto_provider();
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -255,9 +301,18 @@ async fn run(cli: Cli) -> std::io::Result<()> {
         },
         oauth_from_cache: cli.oauth_from_cache,
         token_file: cli.token_file.clone(),
+        allow_oauth_token_for_other_server: cli.allow_oauth_token_for_other_server,
     }
-    .resolve(&process_environment)?;
-    let mut conn = ConnectionOptions {
+    .resolve(server, &process_environment)?;
+    let server_password = resolve_server_password(
+        SecretSources {
+            argument: cli.server_password.clone(),
+            file: cli.server_password_file.clone(),
+        },
+        &process_environment,
+    )?;
+    let response_timeout = std::time::Duration::from_secs(cli.response_timeout);
+    let registered = ConnectionOptions {
         address: server.to_owned(),
         tls: cli.tls,
         tls_server_name: cli.tls_name.clone(),
@@ -265,108 +320,31 @@ async fn run(cli: Cli) -> std::io::Result<()> {
         username,
         realname: "e6irc-cli".into(),
         authentication,
-        response_deadline: std::time::Duration::from_secs(cli.response_timeout),
+        response_deadline: response_timeout,
         cleartext_credentials: cleartext_credentials(&cli),
+        server_password,
     }
     .connect_registered()
-    .await?
-    .connection;
+    .await?;
+    let own_nick = registered.nick;
+    let mut conn = registered.connection;
+    let mut stdout = std::io::stdout().lock();
     match cli.command {
         Command::Send { target, message } => {
-            // Channels are +n by default, so join before speaking and
-            // wait for the join to be confirmed.
-            if is_channel_target(&target) {
-                // A refused or unconfirmed join is an error here: falling
-                // through to PRIVMSG would exit 0 on a message nobody got.
-                for event in conn.join_with_latest_history(&target, 0).await? {
-                    reported(event);
-                }
-            }
-            conn.send_line(&format!("PRIVMSG {target} :{message}"))
-                .await?;
-            conn.send_line("QUIT :done").await?;
-            // Drain until the server closes so the message is flushed — but a
-            // delivery-failure numeric in this window (401 no such nick, 404
-            // cannot send to channel, …) means nobody received the message,
-            // and the exit code is this tool's product.
-            while let Some(msg) = next_interactive_message(&mut conn).await? {
-                if is_send_error(&msg.command) {
-                    let reason = terminal_safe(&msg.params.last().cloned().unwrap_or_default());
-                    return Err(std::io::Error::other(format!(
-                        "cannot send to {target}: {reason}"
-                    )));
-                }
-            }
+            send(&mut conn, &own_nick, &target, &message, response_timeout).await?;
+            finish_quietly(&mut conn, response_timeout).await
         }
         Command::Tail {
             target,
             count,
             json,
         } => {
-            let wanted = (count != 0).then_some(count);
-            let mut seen = 0;
-            let mut print = |message: &OwnedMessage| -> std::io::Result<bool> {
-                // The server relays a channel message with the *sender's*
-                // spelling of the target, so the comparison must fold case
-                // under the server's rfc1459 mapping — a raw equality would
-                // silently miss messages sent to a differently-cased name.
-                if message.command != "PRIVMSG"
-                    || !message
-                        .params
-                        .first()
-                        .is_some_and(|t| e6irc_proto::casemap::CaseMapping::Rfc1459.eq(t, &target))
-                {
-                    return Ok(false);
-                }
-                let from = message.source.as_deref().unwrap_or("?");
-                let text = message.params.get(1).map(String::as_str).unwrap_or("");
-                if json {
-                    println!("{}", tail_json(message, from, text)?);
-                } else {
-                    println!("{}\t{}", terminal_safe(from), terminal_safe(text));
-                }
-                seen += 1;
-                Ok(wanted.is_some_and(|wanted| seen >= wanted))
+            let tail = Tail {
+                target: &target,
+                wanted: (count != 0).then_some(count),
+                json,
             };
-            let mut done = false;
-            if is_channel_target(&target) {
-                // Messages relayed while the join is confirmed are part of the
-                // stream being followed.
-                for event in conn.join_with_latest_history(&target, 0).await? {
-                    if let Some(message) = reported(event)
-                        && !done
-                    {
-                        done = print(&message)?;
-                    }
-                }
-            }
-            while !done {
-                let Some(message) = next_interactive_message(&mut conn).await? else {
-                    break;
-                };
-                if message.command == "PING" {
-                    let token = message.params.first().cloned().unwrap_or_default();
-                    conn.send_line(&format!("PONG :{token}")).await?;
-                    continue;
-                }
-                done = print(&message)?;
-            }
-            // Only a bounded tail that printed everything it promised has a
-            // successful end. One that was cut short delivered less than a
-            // script reading N lines was told to expect, and an unbounded one
-            // stops by itself only when the server goes away — which whatever
-            // supervises it has to be able to see.
-            if !done {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    match wanted {
-                        Some(wanted) => {
-                            format!("connection closed after {seen} of {wanted} messages")
-                        }
-                        None => format!("connection closed after {seen} messages"),
-                    },
-                ));
-            }
+            tail.follow(&mut conn, LIVENESS_WINDOW, &mut stdout).await
         }
         Command::History { target, count } => {
             conn.require_capabilities(&["batch", "draft/chathistory", "server-time"])
@@ -386,50 +364,303 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                         .and_then(|source| source.split('!').next())
                         .unwrap_or("?");
                     let text = message.params.get(1).map(String::as_str).unwrap_or("");
-                    println!("{}\t{}", terminal_safe(from), terminal_safe(text));
-                }
-            }
-            conn.send_line("QUIT :done").await?;
-            while next_interactive_message(&mut conn).await?.is_some() {}
-        }
-        Command::Raw => {
-            use tokio::io::AsyncBufReadExt;
-            // Read stdin asynchronously and keep servicing the socket between
-            // lines — a blocking stdin read on this current-thread runtime
-            // would leave server PINGs unanswered while a slow producer (a
-            // pipe with pauses) feeds us, getting the session ping-timed-out
-            // and the late lines written into a dead socket.
-            let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-            loop {
-                tokio::select! {
-                    line = stdin.next_line() => {
-                        let Some(line) = line? else {
-                            break; // stdin exhausted
-                        };
-                        conn.send_line(&line).await?;
-                    }
-                    msg = next_interactive_message(&mut conn) => {
-                        let Some(msg) = msg? else {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                "server closed the connection before stdin was exhausted",
-                            ));
-                        };
-                        if msg.command == "PING" {
-                            let token = msg.params.first().cloned().unwrap_or_default();
-                            conn.send_line(&format!("PONG :{token}")).await?;
-                        }
+                    let shown = format_args!(
+                        "{}\t{}",
+                        terminal_safe(from),
+                        TerminalSafe::from_irc_text(text)
+                    );
+                    if emit(&mut stdout, shown)? == Reader::Gone {
+                        return Ok(());
                     }
                 }
             }
-            conn.send_line("QUIT :done").await?;
-            while next_interactive_message(&mut conn).await?.is_some() {}
+            finish_quietly(&mut conn, response_timeout).await
         }
+        Command::Raw => raw(&mut conn, &mut stdout).await,
         Command::Api { .. } | Command::Login { .. } => {
             unreachable!("handled before the IRC connect")
         }
     }
-    Ok(())
+}
+
+/// Deliver one PRIVMSG and wait for the server's verdict on it.
+///
+/// The verdict is the echo of the message (echo-message) or a refusal. Without
+/// echo-message nothing tells a delivered message from one refused after the
+/// connection closed (a bouncer attach closes on `QUIT` before the upstream's
+/// refusal arrives), so the message is not sent at all rather than reported
+/// delivered on no evidence.
+async fn send(
+    conn: &mut Connection,
+    own_nick: &str,
+    target: &str,
+    message: &str,
+    response_timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    if !conn.offers("echo-message") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "delivery cannot be confirmed: the server does not offer echo-message, so a \
+             refusal could arrive after the connection closed; the message was not sent",
+        ));
+    }
+    conn.require_capabilities(&["echo-message"]).await?;
+    // Channels are +n by default, so join before speaking and wait for the
+    // join to be confirmed. A refused or unconfirmed join is an error here.
+    if is_channel_target(target) {
+        for event in conn.join_with_latest_history(target, 0).await? {
+            reported(event);
+        }
+    }
+    // Everything the server says about registration and the join (a missing
+    // MOTD is a 422) is behind this round trip, so any refusal after the
+    // PRIVMSG is about the PRIVMSG.
+    conn.round_trip(|event| {
+        reported(event.into());
+        Ok(())
+    })
+    .await?;
+    conn.send_line(&format!("PRIVMSG {target} :{message}"))
+        .await?;
+    let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
+    let mut liveness = Liveness::new(LIVENESS_WINDOW);
+    let verdict = async {
+        loop {
+            let event = liveness.next(conn).await?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "the server closed the connection before confirming the message to \
+                         {target}; it may not have been delivered"
+                    ),
+                )
+            })?;
+            let Some(reply) = reported(event.into()) else {
+                continue;
+            };
+            if is_refusal(&reply) {
+                return Err(std::io::Error::other(format!(
+                    "cannot send to {target}: {}",
+                    refusal_text(&reply)
+                )));
+            }
+            let from_self = reply
+                .source
+                .as_deref()
+                .and_then(|source| source.split('!').next())
+                .is_some_and(|nick| casemap.eq(nick, own_nick));
+            if reply.command == "PRIVMSG"
+                && from_self
+                && reply
+                    .params
+                    .first()
+                    .is_some_and(|echoed| casemap.eq(echoed, target))
+            {
+                return Ok(());
+            }
+        }
+    };
+    tokio::time::timeout(response_timeout, verdict)
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "the server neither confirmed nor refused the message to {target} within \
+                     {response_timeout:?}; it may not have been delivered"
+                ),
+            ))
+        })
+}
+
+/// `QUIT` after a command whose work is done and confirmed. A server that
+/// then keeps the connection open past the response timeout changes nothing
+/// about that work: it is said on stderr, and the connection is closed here.
+async fn finish_quietly(
+    conn: &mut Connection,
+    response_timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    match conn
+        .quit_and_drain("done", |event| {
+            reported(event.into());
+            Ok(())
+        })
+        .await
+    {
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            eprintln!(
+                "warning: the server did not close the connection within {response_timeout:?} \
+                 of QUIT; closing it"
+            );
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// What `tail` follows and how it prints.
+struct Tail<'a> {
+    target: &'a str,
+    /// Stop after this many messages; `None` follows until the server goes.
+    wanted: Option<usize>,
+    json: bool,
+}
+
+impl Tail<'_> {
+    /// Follow the target until the promised count is printed, the reader goes
+    /// away, or the server does — the last being a failure: a server that
+    /// closes, or stays silent through two liveness windows (the first ends
+    /// with a PING), ends an unbounded tail that a supervisor must see end.
+    async fn follow(
+        &self,
+        conn: &mut Connection,
+        liveness_window: std::time::Duration,
+        out: &mut impl std::io::Write,
+    ) -> std::io::Result<()> {
+        let mut seen = 0;
+        if is_channel_target(self.target) {
+            // Messages relayed while the join is confirmed are part of the
+            // stream being followed.
+            for event in conn.join_with_latest_history(self.target, 0).await? {
+                if let Some(message) = reported(event)
+                    && let Some(end) = self.print(&message, &mut seen, out)?
+                {
+                    return end;
+                }
+            }
+        }
+        let mut liveness = Liveness::new(liveness_window);
+        loop {
+            let event = match liveness.next(conn).await {
+                Ok(Some(event)) => event,
+                Ok(None) => return Err(self.cut_short(seen, "the server closed the connection")),
+                Err(error) => return Err(self.cut_short(seen, &error.to_string())),
+            };
+            if let Some(message) = reported(event.into())
+                && let Some(end) = self.print(&message, &mut seen, out)?
+            {
+                return end;
+            }
+        }
+    }
+
+    /// Print `message` when it is one being followed. `Some` is the end of the
+    /// tail: the promised count reached, or the reader gone.
+    fn print(
+        &self,
+        message: &OwnedMessage,
+        seen: &mut usize,
+        out: &mut impl std::io::Write,
+    ) -> std::io::Result<Option<std::io::Result<()>>> {
+        // The server relays a channel message with the *sender's* spelling of
+        // the target, so the comparison must fold case under the server's
+        // rfc1459 mapping — a raw equality would silently miss messages sent to
+        // a differently-cased name.
+        if message.command != "PRIVMSG"
+            || !message.params.first().is_some_and(|target| {
+                e6irc_proto::casemap::CaseMapping::Rfc1459.eq(target, self.target)
+            })
+        {
+            return Ok(None);
+        }
+        let from = message.source.as_deref().unwrap_or("?");
+        let text = message.params.get(1).map(String::as_str).unwrap_or("");
+        let reader = if self.json {
+            emit(out, format_args!("{}", tail_json(message, from, text)?))?
+        } else {
+            emit(
+                out,
+                format_args!(
+                    "{}\t{}",
+                    terminal_safe(from),
+                    TerminalSafe::from_irc_text(text)
+                ),
+            )?
+        };
+        *seen += 1;
+        if reader == Reader::Gone || self.wanted.is_some_and(|wanted| *seen >= wanted) {
+            return Ok(Some(Ok(())));
+        }
+        Ok(None)
+    }
+
+    /// Only a bounded tail that printed everything it promised has a
+    /// successful end. One cut short delivered less than a script reading N
+    /// lines was told to expect.
+    fn cut_short(&self, seen: usize, why: &str) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            match self.wanted {
+                Some(wanted) => format!("{why} after {seen} of {wanted} messages"),
+                None => format!("{why} after {seen} messages"),
+            },
+        )
+    }
+}
+
+/// Send each stdin line, printing every line the server sends — to stdout, or
+/// to stderr when it is a refusal — and fail when any line was refused.
+///
+/// Stdin is read asynchronously and the socket serviced between lines: a
+/// blocking read on this current-thread runtime would leave server PINGs
+/// unanswered while a slow producer feeds us, and get the session
+/// ping-timed-out.
+async fn raw(conn: &mut Connection, out: &mut impl std::io::Write) -> std::io::Result<()> {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut refused = 0usize;
+    let mut reader = Reader::Present;
+    let mut show = |event: RelayEvent, count_refusals: bool| -> std::io::Result<()> {
+        let Some((text, message)) = event_text(&event) else {
+            return Ok(());
+        };
+        if message.is_some_and(is_refusal) {
+            eprintln!("{text}");
+            if count_refusals {
+                refused += 1;
+            }
+        } else if reader == Reader::Present {
+            reader = emit(out, format_args!("{text}"))?;
+        }
+        Ok(())
+    };
+    // The rest of the registration burst is printed, but a refusal in it (a
+    // missing MOTD is a 422) is not about any line from stdin.
+    conn.round_trip(|event| show(event, false)).await?;
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let mut liveness = Liveness::new(LIVENESS_WINDOW);
+    loop {
+        tokio::select! {
+            line = stdin.next_line() => {
+                let Some(line) = line? else {
+                    break; // stdin exhausted
+                };
+                conn.send_line(&line).await?;
+            }
+            read = liveness.bound(conn.next_line_relayable()) => {
+                match liveness.settle(conn, read).await? {
+                    e6irc_client::liveness::Heard::Event(event) => show(event, true)?,
+                    e6irc_client::liveness::Heard::Nothing => {}
+                    e6irc_client::liveness::Heard::Closed => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "server closed the connection before stdin was exhausted",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // Replies to the last lines may still be on their way; they are read
+    // until the server closes, within the response timeout.
+    conn.quit_and_drain("done", |event| show(event, true))
+        .await?;
+    match refused {
+        0 => Ok(()),
+        count => Err(std::io::Error::other(format!(
+            "the server refused {count} line(s); see the refusals above"
+        ))),
+    }
 }
 
 fn cleartext_credentials(cli: &Cli) -> CleartextCredentials {
@@ -573,6 +804,82 @@ mod tests {
         assert!(api(&["--token", "typed"]));
         assert!(api(&["--bearer-token-file", "token"]));
         assert!(!api(&["--token", "typed", "--bearer-token-file", "token"]));
+    }
+
+    /// A TLS server name without TLS verifies nothing; accepting it silently
+    /// would let a user believe the connection was checked against it.
+    #[test]
+    fn transport_options_that_mean_nothing_alone_are_refused() {
+        assert!(send_parses(&["--tls", "--tls-name", "irc.example"]));
+        assert!(!send_parses(&["--tls-name", "irc.example"]));
+        assert!(send_parses(&[
+            "--oauth-from-cache",
+            "--allow-oauth-token-for-other-server"
+        ]));
+        assert!(!send_parses(&["--allow-oauth-token-for-other-server"]));
+    }
+
+    /// A server that registers the client and then goes silent without
+    /// closing: an unbounded tail asks after one window and fails after two,
+    /// so whatever supervises it sees it end.
+    #[tokio::test]
+    async fn tail_gives_up_on_a_silent_server_after_probing_it() {
+        use tokio::io::AsyncBufReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut lines = tokio::io::BufReader::new(socket).lines();
+            let mut seen = Vec::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                seen.push(line);
+            }
+            seen
+        });
+        let mut connection = Connection::connect(&address).await.unwrap();
+        let window = std::time::Duration::from_millis(150);
+        let tail = Tail {
+            target: "bob",
+            wanted: None,
+            json: false,
+        };
+        let mut out = Vec::new();
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tail.follow(&mut connection, window, &mut out),
+        )
+        .await
+        .expect("tail never gave up on a silent server")
+        .expect_err("a silent server is a failed tail");
+        assert!(started.elapsed() >= window * 2, "{:?}", started.elapsed());
+        assert!(
+            error.to_string().contains("server stopped responding"),
+            "{error}"
+        );
+        drop(connection);
+        assert_eq!(
+            server.await.unwrap(),
+            [format!("PING :{}", e6irc_client::liveness::KEEPALIVE_TOKEN)]
+        );
+    }
+
+    #[test]
+    fn a_reader_that_went_away_ends_the_output_without_an_error() {
+        struct Closed;
+        impl std::io::Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(emit(&mut Closed, format_args!("x")).unwrap(), Reader::Gone);
+        let mut open = Vec::new();
+        assert_eq!(emit(&mut open, format_args!("x")).unwrap(), Reader::Present);
+        assert_eq!(open, b"x\n");
     }
 
     #[test]

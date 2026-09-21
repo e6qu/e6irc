@@ -37,6 +37,17 @@ FRESH_DATABASE = "e6irc_recovery_fresh"
 # there reaches it only by honoring the port in the database URL.
 POSTGRES_CONTAINER_PORT = 5544
 TIMEOUT = 30.0
+# The foreign keys that tie account-owned rows to their owners (a bouncer
+# backlog line to its network, an approved device grant to its account). A
+# restore that dropped one would leave rows that outlive what they belong to.
+OWNERSHIP_KEYS_SQL = (
+    "SELECT count(*) FROM information_schema.referential_constraints r "
+    "JOIN information_schema.key_column_usage k "
+    "ON k.constraint_name = r.constraint_name "
+    "WHERE (k.table_name, k.column_name) IN "
+    "(('bnc_buffer', 'network_id'), ('device_grants', 'account_id')) "
+    "AND r.delete_rule = 'CASCADE'"
+)
 
 # Stands in for `pg_dump`, `psql` and `pg_restore` on PATH: the real client of
 # the server's own version runs inside the PostgreSQL container, receiving the
@@ -512,6 +523,9 @@ def main() -> None:
                 "(SELECT count(*) FROM device_grants)",
             )
             assert restored == f"1|{expected_grants}", restored
+            assert container_sql(container, OWNERSHIP_KEYS_SQL) == "2", (
+                "the restore lost an ownership foreign key"
+            )
             client_arguments = client_log.read_text(encoding="utf-8")
             for secret in (POSTGRES_PASSWORD, POSTGRES_PASSWORD_IN_URL, "postgresql://"):
                 assert secret not in client_arguments, (
@@ -573,6 +587,10 @@ def main() -> None:
             assert fresh_restored == f"1|{expected_grants}|{expected_migrations}", (
                 fresh_restored
             )
+            assert (
+                container_sql(container, OWNERSHIP_KEYS_SQL, database=FRESH_DATABASE)
+                == "2"
+            ), "the fresh restore lost an ownership foreign key"
             fresh_config = temporary / "e6ircd-fresh.toml"
             fresh_config.write_text(
                 config.read_text(encoding="utf-8").replace(

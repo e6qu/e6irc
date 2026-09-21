@@ -413,6 +413,26 @@ mod tests {
         assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"irc","revision":1,"name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#).is_ok());
         assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"irc","revision":1,"name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#).is_err());
         assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"discord","revision":1,"name":"bot","addr":"","tls":true,"nick":"alice","autojoin":[],"buffer_cap":1000,"sasl_password":"token"}"#).is_err());
+        // A server password is an IRC connection's PASS, and only kind=irc has one.
+        let with_pass = serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"irc","revision":1,"name":"private","addr":"irc.example:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"server_password":"open sesame"}"#).expect("irc takes a server password");
+        assert_eq!(
+            admin_network_request(with_pass)
+                .expect("valid")
+                .network
+                .server_password
+                .as_deref(),
+            Some("open sesame")
+        );
+        for request in [
+            r#"{"kind":"local","revision":1,"name":"home","addr":"","tls":false,"nick":"alice","username":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"server_password":"pass"}"#,
+            r#"{"kind":"matrix","revision":1,"name":"matrix","addr":"https://matrix.example.test","tls":true,"nick":"@alice:example.test","autojoin":[],"buffer_cap":1000,"sasl_password":"password","server_password":"pass"}"#,
+        ] {
+            let error = serde_json::from_str::<AdminNetworkBody>(request)
+                .err()
+                .expect("only kind=irc sends PASS")
+                .to_string();
+            assert!(error.contains("server_password"), "{error}");
+        }
         for request in [
             r#"{"kind":"local","revision":1,"name":"home","addr":"","tls":false,"nick":"alice","username":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000}"#,
             r#"{"kind":"matrix","revision":1,"name":"matrix","addr":"https://matrix.example.test","tls":true,"nick":"@alice:example.test","autojoin":[],"buffer_cap":1000,"sasl_password":"password"}"#,
@@ -1005,6 +1025,7 @@ pub(super) async fn admin_configuration(
     }
     for network in &mut settings.networks {
         network.sasl_password = None;
+        network.server_password = None;
         if network.kind.account_is_secret() {
             network.sasl_account = None;
         }
@@ -1145,6 +1166,7 @@ struct AdminScalarSettings {
     observability: crate::config::ObservabilityConfig,
     storage: crate::config::StorageConfig,
     bnc_addr: Option<std::net::SocketAddr>,
+    bnc_tls: Option<crate::config::TlsConfig>,
     public_url: Option<String>,
     secure_cookies: bool,
     admin_accounts: Vec<String>,
@@ -1168,6 +1190,7 @@ impl AdminScalarSettings {
             observability: self.observability,
             storage: self.storage,
             bnc_addr: self.bnc_addr,
+            bnc_tls: self.bnc_tls,
             public_url: self.public_url,
             secure_cookies: self.secure_cookies,
             admin_accounts: self.admin_accounts,
@@ -1204,15 +1227,16 @@ pub(super) async fn admin_patch_configuration(
         );
     }
     let settings = body.settings.apply_to(&current.settings);
-    if let Err(error) = settings.validate(state.http_bind) {
+    if let Err(error) = settings.validate(state.bootstrap_context()) {
         return problem(
             StatusCode::BAD_REQUEST,
             "Invalid configuration",
             Some(&error.to_string()),
         );
     }
-    let previous_bnc = current.settings.bnc_addr;
-    let bnc_changed = previous_bnc != settings.bnc_addr;
+    let previous_bnc = current.settings.bnc();
+    let next_bnc = settings.bnc();
+    let bnc_changed = previous_bnc != next_bnc;
     if bnc_changed {
         let Some(listener) = &state.bnc_listener else {
             return problem(
@@ -1221,17 +1245,16 @@ pub(super) async fn admin_patch_configuration(
                 None,
             );
         };
-        let applied = match settings.bnc_addr {
-            Some(address) => listener
-                .enable(address)
-                .await
-                .map(|_| ())
-                .map_err(|error| format!("Could not bind {address}: {error}")),
-            None => {
-                listener.stop().await;
-                Ok(())
-            }
-        };
+        let applied =
+            match &next_bnc {
+                Some(bnc) => listener.enable(bnc).await.map(|_| ()).map_err(|error| {
+                    format!("Could not start the listener on {}: {error}", bnc.addr)
+                }),
+                None => {
+                    listener.stop().await;
+                    Ok(())
+                }
+            };
         if let Err(error) = applied {
             return problem(
                 StatusCode::BAD_REQUEST,
@@ -1265,13 +1288,13 @@ pub(super) async fn admin_patch_configuration(
         }
         Err(error) => {
             if bnc_changed && let Some(listener) = &state.bnc_listener {
-                match previous_bnc {
-                    Some(address) => {
-                        if let Err(rollback) = listener.enable(address).await {
+                match &previous_bnc {
+                    Some(previous) => {
+                        if let Err(rollback) = listener.enable(previous).await {
                             eprintln!(
                                 "{}",
                                 bnc_listener_rollback_failure(
-                                    address,
+                                    previous.addr,
                                     settings.bnc_addr,
                                     &rollback
                                 )
@@ -1399,8 +1422,10 @@ pub(super) async fn admin_create_network(
     let AdminNetworkRequest { revision, network } = request;
     let sasl_account = network.sasl_account.clone();
     let sasl_password = network.sasl_password.clone();
-    let secret_needed =
-        sasl_password.is_some() || (kind.account_is_secret() && sasl_account.is_some());
+    let server_password = network.server_password.clone();
+    let secret_needed = sasl_password.is_some()
+        || server_password.is_some()
+        || (kind.account_is_secret() && sasl_account.is_some());
     let key = state.secret_key.clone();
     if secret_needed && key.is_none() {
         return master_key_required("Upstream credentials");
@@ -1414,9 +1439,11 @@ pub(super) async fn admin_create_network(
             sasl_account
         };
         let sealed_password = seal_configuration_secret(sasl_password, key.as_ref())?;
+        let sealed_server_password = seal_configuration_secret(server_password, key.as_ref())?;
         settings.networks.push(crate::config::NetworkEntry {
             sasl_account: sealed_account,
             sasl_password: sealed_password,
+            server_password: sealed_server_password,
             ..network
         });
         Ok(format!("added server network {name}"))
@@ -1658,7 +1685,7 @@ async fn mutate_managed_configuration(
             );
         }
     };
-    if let Err(error) = settings.validate(state.http_bind) {
+    if let Err(error) = settings.validate(state.bootstrap_context()) {
         return problem(
             StatusCode::BAD_REQUEST,
             "Invalid configuration change",

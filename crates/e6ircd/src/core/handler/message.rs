@@ -10,14 +10,10 @@ pub(super) fn is_blocked_ctcp(text: &str) -> bool {
     bytes.first() == Some(&0x01) && !is_ctcp_action(text)
 }
 
-/// Whether `text` is a CTCP whose tag is exactly `ACTION`. The tag ends at the
-/// first space or the closing `\x01`, so a prefix test (`starts_with("\x01ACTION")`)
-/// would wrongly exempt `\x01ACTIONX\x01` / `\x01ACTIONVERSION\x01` — crafted CTCP
-/// that would then slip through a `+C` (no-CTCP) channel.
+/// Whether `text` is a CTCP whose tag is exactly `ACTION`; see
+/// [`crate::sanitize::ctcp_action`], which the bridges read too.
 fn is_ctcp_action(text: &str) -> bool {
-    text == "\u{1}ACTION"
-        || text.starts_with("\u{1}ACTION ")
-        || text.starts_with("\u{1}ACTION\u{1}")
+    crate::sanitize::ctcp_action(text).is_some()
 }
 
 /// Yield the unique, non-empty targets of a comma-separated target list,

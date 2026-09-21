@@ -67,11 +67,11 @@ surface. See the [client capability matrix](docs/client-capabilities.md).
 
 ```sh
 # Server (needs a recent stable Rust toolchain)
-cargo build --release -p e6ircd
+cargo build --locked --release -p e6ircd
 ./target/release/e6ircd --config e6ircd.toml
 
 # Native clients
-cargo build --profile release-client -p e6irc-cli -p e6irc-tui
+cargo build --locked --profile release-client -p e6irc-cli -p e6irc-tui
 ./target/release-client/e6irc --server 127.0.0.1:6667 --nick alice send '#chan' 'hello'
 
 # TUI (TLS + BNC account/network selection; history/read markers are automatic)
@@ -80,12 +80,23 @@ cargo build --profile release-client -p e6irc-cli -p e6irc-tui
 ```
 
 A password or token is read from a file (`--password-file`,
-`--oauth-token-file`, `api --bearer-token-file`) or from the environment
-(`E6IRC_PASSWORD`, `E6IRC_OAUTH_TOKEN`, `E6IRC_API_TOKEN`). `--password` and
-`--oauth-token` still work, but a value typed on a command line is visible to
-every local user in the process list. Both clients refuse to send a credential
-over a connection that is neither TLS nor loopback;
-`--allow-cleartext-credentials` is the explicit override.
+`--oauth-token-file`, `--server-password-file`, `api --bearer-token-file`) or
+from the environment (`E6IRC_PASSWORD`, `E6IRC_OAUTH_TOKEN`,
+`E6IRC_SERVER_PASSWORD`, `E6IRC_API_TOKEN`). `--password`, `--oauth-token` and
+`--server-password` still work, but a value typed on a command line is visible
+to every local user in the process list. A server password is a private
+server's connection password, sent as `PASS` before registration. Both clients
+refuse to send a credential (a server password included) over a connection
+that is neither TLS nor to this machine — decided by address, not by name:
+every address the host resolves to must be loopback, and exactly those are
+dialed. `--allow-cleartext-credentials` is the explicit override. The CLI's
+HTTP commands ignore proxy variables (`HTTP_PROXY`, `ALL_PROXY`, …) and talk to
+the origin they were given.
+
+`e6irc send` exits 0 only once the server has echoed the message back
+(`echo-message`); a refusal, or a server that cannot confirm delivery, is a
+nonzero exit. `e6irc raw` prints every server line to stdout and each refusal
+to stderr, and exits nonzero when any line was refused.
 
 For a browser-approved token shared by the CLI and TUI:
 
@@ -100,7 +111,10 @@ e6irc-tui --server irc.example:6697 --nick alice --tls --oauth-from-cache \
 
 The cache records its issuing API origin, is replaced atomically, and is
 private to the current user (`0600` on Unix). `--token-file` or
-`E6IRC_TOKEN_FILE` selects an explicit location.
+`E6IRC_TOKEN_FILE` selects an explicit location. `--oauth-from-cache` sends the
+token only to an IRC server on the host of that origin, because any server it
+reaches can use it against the API; `--allow-oauth-token-for-other-server` is
+the explicit override.
 
 ## Native releases
 
@@ -108,13 +122,17 @@ A tag exactly matching the workspace version (for example `v0.1.0`) publishes
 six archives: Linux, macOS, and Windows for x86-64 and ARM64. Each archive
 contains `e6ircd`, `e6irc`, `e6irc-tui`, this README, the license, and the
 systemd unit. `SHA256SUMS` checks transport integrity; GitHub build provenance
-binds each archive to its source and workflow:
+binds each archive to its source and workflow — verify that it was signed by
+`release.yml` running on that exact tag, not merely by some workflow of the
+repository:
 
 ```sh
 grep 'e6irc-0.1.0-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS \
   | sha256sum --check
 gh attestation verify e6irc-0.1.0-x86_64-unknown-linux-gnu.tar.gz \
-  -R e6qu/e6irc
+  -R e6qu/e6irc \
+  --signer-workflow e6qu/e6irc/.github/workflows/release.yml \
+  --source-ref refs/tags/v0.1.0 --deny-self-hosted-runners
 ```
 
 Optional features: `embed-web` (bake the built web client into the

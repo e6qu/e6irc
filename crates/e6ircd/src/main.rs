@@ -30,6 +30,16 @@ const USAGE: &str = "usage:\n  \
                                      given, read in memory; nothing is written";
 
 fn main() -> ExitCode {
+    // Every subcommand handles secrets (the master key, sealed credentials, a
+    // recovery password), so none of them may leave a core file behind.
+    #[cfg(target_os = "linux")]
+    if let Err(error) = e6ircd::secret::mark_process_non_dumpable() {
+        eprintln!(
+            "e6ircd: WARNING: could not mark the process non-dumpable \
+             (prctl PR_SET_DUMPABLE): {error}; a core file or a same-user debugger \
+             could read the master key and opened credentials"
+        );
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("genkey") => genkey(),
@@ -399,12 +409,12 @@ fn load_seal_key(args: &[String]) -> Result<SecretKey, String> {
         [] => {
             let v = std::env::var("E6IRC_SECRET_KEY")
                 .map_err(|_| "no --key-file and E6IRC_SECRET_KEY is unset".to_string())?;
-            SecretKey::from_base64(&v).map_err(|e| format!("E6IRC_SECRET_KEY: {e}"))
+            SecretKey::from_base64_text(v).map_err(|e| format!("E6IRC_SECRET_KEY: {e}"))
         }
         [flag, path] if flag == "--key-file" => {
             let raw = std::fs::read_to_string(path)
                 .map_err(|e| format!("cannot read key_file {path}: {e}"))?;
-            SecretKey::from_base64(&raw).map_err(|e| format!("key_file: {e}"))
+            SecretKey::from_base64_text(raw).map_err(|e| format!("key_file: {e}"))
         }
         _ => Err(format!("bad arguments\n{USAGE}")),
     }

@@ -72,10 +72,12 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
             public_url: None,
             secure_cookies: false,
             admin_accounts: vec![],
+            hsts_include_subdomains: false,
         }),
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         networks: vec![NetworkEntry {
             kind: e6ircd::config::NetworkKind::Irc,
@@ -90,9 +92,11 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
             buffer_cap: 1000,
             sasl_account: None,
             sasl_password: None,
+            server_password: None,
         }],
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
         }),
         internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
@@ -111,6 +115,7 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
         nick: "peer",
         username: "peer",
         realname: "peer",
+        server_password: None,
     })
     .await
     .unwrap();
@@ -384,10 +389,12 @@ async fn ws_ui_resumes_after_a_cursor_and_says_when_it_cannot() {
             public_url: None,
             secure_cookies: false,
             admin_accounts: vec![],
+            hsts_include_subdomains: false,
         }),
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         networks: vec![NetworkEntry {
             kind: e6ircd::config::NetworkKind::Irc,
@@ -402,9 +409,11 @@ async fn ws_ui_resumes_after_a_cursor_and_says_when_it_cannot() {
             buffer_cap: 1000,
             sasl_account: None,
             sasl_password: None,
+            server_password: None,
         }],
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
         }),
         internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
@@ -420,6 +429,7 @@ async fn ws_ui_resumes_after_a_cursor_and_says_when_it_cannot() {
         nick: "peer",
         username: "peer",
         realname: "peer",
+        server_password: None,
     })
     .await
     .unwrap();
@@ -550,13 +560,16 @@ async fn ws_ui_requires_authentication() {
             public_url: None,
             secure_cookies: false,
             admin_accounts: vec![],
+            hsts_include_subdomains: false,
         }),
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
         }),
         internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
@@ -618,13 +631,16 @@ async fn ws_ui_detaches_when_its_network_is_removed() {
             public_url: None,
             secure_cookies: false,
             admin_accounts: vec![],
+            hsts_include_subdomains: false,
         }),
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
         }),
         internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()

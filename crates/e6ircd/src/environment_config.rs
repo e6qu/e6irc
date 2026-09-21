@@ -16,8 +16,12 @@
 //!            `E6IRC_IRC_ADDR` (default `127.0.0.1:6667`: IRC is reached over
 //!              `/ws/irc` publicly; the raw port stays internal)
 //!            `E6IRC_SECURE_COOKIES` (exactly `true` or `false`; default `true`)
+//!            `E6IRC_HSTS_INCLUDE_SUBDOMAINS` (exactly `true` or `false`;
+//!              default `false`: HSTS covers this origin only)
 //!            `E6IRC_ADMIN_ACCOUNTS` (comma-separated)
 //!            `E6IRC_BOOTSTRAP_TOKEN` (one-time first-administrator secret)
+//!            `E6IRC_DATABASE_MAX_CONNECTIONS` (a whole number, 2 to 200;
+//!              default sized to the host — see `database.max_connections`)
 //!            OpenID Connect, all required together once the issuer is set:
 //!              `E6IRC_OIDC_ISSUER`  `E6IRC_OIDC_CLIENT_ID`
 //!              `E6IRC_OIDC_CLIENT_SECRET`  `E6IRC_OIDC_END_SESSION`
@@ -73,6 +77,7 @@ pub enum EnvironmentConfigError {
     NotUnicode(&'static str),
     ControlCharacter(&'static str),
     NotBoolean(&'static str),
+    NotWholeNumber(&'static str),
     Retired {
         variable: &'static str,
         reason: &'static str,
@@ -97,6 +102,7 @@ impl std::fmt::Display for EnvironmentConfigError {
                  with the value?)"
             ),
             Self::NotBoolean(variable) => write!(f, "{variable} must be exactly true or false"),
+            Self::NotWholeNumber(variable) => write!(f, "{variable} must be a whole number"),
             Self::Retired { variable, reason } => {
                 write!(f, "{variable} is no longer honoured: {reason}; unset it")
             }
@@ -212,6 +218,22 @@ pub fn configuration_table(
         Some(_) => return Err(EnvironmentConfigError::NotBoolean("E6IRC_SECURE_COOKIES")),
     };
     http.insert("secure_cookies".into(), Value::Boolean(secure_cookies));
+    let hsts_include_subdomains = match environment
+        .optional("E6IRC_HSTS_INCLUDE_SUBDOMAINS")?
+        .as_deref()
+    {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => {
+            return Err(EnvironmentConfigError::NotBoolean(
+                "E6IRC_HSTS_INCLUDE_SUBDOMAINS",
+            ));
+        }
+    };
+    http.insert(
+        "hsts_include_subdomains".into(),
+        Value::Boolean(hsts_include_subdomains),
+    );
     if let Some(accounts) = environment.optional("E6IRC_ADMIN_ACCOUNTS")? {
         // An empty field (a trailing or doubled comma) names no account.
         let accounts = accounts
@@ -228,6 +250,15 @@ pub fn configuration_table(
         "url".into(),
         environment.required("E6IRC_DATABASE_URL", None)?,
     );
+    const MAX_CONNECTIONS: &str = "E6IRC_DATABASE_MAX_CONNECTIONS";
+    if let Some(stated) = environment.optional(MAX_CONNECTIONS)? {
+        // The bounds are the configuration's to enforce, by the same parser a
+        // file goes through; this only turns the text into a number.
+        let connections: i64 = stated
+            .parse()
+            .map_err(|_| EnvironmentConfigError::NotWholeNumber(MAX_CONNECTIONS))?;
+        database.insert("max_connections".into(), Value::Integer(connections));
+    }
     root.insert("database".into(), Value::Table(database));
 
     if let Some(token) = environment.optional("E6IRC_BOOTSTRAP_TOKEN")? {
@@ -403,6 +434,40 @@ mod tests {
             });
             assert_eq!(table(&absent), expected);
             assert_eq!(table(&with(absent, &[(required, "")])), expected);
+        }
+    }
+
+    #[test]
+    fn the_database_pool_size_is_a_bounded_whole_number() {
+        let stated = with(minimal(), &[("E6IRC_DATABASE_MAX_CONNECTIONS", "48")]);
+        assert_eq!(
+            config(&stated)
+                .database
+                .expect("database")
+                .pool_size()
+                .get(),
+            48
+        );
+        assert_eq!(
+            table(&with(
+                minimal(),
+                &[("E6IRC_DATABASE_MAX_CONNECTIONS", "many")]
+            )),
+            Err(EnvironmentConfigError::NotWholeNumber(
+                "E6IRC_DATABASE_MAX_CONNECTIONS"
+            ))
+        );
+        for out_of_bounds in ["1", "201"] {
+            let stated = with(
+                minimal(),
+                &[("E6IRC_DATABASE_MAX_CONNECTIONS", out_of_bounds)],
+            );
+            let error = Config::from_table(table(&stated).expect("a whole number"))
+                .expect_err("outside 2..=200");
+            assert!(
+                error.to_string().contains("database.max_connections"),
+                "{error}"
+            );
         }
     }
 

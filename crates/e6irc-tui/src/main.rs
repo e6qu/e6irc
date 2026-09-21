@@ -4,26 +4,30 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use e6irc_client::credentials::{CredentialArguments, SecretSources, process_environment};
-use e6irc_client::{
-    CleartextCredentials, ClientEvent, Connection, ConnectionOptions, JoinRefusal, OwnedMessage,
-    Registered,
+use crossterm::event::{self, Event};
+use e6irc_client::credentials::{
+    CredentialArguments, SecretSources, process_environment, resolve_server_password,
 };
-use e6irc_tui::app::{Action, App};
-use e6irc_tui::liveness::{KEEPALIVE_TOKEN, LIVENESS_WINDOW, Liveness, Silence};
+use e6irc_client::liveness::{Heard, LIVENESS_WINDOW, Liveness};
+use e6irc_client::{
+    CleartextCredentials, ClientEvent, Connection, ConnectionOptions, HistoryCoverage, JoinRefusal,
+    OwnedMessage, Registered, TerminalSafe,
+};
+use e6irc_tui::app::{App, LogLine, SCROLLBACK_LINES};
+use e6irc_tui::keys::{self, KeyOutcome};
 use e6irc_tui::reconnect::{AfterFailure, ReconnectPolicy};
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Position};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use tokio::sync::mpsc;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Parser)]
 #[command(name = "e6irc-tui", about = "Terminal IRC client", version)]
@@ -65,15 +69,32 @@ struct Cli {
     /// --password-file.
     #[arg(long)]
     oauth_token_file: Option<PathBuf>,
-    /// Load the OAUTHBEARER token created by `e6irc login`.
+    /// Load the OAUTHBEARER token created by `e6irc login`. It is sent only to
+    /// an IRC server on the host of the API origin that issued it.
     #[arg(long)]
     oauth_from_cache: bool,
     /// Token-cache path used by --oauth-from-cache.
     #[arg(long, requires = "oauth_from_cache")]
     token_file: Option<PathBuf>,
-    /// Send SASL credentials over a connection without --tls to a server that
-    /// is not this machine. Without this flag that is refused: the password or
-    /// token would cross the network readable by anyone on the path.
+    /// Send the cached token to an IRC server on another host than the API
+    /// origin that issued it. That server receives the account's API
+    /// credential and can use it against the API.
+    #[arg(long, requires = "oauth_from_cache")]
+    allow_oauth_token_for_other_server: bool,
+    /// The network's server password, sent as PASS before registration: only
+    /// for a private server that requires one. A value typed here is visible
+    /// to every local user in the process list and is kept by the shell's
+    /// history: prefer --server-password-file or E6IRC_SERVER_PASSWORD.
+    #[arg(long, conflicts_with = "server_password_file")]
+    server_password: Option<String>,
+    /// File holding the server password, under the same rules as
+    /// --password-file.
+    #[arg(long)]
+    server_password_file: Option<PathBuf>,
+    /// Send SASL credentials or a server password over a connection without
+    /// --tls to a server that is not this machine. Without this flag that is
+    /// refused: the password or token would cross the network readable by
+    /// anyone on the path.
     #[arg(long)]
     allow_cleartext_credentials: bool,
     /// Connect over TLS using the public CA set.
@@ -91,7 +112,12 @@ struct Cli {
     /// confirm each JOIN with its history, before the attempt is abandoned.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=600))]
     response_timeout: u64,
-    /// Latest messages loaded for each joined channel. Zero disables history.
+    /// Lines asked for per history request for each joined channel. With the
+    /// server's shared read marker these are the lines after it, paged forward
+    /// until a short page, for at most ten pages (and never more than the
+    /// scrollback holds); a channel with unread lines beyond that says so, and
+    /// its read marker stays at the last line loaded. Without a marker they
+    /// are the latest lines. Zero disables history.
     #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u64).range(0..=1000))]
     history_lines: u64,
     /// Disable draft/read-marker synchronization for servers without the cap.
@@ -104,9 +130,17 @@ struct Cli {
 const NET_QUEUE_DEPTH: usize = 1024;
 
 /// Lines awaiting the socket writer. Keyboard input is local, but terminal
-/// automation and paste can still outrun a stalled socket; this bound makes
-/// admission explicit and lets the UI refuse without a false local echo.
+/// automation can still outrun a stalled socket; this bound makes admission
+/// explicit and lets the UI refuse without a false local echo.
 const OUT_QUEUE_DEPTH: usize = 256;
+
+/// How long quitting waits for the network task to send what is queued and
+/// its `QUIT`. Past it the client says so rather than claiming a clean exit.
+const QUIT_BOUND: Duration = Duration::from_secs(5);
+
+/// How long, after sending `QUIT`, the network task waits for the server to
+/// close the connection.
+const QUIT_GRACE: Duration = Duration::from_secs(2);
 
 /// Events the render loop consumes.
 enum Ev {
@@ -114,18 +148,54 @@ enum Ev {
     /// A new session is registered under this server-confirmed nickname.
     Connected(String),
     JoinRefused(JoinRefusal),
+    /// This channel's unread history did not all load.
+    HistoryGap(String),
+    /// Every unread line of this channel loaded: a gap left by an earlier
+    /// session is closed.
+    HistoryCaughtUp(String),
     Reconnecting(String),
     /// The network task gave up for good; the text says why.
     Stopped(String),
+    /// Lines admitted before the UI learned of a disconnect, never sent.
     DroppedOutbound(usize),
+    /// A read marker admitted before the UI learned of a disconnect: it is
+    /// still to be sent, on the next connection.
+    ReadMarkerUnsent(String),
 }
 
-fn main() -> io::Result<()> {
+/// One line for the socket writer. A read marker is kept apart from what the
+/// user typed: one that meets a disconnect is sent later, not lost, and never
+/// counted as a lost message.
+#[derive(Debug, PartialEq, Eq)]
+enum Queued {
+    Line(String),
+    ReadMarker(String),
+}
+
+impl Queued {
+    fn line(&self) -> &str {
+        match self {
+            Self::Line(line) | Self::ReadMarker(line) => line,
+        }
+    }
+}
+
+fn main() -> ExitCode {
     let cli = Cli::parse();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let outcome = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?;
-    runtime.block_on(async_main(cli))
+        .build()
+        .and_then(|runtime| runtime.block_on(async_main(cli)));
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!(
+                "e6irc-tui: {}",
+                TerminalSafe::from_untrusted(&error.to_string())
+            );
+            ExitCode::FAILURE
+        }
+    }
 }
 
 async fn async_main(cli: Cli) -> io::Result<()> {
@@ -141,8 +211,16 @@ async fn async_main(cli: Cli) -> io::Result<()> {
         },
         oauth_from_cache: cli.oauth_from_cache,
         token_file: cli.token_file,
+        allow_oauth_token_for_other_server: cli.allow_oauth_token_for_other_server,
     }
-    .resolve(&process_environment)?;
+    .resolve(&cli.server, &process_environment)?;
+    let server_password = resolve_server_password(
+        SecretSources {
+            argument: cli.server_password,
+            file: cli.server_password_file,
+        },
+        &process_environment,
+    )?;
     let connection_options = ConnectionOptions {
         address: cli.server,
         tls: cli.tls,
@@ -157,18 +235,21 @@ async fn async_main(cli: Cli) -> io::Result<()> {
         } else {
             CleartextCredentials::Refuse
         },
+        server_password,
     };
+    let history = HistoryWindow::new(cli.history_lines as usize);
     let read_markers = !cli.no_read_markers;
     let mut joined_channels = std::collections::BTreeSet::from([cli.channel.clone()]);
     let Session {
-        connection: mut conn,
+        connection: conn,
         nick: confirmed_nick,
         bootstrap,
         refused,
+        coverage,
     } = connect_and_join(
         &connection_options,
         &mut joined_channels,
-        cli.history_lines as usize,
+        history,
         read_markers,
     )
     .await?;
@@ -178,96 +259,21 @@ async fn async_main(cli: Cli) -> io::Result<()> {
     // which stops reading the socket and lets TCP apply the backpressure —
     // the same shape as the daemon's SendQ, in the other direction.
     let (net_tx, mut net_rx) = mpsc::channel::<Ev>(NET_QUEUE_DEPTH);
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(OUT_QUEUE_DEPTH);
+    let (out_tx, out_rx) = mpsc::channel::<Queued>(OUT_QUEUE_DEPTH);
 
-    // Networking task: read messages up, write outbound lines down, and
-    // reconnect with the same explicit transport/authentication request.
-    let mut policy = ReconnectPolicy::new(Duration::from_secs(cli.reconnect_delay));
-    let mut own_nick = confirmed_nick.clone();
-    let reconnect_options = connection_options.clone();
-    let reconnect_history_lines = cli.history_lines as usize;
-    let reconnect_read_markers = read_markers;
-    tokio::spawn(async move {
-        loop {
-            let Some(failure) = relay_session(
-                &mut conn,
-                &mut out_rx,
-                &net_tx,
-                &mut joined_channels,
-                &mut own_nick,
-                LIVENESS_WINDOW,
-            )
-            .await
-            else {
-                return;
-            };
-            if net_tx.send(Ev::Reconnecting(failure)).await.is_err() {
-                return;
-            }
-
-            let mut delay = policy.first_delay();
-            loop {
-                // Reject anything that raced the disconnect notification.
-                // Delivering it after reconnect would be a surprising delayed
-                // send, while leaving its local echo unqualified would be false.
-                let mut dropped = 0;
-                while out_rx.try_recv().is_ok() {
-                    dropped += 1;
-                }
-                if dropped > 0 && net_tx.send(Ev::DroppedOutbound(dropped)).await.is_err() {
-                    return;
-                }
-                tokio::time::sleep(delay).await;
-                let attempt = connect_and_join(
-                    &reconnect_options,
-                    &mut joined_channels,
-                    reconnect_history_lines,
-                    reconnect_read_markers,
-                )
-                .await;
-                let outcome = match attempt {
-                    Ok(session) => {
-                        policy.connected();
-                        conn = session.connection;
-                        own_nick = session.nick.clone();
-                        let mut events = vec![Ev::Connected(session.nick)];
-                        events.extend(session.refused.into_iter().map(Ev::JoinRefused));
-                        events.extend(session.bootstrap.into_iter().map(Ev::Net));
-                        Ok(events)
-                    }
-                    Err(error) => match policy.after(&error) {
-                        AfterFailure::Stop(status) => Err(Ev::Stopped(status)),
-                        AfterFailure::RetryAfter(next) => {
-                            delay = next;
-                            Ok(vec![Ev::Reconnecting(format!(
-                                "reconnect failed: {error}; next attempt in {}s",
-                                next.as_secs()
-                            ))])
-                        }
-                    },
-                };
-                match outcome {
-                    Ok(events) => {
-                        let connected = matches!(events.first(), Some(Ev::Connected(_)));
-                        for event in events {
-                            if net_tx.send(event).await.is_err() {
-                                return;
-                            }
-                        }
-                        if connected {
-                            break;
-                        }
-                    }
-                    // Dropping `out_rx` with this task is what makes the UI
-                    // refuse further input instead of queueing it for nobody.
-                    Err(stopped) => {
-                        drop(net_tx.send(stopped).await);
-                        return;
-                    }
-                }
-            }
-        }
-    });
+    let network = tokio::spawn(network_task(
+        conn,
+        out_rx,
+        net_tx,
+        joined_channels,
+        confirmed_nick.clone(),
+        Reconnect {
+            options: connection_options.clone(),
+            history,
+            read_markers,
+            policy: ReconnectPolicy::new(Duration::from_secs(cli.reconnect_delay)),
+        },
+    ));
 
     let mut terminal = ratatui::init();
     let mut app = App::new(cli.channel, confirmed_nick);
@@ -277,28 +283,274 @@ async fn async_main(cli: Cli) -> io::Result<()> {
     for event in bootstrap {
         apply(&mut app, Ev::Net(event));
     }
-    let result = run_ui(&mut terminal, &mut app, &mut net_rx, &out_tx).await;
-    let restore = ratatui::try_restore();
-    match (result, restore) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(run_error), Err(restore_error)) => Err(io::Error::other(format!(
-            "UI failed: {run_error}; terminal restoration also failed: {restore_error}"
-        ))),
+    for event in coverage.into_iter().filter_map(coverage_event) {
+        apply(&mut app, event);
+    }
+    let result = match crossterm::execute!(io::stdout(), event::EnableBracketedPaste) {
+        Ok(()) => run_ui(&mut terminal, &mut app, &mut net_rx, &out_tx).await,
+        Err(error) => Err(error),
+    };
+    let paste_restored = crossterm::execute!(io::stdout(), event::DisableBracketedPaste);
+    let restore = ratatui::try_restore().and(paste_restored);
+    let shutdown = shut_down_network(&mut app, out_tx, net_rx, network).await;
+    let mut failures = Vec::new();
+    if let Err(error) = result {
+        failures.push(format!("UI failed: {error}"));
+    }
+    if let Err(error) = restore {
+        failures.push(format!("terminal restoration failed: {error}"));
+    }
+    if let Err(error) = shutdown {
+        failures.push(error.to_string());
+    }
+    match failures.len() {
+        0 => Ok(()),
+        _ => Err(io::Error::other(failures.join("; "))),
     }
 }
 
+/// Hand the network task the last read marker, close the writer queue so it
+/// sends everything still in it followed by `QUIT`, and wait for it — within
+/// [`QUIT_BOUND`]. With no live connection there is nothing to send, and the
+/// task is stopped where it stands.
+async fn shut_down_network(
+    app: &mut App,
+    out_tx: mpsc::Sender<Queued>,
+    net_rx: mpsc::Receiver<Ev>,
+    network: tokio::task::JoinHandle<()>,
+) -> io::Result<()> {
+    if !app.connected() {
+        drop(net_rx);
+        drop(out_tx);
+        network.abort();
+        return Ok(());
+    }
+    let finished = async {
+        if let Some(marker) = app.take_read_marker_command() {
+            // A closed queue here means the connection ended meanwhile.
+            drop(out_tx.send(Queued::ReadMarker(marker)).await);
+        }
+        drop(out_tx);
+        // Nothing reads the UI's events any more; a network task blocked on
+        // sending one is released into its shutdown path.
+        drop(net_rx);
+        network.await
+    };
+    match tokio::time::timeout(QUIT_BOUND, finished).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(io::Error::other(format!(
+            "the network task failed while quitting: {error}"
+        ))),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "the connection did not finish sending queued lines and QUIT within \
+                 {QUIT_BOUND:?}; they may not have reached the server"
+            ),
+        )),
+    }
+}
+
+/// How much history a join loads.
+#[derive(Debug, Clone, Copy)]
+struct HistoryWindow {
+    /// Lines per CHATHISTORY request; zero disables history.
+    page_lines: usize,
+    /// The most lines one join loads across its pages: never more than the
+    /// scrollback holds, so every loaded line can still be shown.
+    max_lines: usize,
+}
+
+impl HistoryWindow {
+    fn new(page_lines: usize) -> Self {
+        Self {
+            page_lines,
+            max_lines: page_lines
+                .saturating_mul(e6irc_client::MAX_HISTORY_PAGES)
+                .min(SCROLLBACK_LINES),
+        }
+    }
+}
+
+/// Everything a reconnect repeats: the same explicit request, the same
+/// history and read-marker choices, and the backoff between attempts.
+struct Reconnect {
+    options: ConnectionOptions,
+    history: HistoryWindow,
+    read_markers: bool,
+    policy: ReconnectPolicy,
+}
+
+/// Lines taken off the writer queue that no connection will send.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Stale {
+    lines: usize,
+    read_markers: Vec<String>,
+}
+
+impl Stale {
+    fn take(&mut self, queued: Queued) {
+        match queued {
+            Queued::Line(_) => self.lines += 1,
+            Queued::ReadMarker(marker) => self.read_markers.push(marker),
+        }
+    }
+
+    /// Everything already in the queue.
+    fn drain(&mut self, out_rx: &mut mpsc::Receiver<Queued>) {
+        while let Ok(queued) = out_rx.try_recv() {
+            self.take(queued);
+        }
+    }
+
+    /// Tell the UI: lines were not sent, read markers go back to be sent on
+    /// the next connection. `false` when the UI is gone.
+    async fn report(&mut self, net_tx: &mpsc::Sender<Ev>) -> bool {
+        let lines = std::mem::take(&mut self.lines);
+        if lines > 0 && net_tx.send(Ev::DroppedOutbound(lines)).await.is_err() {
+            return false;
+        }
+        for marker in std::mem::take(&mut self.read_markers) {
+            if net_tx.send(Ev::ReadMarkerUnsent(marker)).await.is_err() {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Networking: read messages up, write outbound lines down, and reconnect
+/// with the same explicit transport/authentication request.
+async fn network_task(
+    mut conn: Connection,
+    mut out_rx: mpsc::Receiver<Queued>,
+    net_tx: mpsc::Sender<Ev>,
+    mut joined_channels: std::collections::BTreeSet<String>,
+    mut own_nick: String,
+    reconnect: Reconnect,
+) {
+    let Reconnect {
+        options,
+        history,
+        read_markers,
+        mut policy,
+    } = reconnect;
+    loop {
+        let failure = match relay_session(
+            &mut conn,
+            &mut out_rx,
+            &net_tx,
+            &mut joined_channels,
+            &mut own_nick,
+            LIVENESS_WINDOW,
+        )
+        .await
+        {
+            SessionEnd::Failed(failure) => failure,
+            SessionEnd::UiGone => return,
+        };
+        if net_tx.send(Ev::Reconnecting(failure)).await.is_err() {
+            return;
+        }
+
+        let mut delay = policy.first_delay();
+        let mut stale = Stale::default();
+        loop {
+            // Lines that raced the disconnect notification are not delivered
+            // after reconnect (a surprising delayed send), and their local
+            // echo is qualified by saying so.
+            stale.drain(&mut out_rx);
+            if !stale.report(&net_tx).await {
+                return;
+            }
+            if sleep_unless_ui_leaves(delay, &mut out_rx, &mut stale).await {
+                return;
+            }
+            let attempt =
+                connect_and_join(&options, &mut joined_channels, history, read_markers).await;
+            let session = match attempt {
+                Ok(session) => session,
+                Err(error) => match policy.after(&error) {
+                    // Dropping `out_rx` with this task is what makes the UI
+                    // refuse further input instead of queueing it for nobody.
+                    AfterFailure::Stop(status) => {
+                        drop(net_tx.send(Ev::Stopped(status)).await);
+                        return;
+                    }
+                    AfterFailure::RetryAfter(next) => {
+                        delay = next;
+                        let status = format!(
+                            "reconnect failed: {error}; next attempt in {}s",
+                            next.as_secs()
+                        );
+                        if net_tx.send(Ev::Reconnecting(status)).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                },
+            };
+            policy.connected();
+            // Right before the new connection is handed to the relay: a line
+            // admitted after the last drain was typed against the old one.
+            stale.drain(&mut out_rx);
+            if !stale.report(&net_tx).await {
+                return;
+            }
+            conn = session.connection;
+            own_nick = session.nick.clone();
+            let mut events = vec![Ev::Connected(session.nick)];
+            events.extend(session.refused.into_iter().map(Ev::JoinRefused));
+            events.extend(session.bootstrap.into_iter().map(Ev::Net));
+            events.extend(session.coverage.into_iter().filter_map(coverage_event));
+            for event in events {
+                if net_tx.send(event).await.is_err() {
+                    return;
+                }
+            }
+            break;
+        }
+    }
+}
+
+/// Wait out a reconnect delay. `true` when the UI left meanwhile (its queue
+/// closed); anything it queued on the way is stale.
+async fn sleep_unless_ui_leaves(
+    delay: Duration,
+    out_rx: &mut mpsc::Receiver<Queued>,
+    stale: &mut Stale,
+) -> bool {
+    let wake = tokio::time::Instant::now() + delay;
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep_until(wake) => return false,
+            queued = out_rx.recv() => match queued {
+                Some(queued) => stale.take(queued),
+                None => return true,
+            },
+        }
+    }
+}
+
+/// How a relayed session ended.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionEnd {
+    /// The connection failed; the text says why, and the reconnect path runs.
+    Failed(String),
+    /// The UI left: whatever it queued was sent, then `QUIT`.
+    UiGone,
+}
+
 /// Relay one registered session: server messages up to the UI, outbound lines
-/// down to the socket, until the session ends. The text says why it ended and
-/// the reconnect path runs; `None` means the UI is gone and nothing should.
+/// down to the socket, until the session ends.
 async fn relay_session(
     conn: &mut Connection,
-    out_rx: &mut mpsc::Receiver<String>,
+    out_rx: &mut mpsc::Receiver<Queued>,
     net_tx: &mpsc::Sender<Ev>,
     joined_channels: &mut std::collections::BTreeSet<String>,
     own_nick: &mut String,
     liveness_window: Duration,
-) -> Option<String> {
+) -> SessionEnd {
     let mut liveness = Liveness::new(liveness_window);
     loop {
         tokio::select! {
@@ -307,53 +559,51 @@ async fn relay_session(
             // Bounded by the liveness window, measured from the server's last
             // sign of life: an outbound line also ends a turn of this loop and
             // must not make a silent server look alive while the user types.
-            msg = liveness.bound(conn.next_event_lossy()) => match msg {
-                None => match liveness.silent() {
-                    Silence::Probe => {
-                        if let Err(error) = conn.send_line(&format!("PING :{KEEPALIVE_TOKEN}")).await {
-                            return Some(format!("keepalive PING failed: {error}"));
-                        }
+            read = liveness.bound(conn.next_line_relayable()) => {
+                let event = match liveness.settle(conn, read).await {
+                    Ok(Heard::Event(event)) => ClientEvent::from(event),
+                    Ok(Heard::Nothing) => continue,
+                    Ok(Heard::Closed) => {
+                        return SessionEnd::Failed("server closed the connection".into());
                     }
-                    Silence::Dead => return Some("server stopped responding".into()),
-                },
-                Some(Ok(Some(ClientEvent::Message(m)))) => {
-                    liveness.heard();
-                    if m.command == "PING" {
-                        let token = m.params.first().cloned().unwrap_or_default();
-                        if let Err(error) = conn.send_line(&format!("PONG :{token}")).await {
-                            return Some(format!("PING response failed: {error}"));
-                        }
-                    }
-                    // The answer to this client's own probe is bookkeeping,
-                    // not conversation: it proved the server is there, and
-                    // that is all it is for.
-                    if m.command == "PONG"
-                        && m.params.last().map(String::as_str) == Some(KEEPALIVE_TOKEN)
-                    {
-                        continue;
-                    }
-                    track_own_state(joined_channels, own_nick, &m);
-                    if net_tx.send(Ev::Net(ClientEvent::Message(m))).await.is_err() {
-                        return None;
-                    }
+                    Err(error) => return SessionEnd::Failed(error.to_string()),
+                };
+                if let ClientEvent::Message(message) = &event {
+                    track_own_state(joined_channels, own_nick, message);
                 }
-                Some(Ok(Some(rejected @ ClientEvent::Rejected(_)))) => {
-                    liveness.heard();
-                    if net_tx.send(Ev::Net(rejected)).await.is_err() {
-                        return None;
-                    }
+                if net_tx.send(Ev::Net(event)).await.is_err() {
+                    return finish(conn, out_rx).await;
                 }
-                Some(Ok(None)) => return Some("server closed the connection".into()),
-                Some(Err(error)) => return Some(format!("connection read failed: {error}")),
-            },
-            line = out_rx.recv() => match line {
-                Some(line) => if let Err(error) = conn.send_line(&line).await {
-                    return Some(format!("message write failed: {error}"));
+            }
+            queued = out_rx.recv() => match queued {
+                Some(queued) => if let Err(error) = conn.send_line(queued.line()).await {
+                    return SessionEnd::Failed(format!("message write failed: {error}"));
                 },
-                None => return None,
+                None => return finish(conn, out_rx).await,
             },
         }
     }
+}
+
+/// The UI left: send every line still queued, then `QUIT`, and give the
+/// server [`QUIT_GRACE`] to close the connection.
+async fn finish(conn: &mut Connection, out_rx: &mut mpsc::Receiver<Queued>) -> SessionEnd {
+    while let Some(queued) = out_rx.recv().await {
+        if let Err(error) = conn.send_line(queued.line()).await {
+            return SessionEnd::Failed(format!("message write failed: {error}"));
+        }
+    }
+    if let Err(error) = conn.send_line("QUIT :e6irc-tui").await {
+        return SessionEnd::Failed(format!("QUIT write failed: {error}"));
+    }
+    // The server closes after QUIT; the wait only lets it read the line.
+    drop(
+        tokio::time::timeout(QUIT_GRACE, async {
+            while let Ok(Some(_)) = conn.next_line_relayable().await {}
+        })
+        .await,
+    );
+    SessionEnd::UiGone
 }
 
 /// A registered connection and everything the UI starts a session from.
@@ -363,6 +613,18 @@ struct Session {
     nick: String,
     bootstrap: Vec<ClientEvent>,
     refused: Vec<JoinRefusal>,
+    /// How much history each joined channel loaded.
+    coverage: Vec<(String, HistoryCoverage)>,
+}
+
+/// What the UI must know about a channel's history: whether the read marker
+/// is to be held short of a gap, or released because none remains.
+fn coverage_event((channel, coverage): (String, HistoryCoverage)) -> Option<Ev> {
+    match coverage {
+        HistoryCoverage::UnreadBeyondLoaded => Some(Ev::HistoryGap(channel)),
+        HistoryCoverage::AllUnread => Some(Ev::HistoryCaughtUp(channel)),
+        HistoryCoverage::NoHistory | HistoryCoverage::Latest => None,
+    }
 }
 
 /// Register and join `channels`. A channel the server refuses is taken out of
@@ -371,7 +633,7 @@ struct Session {
 async fn connect_and_join(
     options: &ConnectionOptions,
     channels: &mut std::collections::BTreeSet<String>,
-    history_lines: usize,
+    history: HistoryWindow,
     read_markers: bool,
 ) -> io::Result<Session> {
     let Registered {
@@ -379,7 +641,7 @@ async fn connect_and_join(
         nick,
     } = options.connect_registered().await?;
     let mut capabilities = Vec::new();
-    if history_lines > 0 {
+    if history.page_lines > 0 {
         capabilities.extend(["batch", "draft/chathistory", "server-time"]);
     }
     if read_markers {
@@ -388,9 +650,16 @@ async fn connect_and_join(
     connection.require_capabilities(&capabilities).await?;
     let mut bootstrap = Vec::new();
     let mut refused = Vec::new();
+    let mut coverage = Vec::new();
     for channel in channels.clone() {
-        match connection.join_with_history(&channel, history_lines).await {
-            Ok(events) => bootstrap.extend(events),
+        match connection
+            .join_with_history(&channel, history.page_lines, history.max_lines)
+            .await
+        {
+            Ok(joined) => {
+                bootstrap.extend(joined.events);
+                coverage.push((channel, joined.coverage));
+            }
             Err(error) => {
                 let Some(refusal) = JoinRefusal::from_error(&error) else {
                     return Err(error);
@@ -405,6 +674,7 @@ async fn connect_and_join(
         nick,
         bootstrap,
         refused,
+        coverage,
     })
 }
 
@@ -455,12 +725,15 @@ fn remove_channel(channels: &mut std::collections::BTreeSet<String>, channel: &s
     }
 }
 
-async fn run_ui(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+async fn run_ui<B: Backend>(
+    terminal: &mut Terminal<B>,
     app: &mut App,
     net_rx: &mut mpsc::Receiver<Ev>,
-    out_tx: &mpsc::Sender<String>,
-) -> io::Result<()> {
+    out_tx: &mpsc::Sender<Queued>,
+) -> io::Result<()>
+where
+    io::Error: From<B::Error>,
+{
     let mut dirty = true;
     loop {
         // Drain any pending network events.
@@ -477,50 +750,34 @@ async fn run_ui(
             return Ok(());
         }
         // Poll for input with a short timeout so network events still flow.
-        if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            dirty = true;
-            use crossterm::event::KeyModifiers;
-            let alt = key.modifiers.contains(KeyModifiers::ALT);
-            let control = key.modifiers.contains(KeyModifiers::CONTROL);
-            match key.code {
-                KeyCode::Left if alt => app.prev_buffer(),
-                KeyCode::Right if alt => app.next_buffer(),
-                KeyCode::Left => app.move_input_left(),
-                KeyCode::Right => app.move_input_right(),
-                KeyCode::Home => app.move_input_home(),
-                KeyCode::PageUp => app.scroll_up(10),
-                KeyCode::PageDown => app.scroll_down(10),
-                KeyCode::End if control => app.jump_latest(),
-                KeyCode::End => app.move_input_end(),
-                KeyCode::Char('c' | 'C') if control => return Ok(()),
-                KeyCode::Char('u' | 'U') if control => app.clear_input(),
-                KeyCode::Char(c) if !control => app.on_char(c),
-                KeyCode::Backspace => app.on_backspace(),
-                KeyCode::Delete => app.on_delete(),
-                KeyCode::Esc => return Ok(()),
-                KeyCode::Enter => {
-                    if let Action::Send(outbound) = app.on_enter() {
-                        match out_tx.try_send(outbound.line().to_owned()) {
-                            Ok(()) => app.outbound_accepted(&outbound),
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                app.outbound_refused(&outbound);
-                                app.note_outbound_full();
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                app.outbound_refused(&outbound);
-                                app.set_connected(false);
-                                app.status("not connected — message not sent");
-                            }
+        if !event::poll(Duration::from_millis(50))? {
+            continue;
+        }
+        // Every event can change what is on screen: a resize most of all,
+        // which must redraw at the new size now, not at the next keypress.
+        dirty = true;
+        match event::read()? {
+            Event::Key(key) => match keys::dispatch(app, key) {
+                KeyOutcome::Handled | KeyOutcome::Quit => {}
+                KeyOutcome::Send(outbound) => {
+                    match out_tx.try_send(Queued::Line(outbound.line().to_owned())) {
+                        Ok(()) => app.outbound_accepted(&outbound),
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            app.outbound_refused(&outbound);
+                            app.note_outbound_full();
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            app.outbound_refused(&outbound);
+                            app.set_connected(false);
+                            app.status("not connected — message not sent");
                         }
                     }
                 }
-                _ => {}
-            }
-            flush_read_marker(app, out_tx);
+            },
+            Event::Paste(text) => app.on_paste(&text),
+            Event::Resize(..) | Event::FocusGained | Event::FocusLost | Event::Mouse(_) => {}
         }
+        flush_read_marker(app, out_tx);
     }
 }
 
@@ -539,6 +796,8 @@ fn apply(app: &mut App, event: Ev) {
         Ev::JoinRefused(refusal) => {
             app.status(format!("{refusal}; it will not be rejoined"));
         }
+        Ev::HistoryGap(channel) => app.hold_read_marker(&channel),
+        Ev::HistoryCaughtUp(channel) => app.release_read_marker(&channel),
         Ev::Reconnecting(reason) => {
             app.set_connected(false);
             app.status(format!("{reason}; reconnecting"));
@@ -552,24 +811,106 @@ fn apply(app: &mut App, event: Ev) {
                 "{count} outbound message(s) were not sent during disconnect"
             ));
         }
+        Ev::ReadMarkerUnsent(marker) => app.requeue_read_marker_command(marker),
     }
 }
 
-fn flush_read_marker(app: &mut App, out_tx: &mpsc::Sender<String>) {
+/// Offer the pending read marker to the writer. While disconnected it stays
+/// pending: a queued marker would only meet the disconnect, and it is sent on
+/// the next connection instead.
+fn flush_read_marker(app: &mut App, out_tx: &mpsc::Sender<Queued>) {
+    if !app.connected() {
+        return;
+    }
     let Some(command) = app.take_read_marker_command() else {
         return;
     };
-    match out_tx.try_send(command) {
+    match out_tx.try_send(Queued::ReadMarker(command)) {
         Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(command)) => {
+        Err(mpsc::error::TrySendError::Full(Queued::ReadMarker(command))) => {
             app.requeue_read_marker_command(command);
             app.note_outbound_full();
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
+        Err(mpsc::error::TrySendError::Full(Queued::Line(_))) => {
+            unreachable!("the value offered was a read marker")
+        }
+        Err(mpsc::error::TrySendError::Closed(queued)) => {
+            if let Queued::ReadMarker(command) = queued {
+                app.requeue_read_marker_command(command);
+            }
             app.set_connected(false);
-            app.status("not connected — read marker was not sent");
+            app.status("not connected — the read marker will be sent after reconnecting");
         }
     }
+}
+
+/// The styled pieces of one log line: who, a separator, and the text.
+fn log_segments(line: &LogLine) -> [(String, Style); 3] {
+    let route = if line.from.as_str() == "*" {
+        (
+            " route ".to_owned(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            format!(" {} ", line.from),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    [
+        route,
+        ("│ ".to_owned(), Style::default().fg(Color::DarkGray)),
+        (line.text.to_string(), Style::default()),
+    ]
+}
+
+/// `line` wrapped into rows at most `width` columns wide, by display width
+/// (a wide character never straddles two rows). Every row is shown; nothing
+/// past the pane's edge is clipped away.
+fn wrap_log_line(line: &LogLine, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut used = 0;
+    for (text, style) in log_segments(line) {
+        let mut piece = String::new();
+        for character in text.chars() {
+            let columns = character.width().unwrap_or(0);
+            if used + columns > width && used > 0 {
+                if !piece.is_empty() {
+                    rows.last_mut()
+                        .expect("a row")
+                        .push(Span::styled(std::mem::take(&mut piece), style));
+                }
+                rows.push(Vec::new());
+                used = 0;
+            }
+            piece.push(character);
+            used += columns;
+        }
+        if !piece.is_empty() {
+            rows.last_mut()
+                .expect("a row")
+                .push(Span::styled(piece, style));
+        }
+    }
+    rows.into_iter().map(Line::from).collect()
+}
+
+/// The rows of the log pane: the lines ending at the scroll position, wrapped
+/// to `width`, of which the last `height` rows are shown.
+fn log_rows(buffer: &e6irc_tui::app::Buffer, width: usize, height: usize) -> Vec<Line<'static>> {
+    let lines = buffer.visible_rows(height, |line| wrap_log_line(line, width).len());
+    let mut rows: Vec<Line<'static>> = lines
+        .iter()
+        .flat_map(|line| wrap_log_line(line, width))
+        .collect();
+    let overflow = rows.len().saturating_sub(height);
+    rows.drain(..overflow);
+    rows
 }
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
@@ -638,32 +979,8 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     );
 
     let height = chunks[2].height.saturating_sub(2) as usize;
-    let lines: Vec<Line> = buf
-        .visible(height)
-        .iter()
-        .map(|line| {
-            let route = if line.from.as_str() == "*" {
-                Span::styled(
-                    " route ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Span::styled(
-                    format!(" {} ", line.from),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )
-            };
-            Line::from(vec![
-                route,
-                Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-                Span::raw(line.text.to_string()),
-            ])
-        })
-        .collect();
+    let width = chunks[2].width.saturating_sub(2) as usize;
+    let lines = log_rows(buf, width, height);
     let position = format!(" {} / {} ", app.current + 1, app.buffers.len());
     let mut title = vec![
         Span::styled(
@@ -741,10 +1058,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     f.set_cursor_position(Position::new(cursor_x, chunks[3].y.saturating_add(1)));
 
     f.render_widget(
-        Paragraph::new(
-            " Alt-←/→ switch · PgUp/PgDn scroll · Ctrl-End latest · /help commands · Esc/Ctrl-C quit",
-        )
-        .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(keys::HINT).style(Style::default().fg(Color::DarkGray)),
         chunks[4],
     );
 }
@@ -832,6 +1146,11 @@ mod tests {
 
     #[test]
     fn transport_and_reconnect_constraints_fail_at_argument_parsing() {
+        assert!(parses(&[
+            "--oauth-from-cache",
+            "--allow-oauth-token-for-other-server"
+        ]));
+        assert!(!parses(&["--allow-oauth-token-for-other-server"]));
         assert!(parses(&["--tls"]));
         assert!(parses(&["--tls", "--tls-name", "irc.example"]));
         assert!(!parses(&["--tls-name", "irc.example"]));
@@ -893,6 +1212,158 @@ mod tests {
             let mut terminal = Terminal::new(backend).unwrap();
             terminal.draw(|frame| draw(frame, &app)).unwrap();
         }
+    }
+
+    /// A line longer than the pane wraps; its end is on screen, not clipped.
+    #[test]
+    fn a_long_line_wraps_so_its_last_word_is_shown() {
+        let mut app = App::new("#home".into(), "me".into());
+        let long = format!("{} finalword", "x".repeat(189));
+        app.on_message(&message(&format!(":alice!u@h PRIVMSG #home :{long}")));
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("finalword"), "{screen}");
+
+        // Rows are counted by display width: wide characters never straddle.
+        app.on_message(&message(&format!(
+            ":alice!u@h PRIVMSG #home :{}",
+            "界".repeat(10)
+        )));
+        let wide = app.current().log.last().expect("a line").clone();
+        let rows = wrap_log_line(&wide, 11);
+        assert!(rows.len() > 1);
+        for row in &rows {
+            assert!(row.width() <= 11, "{row:?}");
+        }
+    }
+
+    /// A read marker queued while the connection is down is not a message
+    /// lost in the disconnect: it stays pending and goes out on the next
+    /// connection.
+    #[test]
+    fn a_read_marker_waits_out_a_disconnect_instead_of_being_lost() {
+        let (out_tx, mut out_rx) = mpsc::channel::<Queued>(8);
+        let mut app = App::new("#a".into(), "me".into());
+        app.set_connected(false);
+        app.on_message(&message(
+            "@time=2026-07-30T12:00:00.000Z :alice!u@h PRIVMSG #a :hi",
+        ));
+        flush_read_marker(&mut app, &out_tx);
+        assert!(out_rx.try_recv().is_err(), "a marker was queued while down");
+        app.set_connected(true);
+        flush_read_marker(&mut app, &out_tx);
+        assert_eq!(
+            out_rx.try_recv().ok(),
+            Some(Queued::ReadMarker(
+                "MARKREAD #a timestamp=2026-07-30T12:00:00.000Z".into()
+            ))
+        );
+    }
+
+    /// What was queued against a connection that died is taken off the queue
+    /// before the next connection sees it: typed lines are reported unsent,
+    /// read markers go back to the UI to be sent again.
+    #[tokio::test]
+    async fn stale_lines_are_reported_and_stale_markers_are_requeued() {
+        let (out_tx, mut out_rx) = mpsc::channel::<Queued>(8);
+        let (net_tx, mut net_rx) = mpsc::channel::<Ev>(8);
+        out_tx
+            .send(Queued::Line("PRIVMSG #a :late".into()))
+            .await
+            .unwrap();
+        out_tx
+            .send(Queued::ReadMarker("MARKREAD #a timestamp=x".into()))
+            .await
+            .unwrap();
+        let mut stale = Stale::default();
+        stale.drain(&mut out_rx);
+        assert!(stale.report(&net_tx).await);
+        let mut app = App::new("#a".into(), "me".into());
+        while let Ok(event) = net_rx.try_recv() {
+            apply(&mut app, event);
+        }
+        assert!(
+            app.current().log.iter().any(|line| line.text.as_str()
+                == "1 outbound message(s) were not sent during disconnect")
+        );
+        assert!(
+            !app.current()
+                .log
+                .iter()
+                .any(|line| line.text.as_str().contains("read marker"))
+        );
+        assert_eq!(
+            app.take_read_marker_command().as_deref(),
+            Some("MARKREAD #a timestamp=x")
+        );
+    }
+
+    /// Quitting sends what is still queued, then QUIT — the network task does
+    /// not just vanish with the UI.
+    #[tokio::test]
+    async fn leaving_sends_the_queue_then_quit() {
+        use tokio::io::AsyncBufReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut lines = tokio::io::BufReader::new(socket).lines();
+            let mut seen = Vec::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let quit = line.starts_with("QUIT");
+                seen.push(line);
+                if quit {
+                    break;
+                }
+            }
+            seen
+        });
+        let mut conn = Connection::connect(&address).await.unwrap();
+        let (net_tx, _net_rx) = mpsc::channel(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<Queued>(8);
+        out_tx
+            .send(Queued::Line("PRIVMSG #a :last words".into()))
+            .await
+            .unwrap();
+        out_tx
+            .send(Queued::ReadMarker("MARKREAD #a timestamp=x".into()))
+            .await
+            .unwrap();
+        drop(out_tx);
+        let mut channels = std::collections::BTreeSet::new();
+        let mut nick = "me".to_owned();
+        let end = tokio::time::timeout(
+            Duration::from_secs(5),
+            relay_session(
+                &mut conn,
+                &mut out_rx,
+                &net_tx,
+                &mut channels,
+                &mut nick,
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("leaving is bounded");
+        assert_eq!(end, SessionEnd::UiGone);
+        drop(conn);
+        assert_eq!(
+            server.await.unwrap(),
+            [
+                "PRIVMSG #a :last words",
+                "MARKREAD #a timestamp=x",
+                "QUIT :e6irc-tui"
+            ]
+        );
     }
 
     #[test]
@@ -969,10 +1440,11 @@ mod tests {
             authentication: e6irc_client::Authentication::None,
             response_deadline: Duration::from_secs(5),
             cleartext_credentials: CleartextCredentials::Refuse,
+            server_password: None,
         };
         let mut channels =
             std::collections::BTreeSet::from(["#closed".to_owned(), "#open".to_owned()]);
-        let session = connect_and_join(&options, &mut channels, 0, false)
+        let session = connect_and_join(&options, &mut channels, HistoryWindow::new(0), false)
             .await
             .expect("a refused channel does not fail the session");
         assert_eq!(session.nick, "upstream");
@@ -1022,7 +1494,7 @@ mod tests {
         });
         let mut conn = Connection::connect(&address).await.unwrap();
         let (net_tx, _net_rx) = mpsc::channel(8);
-        let (_out_tx, mut out_rx) = mpsc::channel(8);
+        let (_out_tx, mut out_rx) = mpsc::channel::<Queued>(8);
         let mut channels = std::collections::BTreeSet::new();
         let mut nick = "me".to_owned();
         let window = Duration::from_millis(150);
@@ -1039,13 +1511,15 @@ mod tests {
             ),
         )
         .await
-        .expect("a silent server ends the session")
-        .expect("the session ends with a reason, not because the UI left");
-        assert_eq!(reason, "server stopped responding");
+        .expect("a silent server ends the session");
+        assert_eq!(
+            reason,
+            SessionEnd::Failed(e6irc_client::liveness::SERVER_STOPPED_RESPONDING.into())
+        );
         assert!(started.elapsed() >= window * 2, "{:?}", started.elapsed());
         assert_eq!(
-            seen_rx.await.unwrap().as_deref(),
-            Some("PING :e6irc-tui"),
+            seen_rx.await.unwrap(),
+            Some(format!("PING :{}", e6irc_client::liveness::KEEPALIVE_TOKEN)),
             "the client asked before giving up"
         );
     }
@@ -1083,7 +1557,7 @@ mod tests {
         });
         let mut conn = Connection::connect(&address).await.unwrap();
         let (net_tx, mut net_rx) = mpsc::channel(8);
-        let (_out_tx, mut out_rx) = mpsc::channel(8);
+        let (_out_tx, mut out_rx) = mpsc::channel::<Queued>(8);
         let window = Duration::from_millis(100);
         let session = tokio::spawn(async move {
             let mut channels = std::collections::BTreeSet::new();
@@ -1113,8 +1587,10 @@ mod tests {
         let reason = tokio::time::timeout(Duration::from_secs(5), session)
             .await
             .expect("the session ends when the server closes")
-            .expect("session task")
-            .expect("the session ends with a reason");
-        assert_eq!(reason, "server closed the connection");
+            .expect("session task");
+        assert_eq!(
+            reason,
+            SessionEnd::Failed("server closed the connection".into())
+        );
     }
 }

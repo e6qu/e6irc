@@ -554,7 +554,7 @@ impl PublicUser {
             realname: session.realname().expect("registered").to_string(),
             account: session.account.clone(),
             away: session.away.clone(),
-            oper: session.oper,
+            oper: session.oper.is_some(),
             bot: session.bot,
             invisible: session.invisible,
             wallops: session.wallops,
@@ -572,7 +572,7 @@ impl PublicUser {
             && Some(self.realname.as_str()) == session.realname()
             && self.account == session.account
             && self.away == session.away
-            && self.oper == session.oper
+            && self.oper == session.oper.is_some()
             && self.bot == session.bot
             && self.invisible == session.invisible
             && self.wallops == session.wallops
@@ -1062,8 +1062,10 @@ pub(crate) struct Session {
     pub pending_register: Option<PendingServiceReply>,
     /// Away message, when set.
     pub away: Option<String>,
-    /// IRC operator (umode +o).
-    pub oper: bool,
+    /// IRC operator (umode +o): the configured operator name the session
+    /// authenticated as with OPER, which the audit trail records as the actor
+    /// of its privileged actions.
+    pub oper: Option<String>,
     /// Invisible (umode +i): hidden from WHO/WHOIS mask queries by
     /// users who share no channel.
     pub invisible: bool,
@@ -3276,7 +3278,7 @@ impl ServerState {
             realname: session.realname().expect("registered member").to_string(),
             account: session.account.clone(),
             away: session.away.is_some(),
-            oper: session.oper,
+            oper: session.oper.is_some(),
             bot: session.bot,
             last_active: session.last_active.clone(),
         }
@@ -4717,7 +4719,7 @@ impl ServerState {
                 pending_identify: None,
                 pending_register: None,
                 away: None,
-                oper: false,
+                oper: None,
                 invisible: false,
                 wallops: false,
                 bot: false,
@@ -5800,7 +5802,7 @@ mod session_store_tests {
         state.close(ConnId(2), "Client Quit");
         assert_eq!(state.sessions.registered_len(), 1);
         register(&mut state, ConnId(5), "oper");
-        state.sessions.get_mut(&ConnId(5)).expect("oper").oper = true;
+        state.sessions.get_mut(&ConnId(5)).expect("oper").oper = Some("god".into());
         crate::core::handler::dispatch(&mut state, ConnId(5), b"KILL bob :bye");
         assert!(state.sessions.get(&ConnId(3)).is_none(), "bob was killed");
         assert_eq!(state.sessions.registered_len(), 1, "only the operator");

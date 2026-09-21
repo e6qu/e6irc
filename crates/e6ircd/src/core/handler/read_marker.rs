@@ -296,24 +296,34 @@ pub(crate) fn apply_stored_marker(
     }
 }
 
-pub(super) fn read_marker_unavailable(
+/// The request a refused read-marker write answers.
+pub(super) struct ReadMarkerRefusal {
+    pub(super) account: String,
+    pub(super) target: String,
+    pub(super) display: String,
+    pub(super) label: Option<String>,
+}
+
+/// A read-marker write the database did not store: release the pending
+/// reservation (the connection may be gone; the account's is not) and answer
+/// the requester with `FAIL MARKREAD <code>`.
+pub(super) fn read_marker_refused(
     state: &mut ServerState,
     conn: ConnId,
-    account: String,
-    target: String,
-    display: String,
-    label: Option<String>,
+    refusal: ReadMarkerRefusal,
+    code: &'static str,
+    description: &'static str,
 ) {
+    let ReadMarkerRefusal {
+        account,
+        target,
+        display,
+        label,
+    } = refusal;
     release_pending_marker(state, &account, &target);
     if state.sessions.contains_key(&conn) {
         state.emit_deferred_labeled(conn, label, move |state| {
-            markread_fail(
-                state,
-                conn,
-                &display,
-                "TEMPORARILY_UNAVAILABLE",
-                "Read marker could not be persisted",
-            );
+            markread_fail(state, conn, &display, code, description);
         });
     }
 }

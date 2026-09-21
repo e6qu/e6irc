@@ -28,6 +28,9 @@ pub struct NetworkConfig {
     pub buffer_cap: usize,
     /// SASL PLAIN credentials for the upstream, when it requires auth.
     pub sasl: Option<(String, String)>,
+    /// The network's connection password, sent as `PASS` before registration
+    /// when the upstream is a private server that requires one.
+    pub server_password: Option<e6irc_client::ServerPassword>,
     /// Idle gap before the driver sends its own keepalive PING (and again
     /// before it declares a silent upstream dead). 120s in production; tests
     /// shrink it to exercise the half-open-upstream path in real time.
@@ -68,6 +71,7 @@ impl Default for NetworkConfig {
             autojoin: Vec::new(),
             buffer_cap: 1000,
             sasl: None,
+            server_password: None,
             keepalive_idle: KEEPALIVE_IDLE,
             rejection_retry_floor: super::REJECTION_RETRY_FLOOR,
             internal_upstreams: crate::egress::InternalUpstreams::Refuse,
@@ -158,6 +162,7 @@ pub enum IrcPreflightFailure {
     InvalidUsername(Option<e6irc_client::RegistrationRejection>),
     NicknameInUse(Option<e6irc_client::RegistrationRejection>),
     ServerPasswordRejected(Option<e6irc_client::RegistrationRejection>),
+    ServerPasswordRequired(Option<e6irc_client::RegistrationRejection>),
     NetworkBanned(Option<e6irc_client::RegistrationRejection>),
     SaslUnavailable(e6irc_client::RegistrationRejection),
     SaslFailed(e6irc_client::RegistrationRejection),
@@ -180,6 +185,7 @@ impl IrcPreflightFailure {
             Self::InvalidUsername(_) => "invalid_username",
             Self::NicknameInUse(_) => "nickname_in_use",
             Self::ServerPasswordRejected(_) => "server_password_rejected",
+            Self::ServerPasswordRequired(_) => "server_password_required",
             Self::NetworkBanned(_) => "network_banned",
             Self::SaslUnavailable(_) => "sasl_unavailable",
             Self::SaslFailed(_) => "sasl_failed",
@@ -208,6 +214,9 @@ impl IrcPreflightFailure {
             Self::ServerPasswordRejected(_) => {
                 super::NetworkFailure::ServerPasswordRejected.summary()
             }
+            Self::ServerPasswordRequired(_) => {
+                super::NetworkFailure::ServerPasswordRequired.summary()
+            }
             Self::NetworkBanned(_) => "The upstream network banned this connection.",
             Self::SaslUnavailable(_) => super::NetworkFailure::SaslUnavailable.summary(),
             Self::SaslFailed(_) => super::NetworkFailure::SaslFailed.summary(),
@@ -223,6 +232,7 @@ impl IrcPreflightFailure {
             | Self::InvalidUsername(rejection)
             | Self::NicknameInUse(rejection)
             | Self::ServerPasswordRejected(rejection)
+            | Self::ServerPasswordRequired(rejection)
             | Self::NetworkBanned(rejection) => rejection.as_ref().map(|value| value.diagnostic()),
             Self::SaslUnavailable(rejection) | Self::SaslFailed(rejection) => {
                 Some(rejection.diagnostic())
@@ -410,10 +420,14 @@ impl RegistrationError {
 /// driver and the connection test both perform, so a test cannot pass with an
 /// identity the driver would not send.
 async fn register(config: &NetworkConfig, connection: &mut Connection) -> std::io::Result<String> {
+    // The upstream's own echo is the verdict on a message: it arrives only
+    // for a line the upstream accepted. See `PendingEchoes`.
+    connection.request_when_offered("echo-message");
     let identity = e6irc_client::Identity {
         nick: config.nick.as_str(),
         username: config.username.as_str(),
         realname: config.realname.as_str(),
+        server_password: config.server_password.as_ref(),
     };
     match &config.sasl {
         Some((account, password)) => connection.register_sasl(&identity, account, password).await,
@@ -482,6 +496,9 @@ fn preflight_refusal(
         }
         e6irc_client::RegistrationRefusal::ServerPasswordRejected => {
             IrcPreflightFailure::ServerPasswordRejected(Some(rejection))
+        }
+        e6irc_client::RegistrationRefusal::ServerPasswordRequired => {
+            IrcPreflightFailure::ServerPasswordRequired(Some(rejection))
         }
         e6irc_client::RegistrationRefusal::NetworkBanned => {
             IrcPreflightFailure::NetworkBanned(Some(rejection))
@@ -604,6 +621,11 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     }
     ends.begin_irc_session(identity.nick.clone());
     ends.emit(ConnectionEvent::Connected);
+    // With `echo-message` the upstream echoes each message it accepts, and
+    // only those: its echo is relayed as the one echo of the line. Without it
+    // the driver synthesizes the echo when it writes the line.
+    let upstream_echoes = conn.enabled("echo-message");
+    let mut pending_echoes = PendingEchoes::default();
 
     // Keepalive: `connect_once` bounds connect + registration, but the
     // steady-state read below would otherwise block forever on a half-open
@@ -690,7 +712,25 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                     // confirmed JOIN/PART/KICK changes it, so an unrelated
                     // numeric cannot erase channels still awaiting confirmation
                     // on this new session.
-                    let tracked = ends.emit_session_line(raw).and_then(|mut change| {
+                    // Our own message, echoed by the upstream: the echo of the
+                    // line an attachment sent, routed to it.
+                    let echo = parsed
+                        .as_ref()
+                        .filter(|_| upstream_echoes)
+                        .and_then(|message| EchoKey::of_upstream_echo(message, &identity.nick))
+                        .map(|key| (key, parsed.as_ref()));
+                    let (raw, origin) = match echo {
+                        Some((key, Some(message))) => (
+                            redact_sensitive_echo(raw, message),
+                            pending_echoes.take(&key),
+                        ),
+                        _ => (raw, None),
+                    };
+                    let emitted = match origin {
+                        Some(origin) => ends.emit_session_echo(raw, origin),
+                        None => ends.emit_session_line(raw),
+                    };
+                    let tracked = emitted.and_then(|mut change| {
                         if let Some(shown) = change.shown_identity.take() {
                             if let Some(user) = shown.user {
                                 identity.user = user;
@@ -755,13 +795,18 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                     {
                         return dropped(super::NetworkFailure::UpstreamWriteFailed);
                     }
-                    // The upstream never echoes our own messages (we do not
-                    // request echo-message — one synthesized echo beats two
-                    // sources), so manufacture it: the detached buffer and the
-                    // account's other sessions must see both sides of the
-                    // conversation, and the originator sees it exactly when it
-                    // negotiated echo-message on attach.
-                    if let Some(echo) = self_echo(&cmd.line, &identity) {
+                    // The detached buffer and the account's other sessions
+                    // must see both sides of the conversation, and the
+                    // originator sees its echo exactly when it negotiated
+                    // echo-message on attach. An upstream that echoes is
+                    // waited for — a refused line then has no echo, and the
+                    // refusal is the verdict; one that does not echo gets
+                    // the echo manufactured here.
+                    if upstream_echoes {
+                        if let Some(key) = EchoKey::of_client_line(&cmd.line) {
+                            pending_echoes.push(key, cmd.origin);
+                        }
+                    } else if let Some(echo) = self_echo(&cmd.line, &identity) {
                         ends.emit_echo(echo, cmd.origin);
                     }
                 }
@@ -873,6 +918,98 @@ pub(super) fn self_echo(line: &str, identity: &SelfIdentity) -> Option<String> {
     };
     let echo = format!("@{all_tags} {body}");
     e6irc_proto::message::server_frame_fits(echo.as_bytes()).then_some(echo)
+}
+
+/// What identifies a message's echo: its command, its target (casefolded) and
+/// its text. The upstream's echo of a line carries the same three.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EchoKey {
+    command: String,
+    target: String,
+    text: String,
+}
+
+impl EchoKey {
+    fn new(command: &str, params: &[String]) -> Option<Self> {
+        let command = command.to_ascii_uppercase();
+        let (target, text) = match (command.as_str(), params) {
+            ("PRIVMSG" | "NOTICE", [target, text]) if !text.is_empty() => (target, text.as_str()),
+            ("TAGMSG", [target]) => (target, ""),
+            _ => return None,
+        };
+        (!target.is_empty()).then(|| Self {
+            command,
+            target: e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(target),
+            text: text.to_string(),
+        })
+    }
+
+    /// The key of a message an attached client sent, when the upstream will
+    /// echo it.
+    fn of_client_line(line: &str) -> Option<Self> {
+        let parsed = e6irc_proto::message::Message::parse(line).ok()?;
+        let params: Vec<String> = parsed.params.iter().map(ToString::to_string).collect();
+        Self::new(parsed.command, &params)
+    }
+
+    /// The key of an upstream line when it is the echo of our own message.
+    fn of_upstream_echo(message: &e6irc_client::OwnedMessage, own_nick: &str) -> Option<Self> {
+        let source = message.source.as_deref()?;
+        let nick = source.split_once('!').map_or(source, |(nick, _)| nick);
+        if !e6irc_proto::casemap::CaseMapping::Rfc1459.eq(nick, own_nick) {
+            return None;
+        }
+        Self::new(&message.command, &message.params)
+    }
+}
+
+/// Most lines awaiting their upstream echo. A line the upstream refuses is
+/// never echoed, so its entry would wait forever; the oldest is dropped past
+/// this bound, costing at most the routing of one late echo.
+const MAX_PENDING_ECHOES: usize = 256;
+
+/// The messages written upstream whose echo has not arrived yet, oldest
+/// first, each with the attachment that sent it. An echo is matched to the
+/// oldest entry with its key, so identical lines from two attachments are
+/// echoed to each in the order they were sent.
+#[derive(Default)]
+struct PendingEchoes(std::collections::VecDeque<(EchoKey, u64)>);
+
+impl PendingEchoes {
+    fn push(&mut self, key: EchoKey, origin: u64) {
+        if self.0.len() == MAX_PENDING_ECHOES {
+            self.0.pop_front();
+        }
+        self.0.push_back((key, origin));
+    }
+
+    /// The attachment that sent the line `key` echoes, when one is waiting.
+    fn take(&mut self, key: &EchoKey) -> Option<u64> {
+        let position = self.0.iter().position(|(pending, _)| pending == key)?;
+        self.0.remove(position).map(|(_, origin)| origin)
+    }
+}
+
+/// The upstream's echo of our own message, with a NickServ command that can
+/// carry a secret replaced by the same redaction the synthesized echo uses:
+/// the backlog must never hold the password the upstream reflected back.
+fn redact_sensitive_echo(raw: String, message: &e6irc_client::OwnedMessage) -> String {
+    let [target, text] = message.params.as_slice() else {
+        return raw;
+    };
+    let command = message.command.to_ascii_uppercase();
+    if !matches!(command.as_str(), "PRIVMSG" | "NOTICE")
+        || !sensitive_nickserv_command(target, text)
+    {
+        return raw;
+    }
+    let tags = raw
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(' '))
+        .map(|(tags, _)| format!("@{tags} "))
+        .unwrap_or_default();
+    let source = message.source.as_deref().unwrap_or_default();
+    format!("{tags}:{source} {command} {target} :[sensitive NickServ command redacted]")
 }
 
 /// NickServ commands that can carry passwords, email addresses, recovery
@@ -1231,6 +1368,7 @@ mod tests {
                         nick: "bncbot",
                         username: "bncbot",
                         realname: "real",
+                        server_password: None,
                     },
                     "account",
                     "secret",

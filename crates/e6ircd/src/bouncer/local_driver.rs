@@ -134,7 +134,10 @@ async fn await_welcome(
             continue;
         };
         let message = e6irc_client::OwnedMessage::from(&parsed);
-        if let Some(rejection) = e6irc_client::RegistrationRejection::from_reply(&message) {
+        if let Some(rejection) = e6irc_client::RegistrationRejection::from_reply(
+            &message,
+            e6irc_client::ServerPasswordSent::No,
+        ) {
             return Err(RegistrationRejected(rejection));
         }
         match message.command.as_str() {
