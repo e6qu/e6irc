@@ -4,7 +4,10 @@ import { readFile } from "node:fs/promises";
 
 const { expect, test } = playwrightTest;
 
-const identity = { account: "visual-test", email: "visual@example.test", role: "operator", csrf_token: "session-bound-token" };
+const identity = {
+  account: "visual-test", email: "visual@example.test", role: "operator", csrf_token: "session-bound-token",
+  logout_url: "/api/v1/auth/logout?csrf=session-bound-token",
+};
 const presets = [
   { id: "libera", label: "Libera Chat", name: "libera", addr: "irc.libera.chat:6697", tls: true },
   { id: "oftc", label: "OFTC", name: "oftc", addr: "irc.oftc.net:6697", tls: true },
@@ -402,9 +405,80 @@ test("console network editor sends the nickname for a blank real name and restor
   await expect.poll(() => page.evaluate(() => window.consoleApiMutations)).toEqual([{
     method: "PUT", url: "/api/v1/me/networks/libera", json: {
       addr: "irc.libera.chat:6697", tls: true, nick: "alice", username: "alice", realname: "alice", autojoin: ["#e6irc"],
-      credentials: { action: "set", account: "alice", password: null },
+      // The contract declares every credential field a string: a blank
+      // password is omitted (the sealed one is kept), never sent as null.
+      credentials: { action: "set", account: "alice" },
     },
   }]);
+
+  // Emptying the stored account without ticking Remove is refused at the box:
+  // the box says "no account" and the body would have said "keep it".
+  await page.getByLabel("NickServ account").fill("");
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("alice is still stored");
+  await expect(page.getByLabel("NickServ account")).toBeFocused();
+  expect(await page.evaluate(() => window.consoleApiMutations.length)).toBe(1);
+});
+
+test("console bridge editor sends only the fields the contract declares for a bridge", async ({ page }) => {
+  const editor = await consoleTemplate("console_bridge_edit.html", { name: "team", "shell.csrf": "test-csrf" });
+  const network = {
+    kind: "slack", name: "team", addr: "https://slack.com/api", tls: true, nick: "", username: null, realname: null,
+    autojoin: ["C123"], sasl_account: null, has_sasl_account: true, has_sasl_password: true, enabled: true,
+  };
+  await mountConsoleRuntime(page, `<main>${editor}</main>`, await consoleStyles(), { "/api/v1/me/networks/team": network });
+  await expect(page.getByRole("button", { name: "Save bridge", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Save bridge", exact: true }).click();
+  // No realname (the contract declares it a string and a bridge has none), and
+  // blank credentials mean keep -- nothing is null.
+  await expect.poll(() => page.evaluate(() => window.consoleApiMutations)).toEqual([{
+    method: "PUT", url: "/api/v1/me/networks/team", json: {
+      addr: "https://slack.com/api", tls: true, nick: "", autojoin: ["C123"], credentials: { action: "keep" },
+    },
+  }]);
+  await page.locator('[name="sasl_password"]').fill("xapp-new");
+  await page.getByRole("button", { name: "Save bridge", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => window.consoleApiMutations.at(-1).json.credentials)).toEqual({ action: "set", password: "xapp-new" });
+});
+
+test("the console network page's save control says when it also enables the network", async ({ page }) => {
+  const detail = await consoleTemplate("console_network_detail.html", { name: "libera", "shell.csrf": "test-csrf" });
+  const network = {
+    kind: "irc", name: "libera", addr: "irc.libera.chat:6697", tls: true, nick: "alice", username: "alice", realname: null,
+    autojoin: [], sasl_account: null, has_sasl_account: false, has_sasl_password: false, enabled: false,
+  };
+  const operations = { enabled: false, runtime: null, storage: { lines: 0, oldest_at: null, newest_at: null }, recent_lines: [] };
+  await mountConsoleRuntime(page, `<main>${detail}</main>`, await consoleStyles(), {
+    "/api/v1/me/networks/libera/operations": operations,
+    "/api/v1/me/networks/libera": network,
+  });
+  const save = page.locator("[data-api-network-account-save]");
+  const button = save.getByRole("button", { name: "Save credentials and enable", exact: true });
+  await expect(button).toBeVisible();
+  await expect(save.getByText("This network is disabled. Saving enables it")).toBeVisible();
+  await expect(page.locator("[data-network-account-save-name]")).toHaveText("Save credentials and enable");
+  await expectAccessible(page);
+  await save.getByLabel("NickServ password").fill("secret");
+  await button.click();
+  await expect.poll(() => page.evaluate(() => window.consoleApiMutations.map(({ method, url, json }) => `${method} ${url} ${JSON.stringify(json)}`))).toEqual([
+    'PUT /api/v1/me/networks/libera {"addr":"irc.libera.chat:6697","tls":true,"nick":"alice","username":"alice","realname":null,"autojoin":[],"credentials":{"action":"set","account":"alice","password":"secret"}}',
+    'PATCH /api/v1/me/networks/libera {"enabled":true}',
+  ]);
+  await expect(page.getByRole("status")).toContainText("saved and the network enabled");
+});
+
+test("every console disconnect reason box names its connection", async ({ page }) => {
+  const body = await consoleTemplate("console_sessions.html", { "shell.csrf": "test-csrf", own: "true" });
+  await mountConsoleRuntime(page, `<main>${body}</main>`, await consoleStyles(), {
+    "/api/v1/me/sessions": { sessions: [] },
+    "/api/v1/me/connections": { connections: [
+      { id: "7", nick: "alice", user: "alice", host: "h", oper: false, account: "alice", transport: "tls", connected_at: "2026-09-21T10:00:00Z", idle_seconds: 4, channels: ["#e6irc"] },
+      { id: "8", nick: "bob", user: "bob", host: "h", oper: false, account: null, transport: "ws", connected_at: "2026-09-21T10:00:00Z", idle_seconds: 9, channels: [] },
+    ], next_before_id: null },
+  });
+  await expect(page.getByLabel("Disconnect reason for connection 7 (alice)")).toBeVisible();
+  await expect(page.getByLabel("Disconnect reason for connection 8 (bob)")).toBeVisible();
+  await expectAccessible(page);
 });
 
 test("console network page shows the NickServ account first and registration on request", async ({ page }) => {
@@ -646,7 +720,7 @@ test("chat stays non-interactive while the network catalog loads", async ({ page
 async function mockLiveSocket(page) {
   await page.routeWebSocket(/\/ws\/ui/, (socket) => {
     socket.send(JSON.stringify({ t: "status", v: "disconnected", reason: "registration_rejected" }));
-    socket.send(JSON.stringify({ t: "snapshot", v: "complete" }));
+    socket.send(snapshotEvent(0));
   });
 }
 
@@ -868,10 +942,10 @@ test("only a join asked for here moves the view", async ({ page }) => {
     upstream = socket;
     socket.send(JSON.stringify({ t: "status", v: "connected" }));
     socket.send(JSON.stringify({ t: "session", nick: "viewer", channels: [] }));
-    socket.send(JSON.stringify({ t: "snapshot", v: "complete" }));
+    socket.send(snapshotEvent(0));
     socket.onMessage((frame) => {
       const request = JSON.parse(frame);
-      if (request.message === "/join #asked") socket.send(JSON.stringify({ t: "line", v: ":viewer!u@h JOIN #asked" }));
+      if (request.message === "/join #asked") socket.send(lineEvent(":viewer!u@h JOIN #asked", 2));
     });
   });
   await mockSession(page, [ircNetwork("Libera")]);
@@ -879,7 +953,7 @@ test("only a join asked for here moves the view", async ({ page }) => {
   await expect(page.getByLabel("Join a channel")).toBeEnabled();
 
   // The bouncer rejoining after a reconnect, or another attached client.
-  upstream.send(JSON.stringify({ t: "line", v: ":viewer!u@h JOIN #rejoined" }));
+  upstream.send(lineEvent(":viewer!u@h JOIN #rejoined", 1));
   await expect(page.getByRole("button", { name: /^Open #rejoined/ })).toBeVisible();
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("server");
 
@@ -913,9 +987,9 @@ test("a connection the server refuses by policy is said once and not hammered", 
 test("opening a network returns to the conversation that was open, never to whatever replay mentioned last", async ({ page }) => {
   const attach = (channels) => page.routeWebSocket(/\/ws\/ui/, (socket) => {
     socket.send(JSON.stringify({ t: "status", v: "connected" }));
-    for (const channel of channels) socket.send(JSON.stringify({ t: "line", v: `:viewer!u@h JOIN ${channel}` }));
+    channels.forEach((channel, index) => socket.send(lineEvent(`:viewer!u@h JOIN ${channel}`, index + 1)));
     socket.send(JSON.stringify({ t: "session", nick: "viewer", channels }));
-    socket.send(JSON.stringify({ t: "snapshot", v: "complete" }));
+    socket.send(snapshotEvent(channels.length));
   });
   await mockSession(page, [ircNetwork("Libera")]);
   const heading = page.getByRole("heading", { level: 1 });
@@ -936,9 +1010,9 @@ test("opening a network returns to the conversation that was open, never to what
 test("a network's only conversation opens by itself", async ({ page }) => {
   await page.routeWebSocket(/\/ws\/ui/, (socket) => {
     socket.send(JSON.stringify({ t: "status", v: "connected" }));
-    socket.send(JSON.stringify({ t: "line", v: ":viewer!u@h JOIN #only" }));
+    socket.send(lineEvent(":viewer!u@h JOIN #only", 1));
     socket.send(JSON.stringify({ t: "session", nick: "viewer", channels: ["#only"] }));
-    socket.send(JSON.stringify({ t: "snapshot", v: "complete" }));
+    socket.send(snapshotEvent(1));
   });
   await mockSession(page, [ircNetwork("Libera")]);
   await page.goto("/?network=Libera");
@@ -1217,4 +1291,305 @@ test("phone conversation rail returns focus after Escape", async ({ page }) => {
     .poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth))
     .toBe(true);
   await expectAccessible(page);
+});
+
+// ---- live socket: replay, refusals, and session expiry ----------------------
+
+// The server names a ring position on every line and on the replay boundary;
+// the client hands the last one back on its next attach. Positions here count
+// from `first` so a mock can continue a ring across attaches.
+const cursorAt = (position) => `9:${position}`;
+const lineEvent = (line, position) => JSON.stringify({ t: "line", v: line, cursor: cursorAt(position) });
+const snapshotEvent = (position) => JSON.stringify({ t: "snapshot", v: "complete", cursor: cursorAt(position) });
+const attachReplay = (socket, lines, channels, first = 1) => {
+  socket.send(JSON.stringify({ t: "status", v: "connected" }));
+  lines.forEach((line, index) => socket.send(lineEvent(line, first + index)));
+  socket.send(JSON.stringify({ t: "session", nick: "viewer", channels }));
+  socket.send(snapshotEvent(first + lines.length - 1));
+};
+
+test("a reconnect resumes from the last cursor, so every line shows once", async ({ page }) => {
+  const ring = [
+    ":viewer!u@h JOIN #only",
+    ":bob!u@h JOIN #only",
+    ":bob!u@h PRIVMSG #only :same words",
+    ":bob!u@h PRIVMSG #only :same words",
+  ];
+  const attachUrls = [];
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    attachUrls.push(socket.url());
+    if (attachUrls.length === 1) {
+      attachReplay(socket, ring, ["#only"]);
+      socket.onMessage((frame) => {
+        const request = JSON.parse(frame);
+        if (request.message.startsWith("/raw NAMES")) return;
+        // The bouncer acknowledges the send and buffers its own echo at ring
+        // position 5, which this socket is never sent; the live reply takes 6.
+        socket.send(JSON.stringify({ t: "sent", v: request.id }));
+        socket.send(lineEvent(":bob!u@h PRIVMSG #only :live reply", 6));
+        // Then the link drops.
+        setTimeout(() => socket.close(), 50);
+      });
+      return;
+    }
+    // The client returns with the last cursor it saw; only what came after it
+    // is replayed.
+    attachReplay(socket, [":bob!u@h PRIVMSG #only :after the drop"], ["#only"], 7);
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  await page.goto("/?network=Libera");
+
+  const messages = page.getByLabel("Messages");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("#only");
+  await expect(messages.locator(".line-msg")).toHaveCount(2);
+  await page.getByRole("textbox", { name: "Message" }).fill("hello from here");
+  await page.getByRole("textbox", { name: "Message" }).press("Enter");
+  await expect(messages.locator(".line-msg")).toHaveCount(4);
+  await expect(page.locator("#status")).toContainText("Libera: connected", { timeout: 15_000 });
+  await expect.poll(() => attachUrls.length).toBe(2);
+  expect(attachUrls[0]).not.toContain("after=");
+  expect(attachUrls[1]).toContain(`after=${encodeURIComponent(cursorAt(6))}`);
+
+  // Two identical bodies, our own send, the live reply, and the new line: each once.
+  await expect(messages.locator(".line-msg")).toHaveCount(5);
+  await expect(messages.locator(".line-msg", { hasText: "same words" })).toHaveCount(2);
+  await expect(messages.locator(".line-msg", { hasText: "hello from here" })).toHaveCount(1);
+  await expect(messages.locator(".line-msg", { hasText: "live reply" })).toHaveCount(1);
+  await expect(messages.locator(".line-msg", { hasText: "after the drop" })).toHaveCount(1);
+  await expect(messages.locator(".line-event", { hasText: "bob joined" })).toHaveCount(1);
+  await expect(page.locator("#buffers").getByRole("button", { name: /^Open server/ })).toBeVisible();
+  await page.locator("#buffers").getByRole("button", { name: /^Open server/ }).click();
+  await expect(messages.getByText("history reloaded")).toHaveCount(0);
+});
+
+test("a cursor the server cannot honour reloads the transcript once", async ({ page }) => {
+  const ring = [
+    ":viewer!u@h JOIN #only",
+    ":bob!u@h PRIVMSG #only :same words",
+    ":bob!u@h PRIVMSG #only :same words",
+  ];
+  let attaches = 0;
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    attaches += 1;
+    if (attaches === 1) {
+      attachReplay(socket, ring, ["#only"]);
+      setTimeout(() => socket.close(), 200);
+      return;
+    }
+    // The server restarted: the cursor names a ring that no longer exists, so
+    // it says the replay is the whole ring and the page starts over.
+    socket.send(JSON.stringify({ t: "status", v: "connected" }));
+    socket.send(JSON.stringify({ t: "replay", v: "full" }));
+    ring.forEach((line, index) => socket.send(JSON.stringify({ t: "line", v: line, cursor: `10:${index + 1}` })));
+    socket.send(JSON.stringify({ t: "session", nick: "viewer", channels: ["#only"] }));
+    socket.send(JSON.stringify({ t: "snapshot", v: "complete", cursor: `10:${ring.length}` }));
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  await page.goto("/?network=Libera");
+
+  const messages = page.getByLabel("Messages");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("#only");
+  await expect(messages.locator(".line-msg")).toHaveCount(2);
+  await expect.poll(() => attaches, { timeout: 15_000 }).toBe(2);
+  await expect(page.locator("#status")).toContainText("Libera: connected", { timeout: 15_000 });
+  // The ring was replayed twice; it shows once.
+  await expect(messages.locator(".line-msg", { hasText: "same words" })).toHaveCount(2);
+  await page.locator("#buffers").getByRole("button", { name: /^Open server/ }).click();
+  await expect(messages.getByText(/history reloaded/)).toHaveCount(1);
+});
+
+test("a second refused send restores the second message, not the first", async ({ page }) => {
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    attachReplay(socket, [":viewer!u@h JOIN #only"], ["#only"]);
+    socket.onMessage((frame) => {
+      const request = JSON.parse(frame);
+      socket.send(JSON.stringify({ t: "send-error", v: request.id, message: "upstream busy" }));
+    });
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  await page.goto("/?network=Libera");
+  const composer = page.getByRole("textbox", { name: "Message" });
+  await composer.fill("hello");
+  await composer.press("Enter");
+  const alert = page.locator('[data-alert="send"]');
+  await expect(alert).toContainText("upstream busy");
+  await composer.fill("world");
+  await composer.press("Enter");
+  await expect(alert).toContainText("upstream busy");
+  await alert.getByRole("button", { name: "Restore message" }).click();
+  await expect(composer).toHaveValue("world");
+});
+
+test("plain text into a past channel is refused and points at joining", async ({ page }) => {
+  const requests = [];
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    // The channel was joined once; the authoritative session no longer holds it.
+    attachReplay(socket, [":viewer!u@h JOIN #old", ":bob!u@h PRIVMSG #old :earlier"], []);
+    socket.onMessage((frame) => {
+      const request = JSON.parse(frame);
+      requests.push(request.message);
+      if (request.message === "/join #old") socket.send(lineEvent(":viewer!u@h JOIN #old", 2));
+      else socket.send(JSON.stringify({ t: "sent", v: request.id }));
+    });
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  await page.goto("/?network=Libera");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("#old");
+  await expect(page.getByRole("button", { name: /^Open #old, past channel/ })).toBeVisible();
+
+  const composer = page.getByRole("textbox", { name: "Message" });
+  await composer.fill("anyone there?");
+  await composer.press("Enter");
+  const alert = page.locator('[data-alert="send"]');
+  await expect(alert).toContainText("not in #old");
+  await expect(alert).toContainText("Join box");
+  expect(requests).toEqual([]);
+  await expect(composer).toHaveValue("anyone there?");
+  await expect(page.getByLabel("Messages").locator(".line-msg", { hasText: "anyone there?" })).toHaveCount(0);
+
+  // A slash command still goes through: it is how the channel is rejoined.
+  await alert.getByRole("button", { name: "Join #old" }).click();
+  await expect.poll(() => requests).toEqual(["/join #old"]);
+  await expect(page.getByRole("button", { name: /^Open #old, past channel/ })).toHaveCount(0);
+  await composer.press("Enter");
+  await expect.poll(() => requests).toEqual(["/join #old", "anyone there?"]);
+});
+
+test("an expired session stops the socket retry loop and offers sign-in once", async ({ page }) => {
+  let attempts = 0;
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    attempts += 1;
+    // What a refused upgrade looks like from the page: no frames, then closed.
+    socket.close();
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  let identityReads = 0;
+  await page.route(/\/api\/v1\/me$/, (route) => {
+    identityReads += 1;
+    if (identityReads === 1) return route.fallback();
+    return route.fulfill({ status: 401, contentType: "application/problem+json", body: JSON.stringify({ status: 401, title: "Unauthorized" }) });
+  });
+  await page.goto("/?network=Libera");
+
+  await expect(page.locator("#status")).toHaveText("signed out", { timeout: 10_000 });
+  const alert = page.locator('[data-alert="session"]');
+  await expect(alert).toContainText("Your session expired while trying to reconnect");
+  await expect(alert.getByRole("link", { name: "Sign in" })).toHaveAttribute("href", "/login");
+  await expect(page.locator('[data-alert="socket"]')).toHaveCount(0);
+  const after = attempts;
+  await page.waitForTimeout(3_000);
+  expect(attempts).toBe(after);
+  expect(after).toBe(1);
+  await expectAccessible(page);
+});
+
+test("the sign-out link exists only once its CSRF-bearing URL is known", async ({ page }) => {
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  await mockSession(page, []);
+  await page.route(/\/api\/v1\/me$/, async (route) => {
+    await held;
+    return route.fallback();
+  });
+  await page.goto("/");
+  const signOut = page.locator("#logout-link");
+  await expect(signOut).toBeHidden();
+  await expect(signOut).not.toHaveAttribute("href");
+  release();
+  await expect(signOut).toBeVisible();
+  await expect(signOut).toHaveAttribute("href", "/api/v1/auth/logout?csrf=session-bound-token");
+});
+
+test("the add-network dialog's catalog does not type over what was typed while it loaded", async ({ page }) => {
+  await mockSession(page, []);
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  await page.route(/\/api\/v1\/network-presets$/, async (route) => {
+    await held;
+    return route.fallback();
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Add a network", exact: true }).last().click();
+  const dialog = page.getByRole("dialog", { name: "Add a network" });
+  await expect(dialog.locator("#nf-nick")).toBeFocused();
+  await dialog.locator("#nf-advanced summary").click();
+  await dialog.locator("#nf-addr").fill("irc.example.org:6667");
+  await dialog.locator("#nf-tls").uncheck();
+  await dialog.locator("#nf-sasl-password").focus();
+  release();
+  await expect(dialog.getByRole("button", { name: "Save" })).toBeEnabled();
+  // The untouched name takes the preset; the typed server and TLS choice stay;
+  // focus stays where the person put it.
+  await expect(dialog.locator("#nf-name")).toHaveValue("libera");
+  await expect(dialog.locator("#nf-addr")).toHaveValue("irc.example.org:6667");
+  await expect(dialog.locator("#nf-tls")).not.toBeChecked();
+  await expect(dialog.locator("#nf-sasl-password")).toBeFocused();
+});
+
+test("Remove clears and disables the credential boxes in the settings dialog", async ({ page }) => {
+  await mockLiveSocket(page);
+  await mockSession(page, [ircNetwork("Libera")]);
+  await mockNetworkDetails(page, (route) => route.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify({ ...networkDetail("Libera", "irc.libera.example:6697"), sasl_account: "ada", has_sasl_account: true, has_sasl_password: true }),
+  }));
+  await page.goto("/?network=Libera");
+  await page.getByRole("button", { name: "Settings for Libera" }).click();
+  const dialog = page.getByRole("dialog", { name: "Settings — Libera" });
+  await expect(dialog.locator("#nf-sasl-account")).toHaveValue("ada");
+  await dialog.locator("#nf-sasl-password").fill("typed");
+  await dialog.locator("#nf-clear").check();
+  await expect(dialog.locator("#nf-sasl-account")).toBeDisabled();
+  await expect(dialog.locator("#nf-sasl-account")).toHaveValue("");
+  await expect(dialog.locator("#nf-sasl-password")).toBeDisabled();
+  await expect(dialog.locator("#nf-sasl-password")).toHaveValue("");
+  await dialog.locator("#nf-clear").uncheck();
+  await expect(dialog.locator("#nf-sasl-account")).toBeEnabled();
+  await expect(dialog.locator("#nf-sasl-account")).toHaveValue("ada");
+
+  // Emptying the stored account without Remove is refused at the box.
+  await dialog.locator("#nf-sasl-account").fill("");
+  await dialog.getByRole("button", { name: "Save" }).click();
+  await expect(dialog.getByRole("alert")).toContainText("ada is still stored");
+  await expect(dialog.locator("#nf-sasl-account")).toBeFocused();
+  await expect(dialog.locator("#nf-sasl-account")).toHaveAttribute("aria-invalid", "true");
+});
+
+test("on a phone the member list opens from the buffer header", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    attachReplay(socket, [":viewer!u@h JOIN #only"], ["#only"]);
+    socket.onMessage((frame) => {
+      const request = JSON.parse(frame);
+      if (request.message !== "/raw NAMES #only") return;
+      socket.send(lineEvent(":irc.example 353 viewer = #only :@carol viewer bob", 2));
+      socket.send(lineEvent(":irc.example 366 viewer #only :End of /NAMES list", 3));
+    });
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  await page.goto("/?network=Libera");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("#only");
+
+  const members = page.getByRole("button", { name: "Members (3)" });
+  await expect(members).toBeVisible();
+  await expect(members).toHaveAttribute("aria-expanded", "false");
+  await expect(members).toHaveAttribute("aria-controls", "nicklist");
+  const list = page.getByRole("complementary", { name: "Members" });
+  await expect(list).toBeHidden();
+  await members.click();
+  await expect(members).toHaveAttribute("aria-expanded", "true");
+  await expect(list).toBeVisible();
+  await expect(list.getByRole("button", { name: "Open conversation with carol" })).toBeFocused();
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await expectAccessible(page);
+  await page.keyboard.press("Escape");
+  await expect(list).toBeHidden();
+  await expect(members).toBeFocused();
+
+  // Opening a conversation from the list closes the panel, as the rail does.
+  await members.click();
+  await list.getByRole("button", { name: "Open conversation with bob" }).click();
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("bob");
+  await expect(members).toBeHidden();
+  await expect(list).toBeHidden();
 });

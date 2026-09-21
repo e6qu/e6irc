@@ -113,8 +113,7 @@ pub(crate) fn apply_account_suspension(
         .iter()
         .filter_map(|(connection, session)| {
             session
-                .account
-                .as_deref()
+                .account()
                 .is_some_and(|candidate| state.account_key(candidate) == account_key)
                 .then_some(*connection)
         })
@@ -150,7 +149,7 @@ fn begin_owned_channel_registration(
             && state
                 .sessions
                 .get(&conn)
-                .and_then(|session| session.account.as_deref())
+                .and_then(|session| session.account())
                 .is_some_and(|account| state.account_key(account) == actor_key)
     });
     if !operates_channel {
@@ -429,8 +428,7 @@ fn owned_session_nick(
         .filter(|session| session.is_registered())
         .filter(|session| {
             session
-                .account
-                .as_deref()
+                .account()
                 .is_some_and(|session_account| state.casemap.casefold(session_account) == want)
         })
         .and_then(|session| session.nick())
@@ -461,8 +459,7 @@ fn live_connection_matches(
     }
     if let Some(want) = filter.account.as_deref()
         && !session
-            .account
-            .as_deref()
+            .account()
             .is_some_and(|account| state.casemap.casefold(account) == want)
     {
         return false;
@@ -567,7 +564,7 @@ pub(crate) fn connection_list_entries(
                 nick: session.nick().unwrap_or("*").to_string(),
                 user: session.user().unwrap_or("*").to_string(),
                 host: session.host.clone(),
-                account: session.account.clone(),
+                account: session.account().map(str::to_owned),
                 oper: session.oper,
                 transport: session.transport,
                 connected_at: session.signon,
@@ -715,9 +712,10 @@ fn begin_add_ban(
     };
     let mask = MaskKey::new(parsed.as_str(), state.casemap);
     if !state.config.sasl_enabled {
-        let mutation = crate::core::ServerBanMutation::add(&mask, kind, reason.to_string(), actor);
-        super::oper::apply_committed_server_ban(state, mutation.clone());
-        state.broadcast_server_ban_after_local_apply(mutation);
+        super::oper::commit_server_ban(
+            state,
+            crate::core::ServerBanMutation::add(&mask, kind, reason.to_string(), actor),
+        );
         let _ = reply.send(AdminReply::Ok(format!(
             "Added {} for {}",
             kind.label(),
@@ -760,10 +758,10 @@ fn begin_remove_ban(
         return;
     }
     if !state.config.sasl_enabled {
-        let mutation =
-            crate::core::ServerBanMutation::remove_with_id(&mask, kind, actor, expected_id);
-        super::oper::apply_committed_server_ban(state, mutation.clone());
-        state.broadcast_server_ban_after_local_apply(mutation);
+        super::oper::commit_server_ban(
+            state,
+            crate::core::ServerBanMutation::remove_with_id(&mask, kind, actor, expected_id),
+        );
         let _ = reply.send(AdminReply::Ok(format!(
             "Removed {} for {}",
             kind.label(),

@@ -57,35 +57,111 @@ export function chatMessageRoute(message, ownNick, isKnownChannel = () => false)
   return { kind: "dm", target: sentByUs ? wireTarget : (message.nick || wireTarget) };
 }
 
-// Channel membership sigils and their underlying modes, highest rank first.
-export const MEMBER_RANKS = [
-  ["q", "~"],
-  ["a", "&"],
-  ["o", "@"],
-  ["h", "%"],
-  ["v", "+"],
-];
+// ---- channel modes -------------------------------------------------------
+//
+// Which modes rank a member, which sigil each shows, and which modes consume a
+// MODE parameter are properties of the network, declared in its 005 PREFIX and
+// CHANMODES. Until they arrive this RFC/Charybdis-style table applies. Reading
+// every network with it misassigns arguments: on Libera (`PREFIX=(ov)@+`,
+// `CHANMODES=eIbq,k,flj,...`) `+fo #overflow alice` would hand #overflow to
+// `o`, and `+q mask` -- a quiet list entry -- would be taken for an owner.
+export const DEFAULT_CHANNEL_MODES = Object.freeze({
+  // [mode, sigil], highest rank first, as PREFIX orders them.
+  prefix: Object.freeze([["q", "~"], ["a", "&"], ["o", "@"], ["h", "%"], ["v", "+"]].map(Object.freeze)),
+  list: "beI", // type A: a parameter whether set or unset
+  alwaysParameter: "k", // type B: likewise
+  setParameter: "l", // type C: a parameter only when set
+});
 
-const SIGIL_MODE = { "~": "q", "&": "a", "@": "o", "%": "h", "+": "v" };
+// Fold the CHANMODES and PREFIX tokens of one 005 line into `current`. A token
+// that cannot be read leaves the table alone and is returned, so the caller can
+// say so instead of quietly reading the network with the wrong table.
+export function channelModesFrom(params, current = DEFAULT_CHANNEL_MODES) {
+  let modes = current;
+  const malformed = [];
+  // <me> TOKEN... :are supported by this server -- tokens never contain spaces.
+  for (const token of params.slice(1).filter((param) => !param.includes(" "))) {
+    const equals = token.indexOf("=");
+    const key = equals === -1 ? token : token.slice(0, equals);
+    const value = equals === -1 ? "" : token.slice(equals + 1);
+    if (key === "CHANMODES") {
+      const classes = value.split(",");
+      if (classes.length < 4) {
+        malformed.push(token);
+        continue;
+      }
+      modes = { ...modes, list: classes[0], alwaysParameter: classes[1], setParameter: classes[2] };
+    } else if (key === "PREFIX") {
+      if (value === "") {
+        modes = { ...modes, prefix: [] };
+        continue;
+      }
+      const match = value.match(/^\(([A-Za-z]*)\)(.*)$/);
+      if (!match || match[1].length !== match[2].length) {
+        malformed.push(token);
+        continue;
+      }
+      modes = { ...modes, prefix: [...match[1]].map((mode, index) => [mode, match[2][index]]) };
+    }
+  }
+  return { modes, malformed };
+}
 
-export function splitSigil(nick) {
+export function isPrefixMode(modes, mode) {
+  return modes.prefix.some(([prefixMode]) => prefixMode === mode);
+}
+
+export function modeTakesParameter(modes, mode, adding) {
+  return isPrefixMode(modes, mode)
+    || modes.list.includes(mode)
+    || modes.alwaysParameter.includes(mode)
+    || (adding && modes.setParameter.includes(mode));
+}
+
+// Pair each mode letter of a MODE line with its argument, consuming arguments
+// only for the modes the table says take one, so a mixed line like `+o-l nick`
+// maps the nick to `o`, not `l`.
+export function modeChanges(modes, modestr, args) {
+  const changes = [];
+  let adding = true;
+  let next = 0;
+  for (const mode of modestr) {
+    if (mode === "+") adding = true;
+    else if (mode === "-") adding = false;
+    else {
+      const argument = modeTakesParameter(modes, mode, adding) ? args[next++] : undefined;
+      changes.push({ mode, adding, argument });
+    }
+  }
+  return changes;
+}
+
+export function splitSigil(nick, modes = DEFAULT_CHANNEL_MODES) {
   const value = nick || "";
+  const modeOfSigil = new Map(modes.prefix.map(([mode, sigil]) => [sigil, mode]));
   let index = 0;
-  while (index < value.length && SIGIL_MODE[value[index]] !== undefined) index += 1;
-  const modes = new Set();
-  for (const sigil of value.slice(0, index)) modes.add(SIGIL_MODE[sigil]);
-  return { name: value.slice(index), modes };
+  while (index < value.length && modeOfSigil.has(value[index])) index += 1;
+  const memberModes = new Set();
+  for (const sigil of value.slice(0, index)) memberModes.add(modeOfSigil.get(sigil));
+  return { name: value.slice(index), modes: memberModes };
 }
 
-export function stripSigil(nick) {
-  return splitSigil(nick).name;
+export function stripSigil(nick, modes = DEFAULT_CHANNEL_MODES) {
+  return splitSigil(nick, modes).name;
 }
 
-export function nickPrefix(modes) {
-  for (const [mode, sigil] of MEMBER_RANKS) {
-    if (modes.has(mode)) return sigil;
+export function nickPrefix(memberModes, modes = DEFAULT_CHANNEL_MODES) {
+  for (const [mode, sigil] of modes.prefix) {
+    if (memberModes.has(mode)) return sigil;
   }
   return "";
+}
+
+// A member's position in the rank order: 0 for the highest declared rank,
+// `prefix.length` for no rank at all.
+export function memberRank(memberModes, modes = DEFAULT_CHANNEL_MODES) {
+  const index = modes.prefix.findIndex(([mode]) => memberModes.has(mode));
+  return index === -1 ? modes.prefix.length : index;
 }
 
 export function parseIrc(line) {
@@ -213,6 +289,20 @@ export function asMessage(kind, from, text) {
     return { kind: "event", from: null, text: `${from} sent a CTCP ${ctcp[1]} request${detail}` };
   }
   return { kind, from, text: stripFormatting(text) };
+}
+
+// What a line that is not conversation reads as in the server buffer. A
+// numeric carries its human text last, so that is shown. Any other command
+// from a user keeps its subject: `:alice INVITE me :#secret` used to render as
+// "#secret", with no trace of who or what.
+export function serverBufferText(message, raw, ownNick) {
+  const { command, nick, params } = message;
+  if (command === "INVITE" && nick && params.length >= 2) {
+    const invitee = ownNick && fold(params[0]) === fold(ownNick) ? "you" : params[0];
+    return `${nick} invited ${invitee} to ${params[1]}`;
+  }
+  if (!command || /^\d{3}$/.test(command)) return params.length ? params[params.length - 1] : raw;
+  return [nick, command, ...params].filter((part) => part).join(" ");
 }
 
 // Prepend persisted history without replacing lines already present in the

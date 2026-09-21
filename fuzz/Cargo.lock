@@ -813,6 +813,7 @@ dependencies = [
  "toml",
  "tower",
  "tower-http",
+ "url",
 ]
 
 [[package]]

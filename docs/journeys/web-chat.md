@@ -85,6 +85,13 @@ survive process restart.
    publication, so every message is on exactly one side of the replay/live
    boundary: neither lost nor duplicated.
 2. Persisted backlog and current driver replay are normalized into line events.
+   Every line event and the replay boundary carry an opaque replay cursor (the
+   ring's lifetime and the line's position in it); a reconnecting socket hands
+   its last cursor back as `?after=` and is replayed exactly the lines after it.
+   A cursor the ring cannot honour — another lifetime after a restart, a
+   position the ring has evicted — is answered with a typed `replay full`
+   event and the whole ring, and the client starts its transcript over with one
+   "history reloaded" note rather than guessing at an overlap.
 3. The client uses message identifiers and the exact ordered wire overlap at
    the page boundary to deduplicate history/live overlap without conflating
    distinct identical messages.

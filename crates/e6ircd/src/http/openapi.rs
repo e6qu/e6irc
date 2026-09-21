@@ -2,10 +2,97 @@
 
 use super::*;
 
+/// The responses every authenticated operation can produce before its handler
+/// runs, because authentication and admission produce them: no or invalid
+/// credential (`401`), a suspended account, denied token scope, or missing
+/// CSRF value (`403`), the per-account request budget (`429`), and no database
+/// or a failed lookup (`503`). Merged into each such operation under its own
+/// route-specific responses, which take precedence when they name the same
+/// status.
+fn standard_authenticated_responses() -> serde_json::Map<String, serde_json::Value> {
+    let mut responses = serde_json::Map::new();
+    for (status, description) in [
+        (
+            "401",
+            "not signed in, or the token or session is invalid or expired",
+        ),
+        (
+            "403",
+            "the account is suspended, the token lacks the scope this method needs, or a cookie-authenticated unsafe method carried no valid X-E6IRC-CSRF value",
+        ),
+        (
+            "429",
+            "the account's request budget is spent; Retry-After gives the seconds to wait",
+        ),
+        (
+            "503",
+            "no database configured, or the database is unavailable",
+        ),
+    ] {
+        responses.insert(
+            status.to_string(),
+            serde_json::json!({ "description": description }),
+        );
+    }
+    responses
+}
+
+/// Whether an operation's `security` admits an account credential (a bearer or
+/// a browser session) rather than the deployment's monitoring token alone.
+fn operation_authenticates_an_account(operation: &serde_json::Value) -> bool {
+    operation["security"]
+        .as_array()
+        .is_some_and(|requirements| {
+            requirements.iter().any(|requirement| {
+                requirement.as_object().is_some_and(|schemes| {
+                    schemes.keys().any(|scheme| scheme != "monitoringBearer")
+                })
+            })
+        })
+}
+
+/// Give every account-authenticated operation the shared admission responses
+/// it lacks, keeping any it already states.
+fn merge_standard_authenticated_responses(spec: &mut serde_json::Value) {
+    let Some(paths) = spec["paths"].as_object_mut() else {
+        return;
+    };
+    for item in paths.values_mut() {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        for operation in item.values_mut() {
+            if !operation_authenticates_an_account(operation) {
+                continue;
+            }
+            let Some(responses) = operation["responses"].as_object_mut() else {
+                continue;
+            };
+            for (status, response) in standard_authenticated_responses() {
+                responses.entry(status).or_insert(response);
+            }
+        }
+    }
+}
+
 /// Build the OpenAPI 3.1 description consumed by generated clients.
 fn document() -> serde_json::Value {
+    let mut spec = operations();
+    merge_standard_authenticated_responses(&mut spec);
+    spec
+}
+
+fn operations() -> serde_json::Value {
     let authenticated = serde_json::json!([
         { "bearer": [] },
+        { "browserSession": [] },
+        { "secureBrowserSession": [] }
+    ]);
+    // Operations about the browser session itself, or that mint or redirect
+    // authority over the account: a bearer is refused before the handler
+    // exists (`BrowserSession` / `SessionMutation`), so the contract does not
+    // advertise one.
+    let browser_session_only = serde_json::json!([
         { "browserSession": [] },
         { "secureBrowserSession": [] }
     ]);
@@ -439,7 +526,7 @@ fn document() -> serde_json::Value {
             "type": "object", "additionalProperties": false, "required": ["channels", "next_before_id"],
             "properties": { "channels": { "type": "array", "items": { "type": "object", "additionalProperties": false,
                 "required": ["id", "name", "founder", "created_at", "policy"],
-                "properties": { "id": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "founder": { "type": "string" }, "created_at": { "type": "string" }, "policy": { "type": "object", "additionalProperties": false, "required": ["keeptopic", "topic_retained", "mlock", "access_entries"], "properties": { "keeptopic": { "type": "boolean" }, "topic_retained": { "type": ["string", "null"] }, "mlock": { "type": "string" }, "access_entries": { "type": "integer", "minimum": 0 } } } }
+                "properties": { "id": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "founder": { "type": "string" }, "created_at": { "type": "string" }, "policy": { "type": "object", "additionalProperties": false, "required": ["keeptopic", "topic_retained", "mlock", "access_entries"], "properties": { "keeptopic": { "type": "boolean" }, "topic_retained": { "type": "boolean", "description": "Whether a retained topic is stored; the topic text itself is not returned here." }, "mlock": { "type": "string" }, "access_entries": { "type": "integer", "minimum": 0 } } } }
             } }, "next_before_id": { "type": ["integer", "null"], "minimum": 1 } }
         }),
     );
@@ -705,7 +792,7 @@ fn document() -> serde_json::Value {
         schema
     };
     let managed_network_request_schema = serde_json::json!({ "oneOf": [
-        managed_network_variant("irc", &["revision", "name", "addr", "tls", "nick", "username", "realname", "autojoin", "buffer_cap", "sasl_account", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": ["string", "null"], "writeOnly": true }, "sasl_password": { "type": ["string", "null"], "writeOnly": true } } })),
+        managed_network_variant("irc", &["revision", "name", "addr", "tls", "nick", "username", "realname", "autojoin", "buffer_cap"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": ["string", "null"], "writeOnly": true }, "sasl_password": { "type": ["string", "null"], "writeOnly": true } } })),
         managed_network_variant("local", &["revision", "name", "addr", "tls", "nick", "username", "realname", "autojoin", "buffer_cap"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 } } })),
         managed_network_variant("matrix", &["revision", "name", "addr", "tls", "nick", "autojoin", "buffer_cap", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_password": { "type": "string", "writeOnly": true } } })),
         managed_network_variant("discord", &["revision", "name", "addr", "tls", "autojoin", "buffer_cap", "sasl_password"], serde_json::json!({ "type": "object", "additionalProperties": false, "required": [], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_password": { "type": "string", "writeOnly": true } } })),
@@ -895,7 +982,7 @@ fn document() -> serde_json::Value {
                             "properties": {
                                 "account": { "type": "string", "minLength": 1, "maxLength": 64 },
                                 "password": { "type": "string", "minLength": 1, "maxLength": 512 },
-                                "label": { "type": "string", "maxLength": 64 } } } } } },
+                                "label": { "type": "string", "minLength": 1, "maxLength": 64 } } } } } },
                     "responses": { "201": { "description": "the app password (shown once)" },
                         "400": { "description": "invalid account, password, or label" },
                         "401": { "description": "bad credentials" },
@@ -914,8 +1001,8 @@ fn document() -> serde_json::Value {
                 },
                 "patch": {
                     "summary": "Replace or remove your private contact email",
-                    "description": "The address is parsed and bounded before storage. JSON null removes it. The audit event records only replaced/removed, never the address.",
-                    "security": authenticated,
+                    "description": "Requires a cookie-authenticated browser session and its X-E6IRC-CSRF header. The address is parsed and bounded before storage. JSON null removes it. The audit event records only replaced/removed, never the address.",
+                    "security": browser_session_only,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": {
                             "type": "object",
@@ -939,7 +1026,7 @@ fn document() -> serde_json::Value {
                 "delete": {
                     "summary": "Permanently delete your account",
                     "description": "Requires a cookie-authenticated browser session, session-bound CSRF, and the exact display-cased account name. Founded channels must be transferred or dropped first. The account, credentials, sessions, networks, private history, and account-owned buffers are removed atomically and the name is permanently retired.",
-                    "security": authenticated,
+                    "security": browser_session_only,
                     "requestBody": confirmation_body,
                     "responses": {
                         "204": { "description": "account deleted and browser cookie cleared" },
@@ -988,7 +1075,7 @@ fn document() -> serde_json::Value {
                 "delete": {
                     "summary": "Revoke every other active browser session",
                     "description": "Requires the explicit `except=current` selector and a cookie-authenticated browser session. The database deletion is atomic, preserves the authorizing session, and returns the number revoked.",
-                    "security": authenticated,
+                    "security": browser_session_only,
                     "parameters": [{ "name": "except", "in": "query", "required": true,
                         "schema": { "type": "string", "enum": ["current"] } }],
                     "responses": {
@@ -1051,14 +1138,24 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/auth/oidc/{provider}/callback": {
                 "get": { "summary": "OIDC redirect-back: exchange the code and establish the session",
-                    "description": "Verifies the state-binding cookie, exchanges the authorization code (with PKCE) for tokens, validates the ID token, provisions or logs into the account, and sets the session cookie.",
+                    "description": "Verifies the state-binding cookie, exchanges the authorization code (with PKCE) for tokens, validates the ID token, provisions or logs into the account, and sets the session cookie. A first login provisions an account named exactly by the provider's configured claim; a name already in use or retired is refused with 409 (the server never picks a different name for a person). The query is a closed set: exactly these parameters are accepted, and `session_state` (sent by Keycloak and Microsoft Entra) is admitted but not acted on.",
                     "parameters": [
                         { "name": "provider", "in": "path", "required": true, "schema": { "type": "string" } },
                         { "name": "code", "in": "query", "required": false, "schema": { "type": "string" } },
-                        { "name": "state", "in": "query", "required": false, "schema": { "type": "string" } }
+                        { "name": "state", "in": "query", "required": false, "schema": { "type": "string" } },
+                        { "name": "error", "in": "query", "required": false, "schema": { "type": "string" }, "description": "The provider's refusal (RFC 6749 §4.1.2.1); a silent probe's login_required bounces to /?sso=none." },
+                        { "name": "scope", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Must equal the requested scope set when present." },
+                        { "name": "iss", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Must equal the provider's issuer when present (RFC 9207)." },
+                        { "name": "session_state", "in": "query", "required": false, "schema": { "type": "string" }, "description": "OpenID Connect Session Management value some providers append; accepted and ignored." }
                     ],
-                    "responses": { "303": { "description": "logged in; session cookie set" },
-                        "401": { "description": "state/code/token validation failed" } } }
+                    "responses": { "303": { "description": "logged in and session cookie set; or identity linked (to /?linked=1); or a silent probe found no provider session (to /?sso=none)" },
+                        "400": { "description": "the query has an unknown parameter, or is missing code or state" },
+                        "401": { "description": "state/code/token validation failed, the provider refused, or no usable account claim" },
+                        "403": { "description": "the identity is outside the provider's allowed email domains, or the account cannot start a session or gain an identity" },
+                        "404": { "description": "unknown provider" },
+                        "409": { "description": "first login: the claim's account name is already taken or retired; or link: identity already linked to another account" },
+                        "502": { "description": "the provider is unreachable or its discovery document is unusable" },
+                        "503": { "description": "no database configured, or account or session storage failed" } } }
             },
             "/api/v1/auth/oidc/{provider}/sso": {
                 "get": { "summary": "Silently probe for an existing SSO session (prompt=none)",
@@ -1070,8 +1167,13 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/auth/logout": {
                 "get": { "summary": "RP-initiated logout: end the local and provider SSO sessions",
-                    "description": "Clears the e6irc session, then redirects the browser to the OIDC provider's end-session endpoint (id_token_hint + post_logout_redirect_uri) so the provider's SSO session is ended too. Local-account sessions return directly to e6irc; incomplete OIDC logout configuration fails closed.",
-                    "responses": { "303": { "description": "redirect to the provider (or /) after clearing the session" } } },
+                    "description": "Clears the e6irc session, then redirects the browser to the OIDC provider's end-session endpoint (id_token_hint + post_logout_redirect_uri) so the provider's SSO session is ended too. Local-account sessions return directly to e6irc; incomplete OIDC logout configuration fails closed. A request that carries a session cookie must also carry that session's CSRF value as the `csrf` query parameter.",
+                    "parameters": [{ "name": "csrf", "in": "query", "required": false,
+                        "schema": { "type": "string" } }],
+                    "responses": { "303": { "description": "redirect to the provider (or /) after clearing the session" },
+                        "400": { "description": "the query has an unknown parameter" },
+                        "403": { "description": "session cookie presented without its CSRF value" },
+                        "503": { "description": "database unavailable, or the OIDC provider or public URL is not configured for coordinated logout" } } },
                 "post": { "summary": "Local logout: clear the e6irc session only",
                     "description": "Ends the browser session named by the session cookie. A request that carries a session cookie must also carry that session's `X-E6IRC-CSRF` value, as every cookie-authenticated unsafe method does; a request with no session has nothing to end and answers 204.",
                     "responses": { "204": { "description": "session cleared, or no session was presented" },
@@ -1115,7 +1217,8 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/auth/oidc/{provider}/link": {
                 "get": { "summary": "Link an OIDC identity to your account (redirects to the provider)",
-                    "security": authenticated,
+                    "description": "Requires a cookie-authenticated browser session: whoever completes the flow at the provider becomes a login identity of the account, so a bearer cannot start it.",
+                    "security": browser_session_only,
                     "parameters": [{ "name": "provider", "in": "path", "required": true,
                         "schema": { "type": "string" } }],
                     "responses": { "307": { "description": "redirect into the provider" },
@@ -1129,7 +1232,8 @@ fn document() -> serde_json::Value {
             "/api/v1/me/identities/{id}": {
                 "delete": {
                     "summary": "Unlink one of your OIDC identities and revoke its browser sessions",
-                    "security": authenticated,
+                    "description": "Requires a cookie-authenticated browser session and its X-E6IRC-CSRF header.",
+                    "security": browser_session_only,
                     "parameters": [{ "name": "id", "in": "path", "required": true,
                         "schema": { "type": "integer", "minimum": 1 } }],
                     "responses": {
@@ -1161,6 +1265,7 @@ fn document() -> serde_json::Value {
                 "post": {
                     "summary": "Approve a device grant from a browser session",
                     "description": "Requires the cookie-authenticated session and its X-E6IRC-CSRF header. Personal access tokens cannot mint a replacement bearer through device approval.",
+                    "security": browser_session_only,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": {
                             "type": "object", "additionalProperties": false,
@@ -1169,6 +1274,7 @@ fn document() -> serde_json::Value {
                         }
                     } } },
                     "responses": { "204": { "description": "approved" },
+                        "400": { "description": "invalid JSON body" },
                         "401": { "description": "browser session required" },
                         "409": { "description": "the approving account already holds the most personal access tokens allowed; the grant stays pending" },
                         "403": { "description": "invalid or missing CSRF token" },
@@ -1182,6 +1288,7 @@ fn document() -> serde_json::Value {
                 "post": {
                     "summary": "Mint an expiring scoped personal access token (shown once)",
                     "description": "Requires a browser session and its X-E6IRC-CSRF header. Existing bearer tokens cannot expand their own grant.",
+                    "security": browser_session_only,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": {
                             "type": "object",
@@ -1206,7 +1313,7 @@ fn document() -> serde_json::Value {
                     "responses": {
                         "201": token_created_response["201"],
                         "400": { "description": "invalid label, empty/unknown scopes, or lifetime" },
-                        "403": { "description": "the issuing bearer lacks write scope" },
+                        "403": { "description": "invalid or missing CSRF token" },
                         "409": { "description": "the account token cap is reached" }
                     }
                 }
@@ -1226,8 +1333,8 @@ fn document() -> serde_json::Value {
             "/api/v1/me/password": {
                 "put": {
                     "summary": "Change your primary local-account password",
-                    "description": "Creates a first primary password for an OIDC-only account when current_password is omitted. Existing primary passwords require their current value; an app password cannot authorize rotation.",
-                    "security": authenticated,
+                    "description": "Requires a cookie-authenticated browser session and its X-E6IRC-CSRF header. Creates a first primary password for an OIDC-only account when current_password is omitted. Existing primary passwords require their current value; an app password cannot authorize rotation. Every other browser session of the account is signed out in the same transaction; app passwords and personal access tokens are separately managed credentials and are left unchanged, and the response says so.",
+                    "security": browser_session_only,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": {
                             "type": "object",
@@ -1240,7 +1347,10 @@ fn document() -> serde_json::Value {
                         }
                     } } },
                     "responses": {
-                        "204": { "description": "primary password changed" },
+                        "200": json_response("primary password changed; other browser sessions signed out", serde_json::json!({
+                            "type": "object", "additionalProperties": false, "required": ["detail"],
+                            "properties": { "detail": { "type": "string", "const": super::credentials::PASSWORD_CHANGE_DETAIL } }
+                        }))["200"],
                         "400": { "description": "password is empty or exceeds 512 bytes" },
                         "401": { "description": "current primary password is incorrect" },
                         "409": { "description": "current_password omitted but a primary password already exists" },
@@ -1399,7 +1509,7 @@ fn document() -> serde_json::Value {
                 "post": {
                     "summary": "Mint an app password for the current browser-session account",
                     "description": "Requires a cookie-authenticated browser session and session-bound CSRF. Bearer tokens cannot mint credentials.",
-                    "security": authenticated,
+                    "security": browser_session_only,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "type": "object", "required": ["label"], "additionalProperties": false,
                             "properties": { "label": { "type": "string", "minLength": 1, "maxLength": 64 } } }
@@ -1444,7 +1554,10 @@ fn document() -> serde_json::Value {
                                 "properties": { "kind": { "const": "slack" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "const": true }, "autojoin": { "type": "array", "items": { "type": "string" } }, "sasl_account": { "type": "string", "writeOnly": true }, "sasl_password": { "type": "string", "writeOnly": true } } }
                         ] } } } },
                     "responses": { "201": network_created_response["201"],
-                        "409": { "description": "duplicate name, or upstream secret with no master key" } } }
+                        "400": { "description": "invalid name, address, identity, or kind-specific configuration; an upstream inside the server's own network is refused" },
+                        "404": { "description": "the bouncer is not enabled on this server" },
+                        "409": { "description": "duplicate name, or upstream secret with no master key" },
+                        "503": { "description": "database or network registry unavailable" } } }
             },
             "/api/v1/me/network-preflight": {
                 "post": {
@@ -1581,6 +1694,7 @@ fn document() -> serde_json::Value {
                         "schema": { "type": "object", "additionalProperties": false, "required": ["enabled"],
                             "properties": { "enabled": { "type": "boolean" } } } } } },
                     "responses": { "200": network_enabled_response["200"],
+                        "400": { "description": "invalid JSON body" },
                         "404": { "description": "no such network" },
                         "409": { "description": "cannot start (stored secret, no master key)" } } },
                 "delete": { "summary": "Delete a BNC network and stop its driver",
@@ -1597,7 +1711,7 @@ fn document() -> serde_json::Value {
                         { "name": "name", "in": "path", "required": true,
                             "schema": { "type": "string" } },
                         { "name": "limit", "in": "query", "required": false,
-                            "schema": { "type": "integer", "minimum": 1, "maximum": 1000 } }],
+                            "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": super::networks::DEFAULT_BUFFER_READ_LIMIT } }],
                     "responses": { "200": buffer_response["200"],
                         "400": { "description": "limit outside 1–1000" },
                         "404": { "description": "no such network" } } }
@@ -1891,7 +2005,7 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/admin/configuration/oidc-providers": {
                 "post": { "summary": "Add an OIDC provider to managed configuration", "security": authenticated,
-                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision", "name", "issuer_url", "client_id", "client_secret", "account_claim", "token_endpoint_auth_method"], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "issuer_url": { "type": "string" }, "client_id": { "type": "string" }, "client_secret": { "type": "string", "writeOnly": true }, "account_claim": { "type": "string", "enum": ["preferred_username", "email"] }, "scopes": { "type": "array", "items": { "type": "string" } }, "allowed_email_domains": { "type": "array", "items": { "type": "string" } }, "end_session_endpoint": { "type": "string" }, "token_endpoint_auth_method": { "type": "string", "enum": ["client_secret_basic", "client_secret_post"] } } } } } },
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision", "name", "issuer_url", "client_id", "client_secret", "account_claim", "token_endpoint_auth_method"], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "issuer_url": { "type": "string" }, "client_id": { "type": "string" }, "client_secret": { "type": "string", "writeOnly": true }, "account_claim": { "type": "string", "enum": ["preferred_username", "email"] }, "scopes": { "type": "array", "items": { "type": "string" } }, "allowed_email_domains": { "type": "array", "items": { "type": "string" } }, "end_session_endpoint": { "type": ["string", "null"] }, "token_endpoint_auth_method": { "type": "string", "enum": ["client_secret_basic", "client_secret_post"] } } } } } },
                     "responses": { "200": revision_response["200"], "400": { "description": "invalid provider" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision or master key unavailable" }, "503": { "description": "configuration unavailable" } } }
             },
             "/api/v1/admin/configuration/oidc-providers/{name}": {
@@ -1924,7 +2038,7 @@ fn document() -> serde_json::Value {
                     "security": authenticated,
                     "parameters": [{ "name": "owner", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
                     "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["enabled"], "properties": { "enabled": { "type": "boolean" } } } } } },
-                    "responses": { "200": admin_network_enabled_response["200"], "403": { "description": "not an admin account" }, "404": { "description": "network or bouncer missing" }, "409": { "description": "the owner is suspended, or the stored network cannot start" }, "503": { "description": "database unavailable" } } }
+                    "responses": { "200": admin_network_enabled_response["200"], "400": { "description": "invalid JSON body" }, "403": { "description": "not an admin account" }, "404": { "description": "network or bouncer missing" }, "409": { "description": "the owner is suspended, or the stored network cannot start" }, "503": { "description": "database unavailable" } } }
             },
             "/api/v1/admin/observability": {
                 "get": { "summary": "Live telemetry and bounded history (admin only)",
@@ -2004,6 +2118,9 @@ fn validate_documented_operations(spec: &serde_json::Value) -> Result<(), String
         .collect();
     let expected: std::collections::BTreeSet<(&str, &str)> =
         super::DOCUMENTED_ROUTE_OPERATIONS.iter().copied().collect();
+    // Every response-status omission is reported together: an author fixing
+    // the contract should see the whole list, not one entry per attempt.
+    let mut undocumented_statuses = Vec::new();
     let patterns = expected.iter().map(|(path, _)| *path).collect();
     if let Some((left, right)) = colliding_route_patterns(&patterns) {
         return Err(format!(
@@ -2113,7 +2230,44 @@ fn validate_documented_operations(spec: &serde_json::Value) -> Result<(), String
                     path_parameters.into_iter().collect::<Vec<_>>().join(", ")
                 ));
             }
+            // The statuses the framework produces before a handler runs are
+            // knowable from the operation's shape: admission for every
+            // account-authenticated operation, and a body or query rejection
+            // (`400`) for every operation that takes a JSON body or documents
+            // a query parameter. A client validating against the document must
+            // find them.
+            let responses = operation
+                .get("responses")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| format!("OpenAPI {method} {path} has no responses"))?;
+            if operation_authenticates_an_account(operation) {
+                for status in standard_authenticated_responses().keys() {
+                    if !responses.contains_key(status) {
+                        undocumented_statuses.push(format!(
+                            "{} {path} is authenticated but does not document {status}",
+                            method.to_ascii_uppercase()
+                        ));
+                    }
+                }
+            }
+            let takes_json_body = operation
+                .pointer("/requestBody/content/application~1json")
+                .is_some();
+            if (takes_json_body || !documented_query_parameters.is_empty())
+                && !responses.contains_key("400")
+            {
+                undocumented_statuses.push(format!(
+                    "{} {path} takes a JSON body or query parameters but does not document 400",
+                    method.to_ascii_uppercase()
+                ));
+            }
         }
+    }
+    if !undocumented_statuses.is_empty() {
+        return Err(format!(
+            "OpenAPI responses incomplete: [{}]",
+            undocumented_statuses.join("; ")
+        ));
     }
     Ok(())
 }

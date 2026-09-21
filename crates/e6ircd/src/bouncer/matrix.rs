@@ -64,19 +64,18 @@ impl NetworkDriver for MatrixDriver {
 }
 
 struct Session {
-    http: reqwest::Client,
+    http: super::BridgeHttp,
     base: String,
     token: String,
     user_id: String,
     channel_to_room: HashMap<String, String>,
     room_to_channel: HashMap<String, String>,
-    txn: u64,
 }
 
 /// One password login: the access token and who it belongs to.
 #[derive(Clone)]
 struct Login {
-    http: reqwest::Client,
+    http: super::BridgeHttp,
     access_token: String,
     user_id: String,
 }
@@ -92,6 +91,40 @@ struct Login {
 struct Shared {
     config: MatrixConfig,
     login: tokio::sync::Mutex<Option<Login>>,
+    transactions: TransactionIds,
+}
+
+/// The transaction ids this driver puts on the messages it sends.
+///
+/// A transaction id tells the homeserver "the same message again": it answers
+/// a repeat with the first event's id and stores nothing. The ids are scoped
+/// to the device, and the device outlives both the session and the process (it
+/// is named on every login, see [`MatrixConfig::device`]). So the counter
+/// lives with the driver, not the session — a session that started again at
+/// one made its first messages repeats of the previous session's, accepted
+/// and never posted — and every id carries the moment this driver started, so
+/// a restarted process does not replay the last one's ids either.
+struct TransactionIds {
+    started_at_millis: u64,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl TransactionIds {
+    fn new() -> Self {
+        let started_at_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before 1970")
+            .as_millis() as u64;
+        Self {
+            started_at_millis,
+            next: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
+    fn next(&self) -> String {
+        let sequence = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("e6{}x{sequence}", self.started_at_millis)
+    }
 }
 
 impl Shared {
@@ -99,6 +132,7 @@ impl Shared {
         Self {
             config,
             login: tokio::sync::Mutex::new(None),
+            transactions: TransactionIds::new(),
         }
     }
 
@@ -107,13 +141,13 @@ impl Shared {
         if let Some(login) = cached.as_ref() {
             return Ok(login.clone());
         }
-        let http = super::bridge_http_client(
+        let http = super::BridgeHttp::new(
             std::time::Duration::from_secs(60),
             self.config.internal_upstreams,
         )
         .map_err(|e| e.to_string())?;
         let response: LoginResponse = super::bridge_send_credentials(
-            http.post(format!("{}/_matrix/client/v3/login", self.base()))
+            http.post(&format!("{}/_matrix/client/v3/login", self.base()))?
                 .json(&LoginRequest::password(&self.config)),
             "login",
         )
@@ -147,11 +181,18 @@ impl Shared {
         let Some(login) = self.login.lock().await.take() else {
             return;
         };
-        let request = login
+        let request = match login
             .http
-            .post(format!("{}/_matrix/client/v3/logout", self.base()))
-            .bearer_auth(&login.access_token)
-            .json(&EmptyObject {});
+            .post(&format!("{}/_matrix/client/v3/logout", self.base()))
+        {
+            Ok(request) => request
+                .bearer_auth(&login.access_token)
+                .json(&EmptyObject {}),
+            Err(error) => {
+                eprintln!("matrix: logout refused: {error}");
+                return;
+            }
+        };
         match tokio::time::timeout(LOGOUT_DEADLINE, super::bridge_send(request)).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => eprintln!("matrix: logout failed: {error}"),
@@ -224,7 +265,7 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
                 Err(error) => return sync_failed(shared, "sync", error).await,
             },
             cmd = ends.next_command() => match cmd {
-                Some(cmd) => handle_command(&mut session, ends, &cmd.line).await,
+                Some(cmd) => handle_command(&mut session, shared, ends, &cmd.line).await,
                 None => return super::SessionOutcome::Stopped, // every handle dropped
             },
         }
@@ -278,7 +319,7 @@ async fn send_authorized(
     match response.status() {
         reqwest::StatusCode::UNAUTHORIZED => Err(RequestError::TokenRejected),
         reqwest::StatusCode::FORBIDDEN => Err(RequestError::Forbidden),
-        _ => Ok(response.error_for_status().map_err(|e| e.to_string())?),
+        _ => Ok(super::bridge_response_status(response)?),
     }
 }
 
@@ -293,7 +334,6 @@ async fn connect(shared: &Shared) -> Result<Session, super::ConnectFail> {
         user_id: login.user_id,
         channel_to_room: HashMap::new(),
         room_to_channel: HashMap::new(),
-        txn: 0,
     };
     let unmappable = |detail: String| {
         ConnectFail::Configuration(ConfigurationRefusal::new(
@@ -341,7 +381,7 @@ async fn join_room(s: &Session, alias: &str) -> Result<String, RequestError> {
     let encoded = urlencode(alias);
     let response: JoinResponse = send_authorized(
         s.http
-            .post(format!("{}/_matrix/client/v3/join/{encoded}", s.base))
+            .post(&format!("{}/_matrix/client/v3/join/{encoded}", s.base))?
             .bearer_auth(&s.token)
             .json(&EmptyObject {}),
     )
@@ -556,7 +596,7 @@ async fn sync(s: &Session, since: Option<&str>) -> Result<SyncBatch, RequestErro
     };
     let mut req = s
         .http
-        .get(format!("{}/_matrix/client/v3/sync", s.base))
+        .get(&format!("{}/_matrix/client/v3/sync", s.base))?
         .bearer_auth(&s.token)
         .query(&[
             ("timeout", timeout.to_string()),
@@ -569,22 +609,20 @@ async fn sync(s: &Session, since: Option<&str>) -> Result<SyncBatch, RequestErro
     Ok(collect_sync_messages(body)?)
 }
 
-async fn handle_command(s: &mut Session, ends: &super::DriverEnds, line: &str) {
+async fn handle_command(s: &mut Session, shared: &Shared, ends: &super::DriverEnds, line: &str) {
     let routed = super::route_privmsg(line, &s.channel_to_room);
     super::relay_routed(ends, routed, "Matrix", "room", |room_id, text| {
-        s.txn += 1;
-        let txn = s.txn;
         let url = format!(
-            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/e6{txn}",
+            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
             s.base,
             urlencode(&room_id),
+            shared.transactions.next(),
         );
-        let req = s
-            .http
-            .put(url)
-            .bearer_auth(&s.token)
-            .json(&MatrixMessageRequest::text(&text));
-        async move { super::bridge_send(req).await.map(|_| ()) }
+        let req = s.http.put(&url).map(|req| {
+            req.bearer_auth(&s.token)
+                .json(&MatrixMessageRequest::text(&text))
+        });
+        async move { super::bridge_send(req?).await.map(|_| ()) }
     })
     .await;
 }
@@ -632,13 +670,15 @@ mod tests {
         login_requests: Vec<serde_json::Value>,
         logged_out: Vec<String>,
         sync_queries: Vec<HashMap<String, String>>,
+        /// The transaction id of every message sent, in order.
+        sent_transactions: Vec<String>,
     }
 
     impl Homeserver {
         async fn start() -> (Self, String) {
             use axum::extract::{Path, Query, State};
             use axum::http::{HeaderMap, StatusCode};
-            use axum::routing::{get, post};
+            use axum::routing::{get, post, put};
 
             fn token(headers: &HeaderMap) -> String {
                 headers
@@ -705,6 +745,16 @@ mod tests {
                         |State(server): State<Homeserver>, headers: HeaderMap| async move {
                             server.0.lock().unwrap().logged_out.push(token(&headers));
                             axum::Json(serde_json::json!({}))
+                        },
+                    ),
+                )
+                .route(
+                    "/_matrix/client/v3/rooms/{room}/send/m.room.message/{txn}",
+                    put(
+                        |State(server): State<Homeserver>,
+                         Path((_room, txn)): Path<(String, String)>| async move {
+                            server.0.lock().unwrap().sent_transactions.push(txn);
+                            axum::Json(serde_json::json!({ "event_id": "$event:hs.example" }))
                         },
                     ),
                 );
@@ -833,6 +883,58 @@ mod tests {
         }
         // A network nobody owns is still one device, and not any account's.
         assert_eq!(MatrixDevice::for_network(None, "lobby").id, "e6irc/*/lobby");
+    }
+
+    /// A transaction id tells the homeserver "the same message again" — it
+    /// answers a repeat with the first event's id and stores nothing. The login
+    /// (and its token, which scopes the ids) outlives sessions, so a counter
+    /// that restarted with each session made a reconnected driver's first
+    /// messages repeats of the previous session's: accepted, and never posted.
+    #[tokio::test]
+    async fn no_two_sessions_of_one_driver_reuse_a_transaction_id() {
+        let (server, base) = Homeserver::start().await;
+        let shared = Shared::new(config(&base, &["#room:hs.example"]));
+        let (_handle, ends) = NetworkHandle::channels(8);
+        for text in ["one", "two"] {
+            let mut session = connect(&shared).await.unwrap_or_else(|_| panic!("connect"));
+            handle_command(
+                &mut session,
+                &shared,
+                &ends,
+                &format!("PRIVMSG #room :{text}"),
+            )
+            .await;
+        }
+        let sent = server.0.lock().unwrap().sent_transactions.clone();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_ne!(
+            sent[0], sent[1],
+            "the second session repeated the first's id"
+        );
+    }
+
+    /// `2130706433` is 127.0.0.1 to the URL parser and to the kernel, but not to
+    /// `IpAddr::from_str`, and an IP-literal host never reaches the vetting
+    /// resolver. The request itself has to be judged: under the default policy
+    /// no socket is opened; under the operator's allowance the login proceeds.
+    #[tokio::test]
+    async fn a_homeserver_named_by_a_disguised_loopback_literal_is_refused_before_any_socket_opens()
+    {
+        use crate::egress::InternalUpstreams;
+        let (server, base) = Homeserver::start().await;
+        let port = url::Url::parse(&base).unwrap().port().unwrap();
+        let disguised = format!("http://2130706433:{port}");
+        for (policy, logins) in [
+            (InternalUpstreams::Refuse, 0),
+            (InternalUpstreams::Allow, 1),
+        ] {
+            let mut config = config(&disguised, &["#room:hs.example"]);
+            config.internal_upstreams = policy;
+            let shared = Shared::new(config);
+            let (_handle, mut ends) = NetworkHandle::channels(8);
+            session_once(&shared, &mut ends).await;
+            assert_eq!(server.0.lock().unwrap().logins, logins, "under {policy:?}");
+        }
     }
 
     /// An unfiltered initial sync is the whole account: every room, all state,

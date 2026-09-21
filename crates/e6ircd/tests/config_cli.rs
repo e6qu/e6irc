@@ -60,6 +60,58 @@ fn the_environment_alone_states_a_valid_configuration() {
     assert!(output.status.success(), "{}", report(&output));
 }
 
+/// `[secrets].key_file` and `E6IRC_SECRET_KEY` are alternatives; stated
+/// together, the refusal names both so the operator knows which to remove.
+#[test]
+fn a_key_file_and_an_environment_key_together_are_refused_by_name() {
+    let genkey = e6ircd(&["genkey"], &[]);
+    assert!(genkey.status.success(), "{}", report(&genkey));
+    let key = String::from_utf8_lossy(&genkey.stdout).trim().to_string();
+    let directory = std::env::temp_dir();
+    let key_path = directory.join(format!("e6irc-cli-key-{}.b64", std::process::id()));
+    let config_path = directory.join(format!("e6irc-cli-config-{}.toml", std::process::id()));
+    std::fs::write(&key_path, &key).expect("write key");
+    std::fs::write(
+        &config_path,
+        format!(
+            "server_name = \"irc.example.test\"\nnetwork_name = \"ExampleNet\"\n[[listeners]]\naddr = \"127.0.0.1:0\"\n\
+             [secrets]\nkey_file = {key_path:?}\n"
+        ),
+    )
+    .expect("write config");
+    let arguments = [
+        "check-config",
+        "--config",
+        config_path.to_str().expect("utf-8"),
+    ];
+
+    let alone = e6ircd(&arguments, &[]);
+    assert!(alone.status.success(), "{}", report(&alone));
+
+    let both = e6ircd(&arguments, &[("E6IRC_SECRET_KEY", key.clone())]);
+    let text = report(&both);
+    assert!(!both.status.success(), "{text}");
+    assert!(text.contains("E6IRC_SECRET_KEY"), "{text}");
+    assert!(text.contains("key_file"), "{text}");
+    assert!(!text.contains(&key), "never prints the key: {text}");
+    std::fs::remove_file(key_path).ok();
+    std::fs::remove_file(config_path).ok();
+}
+
+/// An `E6IRC_ADMIN_ACCOUNTS` entry that is not an account name — the second
+/// half of an unsplit `"alice, bob"` — is refused by name rather than
+/// accepted as a grant that can never match anyone.
+#[test]
+fn an_admin_accounts_entry_that_is_not_an_account_name_is_refused_by_name() {
+    let mut environment = minimal();
+    environment.push(("E6IRC_ADMIN_ACCOUNTS", "alice, bob".to_owned()));
+    let output = e6ircd(&["check-config", "--config-from-environment"], &environment);
+    let text = report(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("http.admin_accounts"), "{text}");
+    assert!(text.contains("\" bob\""), "names the entry: {text}");
+}
+
 #[test]
 fn a_missing_or_malformed_variable_is_refused_by_name_without_printing_any_value() {
     let cases: [(&str, Option<&str>, &str); 4] = [

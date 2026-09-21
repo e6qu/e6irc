@@ -33,18 +33,23 @@ import {
 } from "./network-request.js";
 import { parseUiEvent } from "./ui-event.js";
 import {
-  MEMBER_RANKS,
+  DEFAULT_CHANNEL_MODES,
   asMessage,
+  channelModesFrom,
   chatMessageRoute,
   fold,
   isChannel,
+  isPrefixMode,
   kickPairs,
+  memberRank,
   membershipTargets,
   mergeTimeline,
   messageIdentity,
+  modeChanges,
   nickPrefix,
   parseIrc,
   reconcileChannelSnapshot,
+  serverBufferText,
   splitSigil,
   stripFormatting,
   stripSigil,
@@ -97,6 +102,7 @@ const bufferActionEl = el("buffer-action");
 const nicklistEl = el("nicklist");
 const nicksEl = el("nicks");
 const nickcountEl = el("nickcount");
+const membersToggle = el("members-toggle");
 const composer = el("composer");
 const messageInput = el("message");
 const alertsEl = el("alerts");
@@ -134,11 +140,32 @@ const settings = loadedSettings.settings;
 // Clearing the key -- the condition ended -- lets it be reported afresh.
 const reportedAlerts = new Map();
 
+// The action control is always rebound, even when the words did not change: two
+// refused sends read the same, but the second one's Restore must restore the
+// second message, not the first.
+function bindAlertAction(alert, action) {
+  alert.querySelector(".alert-action")?.remove();
+  if (!action) return;
+  const control = action.href ? document.createElement("a") : document.createElement("button");
+  control.className = "alert-action";
+  control.textContent = action.label;
+  if (action.href) {
+    control.href = action.href;
+  } else {
+    control.type = "button";
+    control.addEventListener("click", action.onClick);
+  }
+  alert.insertBefore(control, alert.lastElementChild);
+}
+
 function showAlert(key, text, tone = "warning", action = null) {
   const report = `${tone}\n${text}\n${action?.label ?? ""}`;
-  if (reportedAlerts.get(key) === report) return;
-  reportedAlerts.set(key, report);
   let alert = alertsEl.querySelector(`[data-alert="${CSS.escape(key)}"]`);
+  if (reportedAlerts.get(key) === report) {
+    if (alert) bindAlertAction(alert, action);
+    return;
+  }
+  reportedAlerts.set(key, report);
   if (!alert) {
     alert = document.createElement("div");
     alert.dataset.alert = key;
@@ -157,20 +184,7 @@ function showAlert(key, text, tone = "warning", action = null) {
   alert.className = `alert alert-${tone}`;
   alert.setAttribute("role", tone === "error" ? "alert" : "status");
   alert.firstElementChild.textContent = text;
-  const existingAction = alert.querySelector(".alert-action");
-  if (existingAction) existingAction.remove();
-  if (action) {
-    const control = action.href ? document.createElement("a") : document.createElement("button");
-    control.className = "alert-action";
-    control.textContent = action.label;
-    if (action.href) {
-      control.href = action.href;
-    } else {
-      control.type = "button";
-      control.addEventListener("click", action.onClick);
-    }
-    alert.insertBefore(control, alert.lastElementChild);
-  }
+  bindAlertAction(alert, action);
 }
 
 function clearAlert(key) {
@@ -329,6 +343,22 @@ if (sidebarToggle) {
   });
 }
 
+// The member list on a phone: a panel the header button opens, mirroring the
+// conversation rail. Wider layouts show the list beside the chat.
+function closeMobileMembers({ restoreFocus = false } = {}) {
+  document.body.classList.remove("members-open");
+  membersToggle?.setAttribute("aria-expanded", "false");
+  if (restoreFocus) membersToggle?.focus();
+}
+
+if (membersToggle) {
+  membersToggle.addEventListener("click", () => {
+    const open = document.body.classList.toggle("members-open");
+    membersToggle.setAttribute("aria-expanded", String(open));
+    if (open) nicksEl.querySelector(".nick")?.focus();
+  });
+}
+
 document.addEventListener("keydown", (event) => {
   // An open modal owns Escape. Cancelling the event here for the rail or the
   // preferences menu beneath it would also cancel the dialog's close request,
@@ -337,6 +367,11 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && document.body.classList.contains("sidebar-open")) {
     event.preventDefault();
     closeMobileSidebar({ restoreFocus: true });
+    return;
+  }
+  if (event.key === "Escape" && document.body.classList.contains("members-open")) {
+    event.preventDefault();
+    closeMobileMembers({ restoreFocus: true });
     return;
   }
   if (event.key === "Escape" && settingsEl?.open) {
@@ -448,13 +483,10 @@ function ensureBuffer(name, kind) {
   return b;
 }
 
-// Membership modes (each consumes a nick argument in a MODE line).
-const SIGIL_MODE_CHARS = "qaohv";
-// Modes that consume a parameter whether set or unset (membership + list +
-// key), vs. only when set (limit). Used to keep MODE argument alignment so a
-// mixed line like `+o-l nick` maps the nick to `o`, not `l`.
-const MODE_ALWAYS_ARG = new Set(["q", "a", "o", "h", "v", "b", "e", "I", "k"]);
-const MODE_SET_ARG = new Set(["l"]);
+// The network's channel-mode table: which modes rank a member, their sigils,
+// and which consume a MODE parameter. The default applies until the network's
+// 005 replaces it; the page is one network, so it is kept across reconnects.
+let channelModes = DEFAULT_CHANNEL_MODES;
 
 // ---- rendering ----------------------------------------------------------
 
@@ -681,22 +713,24 @@ function renderNickList() {
   const b = buffers.get(active);
   if (!memberTracking || !b || b.kind !== "channel") {
     nicklistEl.hidden = true;
+    if (membersToggle) membersToggle.hidden = true;
+    closeMobileMembers();
     clearAlert("members");
     return;
   }
   nicklistEl.hidden = false;
   // Sort by rank (owner/op/… first) then name, and show the sigil.
-  const rankOf = (m) => {
-    const p = nickPrefix(m);
-    const i = MEMBER_RANKS.findIndex(([, s]) => s === p);
-    return i === -1 ? MEMBER_RANKS.length : i;
-  };
   const members = [...b.nicks.values()].sort(
-    (a, c) => rankOf(a.modes) - rankOf(c.modes) || a.name.localeCompare(c.name),
+    (a, c) => memberRank(a.modes, channelModes) - memberRank(c.modes, channelModes) || a.name.localeCompare(c.name),
   );
-  nickcountEl.textContent = b.membershipKnown
+  const count = b.membershipKnown
     ? `${members.length}${b.membersTruncated ? "+" : ""}`
     : "…";
+  nickcountEl.textContent = count;
+  if (membersToggle) {
+    membersToggle.hidden = false;
+    membersToggle.textContent = `Members (${count})`;
+  }
   if (b.membersTruncated) {
     showAlert(
       "members",
@@ -714,7 +748,7 @@ function renderNickList() {
     const action = `Open conversation with ${m.name}`;
     button.title = action;
     button.setAttribute("aria-label", action);
-    button.textContent = nickPrefix(m.modes) + m.name;
+    button.textContent = nickPrefix(m.modes, channelModes) + m.name;
     // Native button semantics make click, Enter, and Space equivalent.
     const open = () => setActive(ensureBuffer(m.name, "dm").display);
     button.addEventListener("click", open);
@@ -768,6 +802,7 @@ function setActive(name) {
   renderBufferList();
   renderActive();
   closeMobileSidebar();
+  closeMobileMembers();
   if (!messageInput.disabled) messageInput.focus();
 }
 
@@ -867,7 +902,7 @@ const addServer = (text, wire = null) => addLine(SERVER, "server", "server", nul
 const addEvent = (chan, text) => addLine(chan, "event", "channel", null, text);
 
 function addNick(chan, nick, render = true) {
-  const { name, modes } = splitSigil(nick);
+  const { name, modes } = splitSigil(nick, channelModes);
   if (!name) return;
   const b = ensureBuffer(chan, "channel");
   if (b.kind !== "channel") return;
@@ -888,11 +923,11 @@ function addNick(chan, nick, render = true) {
 }
 
 // Apply a membership mode change from a channel MODE line: `add` (true for `+`)
-// the mode `mode` (o/h/v/a/q) to `nick` in `chan`, updating its sigil.
+// the prefix mode `mode` to `nick` in `chan`, updating its sigil.
 function setNickMode(chan, nick, mode, add) {
   const b = buffers.get(fold(chan));
   if (!b) return;
-  const entry = b.nicks.get(fold(stripSigil(nick)));
+  const entry = b.nicks.get(fold(stripSigil(nick, channelModes)));
   if (!entry) return;
   if (add) entry.modes.add(mode);
   else entry.modes.delete(mode);
@@ -901,11 +936,11 @@ function setNickMode(chan, nick, mode, add) {
 
 function removeNick(chan, nick) {
   const b = buffers.get(fold(chan));
-  if (b && b.nicks.delete(fold(stripSigil(nick))) && b.key === active) renderNickList();
+  if (b && b.nicks.delete(fold(stripSigil(nick, channelModes))) && b.key === active) renderNickList();
 }
 
 function removeNickEverywhere(nick, text) {
-  const key = fold(stripSigil(nick));
+  const key = fold(stripSigil(nick, channelModes));
   if (!key) return;
   for (const b of buffers.values()) {
     if (b.kind === "channel" && b.nicks.delete(key)) addEvent(b.display, text);
@@ -914,8 +949,9 @@ function removeNickEverywhere(nick, text) {
 }
 
 function renameNick(from, to) {
-  const fromKey = fold(stripSigil(from));
-  const toName = stripSigil(to);
+  const fromName = stripSigil(from, channelModes);
+  const fromKey = fold(fromName);
+  const toName = stripSigil(to, channelModes);
   if (!fromKey || !toName) return;
   const conversation = buffers.get(fromKey);
   if (conversation && conversation.kind === "dm" && !buffers.has(fold(toName))) {
@@ -925,7 +961,7 @@ function renameNick(from, to) {
     conversation.display = toName;
     buffers.set(conversation.key, conversation);
     if (active === fromKey) active = conversation.key;
-    addEvent(toName, `${stripSigil(from)} is now ${toName}`);
+    addEvent(toName, `${fromName} is now ${toName}`);
     renderBufferList();
     if (active === conversation.key) renderActive();
   }
@@ -936,7 +972,7 @@ function renameNick(from, to) {
       b.nicks.delete(fromKey);
       entry.name = toName;
       b.nicks.set(fold(toName), entry);
-      addEvent(b.display, `${stripSigil(from)} is now ${toName}`);
+      addEvent(b.display, `${fromName} is now ${toName}`);
     }
   }
   if (active) renderNickList();
@@ -1099,28 +1135,29 @@ function handleLine(raw) {
     case "QUIT":
       if (m.nick) {
         const reason = m.params[0] ? ` (${m.params[0]})` : "";
-        removeNickEverywhere(m.nick, `${stripSigil(m.nick)} quit${reason}`);
+        removeNickEverywhere(m.nick, `${stripSigil(m.nick, channelModes)} quit${reason}`);
       } else addServer(raw, raw);
       break;
+    case "005": {
+      // RPL_ISUPPORT: the network's own PREFIX and CHANMODES replace the
+      // default table, so MODE arguments and sigils are read its way.
+      const { modes, malformed } = channelModesFrom(m.params, channelModes);
+      channelModes = modes;
+      if (malformed.length) {
+        addServer(`Ignored unreadable ISUPPORT ${malformed.join(" ")}; channel modes keep the previous table.`);
+      }
+      addServer(serverBufferText(m, raw, myNick), raw);
+      break;
+    }
     case "MODE": {
       // Channel MODE: track membership sigil changes for the member list.
       const chan = m.params[0];
       if (chan && isChannel(chan)) {
-        const modestr = m.params[1] || "";
-        const args = m.params.slice(2);
-        let adding = true;
-        let ai = 0;
-        for (const ch of modestr) {
-          if (ch === "+") adding = true;
-          else if (ch === "-") adding = false;
-          else {
-            const takesArg = MODE_ALWAYS_ARG.has(ch) || (adding && MODE_SET_ARG.has(ch));
-            const arg = takesArg ? args[ai++] : undefined;
-            if (arg && SIGIL_MODE_CHARS.includes(ch)) setNickMode(chan, arg, ch, adding);
-          }
+        for (const { mode, adding, argument } of modeChanges(channelModes, m.params[1] || "", m.params.slice(2))) {
+          if (argument && isPrefixMode(channelModes, mode)) setNickMode(chan, argument, mode, adding);
         }
       } else {
-        addServer(m.params.length ? m.params[m.params.length - 1] : raw, raw);
+        addServer(serverBufferText(m, raw, myNick), raw);
       }
       break;
     }
@@ -1174,9 +1211,9 @@ function handleLine(raw) {
       break;
     }
     default:
-      // Numerics and everything else land in the server buffer. Show the human
-      // part (the trailing) when there is one, else the whole line.
-      addServer(m.params.length ? m.params[m.params.length - 1] : raw, raw);
+      // Numerics and everything else land in the server buffer: a numeric's
+      // human text, a command with its source and subject.
+      addServer(serverBufferText(m, raw, myNick), raw);
   }
 }
 
@@ -1213,7 +1250,7 @@ function scheduleReconnect() {
   );
   reconnectTimer = window.setTimeout(() => {
     reconnectTimer = null;
-    connect();
+    void reconnect();
   }, wait);
 }
 
@@ -1222,6 +1259,26 @@ function retryConnectionNow() {
   if (reconnectTimer) {
     window.clearTimeout(reconnectTimer);
     reconnectTimer = null;
+  }
+  void reconnect();
+}
+
+// A socket upgrade the server refuses because the session expired is only an
+// `error` and an abnormal close, indistinguishable from a dropped link, so the
+// retry loop would run forever. The session is checked before each retry; a
+// 401 ends the loop and says what to do. Any other failure of that check is
+// not a verdict, and the socket attempt itself is the test of the link.
+async function reconnect() {
+  try {
+    await apiGet("/api/v1/me");
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401) {
+      terminalSocket = true;
+      setStatus("signed out", "error");
+      clearAlert("socket");
+      showAlert("session", errorMessage("reconnect", error), "error", { href: "/login", label: "Sign in" });
+      return;
+    }
   }
   connect();
 }
@@ -1241,7 +1298,7 @@ async function reconcileUnavailableNetwork() {
       if (!reconnectTimer) {
         reconnectTimer = window.setTimeout(() => {
           reconnectTimer = null;
-          connect();
+          void reconnect();
         }, 250);
       }
       return;
@@ -1267,6 +1324,26 @@ async function reconcileUnavailableNetwork() {
   }
 }
 
+// Where this page stopped reading the network's ring: the cursor of the last
+// line (or replay boundary) the server sent. Opaque; handed back on the next
+// attach as `?after=` so the server replays exactly the lines after it. A
+// cursor the server cannot honour (it restarted, or the ring moved past it)
+// comes back as a `replay` event: the whole ring follows and the transcript
+// starts over, said once.
+let replayCursor = null;
+
+function resetTranscripts() {
+  for (const b of buffers.values()) {
+    b.lines.length = 0;
+    b.unread = 0;
+    b.mentions = 0;
+    b.pendingVisibleMessages = 0;
+  }
+  renderActive();
+  renderBufferList();
+  addServer("history reloaded: the server could not continue from where this page stopped, so it replayed everything it holds");
+}
+
 function connect() {
   terminalSocket = false;
   upstreamConnected = false;
@@ -1285,7 +1362,8 @@ function connect() {
     }
   }
   const proto = window.location.protocol === "https:" ? "wss" : "ws";
-  const url = `${proto}://${window.location.host}/ws/ui?network=${encodeURIComponent(network)}`;
+  const after = replayCursor ? `&after=${encodeURIComponent(replayCursor)}` : "";
+  const url = `${proto}://${window.location.host}/ws/ui?network=${encodeURIComponent(network)}${after}`;
   const liveSocket = new WebSocket(url);
   socket = liveSocket;
   liveSocket.addEventListener("open", () => {
@@ -1350,9 +1428,11 @@ function connect() {
       return;
     }
     if (event.type === "line") {
+      replayCursor = event.cursor;
       handleLine(event.value);
-    }
-    else if (event.type === "sent") {
+    } else if (event.type === "replay") {
+      resetTranscripts();
+    } else if (event.type === "sent") {
       if (!acceptPendingSend(event.value)) {
         showAlert("protocol", "The server confirmed a message this page did not send.", "error");
       }
@@ -1372,6 +1452,7 @@ function connect() {
       const why = event.reason ? ` — ${event.reason}` : "";
       setStatus(`${network}: reconnecting${why}`, "error");
     } else if (event.type === "snapshot") {
+      replayCursor = event.cursor;
       snapshotComplete = true;
       if (upstreamConnected) resyncMemberships();
       settleInitialView();
@@ -1466,6 +1547,19 @@ composer.addEventListener("submit", (e) => {
     messageInput.focus();
     return;
   }
+  // A past channel is a transcript, not a membership: a PRIVMSG into it is
+  // refused by the network (or, worse, delivered nowhere) while the composer
+  // would echo it as sent. The text stays in the box; joining is one click.
+  if (b && b.kind === "channel" && !b.joined && !text.startsWith("/")) {
+    showAlert(
+      "send",
+      `You are not in ${b.display} any more, so the message was not sent. Join it again first — with the Join box in the sidebar or the button here.`,
+      "error",
+      { label: `Join ${b.display}`, onClick: () => requestJoin(b.display) },
+    );
+    messageInput.focus();
+    return;
+  }
   if (pendingSends.size >= MAX_PENDING_SENDS) {
     addServer(`Not sending more than ${MAX_PENDING_SENDS} messages without server confirmation.`);
     showAlert(
@@ -1476,7 +1570,9 @@ composer.addEventListener("submit", (e) => {
     return;
   }
   const target = b ? b.display : "";
-  const joining = text.match(/^\/(?:join|j)\s+(\S+)/i);
+  // Only /join: the server has no /j alias, so /j is forwarded as an unknown
+  // command and must not be remembered as a join to follow.
+  const joining = text.match(/^\/join\s+(\S+)/i);
   if (joining) rememberRequestedJoins(joining[1]);
   nextSendId += 1;
   const requestId = nextSendId.toString(36);
@@ -1493,6 +1589,26 @@ composer.addEventListener("submit", (e) => {
   messageInput.focus();
 });
 
+// Ask the network to join `chan`; the confirming JOIN moves the view there.
+// True when the request entered the live connection.
+function requestJoin(chan) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    addServer("Not connected — cannot join yet.");
+    return false;
+  }
+  rememberRequestedJoins(chan);
+  try {
+    if (!sendComposer("", `/join ${chan}`)) {
+      addServer("Not connected — cannot join yet.");
+      return false;
+    }
+  } catch {
+    addServer("The request to join was not sent.");
+    return false;
+  }
+  return true;
+}
+
 // Sidebar "join #channel" input: a one-field affordance so joining doesn't
 // require knowing the /join slash-command.
 const joinForm = el("join-form");
@@ -1503,21 +1619,7 @@ if (joinForm) {
     let chan = (input.value || "").trim();
     if (!chan) return;
     if (!isChannel(chan)) chan = "#" + chan;
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      rememberRequestedJoins(chan);
-      try {
-        if (!sendComposer("", `/join ${chan}`)) {
-          addServer("Not connected — cannot join yet.");
-          return;
-        }
-      } catch {
-        addServer("The request to join was not sent.");
-        return;
-      }
-    } else {
-      addServer("Not connected — cannot join yet.");
-    }
-    input.value = "";
+    if (requestJoin(chan)) input.value = "";
   });
 }
 
@@ -1661,12 +1763,16 @@ function setNetworkFieldsLocked(locked) {
 const CUSTOM_PRESET = "custom";
 let networkPresets = [];
 
-function applyPreset() {
+// Choosing a preset fills its name, server, and TLS. When the catalog arrives
+// after the dialog opened, only boxes still at their reset value (empty, TLS
+// ticked) take the preset: the catalog does not type over the person, who may
+// already have opened Advanced and filled a server in.
+function applyPreset({ onlyUntouched = false } = {}) {
   const preset = networkPresets.find((item) => item.id === el("nf-preset").value);
   if (preset) {
-    el("nf-name").value = preset.name;
-    el("nf-addr").value = preset.addr;
-    el("nf-tls").checked = preset.tls;
+    if (!onlyUntouched || !el("nf-name").value) el("nf-name").value = preset.name;
+    if (!onlyUntouched || !el("nf-addr").value) el("nf-addr").value = preset.addr;
+    if (!onlyUntouched || el("nf-tls").checked) el("nf-tls").checked = preset.tls;
     return;
   }
   // Custom: the name and server are now the person's to fill in, so show them.
@@ -1701,7 +1807,25 @@ networkDialog?.addEventListener("close", () => {
 // A required field inside a closed <details> would refuse the submit with no
 // visible reason. Open the section the moment the browser reports one.
 el("nf-advanced")?.addEventListener("invalid", () => { el("nf-advanced").open = true; }, true);
-el("nf-preset")?.addEventListener("change", applyPreset);
+el("nf-preset")?.addEventListener("change", () => applyPreset());
+
+// While Remove is ticked the account and password boxes are cleared and
+// disabled: a value typed there would not be saved, and the request builder
+// refuses one that is. Unticking hands the account back.
+el("nf-clear")?.addEventListener("change", () => {
+  const clearing = el("nf-clear").checked;
+  const account = el("nf-sasl-account");
+  const password = el("nf-sasl-password");
+  if (clearing) {
+    account.dataset.beforeClearing = account.value;
+    account.value = "";
+    password.value = "";
+  } else {
+    account.value = account.dataset.beforeClearing ?? "";
+  }
+  account.disabled = clearing;
+  password.disabled = clearing;
+});
 
 // Editing shows what is configured but never a stored password: the API does
 // not return one, and this deliberately does not ask it to. Leaving the field
@@ -1747,7 +1871,14 @@ async function openNetworkDialog(name = null) {
   setNetworkFieldsLocked(editing);
   el("nf-save").disabled = true;
   networkForm.setAttribute("aria-busy", "true");
+  networkForm.dataset.storedAccount = "";
   if (!networkDialog.open) networkDialog.showModal();
+  // Adding needs nothing from the server to know where typing starts, so the
+  // nickname is focused now. Editing cannot: every box is locked until the
+  // stored values arrive. After the wait, focus moves only if the person has
+  // not moved it themselves in the meantime.
+  if (!editing) el("nf-nick").focus();
+  const focusedBeforeLoading = document.activeElement;
 
   try {
     if (editing) {
@@ -1763,6 +1894,9 @@ async function openNetworkDialog(name = null) {
       el("nf-realname").value = detail.realname ?? "";
       el("nf-autojoin").value = Array.isArray(detail.autojoin) ? detail.autojoin.join(", ") : "";
       el("nf-sasl-account").value = detail.sasl_account ?? "";
+      // What the account box held before editing, so emptying it is refused
+      // instead of being sent as `keep`.
+      networkForm.dataset.storedAccount = detail.sasl_account ?? "";
     } else {
       const catalog = (await apiGet("/api/v1/network-presets")).presets;
       if (opening !== dialogOpening) return;
@@ -1776,7 +1910,7 @@ async function openNetworkDialog(name = null) {
       }));
       // The first curated network (Libera) is the interop target this server is
       // tested against, so it is the default rather than a blank form.
-      applyPreset();
+      applyPreset({ onlyUntouched: true });
     }
     el("nf-save").disabled = false;
   } catch (error) {
@@ -1796,7 +1930,9 @@ async function openNetworkDialog(name = null) {
     if (opening === dialogOpening) networkForm.removeAttribute("aria-busy");
   }
 
-  (editing ? el("nf-sasl-account") : el("nf-nick")).focus();
+  if (document.activeElement === focusedBeforeLoading) {
+    (editing ? el("nf-sasl-account") : el("nf-nick")).focus();
+  }
 }
 
 if (networkForm) {
@@ -1822,6 +1958,7 @@ if (networkForm) {
       account,
       password,
       clearing: editing ? el("nf-clear").checked : false,
+      storedAccount: networkForm.dataset.storedAccount ?? "",
     };
 
     // network-request.js owns both shapes and is tested on the difference.
@@ -2158,7 +2295,12 @@ async function boot() {
     el("account-link").dataset.shauthUser = me.account;
     el("account-name").title = me.email || "";
     el("account-role").textContent = me.role || "";
-    if (me.logoutURL) el("logout-link").href = me.logoutURL;
+    // The sign-out URL carries the session's CSRF token; the link exists only
+    // once it is known, so an early click cannot land on a CSRF refusal.
+    if (me.logoutURL) {
+      el("logout-link").href = me.logoutURL;
+      el("logout-link").hidden = false;
+    }
     clearAlert("identity");
   } catch (error) {
     el("account-name").textContent = "identity unavailable";

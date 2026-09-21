@@ -85,7 +85,7 @@ struct HistoryResponse {
 pub(super) async fn history(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Query(params): Query<HistoryParams>,
+    QueryParams(params): QueryParams<HistoryParams>,
 ) -> Response {
     let pool = pool_of(&state);
     let query = match parse_history_query(&params) {

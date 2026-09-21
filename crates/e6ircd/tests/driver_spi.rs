@@ -59,7 +59,7 @@ async fn assert_echo_driver_contract(driver: Box<dyn NetworkDriver>) {
     assert!(
         wait_for(
             &mut events,
-            |e| matches!(e, DriverEvent::Line(l) if l == "hello world")
+            |e| matches!(e, DriverEvent::Line(e6ircd::bouncer::BufferedLine { line: l, .. }) if l == "hello world")
         )
         .await,
         "{kind}: command was not surfaced as a line"
@@ -194,7 +194,7 @@ async fn an_spi_driver_that_begins_an_irc_session_can_track_its_membership() {
     assert!(
         wait_for(&mut events, |event| matches!(
             event,
-            DriverEvent::Notice(notice)
+            DriverEvent::Notice(e6ircd::bouncer::BufferedLine { line: notice, .. })
                 if notice.contains("*bnc*") && notice.contains("cannot track: notachannel")
         ))
         .await,

@@ -434,14 +434,10 @@ pub(super) fn cmd_add_ban(
                 mask.as_str()
             ),
         );
-        notify_opers(
+        commit_server_ban(
             state,
-            None,
-            &format!("{nick} added {label} for {} ({reason})", mask.as_str()),
+            crate::core::ServerBanMutation::add(&mask, kind, reason, nick),
         );
-        let mutation = crate::core::ServerBanMutation::add(&mask, kind, reason, nick);
-        apply_committed_server_ban(state, mutation.clone());
-        state.broadcast_server_ban_after_local_apply(mutation);
         return;
     }
     let mutation = crate::core::ServerBanMutation::add(&mask, kind, reason, nick);
@@ -594,12 +590,28 @@ fn server_ban_oper_verdict(
     });
 }
 
+/// What a database verdict on a server-ban mutation leaves to be done, once
+/// the requester has been answered.
+#[derive(Debug)]
+pub(crate) enum ServerBanVerdict {
+    /// The change did not happen (the database was unavailable, or a removal
+    /// pinned to a row id found that row already gone); the hot lists stand.
+    Nothing,
+    /// The database holds the change: every shard enforces it, and the
+    /// operators hear of it once.
+    Committed(crate::core::ServerBanMutation),
+    /// A removal keyed only by mask found no row: the database holds no such
+    /// ban, so every shard stops enforcing one. Nothing was removed, so there
+    /// is nothing to announce — the requester was told there was no stored ban.
+    Unstored(crate::core::ServerBanMutation),
+}
+
 pub(crate) fn server_ban_result(
     state: &mut ServerState,
     mutation: crate::core::ServerBanMutation,
     requester: crate::core::ServerBanRequester,
     result: crate::core::ServerBanResult,
-) -> Option<crate::core::ServerBanMutation> {
+) -> ServerBanVerdict {
     let (kind_token, folded_mask) = mutation.key();
     state
         .pending_server_bans
@@ -607,11 +619,11 @@ pub(crate) fn server_ban_result(
     let Some(kind) = BanKind::from_token(kind_token) else {
         eprintln!("core: database echoed invalid server-ban kind {kind_token:?}");
         finish_server_ban_unavailable(state, requester, "server-ban result was invalid");
-        return None;
+        return ServerBanVerdict::Nothing;
     };
     if result == crate::core::ServerBanResult::Unavailable {
         finish_server_ban_unavailable(state, requester, "services are temporarily unavailable");
-        return None;
+        return ServerBanVerdict::Nothing;
     }
     if result == crate::core::ServerBanResult::Missing {
         // A removal keyed only by (mask, kind) found no row, so the database
@@ -636,7 +648,11 @@ pub(crate) fn server_ban_result(
                 message: "server ban no longer exists".into(),
             },
         );
-        return unstored.then_some(mutation);
+        return if unstored {
+            ServerBanVerdict::Unstored(mutation)
+        } else {
+            ServerBanVerdict::Nothing
+        };
     }
 
     let (mask_display, action) = match &mutation {
@@ -651,7 +667,7 @@ pub(crate) fn server_ban_result(
         &text,
         crate::core::AdminReply::Ok(text.clone()),
     );
-    Some(mutation)
+    ServerBanVerdict::Committed(mutation)
 }
 
 /// Deliver one server-ban verdict to whoever asked for the change: the
@@ -672,7 +688,28 @@ fn finish_server_ban(
     }
 }
 
-/// Apply a committed server-ban transition on one shard.
+/// Commit a server-ban change this shard decided: enforce it here and on
+/// every other shard, and tell the operators — once. The other shards apply
+/// the broadcast copy without announcing ([`apply_committed_server_ban`]).
+pub(crate) fn commit_server_ban(state: &mut ServerState, mutation: crate::core::ServerBanMutation) {
+    reconcile_server_ban_everywhere(state, mutation.clone());
+    announce_server_ban(state, &mutation);
+}
+
+/// Bring every shard's hot list in line with a committed transition, without
+/// an announcement: for a removal that found no stored ban, nothing happened
+/// that another operator need hear of.
+pub(crate) fn reconcile_server_ban_everywhere(
+    state: &mut ServerState,
+    mutation: crate::core::ServerBanMutation,
+) {
+    apply_committed_server_ban(state, mutation.clone());
+    state.broadcast_server_ban_after_local_apply(mutation);
+}
+
+/// Apply a committed server-ban transition on one shard: the hot list, and
+/// the disconnection of local sessions the ban matches. Nothing is announced
+/// here — the committing shard does that, once, in [`commit_server_ban`].
 pub(crate) fn apply_committed_server_ban(
     state: &mut ServerState,
     mutation: crate::core::ServerBanMutation,
@@ -686,12 +723,29 @@ pub(crate) fn apply_committed_server_ban(
             ..
         } => {
             let (kind, mask, label) = committed_ban_parts(state, &kind, &mask_display);
-            apply_server_ban_hot(state, mask.clone(), kind, &reason, &set_by, label);
-            notify_opers(
-                state,
-                None,
-                &format!("{set_by} added {label} for {} ({reason})", mask.as_str()),
-            );
+            apply_server_ban_hot(state, mask, kind, &reason, &set_by, label);
+        }
+        crate::core::ServerBanMutation::Remove {
+            mask_display, kind, ..
+        } => {
+            let (kind, mask, _) = committed_ban_parts(state, &kind, &mask_display);
+            remove_server_ban_hot(state, &mask, kind);
+        }
+    }
+}
+
+/// The operator server-notice for a committed server-ban change.
+fn announce_server_ban(state: &mut ServerState, mutation: &crate::core::ServerBanMutation) {
+    let text = match mutation {
+        crate::core::ServerBanMutation::Add {
+            mask_display,
+            reason,
+            set_by,
+            kind,
+            ..
+        } => {
+            let (_, mask, label) = committed_ban_parts(state, kind, mask_display);
+            format!("{set_by} added {label} for {} ({reason})", mask.as_str())
         }
         crate::core::ServerBanMutation::Remove {
             mask_display,
@@ -699,15 +753,11 @@ pub(crate) fn apply_committed_server_ban(
             kind,
             ..
         } => {
-            let (kind, mask, label) = committed_ban_parts(state, &kind, &mask_display);
-            remove_server_ban_hot(state, &mask, kind);
-            notify_opers(
-                state,
-                None,
-                &format!("{actor} removed {label} for {}", mask.as_str()),
-            );
+            let (_, mask, label) = committed_ban_parts(state, kind, mask_display);
+            format!("{actor} removed {label} for {}", mask.as_str())
         }
-    }
+    };
+    notify_opers(state, None, &text);
 }
 
 fn committed_ban_parts(
@@ -796,9 +846,10 @@ pub(super) fn cmd_remove_ban(state: &mut ServerState, conn: ConnId, kind: BanKin
         return;
     }
     if !state.config.sasl_enabled {
-        let mutation = crate::core::ServerBanMutation::remove(&mask, kind, nick.clone());
-        apply_committed_server_ban(state, mutation.clone());
-        state.broadcast_server_ban_after_local_apply(mutation);
+        commit_server_ban(
+            state,
+            crate::core::ServerBanMutation::remove(&mask, kind, nick.clone()),
+        );
         state.send(
             conn,
             &format!(

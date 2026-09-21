@@ -4,16 +4,23 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  DEFAULT_CHANNEL_MODES,
   asMessage,
+  channelModesFrom,
   chatMessageRoute,
   fold,
+  isPrefixMode,
   kickPairs,
+  memberRank,
   membershipTargets,
   mergeTimeline,
   messageIdentity,
+  modeChanges,
+  modeTakesParameter,
   nickPrefix,
   parseIrc,
   reconcileChannelSnapshot,
+  serverBufferText,
   splitSigil,
   stripFormatting,
   tagValue,
@@ -218,3 +225,84 @@ test("a CTCP other than ACTION is named, not shown as raw control bytes", () => 
     kind: "event", from: null, text: "alice sent a CTCP PING request: 12345",
   });
 });
+
+// ---- ISUPPORT-driven channel modes (item: MODE argument alignment) --------
+//
+// Libera declares PREFIX=(ov)@+ and CHANMODES=eIbq,k,flj,...: +q is a quiet
+// list, not owner, and +f takes a parameter when set. Read with the RFC-style
+// defaults, `+fo #overflow alice` hands #overflow to `o` and drops alice.
+
+test("the pre-005 default table is the current one", () => {
+  assert.equal(modeTakesParameter(DEFAULT_CHANNEL_MODES, "o", true), true);
+  assert.equal(modeTakesParameter(DEFAULT_CHANNEL_MODES, "b", false), true);
+  assert.equal(modeTakesParameter(DEFAULT_CHANNEL_MODES, "k", false), true);
+  assert.equal(modeTakesParameter(DEFAULT_CHANNEL_MODES, "l", true), true);
+  assert.equal(modeTakesParameter(DEFAULT_CHANNEL_MODES, "l", false), false);
+  assert.equal(modeTakesParameter(DEFAULT_CHANNEL_MODES, "f", true), false);
+  assert.equal(isPrefixMode(DEFAULT_CHANNEL_MODES, "q"), true);
+  assert.equal(nickPrefix(new Set(["q", "v"]), DEFAULT_CHANNEL_MODES), "~");
+});
+
+test("005 CHANMODES and PREFIX drive parameters and sigils for that network", () => {
+  const first = channelModesFrom(
+    parseIrc(":irc.libera.chat 005 me CHANMODES=eIbq,k,flj,CFLMPQRSTcgimnprstuz :are supported by this server").params,
+  );
+  assert.deepEqual(first.malformed, []);
+  const second = channelModesFrom(
+    parseIrc(":irc.libera.chat 005 me PREFIX=(ov)@+ STATUSMSG=@+ :are supported by this server").params,
+    first.modes,
+  );
+  const libera = second.modes;
+  assert.equal(modeTakesParameter(libera, "f", true), true, "+f takes its limit when set");
+  assert.equal(modeTakesParameter(libera, "f", false), false, "-f takes nothing");
+  assert.equal(modeTakesParameter(libera, "q", true), true, "+q is a quiet mask, a list mode");
+  assert.equal(isPrefixMode(libera, "q"), false, "+q is not owner on Libera");
+  assert.equal(isPrefixMode(libera, "o"), true);
+  assert.deepEqual(splitSigil("@+alice", libera), { name: "alice", modes: new Set(["o", "v"]) });
+  // A sigil the network does not declare is part of the nick, not a rank.
+  assert.equal(splitSigil("~tilde", libera).name, "~tilde");
+  assert.equal(nickPrefix(new Set(["o", "v"]), libera), "@");
+  assert.equal(memberRank(new Set(["v"]), libera), 1);
+  assert.equal(memberRank(new Set(), libera), 2);
+});
+
+test("MODE arguments are assigned by the network's table", () => {
+  const libera = channelModesFrom(
+    parseIrc(":s 005 me CHANMODES=eIbq,k,flj,CFLMPQRSTcgimnprstuz PREFIX=(ov)@+ :are supported by this server").params,
+  ).modes;
+  assert.deepEqual(modeChanges(libera, "+fo", ["#overflow", "alice"]), [
+    { mode: "f", adding: true, argument: "#overflow" },
+    { mode: "o", adding: true, argument: "alice" },
+  ]);
+  assert.deepEqual(modeChanges(libera, "+q-l", ["*!*@spam"]), [
+    { mode: "q", adding: true, argument: "*!*@spam" },
+    { mode: "l", adding: false, argument: undefined },
+  ]);
+  // Before 005 the default table reads the same line the way it used to.
+  assert.deepEqual(modeChanges(DEFAULT_CHANNEL_MODES, "+o-l", ["alice"]), [
+    { mode: "o", adding: true, argument: "alice" },
+    { mode: "l", adding: false, argument: undefined },
+  ]);
+});
+
+test("a malformed ISUPPORT token is reported and leaves the table alone", () => {
+  const result = channelModesFrom(parseIrc(":s 005 me PREFIX=(ov)@ CHANMODES=a,b :are supported").params);
+  assert.deepEqual(result.malformed, ["PREFIX=(ov)@", "CHANMODES=a,b"]);
+  assert.deepEqual(result.modes, DEFAULT_CHANNEL_MODES);
+  // An empty PREFIX is a network with no ranks at all, which is well-formed.
+  assert.deepEqual(channelModesFrom(parseIrc(":s 005 me PREFIX= :are supported").params).modes.prefix, []);
+});
+
+// ---- server-buffer rendering of non-chat commands -------------------------
+
+test("a command from a user keeps its subject in the server buffer", () => {
+  const text = (line, own = "me") => serverBufferText(parseIrc(line), line, own);
+  assert.equal(text(":alice!u@h INVITE me :#secret"), "alice invited you to #secret");
+  assert.equal(text(":alice!u@h INVITE bob #secret"), "alice invited bob to #secret");
+  assert.equal(text(":alice!u@h WALLOPS :server going down"), "alice WALLOPS server going down");
+  // Numerics carry their human text last, as before.
+  assert.equal(text(":irc.example 372 me :- welcome"), "- welcome");
+  assert.equal(text("PING :irc.example"), "PING irc.example");
+  assert.equal(text(":irc.example ERROR :Closing Link"), "irc.example ERROR Closing Link");
+});
+

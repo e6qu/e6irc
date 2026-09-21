@@ -301,7 +301,7 @@ pub async fn verify_round_trip(
             .await
             .expect("component-log timeout")
             .expect("component-log event"),
-        super::DriverEvent::Line(line) if line == ":*bnc* NOTICE * :component connected: unregistered network"
+        super::DriverEvent::Line(super::BufferedLine { line, .. }) if line == ":*bnc* NOTICE * :component connected: unregistered network"
     ));
 
     if matches!(provider, Provider::Slack) {
@@ -318,13 +318,13 @@ pub async fn verify_round_trip(
         }
         Provider::Slack => ":Alice!Alice@slack PRIVMSG #general :hello from Slack".to_string(),
     };
-    assert_eq!(
+    assert!(matches!(
         tokio::time::timeout(std::time::Duration::from_secs(2), driver_events.recv())
             .await
             .expect("inbound timeout")
             .expect("inbound event"),
-        super::DriverEvent::Line(expected_line)
-    );
+        super::DriverEvent::Line(super::BufferedLine { line, .. }) if line == expected_line
+    ));
 
     assert_eq!(
         handle.send("PRIVMSG #general :hello from IRC"),

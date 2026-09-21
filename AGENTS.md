@@ -172,7 +172,8 @@ mistake, before a single line changes.
 
 ## Practical checklist before you stop
 
-- [ ] Builds green (default **and** every feature: `embed-web`, `matrix`).
+- [ ] Builds green (default **and** every feature: `embed-web`, and `matrix`,
+      `discord`, `slack` each on its own, as CI does).
 - [ ] `cargo test --workspace` passes; PG/feature-gated suites run where
       the environment allows.
 - [ ] `cargo clippy --workspace --all-targets` clean in each feature

@@ -112,7 +112,7 @@ pub(super) struct BrowserSessionBulkDeleteQuery {
 /// cannot broaden into a destructive account-wide operation.
 pub(super) async fn revoke_other_browser_sessions(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<BrowserSessionBulkDeleteQuery>,
+    QueryParams(query): QueryParams<BrowserSessionBulkDeleteQuery>,
     BrowserSession(account, current): BrowserSession,
 ) -> Response {
     if query.except.as_deref() != Some("current") {
@@ -341,7 +341,7 @@ fn live_connection_page_response(page: crate::core::LiveConnectionPage) -> Respo
 pub(super) async fn admin_connections(
     State(state): State<Arc<AppState>>,
     _admin: AdminAccount,
-    Query(params): Query<LiveConnectionQueryParams>,
+    QueryParams(params): QueryParams<LiveConnectionQueryParams>,
 ) -> Response {
     let query = match validate_live_connection_query(params, 100) {
         Ok(query) => query,
@@ -356,7 +356,7 @@ pub(super) async fn admin_connections(
 pub(super) async fn me_connections(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Query(params): Query<OwnLiveConnectionQueryParams>,
+    QueryParams(params): QueryParams<OwnLiveConnectionQueryParams>,
 ) -> Response {
     let query = match validate_live_connection_query(params.into(), 100) {
         Ok(query) => query,
@@ -445,7 +445,7 @@ pub(super) async fn admin_disconnect_connection(
     State(state): State<Arc<AppState>>,
     AdminAccount(actor): AdminAccount,
     Path(connection_id): Path<u64>,
-    Query(params): Query<DisconnectConnectionQuery>,
+    QueryParams(params): QueryParams<DisconnectConnectionQuery>,
 ) -> Response {
     validated_disconnect(&state, connection_id, params, |connection_id, reason| {
         crate::core::AdminRequest::DisconnectConnection {
@@ -461,7 +461,7 @@ pub(super) async fn me_disconnect_connection(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
     Path(connection_id): Path<u64>,
-    Query(params): Query<DisconnectConnectionQuery>,
+    QueryParams(params): QueryParams<DisconnectConnectionQuery>,
 ) -> Response {
     validated_disconnect(&state, connection_id, params, |connection_id, reason| {
         crate::core::AdminRequest::DisconnectOwnConnection {

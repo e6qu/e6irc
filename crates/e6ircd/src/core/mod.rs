@@ -28,7 +28,7 @@ use bytes::Bytes;
 use e6irc_queue::Envelope;
 use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
 use state::{
-    ChannelActor, ChannelCommand, ChannelCommandResult, ChannelJoinResult, ChannelKick,
+    ChanKey, ChannelActor, ChannelCommand, ChannelCommandResult, ChannelJoinResult, ChannelKick,
     ChannelKickResult, ChannelListRequest, ChannelListResult, ChannelMemberUpdate, ChannelMessage,
     ChannelMessageResult, ChannelMultiline, ChannelMultilineResult, ChannelPartResult, ChannelQuit,
     ChannelTagmsg, ChannelTagmsgResult, ChannelTopic, ChannelTopicResult,
@@ -530,8 +530,13 @@ pub enum Input {
         label: Option<String>,
     },
     /// The channel owner's typed answer, processed only by the session owner.
+    /// `requested` is the channel the JOIN named, keyed as the session owner
+    /// keyed it when it counted the request against the channel limit
+    /// (`Session::pending_joins`), so that reservation is released whatever
+    /// the answer says.
     ChannelJoinResult {
         session: SessionOwner,
+        requested: ChanKey,
         result: ChannelJoinResult,
         label: Option<String>,
     },
@@ -1796,25 +1801,6 @@ pub enum DbReply {
     AccountRegisterUnavailable {
         origin: AccountOrigin,
     },
-    /// A TOPIC request reached the registered-channel row. `retained` is the
-    /// row's KEEPTOPIC value: the live topic is valid either way, while only a
-    /// retained topic enters the restart-surviving hot mirror.
-    ChannelTopicSet {
-        channel: String,
-        display: String,
-        prefix: String,
-        topic: Option<(String, String, u64)>,
-        revision: u64,
-        retained: bool,
-        label: Option<String>,
-    },
-    ChannelTopicFailed {
-        channel: String,
-        display: String,
-        revision: u64,
-        label: Option<String>,
-        failure: ChannelTopicFailure,
-    },
     /// A read marker was durably stored. `marker_ms` is the value PostgreSQL
     /// returned after applying the monotonic `GREATEST`, not merely the value
     /// the client requested.
@@ -2376,6 +2362,7 @@ impl Core {
             }
             Input::ChannelJoinResult {
                 session,
+                requested,
                 result,
                 label,
             } => {
@@ -2384,7 +2371,13 @@ impl Core {
                     self.shard,
                     "JOIN result reached wrong session shard"
                 );
-                handler::channel_join_result(&mut self.state, session.conn(), result, label);
+                handler::channel_join_result(
+                    &mut self.state,
+                    session.conn(),
+                    requested,
+                    result,
+                    label,
+                );
             }
             Input::ChannelPart {
                 owner,
@@ -2718,11 +2711,15 @@ impl Core {
                 requester,
                 result,
             } => {
-                if let Some(mutation) =
-                    handler::oper::server_ban_result(&mut self.state, mutation, requester, result)
+                match handler::oper::server_ban_result(&mut self.state, mutation, requester, result)
                 {
-                    handler::oper::apply_committed_server_ban(&mut self.state, mutation.clone());
-                    self.state.broadcast_server_ban_after_local_apply(mutation);
+                    handler::oper::ServerBanVerdict::Nothing => {}
+                    handler::oper::ServerBanVerdict::Committed(mutation) => {
+                        handler::oper::commit_server_ban(&mut self.state, mutation);
+                    }
+                    handler::oper::ServerBanVerdict::Unstored(mutation) => {
+                        handler::oper::reconcile_server_ban_everywhere(&mut self.state, mutation);
+                    }
                 }
             }
             Input::ServerBanApplied { mutation } => {
@@ -3857,12 +3854,36 @@ mod ingress_tests {
         }
 
         fn line(&mut self, conn: u64, line: &str) {
+            self.push_line(conn, line);
+            self.settle();
+        }
+
+        /// Hand `conn`'s shard a line without carrying what it causes to the
+        /// other shards: several of these in a row are a pipelined burst whose
+        /// answers are all still in flight until the next `settle`.
+        fn push_line(&mut self, conn: u64, line: &str) {
             let shard = conn as usize % self.cores.len();
             self.cores[shard].handle(Input::Line {
                 conn: ConnId(conn),
                 line: line.as_bytes().to_vec(),
             });
-            self.settle();
+        }
+
+        /// The shard `conn` lives on.
+        fn shard_of(&self, conn: u64) -> usize {
+            conn as usize % self.cores.len()
+        }
+
+        /// The next request `shard` sent the database worker of a given kind,
+        /// discarding the ones before it.
+        fn database_request<T>(
+            &mut self,
+            shard: usize,
+            pick: impl Fn(super::DbRequest) -> Option<T>,
+        ) -> T {
+            std::iter::from_fn(|| self.database[shard].try_pop())
+                .find_map(|request| pick(request.payload))
+                .expect("the shard asked the database")
         }
 
         fn close(&mut self, conn: u64) {
@@ -4064,12 +4085,8 @@ mod ingress_tests {
         // carol's account owns the nick a stale connection still holds.
         shards.client(3, "carol", "");
         shards.client(4, "visitor", "");
-        shards.cores[0]
-            .state
-            .sessions
-            .get_mut(&ConnId(4))
-            .expect("visitor")
-            .account = Some("carol".into());
+        shards.cores[0].state.set_account(ConnId(4), "carol".into());
+        shards.settle();
         shards.line(4, "PRIVMSG NickServ :GHOST carol");
         assert!(
             shards.cores[1].state.sessions.get(&ConnId(3)).is_none(),
@@ -4280,6 +4297,258 @@ mod ingress_tests {
             from_two_workers,
             targets_after_speaking_in(Shards::on_one_worker(), channels),
             "the answer on two workers is the answer on one"
+        );
+    }
+
+    /// alice, not logged in, confides in bob, then identifies to her account
+    /// and leaves. A stranger takes the nick `alice` and asks for the
+    /// conversation with bob. Returns what CHATHISTORY shows the stranger and
+    /// the ring conversations TARGETS hands the database on their behalf.
+    fn conversation_after_login_and_nick_reuse(
+        mut shards: Shards,
+    ) -> (Vec<String>, Vec<(String, e6irc_proto::time::Millis)>) {
+        let caps = "batch draft/chathistory";
+        shards.client(2, "alice", caps);
+        shards.client(1, "bob", caps);
+        shards.line(2, "PRIVMSG bob :the secret");
+        assert_eq!(lines_with(&shards.drain(1), ":the secret").len(), 1);
+        shards.line(2, "PRIVMSG NickServ :IDENTIFY alice pw");
+        let shard = shards.shard_of(2);
+        shards.database_request(shard, |request| {
+            matches!(request, super::DbRequest::VerifyPassword { .. }).then_some(())
+        });
+        shards.cores[shard].handle(Input::DbReply {
+            conn: ConnId(2),
+            reply: super::DbReply::PasswordVerified {
+                account: "alice".into(),
+                origin: super::CredentialOrigin::NickServIdentify,
+            },
+        });
+        shards.settle();
+        assert_eq!(
+            lines_with(&shards.drain(2), "You are now identified").len(),
+            1
+        );
+        shards.close(2);
+        // The stranger lands on bob's shard, which keeps its own copy of the
+        // rings of every conversation bob is in.
+        shards.client(3, "alice", caps);
+        shards.line(3, "CHATHISTORY LATEST bob * 10");
+        // The messages inside the batch; its reference is a per-shard counter.
+        let history: Vec<String> = shards
+            .drain(3)
+            .into_iter()
+            .filter(|line| line.contains(" PRIVMSG "))
+            .collect();
+        shards.line(
+            3,
+            "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:01.000Z \
+             timestamp=2999-01-01T00:00:00.000Z 10",
+        );
+        let stranger = shards.shard_of(3);
+        let session_only = shards.database_request(stranger, |request| match request {
+            super::DbRequest::QueryTargets { session_only, .. } => Some(session_only),
+            _ => None,
+        });
+        (history, session_only)
+    }
+
+    /// `~alice` is whoever holds the nick without an account. The moment alice
+    /// logs in she is `alice`, and `~alice` is free for the next holder — so
+    /// the conversations kept under it are freed then, on every shard, exactly
+    /// as they are when she disconnects or changes nick without logging in.
+    #[test]
+    fn logging_in_frees_the_conversations_of_the_unauthenticated_nick() {
+        let on_two_workers = conversation_after_login_and_nick_reuse(Shards::with_database());
+        assert!(
+            lines_with(&on_two_workers.0, "the secret").is_empty(),
+            "the stranger read alice's conversation: {:#?}",
+            on_two_workers.0
+        );
+        assert!(
+            on_two_workers.1.is_empty(),
+            "TARGETS still lists alice's conversation: {:?}",
+            on_two_workers.1
+        );
+        MONO_NOW.with(|now| now.set(0));
+        assert_eq!(
+            on_two_workers,
+            conversation_after_login_and_nick_reuse(Shards::build(1, true)),
+            "the answer on two workers is the answer on one"
+        );
+    }
+
+    /// alice joins 240 channels one at a time, then sends eleven JOINs for
+    /// channels owned by the shard she is not on before any of them is
+    /// answered. Returns how many she joined and which targets were refused.
+    fn join_burst_answer(mut shards: Shards) -> (usize, Vec<String>) {
+        shards.client(2, "alice", "");
+        for i in 0..240 {
+            shards.line(2, &format!("JOIN #fill{i}"));
+            if i % 10 == 9 {
+                shards.drain(2);
+            }
+        }
+        shards.drain(2);
+        let remote_shard = CoreShardId(shards.cores.len() - 1);
+        let burst: Vec<String> = (0..)
+            .map(|i| format!("#burst{i}"))
+            .filter(|name| shards.cores[0].state.channel_owner(name).shard() == remote_shard)
+            .take(11)
+            .collect();
+        for name in &burst {
+            shards.push_line(2, &format!("JOIN {name}"));
+        }
+        shards.settle();
+        let out = shards.drain(2);
+        let joined = out
+            .iter()
+            .filter(|line| line.starts_with(":alice!") && line.contains(" JOIN #burst"))
+            .count();
+        let refused = out
+            .iter()
+            .filter(|line| line.contains(" 405 alice "))
+            .map(|line| line.split(' ').nth(3).expect("refused target").to_string())
+            .collect();
+        (joined, refused)
+    }
+
+    /// CHANLIMIT is enforced by the shard that holds the session, and a JOIN
+    /// it routed to another shard counts from the moment it is sent — not
+    /// from when the answer comes back — or a pipelined burst is unbounded.
+    #[test]
+    fn a_burst_of_joins_to_another_shard_is_capped_like_local_ones() {
+        let (joined, refused) = join_burst_answer(Shards::new());
+        assert_eq!(joined, 10, "ten of the eleven fit under the limit");
+        assert_eq!(
+            refused.len(),
+            1,
+            "the eleventh is ERR_TOOMANYCHANNELS: {refused:?}"
+        );
+        MONO_NOW.with(|now| now.set(0));
+        let on_one_worker = join_burst_answer(Shards::on_one_worker());
+        assert_eq!(
+            (joined, refused.len()),
+            (on_one_worker.0, on_one_worker.1.len()),
+            "the answer on two workers is the answer on one"
+        );
+    }
+
+    /// Two operators, one per shard.
+    fn operators_on_each_shard(mut shards: Shards) -> Shards {
+        shards.client(2, "alice", "");
+        shards.client(1, "bob", "");
+        for conn in [2, 1] {
+            shards.line(conn, "OPER root secret");
+            shards.drain(conn);
+        }
+        shards
+    }
+
+    fn server_ban_notices<'a>(out: &'a [String], change: &str) -> Vec<&'a str> {
+        lines_with(
+            out,
+            &format!("Notice -- alice {change} K-Line for bad@host.example"),
+        )
+    }
+
+    /// A server ban is one event, whichever shard commits it: every operator
+    /// hears of it once, not once per shard that reconciled its hot list.
+    #[test]
+    fn a_server_ban_is_announced_to_each_operator_once() {
+        let mut shards = operators_on_each_shard(Shards::new());
+        shards.line(2, "KLINE bad@host.example :spam");
+        for conn in [2, 1] {
+            let out = shards.drain(conn);
+            assert_eq!(
+                server_ban_notices(&out, "added").len(),
+                1,
+                "connection {conn}: {out:#?}"
+            );
+        }
+        assert!(
+            shards
+                .cores
+                .iter()
+                .all(|core| core.state.server_bans.len() == 1),
+            "every shard enforces the ban"
+        );
+        shards.line(2, "UNKLINE bad@host.example");
+        for conn in [2, 1] {
+            let out = shards.drain(conn);
+            assert_eq!(
+                server_ban_notices(&out, "removed").len(),
+                1,
+                "connection {conn}: {out:#?}"
+            );
+        }
+        assert!(
+            shards
+                .cores
+                .iter()
+                .all(|core| core.state.server_bans.is_empty()),
+            "every shard stopped enforcing the ban"
+        );
+    }
+
+    /// Answer the one server-ban mutation alice's shard queued.
+    fn answer_server_ban(shards: &mut Shards, result: super::ServerBanResult) {
+        let shard = shards.shard_of(2);
+        let (mutation, requester) = shards.database_request(shard, |request| match request {
+            super::DbRequest::MutateServerBan {
+                mutation,
+                requester,
+            } => Some((mutation, requester)),
+            _ => None,
+        });
+        shards.cores[shard].handle(Input::ServerBanResult {
+            mutation,
+            requester,
+            result,
+        });
+        shards.settle();
+    }
+
+    /// A removal the database could not find still makes every shard stop
+    /// enforcing the ban, but there is nothing to announce: the requester was
+    /// told there was no stored ban, and no other operator is told a ban was
+    /// removed.
+    #[test]
+    fn a_removal_that_found_no_stored_ban_reconciles_without_an_announcement() {
+        let mut shards = operators_on_each_shard(Shards::with_database());
+        shards.line(2, "KLINE bad@host.example :spam");
+        answer_server_ban(&mut shards, super::ServerBanResult::Stored);
+        for conn in [2, 1] {
+            let out = shards.drain(conn);
+            assert_eq!(
+                server_ban_notices(&out, "added").len(),
+                1,
+                "connection {conn}: {out:#?}"
+            );
+        }
+        shards.line(2, "UNKLINE bad@host.example");
+        answer_server_ban(&mut shards, super::ServerBanResult::Missing);
+        let out = shards.drain(2);
+        assert_eq!(
+            lines_with(&out, "No stored K-Line for bad@host.example").len(),
+            1,
+            "{out:#?}"
+        );
+        assert!(
+            server_ban_notices(&out, "removed").is_empty(),
+            "alice: {out:#?}"
+        );
+        let out = shards.drain(1);
+        assert!(
+            server_ban_notices(&out, "removed").is_empty(),
+            "bob: {out:#?}"
+        );
+        assert!(
+            shards
+                .cores
+                .iter()
+                .all(|core| core.state.server_bans.is_empty()),
+            "every shard stopped enforcing the ban the database does not hold"
         );
     }
 

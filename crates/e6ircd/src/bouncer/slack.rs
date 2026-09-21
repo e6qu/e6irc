@@ -87,14 +87,16 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
         }
     };
     let ws =
-        match super::bridge_ws_open(&ws_url, "slack", "socket", config.internal_upstreams).await {
+        match super::bridge_ws_open(&ws_url, "slack", "socket", &base, config.internal_upstreams)
+            .await
+        {
             Ok(ws) => ws,
             Err(outcome) => return outcome,
         };
     let (mut write, mut read) = ws.split();
     ends.emit(ConnectionEvent::Connected);
 
-    let mut user_names: HashMap<String, String> = HashMap::new();
+    let mut user_names = UserNames::default();
 
     let mut silence = super::SilenceDeadline::new(Duration::from_secs(90));
     loop {
@@ -145,7 +147,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                                         m.user.clone()
                                     }
                                 };
-                            user_names.insert(m.user.clone(), name.clone());
+                            user_names.remember(m.user.clone(), name.clone());
                             name
                         }
                     };
@@ -175,6 +177,39 @@ struct SlackMessage {
     channel: String,
     user: String,
     text: String,
+}
+
+/// Distinct upstream user ids whose display names one session remembers. The
+/// ids are the upstream's to mint, so the cache is bounded like every other
+/// upstream-driven table; a workspace with more speakers than this only pays
+/// a `users.info` lookup again after the cache is cleared.
+const MAX_USER_NAMES: usize = 4096;
+
+/// Display names by Slack user id, bounded by [`MAX_USER_NAMES`].
+#[derive(Default)]
+struct UserNames {
+    names: HashMap<String, String>,
+    /// How many times the full cache was cleared, for the log line.
+    clears: u64,
+}
+
+impl UserNames {
+    fn get(&self, user: &str) -> Option<&String> {
+        self.names.get(user)
+    }
+
+    fn remember(&mut self, user: String, name: String) {
+        if !self.names.contains_key(&user) && self.names.len() >= MAX_USER_NAMES {
+            self.clears += 1;
+            eprintln!(
+                "slack: {MAX_USER_NAMES} distinct user ids seen; the display-name cache was \
+                 cleared (clear #{})",
+                self.clears
+            );
+            self.names.clear();
+        }
+        self.names.insert(user, name);
+    }
 }
 
 struct Envelope {
@@ -366,7 +401,7 @@ fn slack_failure(context: &str, err: &str) -> super::SessionOutcome {
 }
 
 async fn open_socket(
-    http: &reqwest::Client,
+    http: &super::BridgeHttp,
     base: &str,
     app_token: &str,
 ) -> Result<String, String> {
@@ -376,7 +411,7 @@ async fn open_socket(
     }
 
     decode_slack_response::<SocketOpen>(
-        http.post(format!("{base}/apps.connections.open"))
+        http.post(&format!("{base}/apps.connections.open"))?
             .header("Authorization", format!("Bearer {app_token}"))
             .send()
             .await
@@ -387,7 +422,7 @@ async fn open_socket(
 }
 
 async fn fetch_channel_name(
-    http: &reqwest::Client,
+    http: &super::BridgeHttp,
     base: &str,
     bot_token: &str,
     id: &str,
@@ -417,14 +452,14 @@ async fn fetch_channel_name(
 }
 
 async fn slack_get_json<T: DeserializeOwned>(
-    http: &reqwest::Client,
+    http: &super::BridgeHttp,
     base: &str,
     token: &str,
     method: &str,
     query: &[(&str, &str)],
 ) -> Result<T, String> {
     decode_slack_response(
-        http.get(format!("{base}/{method}"))
+        http.get(&format!("{base}/{method}"))?
             .header("Authorization", format!("Bearer {token}"))
             .query(query)
             .send()
@@ -435,7 +470,7 @@ async fn slack_get_json<T: DeserializeOwned>(
 }
 
 async fn fetch_user_name(
-    http: &reqwest::Client,
+    http: &super::BridgeHttp,
     base: &str,
     bot_token: &str,
     id: &str,
@@ -473,7 +508,7 @@ async fn fetch_user_name(
 }
 
 async fn post_message(
-    http: &reqwest::Client,
+    http: &super::BridgeHttp,
     base: &str,
     bot_token: &str,
     channel_id: &str,
@@ -486,7 +521,7 @@ async fn post_message(
     }
 
     let req = http
-        .post(format!("{base}/chat.postMessage"))
+        .post(&format!("{base}/chat.postMessage"))?
         .header("Authorization", format!("Bearer {bot_token}"))
         .json(&PostMessage {
             channel: channel_id,
@@ -619,6 +654,27 @@ mod tests {
             route_privmsg("PRIVMSG #nope :x", &map),
             vec![RouteResult::Unmapped("#nope".to_string())]
         );
+    }
+
+    /// The upstream mints the user ids, so it decides how many distinct ones a
+    /// session sees; the cache cannot grow with them.
+    #[test]
+    fn the_user_name_cache_is_bounded_and_says_when_it_clears() {
+        let mut names = UserNames::default();
+        for index in 0..MAX_USER_NAMES {
+            names.remember(format!("U{index}"), format!("user {index}"));
+        }
+        assert_eq!(names.names.len(), MAX_USER_NAMES);
+        assert_eq!(names.clears, 0);
+        // A known id is refreshed in place, never counted as growth.
+        names.remember("U0".into(), "renamed".into());
+        assert_eq!(names.get("U0").map(String::as_str), Some("renamed"));
+        assert_eq!(names.names.len(), MAX_USER_NAMES);
+        // One more distinct id clears the cache and counts the clear.
+        names.remember("Unew".into(), "new".into());
+        assert_eq!(names.names.len(), 1);
+        assert_eq!(names.get("Unew").map(String::as_str), Some("new"));
+        assert_eq!(names.clears, 1);
     }
 
     #[test]

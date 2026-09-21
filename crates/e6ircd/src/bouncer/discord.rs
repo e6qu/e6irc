@@ -110,7 +110,9 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
         }
     };
     let ws =
-        match super::bridge_ws_open(&url, "discord", "gateway", config.internal_upstreams).await {
+        match super::bridge_ws_open(&url, "discord", "gateway", &base, config.internal_upstreams)
+            .await
+        {
             Ok(ws) => ws,
             Err(outcome) => return outcome,
         };
@@ -438,13 +440,13 @@ fn parse_frame(text: &str) -> Result<Frame, String> {
     })
 }
 
-async fn gateway_url(http: &reqwest::Client, base: &str) -> Result<String, String> {
+async fn gateway_url(http: &super::BridgeHttp, base: &str) -> Result<String, String> {
     #[derive(serde::Deserialize)]
     struct GatewayResponse {
         url: String,
     }
 
-    let response: GatewayResponse = super::bridge_send(http.get(format!("{base}/gateway")))
+    let response: GatewayResponse = super::bridge_send(http.get(&format!("{base}/gateway"))?)
         .await?
         .bounded_json()
         .await?;
@@ -456,8 +458,8 @@ async fn gateway_url(http: &reqwest::Client, base: &str) -> Result<String, Strin
 }
 
 fn gateway_connection_url(gateway: &str) -> Result<String, String> {
-    let mut url = openidconnect::url::Url::parse(gateway)
-        .map_err(|_| "must be an absolute ws(s) URL".to_string())?;
+    let mut url =
+        url::Url::parse(gateway).map_err(|_| "must be an absolute ws(s) URL".to_string())?;
     if !matches!(url.scheme(), "ws" | "wss")
         || url.host_str().is_none()
         || !url.username().is_empty()
@@ -480,7 +482,7 @@ fn gateway_connection_url(gateway: &str) -> Result<String, String> {
 }
 
 async fn fetch_channel_name(
-    http: &reqwest::Client,
+    http: &super::BridgeHttp,
     base: &str,
     token: &str,
     id: &str,
@@ -491,7 +493,7 @@ async fn fetch_channel_name(
     }
 
     let response: ChannelResponse = super::bridge_send_credentials(
-        http.get(format!("{base}/channels/{id}"))
+        http.get(&format!("{base}/channels/{id}"))?
             .header("Authorization", format!("Bot {token}")),
         "channel lookup",
     )
@@ -506,7 +508,7 @@ async fn fetch_channel_name(
 }
 
 async fn send_message(
-    http: &reqwest::Client,
+    http: &super::BridgeHttp,
     base: &str,
     token: &str,
     channel_id: &str,
@@ -518,7 +520,7 @@ async fn send_message(
     }
 
     let req = http
-        .post(format!("{base}/channels/{channel_id}/messages"))
+        .post(&format!("{base}/channels/{channel_id}/messages"))?
         .header("Authorization", format!("Bot {token}"))
         .json(&MessageRequest { content: text });
     super::bridge_send(req).await?;
@@ -650,7 +652,7 @@ mod tests {
         let url =
             gateway_connection_url("wss://gateway.example/socket?compress=zlib&v=1&encoding=etf")
                 .expect("valid gateway URL");
-        let parsed = openidconnect::url::Url::parse(&url).expect("output URL");
+        let parsed = url::Url::parse(&url).expect("output URL");
         let query: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
         assert_eq!(query.get("compress"), Some(&"zlib".into()));
         assert_eq!(query.get("v"), Some(&"10".into()));

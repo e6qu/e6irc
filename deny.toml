@@ -1,3 +1,9 @@
+# The image ships every bridge and the embedded web client, so the policy is
+# judged over the all-features dependency graph locally as CI does; the
+# default-feature graph (`default = []`) would never see the bridge trees.
+[graph]
+all-features = true
+
 # cargo-deny configuration. Licenses must be AGPL-3.0-or-later compatible.
 
 [licenses]

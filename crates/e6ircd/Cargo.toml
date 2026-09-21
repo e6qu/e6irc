@@ -38,6 +38,9 @@ e6irc-client = { path = "../e6irc-client" }
 # rustls 0.23.45 (2026-09-14), tokio-rustls 0.26.4 (2025-09-26),
 # serde 1.0.228 (2025-09-27), toml 1.1.3 (2026-07-14).
 bytes = { version = "1.12.1", default-features = false }
+# url 2.5.8 is already in the tree through reqwest and openidconnect; named
+# here because `egress` judges upstream addresses by what its parser reads.
+url = "2.5.8"
 tokio = { version = "1.53.0", default-features = false, features = [
     "rt-multi-thread",
     "net",
@@ -79,6 +82,9 @@ sqlx = { version = "0.9.0", default-features = false, features = [
 ] }
 # argon2 0.5.3 (2024-03) — the 0.6 line is still RC, excluded by policy.
 argon2 = { version = "0.5.3", features = ["std"] }
+# zeroize 1.9.0 is already in the tree through argon2 and aws-lc-rs; named
+# here so a one-time recovery password is wiped when it is dropped.
+zeroize = { version = "1.9.0", default-features = false }
 # axum 0.8.9 (2026-04-14), serde_json 1.0.150 (2026-05-21),
 # http 1.4.2 (2026-06-08) — verified against crates.io, >24h old.
 axum = { version = "0.8.9", default-features = false, features = [
@@ -162,6 +168,10 @@ tokio-tungstenite = { version = "0.29.0", optional = true, default-features = fa
 futures-util = { version = "0.3", optional = true, default-features = false }
 
 [dev-dependencies]
+# Paused time for the reconnect-schedule tests: minutes of backoff run in no time.
+tokio = { version = "1.53.0", default-features = false, features = [
+    "test-util",
+] }
 # reqwest 0.12 line matches openidconnect's transitive pick; dev-only,
 # used to drive the OIDC dance in integration tests.
 reqwest = { version = "0.12.28", default-features = false, features = [

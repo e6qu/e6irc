@@ -146,17 +146,33 @@ let server = startApplicationServer();
 // script, including teardown, which those defaults do not cover.
 const watchdog = setTimeout(() => {
   console.error(
-    "test-oidc-browser: watchdog fired after 180s; forcing exit\n"
+    `test-oidc-browser: watchdog fired after ${watchdogMillis() / 1000}s; forcing exit\n`
       + `page: ${page?.url() ?? "not created"}\n`
       + `navigation: ${navigationTrace.slice(-8).join(" | ")}\n`
       + `requests: ${applicationRequests.slice(-16).join(" | ")}`,
   );
+  // The daemon is a child of this process but outlives a hard exit; left
+  // running it holds the fixed port and the database for the next run.
+  server?.kill("SIGKILL");
   process.exit(1);
-}, 180_000);
+}, watchdogMillis());
+
+// 180 s by default; a slower machine can raise it to see the real failing step
+// instead of the forced exit.
+function watchdogMillis() {
+  const seconds = process.env.E6IRC_BROWSER_WATCHDOG_SECONDS;
+  if (seconds === undefined) return 180_000;
+  assert.match(seconds, /^[1-9][0-9]{1,3}$/, "E6IRC_BROWSER_WATCHDOG_SECONDS must be 10..9999");
+  return Number(seconds) * 1000;
+}
 
 const artifactDirectory = process.env.E6IRC_BROWSER_ARTIFACTS_DIR
   ? resolve(repositoryRoot, process.env.E6IRC_BROWSER_ARTIFACTS_DIR)
   : undefined;
+// The mocked UI socket issues replay cursors the way the server does: opaque,
+// unique and increasing within one ring lifetime.
+let mockCursorSeq = 0;
+const nextMockCursor = () => `7:${++mockCursorSeq}`;
 const applicationErrors = [];
 const applicationRequests = [];
 const navigationTrace = [];
@@ -460,7 +476,10 @@ try {
     ),
     page.getByRole("button", { name: "Add password", exact: true }).click(),
   ]);
-  assert.equal(passwordResponse.status(), 204);
+  // 200, not 204: the answer says what else the change did (other browser
+  // sessions ended; app passwords and tokens untouched).
+  assert.equal(passwordResponse.status(), 200, await passwordResponse.text());
+  assert.match((await passwordResponse.json()).detail, /Other browser sessions were signed out/);
   await expectStatus(page, /Local password added/);
   await endApplicationSession(context.request);
   await page.goto(`${applicationOrigin}/login`);
@@ -1341,7 +1360,11 @@ try {
   await page.locator('[data-network-field="enabled"]', { hasText: "Disabled" }).waitFor();
   upstream.resetJoin("#journey");
   const accountSave = page.locator("[data-api-network-account-save]");
-  await accountSave.getByRole("button", { name: "Save and reconnect", exact: true }).click();
+  // The network was just disabled, so the control says what it will do: save
+  // the credentials AND enable the network. Nothing is enabled silently.
+  assert.equal(await accountSave.getByRole("button", { name: "Save and reconnect", exact: true }).count(), 0);
+  await accountSave.getByRole("button", { name: "Save credentials and enable", exact: true }).click();
+  await expectStatus(page, /saved and the network enabled/);
   await upstream.waitForLine((line) => line === "AUTHENTICATE PLAIN");
   await upstream.waitForJoin("#journey");
   await page.locator('[data-network-field="enabled"]', { hasText: "Enabled" }).waitFor();
@@ -1537,7 +1560,9 @@ try {
   });
   let snapshotSent = false;
   let namesRequestedBeforeSnapshot = false;
-  await page.routeWebSocket(/\/ws\/ui\?network=demo$/, (webSocket) => {
+  // A reconnect presents its replay cursor as `&after=`; the mock must match
+  // that attach too, or the retry silently reaches the real daemon instead.
+  await page.routeWebSocket(/\/ws\/ui\?network=demo(&after=[^&]+)?$/, (webSocket) => {
     mockSocket = webSocket;
     socketConnections += 1;
     if (socketConnections === 2) resolveManualReconnect();
@@ -1567,12 +1592,14 @@ try {
         webSocket.send(
           JSON.stringify({
             t: "line",
+            cursor: nextMockCursor(),
             v: ":irc.example 353 webnick = #room :@webnick +alice bob",
           }),
         );
         webSocket.send(
           JSON.stringify({
             t: "line",
+            cursor: nextMockCursor(),
             v: ":irc.example 366 webnick #room :End of /NAMES list",
           }),
         );
@@ -1580,6 +1607,7 @@ try {
         webSocket.send(
           JSON.stringify({
             t: "line",
+            cursor: nextMockCursor(),
             v: ":webnick!u@h PART #room :leaving",
           }),
         );
@@ -1590,18 +1618,21 @@ try {
       webSocket.send(
         JSON.stringify({
           t: "line",
+          cursor: nextMockCursor(),
           v: ":irc.example 001 webnick :Welcome",
         }),
       );
       webSocket.send(
         JSON.stringify({
           t: "line",
+          cursor: nextMockCursor(),
           v: ":webnick!u@h JOIN #room",
         }),
       );
       webSocket.send(
         JSON.stringify({
           t: "line",
+          cursor: nextMockCursor(),
           v: "@time=2026-07-28T20:00:00.000Z;msgid=shared :alice!u@h PRIVMSG #room :initial tagged",
         }),
       );
@@ -1610,10 +1641,10 @@ try {
       // synchronous mock burst.
       setTimeout(() => {
         snapshotSent = true;
-        webSocket.send(JSON.stringify({ t: "snapshot", v: "complete" }));
+        webSocket.send(JSON.stringify({ t: "snapshot", v: "complete", cursor: nextMockCursor() }));
       }, 25);
     } else {
-      webSocket.send(JSON.stringify({ t: "snapshot", v: "complete" }));
+      webSocket.send(JSON.stringify({ t: "snapshot", v: "complete", cursor: nextMockCursor() }));
     }
   });
   await page.goto(`${applicationOrigin}/?network=demo`);
@@ -1643,6 +1674,7 @@ try {
     .waitFor();
   mockSocket.send(JSON.stringify({
     t: "line",
+    cursor: nextMockCursor(),
     v: ":alice!u@h PRIVMSG #room :valid event after rejected event",
   }));
   await page.getByText("valid event after rejected event", { exact: true }).waitFor();
@@ -1668,6 +1700,7 @@ try {
     mockSocket.send(
       JSON.stringify({
         t: "line",
+        cursor: nextMockCursor(),
         v: `:alice!u@h PRIVMSG #room :scrollback filler ${index}`,
       }),
     );
@@ -1694,6 +1727,7 @@ try {
   mockSocket.send(
     JSON.stringify({
       t: "line",
+      cursor: nextMockCursor(),
       v: ":alice!u@h PRIVMSG #room :new while reading",
     }),
   );
@@ -1723,6 +1757,7 @@ try {
   mockSocket.send(
     JSON.stringify({
       t: "line",
+      cursor: nextMockCursor(),
       v: "@time=2026-07-28T20:00:02.000Z;msgid=live :alice!u@h PRIVMSG #room :arrived while loading",
     }),
   );
@@ -1786,6 +1821,7 @@ try {
   mockSocket.send(
     JSON.stringify({
       t: "line",
+      cursor: nextMockCursor(),
       v: ":alice!u@h PRIVMSG #mentions :webnick: please review this",
     }),
   );
@@ -1810,12 +1846,14 @@ try {
   mockSocket.send(
     JSON.stringify({
       t: "line",
+      cursor: nextMockCursor(),
       v: ":irc.example 353 webnick = #room :@webnick carol",
     }),
   );
   mockSocket.send(
     JSON.stringify({
       t: "line",
+      cursor: nextMockCursor(),
       v: ":irc.example 366 webnick #room :End of /NAMES list",
     }),
   );
@@ -1853,6 +1891,7 @@ try {
   mockSocket.send(
     JSON.stringify({
       t: "line",
+      cursor: nextMockCursor(),
       v: "@time=2026-07-28T20:00:03.000Z;msgid=dm :bob!u@h PRIVMSG webnick :private hello",
     }),
   );
@@ -1878,6 +1917,7 @@ try {
   mockSocket.send(
     JSON.stringify({
       t: "line",
+      cursor: nextMockCursor(),
       v: "@time=2026-07-28T20:00:04.000Z;msgid=dm-failure :bob!u@h PRIVMSG webnick :second private message",
     }),
   );
@@ -2035,9 +2075,17 @@ try {
     [],
   );
 } catch (error) {
+  // Say what failed before collecting artifacts: a wedged renderer can hold a
+  // screenshot for as long as the watchdog allows, and the message must not
+  // wait behind it.
+  console.error(`test-oidc-browser: failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+  const bounded = (promise, what) => Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${what} did not finish within 20s`)), 20_000)),
+  ]);
   if (artifactDirectory && context) {
     const results = await Promise.allSettled([
-      page?.screenshot({ path: join(artifactDirectory, `${browserName}-failure.png`), fullPage: true }),
+      bounded(page?.screenshot({ path: join(artifactDirectory, `${browserName}-failure.png`), fullPage: true }), "screenshot"),
       tracing
         ? context.tracing.stop({ path: join(artifactDirectory, `${browserName}-trace.zip`) })
         : Promise.resolve(),

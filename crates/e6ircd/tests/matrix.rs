@@ -123,7 +123,11 @@ async fn matrix_bridge_relays_both_ways() {
     let line = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match events.recv().await {
-                Ok(DriverEvent::Line(l)) if l.contains("hello from matrix") => return Some(l),
+                Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line: l, .. }))
+                    if l.contains("hello from matrix") =>
+                {
+                    return Some(l);
+                }
                 Ok(_) => {}
                 Err(_) => return None,
             }

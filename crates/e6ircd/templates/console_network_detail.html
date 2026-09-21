@@ -46,7 +46,10 @@
         <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
         <label class="field"><span>NickServ account</span><input name="sasl_account" autocomplete="off" maxlength="255" required /></label>
         <label class="field"><span>NickServ password</span><input type="password" name="sasl_password" autocomplete="new-password" maxlength="512" required /></label>
-        <div class="form-actions field-wide"><button class="primary" type="submit">Save and reconnect</button></div>
+        <div class="form-actions field-wide">
+          <button class="primary" type="submit" data-network-account-save-button>Save and reconnect</button>
+          <small class="section-note" data-network-account-save-note hidden>This network is disabled. Saving enables it, so it connects with these credentials.</small>
+        </div>
       </form>
       <details class="advanced account-registration" data-network-account-registration>
         <summary>Register a new NickServ account</summary>
@@ -75,8 +78,8 @@
           </form>
           <div>
             <span class="step-mark" aria-hidden="true">3</span>
-            <h3>Save and reconnect</h3>
-            <p>When NickServ confirms the verification in the transcript, use <strong>Save and reconnect</strong> above. The new password is already filled in.</p>
+            <h3>Save the account</h3>
+            <p>When NickServ confirms the verification in the transcript, use <strong data-network-account-save-name>Save and reconnect</strong> above. The new password is already filled in.</p>
           </div>
         </div>
       </details>

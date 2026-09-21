@@ -1,7 +1,14 @@
 .git
 .github
 target
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
 web/dist
 web/node_modules
+web/test-results
+test-results
+.pnpm-store
+.test-deps
 vendor
 tools/load

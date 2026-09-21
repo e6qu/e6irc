@@ -509,6 +509,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 .resolve_secrets_with_key(secret_key.as_deref())
                 .map_err(io::Error::other)?;
             config.validate().map_err(io::Error::other)?;
+            config.validate_secrets().map_err(io::Error::other)?;
             (Some(pool), Some(snapshot))
         }
         None => (None, None),
@@ -716,14 +717,6 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             ),
             None => (None, false, std::collections::HashSet::new()),
         };
-        let mut admin_accounts = configured_admin_accounts.clone();
-        if let Some(pool) = &pool {
-            admin_accounts.extend(
-                crate::db::list_admin_accounts(pool)
-                    .await
-                    .map_err(io::Error::other)?,
-            );
-        }
         let monitoring_token_digest =
             crate::http::monitoring_token_digest_from_env().map_err(io::Error::other)?;
         Some(Arc::new(crate::http::AppState {
@@ -746,7 +739,6 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             managed_config: managed_config.clone(),
             telemetry: telemetry.clone(),
             secret_key: secret_key.clone(),
-            admin_accounts: std::sync::RwLock::new(admin_accounts),
             configured_admin_accounts,
             csrf_key: {
                 use aws_lc_rs::rand::SecureRandom;

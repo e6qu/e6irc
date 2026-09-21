@@ -177,7 +177,7 @@ pub(super) struct SecurityActivityQuery {
 pub(super) async fn me_security_activity(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Query(query): Query<SecurityActivityQuery>,
+    QueryParams(query): QueryParams<SecurityActivityQuery>,
 ) -> Response {
     let page_size = match query.limit.map_or_else(
         || crate::db::AuditLogPageSize::new(100),
@@ -413,14 +413,28 @@ pub(super) struct ChangePasswordRequest {
     pub(super) new_password: String,
 }
 
+/// What a password change did beyond the password itself, stated to the person
+/// who made it. Other browser sessions end because the old password may be in
+/// someone else's hands; app passwords and personal access tokens are
+/// separately managed credentials and are deliberately left alone, so the
+/// person is told to revoke those themselves if they suspect them.
+pub(super) const PASSWORD_CHANGE_DETAIL: &str = "Other browser sessions were signed out; app \
+     passwords and access tokens are unchanged — revoke them below if you suspect them.";
+
+#[derive(serde::Serialize)]
+struct PasswordChangeResponse {
+    detail: &'static str,
+}
+
 /// Rotate the authenticated account's primary password. Neither an app
 /// password nor a bearer can authorize this operation: an OpenID Connect-only
 /// account has no current password to demand, so a token admitted here could
-/// install one and sign in as the owner.
+/// install one and sign in as the owner. Every browser session but the one
+/// making the change ends with it (see [`crate::db::change_local_password`]).
 pub(super) async fn change_password(
     State(state): State<Arc<AppState>>,
     _rl: RateLimited,
-    SessionMutation(account, _): SessionMutation,
+    SessionMutation(account, session): SessionMutation,
     body: Result<axum::Json<ChangePasswordRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let req = match super::parse_json(body) {
@@ -437,13 +451,24 @@ pub(super) async fn change_password(
     }
     let result = match req.current_password {
         Some(current) => {
-            crate::db::change_local_password(pool_of(&state), &account, &current, &req.new_password)
+            crate::db::change_local_password(
+                pool_of(&state),
+                &account,
+                &current,
+                &req.new_password,
+                &session,
+            )
+            .await
+        }
+        None => {
+            crate::db::set_local_password(pool_of(&state), &account, &req.new_password, &session)
                 .await
         }
-        None => crate::db::set_local_password(pool_of(&state), &account, &req.new_password).await,
     };
     match result {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => json_no_store(PasswordChangeResponse {
+            detail: PASSWORD_CHANGE_DETAIL,
+        }),
         Err(crate::db::DbError::BadCredentials) => problem(
             StatusCode::UNAUTHORIZED,
             "Current password is incorrect",

@@ -21,6 +21,7 @@
   --chrome-fg: #f0f5f3;
   --chrome-muted: #b5c5c6;
   --chrome-danger: #ff9cab;
+  --chrome-ok: #66d7a9;
   --chrome-border: #34505a;
   --shadow: 0 12px 30px rgb(20 36 43 / 0.12);
   --font-body: "Avenir Next", "Segoe UI", system-ui, sans-serif;
@@ -215,6 +216,10 @@ body {
 .status-ok { color: var(--ok); border-color: var(--ok); }
 .status-connecting { color: var(--chrome-muted); }
 .status-error { color: var(--off); border-color: var(--off); }
+/* The pill sits on the dark topbar in both schemes, where the panel greens and
+   reds fall below AA; the chrome tokens are made for that background. */
+#status.status-ok { color: var(--chrome-ok); border-color: var(--chrome-ok); }
+#status.status-error { color: var(--chrome-danger); border-color: var(--chrome-danger); }
 
 #workspace { display: flex; flex: 1 1 auto; min-height: 0; }
 
@@ -307,6 +312,23 @@ body {
   font-size: 0.75rem;
 }
 #buffer-action:hover { border-color: var(--accent); color: var(--accent); }
+/* The member-list toggle exists for the phone layout only; `hidden` (no
+   channel open) must still win there, hence :not([hidden]). */
+#members-toggle { display: none; }
+#members-toggle:not([hidden]) {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 0.15rem 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.75rem;
+}
+#members-toggle[aria-expanded="true"] { border-color: var(--accent); color: var(--accent); }
+#members-toggle:not([hidden]) ~ #buffer-action { margin-left: 0; }
 
 #messages {
   list-style: none;
@@ -517,7 +539,12 @@ body {
   #sidebar { display: none; flex: 0 0 auto; max-height: 38vh; width: 100%; border-right: none;
     border-bottom: 1px solid var(--border); }
   body.sidebar-open #sidebar { display: block; }
+  #members-toggle:not([hidden]) { display: inline-block; }
   #nicklist { display: none; }
+  body.members-open #nicklist:not([hidden]) {
+    display: block; flex: 0 0 auto; order: -1; max-height: 38vh; width: 100%;
+    border-left: none; border-bottom: 1px solid var(--border);
+  }
   .buffer-title { display: block; }
   .topic { display: block; margin-top: 0.12rem; }
   .line { grid-template-columns: 3rem minmax(4rem, max-content) minmax(0, 1fr); gap: 0.4rem; }

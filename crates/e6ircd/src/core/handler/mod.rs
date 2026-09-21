@@ -69,17 +69,21 @@ pub(crate) fn channel_join(
     label: Option<String>,
 ) {
     let session = actor.session_owner();
+    // The same string under the same casemapping keys the same channel here
+    // as on the session's shard, where it was counted against the limit.
+    let requested = state.chan_key(name);
     let result = channel::join_on_owner(state, actor, name, join_key);
-    state.route_join_result(session, result, label);
+    state.route_join_result(session, requested, result, label);
 }
 
 pub(crate) fn channel_join_result(
     state: &mut ServerState,
     conn: ConnId,
+    requested: ChanKey,
     result: ChannelJoinResult,
     label: Option<String>,
 ) {
-    channel::emit_join_result(state, conn, result, label);
+    channel::emit_join_result(state, conn, requested, result, label);
 }
 
 pub(crate) fn channel_part(

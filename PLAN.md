@@ -30,7 +30,8 @@ URL queries and forms reject unknown fields. Owner, administrator, and static
 network creation use
 the same explicit driver, transport, and identity fields; kind-specific
 requests reject incompatible fields.
-Container startup validates rendered TOML through the daemon parser. Managed
+The container starts with `e6ircd --config-from-environment`; the environment
+goes through the same parser and validation as a configuration file. Managed
 configuration schema changes migrate persisted rows with their historic explicit
 behavior; new configuration never receives an implicit decode default.
 History accepts one typed cursor window and a bounded page size.
@@ -271,6 +272,67 @@ change:
   so the shell entrypoint, its temporary secrets file and its TOML quoting are
   gone; the container has a `HEALTHCHECK` backed by `e6ircd healthcheck`; the systemd unit is hardened; the fuzz lockfile is checked for
   drift; the dead-public guard sees `pub async fn`.
+
+A 2026-09-21 review after #334 (five read-only reviewers over the core, the
+bouncer and clients, the HTTP layer, the browser code, and operations) found,
+and this change fixes:
+
+- **The bouncer.** The egress rule could be passed with a non-canonical
+  spelling of an internal address (`http://2130706433/`, `0x7f.1`, `127.1`):
+  the URL parser canonicalised it and the HTTP client short-circuited DNS for
+  an IP-literal host, so the vetting resolver never ran. Every bridge request
+  now goes through one client that judges the parsed host first, and a 3xx is a
+  failed request. Matrix transaction ids restarted at zero per session while
+  the login was reused, so messages after a reconnect were silently swallowed as
+  duplicates; a stopped or replaced IRC driver never said QUIT and its
+  successor met its own ghost; the gateway dialer tried one address; a
+  services-outage streak made the next parking refusal park at once; a tarpit
+  kept the backoff at 200 ms; upstream writes were unbounded and one stuck
+  socket could hold every account's network mutation; `ws://` gateways were
+  accepted; the Slack name cache was unbounded; the terminal client had no read
+  liveness.
+- **The core.** A session that logged in mid-session (SASL, IDENTIFY, REGISTER)
+  never released the `~nick` conversation rings it had as a stranger, so the
+  next holder of the nick could read them; `Session.account` is now
+  write-private and the one setter releases. The channel limit was not counted
+  for channels owned by another shard; operators received a server-ban notice
+  once per shard, and a removal that found nothing announced a removal; a dead
+  second reply path for topic persistence is gone.
+- **The browser.** The console network editors sent `null` for blank
+  credential and real-name fields and were refused by their own contract
+  check, so a network with a stored NickServ account could not be edited
+  without retyping the password and no bridge could be saved at all; the
+  reconnect replay doubled transcripts; a deduplicated alert kept a stale
+  Restore action; text typed into a channel the session no longer holds was
+  echoed as delivered; an expired session kept the socket retrying forever;
+  credential edits under Remove were discarded or kept silently; channel
+  modes ignored the network's `005`; the add-network dialog typed over the
+  person; the sign-out link was live before its CSRF URL; the member list was
+  unreachable on phones; "Save and reconnect" silently enabled a disabled
+  network.
+- **Accounts and the API.** `recover-administrator` revoked only the local
+  password and browser sessions, leaving an intruder's tokens and app
+  passwords alive on an account it then made administrative; it now revokes
+  everything, as suspension does, and needs no restart because administrator
+  authority is read from the account row on every request. A password change
+  revoked nothing; it now ends every other browser session. A first OpenID
+  Connect login invented `alice-2` on a name clash; it is a loud 409. The
+  OpenAPI document disagreed with the handlers in nine places the browser's
+  validator would trip on, and a router-walking check now refuses an
+  authenticated operation missing its standard responses. Both secret-key
+  sources set at once were resolved by precedence; content rules ran on
+  ciphertext; `admin_accounts` entries were never syntax-checked; an `https`
+  public URL accepted insecure cookies; console pages authenticated bearers
+  through a second, weaker path. Every UI-socket attach replayed the whole
+  ring: lines now carry an opaque replay cursor and a reconnect resumes
+  exactly, or is told to reload.
+- **Operations.** The deployment guide and journey still described the
+  pre-distroless image, a retired variable and the old egress rule; the
+  migration-integrity guard passed on an unresolvable base and compared paths
+  rather than version numbers; the systemd stop budget equalled, rather than
+  exceeded, the daemon's drain-plus-flush; the image accepted a missing build
+  revision as "unknown"; the test matrix's 15-minute job timeout cancelled the
+  merge commit's cold Intel build; CI service images were tag-pinned.
 
 ## Remaining qualification
 

@@ -264,10 +264,15 @@ fn rotate_secrets(args: &[String]) -> ExitCode {
     let keys = match config.secret_keyring() {
         Ok(Some(keys)) if keys.key_count() >= 2 => keys,
         Ok(Some(_)) => {
-            eprintln!(
-                "e6ircd rotate-secrets: configure the new key_file primary and \
-                 at least one previous_key_files entry before rotating"
-            );
+            // The repair differs by ingress: a file names key files, the
+            // environment names the keys themselves.
+            let repair = if args.iter().any(|arg| arg == "--config-from-environment") {
+                "set E6IRC_SECRET_KEY to the new key and E6IRC_PREVIOUS_SECRET_KEYS to the \
+                 old one(s)"
+            } else {
+                "configure the new key_file primary and at least one previous_key_files entry"
+            };
+            eprintln!("e6ircd rotate-secrets: {repair} before rotating");
             return ExitCode::FAILURE;
         }
         Ok(None) => {
@@ -311,8 +316,8 @@ fn rotate_secrets(args: &[String]) -> ExitCode {
 /// the configuration file, and through it the database — and nothing about it
 /// is reachable from the network or happens by itself. One run recovers one
 /// named account (see [`e6ircd::db::recover_administrator`]). The new password
-/// works at once; a running server reads administrator authority when it
-/// starts, so it must be restarted before the account can administer.
+/// and the administrator authority both work at once: a running server reads
+/// an account's authority from the database on every request.
 fn recover_administrator(args: &[String]) -> ExitCode {
     const CONTEXT: &str = "e6ircd recover-administrator";
     let (account, config_args) = match args {
@@ -341,10 +346,10 @@ fn recover_administrator(args: &[String]) -> ExitCode {
         Ok(recovery) => {
             eprintln!(
                 "{CONTEXT}: account {} now has administrator authority and a new local \
-                 password, printed once below. Its browser sessions were ended and the \
-                 audit log records this. Restart e6ircd — a running server reads \
-                 administrator authority when it starts — then sign in at /login and \
-                 change the password.",
+                 password, printed once below. Every credential it held was revoked: its \
+                 app passwords, personal access tokens, device grants, and browser \
+                 sessions. The audit log records this. A running e6ircd honours the \
+                 authority at once; sign in at /login and change the password.",
                 recovery.account
             );
             println!("{}", recovery.password);

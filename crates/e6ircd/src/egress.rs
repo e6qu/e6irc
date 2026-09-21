@@ -100,18 +100,29 @@ impl InternalUpstreams {
     /// Why the address an account typed may not be an upstream, judged from its
     /// literal form: `host[:port]`, `[v6]:port`, or a URL. A hostname cannot be
     /// judged without DNS and passes here; it is judged, resolved, at dial time.
+    ///
+    /// The host is read as the URL parser reads it, because that is what the
+    /// HTTP client dials: `2130706433`, `0x7f000001`, `127.1`, `0177.0.0.1` and
+    /// `%31%32%37.0.0.1` are all `127.0.0.1` to it (and to the kernel), while
+    /// none of them is an address to `IpAddr::from_str`. Judging the parsed
+    /// form closes the whole family of spellings at once. Whatever scheme the
+    /// address came with is replaced by `http` for the reading: only the
+    /// special schemes canonicalize IPv4 numbers, and the scheme is not what
+    /// is being judged.
     pub fn refusal_for_addr(self, addr: &str) -> Option<UpstreamRefusal> {
-        let hostport = addr.split_once("://").map_or(addr, |(_, rest)| rest);
-        let hostport = hostport.split(['/', '?', '#']).next().unwrap_or(hostport);
-        let host = if let Some(rest) = hostport.strip_prefix('[') {
-            rest.split(']').next().unwrap_or(rest)
-        } else {
-            hostport
-                .rsplit_once(':')
-                .map(|(h, _)| h)
-                .unwrap_or(hostport)
-        };
-        host.parse::<IpAddr>().ok().and_then(|ip| self.refusal(ip))
+        let rest = addr.split_once("://").map_or(addr, |(_, rest)| rest);
+        let url = url::Url::parse(&format!("http://{rest}")).ok()?;
+        self.refusal_for_url(&url)
+    }
+
+    /// Why a parsed URL's host may not be an upstream, judged from its literal
+    /// form. A domain passes here and is judged, resolved, at dial time.
+    pub fn refusal_for_url(self, url: &url::Url) -> Option<UpstreamRefusal> {
+        match url.host()? {
+            url::Host::Ipv4(ip) => self.refusal(IpAddr::V4(ip)),
+            url::Host::Ipv6(ip) => self.refusal(IpAddr::V6(ip)),
+            url::Host::Domain(_) => None,
+        }
     }
 }
 
@@ -144,6 +155,11 @@ mod tests {
             "[2001:db8::1]:6697", // v6 documentation
             "http://169.254.169.254",
             "https://[fe80::1]/api",
+            // The metadata endpoint as one decimal number, and in hex: what
+            // the URL parser and the kernel read as 169.254.169.254.
+            "http://2852039166/latest/meta-data/",
+            "http://0xa9fea9fe/",
+            "2852039166:80",
         ] {
             for policy in [InternalUpstreams::Refuse, InternalUpstreams::Allow] {
                 assert_eq!(
@@ -170,6 +186,18 @@ mod tests {
             "[::ffff:10.0.0.5]:6667",
             "http://127.0.0.1:8008",
             "http://192.168.1.10:8008",
+            // Loopback in every spelling the URL parser canonicalizes: one
+            // decimal number, hex, two- and three-part dotted forms, octal,
+            // percent-encoded octets, and behind user information.
+            "http://2130706433:8008",
+            "http://0x7f.1/",
+            "http://127.1/",
+            "http://0x7f000001:8008",
+            "http://0177.0.0.1:8008",
+            "http://%31%32%37.0.0.1/",
+            "http://alice@127.0.0.1/",
+            "2130706433:6667",
+            "0x7f.1:6667",
         ] {
             assert_eq!(
                 refusal(InternalUpstreams::Refuse, addr),

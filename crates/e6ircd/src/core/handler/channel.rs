@@ -167,9 +167,12 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         }
         let key = state.chan_key(target);
         // The session owner alone owns this index, so it enforces the bound
-        // before either a local or remote channel-owner request.
-        if !state.sessions[&conn].channels.contains(&key)
-            && state.sessions[&conn].channels.len() >= MAX_CHANNELS_PER_SESSION
+        // before either a local or remote channel-owner request. A JOIN sent
+        // to another shard holds its place until answered.
+        let session = &state.sessions[&conn];
+        if !session.channels.contains(&key)
+            && !session.pending_joins.contains(&key)
+            && session.channels.len() + session.pending_joins.len() >= MAX_CHANNELS_PER_SESSION
         {
             state.numeric(
                 conn,
@@ -185,6 +188,12 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             let result = join_on_owner(state, actor.clone(), target, join_key);
             emit_join_response(state, conn, result);
         } else {
+            state
+                .sessions
+                .get_mut(&conn)
+                .expect("checked above")
+                .pending_joins
+                .insert(key);
             let label = state.defer_channel_reply(conn);
             state.route_join(
                 owner,
@@ -386,9 +395,16 @@ pub(super) fn join_on_owner(
 pub(super) fn emit_join_result(
     state: &mut ServerState,
     conn: ConnId,
+    requested: ChanKey,
     result: ChannelJoinResult,
     label: Option<String>,
 ) {
+    // Answered, whichever way: the place `cmd_join` held for this request
+    // under the channel limit is given back. A session that has since left
+    // took its reservations with it.
+    if let Some(session) = state.sessions.get_mut(&conn) {
+        session.pending_joins.remove(&requested);
+    }
     state.emit_deferred_labeled(conn, label, |state| {
         emit_join_response(state, conn, result);
     });

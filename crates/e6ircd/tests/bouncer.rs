@@ -145,7 +145,9 @@ async fn driver_registers_relays_and_buffers() {
     let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match events.recv().await {
-                Ok(DriverEvent::Line(l)) if l.contains("PRIVMSG #bnc :hello bouncer") => {
+                Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line: l, .. }))
+                    if l.contains("PRIVMSG #bnc :hello bouncer") =>
+                {
                     return l;
                 }
                 Ok(_) => {}
@@ -327,14 +329,20 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
         let mut disconnected_before_after = false;
         loop {
             match events.recv().await {
-                Ok(DriverEvent::Line(l)) if l.contains("PRIVMSG #bnc :caf") => {
+                Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line: l, .. }))
+                    if l.contains("PRIVMSG #bnc :caf") =>
+                {
                     // The non-UTF-8 body was relayed, lossily decoded.
                     saw_bad_line = true;
                 }
-                Ok(DriverEvent::Line(l)) if l.contains("upstream input rejected") => {
+                Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line: l, .. }))
+                    if l.contains("upstream input rejected") =>
+                {
                     saw_rejection = true;
                 }
-                Ok(DriverEvent::Line(l)) if l.contains("after the bad line") => {
+                Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line: l, .. }))
+                    if l.contains("after the bad line") =>
+                {
                     return (saw_bad_line, saw_rejection, disconnected_before_after);
                 }
                 Ok(DriverEvent::Status {
@@ -1496,7 +1504,8 @@ async fn driver_tracks_forced_upstream_nick_change() {
     // the new nick.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if let Ok(DriverEvent::Line(line)) = events.recv().await
+            if let Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line, .. })) =
+                events.recv().await
                 && line.contains("NICK :renamed")
             {
                 break;
@@ -1512,7 +1521,11 @@ async fn driver_tracks_forced_upstream_nick_change() {
     go_tx.send(()).await.unwrap();
     let echo = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if let Ok(DriverEvent::Echo { line, .. }) = events.recv().await {
+            if let Ok(DriverEvent::Echo {
+                line: e6ircd::bouncer::BufferedLine { line, .. },
+                ..
+            }) = events.recv().await
+            {
                 return line;
             }
         }
@@ -1574,7 +1587,8 @@ async fn runtime_joined_channels_are_rejoined_after_reconnect() {
     assert_eq!(handle.send("JOIN #dynamic"), SendOutcome::Sent);
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if let Ok(DriverEvent::Line(line)) = events.recv().await
+            if let Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line, .. })) =
+                events.recv().await
                 && line.contains("JOIN #dynamic")
             {
                 break;
@@ -1838,7 +1852,7 @@ async fn repeated_registration_rejection_parks_the_driver() {
     let notice = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             match events.recv().await {
-                Ok(DriverEvent::Line(line))
+                Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line, .. }))
                     if line.contains("not reconnecting until this network is reconfigured") =>
                 {
                     return line;
@@ -1857,6 +1871,39 @@ async fn repeated_registration_rejection_parks_the_driver() {
         e6ircd::bouncer::NetworkLifecycle::RegistrationFailed
     );
     assert_eq!(snapshot.connection_attempts, 5, "{snapshot:?}");
+}
+
+/// A driver that is stopped — removed, or replaced by its own reconfigured
+/// successor — leaves as a client would. Dropping the socket instead left the
+/// upstream a ghost session holding the nick, which the successor then met as
+/// a 433 and took the whole refusal schedule for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_driver_says_quit_to_its_upstream() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.complete_registration("bncbot").await;
+        // The goodbye, or the empty line an unannounced close reads as.
+        loop {
+            let line = session.read_line().await;
+            if line.is_empty() || line.starts_with("QUIT") {
+                return line;
+            }
+        }
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    });
+    wait_lifecycle(&handle, NetworkLifecycle::Connected).await;
+    handle.shutdown_and_wait().await;
+    assert_eq!(
+        upstream.await.expect("scripted upstream"),
+        "QUIT :reconfigured"
+    );
 }
 
 /// Solanum withdraws the `sasl` capability while services are down. That

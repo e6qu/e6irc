@@ -39,6 +39,9 @@ test("shared relay-desk palette keeps text and actions above WCAG AA contrast", 
     ["#2b1b00", "#f2b84b"],
     ["#ff9cab", "#14242b"],
     ["#ff9cab", "#091114"],
+    // The status pill sits on the dark topbar in both schemes.
+    ["#66d7a9", "#14242b"],
+    ["#66d7a9", "#091114"],
   ]) {
     assert.ok(ratio(foreground, background) >= 4.5, `${foreground} on ${background} is below 4.5:1`);
   }

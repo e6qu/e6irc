@@ -1599,6 +1599,99 @@ async fn openapi_spec_is_served() {
     assert!(v["paths"]["/api/v1/auth/oidc/backchannel-logout"]["post"].is_object());
     assert!(v["paths"]["/api/v1/auth/oidc/frontchannel-logout"]["get"].is_object());
     assert!(v["components"]["securitySchemes"]["bearer"].is_object());
+    // Operations a bearer is refused from advertise only the browser session.
+    let browser_only = serde_json::json!([
+        { "browserSession": [] },
+        { "secureBrowserSession": [] }
+    ]);
+    for (path, method) in [
+        ("/api/v1/me/sessions", "delete"),
+        ("/api/v1/me/profile", "patch"),
+        ("/api/v1/me/account", "delete"),
+        ("/api/v1/me/password", "put"),
+        ("/api/v1/me/credentials", "post"),
+        ("/api/v1/me/identities/{id}", "delete"),
+        ("/api/v1/auth/oidc/{provider}/link", "get"),
+        ("/api/v1/me/tokens", "post"),
+        ("/api/v1/auth/device/approve", "post"),
+    ] {
+        assert_eq!(
+            v["paths"][path][method]["security"], browser_only,
+            "{method} {path}"
+        );
+    }
+    // Every account-authenticated operation documents what admission answers.
+    for status in ["401", "403", "429", "503"] {
+        assert!(
+            v["paths"]["/api/v1/me"]["get"]["responses"][status].is_object(),
+            "GET /api/v1/me lacks {status}"
+        );
+        assert!(
+            v["paths"]["/api/v1/admin/stats"]["get"]["responses"][status].is_object(),
+            "GET /api/v1/admin/stats lacks {status}"
+        );
+    }
+    assert_eq!(
+        v["paths"]["/api/v1/me/password"]["put"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["properties"]["detail"]["const"],
+        "Other browser sessions were signed out; app passwords and access tokens are unchanged — revoke them below if you suspect them."
+    );
+    assert!(v["paths"]["/api/v1/me/password"]["put"]["responses"]["204"].is_null());
+    let callback_parameters =
+        v["paths"]["/api/v1/auth/oidc/{provider}/callback"]["get"]["parameters"]
+            .as_array()
+            .expect("callback parameters");
+    for name in ["code", "state", "error", "scope", "iss", "session_state"] {
+        assert!(
+            callback_parameters
+                .iter()
+                .any(|parameter| parameter["name"] == name),
+            "OpenAPI OIDC callback query is missing {name}"
+        );
+    }
+    for status in ["400", "403", "409", "503"] {
+        assert!(
+            v["paths"]["/api/v1/auth/oidc/{provider}/callback"]["get"]["responses"][status]
+                .is_object(),
+            "OIDC callback lacks {status}"
+        );
+    }
+    assert_eq!(
+        v["paths"]["/api/v1/me/networks/{name}/buffer"]["get"]["parameters"][1]["schema"]["default"],
+        200
+    );
+    assert_eq!(
+        v["paths"]["/api/v1/admin/channels"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["properties"]["channels"]["items"]["properties"]["policy"]["properties"]["topic_retained"]
+            ["type"],
+        "boolean"
+    );
+    assert_eq!(
+        v["paths"]["/api/v1/admin/configuration/networks"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["oneOf"][0]["required"],
+        serde_json::json!([
+            "kind",
+            "revision",
+            "name",
+            "addr",
+            "tls",
+            "nick",
+            "username",
+            "realname",
+            "autojoin",
+            "buffer_cap"
+        ])
+    );
+    assert_eq!(
+        v["paths"]["/api/v1/admin/configuration/oidc-providers"]["post"]["requestBody"]["content"]
+            ["application/json"]["schema"]["properties"]["end_session_endpoint"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        v["paths"]["/api/v1/auth/app-passwords"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["properties"]["label"]["minLength"],
+        1
+    );
 }
 
 // ---- server-rendered pages (askama) -------------------------------------
@@ -1720,13 +1813,22 @@ async fn local_login_is_browser_bound_and_accepts_only_the_primary_password() {
     );
 }
 
+/// Without a database no browser can be signed in, and `/login` could not sign
+/// one in either: the page says so instead of bouncing the visitor into a form
+/// that cannot work. (The redirect for a visitor with no session, on a server
+/// that has a database, is covered by
+/// `console_pages_are_cookie_only_and_report_their_refusals`.)
 #[tokio::test]
-async fn account_page_redirects_when_unauthenticated() {
+async fn account_page_reports_a_missing_database_instead_of_redirecting() {
     let running = net::start(test_config()).await.expect("start");
     let http = running.http_addr.expect("http bound");
-    let (status, head, _) = request(http, &get("/account")).await;
-    assert_eq!(status, 303); // See Other -> /login
-    assert!(head.to_lowercase().contains("location: /login"), "{head}");
+    let (status, head, body) = request(http, &get("/account")).await;
+    assert_eq!(status, 503, "{body}");
+    assert!(
+        head.to_lowercase().contains("application/problem+json"),
+        "{head}"
+    );
+    assert!(body.contains("No database configured"), "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3265,7 +3367,6 @@ async fn admin_accounts_endpoint_is_gated() {
     .execute(&pool)
     .await
     .expect("channel");
-    drop(pool);
 
     let config = Config {
         server_name: "irc.admin.example".into(),
@@ -3301,6 +3402,25 @@ async fn admin_accounts_endpoint_is_gated() {
     // non-admin -> 403
     let (status, _, _) = request(http, &getauth(&bob_token)).await;
     assert_eq!(status, 403);
+    // Authority is read from the account row on every request: a grant
+    // written to the database behind the running server's back — as
+    // `e6ircd recover-administrator` or another replica writes it — is
+    // honoured by the very next request, and its revocation likewise.
+    let bob_id = e6ircd::db::account_id_by_name(&pool, "bob")
+        .await
+        .expect("bob id")
+        .expect("bob exists");
+    e6ircd::db::set_account_administrator(&pool, bob_id, true, "alice", &["alice".into()])
+        .await
+        .expect("grant bob");
+    let (status, _, body) = request(http, &getauth(&bob_token)).await;
+    assert_eq!(status, 200, "a durable grant needs no restart: {body}");
+    e6ircd::db::set_account_administrator(&pool, bob_id, false, "alice", &["alice".into()])
+        .await
+        .expect("revoke bob");
+    let (status, _, _) = request(http, &getauth(&bob_token)).await;
+    assert_eq!(status, 403, "a durable revocation needs no restart");
+    drop(pool);
     // admin -> 200 + both accounts
     let (status, headers, body) = request(http, &getauth(&alice_token)).await;
     assert_eq!(status, 200, "{body}");
@@ -3410,8 +3530,12 @@ async fn admin_console_page_is_api_hydrated_and_admin_only() {
     e6ircd::db::create_account_with_contact(&pool, "bob", "pw", None)
         .await
         .expect("bob");
-    let alice_token = issue_api_token(&pool, "alice", "t").await.expect("tok");
-    let bob_token = issue_api_token(&pool, "bob", "t").await.expect("tok");
+    let alice_session = e6ircd::db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("alice session");
+    let bob_session = e6ircd::db::create_web_session(&pool, "bob", None)
+        .await
+        .expect("bob session");
     add_server_ban(&pool, "spammer@*", "spammer@*", "spam", "alice", "kline")
         .await
         .expect("kline");
@@ -3450,9 +3574,9 @@ async fn admin_console_page_is_api_hydrated_and_admin_only() {
         .http_addr
         .expect("http");
 
-    let auth = |token: &str| {
+    let page = |session: &str| {
         format!(
-            "GET /console HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            "GET /console HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
         )
     };
     // Anonymous -> redirect to /login (a page, not a 401 like the JSON API).
@@ -3460,10 +3584,10 @@ async fn admin_console_page_is_api_hydrated_and_admin_only() {
     assert_eq!(status, 303, "{head}");
     assert!(head.to_lowercase().contains("location: /login"), "{head}");
     // Signed-in non-admin -> 403.
-    let (status, _, _) = request(http, &auth(&bob_token)).await;
+    let (status, _, _) = request(http, &page(&bob_session)).await;
     assert_eq!(status, 403);
     // Admin -> API-hydrated 200 shell; the seeded data must not be embedded.
-    let (status, _, body) = request(http, &auth(&alice_token)).await;
+    let (status, _, body) = request(http, &page(&alice_session)).await;
     assert_eq!(status, 200, "{body}");
     for needle in [
         "e6irc console",
@@ -3918,7 +4042,7 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
-            public_url: Some("https://irc.onboarding.example".into()),
+            public_url: Some("http://irc.onboarding.example".into()),
             secure_cookies: false,
             admin_accounts: vec![],
         }),
@@ -3969,11 +4093,11 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
         .as_str()
         .expect("single-use URL");
     assert!(
-        invitation_url.starts_with("https://irc.onboarding.example/invite/e6i_"),
+        invitation_url.starts_with("http://irc.onboarding.example/invite/e6i_"),
         "{body}"
     );
     let invitation_path = invitation_url
-        .strip_prefix("https://irc.onboarding.example")
+        .strip_prefix("http://irc.onboarding.example")
         .expect("configured public origin");
     let invitation_directory = format!(
         "GET /api/v1/admin/invitations?limit=1 HTTP/1.1\r\nHost: t\r\n\
@@ -5346,7 +5470,12 @@ async fn console_integrations_page_lists_platforms_for_admins_only() {
         .await
         .expect("bob");
     let alice_token = issue_api_token(&pool, "alice", "t").await.expect("tok");
-    let bob_token = issue_api_token(&pool, "bob", "t").await.expect("tok");
+    let alice_session = e6ircd::db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("alice session");
+    let bob_session = e6ircd::db::create_web_session(&pool, "bob", None)
+        .await
+        .expect("bob session");
     e6ircd::db::create_bnc_network(
         &pool,
         "alice",
@@ -5391,20 +5520,20 @@ async fn console_integrations_page_lists_platforms_for_admins_only() {
         .http_addr
         .expect("http");
 
-    let auth = |token: &str| {
+    let page = |session: &str| {
         format!(
-            "GET /console/integrations HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            "GET /console/integrations HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
         )
     };
     // Anonymous -> redirect to /login.
     let (status, head, _) = request(http, &get("/console/integrations")).await;
     assert_eq!(status, 303, "{head}");
     // Signed-in non-admin -> 403.
-    let (status, _, _) = request(http, &auth(&bob_token)).await;
+    let (status, _, _) = request(http, &page(&bob_session)).await;
     assert_eq!(status, 403);
     // Admin -> 200 with static bridge capabilities; the stored bridge inventory
     // is hydrated from the administrator API rather than rendered into HTML.
-    let (status, _, body) = request(http, &auth(&alice_token)).await;
+    let (status, _, body) = request(http, &page(&alice_session)).await;
     assert_eq!(status, 200, "{body}");
     for needle in [
         "Integrations",
@@ -6048,7 +6177,13 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         api_password.len()
     );
     let (status, _, body) = request(http, &api_change).await;
-    assert_eq!(status, 204, "{body}");
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains(
+            "Other browser sessions were signed out; app passwords and access tokens are unchanged"
+        ),
+        "{body}"
+    );
     assert_eq!(
         e6ircd::db::verify_local_password(&pool, "alice", "api-pw")
             .await
@@ -6237,7 +6372,7 @@ async fn device_authorization_grant_flow() {
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
-            public_url: Some("https://e6.example".into()),
+            public_url: Some("http://e6.example".into()),
             secure_cookies: false,
             admin_accounts: vec![],
         }),
@@ -6265,7 +6400,7 @@ async fn device_authorization_grant_flow() {
     let user_code = v["user_code"].as_str().unwrap().to_string();
     assert_eq!(
         v["verification_uri"].as_str(),
-        Some("https://e6.example/device")
+        Some("http://e6.example/device")
     );
 
     let (status, _, _) = request(
@@ -7042,7 +7177,7 @@ async fn rp_initiated_logout_redirects_to_provider() {
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
-            public_url: Some("https://e6irc.example".into()),
+            public_url: Some("http://e6irc.example".into()),
             secure_cookies: false,
             admin_accounts: vec![],
         }),
@@ -7145,7 +7280,7 @@ async fn rp_initiated_logout_redirects_to_provider() {
         .expect("post_logout_redirect_uri");
     assert_eq!(
         post_logout_redirect,
-        "https://e6irc.example/auth/shauth/logout/complete"
+        "http://e6irc.example/auth/shauth/logout/complete"
     );
 
     // The registered bridge ignores every caller-supplied redirect and
@@ -7274,7 +7409,7 @@ async fn application_entry_starts_shauth_when_configured() {
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
-            public_url: Some("https://chat.example".into()),
+            public_url: Some("http://chat.example".into()),
             secure_cookies: false,
             admin_accounts: vec![],
         }),
@@ -7370,7 +7505,7 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
-            public_url: Some("https://chat.example".into()),
+            public_url: Some("http://chat.example".into()),
             secure_cookies: false,
             admin_accounts: vec![],
         }),
@@ -7693,9 +7828,274 @@ async fn bearer_cannot_install_a_password_or_change_login_identities() {
         &api_request("PUT", "/api/v1/me/password", &owner, Some(password)),
     )
     .await;
-    assert_eq!(status, 204, "{body}");
+    assert_eq!(status, 200, "{body}");
     let (status, _, body) = request(http, &api_request("DELETE", &unlink, &owner, None)).await;
     assert_eq!(status, 204, "{body}");
+}
+
+/// Console pages are cookie-only. A read-scoped bearer of an administrator is
+/// refused with `401`, not sent to the sign-in page (it is not a browser) and
+/// not rendered an administrator shell; a browser with no session goes to
+/// `/login`; a suspended account's cookie gets the `403` it would get from any
+/// JSON route, not a misleading redirect.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn console_pages_are_cookie_only_and_report_their_refusals() {
+    let url = support::test_db("console_pages_are_cookie_only_and_report_their_refusals").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "alice", "pw", None)
+        .await
+        .expect("alice");
+    e6ircd::db::create_account_with_contact(&pool, "mallory", "pw", None)
+        .await
+        .expect("mallory");
+    let read_only = e6ircd::db::issue_scoped_api_token(
+        &pool,
+        "alice",
+        "reader",
+        e6ircd::identity::ApiTokenScopes::new([e6ircd::identity::ApiTokenScope::Read])
+            .expect("read scope"),
+        e6ircd::identity::ApiTokenLifetimeDays::DEFAULT,
+    )
+    .await
+    .expect("read token");
+    let alice_session = e6ircd::db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("alice session");
+    let mallory_session = e6ircd::db::create_web_session(&pool, "mallory", None)
+        .await
+        .expect("mallory session");
+    let http = start_with_database(&url, &["alice"])
+        .await
+        .http_addr
+        .expect("http");
+
+    let (status, headers, body) = request(
+        http,
+        &api_request(
+            "GET",
+            "/console/accounts",
+            &bearer_headers(&read_only),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, 401, "{body}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("application/problem+json"),
+        "{headers}"
+    );
+    assert!(body.contains("Browser session required"), "{body}");
+
+    let (status, headers, _) = request(http, &get("/console/accounts")).await;
+    assert_eq!(status, 303, "{headers}");
+    assert!(headers.contains("location: /login"), "{headers}");
+
+    let cookie = format!("Cookie: e6irc_session={alice_session}\r\n");
+    let (status, _, body) = request(
+        http,
+        &api_request("GET", "/console/accounts", &cookie, None),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let mallory_id = e6ircd::db::account_id_by_name(&pool, "mallory")
+        .await
+        .expect("mallory id")
+        .expect("mallory exists");
+    // A suspension ends the session; the cookie is then simply unknown and a
+    // browser is sent to sign in. Reactivate and suspend the row directly so
+    // the session survives and the suspended posture itself is what answers.
+    let cookie = format!("Cookie: e6irc_session={mallory_session}\r\n");
+    sqlx::query("UPDATE accounts SET flags = flags | 2 WHERE id = $1")
+        .bind(mallory_id)
+        .execute(&pool)
+        .await
+        .expect("suspend mallory in place");
+    let (status, headers, body) =
+        request(http, &api_request("GET", "/console/account", &cookie, None)).await;
+    assert_eq!(status, 403, "{body}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("application/problem+json"),
+        "{headers}"
+    );
+    assert!(body.contains("Account suspended"), "{body}");
+
+    // An empty label is refused by the same rule the contract states
+    // (`minLength: 1`).
+    let owner = session_headers(http, &alice_session).await;
+    let (status, _, body) = request(
+        http,
+        &api_request("POST", "/api/v1/me/tokens", &owner, Some(r#"{"label":""}"#)),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("Labels must not be empty"), "{body}");
+}
+
+/// The operator's way back in, end to end against a running daemon: the
+/// subcommand grants authority the daemon honours on the next request — no
+/// restart — and revokes every credential the account held, while the printed
+/// password signs in at `/login`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn recover_administrator_subcommand_is_honoured_by_a_running_daemon() {
+    let url =
+        support::test_db("recover_administrator_subcommand_is_honoured_by_a_running_daemon").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "bob", "lost", None)
+        .await
+        .expect("bob");
+    let old_token = issue_api_token(&pool, "bob", "automation")
+        .await
+        .expect("token");
+    let http = start_with_database(&url, &[])
+        .await
+        .http_addr
+        .expect("http");
+    let admin_route = |credential_headers: &str| {
+        api_request("GET", "/api/v1/admin/accounts", credential_headers, None)
+    };
+    let (status, _, _) = request(http, &admin_route(&bearer_headers(&old_token))).await;
+    assert_eq!(status, 403, "bob is nobody's administrator yet");
+
+    let config_path = temporary_path("recover-config");
+    let _config_file = TemporaryFile(config_path.clone());
+    std::fs::write(
+        &config_path,
+        format!(
+            "server_name = \"irc.recover.example\"\nnetwork_name = \"RecoverNet\"\n\
+             [[listeners]]\naddr = \"127.0.0.1:0\"\n[database]\nurl = \"{url}\"\n"
+        ),
+    )
+    .expect("write config");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_e6ircd"))
+        .args([
+            "recover-administrator",
+            "--account",
+            "BOB",
+            "--config",
+            config_path.to_str().expect("utf-8 path"),
+        ])
+        .env_clear()
+        .output()
+        .expect("run e6ircd recover-administrator");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        !stderr.to_ascii_lowercase().contains("restart"),
+        "no restart is needed: {stderr}"
+    );
+    let password = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(
+        !password.is_empty(),
+        "the password is printed once, on stdout"
+    );
+
+    let (status, _, _) = request(http, &admin_route(&bearer_headers(&old_token))).await;
+    assert_eq!(status, 401, "the lost credential's token is revoked");
+
+    let (_, _, body) = request(http, &get("/login")).await;
+    let state = login_state_from_html(&body).to_string();
+    let form = format!(
+        "login_state={state}&account=bob&password={}",
+        form_value(&password)
+    );
+    let login = format!(
+        "POST /login HTTP/1.1\r\nHost: t\r\nCookie: e6irc_login_state={state}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{form}",
+        form.len()
+    );
+    let (status, headers, body) = request(http, &login).await;
+    assert_eq!(status, 303, "the printed password signs in: {body}");
+    let session = headers
+        .lines()
+        .find_map(|line| line.strip_prefix("set-cookie: e6irc_session="))
+        .and_then(|value| value.split(';').next())
+        .expect("session cookie");
+    let (status, _, body) = request(
+        http,
+        &admin_route(&format!("Cookie: e6irc_session={session}\r\n")),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the running daemon honours the recovered authority without a restart: {body}"
+    );
+}
+
+/// The provider's redirect back is a closed query: an unknown parameter is a
+/// problem document, and `session_state` — which Keycloak and Entra append —
+/// is inside the set.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn oidc_callback_query_is_closed_and_admits_session_state() {
+    let url = support::test_db("oidc_callback_query_is_closed_and_admits_session_state").await;
+    let config = Config {
+        server_name: "irc.callback.example".into(),
+        network_name: "CallbackNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: Some("http://chat.example".into()),
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        oidc_providers: vec![e6ircd::config::OidcProviderConfig {
+            name: "corp".into(),
+            issuer_url: "https://auth.example".into(),
+            client_id: "e6irc".into(),
+            client_secret: "x".repeat(32),
+            account_claim: e6ircd::config::OidcAccountClaim::PreferredUsername,
+            scopes: vec![],
+            allowed_email_domains: vec![],
+            end_session_endpoint: None,
+            token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
+        }],
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    let (status, headers, body) =
+        request(http, &get("/api/v1/auth/oidc/corp/callback?unexpected=1")).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("application/problem+json"),
+        "{headers}"
+    );
+    assert!(body.contains("Invalid query"), "{body}");
+    assert!(body.contains("unexpected"), "names the parameter: {body}");
+
+    let (status, _, body) = request(
+        http,
+        &get("/api/v1/auth/oidc/corp/callback?session_state=abc123"),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.contains("Missing code or state"),
+        "session_state passed the query and the flow refused on its merits: {body}"
+    );
 }
 
 /// `except=current` names the browser session that authorized the request. A
