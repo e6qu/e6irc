@@ -19,13 +19,21 @@ function invalid() {
   throw new UiEventError();
 }
 
+// A replay cursor is opaque: the server names a ring position with it and the
+// client hands it back unchanged. Non-empty text is all the client checks.
+function cursor(value) {
+  return typeof value === "string" && value.length > 0;
+}
+
 function eventFrom(value) {
   if (!object(value) || typeof value.t !== "string") invalid();
   switch (value.t) {
     case "line":
+      if (!onlyKeys(value, ["t", "v", "cursor"]) || typeof value.v !== "string" || !cursor(value.cursor)) invalid();
+      return Object.freeze({ type: "line", value: value.v, cursor: value.cursor });
     case "sent":
       if (!onlyKeys(value, ["t", "v"]) || typeof value.v !== "string") invalid();
-      return Object.freeze({ type: value.t, value: value.v });
+      return Object.freeze({ type: "sent", value: value.v });
     case "send-error":
       if (
         !onlyKeys(value, ["t", "v", "message"]) ||
@@ -34,8 +42,11 @@ function eventFrom(value) {
       ) invalid();
       return Object.freeze({ type: "send-error", value: value.v, message: value.message });
     case "snapshot":
-      if (!onlyKeys(value, ["t", "v"]) || typeof value.v !== "string" || value.v !== "complete") invalid();
-      return Object.freeze({ type: "snapshot" });
+      if (!onlyKeys(value, ["t", "v", "cursor"]) || value.v !== "complete" || !cursor(value.cursor)) invalid();
+      return Object.freeze({ type: "snapshot", cursor: value.cursor });
+    case "replay":
+      if (!onlyKeys(value, ["t", "v"]) || value.v !== "full") invalid();
+      return Object.freeze({ type: "replay" });
     case "session":
       if (
         !onlyKeys(value, ["t", "nick", "channels"]) ||

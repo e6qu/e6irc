@@ -363,7 +363,7 @@ async fn ui_socket_refuses_a_browser_origin_it_cannot_verify() {
     // A configured public URL is the origin, whatever `Host` a proxy forwards.
     // The public URL is a stored setting, so this server gets its own database.
     let (url, cookie) = database_with_session("ui_socket_origin_is_the_public_url").await;
-    let http = bouncer(url, up, Some("https://chat.example")).await;
+    let http = bouncer(url, up, Some("http://chat.example")).await;
     assert_eq!(
         upgrade_status(
             http,
@@ -375,7 +375,7 @@ async fn ui_socket_refuses_a_browser_origin_it_cannot_verify() {
     assert_eq!(
         upgrade_status(
             http,
-            &[cookie.clone(), ("origin", "https://chat.example".into())]
+            &[cookie.clone(), ("origin", "http://chat.example".into())]
         )
         .await,
         101

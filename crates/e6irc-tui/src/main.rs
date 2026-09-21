@@ -14,6 +14,7 @@ use e6irc_client::{
     Registered,
 };
 use e6irc_tui::app::{Action, App};
+use e6irc_tui::liveness::{KEEPALIVE_TOKEN, LIVENESS_WINDOW, Liveness, Silence};
 use e6irc_tui::reconnect::{AfterFailure, ReconnectPolicy};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -188,37 +189,17 @@ async fn async_main(cli: Cli) -> io::Result<()> {
     let reconnect_read_markers = read_markers;
     tokio::spawn(async move {
         loop {
-            let failure = loop {
-                tokio::select! {
-                    // Lossy steady-state read: one non-UTF-8 line (a Latin-1
-                    // channel message any member can post) must not disconnect
-                    // the session.
-                    msg = conn.next_event_lossy() => match msg {
-                        Ok(Some(ClientEvent::Message(m))) => {
-                            if m.command == "PING" {
-                                let token = m.params.first().cloned().unwrap_or_default();
-                                if let Err(error) = conn.send_line(&format!("PONG :{token}")).await {
-                                    break format!("PING response failed: {error}");
-                                }
-                            }
-                            track_own_state(&mut joined_channels, &mut own_nick, &m);
-                            if net_tx.send(Ev::Net(ClientEvent::Message(m))).await.is_err() { return; }
-                        }
-                        Ok(Some(rejected @ ClientEvent::Rejected(_))) => {
-                            if net_tx.send(Ev::Net(rejected)).await.is_err() {
-                                return;
-                            }
-                        }
-                        Ok(None) => break "server closed the connection".into(),
-                        Err(error) => break format!("connection read failed: {error}"),
-                    },
-                    line = out_rx.recv() => match line {
-                        Some(line) => if let Err(error) = conn.send_line(&line).await {
-                            break format!("message write failed: {error}");
-                        },
-                        None => return,
-                    },
-                }
+            let Some(failure) = relay_session(
+                &mut conn,
+                &mut out_rx,
+                &net_tx,
+                &mut joined_channels,
+                &mut own_nick,
+                LIVENESS_WINDOW,
+            )
+            .await
+            else {
+                return;
             };
             if net_tx.send(Ev::Reconnecting(failure)).await.is_err() {
                 return;
@@ -304,6 +285,74 @@ async fn async_main(cli: Cli) -> io::Result<()> {
         (Err(run_error), Err(restore_error)) => Err(io::Error::other(format!(
             "UI failed: {run_error}; terminal restoration also failed: {restore_error}"
         ))),
+    }
+}
+
+/// Relay one registered session: server messages up to the UI, outbound lines
+/// down to the socket, until the session ends. The text says why it ended and
+/// the reconnect path runs; `None` means the UI is gone and nothing should.
+async fn relay_session(
+    conn: &mut Connection,
+    out_rx: &mut mpsc::Receiver<String>,
+    net_tx: &mpsc::Sender<Ev>,
+    joined_channels: &mut std::collections::BTreeSet<String>,
+    own_nick: &mut String,
+    liveness_window: Duration,
+) -> Option<String> {
+    let mut liveness = Liveness::new(liveness_window);
+    loop {
+        tokio::select! {
+            // Lossy steady-state read: one non-UTF-8 line (a Latin-1 channel
+            // message any member can post) must not disconnect the session.
+            // Bounded by the liveness window, measured from the server's last
+            // sign of life: an outbound line also ends a turn of this loop and
+            // must not make a silent server look alive while the user types.
+            msg = liveness.bound(conn.next_event_lossy()) => match msg {
+                None => match liveness.silent() {
+                    Silence::Probe => {
+                        if let Err(error) = conn.send_line(&format!("PING :{KEEPALIVE_TOKEN}")).await {
+                            return Some(format!("keepalive PING failed: {error}"));
+                        }
+                    }
+                    Silence::Dead => return Some("server stopped responding".into()),
+                },
+                Some(Ok(Some(ClientEvent::Message(m)))) => {
+                    liveness.heard();
+                    if m.command == "PING" {
+                        let token = m.params.first().cloned().unwrap_or_default();
+                        if let Err(error) = conn.send_line(&format!("PONG :{token}")).await {
+                            return Some(format!("PING response failed: {error}"));
+                        }
+                    }
+                    // The answer to this client's own probe is bookkeeping,
+                    // not conversation: it proved the server is there, and
+                    // that is all it is for.
+                    if m.command == "PONG"
+                        && m.params.last().map(String::as_str) == Some(KEEPALIVE_TOKEN)
+                    {
+                        continue;
+                    }
+                    track_own_state(joined_channels, own_nick, &m);
+                    if net_tx.send(Ev::Net(ClientEvent::Message(m))).await.is_err() {
+                        return None;
+                    }
+                }
+                Some(Ok(Some(rejected @ ClientEvent::Rejected(_)))) => {
+                    liveness.heard();
+                    if net_tx.send(Ev::Net(rejected)).await.is_err() {
+                        return None;
+                    }
+                }
+                Some(Ok(None)) => return Some("server closed the connection".into()),
+                Some(Err(error)) => return Some(format!("connection read failed: {error}")),
+            },
+            line = out_rx.recv() => match line {
+                Some(line) => if let Err(error) = conn.send_line(&line).await {
+                    return Some(format!("message write failed: {error}"));
+                },
+                None => return None,
+            },
+        }
     }
 }
 
@@ -948,5 +997,124 @@ mod tests {
             Ev::Stopped("the server banned this connection".into()),
         );
         assert!(app.gave_up() && !app.connected());
+    }
+
+    /// A half-open connection reads as nothing forever. The client asks after
+    /// one silent window, and after a second declares the server gone so the
+    /// reconnect path runs — instead of sitting CONNECTED with every message
+    /// typed into it accepted and lost.
+    #[tokio::test]
+    async fn a_server_that_stops_answering_is_declared_dead_after_two_silent_windows() {
+        use tokio::io::AsyncBufReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, _writer) = socket.into_split();
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            // The first thing the client says is its probe; nothing is ever
+            // answered.
+            let first = lines.next_line().await.unwrap();
+            drop(seen_tx.send(first));
+            while let Ok(Some(_)) = lines.next_line().await {}
+        });
+        let mut conn = Connection::connect(&address).await.unwrap();
+        let (net_tx, _net_rx) = mpsc::channel(8);
+        let (_out_tx, mut out_rx) = mpsc::channel(8);
+        let mut channels = std::collections::BTreeSet::new();
+        let mut nick = "me".to_owned();
+        let window = Duration::from_millis(150);
+        let started = std::time::Instant::now();
+        let reason = tokio::time::timeout(
+            Duration::from_secs(5),
+            relay_session(
+                &mut conn,
+                &mut out_rx,
+                &net_tx,
+                &mut channels,
+                &mut nick,
+                window,
+            ),
+        )
+        .await
+        .expect("a silent server ends the session")
+        .expect("the session ends with a reason, not because the UI left");
+        assert_eq!(reason, "server stopped responding");
+        assert!(started.elapsed() >= window * 2, "{:?}", started.elapsed());
+        assert_eq!(
+            seen_rx.await.unwrap().as_deref(),
+            Some("PING :e6irc-tui"),
+            "the client asked before giving up"
+        );
+    }
+
+    /// A server that answers the probe is alive: the session continues, and the
+    /// answer to the client's own keepalive is bookkeeping, not conversation.
+    #[tokio::test]
+    async fn a_server_that_answers_the_probe_keeps_the_session_and_the_answer_stays_out_of_the_log()
+    {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (probes_tx, mut probes_rx) = mpsc::channel(8);
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            let mut close_rx = std::pin::pin!(close_rx);
+            loop {
+                tokio::select! {
+                    line = lines.next_line() => {
+                        let Ok(Some(line)) = line else { return };
+                        if let Some(token) = line.strip_prefix("PING :") {
+                            writer.write_all(format!("PONG :{token}\r\n").as_bytes()).await.unwrap();
+                            if probes_tx.send(()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    _ = &mut close_rx => return,
+                }
+            }
+        });
+        let mut conn = Connection::connect(&address).await.unwrap();
+        let (net_tx, mut net_rx) = mpsc::channel(8);
+        let (_out_tx, mut out_rx) = mpsc::channel(8);
+        let window = Duration::from_millis(100);
+        let session = tokio::spawn(async move {
+            let mut channels = std::collections::BTreeSet::new();
+            let mut nick = "me".to_owned();
+            relay_session(
+                &mut conn,
+                &mut out_rx,
+                &net_tx,
+                &mut channels,
+                &mut nick,
+                window,
+            )
+            .await
+        });
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_secs(5), probes_rx.recv())
+                .await
+                .expect("the client keeps probing an idle server")
+                .expect("the server task is alive");
+        }
+        assert!(!session.is_finished(), "an answered probe is a live server");
+        assert!(
+            net_rx.try_recv().is_err(),
+            "the keepalive answer reached the log"
+        );
+        drop(close_tx);
+        let reason = tokio::time::timeout(Duration::from_secs(5), session)
+            .await
+            .expect("the session ends when the server closes")
+            .expect("session task")
+            .expect("the session ends with a reason");
+        assert_eq!(reason, "server closed the connection");
     }
 }

@@ -32,3 +32,9 @@ clap = { version = "4.6.2", default-features = false, features = [
     "usage",
     "error-context",
 ] }
+
+[dev-dependencies]
+# Paused time for the liveness tests: a three-minute window runs in no time.
+tokio = { version = "1.53.0", default-features = false, features = [
+    "test-util",
+] }

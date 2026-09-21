@@ -59,13 +59,6 @@ test("an account with no password sets the identity and keeps the sealed passwor
   assert.deepEqual(credentialAction({ account: "ada" }), { action: "set", account: "ada" });
 });
 
-test("clearing wins over anything typed, so removal is never ambiguous", () => {
-  assert.deepEqual(
-    credentialAction({ clearing: true, account: "ada", password: "hunter2" }),
-    { action: "remove" },
-  );
-});
-
 // A password with nothing to authenticate as is refused where the field is,
 // rather than travelling to the server to come back as a rejected request.
 test("a password with no account is refused on both endpoints", () => {
@@ -145,4 +138,35 @@ test("auto-join accepts commas, spaces, or both, and drops the gaps", () => {
   assert.deepEqual(autojoinList("#e6qu, #rust  #irc"), ["#e6qu", "#rust", "#irc"]);
   assert.deepEqual(autojoinList(""), []);
   assert.deepEqual(autojoinList(undefined), []);
+});
+
+// ---- the two ambiguous edits of a stored credential ------------------------
+//
+// Ticking "Remove" while an account or password is typed, and blanking the
+// stored account without ticking it, both used to send something other than
+// what was on screen: the first dropped the typed values, the second sent
+// `keep` for a box the person had just emptied. Both are refused at the box.
+
+test("typed credentials under a ticked Remove are refused, pointing at the checkbox", () => {
+  assert.throws(
+    () => credentialAction({ clearing: true, account: "ada", password: "" }),
+    (error) => error instanceof NetworkRequestError && error.field === "sasl_password" && /Remove the stored account and password/.test(error.message),
+  );
+  assert.throws(
+    () => credentialAction({ clearing: true, account: "", password: "hunter2" }),
+    (error) => error instanceof NetworkRequestError && error.field === "sasl_password",
+  );
+  assert.deepEqual(credentialAction({ clearing: true, storedAccount: "ada" }), { action: "remove" });
+});
+
+test("an emptied stored account is not silently kept", () => {
+  assert.throws(
+    () => credentialAction({ account: "", password: "", storedAccount: "ada" }),
+    (error) => error instanceof NetworkRequestError && error.field === "sasl_account" && /Remove the stored account and password/.test(error.message),
+  );
+  // With nothing stored an empty box still means keep (nothing to remove).
+  assert.deepEqual(credentialAction({ account: "", password: "", storedAccount: "" }), { action: "keep" });
+  // Renaming or re-entering the stored account is a set, as before.
+  assert.deepEqual(credentialAction({ account: "ada", storedAccount: "ada" }), { action: "set", account: "ada" });
+  assert.deepEqual(updateNetworkBody({ addr: "irc.libera.chat:6697", tls: true, nick: "ada", account: "ada", storedAccount: "ada" }).credentials, { action: "set", account: "ada" });
 });

@@ -29,7 +29,7 @@ pub(super) fn send_current_markread(
     key: &ChanKey,
     display: &str,
 ) {
-    let account = state.sessions[&conn].account.clone();
+    let account = state.sessions[&conn].account().map(str::to_owned);
     let ms = match &account {
         Some(a) => state
             .read_markers
@@ -80,7 +80,7 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // per-connection markers (the connection *is* the client), kept in the
     // session and lost on disconnect. Either way MARKREAD works — the spec ties
     // markers to the client, not strictly to an account.
-    let account = state.sessions[&conn].account.clone();
+    let account = state.sessions[&conn].account().map(str::to_owned);
     let key = state.chan_key(target);
     let server = state.config.server_name.clone();
     let marker_pending = account.as_ref().is_some_and(|account| {

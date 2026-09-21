@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use sqlx::PgPool;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::{NetworkConfig, NetworkHandle, attach};
+use super::{BufferedLine, NetworkConfig, NetworkHandle, attach};
 use crate::config::NetworkEntry;
 use e6irc_proto::framing::{LineBuffer, LineEvent};
 use e6irc_proto::message::Message;
@@ -435,11 +435,14 @@ fn spawn_persistence(
                 // A synthesized self-echo is part of the conversation record:
                 // persist it like an upstream line so a reattached client sees
                 // both sides after a restart.
-                Ok(DriverEvent::Line(line)) => {
+                Ok(DriverEvent::Line(BufferedLine { line, .. })) => {
                     let own_nick = handle.irc_session_snapshot().map(|session| session.nick);
                     (line, own_nick)
                 }
-                Ok(DriverEvent::Echo { line, .. }) => {
+                Ok(DriverEvent::Echo {
+                    line: BufferedLine { line, .. },
+                    ..
+                }) => {
                     // The echo carries the exact identity used when it was
                     // synthesized. Derive ownership from that line instead of
                     // a later sticky snapshot: the persistence task may lag

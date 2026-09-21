@@ -134,13 +134,12 @@ pub struct AppState {
     /// key is configured (then networks with an upstream password are
     /// refused rather than stored in the clear).
     pub secret_key: Option<std::sync::Arc<crate::secret::SecretKeyring>>,
-    /// Accounts permitted to use the `/api/v1/admin` endpoints (rfc1459
-    /// casefolded at startup). Empty = admin disabled.
-    pub admin_accounts: std::sync::RwLock<std::collections::HashSet<String>>,
     /// Restart-scoped administrator grants from managed/bootstrap
-    /// configuration. Kept separate from the effective registry so revoking a
-    /// durable grant cannot accidentally revoke authority that configuration
-    /// still grants (or pretend that it did).
+    /// configuration (rfc1459 casefolded at startup). Durable grants live on
+    /// the account row and are read per request (`is_effective_admin`), so a
+    /// grant made outside this process needs no restart; these are the grants
+    /// only configuration knows about, kept apart so revoking a durable grant
+    /// cannot revoke authority configuration still gives (or pretend it did).
     pub configured_admin_accounts: std::collections::HashSet<String>,
     /// Per-startup key for deriving CSRF tokens for cookie-authenticated
     /// form posts from the server-rendered pages.
@@ -248,7 +247,7 @@ impl AppState {
 /// bound them like every other client-supplied field (the network fields cap at
 /// 64/128/255) rather than accepting a multi-megabyte JSON body into storage.
 pub(super) const MAX_LABEL_LEN: usize = 64;
-pub(super) const MAX_ACCOUNT_LEN: usize = 64;
+pub(super) const MAX_ACCOUNT_LEN: usize = crate::config::MAX_ACCOUNT_NAME_LEN;
 pub(super) const MAX_PASSWORD_LEN: usize = 512;
 
 /// A problem response carried through an internal fallible helper. Boxing the
@@ -286,6 +285,9 @@ impl IntoResponse for ResponseRejection {
 pub(super) type ResponseResult<T> = Result<T, ResponseRejection>;
 
 pub(super) fn label_validation_error(label: &str) -> Option<String> {
+    if label.is_empty() {
+        return Some("Labels must not be empty.".into());
+    }
     if label.chars().count() > MAX_LABEL_LEN {
         return Some(format!("Labels are at most {MAX_LABEL_LEN} characters."));
     }
@@ -660,15 +662,6 @@ pub(super) async fn mutate_account_administrator(
     .map_err(|error| authority_error_status("account authority mutation", error))?
     .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
     let configured = state.configured_admin_accounts.contains(&change.folded);
-    let mut effective = state
-        .admin_accounts
-        .write()
-        .expect("administrator registry lock");
-    if administrator || configured {
-        effective.insert(change.folded.clone());
-    } else {
-        effective.remove(&change.folded);
-    }
     Ok(if administrator {
         format!(
             "Granted durable administrator authority to {}.",
@@ -733,13 +726,6 @@ pub(super) async fn create_account_lifecycle(
             )
         }
     })?;
-    if administrator {
-        state
-            .admin_accounts
-            .write()
-            .expect("administrator registry lock")
-            .insert(e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account));
-    }
     Ok(account_id)
 }
 
@@ -810,11 +796,6 @@ pub(super) async fn delete_account_lifecycle(
         }
     };
     let stopped_networks = registry.remove_owner(&deleted.folded).await;
-    state
-        .admin_accounts
-        .write()
-        .expect("administrator registry lock")
-        .remove(&deleted.folded);
     Ok(format!(
         "Permanently deleted {} and stopped {stopped_networks} owned network(s). The account name is retired.",
         deleted.name
@@ -1074,7 +1055,7 @@ struct ObservabilityResponse {
 async fn admin_observability(
     State(state): State<Arc<AppState>>,
     _admin: AdminAccount,
-    Query(query): Query<ObservabilityQuery>,
+    QueryParams(query): QueryParams<ObservabilityQuery>,
 ) -> Response {
     let minutes = match validate_observability_minutes(query.minutes) {
         Ok(minutes) => minutes,
@@ -1457,7 +1438,9 @@ mod web {
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
     ) -> Response {
-        match authenticate(&state, &headers).await {
+        // The shell is a page: a browser session or nothing, like every other
+        // page (a bearer gets the 401 that sends it to the sign-in chooser).
+        match authenticate_browser_session(&state, &headers).await {
             Ok(_) => serve("index.html"),
             Err(response) if response.status() != StatusCode::UNAUTHORIZED => response.into(),
             Err(_) => match state
@@ -1627,14 +1610,15 @@ mod pages {
         active: &'static str,
     }
 
-    fn console_shell(
-        state: &AppState,
-        account: String,
-        csrf: String,
-        active: &'static str,
-    ) -> ConsoleShell {
+    fn console_shell(actor: PageActor, active: &'static str) -> ConsoleShell {
+        let PageActor {
+            account,
+            csrf,
+            admin,
+            ..
+        } = actor;
         ConsoleShell {
-            is_admin: is_admin_account(state, &account),
+            is_admin: admin,
             account,
             csrf,
             active,
@@ -1883,11 +1867,6 @@ mod pages {
                 );
             }
         }
-        state
-            .admin_accounts
-            .write()
-            .expect("administrator registry lock")
-            .insert(e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&form.account));
         state.bootstrap_available.store(false, Ordering::Release);
         let user_agent = super::session_user_agent(&headers);
         let token =
@@ -2073,13 +2052,6 @@ mod pages {
                 );
             }
         };
-        if preview.administrator {
-            state
-                .admin_accounts
-                .write()
-                .expect("administrator registry lock")
-                .insert(e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account));
-        }
         let user_agent = super::session_user_agent(&headers);
         let session = match crate::db::create_web_session(pool, &account, user_agent.as_ref()).await
         {
@@ -2349,34 +2321,68 @@ mod pages {
         shell: ConsoleShell,
     }
 
-    /// Authenticate a cookie session for a server-rendered page and derive its
-    /// CSRF token, returning `(account, csrf)`. On no/invalid session returns the
-    /// `/login` redirect; with `admin_only`, a non-admin gets 403. This is the
-    /// shared preamble of every console/account page handler.
+    /// The browser behind a server-rendered page: its account, the session that
+    /// proved it, the session-bound CSRF value the page's forms carry, and
+    /// whether it may see the administrator sections.
+    pub(super) struct PageActor {
+        account: String,
+        session: String,
+        csrf: String,
+        admin: bool,
+    }
+
+    /// Authenticate a server-rendered page's browser session. Pages are
+    /// cookie-only, like every route that acts for a browser: a bearer is
+    /// refused, not redirected — it is not a browser that can sign in, and the
+    /// console is the one place a read-scoped token of an administrator must
+    /// never be able to reach. A visitor with no session, or a session that
+    /// has ended, goes to `/login`; a suspended account and an unavailable
+    /// database are reported as the problem they are, and the same per-account
+    /// budget every JSON read spends is spent here. With `admin_only`, a
+    /// signed-in non-administrator gets 403.
     async fn page_actor(
         state: &AppState,
         headers: &axum::http::HeaderMap,
         admin_only: bool,
-    ) -> ResponseResult<(String, String)> {
-        let account = authenticate(state, headers)
+    ) -> ResponseResult<PageActor> {
+        let (principal, session) = authenticate_browser_session(state, headers)
             .await
-            .map_err(|_| Redirect::to("/login").into_response())?;
-        if admin_only && !is_admin_account(state, &account) {
+            .map_err(|rejection| page_rejection(headers, rejection))?;
+        let admin = is_effective_admin(state, &principal);
+        if admin_only && !admin {
             return Err(problem(StatusCode::FORBIDDEN, "Admin only", None).into());
         }
-        let csrf = session_token(headers, state.secure_cookies)
-            .map(|s| state.csrf_token(&s))
-            .unwrap_or_default();
-        Ok((account, csrf))
+        spend_api_budget(state, &principal.account, false)
+            .map_err(|retry_after| ResponseRejection::from(rate_limit_response(retry_after)))?;
+        Ok(PageActor {
+            account: principal.account,
+            csrf: state.csrf_token(&session),
+            session,
+            admin,
+        })
+    }
+
+    /// A page turns "not signed in" into the sign-in page — for a browser. A
+    /// request that presented an `Authorization` header is not a browser
+    /// looking for a login form; it keeps the `401` that names what was wrong
+    /// with its credential. Every other failure (suspended, database
+    /// unavailable, rate limited) is its problem document.
+    fn page_rejection(
+        headers: &axum::http::HeaderMap,
+        rejection: ResponseRejection,
+    ) -> ResponseRejection {
+        if rejection.status() == StatusCode::UNAUTHORIZED
+            && !headers.contains_key(header::AUTHORIZATION)
+        {
+            return Redirect::to("/login").into_response().into();
+        }
+        rejection
     }
 
     /// An administrator-authenticated server-rendered page actor. Declaring
     /// this extractor in a handler signature makes the login redirect, admin
     /// gate, and session-bound CSRF derivation preconditions of calling it.
-    pub(super) struct AdminPageActor {
-        account: String,
-        csrf: String,
-    }
+    pub(super) struct AdminPageActor(PageActor);
 
     impl axum::extract::FromRequestParts<Arc<AppState>> for AdminPageActor {
         type Rejection = Response;
@@ -2385,8 +2391,10 @@ mod pages {
             parts: &mut axum::http::request::Parts,
             state: &Arc<AppState>,
         ) -> Result<Self, Self::Rejection> {
-            let (account, csrf) = page_actor(state, &parts.headers, true).await?;
-            Ok(Self { account, csrf })
+            page_actor(state, &parts.headers, true)
+                .await
+                .map(Self)
+                .map_err(Into::into)
         }
     }
 
@@ -2406,12 +2414,12 @@ mod pages {
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
     ) -> Response {
-        let (account, csrf) = match page_actor(&state, &headers, false).await {
+        let actor = match page_actor(&state, &headers, false).await {
             Ok(actor) => actor,
             Err(response) => return response.into(),
         };
         render_private(ConsoleAccount {
-            shell: console_shell(&state, account, csrf, "account"),
+            shell: console_shell(actor, "account"),
         })
     }
 
@@ -2425,12 +2433,12 @@ mod pages {
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
     ) -> Response {
-        let (account, csrf) = match page_actor(&state, &headers, false).await {
-            Ok(resolved) => resolved,
+        let actor = match page_actor(&state, &headers, false).await {
+            Ok(actor) => actor,
             Err(response) => return response.into(),
         };
         render_private(ConsoleChannels {
-            shell: console_shell(&state, account, csrf, "channels"),
+            shell: console_shell(actor, "channels"),
         })
     }
 
@@ -2576,16 +2584,15 @@ mod pages {
     }
 
     pub async fn console_monitoring(
-        State(state): State<Arc<AppState>>,
-        AdminPageActor { account, csrf }: AdminPageActor,
-        Query(query): Query<ConsoleMonitoringQuery>,
+        AdminPageActor(actor): AdminPageActor,
+        QueryParams(query): QueryParams<ConsoleMonitoringQuery>,
     ) -> Response {
         let window = match MonitoringWindow::from_query(query.minutes) {
             Ok(window) => window,
             Err(InvalidMonitoringWindow) => return invalid_monitoring_window_response(),
         };
         render_private(ConsoleMonitoring {
-            shell: console_shell(&state, account, csrf, "monitoring"),
+            shell: console_shell(actor, "monitoring"),
             minutes: window.minutes(),
             window_links: monitoring_window_links(window),
         })
@@ -2599,34 +2606,26 @@ mod pages {
         })
     }
 
-    pub async fn console_logs(
-        State(state): State<Arc<AppState>>,
-        AdminPageActor { account, csrf }: AdminPageActor,
-    ) -> Response {
+    pub async fn console_logs(AdminPageActor(actor): AdminPageActor) -> Response {
         render_private(ConsoleLogs {
-            shell: console_shell(&state, account, csrf, "logs"),
+            shell: console_shell(actor, "logs"),
         })
     }
 
-    pub async fn console_accounts(
-        State(state): State<Arc<AppState>>,
-        AdminPageActor { account, csrf }: AdminPageActor,
-    ) -> Response {
+    pub async fn console_accounts(AdminPageActor(actor): AdminPageActor) -> Response {
         render_private(ConsoleAccounts {
-            shell: console_shell(&state, account, csrf, "accounts"),
+            shell: console_shell(actor, "accounts"),
         })
     }
 
     fn console_admin_channels_build(
-        state: &AppState,
-        account: String,
-        csrf: String,
+        actor: PageActor,
         query: super::device::ValidatedRegisteredChannelDirectoryQuery,
     ) -> ConsoleAdminChannels {
         let name = query.name.unwrap_or_default();
         let founder = query.founder.unwrap_or_default();
         ConsoleAdminChannels {
-            shell: console_shell(state, account, csrf, "admin-channels"),
+            shell: console_shell(actor, "admin-channels"),
             has_filters: !name.is_empty() || !founder.is_empty(),
             has_cursor: query.before_id.is_some(),
             name,
@@ -2636,39 +2635,33 @@ mod pages {
     }
 
     pub async fn console_admin_channels(
-        State(state): State<Arc<AppState>>,
-        AdminPageActor { account, csrf }: AdminPageActor,
-        Query(params): Query<super::device::RegisteredChannelDirectoryQuery>,
+        AdminPageActor(actor): AdminPageActor,
+        QueryParams(params): QueryParams<super::device::RegisteredChannelDirectoryQuery>,
     ) -> Response {
         let query = match super::device::validate_registered_channel_directory_query(params, 50) {
             Ok(query) => query,
             Err(response) => return response.into(),
         };
-        render_private(console_admin_channels_build(&state, account, csrf, query))
+        render_private(console_admin_channels_build(actor, query))
     }
 
     /// The fleet-wide BNC view: every account's networks with live driver
     /// state, so an operator can spot (and stop) a single misbehaving
     /// upstream without suspending the whole account.
-    pub async fn console_admin_networks(
-        State(state): State<Arc<AppState>>,
-        AdminPageActor { account, csrf }: AdminPageActor,
-    ) -> Response {
+    pub async fn console_admin_networks(AdminPageActor(actor): AdminPageActor) -> Response {
         render_private(ConsoleAdminNetworks {
-            shell: console_shell(&state, account, csrf, "admin-networks"),
+            shell: console_shell(actor, "admin-networks"),
         })
     }
 
     fn console_server_bans_build(
-        state: &AppState,
-        account: String,
-        csrf: String,
+        actor: PageActor,
         query: super::device::ValidatedServerBanDirectoryQuery,
     ) -> ConsoleServerBans {
         let kind = query.kind.unwrap_or_default();
         let mask = query.mask.unwrap_or_default();
         ConsoleServerBans {
-            shell: console_shell(state, account, csrf, "bans"),
+            shell: console_shell(actor, "bans"),
             has_filters: !kind.is_empty() || !mask.is_empty(),
             has_cursor: query.before_id.is_some(),
             kind,
@@ -2678,21 +2671,19 @@ mod pages {
     }
 
     pub async fn console_server_bans(
-        State(state): State<Arc<AppState>>,
-        AdminPageActor { account, csrf }: AdminPageActor,
-        Query(params): Query<super::device::ServerBanDirectoryQuery>,
+        AdminPageActor(actor): AdminPageActor,
+        QueryParams(params): QueryParams<super::device::ServerBanDirectoryQuery>,
     ) -> Response {
         let query = match super::device::validate_server_ban_directory_query(params, 50) {
             Ok(query) => query,
             Err(response) => return response.into(),
         };
-        render_private(console_server_bans_build(&state, account, csrf, query))
+        render_private(console_server_bans_build(actor, query))
     }
 
     pub async fn console_audit(
-        State(state): State<Arc<AppState>>,
-        AdminPageActor { account, csrf }: AdminPageActor,
-        Query(params): Query<super::device::AuditQuery>,
+        AdminPageActor(page): AdminPageActor,
+        QueryParams(params): QueryParams<super::device::AuditQuery>,
     ) -> Response {
         let query = match super::device::validate_audit_query(params, 50) {
             Ok(query) => query,
@@ -2703,7 +2694,7 @@ mod pages {
         let target = query.target.unwrap_or_default();
         let has_cursor = query.before_id.is_some();
         render_private(ConsoleAudit {
-            shell: console_shell(&state, account, csrf, "audit"),
+            shell: console_shell(page, "audit"),
             has_filters: !actor.is_empty() || !action.is_empty() || !target.is_empty(),
             has_cursor,
             actor,
@@ -2721,11 +2712,11 @@ mod pages {
 
     pub async fn console_configuration(
         State(state): State<Arc<AppState>>,
-        AdminPageActor { account, csrf }: AdminPageActor,
+        AdminPageActor(actor): AdminPageActor,
     ) -> Response {
         let _config = require_managed_config!(state);
         render_private(ConsoleConfiguration {
-            shell: console_shell(&state, account, csrf, "configuration"),
+            shell: console_shell(actor, "configuration"),
         })
     }
 
@@ -2798,22 +2789,13 @@ mod pages {
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
     ) -> Response {
-        let (account, csrf) = match page_actor(&state, &headers, true).await {
-            Ok(resolved) => resolved,
+        let actor = match page_actor(&state, &headers, true).await {
+            Ok(actor) => actor,
             Err(response) => return response.into(),
         };
         render_private(Console {
-            shell: console_shell(&state, account, csrf, "overview"),
+            shell: console_shell(actor, "overview"),
         })
-    }
-
-    /// Whether `account` may reach the admin console sections.
-    fn is_admin_account(state: &AppState, account: &str) -> bool {
-        state
-            .admin_accounts
-            .read()
-            .expect("administrator registry lock")
-            .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account))
     }
 
     async fn network_operations_response(
@@ -2872,12 +2854,12 @@ mod pages {
         headers: axum::http::HeaderMap,
         Path(name): Path<String>,
     ) -> Response {
-        let (account, csrf) = match page_actor(&state, &headers, false).await {
-            Ok(result) => result,
+        let actor = match page_actor(&state, &headers, false).await {
+            Ok(actor) => actor,
             Err(response) => return response.into(),
         };
         render_private(ConsoleNetworkDetail {
-            shell: console_shell(&state, account, csrf, "networks"),
+            shell: console_shell(actor, "networks"),
             name,
         })
     }
@@ -2889,12 +2871,12 @@ mod pages {
         headers: axum::http::HeaderMap,
         Path(name): Path<String>,
     ) -> Response {
-        let (account, csrf) = match page_actor(&state, &headers, false).await {
-            Ok(result) => result,
+        let actor = match page_actor(&state, &headers, false).await {
+            Ok(actor) => actor,
             Err(response) => return response.into(),
         };
         render_private(ConsoleNetworkLogs {
-            shell: console_shell(&state, account, csrf, "networks"),
+            shell: console_shell(actor, "networks"),
             name,
         })
     }
@@ -2945,19 +2927,20 @@ mod pages {
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
     ) -> Response {
-        let (account, csrf) = match page_actor(&state, &headers, false).await {
-            Ok(resolved) => resolved,
+        let actor = match page_actor(&state, &headers, false).await {
+            Ok(actor) => actor,
             Err(response) => return response.into(),
         };
         let attach_addr = match &state.bnc_listener {
             Some(listener) => listener.status().await.map(|(_, bound)| bound),
             None => None,
         };
+        let form = NetworkFormView::libera(&actor.account);
         render_private(ConsoleNetworks {
-            shell: console_shell(&state, account.clone(), csrf, "networks"),
+            shell: console_shell(actor, "networks"),
             attach_addr,
             presets: IRC_NETWORK_PRESETS,
-            form: NetworkFormView::libera(&account),
+            form,
             can_store_secrets: state.secret_key.is_some(),
         })
     }
@@ -2969,12 +2952,12 @@ mod pages {
         headers: axum::http::HeaderMap,
         Path(name): Path<String>,
     ) -> Response {
-        let (account, csrf) = match page_actor(&state, &headers, false).await {
-            Ok(x) => x,
-            Err(r) => return r.into(),
+        let actor = match page_actor(&state, &headers, false).await {
+            Ok(actor) => actor,
+            Err(response) => return response.into(),
         };
         render_private(ConsoleNetworkEdit {
-            shell: console_shell(&state, account, csrf, "networks"),
+            shell: console_shell(actor, "networks"),
             name,
         })
     }
@@ -3042,11 +3025,7 @@ mod pages {
 
     /// Console → Integrations (admin): a document shell. The browser reads the
     /// complete stored and shared bridge inventory from the administrator API.
-    fn console_integrations_build(
-        state: &AppState,
-        account: String,
-        csrf: String,
-    ) -> ConsoleIntegrations {
+    fn console_integrations_build(state: &AppState, actor: PageActor) -> ConsoleIntegrations {
         let platforms = BRIDGE_PLATFORMS
             .iter()
             .map(|meta| BridgePlatform {
@@ -3055,7 +3034,7 @@ mod pages {
             })
             .collect();
         ConsoleIntegrations {
-            shell: console_shell(state, account, csrf, "integrations"),
+            shell: console_shell(actor, "integrations"),
             bouncer_enabled: state.bnc_registry.is_some(),
             platforms,
         }
@@ -3064,9 +3043,9 @@ mod pages {
     /// Console → Integrations (admin) GET.
     pub async fn console_integrations(
         State(state): State<Arc<AppState>>,
-        AdminPageActor { account, csrf }: AdminPageActor,
+        AdminPageActor(actor): AdminPageActor,
     ) -> Response {
-        render_private(console_integrations_build(&state, account, csrf))
+        render_private(console_integrations_build(&state, actor))
     }
 
     /// Unwrap an axum form, turning a rejection into a 400 problem response.
@@ -3087,12 +3066,9 @@ mod pages {
     }
 
     /// Console → API-hydrated live connection directory (admin-gated).
-    pub async fn console_sessions(
-        State(state): State<Arc<AppState>>,
-        AdminPageActor { account, csrf }: AdminPageActor,
-    ) -> Response {
+    pub async fn console_sessions(AdminPageActor(actor): AdminPageActor) -> Response {
         render_private(ConsoleSessions {
-            shell: console_shell(&state, account, csrf, "sessions"),
+            shell: console_shell(actor, "sessions"),
             own: false,
         })
     }
@@ -3103,12 +3079,12 @@ mod pages {
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
     ) -> Response {
-        let (account, csrf) = match page_actor(&state, &headers, false).await {
-            Ok(resolved) => resolved,
+        let actor = match page_actor(&state, &headers, false).await {
+            Ok(actor) => actor,
             Err(response) => return response.into(),
         };
         render_private(ConsoleSessions {
-            shell: console_shell(&state, account, csrf, "my-sessions"),
+            shell: console_shell(actor, "my-sessions"),
             own: true,
         })
     }
@@ -3116,12 +3092,11 @@ mod pages {
     /// Console → Integrations bridge editor. The browser reads the owner API
     /// resource before populating its typed provider fields.
     pub async fn console_edit_bridge(
-        State(state): State<Arc<AppState>>,
-        AdminPageActor { account, csrf }: AdminPageActor,
+        AdminPageActor(actor): AdminPageActor,
         Path(name): Path<String>,
     ) -> Response {
         render_private(ConsoleBridgeEdit {
-            shell: console_shell(&state, account, csrf, "integrations"),
+            shell: console_shell(actor, "integrations"),
             name,
         })
     }
@@ -3144,14 +3119,12 @@ mod pages {
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
     ) -> Response {
-        let Ok(_account) = authenticate(&state, &headers).await else {
-            return Redirect::to("/login").into_response();
+        let actor = match page_actor(&state, &headers, false).await {
+            Ok(actor) => actor,
+            Err(response) => return response.into(),
         };
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|s| state.csrf_token(&s))
-            .unwrap_or_default();
         render_auth(Device {
-            csrf,
+            csrf: actor.csrf,
             outcome: None,
             approved: false,
         })
@@ -3172,11 +3145,13 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<DeviceFormFields>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let Ok(account) = authenticate(&state, &headers).await else {
-            return Redirect::to("/login").into_response();
-        };
-        let Some(session) = session_token(&headers, state.secure_cookies) else {
-            return problem(StatusCode::UNAUTHORIZED, "Session required", None);
+        // The form carries its CSRF value as a field, so the page actor's
+        // cookie-only authentication applies and the field is checked here.
+        let PageActor {
+            account, session, ..
+        } = match page_actor(&state, &headers, false).await {
+            Ok(actor) => actor,
+            Err(response) => return response.into(),
         };
         let axum::Form(fields) = match form {
             Ok(f) => f,

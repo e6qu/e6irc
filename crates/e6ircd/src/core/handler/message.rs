@@ -318,7 +318,7 @@ pub(super) fn deliver_one_message(
             let prefix = state.sessions[&conn].prefix();
             let text = fit_relayed_text(&prefix, kind.wire(), target, text);
             let line = format!(":{prefix} {} {target} :{text}", kind.wire());
-            let sender_account = state.sessions[&conn].account.clone();
+            let sender_account = state.sessions[&conn].account().map(str::to_owned);
             let sender_is_bot = state.sessions[&conn].bot;
             let (ts, msgid) = state.stamp();
             let sender = state.local_recipient(conn);
@@ -384,7 +384,7 @@ pub(super) fn deliver_one_message(
         msgid,
         ts,
         sender_prefix: prefix.clone(),
-        sender_account: state.sessions[&conn].account.clone(),
+        sender_account: state.sessions[&conn].account().map(str::to_owned),
         kind,
         body: text.to_string(),
         sender_is_bot: state.sessions[&conn].bot,
@@ -618,7 +618,7 @@ fn deliver_one_tagmsg(state: &mut ServerState, conn: ConnId, target: &str, clien
     // IRCv3 account-tag and bot-mode specs list TAGMSG among the messages that
     // bear them, and identity/anti-spam tooling keying on these tags would
     // otherwise silently lose typing/reaction attribution.
-    let sender_account = state.sessions[&conn].account.clone();
+    let sender_account = state.sessions[&conn].account().map(str::to_owned);
     let sender_is_bot = state.sessions[&conn].bot;
     let make_line = |server_time: Option<String>, account_tag: bool| {
         let mut tags = vec![format!("msgid={msgid}")];
@@ -1026,7 +1026,7 @@ pub(super) fn deliver_multiline(
     };
     let target = batch.target.as_str();
     let prefix = state.sessions[&conn].prefix();
-    let sender_account = state.sessions[&conn].account.clone();
+    let sender_account = state.sessions[&conn].account().map(str::to_owned);
     let sender_is_bot = state.sessions[&conn].bot;
     let (ts, msgid) = state.stamp();
     let time = e6irc_proto::time::server_time(ts);

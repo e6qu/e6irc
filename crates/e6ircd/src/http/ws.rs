@@ -245,6 +245,12 @@ pub(super) async fn ws_irc_conn(
 pub(super) struct UiParams {
     /// Which of the caller's networks to attach this UI socket to.
     pub(super) network: String,
+    /// The cursor of the last line this client handled on an earlier socket,
+    /// as a `line` or `snapshot` event carried it. Replay then holds only the
+    /// lines after it; a cursor the ring cannot honour (another ring lifetime,
+    /// an evicted position, or not a cursor at all) is answered with a
+    /// `replay full` event and the whole ring.
+    pub(super) after: Option<String>,
 }
 
 /// Whether composer frames from this socket may reach the upstream.
@@ -396,7 +402,7 @@ pub(super) async fn ws_ui(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Authenticated(account, credential): Authenticated,
-    Query(params): Query<UiParams>,
+    QueryParams(params): QueryParams<UiParams>,
     ws: WebSocketUpgrade,
 ) -> Response {
     if let Err(refusal) = require_same_origin_upgrade(&state, &headers) {
@@ -413,6 +419,7 @@ pub(super) async fn ws_ui(
     };
     // Counted before the upgrade, so sockets still in their handshake count.
     let slot = state.ui_sockets.admit(&account);
+    let resume = params.after.as_deref().map(ReplayRequest::from_cursor);
     ws.max_message_size(MAX_UI_WS_FRAME)
         .max_frame_size(MAX_UI_WS_FRAME)
         .on_upgrade(move |socket| {
@@ -421,9 +428,26 @@ pub(super) async fn ws_ui(
                 socket,
                 composer,
                 slot,
+                resume,
                 crate::bouncer::ATTACH_LIVENESS_INTERVAL,
             )
         })
+}
+
+/// What a returning client asked replay to start from.
+#[derive(Clone, Copy)]
+pub(super) enum ReplayRequest {
+    /// A well-formed cursor; the ring decides whether it can still honour it.
+    After(crate::bouncer::ReplayCursor),
+    /// Text that is not a cursor. The client believes it has history, so it
+    /// is told to start over rather than left to guess.
+    Unknown,
+}
+
+impl ReplayRequest {
+    fn from_cursor(text: &str) -> Self {
+        crate::bouncer::ReplayCursor::parse(text).map_or(Self::Unknown, Self::After)
+    }
 }
 
 /// Serve one live chat socket until either side ends it.
@@ -444,6 +468,7 @@ pub(super) async fn ws_ui_conn(
     mut socket: WebSocket,
     composer: ComposerAuthority,
     slot: Option<UiSocketSlot>,
+    resume: Option<ReplayRequest>,
     liveness: std::time::Duration,
 ) {
     use crate::bouncer::DriverEvent;
@@ -481,7 +506,15 @@ pub(super) async fn ws_ui_conn(
     }
     let _attachment = handle.track_attachment();
     let attach_id = handle.next_attachment_id();
-    let (mut events, buffer_snapshot, session_snapshot) = handle.subscribe_with_replay_snapshot();
+    let after = match resume {
+        Some(ReplayRequest::After(cursor)) => Some(cursor),
+        Some(ReplayRequest::Unknown) | None => None,
+    };
+    let (mut events, replay, session_snapshot) = handle.subscribe_with_replay_snapshot(after);
+    // Every line event names the ring position after it, so a client that
+    // loses this socket can hand back exactly where it stopped. A live event
+    // that entered no ring keeps the position where it was.
+    let mut cursor = replay.position();
 
     // Send the current connection status up front: a driver is always-on, so a
     // client attaching to an already-connected network would otherwise see no
@@ -496,11 +529,28 @@ pub(super) async fn ws_ui_conn(
         return;
     }
 
-    // Playback: everything buffered while detached, as JSON line events.
-    for line in buffer_snapshot {
-        if send_frame(&mut socket, WsMessage::text(line_event(&line)))
+    // A client that presented a cursor the ring could not honour holds a
+    // transcript this replay does not continue: say so first, so it starts
+    // over instead of showing the ring twice.
+    if resume.is_some()
+        && !replay.resumed
+        && send_frame(&mut socket, WsMessage::text(replay_full_event()))
             .await
             .is_err()
+    {
+        return;
+    }
+
+    // Playback: everything buffered while detached (or after the cursor), as
+    // JSON line events.
+    for entry in &replay.lines {
+        let entry_cursor = replay.cursor_at(entry.seq);
+        if send_frame(
+            &mut socket,
+            WsMessage::text(line_event(&entry.line, entry_cursor)),
+        )
+        .await
+        .is_err()
         {
             return;
         }
@@ -518,7 +568,9 @@ pub(super) async fn ws_ui_conn(
     // Delimit replay from live traffic. The browser waits for this typed
     // boundary before requesting authoritative NAMES snapshots, so old NAMES
     // rows in the detached buffer cannot race and overwrite the fresh result.
-    if send_frame(&mut socket, WsMessage::text(snapshot_event()))
+    // It carries the ring position after the replay, so a client that saw no
+    // line still has a cursor to return with.
+    if send_frame(&mut socket, WsMessage::text(snapshot_event(cursor)))
         .await
         .is_err()
     {
@@ -538,21 +590,25 @@ pub(super) async fn ws_ui_conn(
                 }
             }
             ev = events.recv() => match ev {
-                Ok(event @ (DriverEvent::Line(_) | DriverEvent::Notice(_))) => {
-                    let line = event.display_line().expect("display event carries a line");
-                    if send_frame(&mut socket, WsMessage::text(line_event(line))).await
+                Ok(DriverEvent::Line(entry) | DriverEvent::Notice(entry)) => {
+                    cursor = replay.cursor_at(entry.seq);
+                    if send_frame(&mut socket, WsMessage::text(line_event(&entry.line, cursor))).await
                         .is_err()
                     {
                         break;
                     }
                 }
-                Ok(DriverEvent::Echo { line, origin }) => {
+                Ok(DriverEvent::Echo { line: entry, origin }) => {
+                    // The echo took a ring position whether or not this socket
+                    // renders it, so the cursor moves past it either way: a
+                    // resume must not replay this client its own line.
+                    cursor = replay.cursor_at(entry.seq);
                     // This socket already rendered its own line optimistically
                     // with the correlated `sent` acknowledgement; an echo of it
                     // would double-render. Echoes from the account's *other*
                     // sessions are real conversation and render normally.
                     if origin != attach_id
-                        && send_frame(&mut socket, WsMessage::text(line_event(&line))).await
+                        && send_frame(&mut socket, WsMessage::text(line_event(&entry.line, cursor))).await
                             .is_err()
                     {
                         break;
@@ -580,8 +636,12 @@ pub(super) async fn ws_ui_conn(
                 // authenticated raw attaches that opted into it.
                 Ok(DriverEvent::ReadMarker { .. }) => {}
                 Err(RecvError::Lagged(n)) => {
+                    // The cursor still names the last line this socket sent, so
+                    // the reconnect below resumes with exactly the skipped
+                    // lines — the ring holds them even though the broadcast
+                    // queue dropped them.
                     let notice = format!(":*bnc* NOTICE * :{n} line(s) skipped (slow connection)");
-                    if send_frame(&mut socket, WsMessage::text(line_event(&notice))).await
+                    if send_frame(&mut socket, WsMessage::text(line_event(&notice, cursor))).await
                         .is_err()
                     {
                         break;
@@ -617,7 +677,7 @@ pub(super) async fn ws_ui_conn(
                     let request = match composer_request(&t) {
                         Ok(request) => request,
                         Err(error) => {
-                            let event = composer_result_event(ComposerResult::Rejected {
+                            let event = composer_result_event(cursor, ComposerResult::Rejected {
                                 request_id: error.request_id.as_ref().map(ComposerRequestId::as_str),
                                 message: error.message,
                             });
@@ -628,7 +688,7 @@ pub(super) async fn ws_ui_conn(
                         }
                     };
                     if let ComposerAuthority::ReadOnly = composer {
-                        let event = composer_result_event(ComposerResult::Rejected {
+                        let event = composer_result_event(cursor, ComposerResult::Rejected {
                             request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
                             message: "this token is read-only; sending needs the write scope. Nothing was sent",
                         });
@@ -642,7 +702,7 @@ pub(super) async fn ws_ui_conn(
                             if let Some(request_id) = request.request_id
                                 && send_frame(
                                     &mut socket,
-                                    WsMessage::text(composer_result_event(ComposerResult::Sent(
+                                    WsMessage::text(composer_result_event(cursor, ComposerResult::Sent(
                                         request_id.as_str(),
                                     ))),
                                 )
@@ -653,7 +713,7 @@ pub(super) async fn ws_ui_conn(
                             }
                         }
                         crate::bouncer::SendOutcome::Full => {
-                            let event = composer_result_event(ComposerResult::Rejected {
+                            let event = composer_result_event(cursor, ComposerResult::Rejected {
                                 request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
                                 message: "upstream busy; line not sent, try again",
                             });
@@ -666,7 +726,7 @@ pub(super) async fn ws_ui_conn(
                             break;
                         }
                         crate::bouncer::SendOutcome::Unavailable => {
-                            let event = composer_result_event(ComposerResult::Rejected {
+                            let event = composer_result_event(cursor, ComposerResult::Rejected {
                                 request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
                                 message: "upstream registration is parked; reconfigure the network before sending",
                             });
@@ -675,7 +735,7 @@ pub(super) async fn ws_ui_conn(
                             }
                         }
                         crate::bouncer::SendOutcome::Rejected(error) => {
-                            let event = composer_result_event(ComposerResult::Rejected {
+                            let event = composer_result_event(cursor, ComposerResult::Rejected {
                                 request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
                                 message: error.message(),
                             });
@@ -686,7 +746,7 @@ pub(super) async fn ws_ui_conn(
                     }
                 }
                 Some(Ok(WsMessage::Binary(_))) => {
-                    let event = composer_result_event(ComposerResult::Rejected {
+                    let event = composer_result_event(cursor, ComposerResult::Rejected {
                         request_id: None,
                         message: "composer requests must be text JSON",
                     });
@@ -884,13 +944,21 @@ enum ComposerResult<'a> {
 #[serde(tag = "t")]
 enum UiEvent<'a> {
     #[serde(rename = "line")]
-    Line { v: &'a str },
+    Line {
+        v: &'a str,
+        /// The ring position after this line, to resume from (`?after=`).
+        cursor: String,
+    },
     #[serde(rename = "sent")]
     Sent { v: &'a str },
     #[serde(rename = "send-error")]
     SendError { v: &'a str, message: &'a str },
     #[serde(rename = "snapshot")]
-    Snapshot { v: &'static str },
+    Snapshot { v: &'static str, cursor: String },
+    /// The presented cursor could not be honoured; the whole ring follows and
+    /// the client's transcript starts over.
+    #[serde(rename = "replay")]
+    Replay { v: &'static str },
     #[serde(rename = "session")]
     Session {
         nick: &'a str,
@@ -908,7 +976,13 @@ fn ui_event(event: UiEvent<'_>) -> String {
     serde_json::to_string(&event).expect("UI event serialization is infallible")
 }
 
-fn composer_result_event(result: ComposerResult<'_>) -> String {
+/// `cursor` is the socket's current ring position: a rejection that cannot be
+/// correlated is shown as a notice line, and a notice line, like every line,
+/// says where the ring stands (unchanged — it entered no ring).
+fn composer_result_event(
+    cursor: crate::bouncer::ReplayCursor,
+    result: ComposerResult<'_>,
+) -> String {
     match result {
         ComposerResult::Sent(request_id) => ui_event(UiEvent::Sent { v: request_id }),
         ComposerResult::Rejected {
@@ -921,7 +995,7 @@ fn composer_result_event(result: ComposerResult<'_>) -> String {
         ComposerResult::Rejected {
             request_id: None,
             message,
-        } => line_event(&format!(":*bnc* NOTICE * :{message}")),
+        } => line_event(&format!(":*bnc* NOTICE * :{message}"), cursor),
     }
 }
 
@@ -1002,13 +1076,26 @@ pub(super) fn slash_to_irc(message: &str, target: &str) -> Result<String, &'stat
 /// APIs, so no HTML is produced here. IRCv3 tags stay intact: `server-time`
 /// gives the live and persisted timelines the same clock, while `msgid` gives
 /// their overlap a stable identity. `serde_json` handles all escaping.
-pub(super) fn line_event(line: &str) -> String {
-    ui_event(UiEvent::Line { v: line })
+pub(super) fn line_event(line: &str, cursor: crate::bouncer::ReplayCursor) -> String {
+    ui_event(UiEvent::Line {
+        v: line,
+        cursor: cursor.to_string(),
+    })
 }
 
-/// Marks the point after detached-buffer replay and before live traffic.
-pub(super) fn snapshot_event() -> String {
-    ui_event(UiEvent::Snapshot { v: "complete" })
+/// Marks the point after detached-buffer replay and before live traffic, and
+/// names the ring position there.
+pub(super) fn snapshot_event(cursor: crate::bouncer::ReplayCursor) -> String {
+    ui_event(UiEvent::Snapshot {
+        v: "complete",
+        cursor: cursor.to_string(),
+    })
+}
+
+/// Tells a returning client its cursor was not honoured: the whole ring
+/// follows, and its transcript starts over.
+pub(super) fn replay_full_event() -> String {
+    ui_event(UiEvent::Replay { v: "full" })
 }
 
 fn session_event(session: &crate::bouncer::IrcSessionSnapshot) -> String {
@@ -1078,22 +1165,27 @@ mod tests {
         );
     }
 
+    fn cursor(text: &str) -> crate::bouncer::ReplayCursor {
+        crate::bouncer::ReplayCursor::parse(text).expect("test cursor")
+    }
+
     #[test]
     fn ui_line_event_preserves_message_identity_and_server_time() {
         let line = "@time=2026-07-28T20:00:00.000Z;msgid=m1 :alice!u@h PRIVMSG #chat :hello";
         let event: serde_json::Value =
-            serde_json::from_str(&line_event(line)).expect("line event JSON");
+            serde_json::from_str(&line_event(line, cursor("7:42"))).expect("line event JSON");
         assert_eq!(event["t"], "line");
         assert_eq!(event["v"], line);
+        assert_eq!(event["cursor"], "7:42");
     }
 
     #[test]
     fn ui_snapshot_event_is_a_closed_replay_boundary() {
         let event: serde_json::Value =
-            serde_json::from_str(&snapshot_event()).expect("snapshot event JSON");
+            serde_json::from_str(&snapshot_event(cursor("7:42"))).expect("snapshot event JSON");
         assert_eq!(
             event,
-            serde_json::json!({ "t": "snapshot", "v": "complete" })
+            serde_json::json!({ "t": "snapshot", "v": "complete", "cursor": "7:42" })
         );
     }
 
@@ -1101,19 +1193,36 @@ mod tests {
     fn ui_events_have_exact_shapes() {
         let cases = [
             (
-                line_event("PING :server"),
-                serde_json::json!({ "t": "line", "v": "PING :server" }),
+                line_event("PING :server", cursor("7:42")),
+                serde_json::json!({ "t": "line", "v": "PING :server", "cursor": "7:42" }),
             ),
             (
-                composer_result_event(ComposerResult::Sent("a1")),
+                replay_full_event(),
+                serde_json::json!({ "t": "replay", "v": "full" }),
+            ),
+            (
+                composer_result_event(cursor("7:42"), ComposerResult::Sent("a1")),
                 serde_json::json!({ "t": "sent", "v": "a1" }),
             ),
             (
-                composer_result_event(ComposerResult::Rejected {
-                    request_id: Some("a1"),
-                    message: "not sent",
-                }),
+                composer_result_event(
+                    cursor("7:42"),
+                    ComposerResult::Rejected {
+                        request_id: Some("a1"),
+                        message: "not sent",
+                    },
+                ),
                 serde_json::json!({ "t": "send-error", "v": "a1", "message": "not sent" }),
+            ),
+            (
+                composer_result_event(
+                    cursor("7:42"),
+                    ComposerResult::Rejected {
+                        request_id: None,
+                        message: "not sent",
+                    },
+                ),
+                serde_json::json!({ "t": "line", "v": ":*bnc* NOTICE * :not sent", "cursor": "7:42" }),
             ),
             (
                 status_event(ConnStatus::Connected, None),
@@ -1299,16 +1408,21 @@ mod tests {
 
     #[test]
     fn composer_results_are_typed_and_request_correlated() {
-        let accepted: serde_json::Value =
-            serde_json::from_str(&composer_result_event(ComposerResult::Sent("a1"))).unwrap();
+        let accepted: serde_json::Value = serde_json::from_str(&composer_result_event(
+            cursor("7:42"),
+            ComposerResult::Sent("a1"),
+        ))
+        .unwrap();
         assert_eq!(accepted, serde_json::json!({ "t": "sent", "v": "a1" }));
 
-        let rejected: serde_json::Value =
-            serde_json::from_str(&composer_result_event(ComposerResult::Rejected {
+        let rejected: serde_json::Value = serde_json::from_str(&composer_result_event(
+            cursor("7:42"),
+            ComposerResult::Rejected {
                 request_id: Some("a2"),
                 message: "not sent",
-            }))
-            .unwrap();
+            },
+        ))
+        .unwrap();
         assert_eq!(rejected["t"], "send-error");
         assert_eq!(rejected["v"], "a2");
         assert_eq!(rejected["message"], "not sent");
@@ -1356,7 +1470,14 @@ mod ui_socket_bound_tests {
                 async move {
                     let slot = limiter.admit("Alice");
                     ws.on_upgrade(move |socket| {
-                        ws_ui_conn(handle, socket, ComposerAuthority::MaySend, slot, LIVENESS)
+                        ws_ui_conn(
+                            handle,
+                            socket,
+                            ComposerAuthority::MaySend,
+                            slot,
+                            None,
+                            LIVENESS,
+                        )
                     })
                 }
             }),

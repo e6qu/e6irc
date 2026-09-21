@@ -949,8 +949,12 @@ pub(crate) struct Session {
     /// Mid-CAP-negotiation: registration is held until CAP END.
     pub cap_negotiating: bool,
     pub caps: Caps,
-    /// Services account this connection is authenticated to.
-    pub account: Option<String>,
+    /// Services account this connection is authenticated to. Written only by
+    /// [`ServerState::set_account`] and [`ServerState::clear_account`]: a
+    /// login changes the connection's identity (see
+    /// [`ServerState::conn_identity`]), and what the old identity owned must
+    /// be dealt with in the same step.
+    account: Option<String>,
     pub sasl: SaslState,
     /// A SASL credential verify is genuinely outstanding (dispatched, reply not
     /// yet seen). Unlike `sasl == Verifying`, this survives an `AUTHENTICATE *`
@@ -983,6 +987,13 @@ pub(crate) struct Session {
     pub bot: bool,
     /// Joined channels.
     pub channels: HashSet<ChanKey>,
+    /// JOINs routed to a channel owned by another shard and not yet answered.
+    /// They count towards the per-session channel limit from the moment they
+    /// are sent: the limit is enforced here, before routing, and a pipelined
+    /// burst would otherwise be admitted without bound while its answers are
+    /// in flight. A channel this shard owns is joined in the same step and
+    /// never appears here.
+    pub pending_joins: HashSet<ChanKey>,
     /// Nicks this session MONITORs (display form as given).
     pub monitoring: HashMap<NickKey, String>,
     /// The `draft/multiline` batch this connection is filling, if any.
@@ -1271,6 +1282,11 @@ impl Session {
     /// Whether registration has completed.
     pub fn is_registered(&self) -> bool {
         matches!(self.reg, Registration::Registered { .. })
+    }
+
+    /// The services account this connection is logged in to.
+    pub fn account(&self) -> Option<&str> {
+        self.account.as_deref()
     }
 
     /// The current nick, in either registration state (`None` before NICK).
@@ -3213,12 +3229,14 @@ impl ServerState {
     pub fn route_join_result(
         &mut self,
         session: SessionOwner,
+        requested: ChanKey,
         result: ChannelJoinResult,
         label: Option<String>,
     ) {
         self.effects
             .push(CoreEffect::Input(crate::core::Input::ChannelJoinResult {
                 session,
+                requested,
                 result,
                 label,
             }));
@@ -3280,23 +3298,6 @@ impl ServerState {
                 result,
                 label,
             }));
-    }
-
-    pub fn route_topic_persisted(
-        &mut self,
-        owner: ChannelOwner,
-        conn: ConnId,
-        session: Option<SessionOwner>,
-        result: crate::core::ChannelTopicPersistence,
-    ) {
-        self.effects.push(crate::core::CoreEffect::Input(
-            crate::core::Input::ChannelTopicPersisted {
-                owner,
-                conn,
-                session,
-                result,
-            },
-        ));
     }
 
     pub fn route_channel_command(&mut self, command: ChannelCommand) {
@@ -4504,6 +4505,7 @@ impl ServerState {
                 wallops: false,
                 bot: false,
                 channels: HashSet::new(),
+                pending_joins: HashSet::new(),
                 monitoring: HashMap::new(),
                 multiline: None,
                 label_groups: HashMap::new(),
@@ -5262,9 +5264,40 @@ impl ServerState {
         }
     }
 
-    /// An unauthenticated session has let go of `nick` — by leaving or by
-    /// changing nick — and with it the `~nick` identity. Every shard frees the
-    /// conversations kept with it (each party's shard keeps a copy).
+    /// Log `conn` in to `account` — the one way a session gains an account.
+    ///
+    /// Its identity changes with it: it was `~nick`, the identity of whoever
+    /// holds the nick without an account, and is the account from here on.
+    /// `~nick` is therefore let go now, exactly as when an unauthenticated
+    /// connection leaves or changes nick, and every shard frees the
+    /// conversations kept under it — or the next person to take the nick would
+    /// read them. A session already logged in keeps nothing under `~nick`, so
+    /// changing accounts releases nothing.
+    pub(crate) fn set_account(&mut self, conn: ConnId, account: String) {
+        let session = self.sessions.get_mut(&conn).expect("session logging in");
+        let released = session
+            .account
+            .is_none()
+            .then(|| session.nick().map(str::to_owned))
+            .flatten();
+        session.account = Some(account);
+        if let Some(nick) = released {
+            self.release_unauthenticated_identity(&nick);
+        }
+    }
+
+    /// Log `conn` out: it is `~nick` again from here on.
+    pub(crate) fn clear_account(&mut self, conn: ConnId) {
+        self.sessions
+            .get_mut(&conn)
+            .expect("session logging out")
+            .account = None;
+    }
+
+    /// An unauthenticated session has let go of `nick` — by leaving, by
+    /// changing nick, or by logging in — and with it the `~nick` identity.
+    /// Every shard frees the conversations kept with it (each party's shard
+    /// keeps a copy).
     pub(crate) fn release_unauthenticated_identity(&mut self, nick: &str) {
         let identity = format!("~{}", self.casemap.casefold(nick));
         self.forget_unauthenticated_identity(&identity);

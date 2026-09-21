@@ -155,7 +155,7 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
         state.err_needmoreparams(conn, "AUTHENTICATE");
         return;
     };
-    if state.sessions[&conn].account.is_some() {
+    if state.sessions[&conn].account().is_some() {
         state.numeric(
             conn,
             ERR_SASLALREADY,
@@ -333,19 +333,16 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
 
 pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core::DbReply) {
     use crate::core::state::SaslState;
-    // Session-scoped replies are moot once the client is gone — but replies
-    // that carry *global* state (the hot founder map, channel access) must be
-    // applied regardless: the DB has already committed, and skipping the
-    // hot-map update would let it diverge from storage until restart. Worst
-    // case is a FLAGS revocation whose requester disconnected mid-round-trip:
-    // the DB says revoked while the hot map keeps auto-opping the revoked
-    // account. The notices inside those arms degrade safely on a dead conn.
+    // Session-scoped replies are moot once the client is gone — but a reply
+    // that carries *account* state (a read marker, kept per account rather
+    // than per connection) must be applied regardless: the DB has already
+    // committed, and skipping the hot-map update would let it diverge from
+    // storage until restart. The notices inside those arms degrade safely on
+    // a dead conn.
     if !state.sessions.contains_key(&conn)
         && !matches!(
             reply,
-            crate::core::DbReply::ChannelTopicSet { .. }
-                | crate::core::DbReply::ChannelTopicFailed { .. }
-                | crate::core::DbReply::ReadMarkerStored { .. }
+            crate::core::DbReply::ReadMarkerStored { .. }
                 | crate::core::DbReply::ReadMarkerUnavailable { .. }
         )
     {
@@ -397,11 +394,8 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             if state.sessions[&conn].sasl != SaslState::Verifying {
                 return; // stale SASL reply (the attempt was aborted)
             }
-            {
-                let session = state.sessions.get_mut(&conn).expect("checked");
-                session.sasl = SaslState::Idle;
-                session.account = Some(account.clone());
-            }
+            state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Idle;
+            state.set_account(conn, account.clone());
             let session = &state.sessions[&conn];
             let nick = session
                 .nick()
@@ -438,7 +432,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             let Some(label) = take_identify_label(state, conn) else {
                 return; // stale IDENTIFY reply (superseded/aborted)
             };
-            state.sessions.get_mut(&conn).expect("checked").account = Some(account.clone());
+            state.set_account(conn, account.clone());
             // Frame the verdict under the IDENTIFY's label (if any) so a labeled
             // client can correlate the result; an unlabeled one just gets the
             // NOTICE. Unheld — it interleaves with other output like a real server.
@@ -487,7 +481,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             }
         }
         crate::core::DbReply::AccountCreated { account, origin } => {
-            state.sessions.get_mut(&conn).expect("checked").account = Some(account.clone());
+            state.set_account(conn, account.clone());
             match origin {
                 crate::core::AccountOrigin::NickServ => state.service_notice(
                     conn,
@@ -536,74 +530,6 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                 }
             }
         }
-        crate::core::DbReply::ChannelTopicSet {
-            channel,
-            display,
-            prefix,
-            topic,
-            revision,
-            retained,
-            label,
-        } => {
-            let owner = state.channel_owner(&channel);
-            if state.owns_channel(&owner) {
-                super::channel::channel_topic_set(
-                    state,
-                    conn,
-                    super::channel::AppliedChannelTopic {
-                        channel,
-                        display,
-                        prefix,
-                        topic,
-                        revision,
-                        retained,
-                        label,
-                    },
-                );
-            } else {
-                route_remote_topic_persistence(
-                    state,
-                    conn,
-                    owner,
-                    crate::core::ChannelTopicPersistence::Set {
-                        channel,
-                        display,
-                        prefix,
-                        topic,
-                        revision,
-                        retained,
-                        label,
-                    },
-                );
-            }
-        }
-        crate::core::DbReply::ChannelTopicFailed {
-            channel,
-            display,
-            revision,
-            label,
-            failure,
-        } => {
-            let owner = state.channel_owner(&channel);
-            if state.owns_channel(&owner) {
-                super::channel::channel_topic_failed(
-                    state, conn, channel, display, revision, label, failure,
-                );
-            } else {
-                route_remote_topic_persistence(
-                    state,
-                    conn,
-                    owner,
-                    crate::core::ChannelTopicPersistence::Failed {
-                        channel,
-                        display,
-                        revision,
-                        label,
-                        failure,
-                    },
-                );
-            }
-        }
         crate::core::DbReply::ReadMarkerStored {
             account,
             target,
@@ -630,19 +556,6 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
     if was_verify_reply {
         super::services::maybe_complete_registration(state, conn);
     }
-}
-
-fn route_remote_topic_persistence(
-    state: &mut ServerState,
-    conn: ConnId,
-    owner: crate::core::state::ChannelOwner,
-    result: crate::core::ChannelTopicPersistence,
-) {
-    let session = state
-        .sessions
-        .contains_key(&conn)
-        .then(|| state.channel_actor(conn).session_owner());
-    state.route_topic_persisted(owner, conn, session, result);
 }
 
 /// account-notify: tell channel peers with the cap about a login state

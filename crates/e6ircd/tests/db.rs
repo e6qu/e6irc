@@ -1063,13 +1063,37 @@ async fn primary_password_rotation_is_single_and_rejects_app_passwords() {
         Err(db::DbError::BadCredentials)
     ));
     assert!(matches!(
-        db::change_local_password(&pool, "rotate", &app, "attacker-choice").await,
+        db::change_local_password(&pool, "rotate", &app, "attacker-choice", "no-session").await,
         Err(db::DbError::BadCredentials)
     ));
 
-    db::change_local_password(&pool, "ROTATE", "old", "new")
+    // The browser making the change keeps its session; every other one ends —
+    // the old password may be in someone else's hands, and they may be signed
+    // in with it.
+    let changing_session = db::create_web_session(&pool, "rotate", None)
+        .await
+        .expect("changing session");
+    let other_session = db::create_web_session(&pool, "rotate", None)
+        .await
+        .expect("other session");
+    db::change_local_password(&pool, "ROTATE", "old", "new", &changing_session)
         .await
         .expect("rotate");
+    assert_eq!(
+        db::session_account(&pool, &changing_session)
+            .await
+            .expect("changing session lookup")
+            .as_deref(),
+        Some("rotate"),
+        "the session that changed the password stays signed in"
+    );
+    assert_eq!(
+        db::session_account(&pool, &other_session)
+            .await
+            .expect("other session lookup"),
+        None,
+        "every other browser session ended with the password change"
+    );
     assert_eq!(
         db::verify_local_password(&pool, "rotate", "old")
             .await
@@ -1115,7 +1139,13 @@ async fn primary_password_rotation_is_single_and_rejects_app_passwords() {
     )
     .await
     .expect("OIDC account");
-    db::set_local_password(&pool, &oidc_account, "first-local")
+    let adding_session = db::create_web_session(&pool, &oidc_account, None)
+        .await
+        .expect("adding session");
+    let stale_session = db::create_web_session(&pool, &oidc_account, None)
+        .await
+        .expect("stale session");
+    db::set_local_password(&pool, &oidc_account, "first-local", &adding_session)
         .await
         .expect("set first password");
     assert_eq!(
@@ -1124,10 +1154,82 @@ async fn primary_password_rotation_is_single_and_rejects_app_passwords() {
             .expect("verify first password"),
         Some(oidc_account.clone())
     );
+    assert_eq!(
+        db::list_web_sessions(&pool, &oidc_account, Some(&adding_session))
+            .await
+            .expect("session inventory")
+            .len(),
+        1,
+        "adding a password ends every other browser session"
+    );
+    assert_eq!(
+        db::session_account(&pool, &stale_session)
+            .await
+            .expect("stale session lookup"),
+        None
+    );
     assert!(matches!(
-        db::set_local_password(&pool, &oidc_account, "second-local").await,
+        db::set_local_password(&pool, &oidc_account, "second-local", &adding_session).await,
         Err(db::DbError::LocalPasswordExists)
     ));
+}
+
+/// A first login provisions the account the provider's claim names, exactly.
+/// A name that is already someone's, or retired, is refused by name — the
+/// server never picks a different name for a person.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn oidc_first_login_refuses_a_taken_or_retired_name() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("oidc_first_login_refuses_a_taken_or_retired_name").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account_with_contact(&pool, "Kilgore", "pw", None)
+        .await
+        .expect("kilgore");
+    sqlx::query("INSERT INTO retired_account_names (name_folded) VALUES ('trout')")
+        .execute(&pool)
+        .await
+        .expect("retire a name");
+
+    for (subject, claim) in [
+        ("sub-taken", "kilgore"),
+        ("sub-taken-case", "KILGORE"),
+        ("sub-retired", "trout"),
+    ] {
+        let refusal =
+            db::find_or_create_oidc_account(&pool, "https://idp.example", subject, claim).await;
+        assert!(
+            matches!(&refusal, Err(db::DbError::DuplicateAccount(name)) if name == claim),
+            "{claim}: {refusal:?}"
+        );
+    }
+    let accounts: i64 = sqlx::query_scalar("SELECT count(*) FROM accounts")
+        .fetch_one(&pool)
+        .await
+        .expect("account count");
+    assert_eq!(accounts, 1, "no account was provisioned under another name");
+    let identities: i64 = sqlx::query_scalar("SELECT count(*) FROM oidc_identities")
+        .fetch_one(&pool)
+        .await
+        .expect("identity count");
+    assert_eq!(identities, 0);
+
+    // A free name is provisioned exactly as the claim spells it, and the same
+    // identity resolves to it afterwards whatever the claim says then.
+    assert_eq!(
+        db::find_or_create_oidc_account(&pool, "https://idp.example", "sub-free", "Eliot")
+            .await
+            .expect("provision"),
+        "Eliot"
+    );
+    assert_eq!(
+        db::find_or_create_oidc_account(&pool, "https://idp.example", "sub-free", "kilgore")
+            .await
+            .expect("resolve linked identity"),
+        "Eliot"
+    );
 }
 
 /// Per-account app passwords are capped, so an authenticated account can't flood
@@ -5114,6 +5216,21 @@ async fn oidc_identity_link_list_and_conflict() {
             .expect("steal"),
         LinkOutcome::Conflict
     );
+    // A suspended account cannot gain a login identity.
+    let bob_id = db::account_id_by_name(&pool, "bob")
+        .await
+        .expect("bob id")
+        .expect("bob exists");
+    db::set_account_suspended(&pool, bob_id, true, "alice", &[])
+        .await
+        .expect("suspend bob");
+    assert!(matches!(
+        db::link_oidc_identity(&pool, "bob", "https://idp.example", "sub-9").await,
+        Err(db::DbError::BadCredentials)
+    ));
+    db::set_account_suspended(&pool, bob_id, false, "alice", &[])
+        .await
+        .expect("reactivate bob");
 
     // A second identity for alice; listing is issuer/subject-ordered.
     db::link_oidc_identity(&pool, "alice", "https://idp.example", "sub-0")
@@ -6042,6 +6159,16 @@ async fn suspension_revokes_every_bearer_and_blocks_new_credential_issuance() {
     assert_eq!(actions, ["ACCOUNT_SUSPEND", "ACCOUNT_REACTIVATE"]);
 }
 
+/// Whether the account row itself carries administrator authority — what the
+/// server reads on every request.
+async fn is_durable_administrator(pool: &sqlx::PgPool, account: &str) -> bool {
+    db::account_flags(pool, account)
+        .await
+        .expect("account flags")
+        .expect("account exists")
+        .is_admin()
+}
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn suspension_preserves_an_active_administrator_and_rejects_self_targeting() {
@@ -6072,12 +6199,8 @@ async fn suspension_preserves_an_active_administrator_and_rejects_self_targeting
         .await
         .expect("grant Bob")
         .expect("Bob");
-    assert_eq!(
-        db::list_admin_accounts(&pool)
-            .await
-            .expect("administrators"),
-        ["alice", "bob"]
-    );
+    assert!(is_durable_administrator(&pool, "alice").await);
+    assert!(is_durable_administrator(&pool, "bob").await);
 
     assert!(matches!(
         db::set_account_suspended(&pool, alice_id, true, "ALICE", &[]).await,
@@ -6107,12 +6230,8 @@ async fn suspension_preserves_an_active_administrator_and_rejects_self_targeting
         .await
         .expect("Alice can revoke Bob")
         .expect("Bob");
-    assert_eq!(
-        db::list_admin_accounts(&pool)
-            .await
-            .expect("administrators"),
-        ["alice"]
-    );
+    assert!(is_durable_administrator(&pool, "alice").await);
+    assert!(!is_durable_administrator(&pool, "bob").await);
     let configured = ["carol".to_string()];
     db::set_account_suspended(&pool, alice_id, true, "Bob", &configured)
         .await
@@ -6122,12 +6241,8 @@ async fn suspension_preserves_an_active_administrator_and_rejects_self_targeting
         .await
         .expect("configured Carol permits durable succession")
         .expect("Alice");
-    assert!(
-        db::list_admin_accounts(&pool)
-            .await
-            .expect("durable administrators")
-            .is_empty()
-    );
+    assert!(!is_durable_administrator(&pool, "alice").await);
+    assert!(!is_durable_administrator(&pool, "bob").await);
     assert!(matches!(
         db::set_account_suspended(&pool, carol_id, true, "Bob", &configured).await,
         Err(db::DbError::LastAdministrator)
@@ -6787,10 +6902,70 @@ async fn administrator_recovery_restores_one_named_account_and_is_audited() {
     let stale_session = db::create_web_session(&pool, "alice", None)
         .await
         .expect("session");
+    // Everything else the lost credential could have been used to mint is
+    // revoked with it: an app password, a personal access token, a device
+    // grant.
+    let app_password = db::issue_app_password(&pool, "Alice", "forgotten", "phone")
+        .await
+        .expect("app password");
+    let api_token = db::issue_scoped_api_token(
+        &pool,
+        "Alice",
+        "automation",
+        e6ircd::identity::ApiTokenScopes::new(e6ircd::identity::ApiTokenScope::ALL)
+            .expect("scopes"),
+        e6ircd::identity::ApiTokenLifetimeDays::DEFAULT,
+    )
+    .await
+    .expect("api token");
+    let (_device_code, user_code) = db::create_device_grant(&pool).await.expect("device grant");
+    assert_eq!(
+        db::approve_device_grant(&pool, &user_code, "Alice")
+            .await
+            .expect("approve"),
+        db::DeviceApproval::Approved
+    );
 
     let recovered = db::recover_administrator(&pool, "ALICE")
         .await
         .expect("recover");
+    assert_eq!(
+        db::verify_credentials(&pool, "alice", &app_password)
+            .await
+            .expect("app password verify"),
+        None,
+        "the app password no longer opens the account"
+    );
+    assert!(
+        db::api_token_principal(&pool, &api_token)
+            .await
+            .expect("token lookup")
+            .is_none(),
+        "the personal access token is revoked"
+    );
+    let credentials = db::list_credentials(&pool, "alice")
+        .await
+        .expect("credential inventory");
+    assert_eq!(
+        credentials
+            .iter()
+            .map(|credential| credential.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["local_password"],
+        "only the new local password remains"
+    );
+    assert!(
+        db::list_api_tokens(&pool, "alice")
+            .await
+            .expect("token inventory")
+            .is_empty()
+    );
+    let device_grants: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM device_grants WHERE account = 'Alice'")
+            .fetch_one(&pool)
+            .await
+            .expect("device grant count");
+    assert_eq!(device_grants, 0, "the approved device grant is revoked");
     assert_eq!(
         recovered.account, "Alice",
         "the stored name, not the typed one"

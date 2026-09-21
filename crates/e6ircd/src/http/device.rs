@@ -579,7 +579,7 @@ pub(super) fn validate_account_directory_query(
 pub(super) async fn admin_accounts(
     State(state): State<Arc<AppState>>,
     AdminAccount(actor): AdminAccount,
-    axum::extract::Query(params): axum::extract::Query<AccountDirectoryQuery>,
+    QueryParams(params): QueryParams<AccountDirectoryQuery>,
 ) -> Response {
     let pool = pool_of(&state);
     let query = match validate_account_directory_query(params, 100) {
@@ -752,7 +752,7 @@ fn validate_account_invitation_directory_query(
 pub(super) async fn admin_account_invitations(
     State(state): State<Arc<AppState>>,
     _admin: AdminAccount,
-    axum::extract::Query(params): axum::extract::Query<AccountInvitationDirectoryQuery>,
+    QueryParams(params): QueryParams<AccountInvitationDirectoryQuery>,
 ) -> Response {
     let (page_size, before_id) = match validate_account_invitation_directory_query(params, 100) {
         Ok(query) => query,
@@ -1672,7 +1672,7 @@ pub(super) fn validate_registered_channel_directory_query(
 pub(super) async fn admin_channels(
     State(state): State<Arc<AppState>>,
     _admin: AdminAccount,
-    axum::extract::Query(params): axum::extract::Query<RegisteredChannelDirectoryQuery>,
+    QueryParams(params): QueryParams<RegisteredChannelDirectoryQuery>,
 ) -> Response {
     let pool = pool_of(&state);
     let query = match validate_registered_channel_directory_query(params, 100) {
@@ -1776,7 +1776,7 @@ pub(super) fn validate_server_ban_directory_query(
 pub(super) async fn admin_server_bans(
     State(state): State<Arc<AppState>>,
     _admin: AdminAccount,
-    axum::extract::Query(params): axum::extract::Query<ServerBanDirectoryQuery>,
+    QueryParams(params): QueryParams<ServerBanDirectoryQuery>,
 ) -> Response {
     let pool = pool_of(&state);
     let query = match validate_server_ban_directory_query(params, 100) {
@@ -1986,7 +1986,7 @@ pub(super) fn validate_audit_query(
 pub(super) async fn admin_audit(
     State(state): State<Arc<AppState>>,
     _admin: AdminAccount,
-    axum::extract::Query(params): axum::extract::Query<AuditQuery>,
+    QueryParams(params): QueryParams<AuditQuery>,
 ) -> Response {
     let pool = pool_of(&state);
     let query = match validate_audit_query(params, 100) {
@@ -2473,7 +2473,7 @@ pub(super) struct LogoutQuery {
 pub(super) async fn logout_sso(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-    Query(query): Query<LogoutQuery>,
+    QueryParams(query): QueryParams<LogoutQuery>,
 ) -> Response {
     let clear = clear_session_cookie(state.secure_cookies);
     let pool = require_pool!(state);

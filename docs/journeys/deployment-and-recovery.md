@@ -113,11 +113,11 @@ when archives are requested.
   referrers. The assembled multi-architecture digest
   receives signed provenance, and the workflow verifies each attestation
   through the same public consumer command operators use.
-- The runtime image is `debian:bookworm-slim`; the server runs as an
-  unprivileged user and contains the embedded web client and every compiled
-  bridge driver.
-- Environment bootstrap renders to an unpredictable mode-`0600` file unless
-  an operator explicitly supplies the path.
+- The runtime image is distroless (`gcr.io/distroless/cc-debian12`, pinned by
+  digest): the daemon, glibc and CA certificates, no shell. It runs as user
+  10001 with the embedded web client and every compiled bridge driver.
+- The container's command is `e6ircd --config-from-environment`; the
+  configuration is built in memory and never written to disk.
 - `deploy/` documents the environment-variable deployment contract and ships
   a hardened systemd service for native Linux installation. The Terraform/ECS
   example lives in the separate `e6qu/infra` repository, not in this one.
@@ -144,7 +144,8 @@ manifest shape. Ordinary pull-request CI proves the native packager's exact
 members, executable/document modes, and byte-for-byte reproducibility; the
 tag workflow uses that packager on all six native runners and refuses an
 incomplete archive set. `systemd-analyze verify` checks the service in CI,
-the same gate compares its stop budget to the daemon flush budget, and
+the same gate compares its stop budget to the daemon's core-drain plus
+database-flush budget, and
 `crates/e6ircd/tests/config_cli.rs` drives the binary's environment-stated configuration:
 valid, refused by variable name, and never printing a value. The
 production-container job then boots the distroless image itself and proves it

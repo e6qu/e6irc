@@ -24,6 +24,10 @@ pub const MAX_HOT_CHANNELS: usize = 1 << 20;
 /// Most lines one configured network keeps in memory for replay (100× the
 /// default). Every attach copies the whole buffer.
 pub const MAX_NETWORK_BUFFER_CAP: usize = 100_000;
+/// Longest account name, in bytes: an IRC nickname the account store admits.
+/// `http.admin_accounts` entries and administrator-created accounts are held
+/// to it at their respective ingresses.
+pub const MAX_ACCOUNT_NAME_LEN: usize = 64;
 
 fn default_sendq() -> usize {
     1024
@@ -464,6 +468,46 @@ pub struct SecretsConfig {
     /// every stored secret has been re-sealed with the primary key.
     #[serde(default)]
     pub previous_key_files: Vec<PathBuf>,
+}
+
+/// The master-key material the process environment states, read once so the
+/// keyring can be resolved against a stated environment rather than the live
+/// one (which tests cannot set without racing each other).
+pub struct EnvironmentSecretKeys {
+    /// `E6IRC_SECRET_KEY`: the base64 primary key.
+    pub primary: Option<String>,
+    /// `E6IRC_PREVIOUS_SECRET_KEYS`: comma-separated base64 fallback keys.
+    pub previous: Option<String>,
+}
+
+impl EnvironmentSecretKeys {
+    const PRIMARY_VARIABLE: &'static str = "E6IRC_SECRET_KEY";
+    const PREVIOUS_VARIABLE: &'static str = "E6IRC_PREVIOUS_SECRET_KEYS";
+
+    pub fn from_process() -> Result<Self, ConfigError> {
+        let read = |variable: &str| match std::env::var(variable) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::Invalid(format!(
+                "{variable} is not valid UTF-8"
+            ))),
+        };
+        Ok(Self {
+            primary: read(Self::PRIMARY_VARIABLE)?,
+            previous: read(Self::PREVIOUS_VARIABLE)?,
+        })
+    }
+
+    /// The name of a set variable, for a refusal that names its source.
+    fn first_set_variable(&self) -> Option<&'static str> {
+        if self.primary.is_some() {
+            Some(Self::PRIMARY_VARIABLE)
+        } else if self.previous.is_some() {
+            Some(Self::PREVIOUS_VARIABLE)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1130,19 +1174,40 @@ impl Config {
         Self::checked(table.try_into().map_err(ConfigError::Parse)?)
     }
 
+    /// Structure and non-secret content are checked first; then sealed secrets
+    /// are opened; then the rules about what a secret *contains* run on the
+    /// opened text (`validate_secrets`). Run before opening, those rules would
+    /// judge the ciphertext — an `enc:v2:` bootstrap token is always long
+    /// enough, and a sealed client secret that opens to nothing is never empty.
     fn checked(mut config: Self) -> Result<Self, ConfigError> {
         config.validate()?;
         config.resolve_secrets()?;
+        config.validate_secrets()?;
         Ok(config)
     }
 
-    /// Resolve the primary and rotation fallback keys. `[secrets]` is
-    /// authoritative when present; otherwise `E6IRC_SECRET_KEY` supplies the
-    /// primary and comma-separated `E6IRC_PREVIOUS_SECRET_KEYS` supplies
-    /// read-only fallbacks.
+    /// Resolve the primary and rotation fallback keys from `[secrets]` or the
+    /// process environment (`E6IRC_SECRET_KEY`, and comma-separated
+    /// `E6IRC_PREVIOUS_SECRET_KEYS` for read-only fallbacks). The two sources
+    /// are alternatives: a configuration that states both is refused rather
+    /// than one being silently ignored.
     pub fn secret_keyring(&self) -> Result<Option<crate::secret::SecretKeyring>, ConfigError> {
+        self.secret_keyring_from(EnvironmentSecretKeys::from_process()?)
+    }
+
+    fn secret_keyring_from(
+        &self,
+        environment: EnvironmentSecretKeys,
+    ) -> Result<Option<crate::secret::SecretKeyring>, ConfigError> {
         use crate::secret::{SecretKey, SecretKeyring};
         if let Some(s) = &self.secrets {
+            if let Some(variable) = environment.first_set_variable() {
+                return Err(ConfigError::Invalid(format!(
+                    "[secrets].key_file ({}) and the {variable} environment variable both \
+                     name a master key; state it once — remove one of them",
+                    s.key_file.display()
+                )));
+            }
             let raw = std::fs::read_to_string(&s.key_file).map_err(|e| {
                 ConfigError::Invalid(format!(
                     "cannot read secrets key_file {}: {e}",
@@ -1170,20 +1235,16 @@ impl Config {
                 .map(Some)
                 .map_err(|e| ConfigError::Invalid(format!("secrets keyring: {e}")));
         }
-        let primary = match std::env::var("E6IRC_SECRET_KEY") {
-            Ok(value) => Some(
-                SecretKey::from_base64(&value)
-                    .map_err(|e| ConfigError::Invalid(format!("E6IRC_SECRET_KEY: {e}")))?,
-            ),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(ConfigError::Invalid(
-                    "E6IRC_SECRET_KEY is not valid UTF-8".into(),
-                ));
-            }
-        };
-        let previous = match std::env::var("E6IRC_PREVIOUS_SECRET_KEYS") {
-            Ok(value) => {
+        let primary = environment
+            .primary
+            .as_deref()
+            .map(|value| {
+                SecretKey::from_base64(value)
+                    .map_err(|e| ConfigError::Invalid(format!("E6IRC_SECRET_KEY: {e}")))
+            })
+            .transpose()?;
+        let previous = match environment.previous.as_deref() {
+            Some(value) => {
                 if value.split(',').any(|part| part.trim().is_empty()) {
                     return Err(ConfigError::Invalid(
                         "E6IRC_PREVIOUS_SECRET_KEYS contains an empty key".into(),
@@ -1198,12 +1259,7 @@ impl Config {
                     })
                     .collect::<Result<Vec<_>, _>>()?
             }
-            Err(std::env::VarError::NotPresent) => Vec::new(),
-            Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(ConfigError::Invalid(
-                    "E6IRC_PREVIOUS_SECRET_KEYS is not valid UTF-8".into(),
-                ));
-            }
+            None => Vec::new(),
         };
         match primary {
             Some(primary) => SecretKeyring::new(primary, previous)
@@ -1214,6 +1270,39 @@ impl Config {
                 "E6IRC_PREVIOUS_SECRET_KEYS is set but E6IRC_SECRET_KEY is unset".into(),
             )),
         }
+    }
+
+    /// Rules about what a secret-bearing field contains, judged on the opened
+    /// text — so they run after `resolve_secrets`, never on an `enc:v2:` blob.
+    /// Everything about a configuration that is not a secret's content is
+    /// `validate`'s.
+    pub fn validate_secrets(&self) -> Result<(), ConfigError> {
+        if let Some(bootstrap) = &self.bootstrap
+            && (!(32..=512).contains(&bootstrap.token.len())
+                || bootstrap.token.chars().any(char::is_control))
+        {
+            return Err(ConfigError::Invalid(
+                "bootstrap.token must contain 32–512 bytes and no control characters".into(),
+            ));
+        }
+        for provider in &self.oidc_providers {
+            if provider.client_secret.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "OIDC provider '{}' requires a non-empty client_secret",
+                    provider.name
+                )));
+            }
+        }
+        // An empty oper password would let `OPER <name> ""` succeed.
+        for oper in &self.opers {
+            if oper.password.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "[[oper]] '{}' requires a non-empty password",
+                    oper.name
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Decrypt every sealed (`enc:v1:`/`enc:v2:`) secret field in place. Plaintext
@@ -1314,19 +1403,10 @@ impl Config {
                 "a [[listeners]] with websocket = true cannot also set tls (terminate TLS at a proxy)".into(),
             ));
         }
-        if let Some(bootstrap) = &self.bootstrap {
-            if self.database.is_none() || self.http.is_none() {
-                return Err(ConfigError::Invalid(
-                    "[bootstrap] requires both [database] and [http]".into(),
-                ));
-            }
-            if !(32..=512).contains(&bootstrap.token.len())
-                || bootstrap.token.chars().any(char::is_control)
-            {
-                return Err(ConfigError::Invalid(
-                    "bootstrap.token must contain 32–512 bytes and no control characters".into(),
-                ));
-            }
+        if self.bootstrap.is_some() && (self.database.is_none() || self.http.is_none()) {
+            return Err(ConfigError::Invalid(
+                "[bootstrap] requires both [database] and [http]".into(),
+            ));
         }
         // server_name is the source prefix (`:<server_name> …`) of every
         // server-originated line, so a space, control byte, or prefix-significant
@@ -1518,9 +1598,9 @@ impl Config {
                         provider.issuer_url
                     )));
                 }
-                if provider.client_id.is_empty() || provider.client_secret.is_empty() {
+                if provider.client_id.is_empty() {
                     return Err(ConfigError::Invalid(format!(
-                        "OIDC provider '{}' requires client_id and client_secret",
+                        "OIDC provider '{}' requires client_id",
                         provider.name
                     )));
                 }
@@ -1639,25 +1719,51 @@ impl Config {
                 "http.admin_accounts requires [database] (admin names resolve against the account store)".into(),
             ));
         }
-        // `secure_cookies` declares a TLS deployment: the session cookie is
-        // `Secure`/`__Host-` and won't ride a plaintext origin, and `public_url`
-        // builds the OIDC `redirect_uri`/`post_logout_redirect_uri`. A
-        // `secure_cookies = true` with an `http://` public_url is contradictory
-        // — it advertises the auth round-trip over plaintext while the cookie it
-        // needs can't be sent — and boots silently today. Reject it, symmetric
-        // to the OIDC `issuer_url` https-under-secure-cookies guard above.
+        // Every entry is compared, casefolded, against account names on every
+        // request. An entry that is not an account name — `" bob"` from an
+        // unsplit `"alice, bob"`, an empty string — can never match anyone and
+        // would grant nothing while looking like a grant.
         if let Some(h) = &self.http
-            && h.secure_cookies
-            && h.public_url.as_deref().is_some_and(|value| {
-                openidconnect::url::Url::parse(value).is_ok_and(|url| url.scheme() != "https")
-            })
+            && let Some(entry) = h
+                .admin_accounts
+                .iter()
+                .find(|entry| !crate::sanitize::valid_nick(entry, MAX_ACCOUNT_NAME_LEN))
         {
-            return Err(ConfigError::Invalid(
-                "http.public_url must be https when secure_cookies is set (a Secure/__Host- \
-                 cookie cannot ride a plaintext origin, and the OIDC redirect_uri would be \
-                 advertised over http)"
-                    .into(),
-            ));
+            return Err(ConfigError::Invalid(format!(
+                "http.admin_accounts entry {entry:?} is not a valid account name (an IRC \
+                 nickname of at most {MAX_ACCOUNT_NAME_LEN} bytes, no spaces)"
+            )));
+        }
+        // `secure_cookies` and the scheme of `public_url` describe the same
+        // deployment and must agree. `secure_cookies = true` with an `http://`
+        // origin advertises the auth round-trip over plaintext while the
+        // `Secure`/`__Host-` cookie it needs can't be sent; `secure_cookies =
+        // false` with an `https://` origin serves a TLS site whose session
+        // cookie a browser will also send over plaintext. Both are refused,
+        // symmetric to the OIDC `issuer_url` https-under-secure-cookies guard.
+        if let Some(h) = &self.http
+            && let Some(scheme) = h
+                .public_url
+                .as_deref()
+                .and_then(|value| openidconnect::url::Url::parse(value).ok())
+                .map(|url| url.scheme().to_owned())
+        {
+            if h.secure_cookies && scheme != "https" {
+                return Err(ConfigError::Invalid(
+                    "http.public_url must be https when secure_cookies is set (a Secure/__Host- \
+                     cookie cannot ride a plaintext origin, and the OIDC redirect_uri would be \
+                     advertised over http)"
+                        .into(),
+                ));
+            }
+            if !h.secure_cookies && scheme == "https" {
+                return Err(ConfigError::Invalid(
+                    "http.secure_cookies must be true when http.public_url is https (a session \
+                     cookie without Secure is also sent over plaintext; set secure_cookies = \
+                     false only with an http:// public_url for local development)"
+                        .into(),
+                ));
+            }
         }
         // A configured `public_url` seeds every browser-facing absolute URL.
         // Credentials leak into those links; queries and fragments corrupt an
@@ -1719,15 +1825,15 @@ impl Config {
             n.validate_connection_intent()
                 .map_err(|error| ConfigError::Invalid(format!("network '{}': {error}", n.name)))?;
         }
-        // OPER blocks: an empty name or password is a dangerous silent default
-        // (an empty password would let `OPER <name> ""` succeed), and a duplicate
-        // name is ambiguous (first-match wins with no warning). Reject loudly,
-        // like every other subsystem's config.
+        // OPER blocks: an empty name is a dangerous silent default, and a
+        // duplicate name is ambiguous (first-match wins with no warning). Reject
+        // loudly, like every other subsystem's config. (The password's content
+        // is `validate_secrets`'s: it may be sealed here.)
         let mut oper_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for oper in &self.opers {
-            if oper.name.is_empty() || oper.password.is_empty() {
+            if oper.name.is_empty() {
                 return Err(ConfigError::Invalid(
-                    "[[oper]] requires a non-empty name and password".into(),
+                    "[[oper]] requires a non-empty name".into(),
                 ));
             }
             if !oper_names.insert(oper.name.as_str()) {
@@ -1930,13 +2036,22 @@ mod tests {
             [[listeners]]
             addr = "0.0.0.0:6667"
         "#;
-        // Empty password is a dangerous silent default.
+        // Empty password is a dangerous silent default. It is a rule about the
+        // secret's content, so it is judged after sealed values are opened.
         let c: Config = toml::from_str(&format!(
             "{base}\n[[oper]]\nname = \"admin\"\npassword = \"\"\n"
         ))
         .expect("parse");
+        c.validate().expect("structure is fine");
+        let err = c.validate_secrets().unwrap_err().to_string();
+        assert!(err.contains("non-empty password"), "{err}");
+        // An empty name is structural and refused before any secret is opened.
+        let c: Config = toml::from_str(&format!(
+            "{base}\n[[oper]]\nname = \"\"\npassword = \"x\"\n"
+        ))
+        .expect("parse");
         let err = c.validate().unwrap_err().to_string();
-        assert!(err.contains("non-empty name and password"), "{err}");
+        assert!(err.contains("non-empty name"), "{err}");
         // Duplicate oper name is ambiguous.
         let c: Config = toml::from_str(&format!(
             "{base}\n[[oper]]\nname = \"admin\"\npassword = \"a\"\n\
@@ -2629,19 +2744,158 @@ mod tests {
             admin_accounts: vec![],
         });
         config.validate().expect("complete browser bootstrap");
+        config.validate_secrets().expect("a strong bounded token");
 
-        config.bootstrap = Some(BootstrapConfig {
-            token: "too-short".into(),
+        for token in [
+            "too-short".to_string(),
+            format!("{}x", "a".repeat(512)),
+            format!("{}\n", "a".repeat(31)),
+        ] {
+            config.bootstrap = Some(BootstrapConfig { token });
+            config.validate().expect("token content is not structure");
+            assert!(config.validate_secrets().is_err());
+        }
+    }
+
+    /// A sealed bootstrap token is long enough as ciphertext whatever it opens
+    /// to, and a sealed client secret is never empty as ciphertext. The rules
+    /// about a secret's content must judge the opened text.
+    #[test]
+    fn secret_content_rules_judge_the_opened_secret_not_the_ciphertext() {
+        let key = crate::secret::SecretKey::generate();
+        let keyring = crate::secret::SecretKeyring::single(
+            crate::secret::SecretKey::from_base64(&key.to_base64()).expect("key round trip"),
+        );
+        let mut config = Config {
+            listeners: vec![listener()],
+            database: db(),
+            http: Some(HttpConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                public_url: None,
+                secure_cookies: false,
+                admin_accounts: vec![],
+            }),
+            bootstrap: Some(BootstrapConfig {
+                token: key.seal("short", crate::secret::CONFIG_CONTEXT),
+            }),
+            ..Config::default()
+        };
+        assert!(
+            config.bootstrap.as_ref().unwrap().token.len() >= 32,
+            "the ciphertext is long enough to pass a length rule by itself"
+        );
+        config.validate().expect("structure");
+        config
+            .resolve_secrets_with_key(Some(&keyring))
+            .expect("opens");
+        let error = config.validate_secrets().unwrap_err().to_string();
+        assert!(error.contains("bootstrap.token"), "{error}");
+
+        let mut config = oidc_config("corp", "https://auth.example", None);
+        config.oidc_providers[0].client_secret = key.seal("", crate::secret::CONFIG_CONTEXT);
+        config.validate().expect("structure");
+        config
+            .resolve_secrets_with_key(Some(&keyring))
+            .expect("opens");
+        let error = config.validate_secrets().unwrap_err().to_string();
+        assert!(error.contains("client_secret"), "{error}");
+    }
+
+    /// `[secrets].key_file` and `E6IRC_SECRET_KEY` are alternatives. Stated
+    /// together, one used to win silently; now the pair is refused by name.
+    #[test]
+    fn a_key_file_and_an_environment_key_together_are_refused_by_name() {
+        let key = crate::secret::SecretKey::generate();
+        let path =
+            std::env::temp_dir().join(format!("e6irc-both-key-sources-{}.b64", std::process::id()));
+        std::fs::write(&path, key.to_base64()).unwrap();
+        let config = Config {
+            secrets: secrets_at(&path),
+            ..Config::default()
+        };
+        let refusal =
+            |environment: EnvironmentSecretKeys| match config.secret_keyring_from(environment) {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("a key file beside an environment key must be refused"),
+            };
+        let error = refusal(EnvironmentSecretKeys {
+            primary: Some(key.to_base64()),
+            previous: None,
         });
-        assert!(config.validate().is_err());
-        config.bootstrap = Some(BootstrapConfig {
-            token: format!("{}x", "a".repeat(512)),
+        assert!(error.contains("E6IRC_SECRET_KEY"), "{error}");
+        assert!(error.contains("key_file"), "{error}");
+        assert!(
+            error.contains(&path.display().to_string()),
+            "names the file: {error}"
+        );
+        let error = refusal(EnvironmentSecretKeys {
+            primary: None,
+            previous: Some(key.to_base64()),
         });
-        assert!(config.validate().is_err());
-        config.bootstrap = Some(BootstrapConfig {
-            token: format!("{}\n", "a".repeat(31)),
-        });
-        assert!(config.validate().is_err());
+        assert!(error.contains("E6IRC_PREVIOUS_SECRET_KEYS"), "{error}");
+        // Each source alone still resolves.
+        config
+            .secret_keyring_from(EnvironmentSecretKeys {
+                primary: None,
+                previous: None,
+            })
+            .expect("file alone")
+            .expect("configured");
+        std::fs::remove_file(&path).ok();
+        Config::default()
+            .secret_keyring_from(EnvironmentSecretKeys {
+                primary: Some(key.to_base64()),
+                previous: None,
+            })
+            .expect("environment alone")
+            .expect("configured");
+    }
+
+    /// An `http.admin_accounts` entry is compared against account names on
+    /// every request; one that is not an account name grants nothing while
+    /// looking like a grant.
+    #[test]
+    fn admin_accounts_entries_must_be_account_names() {
+        let mut config = Config {
+            listeners: vec![listener()],
+            database: db(),
+            http: Some(HttpConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                public_url: None,
+                secure_cookies: false,
+                admin_accounts: vec!["alice".into(), "Bob_1".into()],
+            }),
+            ..Config::default()
+        };
+        config.validate().expect("account names");
+        for entry in ["alice, bob", " bob", "", "1alice", "a".repeat(65).as_str()] {
+            config.http.as_mut().unwrap().admin_accounts = vec![entry.to_string()];
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("http.admin_accounts") && error.contains(&format!("{entry:?}")),
+                "{entry:?}: {error}"
+            );
+        }
+    }
+
+    /// `secure_cookies` and the `public_url` scheme describe one deployment;
+    /// both disagreements are refused, not just the one that breaks login.
+    #[test]
+    fn secure_cookies_and_public_url_scheme_must_agree() {
+        let mut config = oidc_config("corp", "https://auth.example", None);
+        config.validate().expect("https with secure cookies");
+        config.http.as_mut().unwrap().secure_cookies = false;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("secure_cookies must be true"), "{error}");
+        config.http.as_mut().unwrap().public_url = Some("http://chat.example".into());
+        config.oidc_providers[0].issuer_url = "http://auth.example".into();
+        config
+            .validate()
+            .expect("http with plain cookies is local development");
+        config.oidc_providers[0].issuer_url = "https://auth.example".into();
+        config.http.as_mut().unwrap().secure_cookies = true;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("public_url must be https"), "{error}");
     }
 
     #[test]
@@ -2797,9 +3051,11 @@ mod tests {
             config.validate().unwrap_err().to_string().contains("https"),
             "http issuer must be rejected under secure_cookies"
         );
-        // A dev setup (secure_cookies = false) may still use http locally.
+        // A dev setup (secure_cookies = false, http public_url) may still use
+        // http locally.
         let mut dev = oidc_config("dex", "http://127.0.0.1:5556/dex", None);
         dev.http.as_mut().unwrap().secure_cookies = false;
+        dev.http.as_mut().unwrap().public_url = Some("http://127.0.0.1:8080".into());
         dev.validate().expect("http issuer allowed in dev");
     }
 

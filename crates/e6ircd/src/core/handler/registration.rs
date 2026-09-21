@@ -89,7 +89,7 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             if let Some(old_nick) = old_nick_display {
                 // The old nick is free for anyone to take, and `~oldnick` with
                 // it (see `ServerState::close`, which does the same).
-                if state.sessions[&conn].account.is_none() {
+                if state.sessions[&conn].account().is_none() {
                     state.release_unauthenticated_identity(&old_nick);
                 }
                 monitor_notify(state, &old_nick, false);
@@ -250,7 +250,7 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             }
         }
     };
-    if state.sessions[&conn].account.is_some() {
+    if state.sessions[&conn].account().is_some() {
         register_fail(
             state,
             conn,

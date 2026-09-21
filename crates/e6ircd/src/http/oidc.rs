@@ -329,6 +329,12 @@ fn callback_scope_matches(provider: &OidcProviderConfig, scope: &str) -> bool {
     returned == expected.iter().map(String::as_str).collect()
 }
 
+/// The provider's redirect back. The set is closed: a parameter this server
+/// does not act on is refused, so a provider cannot smuggle meaning past the
+/// handler. `session_state` is the one parameter admitted without being acted
+/// on — Keycloak and Microsoft Entra append it to every authorization response
+/// (OpenID Connect Session Management) and there is nothing for this server to
+/// do with it; without the field those providers' every login was a `400`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct CallbackQuery {
@@ -338,13 +344,31 @@ pub(super) struct CallbackQuery {
     pub(super) scope: Option<String>,
     #[serde(rename = "iss")]
     pub(super) issuer: Option<String>,
+    #[serde(rename = "session_state")]
+    pub(super) _session_state: Option<String>,
+}
+
+/// How the callback answers a provisioning refusal: the provider's claim named
+/// an account that already exists (or whose name is retired), and the server
+/// does not pick a different name for a person.
+fn account_name_taken(claim_name: &str) -> Response {
+    problem(
+        StatusCode::CONFLICT,
+        "Account name already taken",
+        Some(&format!(
+            "The identity provider's account claim is \"{claim_name}\", and an account of that \
+             name already exists on this server (or the name is retired). Sign in to the \
+             existing account and link this identity from its account page, or ask an \
+             administrator."
+        )),
+    )
 }
 
 pub(super) async fn oidc_callback(
     State(state): State<Arc<AppState>>,
     Path(provider_name): Path<String>,
     headers: axum::http::HeaderMap,
-    Query(query): Query<CallbackQuery>,
+    QueryParams(query): QueryParams<CallbackQuery>,
 ) -> Response {
     use openidconnect::{AuthorizationCode, PkceCodeVerifier, TokenResponse};
     if query.issuer.as_deref().is_some_and(|issuer| {
@@ -496,17 +520,36 @@ pub(super) async fn oidc_callback(
     }
     let token_claims = jwt_string_claims(&id_token.to_string()).ok();
     let sid = token_claims.as_ref().and_then(|claims| claims.sid.clone());
+    // The state-binding cookie has done its job (the pending entry was
+    // consumed above); every completed flow expires it now rather than leaving
+    // it in the browser until its Max-Age. Defense-in-depth — no stray auth
+    // state.
+    let secure = if state.secure_cookies { "; Secure" } else { "" };
+    let clear_state_cookie = format!(
+        "{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure}",
+        oidc_state_cookie_name(state.secure_cookies)
+    );
     // Link flow: attach this identity to the account that started it,
     // rather than logging in / provisioning a new account.
     if let Some(account) = &pending.link_account {
         return match crate::db::link_oidc_identity(&pool, account, issuer, subject).await {
-            Ok(crate::db::LinkOutcome::Linked | crate::db::LinkOutcome::AlreadyYours) => {
-                Redirect::to("/?linked=1").into_response()
-            }
+            Ok(crate::db::LinkOutcome::Linked | crate::db::LinkOutcome::AlreadyYours) => (
+                StatusCode::SEE_OTHER,
+                [
+                    (header::LOCATION, "/?linked=1".to_string()),
+                    (header::SET_COOKIE, clear_state_cookie),
+                ],
+            )
+                .into_response(),
             Ok(crate::db::LinkOutcome::Conflict) => problem(
                 StatusCode::CONFLICT,
                 "Identity already linked to another account",
                 None,
+            ),
+            Err(crate::db::DbError::BadCredentials) => problem(
+                StatusCode::FORBIDDEN,
+                "Account unavailable",
+                Some("This account cannot gain a login identity."),
             ),
             Err(e) => {
                 eprintln!("oidc: identity link failed: {e}");
@@ -557,6 +600,7 @@ pub(super) async fn oidc_callback(
     let account =
         match crate::db::find_or_create_oidc_account(&pool, issuer, subject, &preferred).await {
             Ok(a) => a,
+            Err(crate::db::DbError::DuplicateAccount(name)) => return account_name_taken(&name),
             Err(e) => {
                 eprintln!("oidc: account provisioning failed: {e}");
                 return problem(
@@ -603,7 +647,6 @@ pub(super) async fn oidc_callback(
             );
         }
     };
-    let secure = if state.secure_cookies { "; Secure" } else { "" };
     // `AppendHeaders`, not a plain array: two `Set-Cookie` values with the same
     // header name must *append*, not overwrite. A plain `[(SET_COOKIE, ..),
     // (SET_COOKIE, ..)]` inserts, so the second (the state-cookie clear) would
@@ -617,16 +660,7 @@ pub(super) async fn oidc_callback(
                 header::SET_COOKIE,
                 session_cookie(&token, state.secure_cookies),
             ),
-            // The state-binding cookie has done its job (the pending entry was
-            // consumed above); expire it now rather than leaving it in the
-            // browser until its Max-Age. Defense-in-depth — no stray auth state.
-            (
-                header::SET_COOKIE,
-                format!(
-                    "{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure}",
-                    oidc_state_cookie_name(state.secure_cookies)
-                ),
-            ),
+            (header::SET_COOKIE, clear_state_cookie),
         ]),
     )
         .into_response()
@@ -925,7 +959,7 @@ pub(super) async fn oidc_frontchannel_logout(
     // it revokes a session by a guessable `sid`. Rate-limit per client IP so it
     // can't be used to brute-force sids and force-logout victims.
     _rl: RateLimited,
-    Query(query): Query<FrontchannelLogoutQuery>,
+    QueryParams(query): QueryParams<FrontchannelLogoutQuery>,
 ) -> Response {
     let pool = require_pool!(state);
     if query.sid.trim().is_empty()
@@ -993,6 +1027,35 @@ where
     }
 }
 
+/// A query string, rejected as a problem document rather than axum's plain-text
+/// default. Every query struct is `deny_unknown_fields`, so a stray parameter
+/// is a `400` on every route; this is the one place that `400` takes its shape.
+pub(crate) struct QueryParams<T>(pub(crate) T);
+
+impl<T, S> axum::extract::FromRequestParts<S> for QueryParams<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match <Query<T> as axum::extract::FromRequestParts<S>>::from_request_parts(parts, state)
+            .await
+        {
+            Ok(Query(value)) => Ok(QueryParams(value)),
+            Err(rejection) => Err(problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid query",
+                Some(&rejection.body_text()),
+            )),
+        }
+    }
+}
+
 /// An authenticated account and the credential that proved it, extracted
 /// before the handler body runs.
 ///
@@ -1039,15 +1102,7 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for BrowserSession {
         parts: &mut axum::http::request::Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let principal = authenticate_principal(state, &parts.headers).await?;
-        let RequestCredential::Session(session) = &principal.credential else {
-            return Err(problem(
-                StatusCode::UNAUTHORIZED,
-                "Browser session required",
-                Some("A bearer token cannot act for a browser session."),
-            ));
-        };
-        let session = session.clone();
+        let (principal, session) = authenticate_browser_session(state, &parts.headers).await?;
         admit_api_request(state, &principal, parts)?;
         Ok(BrowserSession(principal.account, session))
     }
@@ -1098,13 +1153,7 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for AdminAccount {
         let principal = authenticate_principal(state, &parts.headers).await?;
         authorize_api_request(state, &principal.credential, parts, true)
             .map_err(|denial| api_authorization_response(denial, parts.uri.path()))?;
-        let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&principal.account);
-        if state
-            .admin_accounts
-            .read()
-            .expect("administrator registry lock")
-            .contains(&folded)
-        {
+        if is_effective_admin(state, &principal) {
             spend_api_budget(state, &principal.account, true).map_err(rate_limit_response)?;
             Ok(AdminAccount(principal.account))
         } else {
@@ -1153,25 +1202,52 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for RateLimited {
     }
 }
 
-/// The pool, once a request has authenticated. `authenticate` fails closed when
-/// no database is configured, so reaching a handler body proves one.
+/// The pool, once a request has authenticated. Authentication fails closed
+/// when no database is configured, so reaching a handler body proves one.
 pub(super) fn pool_of(state: &AppState) -> &sqlx::PgPool {
     state.pool.as_ref().expect("authenticate checked the pool")
 }
 
-pub(super) async fn authenticate(
-    state: &AppState,
-    headers: &axum::http::HeaderMap,
-) -> ResponseResult<String> {
-    authenticate_principal(state, headers)
-        .await
-        .map(|principal| principal.account)
+/// The account a request authenticated as, the credential that proved it, and
+/// the account's durable posture as the database held it for this request.
+#[derive(Debug, Clone)]
+pub(super) struct RequestPrincipal {
+    pub(super) account: String,
+    pub(super) credential: RequestCredential,
+    /// Read from the account row on every request, so authority granted or
+    /// revoked outside this process — `e6ircd recover-administrator`, another
+    /// replica — is honoured by the next request without a restart.
+    pub(super) flags: crate::db::AccountFlags,
 }
 
-#[derive(Debug, Clone)]
-struct RequestPrincipal {
-    account: String,
-    credential: RequestCredential,
+/// Whether `principal` may administer: durable authority on its account row, or
+/// a grant in the running configuration. This is the one place that answers
+/// the question, for the JSON administrator routes and the console pages alike.
+pub(super) fn is_effective_admin(state: &AppState, principal: &RequestPrincipal) -> bool {
+    principal.flags.is_admin()
+        || state
+            .configured_admin_accounts
+            .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&principal.account))
+}
+
+/// Authenticate a request by its browser session and nothing else, yielding the
+/// principal and the verified session token. A bearer is refused: it cannot
+/// name a browser session and must not be able to act as one.
+pub(super) async fn authenticate_browser_session(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> ResponseResult<(RequestPrincipal, String)> {
+    let principal = authenticate_principal(state, headers).await?;
+    let RequestCredential::Session(session) = &principal.credential else {
+        return Err(problem(
+            StatusCode::UNAUTHORIZED,
+            "Browser session required",
+            Some("A bearer token cannot act for a browser session."),
+        )
+        .into());
+    };
+    let session = session.clone();
+    Ok((principal, session))
 }
 
 #[derive(Debug, Clone)]
@@ -1231,9 +1307,10 @@ async fn authenticate_principal(
             Ok(Some(principal)) => {
                 require_active_account(pool, principal.account)
                     .await
-                    .map(|account| RequestPrincipal {
+                    .map(|(account, flags)| RequestPrincipal {
                         account,
                         credential: RequestCredential::ApiToken(principal.scopes),
+                        flags,
                     })
             }
             Ok(None) => Err(problem(StatusCode::UNAUTHORIZED, "Invalid token", None).into()),
@@ -1253,9 +1330,10 @@ async fn authenticate_principal(
             Ok(Some(account)) => {
                 require_active_account(pool, account)
                     .await
-                    .map(|account| RequestPrincipal {
+                    .map(|(account, flags)| RequestPrincipal {
                         account,
                         credential: RequestCredential::Session(token),
+                        flags,
                     })
             }
             Ok(None) => Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None).into()),
@@ -1276,7 +1354,7 @@ async fn authenticate_principal(
 /// The shared admission rule for an ordinary authenticated route: the
 /// credential authorizes this method, then the request spends the account's
 /// budget.
-fn admit_api_request(
+pub(super) fn admit_api_request(
     state: &AppState,
     principal: &RequestPrincipal,
     parts: &axum::http::request::Parts,
@@ -1361,7 +1439,11 @@ const MAX_API_RATE_BUCKETS: usize = 65_536;
 pub(super) const API_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 const API_RATE_BUCKET_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 
-fn spend_api_budget(state: &AppState, account: &str, administrator: bool) -> Result<(), u64> {
+pub(super) fn spend_api_budget(
+    state: &AppState,
+    account: &str,
+    administrator: bool,
+) -> Result<(), u64> {
     let burst = if administrator {
         state.administrator_api_rate_burst
     } else {
@@ -1405,7 +1487,7 @@ pub(super) fn spend_api_bucket<K: std::hash::Hash + Eq>(
     }
 }
 
-fn rate_limit_response(retry_after: u64) -> Response {
+pub(super) fn rate_limit_response(retry_after: u64) -> Response {
     retry_later(
         "Account request limit exceeded",
         "Retry after the interval in the Retry-After header.",
@@ -1427,12 +1509,16 @@ pub(super) fn retry_later(title: &str, detail: &str, retry_after: u64) -> Respon
     response
 }
 
-async fn require_active_account(pool: &sqlx::PgPool, account: String) -> ResponseResult<String> {
+/// The account and its durable posture, refused when suspended or gone.
+async fn require_active_account(
+    pool: &sqlx::PgPool,
+    account: String,
+) -> ResponseResult<(String, crate::db::AccountFlags)> {
     match crate::db::account_flags(pool, &account).await {
         Ok(Some(flags)) if flags.is_suspended() => {
             Err(problem(StatusCode::FORBIDDEN, "Account suspended", None).into())
         }
-        Ok(Some(_flags)) => Ok(account),
+        Ok(Some(flags)) => Ok((account, flags)),
         Ok(None) => Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None).into()),
         Err(error) => {
             eprintln!("http: account posture lookup failed: {error}");

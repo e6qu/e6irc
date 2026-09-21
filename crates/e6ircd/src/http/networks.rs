@@ -1697,13 +1697,17 @@ pub(super) struct BufferQuery {
 }
 
 /// Recent bouncer lines for one caller-owned network, oldest-first — the same
+/// Lines `GET /me/networks/{name}/buffer` returns when the request names no
+/// `limit`; the OpenAPI document advertises the same value.
+pub(super) const DEFAULT_BUFFER_READ_LIMIT: usize = 200;
+
 /// stream attach playback replays. A running driver provides its live bounded
 /// buffer; a stopped driver falls back to persisted history.
 pub(super) async fn network_buffer(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
     Path(name): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<BufferQuery>,
+    QueryParams(params): QueryParams<BufferQuery>,
 ) -> Response {
     if state.bnc_registry.is_none() {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
@@ -1722,7 +1726,7 @@ pub(super) async fn network_buffer(
             );
         }
     }
-    let limit = match bounded_query_limit(params.limit, 200, 1000, "buffer") {
+    let limit = match bounded_query_limit(params.limit, DEFAULT_BUFFER_READ_LIMIT, 1000, "buffer") {
         Ok(limit) => limit,
         Err(response) => return response.into(),
     };

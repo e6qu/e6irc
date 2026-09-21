@@ -120,7 +120,7 @@ case "$refusal" in
 esac
 
 # SIGTERM with the documented stop budget must end in a clean exit, not a kill.
-docker stop --time 35 "$server" >/dev/null
+docker stop --time 40 "$server" >/dev/null
 exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$server")"
 [ "$exit_code" = 0 ] || { echo "graceful stop exited $exit_code" >&2; exit 1; }
 echo "production container contract ok"

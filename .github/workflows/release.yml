@@ -98,6 +98,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # The `<tag>-<arch>` reference is a candidate, not a release artifact:
+      # buildx pushes it (the shape check below reads the registry manifest, and
+      # buildx's own push is what keeps it a direct OCI image manifest), the
+      # check then verifies it, and only the `manifest` job assembles verified
+      # candidates into the 12-hex-digit reference operators deploy. A candidate
+      # that fails verification is never assembled and is removed by the prune.
       - id: image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:

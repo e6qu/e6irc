@@ -945,6 +945,8 @@ dependencies = [
  "toml",
  "tower",
  "tower-http",
+ "url",
+ "zeroize",
 ]
 
 [[package]]

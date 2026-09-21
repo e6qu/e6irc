@@ -37,6 +37,8 @@ export function autojoinList(value) {
     .filter(Boolean);
 }
 
+const REMOVE_CONTROL = "“Remove the stored account and password”";
+
 /**
  * The credential half of a replace.
  *
@@ -44,11 +46,33 @@ export function autojoinList(value) {
  * and keeps the sealed secret. A password with no account is not -- there is
  * nothing for it to authenticate as -- so it is refused here, where the form
  * can point at the empty field, rather than by the server.
+ *
+ * Two edits say one thing on screen and would send another, so both are
+ * refused rather than resolved: a typed account or password under a ticked
+ * Remove (the typed values would be thrown away), and a stored account blanked
+ * without ticking Remove (an empty box would be sent as `keep`).
+ * `storedAccount` is what the server reported before the edit.
  */
-export function credentialAction({ clearing = false, account = "", password = "" } = {}) {
-  if (clearing) return { action: "remove" };
+export function credentialAction({ clearing = false, account = "", password = "", storedAccount = "" } = {}) {
   const trimmed = account.trim();
-  if (!trimmed && !password) return { action: "keep" };
+  if (clearing) {
+    if (trimmed || password) {
+      throw new NetworkRequestError(
+        "sasl_password",
+        `${REMOVE_CONTROL} is ticked, so the typed account and password would not be saved. Untick it to save them, or clear them to remove the stored ones.`,
+      );
+    }
+    return { action: "remove" };
+  }
+  if (!trimmed && !password) {
+    if (storedAccount) {
+      throw new NetworkRequestError(
+        "sasl_account",
+        `The NickServ account box was emptied but ${storedAccount} is still stored. Enter the account to keep authenticating, or tick ${REMOVE_CONTROL}.`,
+      );
+    }
+    return { action: "keep" };
+  }
   if (!trimmed) {
     throw new NetworkRequestError("sasl_account", "Enter the NickServ account this password belongs to.");
   }

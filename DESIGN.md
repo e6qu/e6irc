@@ -186,7 +186,11 @@ These are project-wide rules, enforced in review and (where possible) CI:
     enforcement, disconnects, operator notices, and HTTP admin responses happen
     only after it commits. The IRC and HTTP origins are typed requesters, so a
     global committed result does not depend on a still-live `ConnId`, and no
-    sentinel connection can accidentally stand in for an admin request.
+    sentinel connection can accidentally stand in for an admin request. A
+    committed change is announced to operators once, by the shard that
+    committed it; the other shards reconcile from the `ServerBanApplied`
+    broadcast without announcing, and a removal the database could not find
+    reconciles silently (the requester alone is told nothing was stored).
   - `PersistedChannelMutation` — the founder web console and REST API do not
     write channel rows beside the live core. They submit one typed mutation to
     the core, which validates and canonicalizes it, while the serial database
@@ -312,7 +316,10 @@ These are project-wide rules, enforced in review and (where possible) CI:
     and is therefore cancel-safe. Exceeding the backlog stops the worker with
     the typed `CoreWorkerExit::Backlogged`, which supervision treats as the
     critical failure it is.
-  - One worker and N workers give the same answers by construction. What a
+  - One worker and N workers give the same answers by construction. The
+    session's shard counts the JOINs it has routed to another shard
+    (`Session::pending_joins`) from the moment they are sent, so a pipelined
+    burst meets the channel limit exactly as on one worker. What a
     command needs to know about a user or channel on another shard (WHOIS,
     ISON, USERHOST, MONITOR, WHOWAS, LUSERS, a labeled away reply) is read
     from process-wide directories that every shard — including a lone one —
@@ -1101,10 +1108,10 @@ gives one *existing, active* account a new 32-random-byte password printed
 once, durable administrator authority, and no remaining browser sessions, and
 writes an `ADMINISTRATOR_RECOVERY` audit row whose actor is
 `host:recover-administrator`. An unknown or suspended account is refused and
-nothing is changed. Administrator authority is read at start, so the command
-says the daemon must be restarted before the account can administer. It is
-explicit, local, one-shot and audited; nothing about it is reachable from the
-network.
+nothing is changed. It needs no restart: the running daemon honours the
+granted authority and the revoked credentials on its next request, and the
+operator signs in with the printed password and changes it. It is explicit,
+local, one-shot and audited; nothing about it is reachable from the network.
 
 Suspension is a durable account state, not a credential rewrite. One
 transaction sets the flag, revokes every browser session, personal access
@@ -1629,9 +1636,11 @@ upstream's.
   a retry re-sends the same password, can only fail the same way, and every
   failure counts against the owner's account on the upstream. **Any other
   registration refusal** (a ghost on the nick, a connection throttle, a ban
-  that expires) retries after 30s, 1m, 2m, and 4m and parks on the fifth in a
-  row, keeping the upstream's sanitized reason in the runtime snapshot for the
-  whole wait. The failure and the time of the next attempt are published as one
+  that expires) retries after 30s, 1m, 2m, and 4m and parks on the fifth **of
+  one kind** in a row — a refusal of another kind starts the count over, so the
+  433 that follows a services outage (the driver's own ghost) is owed the whole
+  schedule, not an instant park — keeping the upstream's sanitized reason in the
+  runtime snapshot for the whole wait. The failure and the time of the next attempt are published as one
   transition (`FailureDisposition::Retry { next_attempt_in }`), so no observer
   can see a network waiting to retry with its reason but no next-attempt time
   (the time is cleared again when the attempt begins). **A refusal that ends by
@@ -1647,7 +1656,15 @@ upstream's.
   mistake. Only a session that actually registered resets that count: a dial
   that dies before registration neither counts as a refusal nor forgives the
   ones already counted, so a refusing upstream's own throttle cannot keep the
-  driver from parking. A server `ERROR` is classified by the one pre-welcome
+  driver from parking. The transient backoff likewise resets only after a
+  session that reached `Connected` and stayed up for ten seconds: a tarpit that
+  completes the handshake and says nothing until the registration deadline
+  keeps the schedule growing. A stopped driver (removed or replaced) says
+  `QUIT :reconfigured` within 2 s before its socket closes, so its successor
+  never meets its own ghost; every upstream write is bounded (10 s, then
+  `upstream_write_failed`), the auto-join burst is raced against the stop
+  signal, and the registry waits at most 15 s for a stopped driver before a
+  replace or remove proceeds, loudly. A server `ERROR` is classified by the one pre-welcome
   refusal predicate at every stage — capability discovery, capability
   requests, SASL, and the welcome — so its reason (`Trying to reconnect too
   fast`, `SASL access only`) is typed and kept wherever it arrives.
@@ -1732,7 +1749,9 @@ upstream's.
   would let any account make the server connect to internal infrastructure and
   learn what answers. The rule is applied to the literal at every API ingress
   (create, replace, connection test; the refusal names the rule, never the
-  address) and to every *resolved* address at dial time, so a hostname that
+  address), read as the URL parser reads it — `2130706433`, `0x7f.1`, `127.1`,
+  `0177.0.0.1`, percent-encoded octets, `user@host` — so no spelling of an
+  internal address passes as a hostname, and to every *resolved* address at dial time, so a hostname that
   resolves — or later rebinds — to an internal address is refused there. The
   one exception is operator-level: `internal_upstreams = "allow"` in the server
   configuration, which the test harnesses set because their upstreams are
@@ -1775,7 +1794,13 @@ commercial-provider claim still requires retained passed evidence.
 
 External qualification parses provider-discovered HTTP and WebSocket endpoints
 before it sends credentials. HTTP endpoints use HTTPS unless the issuer is a
-loopback test oracle; WebSockets use WSS under the same rule. OIDC metadata
+loopback test oracle; WebSockets use WSS under the same rule, and the bridge
+gateway dialer enforces it: a `ws://` gateway URL from the upstream is refused
+unless the configured API base is itself a loopback `http://` under
+`internal_upstreams = "allow"`. Every bridge HTTP request is built through
+`BridgeHttp`, which judges the parsed URL host against the egress rule before
+the HTTP client sees it (IP-literal hosts never reach the vetting resolver),
+and any 3xx answer is a failed request, never a delivery. OIDC metadata
 cannot cross between the external and loopback trust domains. Signed provider
 WebSocket query parameters stay inside the typed endpoint and never enter
 evidence.
@@ -1817,7 +1842,12 @@ Design constraints recorded now:
   position; a timeline the homeserver cut short is announced as a gap. Every
   login names the same device, `e6irc/<owner>/<network>` (`*` for a
   server-level network), so a process that crashed before it could log out
-  re-uses its device instead of leaving one behind.
+  re-uses its device instead of leaving one behind. Transaction ids are minted
+  per driver (a counter prefixed with the driver's start time), never per
+  session: the device, and so the id scope, outlives sessions and processes,
+  and a repeated id is silently deduplicated by the homeserver. The Slack
+  display-name cache is bounded at 4096 upstream ids; overflow clears it,
+  counted and logged.
 - Reverse bridge delivery accepts `PRIVMSG` only. Unmapped targets, malformed
   messages, unsupported commands, and per-target provider failures each emit a
   bounded `*bnc*` refusal notice; queue admission can never become a silent
@@ -1853,8 +1883,12 @@ Design constraints recorded now:
   nothing stronger to key on. A conversation with an unauthenticated party is
   therefore never written to the database and never read from it: it lives
   only in the in-memory ring, on the shard of each party, and every shard frees
-  it the moment that identity is let go, whether by disconnecting or by
-  changing nick. An authenticated participant keeps such a conversation for
+  it the moment that identity is let go, whether by disconnecting, by
+  changing nick, or by logging in (SASL, NickServ IDENTIFY, or account
+  registration): the connection is then its account, and `~nick` belongs to
+  the next holder. `ServerState::set_account` is the one path by which a
+  session gains an account — the field is write-private — and it performs the
+  release. An authenticated participant keeps such a conversation for
   exactly as long as the other party holds the nick; CHATHISTORY TARGETS lists
   it from the ring alongside what the database returns. Only a conversation
   between two accounts is stored, and a stored conversation is always addressed
@@ -1932,7 +1966,19 @@ Surface (initial):
 - `networks`: BNC network CRUD (+ enable/disable, status), buffers list,
   read-marker get/set. Full IRC updates use `PUT /me/networks/{name}` with a
   required credential action (`keep`, `set`, or `remove`), so a write-only
-  secret is never changed through an ambiguous omitted-field convention.
+  secret is never changed through an ambiguous omitted-field convention. Both
+  browser clients omit a blank credential field rather than sending null; an
+  account box emptied against a stored account, or a value typed under a
+  ticked Remove, is refused at the box rather than resolved one way or the
+  other.
+- A first OpenID Connect login provisions an account named exactly by the
+  provider's configured claim; a name already in use or retired is a
+  `409 Account name already taken` naming the claim — the server never
+  suffixes or invents a name for a person. The callback query is a closed set:
+  `session_state` (Keycloak, Microsoft Entra) is admitted and ignored, and any
+  other unknown parameter is a problem-document 400, as is every other
+  handler's query (`QueryParams`). Linking an identity requires an active
+  account.
 - `channels`: owner-scoped registered-channel inventory and management at
   `/me/channels` (live-operator registration, retained topic, KEEPTOPIC,
   canonical MLOCK, access flags, founder transfer, unregister)
@@ -2042,8 +2088,12 @@ still opens: its page says why chat is unavailable and links to where it can be
 enabled. Identity, network-list,
 history, storage, notification, and socket-protocol failures have visible,
 actionable states; an API failure is never rendered as an empty account. The
-member list is rank-ordered with sigils kept live from channel `MODE`, and the
-client offers a join-channel input and click-to-query on nicks.
+member list is rank-ordered with sigils kept live from channel `MODE`, reading
+membership sigils and which modes take a parameter from the network's own
+`005 PREFIX` and `CHANMODES` (RFC-style defaults until they arrive), and the
+client offers a join-channel input and click-to-query on nicks. On phone widths
+the member list is a header-toggled panel mirroring the conversation rail. The
+sign-out link exists only once `/me` has supplied its CSRF-bearing URL.
 
 ### 13.2 Live chat over WebSocket
 
@@ -2061,7 +2111,18 @@ inject markup). Startup uses this atomic socket replay as its single initial
 backlog source rather than racing it against a duplicate REST snapshot. The
 replay boundary precedes live traffic; only after it does
 the client request authoritative NAMES snapshots, preventing stale detached
-replay from overwriting current membership. The composer sends
+replay from overwriting current membership. Every `line` event and the
+`snapshot` boundary carry an opaque replay cursor (`<epoch>:<seq>`: the
+ring's lifetime and the line's position); a reconnecting socket presents it as
+`?after=` and is replayed exactly the lines after it. A cursor the ring cannot
+honour — another lifetime after a restart or a replaced driver, an evicted
+position, or text that is not a cursor — is answered with
+`{"t":"replay","v":"full"}` followed by the whole ring, and the client resets
+its transcripts with one "history reloaded" note. The client keeps no
+de-duplication heuristic. Before each transport retry the
+client checks the session; a 401 ends the retry loop and offers sign-in once.
+A message typed into a channel the session no longer holds is refused with a
+one-click rejoin; only slash commands pass. The composer sends
 `{id, target, message}` (with slash-commands) up the same socket, which the
 server validates as one complete IRC line and maps to the driver. CR/LF/NUL
 injection and an over-limit derived line reject the whole request; they are
@@ -2214,7 +2275,11 @@ bounded scrollback, a relay/status strip, an active-first conversation rail,
 a visible horizontally-following composer caret, `/help`, `/join`, `/msg`,
 `/win`, `/raw`, literal-slash escape with `//`, `/quit`, Ctrl-End return to the
 latest message, Ctrl-C exit, automatic reconnect with the same explicit
-request, and loud disconnect/write/drop state. Reconnection is not a fixed
+request, and loud disconnect/write/drop state. The steady-state read is
+bounded by a three-minute liveness window measured from the server's last
+line: one silent window sends `PING :e6irc-tui`, a second ends the session
+with "server stopped responding" and runs the reconnect path; the answer to
+its own probe stays out of the log. Reconnection is not a fixed
 two-second loop: rejected credentials, a rejected server password, and a ban
 are never retried (the client stops with a final status, as the bouncer's
 driver parks), and any other failure backs off exponentially from
@@ -2282,6 +2347,18 @@ but the CLI, TUI, and BNC must surface the rejection.
   passwords, so none can exist that would have to be tried blind; the ones
   minted before 0059, whose secrets were never stored, were revoked by it with
   an audit record each.
+- Administrator authority is read from the account row on every request
+  (`is_effective_admin`: the durable flag or a configured grant); no process
+  holds a registry, so `e6ircd recover-administrator` and any out-of-process
+  grant take effect on the next request. Recovery revokes every credential the
+  account held (local and app passwords, personal access tokens, device
+  grants, browser sessions) exactly as suspension does, through one shared
+  revocation. A primary password change or addition ends every other browser
+  session in the same transaction; app passwords and personal access tokens
+  are separately managed and left unchanged, and the response says so.
+  Console pages authenticate by browser session only: a bearer — whatever its
+  scopes — gets 401, and suspension or an unavailable database surface as
+  their problem documents, not a login redirect.
 - Every personal access token is minted by one capped path
   (`mint_api_token_under_cap`, 32 per account, checked under the account-row
   lock), the device grant included. Approval at the cap is refused in the
@@ -2504,6 +2581,14 @@ Layers, bottom to top:
   persisted revision before constructing the core or listeners, so the UI is
   authoritative. Writes use compare-and-swap revisions and a same-transaction
   redacted audit entry; stale writers fail visibly.
+- `[secrets].key_file` and `E6IRC_SECRET_KEY` are alternatives; a configuration
+  stating both is refused naming both sources, never resolved by precedence.
+  Rules about a secret's *content* (bootstrap token length, a non-empty OIDC
+  client secret and oper password) run in `validate_secrets()` after sealed
+  values are opened, so they judge the secret, never its `enc:v2:` ciphertext.
+  Every `http.admin_accounts` entry must be a valid account name (an IRC
+  nickname of at most 64 bytes; `"alice, bob"` is refused naming `" bob"`), and
+  `secure_cookies` and the `public_url` scheme must agree in both directions.
 - `internal_upstreams` (`refuse` by default, `allow`) is the server's policy on
   bouncer upstreams inside its own network (§10.3). It is bootstrap
   configuration, not a console setting, and the environment-stated
@@ -2566,8 +2651,9 @@ Layers, bottom to top:
   the configuration (`check-config`, `rotate-secrets`,
   `recover-administrator`) takes the same flag, so it runs by `docker exec` in
   a container that has no file to point at.
-  The systemd stop budget mechanically exceeds the daemon's bounded
-  PostgreSQL flush budget.
+  The systemd stop budget mechanically exceeds the daemon's bounded shutdown
+  — the core drain followed by the PostgreSQL flush; the guard sums both
+  constants.
   A version tag equal to `v` plus the workspace version publishes deterministic
   archives containing `e6ircd`, `e6irc`, and `e6irc-tui` for Linux, macOS, and
   Windows on x86-64 and ARM64. Each archive has a GitHub build-provenance

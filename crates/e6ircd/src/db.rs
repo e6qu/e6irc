@@ -1111,12 +1111,19 @@ pub async fn bootstrap_first_admin(
 }
 
 /// The account an operator recovered from the host, and the one-time password
-/// that now opens it.
+/// that now opens it. The password is wiped from memory when this is dropped.
 #[derive(Debug)]
 pub struct AdministratorRecovery {
     /// The account's stored name, which may differ in case from the one typed.
     pub account: String,
     pub password: String,
+}
+
+impl Drop for AdministratorRecovery {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.password.zeroize();
+    }
 }
 
 /// Who the audit log records for a recovery: not an account, because the point
@@ -1128,13 +1135,16 @@ const ADMINISTRATOR_RECOVERY_ACTOR: &str = "host:recover-administrator";
 /// backed them is broken (`e6ircd recover-administrator`).
 ///
 /// It acts on one existing, active account the operator names, in one
-/// transaction: the local password is replaced (or added, for an account only
-/// an identity provider ever opened) with a generated one returned once,
-/// durable administrator authority is granted, the account's browser sessions
-/// end — whoever held the lost credential is signed out — and the audit log
-/// records it. Nothing is guessed: an unknown name or a suspended account is
-/// refused. Nothing stays open afterwards: unlike the first-run browser
-/// bootstrap there is no token or page for anyone else to reach.
+/// transaction: every credential the account held is revoked — the local
+/// password and every app password, every personal access token, every device
+/// grant, every browser session — exactly as suspension revokes them, because
+/// the premise of a recovery is that the account's credentials are lost, and a
+/// lost credential may be in someone else's hands. A generated local password
+/// is installed and returned once, durable administrator authority is granted,
+/// and the audit log records it. Nothing is guessed: an unknown name or a
+/// suspended account is refused. Nothing stays open afterwards: unlike the
+/// first-run browser bootstrap there is no token or page for anyone else to
+/// reach.
 pub async fn recover_administrator(
     pool: &PgPool,
     account: &str,
@@ -1159,22 +1169,16 @@ pub async fn recover_administrator(
     if flags & ACCOUNT_FLAG_SUSPENDED != 0 {
         return Err(DbError::RecoveryOfSuspendedAccount(name));
     }
-    sqlx::query(
-        "DELETE FROM account_credentials WHERE account_id = $1 AND kind = 'local_password'",
-    )
-    .bind(account_id)
-    .execute(&mut *transaction)
-    .await
-    .map_err(DbError::Query)?;
+    sqlx::query("DELETE FROM account_credentials WHERE account_id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(DbError::Query)?;
+    revoke_account_bearers(&mut transaction, account_id, &name).await?;
     insert_primary_password(&mut transaction, account_id, &hash).await?;
     sqlx::query("UPDATE accounts SET flags = flags | $2 WHERE id = $1")
         .bind(account_id)
         .bind(ACCOUNT_FLAG_ADMIN)
-        .execute(&mut *transaction)
-        .await
-        .map_err(DbError::Query)?;
-    sqlx::query("DELETE FROM web_sessions WHERE account_id = $1")
-        .bind(account_id)
         .execute(&mut *transaction)
         .await
         .map_err(DbError::Query)?;
@@ -1183,7 +1187,7 @@ pub async fn recover_administrator(
         ADMINISTRATOR_RECOVERY_ACTOR,
         "ADMINISTRATOR_RECOVERY",
         &folded,
-        "local password replaced, administrator authority granted, and browser sessions ended from the host",
+        "every credential revoked (local and app passwords, personal access tokens, device grants, browser sessions), local password replaced, and administrator authority granted from the host",
     )
     .await?;
     transaction.commit().await.map_err(DbError::Query)?;
@@ -1376,16 +1380,6 @@ pub async fn account_id_by_name(pool: &PgPool, account: &str) -> Result<Option<i
     sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1")
         .bind(folded)
         .fetch_optional(pool)
-        .await
-        .map_err(DbError::Query)
-}
-
-/// Folded account keys holding durable administrator authority, loaded once
-/// into the live HTTP authorization registry at startup.
-pub async fn list_admin_accounts(pool: &PgPool) -> Result<Vec<String>, DbError> {
-    sqlx::query_scalar("SELECT name_folded FROM accounts WHERE (flags & $1) = $1 ORDER BY id")
-        .bind(ACCOUNT_FLAG_ADMIN)
-        .fetch_all(pool)
         .await
         .map_err(DbError::Query)
 }
@@ -1616,21 +1610,7 @@ pub async fn set_account_suspended(
     };
     write_account_flags(&mut transaction, account_id, next_flags).await?;
     if suspended {
-        sqlx::query("DELETE FROM web_sessions WHERE account_id = $1")
-            .bind(account_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(DbError::Query)?;
-        sqlx::query("DELETE FROM api_tokens WHERE account_id = $1")
-            .bind(account_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(DbError::Query)?;
-        sqlx::query("DELETE FROM device_grants WHERE account = $1")
-            .bind(&name)
-            .execute(&mut *transaction)
-            .await
-            .map_err(DbError::Query)?;
+        revoke_account_bearers(&mut transaction, account_id, &name).await?;
     }
     let action = if suspended {
         "ACCOUNT_SUSPEND"
@@ -1644,6 +1624,34 @@ pub async fn set_account_suspended(
         folded,
         suspended,
     }))
+}
+
+/// Revoke every bearer of an account's authority that is not a password: its
+/// browser sessions, personal access tokens, and device grants. Suspension and
+/// administrator recovery both end an account's existing access, and they must
+/// end the same set — a revocation that forgets one table leaves a live
+/// credential behind.
+async fn revoke_account_bearers(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: i64,
+    account_name: &str,
+) -> Result<(), DbError> {
+    sqlx::query("DELETE FROM web_sessions WHERE account_id = $1")
+        .bind(account_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(DbError::Query)?;
+    sqlx::query("DELETE FROM api_tokens WHERE account_id = $1")
+        .bind(account_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(DbError::Query)?;
+    sqlx::query("DELETE FROM device_grants WHERE account = $1")
+        .bind(account_name)
+        .execute(&mut **transaction)
+        .await
+        .map_err(DbError::Query)?;
+    Ok(())
 }
 
 /// The single Argon2 configuration used for every password hash and verify,
@@ -2883,7 +2891,9 @@ pub async fn unlink_oidc_identity(
 
 /// Attach an OIDC `(issuer, subject)` to `account`. Because the pair is
 /// globally unique, an identity already owned by another account is a hard
-/// [`LinkOutcome::Conflict`], never a silent move.
+/// [`LinkOutcome::Conflict`], never a silent move. A suspended account cannot
+/// gain a login identity: the account is resolved through the same active-only
+/// lock every other credential mutation uses.
 pub async fn link_oidc_identity(
     pool: &PgPool,
     account: &str,
@@ -2892,12 +2902,7 @@ pub async fn link_oidc_identity(
 ) -> Result<LinkOutcome, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let mut transaction = pool.begin().await.map_err(DbError::Query)?;
-    let account_id: i64 = sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1")
-        .bind(&folded)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(DbError::Query)?
-        .ok_or(DbError::BadCredentials)?;
+    let account_id = lock_active_account_id(&mut transaction, &folded).await?;
     let inserted: Option<i64> = sqlx::query_scalar(
         "INSERT INTO oidc_identities (account_id, issuer, subject) VALUES ($1, $2, $3)
          ON CONFLICT (issuer, subject) DO NOTHING RETURNING id",
@@ -5036,11 +5041,18 @@ struct LocalCredentialRow {
 /// Replace an account's primary password after verifying the current primary
 /// credential. The credential row is locked across verify-and-update so two
 /// concurrent rotations cannot both authorize against the same old password.
+///
+/// Every browser session other than `current_session` — the one that made the
+/// change — ends in the same transaction: a password is changed because the old
+/// one may be known to someone else, and that someone may be signed in. App
+/// passwords and personal access tokens are separately managed credentials and
+/// are left alone; the response says so.
 pub async fn change_local_password(
     pool: &PgPool,
     account: &str,
     current_password: &str,
     new_password: &str,
+    current_session: &str,
 ) -> Result<(), DbError> {
     let PasswordMutation {
         mut transaction,
@@ -5092,12 +5104,13 @@ pub async fn change_local_password(
     .execute(&mut *transaction)
     .await
     .map_err(DbError::Query)?;
+    delete_other_web_sessions_in(&mut transaction, &folded, current_session).await?;
     insert_audit_log_with(
         &mut *transaction,
         &folded,
         "ACCOUNT_PASSWORD_CHANGE",
         &folded,
-        "primary password changed",
+        "primary password changed; other browser sessions ended",
     )
     .await?;
     transaction.commit().await.map_err(DbError::Query)?;
@@ -5106,11 +5119,15 @@ pub async fn change_local_password(
 
 /// Add the first primary password to an authenticated account provisioned by
 /// OIDC. The account-row lock plus the partial unique index serialize and
-/// enforce the absent-to-present transition.
+/// enforce the absent-to-present transition. Other browser sessions end as they
+/// do for [`change_local_password`]: a new way into the account is a
+/// credential change, and whoever else is signed in does not get to keep
+/// riding a session opened before it existed.
 pub async fn set_local_password(
     pool: &PgPool,
     account: &str,
     new_password: &str,
+    current_session: &str,
 ) -> Result<(), DbError> {
     let PasswordMutation {
         mut transaction,
@@ -5135,12 +5152,13 @@ pub async fn set_local_password(
         return Err(DbError::LocalPasswordExists);
     }
     insert_primary_password(&mut transaction, account_id, &new_hash).await?;
+    delete_other_web_sessions_in(&mut transaction, &folded, current_session).await?;
     insert_audit_log_with(
         &mut *transaction,
         &folded,
         "ACCOUNT_PASSWORD_ADD",
         &folded,
-        "primary password added",
+        "primary password added; other browser sessions ended",
     )
     .await?;
     transaction.commit().await.map_err(DbError::Query)?;
@@ -6056,13 +6074,15 @@ pub async fn bnc_buffer_summary(
 // ---- web auth (OIDC identities + sessions) ------------------------------
 
 /// Find the account linked to (issuer, subject), or provision one named
-/// after the OIDC profile. Name collisions auto-suffix (-2, -3, …) —
-/// interactive nick-picking arrives with the web UI.
+/// exactly `account_name`, the name the provider's configured claim carries.
+/// A name that is already an account's or retired is refused with
+/// [`DbError::DuplicateAccount`] naming it — the server never invents a
+/// different name for a person, and the caller reports the conflict.
 pub async fn find_or_create_oidc_account(
     pool: &PgPool,
     issuer: &str,
     subject: &str,
-    preferred_name: &str,
+    account_name: &str,
 ) -> Result<String, DbError> {
     let existing: Option<String> = sqlx::query_scalar(
         "SELECT a.name FROM accounts a
@@ -6078,46 +6098,23 @@ pub async fn find_or_create_oidc_account(
         return Ok(name);
     }
 
-    let base: String = preferred_name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-        .take(24)
-        .collect();
-    let base = if base.is_empty() {
-        "user".to_string()
-    } else {
-        base
-    };
+    let folded = CaseMapping::Rfc1459.casefold(account_name);
     let mut tx = pool.begin().await.map_err(DbError::Query)?;
-    let mut chosen = None;
-    for i in 0..50u32 {
-        let candidate = if i == 0 {
-            base.clone()
-        } else {
-            format!("{base}-{}", i + 1)
-        };
-        let folded = CaseMapping::Rfc1459.casefold(&candidate);
-        lock_account_name(&mut tx, &folded).await?;
-        if account_name_is_retired(&mut tx, &folded).await? {
-            continue;
-        }
-        let id: Option<i64> = sqlx::query_scalar(
-            "INSERT INTO accounts (name, name_folded) VALUES ($1, $2)
-             ON CONFLICT (name_folded) DO NOTHING RETURNING id",
-        )
-        .bind(&candidate)
-        .bind(&folded)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(DbError::Query)?;
-        if let Some(id) = id {
-            chosen = Some((id, candidate));
-            break;
-        }
+    lock_account_name(&mut tx, &folded).await?;
+    if account_name_is_retired(&mut tx, &folded).await? {
+        return Err(DbError::DuplicateAccount(account_name.to_string()));
     }
-    let Some((account_id, name)) = chosen else {
-        return Err(DbError::DuplicateAccount(base));
-    };
+    let account_id: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (name, name_folded) VALUES ($1, $2)
+         ON CONFLICT (name_folded) DO NOTHING RETURNING id",
+    )
+    .bind(account_name)
+    .bind(&folded)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(DbError::Query)?
+    .ok_or_else(|| DbError::DuplicateAccount(account_name.to_string()))?;
+    let name = account_name.to_string();
     let inserted = sqlx::query(
         "INSERT INTO oidc_identities (account_id, issuer, subject) VALUES ($1, $2, $3)
          ON CONFLICT (issuer, subject) DO NOTHING",
@@ -6612,6 +6609,26 @@ pub async fn delete_web_session_by_id(
     Ok(deleted)
 }
 
+/// Delete every browser session of the account `folded` except the one whose
+/// token is `current_token`, inside the caller's transaction; the number
+/// deleted is returned.
+async fn delete_other_web_sessions_in(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    folded: &str,
+    current_token: &str,
+) -> Result<u64, DbError> {
+    sqlx::query(
+        "DELETE FROM web_sessions s USING accounts a
+         WHERE s.account_id = a.id AND a.name_folded = $1 AND s.token_hash <> $2",
+    )
+    .bind(folded)
+    .bind(token_hash(current_token))
+    .execute(&mut **transaction)
+    .await
+    .map(|result| result.rows_affected())
+    .map_err(DbError::Query)
+}
+
 /// Revoke every other browser session owned by `account`, preserving the
 /// supplied current cookie session.
 pub async fn delete_other_web_sessions(
@@ -6621,17 +6638,8 @@ pub async fn delete_other_web_sessions(
 ) -> Result<u64, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let mut transaction = pool.begin().await.map_err(DbError::Query)?;
-    let deleted = sqlx::query(
-        "DELETE FROM web_sessions s USING accounts a
-         WHERE s.account_id = a.id AND a.name_folded = $1 AND s.token_hash <> $2",
-    )
-    .bind(folded)
-    .bind(token_hash(current_token))
-    .execute(&mut *transaction)
-    .await
-    .map_err(DbError::Query)?;
-    if deleted.rows_affected() != 0 {
-        let folded = CaseMapping::Rfc1459.casefold(account);
+    let deleted = delete_other_web_sessions_in(&mut transaction, &folded, current_token).await?;
+    if deleted != 0 {
         insert_audit_log_with(
             &mut *transaction,
             &folded,
@@ -6642,7 +6650,7 @@ pub async fn delete_other_web_sessions(
         .await?;
     }
     transaction.commit().await.map_err(DbError::Query)?;
-    Ok(deleted.rows_affected())
+    Ok(deleted)
 }
 
 // ---- personal access tokens ---------------------------------------------

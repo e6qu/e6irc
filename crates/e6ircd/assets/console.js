@@ -1707,6 +1707,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           reason.name = "reason";
           reason.maxLength = 300;
           reason.placeholder = "reason";
+          reason.setAttribute("aria-label", `Disconnect reason for connection ${row.id} (${row.nick})`);
           disconnect.append(csrfInput(), reason, formButton("Disconnect", "danger"));
           disconnect.addEventListener("submit", (event) => {
             event.preventDefault();
@@ -1861,7 +1862,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         void mutateAccount(form, "PUT", body, "Password update failed.")
           .then((result) => {
             if (result === undefined) return;
-            setAccountResult(current ? "Local password changed." : "Local password added.", true);
+            setAccountResult(`${current ? "Local password changed." : "Local password added."} Other browser sessions were signed out; app passwords and access tokens are unchanged — revoke them below if you suspect them.`, true);
             void apiRead("/api/v1/me/credentials").then((updated) => {
               const credentials = apiCollection(updated, "credentials", "credential directory");
               renderPassword(credentials.some((credential) => credential.kind === "local_password"));
@@ -1988,23 +1989,6 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       return true;
     };
     void refreshContactEmail();
-  }
-
-  for (const form of document.querySelectorAll("[data-api-account-password]")) {
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      const fields = new FormData(form);
-      const current = fieldValue(fields, "current_password");
-      const next = fieldValue(fields, "new_password");
-      if (next !== fieldValue(fields, "confirm_password")) {
-        setAccountResult("The new password and confirmation do not match.", false);
-        return;
-      }
-      void mutateAccount(form, "PUT", { current_password: current || null, new_password: next }, "Password update failed.")
-        .then((result) => {
-          if (result !== undefined) setAccountResult(current ? "Local password changed." : "Local password added.", true);
-        });
-    });
   }
 
   for (const form of document.querySelectorAll("[data-api-account-app-password]")) {
@@ -2651,26 +2635,41 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     });
   }
 
-  const ownerNetworkUpdate = (form, bridge) => {
-    const fields = new FormData(form);
+  // The credential action of a replace. Every field the contract declares is a
+  // string, so a blank one is omitted, never sent as null: `set` with the
+  // account alone keeps the sealed password, and a bridge's password alone
+  // replaces its token. A stored IRC account whose box was emptied is refused
+  // rather than sent as `keep`, because the box says the opposite of the body.
+  const ownerCredentialAction = (form, fields) => {
+    if (fields.has("clear_sasl")) return { action: "remove" };
     const password = String(fields.get("sasl_password") || "");
     const account = optionalValue(String(fields.get("sasl_account") || ""));
-    const credentials = fields.has("clear_sasl")
-      ? { action: "remove" }
-      : (account || password)
-        ? { action: "set", account, password: password || null }
-        : { action: "keep" };
+    if (!account && !password) {
+      const stored = form.dataset.storedSaslAccount || "";
+      if (stored) {
+        throw Object.assign(
+          new Error(`The NickServ account box was emptied but ${stored} is still stored. Enter the account to keep authenticating, or tick “Remove the stored account and password”.`),
+          { field: "sasl_account" },
+        );
+      }
+      return { action: "keep" };
+    }
+    return { action: "set", ...(account ? { account } : {}), ...(password ? { password } : {}) };
+  };
+
+  const ownerNetworkUpdate = (form, bridge) => {
+    const fields = new FormData(form);
+    const credentials = ownerCredentialAction(form, fields);
     if (!bridge && (!fieldValue(fields, "addr") || !fieldValue(fields, "nick"))) {
       throw new Error("Enter the server and nickname.");
     }
     const body = {
       addr: fieldValue(fields, "addr"), tls: bridge || fields.has("tls"),
       nick: fieldValue(fields, "nick"),
-      // A bridge has no user name and the API refuses one for it.
-      ...(bridge ? {} : { username: userNameFor(fields) }),
-      // An IRC network always has a real name (the API refuses null for one),
-      // so a blank box means the nickname, on edit exactly as on create.
-      realname: bridge ? null : (fieldValue(fields, "realname") || fieldValue(fields, "nick")),
+      // A bridge has no user name or real name and the contract declares both
+      // as strings, so neither is sent for one. An IRC network always has a
+      // real name: a blank box means the nickname, on edit exactly as on create.
+      ...(bridge ? {} : { username: userNameFor(fields), realname: fieldValue(fields, "realname") || fieldValue(fields, "nick") }),
       autojoin: splitValues(String(fields.get("autojoin") || ""), bridge ? "," : /[\s,]+/), credentials,
     };
     return body;
@@ -2744,6 +2743,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       if (network.kind !== "irc") { window.location.replace("/console/networks"); return; }
       if (ownerNetworkResult instanceof HTMLElement) { ownerNetworkResult.replaceChildren(); ownerNetworkResult.className = ""; }
       hydrateTextInput(form, "addr", network.addr); hydrateTextInput(form, "nick", network.nick); hydrateTextInput(form, "username", network.username ?? ""); hydrateTextInput(form, "realname", network.realname ?? ""); hydrateTextInput(form, "autojoin", network.autojoin.join(", ")); hydrateTextInput(form, "sasl_account", network.sasl_account ?? "");
+      // What the account box held before editing, so emptying it is refused
+      // instead of being sent as `keep`.
+      form.dataset.storedSaslAccount = network.sasl_account ?? "";
       hydrateCheckbox(form, "tls", network.tls);
       form.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
       const title = ownerNetworkEditor.querySelector("[data-network-editor-title]"); if (title) title.textContent = `Edit ${network.name}`;
@@ -2847,6 +2849,16 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         if (chat instanceof HTMLAnchorElement) chat.href = `/?network=${encodeURIComponent(network.name)}`;
         const account = accountSetup.querySelector('[name="sasl_account"]');
         if (account instanceof HTMLInputElement && !account.value) account.value = network.sasl_account || network.nick;
+        // Saving into a disabled network also enables it (nothing would
+        // reconnect otherwise), so the control says so instead of doing it
+        // under a label that promises only a reconnect.
+        const saveLabel = network.enabled ? "Save and reconnect" : "Save credentials and enable";
+        const saveButton = accountSetup.querySelector("[data-network-account-save-button]");
+        if (saveButton) saveButton.textContent = saveLabel;
+        const saveName = accountSetup.querySelector("[data-network-account-save-name]");
+        if (saveName) saveName.textContent = saveLabel;
+        const saveNote = accountSetup.querySelector("[data-network-account-save-note]");
+        if (saveNote instanceof HTMLElement) saveNote.hidden = network.enabled;
         const warning = accountSetup.querySelector("[data-network-registration-warning]");
         if (warning instanceof HTMLElement) warning.hidden = !network.addr.toLowerCase().includes("libera.chat");
       }
@@ -2910,10 +2922,11 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         credentials: { action: "set", account, password },
       };
       const url = `/api/v1/me/networks/${encodeURIComponent(name)}`;
+      const enabling = !currentNetwork.enabled;
       void runFormSubmission(save, async () => {
         try {
           await apiRequest(save, apiMutation("PUT", url), body);
-          if (!currentNetwork.enabled) {
+          if (enabling) {
             await apiRequest(save, apiMutation("PATCH", url), { enabled: true });
           }
           const registrationPassword = ownerNetworkDetail.querySelector('[data-api-network-account-register] [name="password"]');
@@ -2921,7 +2934,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           const savedPassword = save.querySelector('[name="sasl_password"]');
           if (savedPassword instanceof HTMLInputElement) savedPassword.value = "";
           await refreshOwnerNetworkDetail();
-          setOwnerNetworkResult("NickServ account saved. The network is reconnecting with it.", true);
+          setOwnerNetworkResult(enabling ? "NickServ account saved and the network enabled. It is connecting with it." : "NickServ account saved. The network is reconnecting with it.", true);
         } catch (error) {
           setOwnerNetworkResult(error instanceof Error ? error.message : "NickServ account update failed.", false);
         }
@@ -3034,7 +3047,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   if (ownedChannelList instanceof HTMLElement) {
     const csrf = ownedChannelList.dataset.csrf || "";
     const input = (name, value = "") => { const node = element("input"); node.name = name; node.value = value; return node; };
-    const form = (url, label, body) => {
+    const form = (url, body) => {
       const node = element("form", "inline-control"); node.method = "post"; node.action = url;
       const token = input("csrf", csrf); token.type = "hidden"; node.append(token);
       body(node);
@@ -3057,15 +3070,15 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         const card = element("article", "panel channel-control");
         const access = apiCollection(channel, "access", "channel access");
         card.append(append(element("div", "panel-head"), append(element("div"), element("p", "eyebrow", "Registered channel"), element("h2", "", channel.name), element("p", "", `Founder ${channel.founder} · ${access.length} access grants`)), element("span", channel.keeptopic ? "live-pill" : "revision", channel.keeptopic ? "Topic retained" : "Topic retention off")));
-        const topic = form(url, "topic", (node) => { const field = element("label", "field"); const area = element("textarea"); area.name = "topic"; area.rows = 3; area.maxLength = 390; area.value = channel.topic || ""; append(field, element("span", "", "Retained topic"), area); node.append(field); }); submit(topic, "Save topic", (node) => mutateChannel(node, url, "PATCH", { action: "set_topic", topic: fieldValue(new FormData(node), "topic") || null }));
-        const lock = form(url, "mlock", (node) => { const field = element("label", "field"); append(field, element("span", "", "Mode lock"), input("mlock", channel.mlock || "")); node.append(field); }); submit(lock, "Save mode lock", (node) => mutateChannel(node, url, "PATCH", { action: "set_mlock", mlock: fieldValue(new FormData(node), "mlock") || null }));
-        const keep = form(url, "keep", (node) => { const select = element("select"); select.name = "enabled"; for (const [value, text] of [["on", "Retention on"], ["off", "Retention off"]]) { const option = element("option", "", text); option.value = value; option.selected = channel.keeptopic === (value === "on"); select.append(option); } node.append(select); }); submit(keep, "Apply retention", (node) => mutateChannel(node, url, "PATCH", { action: "set_keeptopic", enabled: fieldValue(new FormData(node), "enabled") === "on" }));
+        const topic = form(url, (node) => { const field = element("label", "field"); const area = element("textarea"); area.name = "topic"; area.rows = 3; area.maxLength = 390; area.value = channel.topic || ""; append(field, element("span", "", "Retained topic"), area); node.append(field); }); submit(topic, "Save topic", (node) => mutateChannel(node, url, "PATCH", { action: "set_topic", topic: fieldValue(new FormData(node), "topic") || null }));
+        const lock = form(url, (node) => { const field = element("label", "field"); append(field, element("span", "", "Mode lock"), input("mlock", channel.mlock || "")); node.append(field); }); submit(lock, "Save mode lock", (node) => mutateChannel(node, url, "PATCH", { action: "set_mlock", mlock: fieldValue(new FormData(node), "mlock") || null }));
+        const keep = form(url, (node) => { const select = element("select"); select.name = "enabled"; for (const [value, text] of [["on", "Retention on"], ["off", "Retention off"]]) { const option = element("option", "", text); option.value = value; option.selected = channel.keeptopic === (value === "on"); select.append(option); } node.append(select); }); submit(keep, "Apply retention", (node) => mutateChannel(node, url, "PATCH", { action: "set_keeptopic", enabled: fieldValue(new FormData(node), "enabled") === "on" }));
         const controls = element("div", "channel-control-grid"); controls.append(topic, lock, keep); card.append(controls);
         const grants = element("section", "control-block access-control"); grants.append(element("h3", "", "Channel access"));
         for (const grant of access) { const row = element("div", "compact-list"); row.append(element("code", "", grant.account), element("span", "tag", `+${grant.flags}`)); const remove = form(`${url}/access/${encodeURIComponent(grant.account)}`, "remove", () => {}); submit(remove, "Remove", (node) => mutateChannel(node, node.action, "DELETE"), `Remove ${grant.account} from ${channel.name} access?`); row.append(remove); grants.append(row); }
-        const add = form(`${url}/access`, "access", (node) => { node.append(input("account")); for (const [name, text] of [["auto_op", "Auto-op"], ["auto_voice", "Auto-voice"]]) { const label = element("label", "check"); const box = input(name); box.type = "checkbox"; append(label, box, element("span", "", text)); node.append(label); } }); submit(add, "Save access", (node) => { const fields = new FormData(node); const account = fieldValue(fields, "account"); const flags = [fields.has("auto_op") && "o", fields.has("auto_voice") && "v"].filter(Boolean).join(""); if (!account || !flags) { setChannelResult("Enter an account and select at least one access grant.", false); return Promise.resolve(); } return mutateChannel(node, `${node.action}/${encodeURIComponent(account)}`, "PUT", { flags }); }); grants.append(add); card.append(grants);
-        const transfer = form(url, "transfer", (node) => { node.append(input("account")); }); submit(transfer, "Transfer ownership", (node) => { const account = fieldValue(new FormData(node), "account"); if (!account) { setChannelResult("Enter the new founder account.", false); return Promise.resolve(); } return mutateChannel(node, url, "PATCH", { action: "transfer_founder", account }); }, `Transfer ${channel.name} to this account? You will lose founder control.`); card.append(transfer);
-        const drop = form(url, "drop", () => {}); submit(drop, "Unregister", (node) => mutateChannel(node, url, "DELETE"), `Unregister ${channel.name} and delete its retained policy?`); card.append(drop); ownedChannelList.append(card);
+        const add = form(`${url}/access`, (node) => { node.append(input("account")); for (const [name, text] of [["auto_op", "Auto-op"], ["auto_voice", "Auto-voice"]]) { const label = element("label", "check"); const box = input(name); box.type = "checkbox"; append(label, box, element("span", "", text)); node.append(label); } }); submit(add, "Save access", (node) => { const fields = new FormData(node); const account = fieldValue(fields, "account"); const flags = [fields.has("auto_op") && "o", fields.has("auto_voice") && "v"].filter(Boolean).join(""); if (!account || !flags) { setChannelResult("Enter an account and select at least one access grant.", false); return Promise.resolve(); } return mutateChannel(node, `${node.action}/${encodeURIComponent(account)}`, "PUT", { flags }); }); grants.append(add); card.append(grants);
+        const transfer = form(url, (node) => { node.append(input("account")); }); submit(transfer, "Transfer ownership", (node) => { const account = fieldValue(new FormData(node), "account"); if (!account) { setChannelResult("Enter the new founder account.", false); return Promise.resolve(); } return mutateChannel(node, url, "PATCH", { action: "transfer_founder", account }); }, `Transfer ${channel.name} to this account? You will lose founder control.`); card.append(transfer);
+        const drop = form(url, () => {}); submit(drop, "Unregister", (node) => mutateChannel(node, url, "DELETE"), `Unregister ${channel.name} and delete its retained policy?`); card.append(drop); ownedChannelList.append(card);
       }
     };
     refreshOwnedChannels = async () => {

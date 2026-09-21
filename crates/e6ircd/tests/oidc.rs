@@ -8,22 +8,11 @@ use e6ircd::net;
 
 mod support;
 
-#[tokio::test]
-#[ignore = "needs PostgreSQL + dex; see module docs"]
-async fn full_oidc_login_provisions_account_and_session() {
-    let db_url = support::test_db("full_oidc_login_provisions_account_and_session").await;
-    let dex_url = std::env::var("E6IRC_TEST_DEX_URL").expect("E6IRC_TEST_DEX_URL");
-
-    let pool = e6ircd::db::connect_and_migrate(&db_url)
-        .await
-        .expect("connect");
-    drop(pool);
-
-    // dex validates redirect URIs exactly, so the port is fixed and
-    // registered in tools/dex-config.yaml.
-    let http_addr: std::net::SocketAddr = "127.0.0.1:18080".parse().unwrap();
-
-    let config = Config {
+/// A server whose only login is the dex mock connector, whose one user is
+/// `kilgore@kilgore.trout` — so the account claim (the email's local part)
+/// names the account `kilgore`.
+fn dex_login_config(db_url: String, dex_url: String, http_addr: std::net::SocketAddr) -> Config {
+    Config {
         server_name: "irc.oidc.example".into(),
         network_name: "OidcNet".into(),
         listeners: vec![ListenerConfig {
@@ -52,16 +41,20 @@ async fn full_oidc_login_provisions_account_and_session() {
             token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
         }],
         ..Config::default()
-    };
-    let running = net::start(config).await.expect("start");
-    let base = format!("http://{}", running.http_addr.expect("http"));
+    }
+}
 
-    let client = reqwest::Client::builder()
+fn browser() -> reqwest::Client {
+    reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .cookie_store(true)
         .build()
-        .expect("client");
+        .expect("client")
+}
 
+/// Start a dex login at `base`, follow dex's redirects (the mock connector
+/// auto-approves) back to the callback, and return the callback's response.
+async fn complete_dex_login(client: &reqwest::Client, base: &str) -> reqwest::Response {
     // 1. start → redirect into dex
     let resp = client
         .get(format!("{base}/api/v1/auth/oidc/dex/start"))
@@ -78,10 +71,9 @@ async fn full_oidc_login_provisions_account_and_session() {
         .to_string();
     assert!(location.contains("/auth"), "{location}");
 
-    // 2. follow redirects inside dex (mock connector auto-approves)
-    //    until it sends us back to our callback.
+    // 2. follow redirects inside dex until it sends us back to our callback.
     for _ in 0..10 {
-        if location.starts_with(&base) {
+        if location.starts_with(base) {
             break;
         }
         let resp = client.get(&location).send().await.expect("dex hop");
@@ -105,12 +97,69 @@ async fn full_oidc_login_provisions_account_and_session() {
         };
     }
     assert!(
-        location.starts_with(&base),
+        location.starts_with(base),
         "never returned to callback: {location}"
     );
 
-    // 3. our callback: session cookie + redirect home
-    let resp = client.get(&location).send().await.expect("callback");
+    // 3. our callback
+    client.get(&location).send().await.expect("callback")
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL + dex; see module docs"]
+async fn full_oidc_login_provisions_account_and_session() {
+    let dex_url = std::env::var("E6IRC_TEST_DEX_URL").expect("E6IRC_TEST_DEX_URL");
+    // dex validates redirect URIs exactly, so the port is fixed and
+    // registered in tools/dex-config.yaml. Both servers below take it in turn.
+    let http_addr: std::net::SocketAddr = "127.0.0.1:18080".parse().unwrap();
+
+    // A first login whose claim names an account that already exists is
+    // refused by that name — the server never picks another name for a
+    // person — and nothing is provisioned.
+    let taken_db = support::test_db("full_oidc_login_provisions_account_and_session_taken").await;
+    let pool = e6ircd::db::connect_and_migrate(&taken_db)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "kilgore", "pw", None)
+        .await
+        .expect("the name is taken");
+    let running = net::start(dex_login_config(taken_db, dex_url.clone(), http_addr))
+        .await
+        .expect("start");
+    let base = format!("http://{}", running.http_addr.expect("http"));
+    let resp = complete_dex_login(&browser(), &base).await;
+    assert_eq!(resp.status(), 409);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/problem+json")
+    );
+    let refusal: serde_json::Value = resp.json().await.expect("problem document");
+    assert_eq!(refusal["title"], "Account name already taken");
+    assert!(
+        refusal["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("\"kilgore\"")),
+        "{refusal}"
+    );
+    let accounts: i64 = sqlx::query_scalar("SELECT count(*) FROM accounts")
+        .fetch_one(&pool)
+        .await
+        .expect("account count");
+    assert_eq!(accounts, 1, "no account was provisioned under another name");
+    drop(pool);
+    running.shutdown.run().await;
+
+    let db_url = support::test_db("full_oidc_login_provisions_account_and_session").await;
+    let running = net::start(dex_login_config(db_url, dex_url, http_addr))
+        .await
+        .expect("start");
+    let base = format!("http://{}", running.http_addr.expect("http"));
+    let client = browser();
+
+    // The callback: session cookie + redirect home.
+    let resp = complete_dex_login(&client, &base).await;
     assert_eq!(
         resp.status(),
         303,

@@ -65,7 +65,7 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                     return;
                 }
             };
-            if state.sessions[&conn].account.is_some() {
+            if state.sessions[&conn].account().is_some() {
                 state.service_notice(conn, "NickServ", "You are already logged in.");
                 return;
             }
@@ -217,11 +217,11 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
             // session is now unauthenticated (`ACCOUNT *`). Founder/access
             // authority is checked live against `account`, so it is revoked at
             // once; a client can now drop its identity without reconnecting.
-            if state.sessions[&conn].account.is_none() {
+            if state.sessions[&conn].account().is_none() {
                 state.service_notice(conn, "NickServ", "You are not logged in.");
                 return;
             }
-            state.sessions.get_mut(&conn).expect("checked").account = None;
+            state.clear_account(conn);
             super::sasl::notify_account_change(state, conn, "*");
             state.service_notice(conn, "NickServ", "You are now logged out.");
         }
@@ -586,7 +586,7 @@ fn require_identified(
     service: &str,
     hint: &str,
 ) -> Option<String> {
-    let Some(account) = state.sessions[&conn].account.clone() else {
+    let Some(account) = state.sessions[&conn].account().map(str::to_owned) else {
         state.service_notice(conn, service, hint);
         return None;
     };

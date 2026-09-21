@@ -18,6 +18,9 @@ struct TestServer {
     conns: Vec<(ConnId, Receiver<Output>)>,
     db_rx: Receiver<e6ircd::core::DbRequest>,
     channel_service_route: Option<(e6ircd::core::ChannelOwner, e6ircd::core::SessionOwner)>,
+    /// Where the last queued TOPIC persistence request came from, so its
+    /// verdict can be delivered the way the database worker delivers it.
+    channel_topic_route: Option<(e6ircd::core::ChannelOwner, e6ircd::core::SessionOwner)>,
 }
 
 impl TestServer {
@@ -96,6 +99,7 @@ impl TestServer {
             conns: Vec::new(),
             db_rx,
             channel_service_route: None,
+            channel_topic_route: None,
         }
     }
 
@@ -110,11 +114,34 @@ impl TestServer {
                 | e6ircd::core::DbRequest::SetChannelAccess { owner, session, .. } => {
                     self.channel_service_route = Some((owner.clone(), *session));
                 }
+                e6ircd::core::DbRequest::SetChannelTopic { owner, session, .. } => {
+                    self.channel_topic_route = Some((owner.clone(), *session));
+                }
                 _ => {}
             }
             out.push(env.payload);
         }
         out
+    }
+
+    /// Answer the queued TOPIC persistence request as the database worker
+    /// does: the verdict goes to the channel's owner, naming the requester
+    /// (`conn`, the connection that sent the TOPIC).
+    fn channel_topic_persisted(
+        &mut self,
+        conn: ConnId,
+        result: e6ircd::core::ChannelTopicPersistence,
+    ) {
+        let (owner, session) = self
+            .channel_topic_route
+            .take()
+            .expect("TOPIC persistence request");
+        self.core.handle(Input::ChannelTopicPersisted {
+            owner,
+            conn,
+            session: Some(session),
+            result,
+        });
     }
 
     fn channel_service_persisted(&mut self, result: e6ircd::core::ChannelServicePersistence) {
@@ -6859,9 +6886,9 @@ fn registered_channel_topic_persisted_on_set() {
         ] if channel == "#reg" && text == "new topic" => *revision,
         other => panic!("SetChannelTopic not queued once: {other:#?}"),
     };
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::ChannelTopicSet {
+    s.channel_topic_persisted(
+        boss,
+        e6ircd::core::ChannelTopicPersistence::Set {
             channel: "#reg".into(),
             display: "#reg".into(),
             prefix: "boss!u@127.0.0.1".into(),
@@ -6870,7 +6897,7 @@ fn registered_channel_topic_persisted_on_set() {
             retained: true,
             label: None,
         },
-    });
+    );
     assert!(
         s.drain(boss)
             .iter()
@@ -6923,16 +6950,16 @@ fn registered_topic_failed_verdicts_are_loud_labeled_and_non_mutating() {
         ] if label == "topic7" => *revision,
         other => panic!("labeled TOPIC request lost its correlation: {other:#?}"),
     };
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::ChannelTopicFailed {
+    s.channel_topic_persisted(
+        boss,
+        e6ircd::core::ChannelTopicPersistence::Failed {
             channel: "#reg".into(),
             display: "#reg".into(),
             revision,
             label: Some("topic7".into()),
             failure: e6ircd::core::ChannelTopicFailure::PersistenceUnavailable,
         },
-    });
+    );
     let out = s.drain(boss);
     assert!(
         out.iter().any(|line| {
@@ -6956,16 +6983,16 @@ fn registered_topic_failed_verdicts_are_loud_labeled_and_non_mutating() {
         [e6ircd::core::DbRequest::SetChannelTopic { revision, .. }] => *revision,
         other => panic!("second TOPIC did not enter the persistence path: {other:#?}"),
     };
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::ChannelTopicFailed {
+    s.channel_topic_persisted(
+        boss,
+        e6ircd::core::ChannelTopicPersistence::Failed {
             channel: "#reg".into(),
             display: "#reg".into(),
             revision,
             label: Some("topic8".into()),
             failure: e6ircd::core::ChannelTopicFailure::MissingRegistration,
         },
-    });
+    );
     let out = s.drain(boss);
     assert!(
         out.iter().any(|line| {
@@ -7000,9 +7027,9 @@ fn committed_registered_topic_survives_the_live_channel_becoming_empty() {
         other => panic!("registered TOPIC was not queued: {other:#?}"),
     };
     s.line(boss, "PART #reg");
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::ChannelTopicSet {
+    s.channel_topic_persisted(
+        boss,
+        e6ircd::core::ChannelTopicPersistence::Set {
             channel: "#reg".into(),
             display: "#reg".into(),
             prefix: "boss!u@127.0.0.1".into(),
@@ -7011,7 +7038,7 @@ fn committed_registered_topic_survives_the_live_channel_becoming_empty() {
             retained: true,
             label: None,
         },
-    });
+    );
     let out = s.drain(boss);
     assert!(
         out.iter()
@@ -7132,9 +7159,9 @@ fn chanserv_set_keeptopic_off_stops_topic_retention() {
             if channel == "#reg" && text == "while off")),
         "registered TOPIC did not enter the ordered persistence path"
     );
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::ChannelTopicSet {
+    s.channel_topic_persisted(
+        boss,
+        e6ircd::core::ChannelTopicPersistence::Set {
             channel: "#reg".into(),
             display: "#reg".into(),
             prefix: "boss!u@127.0.0.1".into(),
@@ -7143,7 +7170,7 @@ fn chanserv_set_keeptopic_off_stops_topic_retention() {
             retained: false,
             label: None,
         },
-    });
+    );
     assert!(
         s.drain(boss)
             .iter()
@@ -7208,9 +7235,9 @@ fn chanserv_set_keeptopic_on_recaptures_the_live_topic() {
     // A topic set while KEEPTOPIC is off: live, but not retained.
     s.line(boss, "TOPIC #reg :the live topic");
     s.db_requests();
-    s.core.handle(Input::DbReply {
-        conn: boss,
-        reply: e6ircd::core::DbReply::ChannelTopicSet {
+    s.channel_topic_persisted(
+        boss,
+        e6ircd::core::ChannelTopicPersistence::Set {
             channel: "#reg".into(),
             display: "#reg".into(),
             prefix: "boss!u@127.0.0.1".into(),
@@ -7219,7 +7246,7 @@ fn chanserv_set_keeptopic_on_recaptures_the_live_topic() {
             retained: false,
             label: None,
         },
-    });
+    );
     s.drain(boss);
     // Turning KEEPTOPIC back on must persist the current live topic right away,
     // in the same option write, with no second fallible request.
@@ -9437,13 +9464,8 @@ fn oper_sethost_capable_target_gets_no_redundant_396() {
 #[test]
 fn oper_kill_and_ban_raise_snotices() {
     let mut s = TestServer::new();
-    let op1 = s.register(1, "god");
-    s.line(op1, "OPER god letmein");
-    s.drain(op1);
-    // A second operator (same credentials, second session) watches for snotices.
-    let op2 = s.register(2, "god2");
-    s.line(op2, "OPER god letmein");
-    s.drain(op2);
+    // The second operator (same credentials, second session) watches for snotices.
+    let (op1, op2) = two_operators(&mut s);
     let victim = s.register(3, "victim");
     s.drain(victim);
 
@@ -9457,14 +9479,139 @@ fn oper_kill_and_ban_raise_snotices() {
         "op2 did not see the KILL snotice: {seen:#?}"
     );
 
-    // Ban: op2 sees the K-Line notice.
+    // Ban: op2 sees the K-Line notice, exactly once.
     s.line(op1, "KLINE bad@host.example :spam");
     commit_server_ban(&mut s);
     let seen = s.drain(op2);
+    assert_eq!(
+        server_ban_snotices(&seen, "added").len(),
+        1,
+        "op2 must see the ban snotice once: {seen:#?}"
+    );
+}
+
+/// Operator server-notices announcing a change to the K-Line the tests set.
+fn server_ban_snotices<'a>(lines: &'a [String], change: &str) -> Vec<&'a String> {
+    lines
+        .iter()
+        .filter(|l| {
+            l.contains("Notice --") && l.contains(&format!("{change} K-Line for bad@host.example"))
+        })
+        .collect()
+}
+
+/// Two operators; the second only watches for server notices.
+fn two_operators(s: &mut TestServer) -> (ConnId, ConnId) {
+    let op1 = s.register(1, "god");
+    s.line(op1, "OPER god letmein");
+    s.drain(op1);
+    let op2 = s.register(2, "god2");
+    s.line(op2, "OPER god letmein");
+    s.drain(op2);
+    (op1, op2)
+}
+
+/// Without a database the ban is committed on the spot; it is still one
+/// event, announced once — not once by the command and again by the apply.
+#[test]
+fn server_ban_snotice_is_raised_once_without_a_database() {
+    let mut s = TestServer::new_no_persistence();
+    let (op1, op2) = two_operators(&mut s);
+    s.line(op1, "KLINE bad@host.example :spam");
+    let seen = s.drain(op2);
+    assert_eq!(
+        server_ban_snotices(&seen, "added").len(),
+        1,
+        "op2 must see the ban snotice once: {seen:#?}"
+    );
+    s.line(op1, "UNKLINE bad@host.example");
+    let seen = s.drain(op2);
+    assert_eq!(
+        server_ban_snotices(&seen, "removed").len(),
+        1,
+        "op2 must see the removal snotice once: {seen:#?}"
+    );
+}
+
+/// A removal the database could not find reconciles the hot list (the ban
+/// stops being enforced) but announces nothing: the requester is told there
+/// was no stored ban, and nothing was removed for other operators to hear of.
+#[test]
+fn unstored_ban_removal_reconciles_without_a_snotice() {
+    let mut s = TestServer::new();
+    let (op1, op2) = two_operators(&mut s);
+    s.line(op1, "KLINE bad@host.example :spam");
+    commit_server_ban(&mut s);
+    s.drain(op1);
+    s.drain(op2);
+    s.line(op1, "UNKLINE bad@host.example");
+    let mut pending = None;
+    for request in s.db_requests() {
+        if let e6ircd::core::DbRequest::MutateServerBan {
+            mutation,
+            requester,
+        } = request
+        {
+            pending = Some((mutation, requester));
+        }
+    }
+    let (mutation, requester) = pending.expect("removal queued");
+    s.core.handle(Input::ServerBanResult {
+        mutation,
+        requester,
+        result: e6ircd::core::ServerBanResult::Missing,
+    });
+    let out = s.drain(op1);
     assert!(
-        seen.iter()
-            .any(|l| l.contains("Notice --") && l.contains("added K-Line for bad@host.example")),
-        "op2 did not see the ban snotice: {seen:#?}"
+        out.iter()
+            .any(|l| l.contains("No stored K-Line for bad@host.example")),
+        "requester was not told the ban is not stored: {out:#?}"
+    );
+    let seen = s.drain(op2);
+    assert!(
+        server_ban_snotices(&seen, "removed").is_empty(),
+        "nothing was removed, so nothing is announced: {seen:#?}"
+    );
+    s.line(op1, "UNKLINE bad@host.example");
+    let out = s.drain(op1);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("No K-Line found for bad@host.example")),
+        "the hot list still enforces a ban the database does not hold: {out:#?}"
+    );
+}
+
+/// Registering an account mid-session is a login like any other: `~alice`
+/// stops being this connection's identity, and the conversations kept under
+/// it are freed before the next holder of the nick can ask for them.
+#[test]
+fn registering_an_account_frees_the_conversations_of_the_unauthenticated_nick() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch draft/chathistory");
+    let bob = s.register(2, "bob");
+    s.line(alice, "PRIVMSG bob :the secret");
+    s.drain(bob);
+    s.line(alice, "PRIVMSG NickServ :REGISTER hunter2");
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::AccountCreated {
+            account: "alice".into(),
+            origin: e6ircd::core::AccountOrigin::NickServ,
+        },
+    });
+    s.drain(alice);
+    s.line(alice, "QUIT :bye");
+    s.core.handle(Input::Closed {
+        conn: alice,
+        reason: "Connection closed".into(),
+    });
+    let stranger = register_with_caps(&mut s, 3, "alice", "batch draft/chathistory");
+    s.line(stranger, "CHATHISTORY LATEST bob * 10");
+    let out = s.drain(stranger);
+    assert!(
+        !out.iter().any(|l| l.contains("the secret")),
+        "the stranger read alice's conversation: {out:#?}"
     );
 }
 

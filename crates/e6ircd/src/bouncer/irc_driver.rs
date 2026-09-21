@@ -247,7 +247,7 @@ pub async fn preflight_irc(
     let dns_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(10));
     let addresses = tokio::time::timeout_at(
         dns_deadline,
-        resolve_vetted(&config.addr, config.internal_upstreams),
+        super::resolve_vetted(config.addr.as_str(), config.internal_upstreams),
     )
     .await
     .map_err(|_| IrcPreflightFailure::ConnectionTimedOut)?
@@ -321,20 +321,7 @@ pub async fn preflight_irc(
     }
     .await;
 
-    // Leave as a client would. Dropping the socket instead shows the upstream a
-    // read error, and its record of this nick can outlive the test long enough
-    // to refuse the driver that starts from the same settings a moment later.
-    // The result is already decided, so a failed or slow goodbye is only logged.
-    match tokio::time::timeout(
-        Duration::from_secs(2),
-        connection.send_line("QUIT :connection test complete"),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => eprintln!("irc preflight: quit failed: {error}"),
-        Err(_) => eprintln!("irc preflight: quit timed out"),
-    }
+    say_goodbye(&mut connection, "connection test complete", "irc preflight").await;
 
     let (confirmed_nick, registration_ms, joined_channels) = outcome?;
     Ok(IrcPreflight {
@@ -350,6 +337,33 @@ pub async fn preflight_irc(
 fn elapsed_millis(elapsed: Duration) -> u64 {
     elapsed.as_millis().min(u64::MAX as u128) as u64
 }
+
+/// How long the goodbye may take. The exit is already decided; this only keeps
+/// a dead socket from holding it.
+const GOODBYE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Leave as a client would: `QUIT`, then the socket. Dropping the socket
+/// instead shows the upstream a read error, and its record of this nick can
+/// outlive the close long enough to refuse — as a 433, with the whole refusal
+/// schedule behind it — whatever starts from the same settings a moment later:
+/// the connection test's driver, or a reconfigured network's replacement. The
+/// exit is already decided, so a failed or slow goodbye is only logged.
+async fn say_goodbye(connection: &mut Connection, reason: &str, who: &str) {
+    match tokio::time::timeout(
+        GOODBYE_DEADLINE,
+        connection.send_line(&format!("QUIT :{reason}")),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("{who}: quit failed: {error}"),
+        Err(_) => eprintln!("{who}: quit timed out"),
+    }
+}
+
+/// What a stopped driver says on its way out, whether the network was removed
+/// or replaced by its reconfigured successor.
+const STOPPED_GOODBYE: &str = "reconfigured";
 
 async fn run(config: NetworkConfig, mut ends: DriverEnds) {
     ends.set_rejection_retry_floor(config.rejection_retry_floor);
@@ -516,8 +530,13 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     };
     let register_fut = register(config, &mut conn);
     let registration = tokio::select! {
-        _ = ends.shutdown_signalled() => return super::SessionOutcome::Stopped,
-        result = tokio::time::timeout(Duration::from_secs(30), register_fut) => result,
+        _ = ends.shutdown_signalled() => None,
+        result = tokio::time::timeout(Duration::from_secs(30), register_fut) => Some(result),
+    };
+    let Some(registration) = registration else {
+        // Stopped while registering: the socket is open, so leave properly.
+        say_goodbye(&mut conn, STOPPED_GOODBYE, "irc driver").await;
+        return super::SessionOutcome::Stopped;
     };
     let granted = registration_outcome(registration).and_then(|welcomed| {
         configured_nick_was_granted(config.nick.as_str(), welcomed)
@@ -550,10 +569,26 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
         list.extend(extras);
         list
     };
-    for chan in &rejoin {
-        if conn.send_line(&format!("JOIN {chan}")).await.is_err() {
-            return dropped(super::NetworkFailure::AutojoinFailed);
+    // Up to `MAX_TRACKED_CHANNELS` writes, each bounded; the whole burst is
+    // still raced against the stop signal so a removal or replacement is not
+    // held behind a slow upstream's worth of them.
+    let rejoined = tokio::select! {
+        _ = ends.shutdown_signalled() => None,
+        result = async {
+            for chan in &rejoin {
+                write_bounded(&mut conn, &format!("JOIN {chan}"), super::UPSTREAM_WRITE_DEADLINE)
+                    .await?;
+            }
+            Ok::<(), std::io::Error>(())
+        } => Some(result),
+    };
+    match rejoined {
+        None => {
+            say_goodbye(&mut conn, STOPPED_GOODBYE, "irc driver").await;
+            return super::SessionOutcome::Stopped;
         }
+        Some(Err(_)) => return dropped(super::NetworkFailure::AutojoinFailed),
+        Some(Ok(())) => {}
     }
     ends.begin_irc_session(current_nick.clone());
     ends.emit(ConnectionEvent::Connected);
@@ -592,7 +627,10 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                         // driver's job, not the attached client's).
                         if m.command == "PING" {
                             let token = m.params.first().cloned().unwrap_or_default();
-                            if conn.send_line(&format!("PONG :{token}")).await.is_err() {
+                            if write_bounded(&mut conn, &format!("PONG :{token}"), super::UPSTREAM_WRITE_DEADLINE)
+                                .await
+                                .is_err()
+                            {
                                 return dropped(super::NetworkFailure::UpstreamWriteFailed);
                             }
                             continue;
@@ -661,7 +699,10 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                     }
                     awaiting_keepalive = true;
                     silence.restart();
-                    if conn.send_line("PING :e6bnc-keepalive").await.is_err() {
+                    if write_bounded(&mut conn, "PING :e6bnc-keepalive", super::UPSTREAM_WRITE_DEADLINE)
+                        .await
+                        .is_err()
+                    {
                         return dropped(super::NetworkFailure::UpstreamWriteFailed);
                     }
                 }
@@ -669,7 +710,10 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
             // Downstream command -> upstream.
             cmd = ends.next_command() => match cmd {
                 Some(cmd) => {
-                    if conn.send_line(&cmd.line).await.is_err() {
+                    if write_bounded(&mut conn, &cmd.line, super::UPSTREAM_WRITE_DEADLINE)
+                        .await
+                        .is_err()
+                    {
                         return dropped(super::NetworkFailure::UpstreamWriteFailed);
                     }
                     // The upstream never echoes our own messages (we do not
@@ -682,7 +726,12 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                         ends.emit_echo(echo, cmd.origin);
                     }
                 }
-                None => return super::SessionOutcome::Stopped, // handle dropped
+                // Stopped by the registry, or every handle dropped: the
+                // successor (if any) must not meet this session's ghost.
+                None => {
+                    say_goodbye(&mut conn, STOPPED_GOODBYE, "irc driver").await;
+                    return super::SessionOutcome::Stopped;
+                }
             },
         }
     }
@@ -791,7 +840,7 @@ async fn connect(config: &NetworkConfig) -> std::io::Result<Connection> {
     // `169.254.169.254` (or a DNS rebind between creation and now) would reach an
     // internal target. Connecting to the specific vetted socket address closes
     // both: resolution can't differ between the check and the connect.
-    let vetted = resolve_vetted(&config.addr, config.internal_upstreams).await?;
+    let vetted = super::resolve_vetted(config.addr.as_str(), config.internal_upstreams).await?;
     if vetted.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -802,16 +851,22 @@ async fn connect(config: &NetworkConfig) -> std::io::Result<Connection> {
     connect_resolved(config, vetted).await
 }
 
-async fn resolve_vetted(
-    addr: &str,
-    policy: crate::egress::InternalUpstreams,
-) -> std::io::Result<Vec<std::net::SocketAddr>> {
-    Ok(interleave_address_families(
-        tokio::net::lookup_host(addr)
-            .await?
-            .filter(|address| policy.permits(address.ip()))
-            .collect(),
-    ))
+/// One write to the upstream, bounded by `deadline`; the timeout is an
+/// `io::Error` like any other write failure, so every caller reads it as
+/// [`super::NetworkFailure::UpstreamWriteFailed`].
+async fn write_bounded(
+    connection: &mut Connection,
+    line: &str,
+    deadline: Duration,
+) -> std::io::Result<()> {
+    tokio::time::timeout(deadline, connection.send_line(line))
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the upstream stopped draining its socket; the write did not finish in time",
+            ))
+        })
 }
 
 async fn connect_resolved(
@@ -830,7 +885,7 @@ async fn connect_resolved(
     );
     for address in vetted {
         let stream = match tokio::time::timeout(
-            Duration::from_secs(5),
+            super::ADDRESS_DIAL_DEADLINE,
             tokio::net::TcpStream::connect(address),
         )
         .await
@@ -850,7 +905,7 @@ async fn connect_resolved(
         };
         let connected = if config.tls {
             match tokio::time::timeout(
-                Duration::from_secs(5),
+                super::ADDRESS_DIAL_DEADLINE,
                 Connection::from_tcp_tls(stream, server_name, e6irc_client::webpki_root_store()),
             )
             .await
@@ -870,28 +925,6 @@ async fn connect_resolved(
         }
     }
     Err(last_error)
-}
-
-fn interleave_address_families(addresses: Vec<std::net::SocketAddr>) -> Vec<std::net::SocketAddr> {
-    let start_with_ipv6 = addresses.first().is_some_and(std::net::SocketAddr::is_ipv6);
-    let (ipv6, ipv4): (std::collections::VecDeque<_>, std::collections::VecDeque<_>) = addresses
-        .into_iter()
-        .partition(std::net::SocketAddr::is_ipv6);
-    let (mut first, mut second) = if start_with_ipv6 {
-        (ipv6, ipv4)
-    } else {
-        (ipv4, ipv6)
-    };
-    let mut ordered = Vec::with_capacity(first.len() + second.len());
-    while !first.is_empty() || !second.is_empty() {
-        if let Some(address) = first.pop_front() {
-            ordered.push(address);
-        }
-        if let Some(address) = second.pop_front() {
-            ordered.push(address);
-        }
-    }
-    ordered
 }
 
 fn upstream_host(addr: &str) -> std::io::Result<&str> {
@@ -948,11 +981,11 @@ mod tests {
     #[tokio::test]
     async fn a_hostname_is_judged_by_what_it_resolves_to() {
         use crate::egress::InternalUpstreams;
-        let refused = resolve_vetted("localhost:6667", InternalUpstreams::Refuse)
+        let refused = super::super::resolve_vetted("localhost:6667", InternalUpstreams::Refuse)
             .await
             .expect("resolution itself succeeds");
         assert!(refused.is_empty(), "{refused:?}");
-        let allowed = resolve_vetted("localhost:6667", InternalUpstreams::Allow)
+        let allowed = super::super::resolve_vetted("localhost:6667", InternalUpstreams::Allow)
             .await
             .expect("resolution itself succeeds");
         assert!(
@@ -960,7 +993,7 @@ mod tests {
             "{allowed:?}"
         );
         assert!(!allowed.is_empty());
-        let never = resolve_vetted("169.254.169.254:80", InternalUpstreams::Allow)
+        let never = super::super::resolve_vetted("169.254.169.254:80", InternalUpstreams::Allow)
             .await
             .expect("a literal resolves to itself");
         assert!(never.is_empty(), "{never:?}");
@@ -983,20 +1016,37 @@ mod tests {
         assert!(upstream_host("[irc.example]:6697").is_err());
     }
 
-    #[test]
-    fn resolved_addresses_alternate_families_without_reordering_each_family() {
-        let v6a = "[2001:db8::1]:6697".parse().unwrap();
-        let v6b = "[2001:db8::2]:6697".parse().unwrap();
-        let v4a = "192.0.2.1:6697".parse().unwrap();
-        let v4b = "192.0.2.2:6697".parse().unwrap();
-        assert_eq!(
-            interleave_address_families(vec![v6a, v6b, v4a, v4b]),
-            [v6a, v4a, v6b, v4b]
-        );
-        assert_eq!(
-            interleave_address_families(vec![v4a, v4b, v6a, v6b]),
-            [v4a, v6a, v4b, v6b]
-        );
+    /// A peer that stops draining its socket makes every write block once the
+    /// kernel buffers fill. The bound turns that into a write failure the
+    /// session loop ends on, instead of a driver held for as long as the
+    /// kernel keeps the connection.
+    #[tokio::test]
+    async fn a_write_the_peer_never_drains_fails_at_the_deadline() {
+        let server = tokio::net::TcpSocket::new_v4().unwrap();
+        server.set_recv_buffer_size(4096).unwrap();
+        server.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = server.listen(1).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = tokio::net::TcpSocket::new_v4().unwrap();
+        client.set_send_buffer_size(4096).unwrap();
+        let stream = client.connect(address).await.unwrap();
+        // Accepted and then never read from.
+        let (_held, _) = listener.accept().await.unwrap();
+        let mut connection = Connection::from_tcp(stream).unwrap();
+        let line = format!("PRIVMSG #room :{}", "x".repeat(400));
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            for _ in 0..100_000 {
+                if let Err(error) =
+                    write_bounded(&mut connection, &line, Duration::from_millis(200)).await
+                {
+                    return error;
+                }
+            }
+            panic!("100k lines were accepted by a peer that never reads");
+        })
+        .await
+        .expect("the bounded write returned within the test budget");
+        assert_eq!(outcome.kind(), std::io::ErrorKind::TimedOut, "{outcome}");
     }
 
     fn confirmed(names: &[String]) -> super::super::SessionChange {

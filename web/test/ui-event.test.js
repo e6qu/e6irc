@@ -6,17 +6,22 @@ import test from "node:test";
 import { UiEventError, parseUiEvent } from "../src/ui-event.js";
 
 test("live event parser accepts the closed server event contract", () => {
-  assert.deepEqual(parseUiEvent('{"t":"line","v":"PING :server"}'), {
+  assert.deepEqual(parseUiEvent('{"t":"line","v":"PING :server","cursor":"7:42"}'), {
     type: "line",
     value: "PING :server",
+    cursor: "7:42",
   });
+  assert.deepEqual(parseUiEvent('{"t":"replay","v":"full"}'), { type: "replay" });
   assert.deepEqual(parseUiEvent('{"t":"sent","v":"a1"}'), { type: "sent", value: "a1" });
   assert.deepEqual(parseUiEvent('{"t":"send-error","v":"a1","message":"not sent"}'), {
     type: "send-error",
     value: "a1",
     message: "not sent",
   });
-  assert.deepEqual(parseUiEvent('{"t":"snapshot","v":"complete"}'), { type: "snapshot" });
+  assert.deepEqual(parseUiEvent('{"t":"snapshot","v":"complete","cursor":"7:42"}'), {
+    type: "snapshot",
+    cursor: "7:42",
+  });
   assert.deepEqual(
     parseUiEvent('{"t":"session","nick":"alice","channels":["#one","#Two"]}'),
     { type: "session", nick: "alice", channels: ["#one", "#Two"] },
@@ -48,8 +53,14 @@ test("live event parser rejects every malformed or unsupported shape", () => {
     "{}",
     '{"t":"line"}',
     '{"t":"line","v":1}',
-    '{"t":"line","v":"ok","extra":true}',
-    '{"t":"snapshot","v":"partial"}',
+    '{"t":"line","v":"ok"}',
+    '{"t":"line","v":"ok","cursor":""}',
+    '{"t":"line","v":"ok","cursor":7}',
+    '{"t":"line","v":"ok","cursor":"7:1","extra":true}',
+    '{"t":"snapshot","v":"complete"}',
+    '{"t":"snapshot","v":"partial","cursor":"7:1"}',
+    '{"t":"replay","v":"partial"}',
+    '{"t":"replay","v":"full","cursor":"7:1"}',
     '{"t":"session","nick":"","channels":[]}',
     '{"t":"session","nick":"alice","channels":"#one"}',
     '{"t":"session","nick":"alice","channels":[1]}',

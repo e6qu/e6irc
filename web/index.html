@@ -41,7 +41,10 @@
             <span id="account-name" aria-live="polite">signed in</span>
             <span id="account-role" class="user-role" aria-live="polite"></span>
           </a>
-          <a id="logout-link" data-shauth-sign-out href="/api/v1/auth/logout">Sign out</a>
+          <!-- Signing out needs the session's CSRF token, which arrives with
+               /api/v1/me. Until then there is no link: one without the token
+               only lands on a CSRF refusal page. -->
+          <a id="logout-link" data-shauth-sign-out hidden>Sign out</a>
         </nav>
       </header>
 
@@ -92,6 +95,16 @@
               <p class="route-kicker" id="route-network"></p>
               <div class="buffer-title"><h1 id="bufname">—</h1><span id="buftopic" class="topic"></span></div>
             </div>
+            <!-- On a phone the member list is a panel this button opens, the
+                 way the Conversations button opens the rail; wider layouts
+                 show the list beside the chat and hide the button. -->
+            <button
+              id="members-toggle"
+              type="button"
+              aria-expanded="false"
+              aria-controls="nicklist"
+              hidden
+            >Members</button>
             <button id="buffer-action" type="button" hidden>Close</button>
           </div>
           <button id="load-earlier" type="button" hidden>Load earlier messages</button>

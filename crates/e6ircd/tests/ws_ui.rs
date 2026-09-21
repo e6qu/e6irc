@@ -141,7 +141,7 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
                     if event["t"] == "session" {
                         session = Some(event.clone());
                     }
-                    if event == serde_json::json!({ "t": "snapshot", "v": "complete" }) {
+                    if event["t"] == "snapshot" {
                         return (event, session);
                     }
                 }
@@ -152,9 +152,12 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
     })
     .await
     .expect("timeout waiting for replay boundary");
-    assert_eq!(
-        boundary,
-        serde_json::json!({ "t": "snapshot", "v": "complete" })
+    assert_eq!(boundary["v"], "complete");
+    assert!(
+        boundary["cursor"]
+            .as_str()
+            .is_some_and(|cursor| !cursor.is_empty()),
+        "the boundary names the ring position to resume from: {boundary}"
     );
     assert_eq!(
         session,
@@ -309,6 +312,214 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
         got.source.as_deref().unwrap_or("").starts_with("alicebnc!"),
         "{got:?}"
     );
+}
+
+/// Read `/ws/ui` events up to and including the replay boundary.
+async fn events_until_snapshot(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Vec<serde_json::Value> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut events = Vec::new();
+        loop {
+            match ws.next().await {
+                Some(Ok(Tung::Text(text))) => {
+                    let event: serde_json::Value =
+                        serde_json::from_str(&text).expect("ws/ui event JSON");
+                    let boundary = event["t"] == "snapshot";
+                    events.push(event);
+                    if boundary {
+                        return events;
+                    }
+                }
+                Some(Ok(_)) => {}
+                _ => panic!("ws/ui closed before the replay boundary"),
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for replay boundary")
+}
+
+fn line_values(events: &[serde_json::Value]) -> Vec<&str> {
+    events
+        .iter()
+        .filter(|event| event["t"] == "line")
+        .map(|event| event["v"].as_str().expect("line value"))
+        .collect()
+}
+
+/// A returning socket hands back the cursor of the last line it handled and is
+/// replayed exactly the lines after it — never the ones it already showed. A
+/// cursor the ring cannot honour is answered with a typed `replay full` and the
+/// whole ring, so the client knows to start over instead of guessing.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn ws_ui_resumes_after_a_cursor_and_says_when_it_cannot() {
+    let url = support::test_db("ws_ui_resumes_after_a_cursor_and_says_when_it_cannot").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "alice", "s3cr3t", None)
+        .await
+        .expect("acct");
+    let token = issue_api_token(&pool, "alice", "web").await.expect("token");
+    drop(pool);
+
+    let up = upstream().await;
+    let config = Config {
+        server_name: "irc.web.example".into(),
+        network_name: "Web".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        networks: vec![NetworkEntry {
+            kind: e6ircd::config::NetworkKind::Irc,
+            name: "up".into(),
+            owner: Some("alice".into()),
+            addr: up.to_string(),
+            tls: false,
+            nick: "alicebnc".into(),
+            username: Some("tester".into()),
+            realname: Some("alicebnc".into()),
+            autojoin: vec!["#lobby".into()],
+            buffer_cap: 1000,
+            sasl_account: None,
+            sasl_password: None,
+        }],
+        bnc: Some(BncConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+        }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let mut peer = e6irc_client::Connection::connect(&up.to_string())
+        .await
+        .unwrap();
+    peer.register(&e6irc_client::Identity {
+        nick: "peer",
+        username: "peer",
+        realname: "peer",
+    })
+    .await
+    .unwrap();
+    peer.send_line("JOIN #lobby").await.unwrap();
+    loop {
+        if peer.next_message().await.unwrap().unwrap().command == "366" {
+            break;
+        }
+    }
+
+    let attach = |query: String| {
+        let token = token.clone();
+        async move {
+            let mut req = format!("ws://{http}/ws/ui?network=up{query}")
+                .into_client_request()
+                .unwrap();
+            req.headers_mut()
+                .insert("authorization", format!("Bearer {token}").parse().unwrap());
+            tokio_tungstenite::connect_async(req)
+                .await
+                .expect("ws/ui connect")
+                .0
+        }
+    };
+
+    // First attach: the whole ring, no reset (nothing was presented).
+    let mut first = attach(String::new()).await;
+    let initial = events_until_snapshot(&mut first).await;
+    assert!(
+        !initial.iter().any(|event| event["t"] == "replay"),
+        "a first attach presented no cursor and is told of no reset: {initial:?}"
+    );
+    peer.send_line("PRIVMSG #lobby :one").await.unwrap();
+    let one = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match first.next().await {
+                Some(Ok(Tung::Text(text))) if text.contains(":one") => {
+                    return serde_json::from_str::<serde_json::Value>(&text).expect("json");
+                }
+                Some(Ok(_)) => {}
+                _ => panic!("ws/ui closed before the line"),
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for the first line");
+    let cursor = one["cursor"].as_str().expect("every line carries a cursor");
+    drop(first);
+    peer.send_line("PRIVMSG #lobby :two").await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Resume: only what came after the cursor, and no reset.
+    let mut resumed = attach(format!("&after={cursor}")).await;
+    let events = events_until_snapshot(&mut resumed).await;
+    let lines = line_values(&events);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("PRIVMSG #lobby :two")),
+        "the line after the cursor is replayed: {lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("PRIVMSG #lobby :one")),
+        "the line the cursor names is not shown again: {lines:?}"
+    );
+    assert!(
+        !events.iter().any(|event| event["t"] == "replay"),
+        "an honoured cursor is not a reset: {events:?}"
+    );
+    let boundary_cursor = events
+        .last()
+        .and_then(|event| event["cursor"].as_str())
+        .expect("boundary cursor");
+    assert_ne!(
+        boundary_cursor, cursor,
+        "the boundary names the newest position"
+    );
+    drop(resumed);
+
+    // A stale cursor (another ring's epoch) and a malformed one: the client is
+    // told to start over, then gets everything.
+    for stale in ["1:1", "not-a-cursor"] {
+        let mut socket = attach(format!("&after={stale}")).await;
+        let events = events_until_snapshot(&mut socket).await;
+        let first_after_status = events
+            .iter()
+            .find(|event| event["t"] != "status")
+            .expect("events after the status");
+        assert_eq!(
+            first_after_status,
+            &serde_json::json!({ "t": "replay", "v": "full" }),
+            "{stale}: {events:?}"
+        );
+        let lines = line_values(&events);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("PRIVMSG #lobby :one"))
+                && lines
+                    .iter()
+                    .any(|line| line.contains("PRIVMSG #lobby :two")),
+            "{stale}: the whole ring follows the reset: {lines:?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

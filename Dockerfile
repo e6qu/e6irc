@@ -27,8 +27,11 @@ FROM rust:1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5
 WORKDIR /src
 # The running binary reports this as e6irc_build_info's revision label; the
 # build arg keeps the image's provenance honest without baking the whole
-# repository state into the runtime stage.
-ARG E6IRC_BUILD_REVISION=unknown
+# repository state into the runtime stage. It has no default: an image whose
+# revision label says "unknown" is not provenance, so a build without
+# `--build-arg E6IRC_BUILD_REVISION=$(git rev-parse HEAD)` stops here.
+ARG E6IRC_BUILD_REVISION
+RUN test -n "$E6IRC_BUILD_REVISION" || { echo "E6IRC_BUILD_REVISION build argument is required" >&2; exit 1; }
 ENV E6IRC_BUILD_REVISION=$E6IRC_BUILD_REVISION
 COPY . .
 COPY --from=web-build /src/web/dist ./web/dist
@@ -51,5 +54,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
   CMD ["/usr/local/bin/e6ircd", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/e6ircd"]
 # Replace the command with `--config /path/to/e6irc.toml` to run from a
-# mounted configuration file instead.
+# mounted configuration file instead; then also set E6IRC_HTTP_ADDR to the
+# file's [http].addr (or override the health check with
+# `e6ircd healthcheck --addr ip:port`), because the probe reads the environment,
+# not the file.
 CMD ["--config-from-environment"]

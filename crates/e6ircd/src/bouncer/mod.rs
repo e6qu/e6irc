@@ -477,8 +477,8 @@ impl Backoff {
     /// The delay the next [`Backoff::wait`] will sleep, computed exactly as
     /// `wait` computes it. Exposed so the runtime snapshot can say *when* the
     /// next attempt fires, not just that the driver is reconnecting.
-    pub(crate) fn next_delay(&self, session_ran: std::time::Duration) -> std::time::Duration {
-        let base = if session_ran >= std::time::Duration::from_secs(10) {
+    pub(crate) fn next_delay(&self, session_held: bool) -> std::time::Duration {
+        let base = if session_held {
             std::time::Duration::from_millis(200)
         } else {
             self.current
@@ -488,10 +488,12 @@ impl Backoff {
         base + jitter
     }
 
-    /// Sleep before the next reconnect attempt, given how long the session that
-    /// just ended lasted, then grow the delay for the attempt after this one.
-    pub(crate) async fn wait(&mut self, session_ran: std::time::Duration) {
-        if session_ran >= std::time::Duration::from_secs(10) {
+    /// Sleep before the next reconnect attempt, then grow the delay for the
+    /// attempt after this one. `session_held` says the session that just ended
+    /// was a real one (see [`Backoff::session_held`]), which starts the schedule
+    /// over.
+    pub(crate) async fn wait(&mut self, session_held: bool) {
+        if session_held {
             self.current = std::time::Duration::from_millis(200);
         }
         // Combine the per-round delay term with the per-driver offset so both the
@@ -502,6 +504,18 @@ impl Backoff {
         tokio::time::sleep(self.current + jitter).await;
         self.current = (self.current * 2).min(std::time::Duration::from_secs(30));
     }
+
+    /// Whether the attempt that just ended earns a fresh schedule: it reached
+    /// `Connected` *and* stayed up for [`Self::HELD_FOR`]. Elapsed time alone
+    /// is not enough — a tarpit that completes the handshake and says nothing
+    /// until the registration deadline also lasts that long, and read that way
+    /// it kept the driver re-dialling it every 200 ms.
+    pub(crate) fn session_held(connected: bool, elapsed: std::time::Duration) -> bool {
+        connected && elapsed >= Self::HELD_FOR
+    }
+
+    /// How long a connected session must last to count as held.
+    pub(crate) const HELD_FOR: std::time::Duration = std::time::Duration::from_secs(10);
 
     /// The delay before re-dialing an upstream that *refused* the previous
     /// attempt: `floor` doubled per consecutive refusal. A refusal is the
@@ -589,7 +603,23 @@ enum Refusal {
     Configuration(ConfigurationRefusal),
 }
 
+/// What kind of refusal one was, so a run of them can be told from a change.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefusalKind {
+    Registration(e6irc_client::RegistrationRefusal),
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    Configuration(NetworkFailure),
+}
+
 impl Refusal {
+    fn kind(&self) -> RefusalKind {
+        match self {
+            Self::Registration(rejection) => RefusalKind::Registration(rejection.refusal()),
+            #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+            Self::Configuration(refusal) => RefusalKind::Configuration(refusal.failure()),
+        }
+    }
+
     /// Parking waits for the owner to change something. A refusal that ends by
     /// itself gives them nothing to change, so it is retried at the schedule's
     /// last step for as long as it lasts.
@@ -618,9 +648,13 @@ impl Refusal {
     }
 }
 
-/// Consecutive upstream registration rejections before a driver stops
-/// re-dialing and parks until the network is reconfigured. Rejected
-/// *credentials* never reach this count: they park on the first rejection.
+/// Consecutive upstream registration rejections *of one kind* before a driver
+/// stops re-dialing and parks until the network is reconfigured. A refusal of
+/// another kind starts the count over: a services outage is a long run of
+/// refusals that never park, and the 433 that follows it (the driver's own
+/// ghost, still holding the nick) is the first of its kind, owed the whole
+/// schedule rather than an instant park. Rejected *credentials* never reach
+/// this count: they park on the first rejection.
 pub(crate) const MAX_CONSECUTIVE_REGISTRATION_REJECTIONS: u32 = 5;
 
 /// First delay after an upstream refuses registration, doubled per consecutive
@@ -628,6 +662,20 @@ pub(crate) const MAX_CONSECUTIVE_REGISTRATION_REJECTIONS: u32 = 5;
 /// throttle and most of a ghost session's ping timeout; tests shrink it through
 /// [`DriverEnds::set_rejection_retry_floor`].
 pub(crate) const REJECTION_RETRY_FLOOR: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the registry waits for a stopped driver to release its upstream
+/// before it proceeds with the replacement or removal. Longer than the bounded
+/// work a stopping IRC driver can still have in hand (one
+/// [`UPSTREAM_WRITE_DEADLINE`] write, then the goodbye), so a healthy driver
+/// always makes it; a wedged one is left to finish on its own, loudly.
+pub const SHUTDOWN_WAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long one write to an IRC upstream may block. A line only blocks when the
+/// peer has stopped draining its side of the socket, so past this the link is
+/// treated as dead ([`NetworkFailure::UpstreamWriteFailed`]) rather than left to
+/// hold the driver — and, through the registry's wait, every other account's
+/// network mutation — for as long as the kernel keeps the connection.
+pub const UPSTREAM_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Depth of the bounded client→upstream command queue per network (shared by all
 /// attached clients). Past this a send is refused (`SendOutcome::Full`) and the
@@ -751,7 +799,9 @@ pub(crate) async fn run_with_backoff<C>(
     session: DriverSession<C>,
 ) {
     let mut backoff = Backoff::new(ends.reconnect_seed);
+    // How many refusals of `last_refusal`'s kind in a row.
     let mut consecutive_rejections: u32 = 0;
+    let mut last_refusal: Option<RefusalKind> = None;
     loop {
         // A stop signalled while a session runs is observed inside it (via
         // `next_command`); one signalled while we wait to reconnect is caught
@@ -777,18 +827,24 @@ pub(crate) async fn run_with_backoff<C>(
                 // nor forgives the ones already counted — otherwise a refusing
                 // upstream's own throttle would keep the driver from ever
                 // parking.
-                if ends.connected_this_attempt() {
+                let connected = ends.connected_this_attempt();
+                if connected {
                     consecutive_rejections = 0;
+                    last_refusal = None;
                 }
-                let elapsed = started.elapsed();
-                let delay = backoff.next_delay(elapsed);
+                let session_held = Backoff::session_held(connected, started.elapsed());
+                let delay = backoff.next_delay(session_held);
                 let reconnecting = ConnectionEvent::Reconnecting(failure);
-                if !wait_for_reconnect(ends, reconnecting, delay, backoff.wait(elapsed)).await {
+                if !wait_for_reconnect(ends, reconnecting, delay, backoff.wait(session_held)).await
+                {
                     return;
                 }
                 continue;
             }
         };
+        if last_refusal.replace(refusal.kind()) != Some(refusal.kind()) {
+            consecutive_rejections = 0;
+        }
         consecutive_rejections = consecutive_rejections.saturating_add(1);
         if consecutive_rejections >= MAX_CONSECUTIVE_REGISTRATION_REJECTIONS && refusal.parks() {
             park(ends, refusal.parked()).await;
@@ -953,16 +1009,66 @@ impl reqwest::dns::Resolve for VettingResolver {
 /// configured host can't point an HTTP call at a cloud-metadata endpoint. One
 /// constructor so all three bridges share the discipline rather than each
 /// rebuilding it (and drifting).
+///
+/// The resolver only sees *names*. A URL whose host is an IP literal —
+/// `http://127.0.0.1`, but also `http://2130706433` or `http://0x7f.1`, which
+/// the URL parser canonicalizes to the same address — never reaches it: the
+/// connector dials the literal directly. So the `reqwest::Client` is private,
+/// and every request starts in [`BridgeHttp::request`], which judges the URL's
+/// host against the same policy before the client sees it. There is no other
+/// way to build a bridge request, so no caller can forget the literal check.
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-pub(crate) fn bridge_http_client(
-    timeout: std::time::Duration,
+#[derive(Clone)]
+pub(crate) struct BridgeHttp {
+    client: reqwest::Client,
     internal_upstreams: crate::egress::InternalUpstreams,
-) -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .dns_resolver(std::sync::Arc::new(VettingResolver(internal_upstreams)))
-        .build()
+}
+
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+impl BridgeHttp {
+    pub(crate) fn new(
+        timeout: std::time::Duration,
+        internal_upstreams: crate::egress::InternalUpstreams,
+    ) -> reqwest::Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(std::sync::Arc::new(VettingResolver(internal_upstreams)))
+            .build()?;
+        Ok(Self {
+            client,
+            internal_upstreams,
+        })
+    }
+
+    /// Begin a request to `url`, refused here when its host is an address the
+    /// policy does not dial. The error names the rule, never the address.
+    pub(crate) fn request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+    ) -> Result<reqwest::RequestBuilder, String> {
+        let url = reqwest::Url::parse(url).map_err(|e| format!("bridge request URL: {e}"))?;
+        if let Some(refusal) = self.internal_upstreams.refusal_for_url(&url) {
+            return Err(refusal.reason().to_string());
+        }
+        Ok(self.client.request(method, url))
+    }
+
+    pub(crate) fn get(&self, url: &str) -> Result<reqwest::RequestBuilder, String> {
+        self.request(reqwest::Method::GET, url)
+    }
+
+    pub(crate) fn post(&self, url: &str) -> Result<reqwest::RequestBuilder, String> {
+        self.request(reqwest::Method::POST, url)
+    }
+
+    /// Only the Matrix bridge sends with PUT (the transaction id is in the
+    /// path); the `lint` job builds each bridge alone with `-Dwarnings`.
+    #[cfg(feature = "matrix")]
+    pub(crate) fn put(&self, url: &str) -> Result<reqwest::RequestBuilder, String> {
+        self.request(reqwest::Method::PUT, url)
+    }
 }
 
 /// A bridge's effective API base URL: the configured one (trailing slash
@@ -995,8 +1101,8 @@ pub(crate) fn bridge_http_or_outcome(
     tag: &str,
     timeout: std::time::Duration,
     internal_upstreams: crate::egress::InternalUpstreams,
-) -> Result<reqwest::Client, SessionOutcome> {
-    bridge_http_client(timeout, internal_upstreams).map_err(|e| {
+) -> Result<BridgeHttp, SessionOutcome> {
+    BridgeHttp::new(timeout, internal_upstreams).map_err(|e| {
         eprintln!("{tag}: http client build failed: {e}");
         SessionOutcome::Dropped(NetworkFailure::UpstreamRequestFailed)
     })
@@ -1015,11 +1121,12 @@ pub(crate) async fn bridge_ws_open(
     url: &str,
     tag: &str,
     transport: &str,
+    api_base: &str,
     internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<BridgeWs, SessionOutcome> {
     match tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        bridge_ws_connect(url, bridge_ws_config(), internal_upstreams),
+        bridge_ws_connect(url, bridge_ws_config(), api_base, internal_upstreams),
     )
     .await
     {
@@ -1194,6 +1301,7 @@ pub(crate) use bridge_run;
 pub(crate) async fn bridge_ws_connect(
     url: &str,
     config: tokio_tungstenite::tungstenite::protocol::WebSocketConfig,
+    api_base: &str,
     internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -1201,13 +1309,17 @@ pub(crate) async fn bridge_ws_connect(
 > {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let (host, port) = bridge_gateway_authority(url)?;
+    require_secure_gateway(url, api_base, internal_upstreams)?;
     let request = url.into_client_request().map_err(|e| e.to_string())?;
-    let vetted = tokio::net::lookup_host((host.as_str(), port))
+    let vetted = resolve_vetted((host.as_str(), port), internal_upstreams)
         .await
-        .map_err(|e| e.to_string())?
-        .find(|sa| internal_upstreams.permits(sa.ip()))
-        .ok_or_else(|| format!("{host}: no permitted address (internal or never an upstream)"))?;
-    let tcp = tokio::net::TcpStream::connect(vetted)
+        .map_err(|e| e.to_string())?;
+    if vetted.is_empty() {
+        return Err(format!(
+            "{host}: no permitted address (internal or never an upstream)"
+        ));
+    }
+    let tcp = connect_first_reachable(vetted)
         .await
         .map_err(|e| e.to_string())?;
     let (ws, _response) =
@@ -1217,9 +1329,130 @@ pub(crate) async fn bridge_ws_connect(
     Ok(ws)
 }
 
+/// Resolve `addr`, keep only the addresses the policy permits, and order them so
+/// the address families alternate. Every upstream dial — IRC, and a bridge's
+/// gateway socket — resolves through here, so a hostname that resolves (now, or
+/// after a DNS rebind) to a refused address is refused at connect time.
+pub(crate) async fn resolve_vetted<A: tokio::net::ToSocketAddrs>(
+    addr: A,
+    policy: crate::egress::InternalUpstreams,
+) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    Ok(interleave_address_families(
+        tokio::net::lookup_host(addr)
+            .await?
+            .filter(|address| policy.permits(address.ip()))
+            .collect(),
+    ))
+}
+
+/// Alternate the address families, keeping each family's own order. Public
+/// round robins commonly answer with both IPv6 and IPv4; a host without working
+/// IPv6 that only ever tried the first answer retried the same unreachable
+/// address forever instead of reaching the IPv4 peer.
+pub(crate) fn interleave_address_families(
+    addresses: Vec<std::net::SocketAddr>,
+) -> Vec<std::net::SocketAddr> {
+    let start_with_ipv6 = addresses.first().is_some_and(std::net::SocketAddr::is_ipv6);
+    let (ipv6, ipv4): (std::collections::VecDeque<_>, std::collections::VecDeque<_>) = addresses
+        .into_iter()
+        .partition(std::net::SocketAddr::is_ipv6);
+    let (mut first, mut second) = if start_with_ipv6 {
+        (ipv6, ipv4)
+    } else {
+        (ipv4, ipv6)
+    };
+    let mut ordered = Vec::with_capacity(first.len() + second.len());
+    while !first.is_empty() || !second.is_empty() {
+        if let Some(address) = first.pop_front() {
+            ordered.push(address);
+        }
+        if let Some(address) = second.pop_front() {
+            ordered.push(address);
+        }
+    }
+    ordered
+}
+
+/// How long one concrete address may take to answer a TCP handshake. Bounded
+/// per address so one black-holed answer cannot consume the whole connection
+/// deadline before the next address is tried.
+pub(crate) const ADDRESS_DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Open a TCP connection to the first of `addresses` that answers within
+/// [`ADDRESS_DIAL_DEADLINE`]; the error is the last address's when none does.
+/// The gateway WebSocket dialer's loop; the IRC driver keeps its own because it
+/// also retries the *TLS* handshake on the next address.
+#[cfg(any(feature = "discord", feature = "slack"))]
+pub(crate) async fn connect_first_reachable(
+    addresses: Vec<std::net::SocketAddr>,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let mut last_error = std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "upstream resolved addresses were exhausted",
+    );
+    for address in addresses {
+        match tokio::time::timeout(
+            ADDRESS_DIAL_DEADLINE,
+            tokio::net::TcpStream::connect(address),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(error)) => last_error = error,
+            Err(_) => {
+                last_error = std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "concrete upstream address timed out",
+                );
+            }
+        }
+    }
+    Err(last_error)
+}
+
+/// The gateway socket carries the session's credentials (Discord's IDENTIFY
+/// is the bot token), and its URL is whatever the upstream's REST answer
+/// said. A `ws://` answer would send them in the clear, so the gateway must
+/// be `wss://` — with one exception: a loopback `http://` API base under the
+/// operator's allowance is the in-process test oracle, and it speaks
+/// cleartext to itself.
+#[cfg(any(feature = "discord", feature = "slack"))]
+fn require_secure_gateway(
+    url: &str,
+    api_base: &str,
+    internal_upstreams: crate::egress::InternalUpstreams,
+) -> Result<(), String> {
+    let gateway = url::Url::parse(url)
+        .map_err(|_| "gateway URL must be an absolute ws(s) URL".to_string())?;
+    if gateway.scheme() == "wss" {
+        return Ok(());
+    }
+    let oracle = internal_upstreams == crate::egress::InternalUpstreams::Allow
+        && url::Url::parse(api_base)
+            .is_ok_and(|base| base.scheme() == "http" && base.host().is_some_and(is_loopback_host));
+    if oracle {
+        Ok(())
+    } else {
+        Err(
+            "gateway URL must be wss://: the session credentials cross this socket, and only \
+             a loopback http:// API base under internal_upstreams = \"allow\" may speak cleartext"
+                .into(),
+        )
+    }
+}
+
+#[cfg(any(feature = "discord", feature = "slack"))]
+fn is_loopback_host(host: url::Host<&str>) -> bool {
+    match host {
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.to_canonical().is_loopback(),
+        url::Host::Domain(name) => name.eq_ignore_ascii_case("localhost"),
+    }
+}
+
 #[cfg(any(feature = "discord", feature = "slack"))]
 fn bridge_gateway_authority(url: &str) -> Result<(String, u16), String> {
-    let parsed = openidconnect::url::Url::parse(url)
+    let parsed = url::Url::parse(url)
         .map_err(|_| "gateway URL must be an absolute ws(s) URL".to_string())?;
     if !matches!(parsed.scheme(), "ws" | "wss")
         || parsed.host_str().is_none()
@@ -1250,11 +1483,30 @@ pub(crate) const MAX_BRIDGE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// an application-level check its `check_ok` still performs on top of this.)
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 pub(crate) async fn bridge_send(req: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
-    req.send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())
+    bridge_response_status(req.send().await.map_err(|e| e.to_string())?)
+}
+
+/// A bridge response that is not a success is a failed request. A 3xx is
+/// named as such: the client never follows one (an upstream cannot re-target
+/// a request at an internal address), and `error_for_status` alone let it
+/// through — a message "sent" with a 302 was reported delivered and never
+/// posted.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) fn bridge_response_status(
+    response: reqwest::Response,
+) -> Result<reqwest::Response, String> {
+    let status = response.status();
+    if status.is_redirection() {
+        return Err(format!(
+            "upstream answered HTTP {status}; a bridge never follows a redirect"
+        ));
+    }
+    let response = response.error_for_status().map_err(|e| e.to_string())?;
+    if response.status().is_success() {
+        Ok(response)
+    } else {
+        Err(format!("upstream answered HTTP {}", response.status()))
+    }
 }
 
 /// [`bridge_send`] for a request that presents the network's credentials: a
@@ -1269,8 +1521,8 @@ pub(crate) async fn bridge_send_credentials(
 ) -> Result<reqwest::Response, ConnectFail> {
     let response = req.send().await.map_err(|e| e.to_string())?;
     let status = response.status();
-    response.error_for_status().map_err(|e| {
-        let detail = format!("{what} rejected: {e}");
+    bridge_response_status(response).map_err(|detail| {
+        let detail = format!("{what} rejected: {detail}");
         if matches!(
             status,
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
@@ -1459,12 +1711,15 @@ pub enum DriverEvent {
         /// its initial status snapshot.
         revision: u64,
     },
-    /// One line received from upstream (CRLF stripped).
-    Line(String),
+    /// One line received from upstream (CRLF stripped), with the ring position
+    /// it took.
+    Line(BufferedLine),
     /// A safe component notice for attached clients. It intentionally does not
     /// enter the persistence stream: a failed backlog writer cannot retry its
-    /// own failure notice forever.
-    Notice(String),
+    /// own failure notice forever. Its `seq` is the ring position after it —
+    /// its own when it was retained, the newest retained line's when it was
+    /// not — so a cursor read off it resumes exactly.
+    Notice(BufferedLine),
     /// A synthesized copy of a line an attached client sent. IRC servers do
     /// not echo a sender's own messages unless echo-message was negotiated —
     /// and the driver never negotiates it — so without this the detached
@@ -1472,7 +1727,7 @@ pub enum DriverEvent {
     /// side of the conversation. `origin` identifies the sending attachment:
     /// the originator itself is excluded unless it negotiated echo-message on
     /// attach, mirroring how a real server treats that capability.
-    Echo { line: String, origin: u64 },
+    Echo { line: BufferedLine, origin: u64 },
     /// Authoritative state for a newly registered IRC upstream session. A
     /// bounded event backlog cannot establish the current nick or memberships:
     /// the relevant NICK/JOIN may have aged out while a stale PART remains.
@@ -1492,7 +1747,7 @@ pub enum DriverEvent {
 impl DriverEvent {
     pub(crate) fn display_line(&self) -> Option<&str> {
         match self {
-            Self::Line(line) | Self::Notice(line) => Some(line),
+            Self::Line(entry) | Self::Notice(entry) => Some(&entry.line),
             Self::Status { .. }
             | Self::Echo { .. }
             | Self::Session(_)
@@ -1987,14 +2242,15 @@ fn emit_failure_notice(
 ) {
     let line = crate::sanitize::upstream_line(failure_notice(failure));
     let mut buffer = buffer.lock().expect("buffer poisoned");
-    buffer.push(line.clone());
+    let seq = buffer.push(line.clone());
+    let entry = BufferedLine { seq, line };
     let event = if matches!(
         failure,
         NetworkFailure::BacklogStorageFailed | NetworkFailure::BacklogStorageLagged
     ) {
-        DriverEvent::Notice(line)
+        DriverEvent::Notice(entry)
     } else {
-        DriverEvent::Line(line)
+        DriverEvent::Line(entry)
     };
     // Keep the replay boundary atomic for failure lines too.
     drop(events.send(event));
@@ -2340,30 +2596,151 @@ impl Drop for NetworkAttachment {
     }
 }
 
+/// A line as the ring holds it: its text and the ring position it occupies.
+///
+/// The position is what a client hands back to resume: every line pushed to a
+/// ring takes the next position, so "everything after position *n*" is exact,
+/// whatever the lines say. Event consumers that are not the ring (persistence,
+/// raw attaches) read only `line`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BufferedLine {
+    pub seq: u64,
+    pub line: String,
+}
+
+/// Where a client stopped reading one network's ring: the ring's lifetime and
+/// a position in it. Opaque to the client (`<epoch>:<seq>` on the wire), and
+/// self-invalidating: a ring that was replaced — the process restarted, the
+/// driver rebuilt — has another epoch, and a position the ring has evicted is
+/// recognised as gone, so a cursor is either honoured exactly or refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayCursor {
+    epoch: u64,
+    seq: u64,
+}
+
+impl ReplayCursor {
+    /// The wire form, or `None` for anything that is not one: the cursor is
+    /// opaque and a client presenting something else has nothing to resume.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (epoch, seq) = text.split_once(':')?;
+        Some(Self {
+            epoch: epoch.parse().ok()?,
+            seq: seq.parse().ok()?,
+        })
+    }
+}
+
+impl std::fmt::Display for ReplayCursor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}:{}", self.epoch, self.seq)
+    }
+}
+
+/// What an attach replays: the lines, where the ring stands after them, and
+/// whether a presented cursor was honoured (only the lines after it) or the
+/// whole ring was replayed instead.
+#[derive(Debug)]
+pub struct Replay {
+    pub lines: Vec<BufferedLine>,
+    epoch: u64,
+    position: u64,
+    pub resumed: bool,
+}
+
+impl Replay {
+    /// The cursor naming ring position `seq`, for a live line of this ring.
+    pub fn cursor_at(&self, seq: u64) -> ReplayCursor {
+        ReplayCursor {
+            epoch: self.epoch,
+            seq,
+        }
+    }
+
+    /// The cursor naming the ring position after every replayed line.
+    pub fn position(&self) -> ReplayCursor {
+        self.cursor_at(self.position)
+    }
+}
+
 /// Bounded ring of recent upstream lines, for playback on attach.
-#[derive(Default)]
 pub struct Buffer {
-    lines: std::collections::VecDeque<String>,
+    lines: std::collections::VecDeque<BufferedLine>,
     cap: usize,
+    /// Identifies this ring's lifetime; part of every cursor it hands out.
+    epoch: u64,
+    /// The position the next pushed line takes. Starts above `cap` so the
+    /// lines `preload_front` restores from storage — older than anything
+    /// pushed, at most `cap` of them — take positions that stay positive.
+    next_seq: u64,
 }
 
 impl Buffer {
     fn new(cap: usize) -> Self {
+        // Distinct for every ring this process creates, and for every process:
+        // the clock keeps rings of successive processes apart, the counter
+        // keeps rings created in the same millisecond apart.
+        static RING_EPOCHS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let ordinal = RING_EPOCHS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let epoch = (epoch_millis().as_millis() << 16) | (ordinal & 0xffff);
         Self {
             lines: std::collections::VecDeque::new(),
             cap,
+            epoch,
+            next_seq: cap as u64 + 1,
         }
     }
-    fn push(&mut self, line: String) {
+
+    /// Retain `line` as the newest, returning the position it took.
+    fn push(&mut self, line: String) -> u64 {
         // `>=` (not `==`) so a zero/under-filled cap can never let the ring
         // grow without bound.
         while self.lines.len() >= self.cap.max(1) {
             self.lines.pop_front();
         }
-        self.lines.push_back(line);
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.lines.push_back(BufferedLine { seq, line });
+        seq
     }
+
+    /// The position of the newest line (or of the ring's start, when empty):
+    /// what a live-only event that enters no ring reports as its cursor.
+    fn position(&self) -> u64 {
+        self.next_seq - 1
+    }
+
     pub fn snapshot(&self) -> Vec<String> {
-        self.lines.iter().cloned().collect()
+        self.lines.iter().map(|entry| entry.line.clone()).collect()
+    }
+
+    /// The lines after `after`, when that cursor names a position of this ring
+    /// whose every successor is still retained; otherwise the whole ring, with
+    /// `resumed` false so the client knows to start its transcript over.
+    fn replay_after(&self, after: Option<ReplayCursor>) -> Replay {
+        let honoured = after.is_some_and(|cursor| {
+            cursor.epoch == self.epoch
+                && cursor.seq < self.next_seq
+                && self
+                    .lines
+                    .front()
+                    .is_none_or(|oldest| cursor.seq + 1 >= oldest.seq)
+        });
+        let lines = match after.filter(|_| honoured) {
+            Some(cursor) => self
+                .lines
+                .iter()
+                .filter(|entry| entry.seq > cursor.seq)
+                .cloned()
+                .collect(),
+            None => self.lines.iter().cloned().collect(),
+        };
+        Replay {
+            lines,
+            epoch: self.epoch,
+            position: self.position(),
+            resumed: honoured,
+        }
     }
 }
 
@@ -2553,18 +2930,23 @@ impl NetworkHandle {
     /// live delivery. Buffered emitters hold these same locks until their event
     /// has been published, so every line and its state effect are either in the
     /// snapshots or receivable from `events`, never both and never neither.
+    ///
+    /// `after` is the cursor a returning client presents; the replay holds only
+    /// the lines past it when the ring can honour it (see
+    /// [`Buffer::replay_after`]).
     pub(crate) fn subscribe_with_replay_snapshot(
         &self,
+        after: Option<ReplayCursor>,
     ) -> (
         tokio::sync::broadcast::Receiver<DriverEvent>,
-        Vec<String>,
+        Replay,
         Option<IrcSessionSnapshot>,
     ) {
         let irc_session = self.irc_session.lock().expect("IRC session state poisoned");
         let buffer = self.buffer.lock().expect("buffer poisoned");
         let events = self.events.subscribe();
-        let snapshot = buffer.snapshot();
-        (events, snapshot, irc_session.snapshot())
+        let replay = buffer.replay_after(after);
+        (events, replay, irc_session.snapshot())
     }
 
     /// Authoritative IRC identity/membership state, when this driver represents
@@ -2586,14 +2968,19 @@ impl NetworkHandle {
         let room = buf.cap.saturating_sub(buf.lines.len());
         let skip = older.len().saturating_sub(room);
         for line in older[skip..].iter().rev() {
+            // Each restored line takes the position just below the current
+            // oldest: older than everything pushed, in storage order.
+            let seq = buf.lines.front().map_or(buf.next_seq, |oldest| oldest.seq) - 1;
             // Neutralized here as well as in `emit_line`. These lines come back
             // from storage, which outlives the code that wrote them: a row put
             // there by an older build, a restore, or anything else with database
             // access would otherwise be replayed to an attaching client verbatim.
             // Both ways into the buffer sanitize, so no reader has to ask which
             // one a line arrived through.
-            buf.lines
-                .push_front(crate::sanitize::upstream_line(line.clone()));
+            buf.lines.push_front(BufferedLine {
+                seq,
+                line: crate::sanitize::upstream_line(line.clone()),
+            });
         }
     }
 
@@ -2748,15 +3135,34 @@ impl NetworkHandle {
         self.shutdown.send_replace(true);
     }
 
-    /// Stop the driver and wait until its upstream transport is released.
+    /// Stop the driver and wait until its upstream transport is released, or
+    /// until [`SHUTDOWN_WAIT_DEADLINE`] passes — whichever is first. The stop is
+    /// signalled either way; the deadline only bounds how long the caller (the
+    /// registry, under its one mutation guard) holds still for one driver.
     pub async fn shutdown_and_wait(&self) {
+        if !self.shutdown_and_wait_within(SHUTDOWN_WAIT_DEADLINE).await {
+            eprintln!(
+                "bnc: {} did not release its upstream within {}s of being stopped; \
+                 proceeding without it (the stop stands, and the task exits when its \
+                 bounded write ends)",
+                self.runtime.label(),
+                SHUTDOWN_WAIT_DEADLINE.as_secs()
+            );
+        }
+    }
+
+    /// [`NetworkHandle::shutdown_and_wait`] with the deadline stated. `true`
+    /// when the driver released its transport before it.
+    pub(crate) async fn shutdown_and_wait_within(&self, deadline: std::time::Duration) -> bool {
         self.shutdown();
         let mut stopped = self.stopped.clone();
-        while !*stopped.borrow() {
-            if stopped.changed().await.is_err() {
-                return;
-            }
-        }
+        tokio::time::timeout(deadline, async move {
+            // `Ok` is the driver saying it stopped; `Err` is its endpoints
+            // dropped, which is the same release.
+            drop(stopped.wait_for(|released| *released).await);
+        })
+        .await
+        .is_ok()
     }
 
     pub(crate) fn set_telemetry(&self, telemetry: std::sync::Arc<crate::observability::Telemetry>) {
@@ -2934,10 +3340,17 @@ impl DriverEnds {
         // this session does not hold and will not restore. Say so to whoever is
         // attached; it is not conversation, so it stays out of the backlog.
         for name in &change.untracked {
-            let notice = crate::sanitize::upstream_line(format!(
+            let line = crate::sanitize::upstream_line(format!(
                 ":*bnc* NOTICE * :upstream confirmed a channel name e6irc cannot track: {name}"
             ));
-            drop(self.events.send(DriverEvent::Notice(notice)));
+            // Not retained, so it reports the ring's position unchanged — read
+            // and published under the ring's lock, in order with the lines
+            // around it.
+            let buffer = self.buffer.lock().expect("buffer poisoned");
+            drop(self.events.send(DriverEvent::Notice(BufferedLine {
+                seq: buffer.position(),
+                line,
+            })));
         }
         Ok(change)
     }
@@ -2956,12 +3369,15 @@ impl DriverEnds {
 
     fn publish_buffered(&self, line: String) {
         let mut buffer = self.buffer.lock().expect("buffer poisoned");
-        buffer.push(line.clone());
+        let seq = buffer.push(line.clone());
         // A detached network legitimately has no live subscribers; the line is
         // still retained in the buffer above. Keep the buffer lock through the
         // publish: attach takes that lock before subscribing and snapshotting,
         // which makes the replay/live boundary atomic.
-        drop(self.events.send(DriverEvent::Line(line)));
+        drop(
+            self.events
+                .send(DriverEvent::Line(BufferedLine { seq, line })),
+        );
     }
 
     #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
@@ -2978,8 +3394,11 @@ impl DriverEnds {
         let line = crate::sanitize::upstream_line(line);
         self.runtime.record_input(line.len());
         let mut buffer = self.buffer.lock().expect("buffer poisoned");
-        buffer.push(line.clone());
-        drop(self.events.send(DriverEvent::Echo { line, origin }));
+        let seq = buffer.push(line.clone());
+        drop(self.events.send(DriverEvent::Echo {
+            line: BufferedLine { seq, line },
+            origin,
+        }));
     }
 
     /// Report a connection-state change, updating the sticky connection state
@@ -3102,7 +3521,12 @@ impl DriverEnds {
             .lock()
             .expect("buffered status poisoned");
         if buffered_status.replace(status) == Some(status) {
-            drop(self.events.send(DriverEvent::Notice(notice)));
+            // Live only: the ring's position is unchanged, read under its lock.
+            let buffer = self.buffer.lock().expect("buffer poisoned");
+            drop(self.events.send(DriverEvent::Notice(BufferedLine {
+                seq: buffer.position(),
+                line: notice,
+            })));
         } else {
             self.publish_buffered(notice);
         }
@@ -3351,7 +3775,8 @@ where
     }
     let _attachment = handle.track_attachment();
     let attach_id = handle.next_attachment_id();
-    let (mut events, buffer_snapshot, session_snapshot) = handle.subscribe_with_replay_snapshot();
+    // A raw IRC client has no cursor to present; it always takes the whole ring.
+    let (mut events, replay, session_snapshot) = handle.subscribe_with_replay_snapshot(None);
 
     // Send the current upstream connection status up front, so a client that
     // attaches to an already-connected (or still-reconnecting) network learns the
@@ -3371,8 +3796,8 @@ where
     // client didn't negotiate stripped.
     let mut downstream_session = IrcSessionState::default();
     downstream_session.begin(downstream_nick.to_string());
-    for line in buffer_snapshot {
-        let line = downstream_session.mirror(&line);
+    for entry in replay.lines {
+        let line = downstream_session.mirror(&entry.line);
         if let Some(line) = filter_tags(line, caps) {
             write.write_all(line.as_bytes()).await?;
             write.write_all(b"\r\n").await?;
@@ -3422,7 +3847,7 @@ where
                     // negotiated echo-message — the same contract a real
                     // server has. Every other attached client always gets it.
                     if origin != attach_id || caps.echo_message {
-                        write_filtered_line(&mut write, &line, caps).await?;
+                        write_filtered_line(&mut write, &line.line, caps).await?;
                     }
                 }
                 Ok(DriverEvent::Status { status, revision }) => {
@@ -4178,7 +4603,12 @@ mod tests {
         ends.emit_line(":upstream PRIVMSG #room :before boundary".into());
 
         ends.begin_irc_session("upstream".into());
-        let (mut events, snapshot, session) = handle.subscribe_with_replay_snapshot();
+        let (mut events, replay, session) = handle.subscribe_with_replay_snapshot(None);
+        let snapshot: Vec<&str> = replay
+            .lines
+            .iter()
+            .map(|entry| entry.line.as_str())
+            .collect();
         assert_eq!(snapshot, vec![":upstream PRIVMSG #room :before boundary"]);
         assert_eq!(
             session,
@@ -4194,11 +4624,11 @@ mod tests {
         );
 
         ends.emit_line(":upstream PRIVMSG #room :after boundary".into());
-        assert_eq!(
-            events.try_recv(),
-            Ok(DriverEvent::Line(
-                ":upstream PRIVMSG #room :after boundary".into()
-            )),
+        assert!(
+            matches!(
+                events.try_recv(),
+                Ok(DriverEvent::Line(BufferedLine { line, .. })) if line == ":upstream PRIVMSG #room :after boundary"
+            ),
             "a post-boundary line must be delivered live"
         );
         assert_eq!(
@@ -4444,10 +4874,14 @@ mod tests {
             crate::egress::InternalUpstreams::Refuse,
             crate::egress::InternalUpstreams::Allow,
         ] {
-            let err =
-                bridge_ws_connect("wss://169.254.169.254/gateway", bridge_ws_config(), policy)
-                    .await
-                    .expect_err("a link-local gateway must be refused");
+            let err = bridge_ws_connect(
+                "wss://169.254.169.254/gateway",
+                bridge_ws_config(),
+                "https://api.example",
+                policy,
+            )
+            .await
+            .expect_err("a link-local gateway must be refused");
             assert!(
                 err.contains("permitted"),
                 "refusal must name the rule, got: {err}"
@@ -4457,21 +4891,359 @@ mod tests {
         // under the operator's explicit allowance (here: nothing listens, so
         // the refusal gives way to a connection error).
         let err = bridge_ws_connect(
-            "ws://127.0.0.1:9/gateway",
+            "wss://127.0.0.1:9/gateway",
             bridge_ws_config(),
+            "https://api.example",
             crate::egress::InternalUpstreams::Refuse,
         )
         .await
         .expect_err("a loopback gateway is refused by default");
         assert!(err.contains("permitted"), "{err}");
         let err = bridge_ws_connect(
-            "ws://127.0.0.1:9/gateway",
+            "wss://127.0.0.1:9/gateway",
             bridge_ws_config(),
+            "https://api.example",
             crate::egress::InternalUpstreams::Allow,
         )
         .await
         .expect_err("nothing listens on port 9");
         assert!(!err.contains("permitted"), "{err}");
+    }
+
+    /// Discord's IDENTIFY carries the bot token over the gateway socket, and the
+    /// gateway URL is whatever the REST answer said. A `ws://` answer would send
+    /// the token in the clear; only the test oracle — a loopback `http://` API
+    /// base under the operator's allowance — may speak cleartext.
+    #[tokio::test]
+    #[cfg(any(feature = "discord", feature = "slack"))]
+    async fn a_cleartext_gateway_is_refused_unless_the_api_base_is_the_loopback_oracle() {
+        use crate::egress::InternalUpstreams;
+        let cleartext = "ws://127.0.0.1:9/gateway";
+        for (api_base, policy) in [
+            ("https://discord.com/api/v10", InternalUpstreams::Allow),
+            ("http://127.0.0.1:9", InternalUpstreams::Refuse),
+            ("https://127.0.0.1:9", InternalUpstreams::Allow),
+            ("http://api.example", InternalUpstreams::Allow),
+            ("http://10.0.0.5:9", InternalUpstreams::Allow),
+        ] {
+            let err = bridge_ws_connect(cleartext, bridge_ws_config(), api_base, policy)
+                .await
+                .expect_err("a cleartext gateway must be refused");
+            assert!(err.contains("wss"), "{api_base} under {policy:?}: {err}");
+        }
+        for api_base in ["http://127.0.0.1:9", "http://localhost:9", "http://[::1]:9"] {
+            let err = bridge_ws_connect(
+                cleartext,
+                bridge_ws_config(),
+                api_base,
+                InternalUpstreams::Allow,
+            )
+            .await
+            .expect_err("nothing listens on port 9");
+            assert!(!err.contains("wss"), "{api_base}: {err}");
+        }
+    }
+
+    /// `2130706433`, `0x7f.1` and `127.1` are all 127.0.0.1 to the URL parser
+    /// and so to the connector, which dials an IP-literal host without asking
+    /// the resolver. The request is refused where it is built, before any
+    /// socket opens; the never-an-upstream classes are refused under either
+    /// policy, and the operator's allowance lets the dial happen.
+    #[tokio::test]
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    async fn a_bridge_request_to_a_disguised_internal_literal_never_opens_a_socket() {
+        use crate::egress::InternalUpstreams;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while listener.accept().await.is_ok() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let refused =
+            BridgeHttp::new(std::time::Duration::from_secs(1), InternalUpstreams::Refuse).unwrap();
+        for url in [
+            format!("http://2130706433:{port}/"),
+            format!("http://0x7f.1:{port}/"),
+            format!("http://127.1:{port}/"),
+            format!("http://0177.0.0.1:{port}/"),
+        ] {
+            let Err(err) = refused.get(&url) else {
+                panic!("{url} was not refused");
+            };
+            assert!(err.contains("internal"), "{url}: {err}");
+        }
+        for policy in [InternalUpstreams::Refuse, InternalUpstreams::Allow] {
+            let http = BridgeHttp::new(std::time::Duration::from_secs(1), policy).unwrap();
+            let err = http
+                .get("http://2852039166/latest/meta-data/")
+                .expect_err("the metadata endpoint is never an upstream");
+            assert!(err.contains("link-local"), "{err}");
+        }
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let allowed =
+            BridgeHttp::new(std::time::Duration::from_secs(1), InternalUpstreams::Allow).unwrap();
+        let request = allowed
+            .get(&format!("http://2130706433:{port}/"))
+            .expect("the operator's allowance admits loopback");
+        // The listener answers nothing, so the send fails; the accept is the point.
+        drop(request.send().await);
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A 3xx is a re-targeting the client never follows — and never reads as
+    /// success either: a message "sent" with a 302 was not posted.
+    #[tokio::test]
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    async fn a_redirecting_upstream_is_a_failed_request_not_a_delivered_one() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = connections.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut request = [0u8; 1024];
+                drop(socket.read(&mut request).await);
+                drop(
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/\r\n\
+                              Content-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await,
+                );
+            }
+        });
+        let http = BridgeHttp::new(
+            std::time::Duration::from_secs(2),
+            crate::egress::InternalUpstreams::Allow,
+        )
+        .unwrap();
+        let err = bridge_send(http.get(&format!("http://127.0.0.1:{port}/")).unwrap())
+            .await
+            .expect_err("a redirect is not a delivered request");
+        assert!(err.contains("302"), "{err}");
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn resolved_addresses_alternate_families_without_reordering_each_family() {
+        let v6a = "[2001:db8::1]:6697".parse().unwrap();
+        let v6b = "[2001:db8::2]:6697".parse().unwrap();
+        let v4a = "192.0.2.1:6697".parse().unwrap();
+        let v4b = "192.0.2.2:6697".parse().unwrap();
+        assert_eq!(
+            interleave_address_families(vec![v6a, v6b, v4a, v4b]),
+            [v6a, v4a, v6b, v4b]
+        );
+        assert_eq!(
+            interleave_address_families(vec![v4a, v4b, v6a, v6b]),
+            [v4a, v6a, v4b, v6b]
+        );
+    }
+
+    /// The dialer every upstream socket goes through moves past an address
+    /// that refuses to the next one, so a v6-first answer on a v4-only host
+    /// still connects. (The gateway WebSocket used to take only the first
+    /// permitted address; this is the loop it now shares with the IRC driver.)
+    #[tokio::test]
+    #[cfg(any(feature = "discord", feature = "slack"))]
+    async fn the_dialer_moves_past_an_address_that_refuses() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let open = listener.local_addr().unwrap();
+        // Bound, then dropped: the port refuses for the moment nothing is on it.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let stream = connect_first_reachable(vec![closed, open])
+            .await
+            .expect("the second address answers");
+        assert_eq!(stream.peer_addr().unwrap(), open);
+        let err = connect_first_reachable(vec![closed])
+            .await
+            .expect_err("no address answers");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+        let err = connect_first_reachable(Vec::new())
+            .await
+            .expect_err("nothing to dial");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// One step a scripted driver session takes, for exercising
+    /// [`run_with_backoff`] without a socket.
+    enum ScriptedStep {
+        Refuse(e6irc_client::RegistrationRefusal),
+        /// Hold the session for this long — having reached `Connected` or not —
+        /// then drop it.
+        Drop {
+            hold_for: std::time::Duration,
+            connected: bool,
+        },
+        Stop,
+    }
+
+    #[derive(Default)]
+    struct Script {
+        steps: std::sync::Mutex<std::collections::VecDeque<ScriptedStep>>,
+        /// When each session began, in order.
+        starts: std::sync::Mutex<Vec<tokio::time::Instant>>,
+    }
+
+    fn scripted_session<'a>(
+        script: &'a Script,
+        ends: &'a mut DriverEnds,
+    ) -> std::pin::Pin<Box<dyn Future<Output = SessionOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            script
+                .starts
+                .lock()
+                .unwrap()
+                .push(tokio::time::Instant::now());
+            let step = script.steps.lock().unwrap().pop_front();
+            match step {
+                Some(ScriptedStep::Refuse(refusal)) => SessionOutcome::RegistrationRejected(
+                    e6irc_client::RegistrationRejection::without_diagnostic(refusal),
+                ),
+                Some(ScriptedStep::Drop {
+                    hold_for,
+                    connected,
+                }) => {
+                    if connected {
+                        ends.emit(ConnectionEvent::Connected);
+                    }
+                    tokio::time::sleep(hold_for).await;
+                    SessionOutcome::Dropped(NetworkFailure::ConnectionLost)
+                }
+                Some(ScriptedStep::Stop) | None => SessionOutcome::Stopped,
+            }
+        })
+    }
+
+    /// Run the script to its end under [`run_with_backoff`]; when each session
+    /// began, and the handle whose runtime the run left behind.
+    async fn run_script(steps: Vec<ScriptedStep>) -> (Vec<tokio::time::Instant>, NetworkHandle) {
+        let (handle, mut ends) = NetworkHandle::channels(8);
+        ends.set_rejection_retry_floor(std::time::Duration::from_millis(1));
+        let script = Script {
+            steps: std::sync::Mutex::new(steps.into_iter().collect()),
+            starts: std::sync::Mutex::new(Vec::new()),
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            run_with_backoff(&script, &mut ends, |script, ends| {
+                scripted_session(script, ends)
+            }),
+        )
+        .await
+        .expect("the scripted driver parked instead of running its script out");
+        let starts = script.starts.lock().unwrap().clone();
+        (starts, handle)
+    }
+
+    /// A services outage is a run of refusals that never park. When it ends and
+    /// the driver's own ghost still holds the nick, that first 433 is the first
+    /// of *its* kind: it gets the refusal schedule, not an instant park.
+    #[tokio::test(start_paused = true)]
+    async fn refusals_that_never_park_do_not_count_toward_parking_a_later_one() {
+        use e6irc_client::RegistrationRefusal;
+        let mut steps: Vec<ScriptedStep> = (0..MAX_CONSECUTIVE_REGISTRATION_REJECTIONS)
+            .map(|_| ScriptedStep::Refuse(RegistrationRefusal::SaslUnavailable))
+            .collect();
+        steps.push(ScriptedStep::Refuse(RegistrationRefusal::NicknameInUse));
+        steps.push(ScriptedStep::Stop);
+        let (_, handle) = run_script(steps).await;
+        let snapshot = handle.runtime_snapshot();
+        assert_ne!(
+            snapshot.lifecycle,
+            NetworkLifecycle::RegistrationFailed,
+            "{snapshot:?}"
+        );
+        assert_eq!(
+            snapshot.connection_attempts,
+            u64::from(MAX_CONSECUTIVE_REGISTRATION_REJECTIONS) + 2,
+            "{snapshot:?}"
+        );
+    }
+
+    /// A tarpit completes the handshake and says nothing until the registration
+    /// deadline. Read as "the session lasted long enough", that reset the
+    /// schedule and had the driver re-dial it every 200 ms; only a session that
+    /// reached `Connected` and stayed up earns the reset.
+    #[tokio::test(start_paused = true)]
+    async fn a_long_attempt_that_never_connected_keeps_the_backoff_growing() {
+        async fn waits_between(connected: &[bool]) -> Vec<std::time::Duration> {
+            let hold_for = Backoff::HELD_FOR;
+            let steps = connected
+                .iter()
+                .map(|&connected| ScriptedStep::Drop {
+                    hold_for,
+                    connected,
+                })
+                .chain([ScriptedStep::Stop])
+                .collect();
+            let (starts, _handle) = run_script(steps).await;
+            starts
+                .windows(2)
+                .map(|pair| pair[1] - pair[0] - hold_for)
+                .collect()
+        }
+        let tarpit = waits_between(&[false, false, false]).await;
+        // 200 ms, 400 ms, 800 ms: each attempt waits longer, jitter under 97 ms.
+        assert!(
+            tarpit[0] < std::time::Duration::from_millis(300),
+            "{tarpit:?}"
+        );
+        assert!(
+            tarpit[1] >= std::time::Duration::from_millis(400),
+            "{tarpit:?}"
+        );
+        assert!(
+            tarpit[2] >= std::time::Duration::from_millis(800),
+            "{tarpit:?}"
+        );
+
+        let held = waits_between(&[false, true]).await;
+        // The held session starts the schedule over.
+        assert!(held[1] < std::time::Duration::from_millis(300), "{held:?}");
+    }
+
+    /// The registry waits for a stopped driver under its one mutation guard. A
+    /// driver wedged in a write it cannot finish must not hold every account's
+    /// network mutation with it: the wait is bounded, and says so.
+    #[tokio::test]
+    async fn the_wait_for_a_stopped_driver_is_bounded() {
+        let (handle, ends) = NetworkHandle::channels(8);
+        let wedged = tokio::spawn(async move {
+            let _ends = ends;
+            std::future::pending::<()>().await;
+        });
+        let released = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle.shutdown_and_wait_within(std::time::Duration::from_millis(100)),
+        )
+        .await
+        .expect("the wait returned at its deadline");
+        assert!(
+            !released,
+            "a wedged driver cannot have released its transport"
+        );
+        wedged.abort();
+
+        let (handle, mut ends) = NetworkHandle::channels(8);
+        tokio::spawn(async move { while ends.next_command().await.is_some() {} });
+        assert!(
+            handle
+                .shutdown_and_wait_within(std::time::Duration::from_secs(5))
+                .await,
+            "a cooperating driver releases its transport"
+        );
     }
 
     #[test]
@@ -4701,7 +5473,10 @@ mod tests {
 
         ends.emit_line(tagged.clone());
         assert_eq!(handle.buffer_snapshot(), vec![tagged.clone()]);
-        assert_eq!(events.try_recv(), Ok(DriverEvent::Line(tagged)));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(DriverEvent::Line(BufferedLine { line, .. })) if line == tagged
+        ));
     }
 
     #[test]
@@ -5178,5 +5953,98 @@ mod tests {
             z.push(format!("line{i}"));
         }
         assert!(z.snapshot().len() <= 1, "cap 0 must not grow without bound");
+    }
+
+    fn replayed(replay: &Replay) -> Vec<&str> {
+        replay
+            .lines
+            .iter()
+            .map(|entry| entry.line.as_str())
+            .collect()
+    }
+
+    /// A cursor is honoured exactly while every line after it is still held;
+    /// a position the ring evicted, another ring's cursor, or none at all
+    /// replays the whole ring — and says which happened.
+    #[test]
+    fn replay_after_a_cursor_is_exact_or_refused() {
+        let mut ring = Buffer::new(3);
+        let first = ring.push("one".into());
+        let second = ring.push("two".into());
+
+        let start = ring.replay_after(None);
+        assert_eq!(replayed(&start), ["one", "two"]);
+        assert!(!start.resumed);
+        assert_eq!(start.position(), start.cursor_at(second));
+
+        let resumed = ring.replay_after(Some(start.cursor_at(first)));
+        assert_eq!(replayed(&resumed), ["two"]);
+        assert!(resumed.resumed);
+        let caught_up = ring.replay_after(Some(start.position()));
+        assert!(replayed(&caught_up).is_empty());
+        assert!(caught_up.resumed, "nothing new is still an exact resume");
+
+        // The position just before the oldest retained line is still exact:
+        // everything after it is held.
+        ring.push("three".into());
+        ring.push("four".into());
+        let oldest_retained = ring.lines.front().expect("ring holds lines").seq;
+        let edge = ring.replay_after(Some(start.cursor_at(oldest_retained - 1)));
+        assert_eq!(replayed(&edge), ["two", "three", "four"]);
+        assert!(edge.resumed);
+        let evicted = ring.replay_after(Some(start.cursor_at(oldest_retained - 2)));
+        assert_eq!(replayed(&evicted), ["two", "three", "four"]);
+        assert!(
+            !evicted.resumed,
+            "a position the ring evicted cannot be resumed"
+        );
+
+        // Beyond the newest position nothing was ever pushed: not this ring's.
+        let ahead = ring.replay_after(Some(start.cursor_at(ring.position() + 1)));
+        assert!(!ahead.resumed);
+
+        let other_ring = Buffer::new(3);
+        let foreign = ring.replay_after(Some(other_ring.replay_after(None).position()));
+        assert_eq!(replayed(&foreign), ["two", "three", "four"]);
+        assert!(!foreign.resumed, "another ring's cursor names nothing here");
+
+        // The wire form round-trips and refuses anything else.
+        let cursor = start.cursor_at(first);
+        assert_eq!(ReplayCursor::parse(&cursor.to_string()), Some(cursor));
+        for text in ["", "7", "7:", ":7", "a:b", "7:-1", "1:2:3"] {
+            assert_eq!(ReplayCursor::parse(text), None, "{text:?}");
+        }
+    }
+
+    /// Lines restored from storage sit below every pushed line, in order, and
+    /// an empty ring still answers with a cursor a client can return with.
+    #[test]
+    fn preloaded_history_takes_positions_below_the_live_lines() {
+        let (handle, ends) = NetworkHandle::channels(4);
+        let empty = handle.subscribe_with_replay_snapshot(None).1;
+        assert!(replayed(&empty).is_empty());
+        let resumed_from_empty = handle
+            .subscribe_with_replay_snapshot(Some(empty.position()))
+            .1;
+        assert!(resumed_from_empty.resumed);
+
+        ends.emit_line("live".into());
+        handle.preload_front(vec!["older".into(), "old".into()]);
+        let replay = handle.subscribe_with_replay_snapshot(None).1;
+        assert_eq!(replayed(&replay), ["older", "old", "live"]);
+        let positions: Vec<u64> = replay.lines.iter().map(|entry| entry.seq).collect();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] + 1 == pair[1]),
+            "{positions:?}"
+        );
+        assert!(
+            positions[0] >= 1,
+            "restored positions stay positive: {positions:?}"
+        );
+        let after_older = handle
+            .subscribe_with_replay_snapshot(Some(replay.cursor_at(positions[0])))
+            .1;
+        assert_eq!(replayed(&after_older), ["old", "live"]);
+        assert!(after_older.resumed);
     }
 }

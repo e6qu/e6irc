@@ -280,7 +280,9 @@ async fn cli_sasl_login() {
         }],
         http: Some(e6ircd::config::HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
-            public_url: Some("https://cli.e2e.example".into()),
+            // An http:// origin: the daemon refuses an https public URL with insecure
+            // cookies, and this harness runs without TLS.
+            public_url: Some("http://cli.e2e.example".into()),
             secure_cookies: false,
             admin_accounts: vec![],
         }),
@@ -440,7 +442,7 @@ async fn cli_sasl_login() {
     let (status, transcript) = login.await.expect("device login task");
     assert!(status.success(), "device login failed: {transcript}");
     assert!(
-        transcript.contains("Open https://cli.e2e.example/device and enter "),
+        transcript.contains("Open http://cli.e2e.example/device and enter "),
         "device verification URI must be absolute: {transcript}"
     );
     let cached = e6irc_client::token_cache::load_token(&device_path)

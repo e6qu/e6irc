@@ -16,6 +16,12 @@ on:
     branches: [main]
   pull_request:
 
+# Service and tool images are pinned by digest like the Dockerfile's bases; to
+# refresh one, resolve its tag with `docker buildx imagetools inspect IMAGE:TAG`
+# and update the digest and this date together.
+#   postgres:18-alpine, ghcr.io/dexidp/dex:v2.41.1,
+#   mcr.microsoft.com/playwright:v1.61.1-noble,
+#   matrixconduit/matrix-conduit:v0.9.0   resolved 2026-09-21
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
@@ -41,7 +47,7 @@ jobs:
       # rest would become that script's positional parameters, unread.
       - name: Shell syntax
         run: |
-          for script in tools/*.sh tools/*/*.sh; do
+          for script in tools/*.sh tools/*/*.sh vendor/tests/irctest/run.sh; do
             case "$(head -n 1 "$script")" in
               '#!/bin/sh'*) sh -n "$script" ;;
               *) bash -n "$script" ;;
@@ -133,7 +139,10 @@ jobs:
           - { os: windows-2025, target: x86_64-pc-windows-msvc }
           - { os: windows-11-arm, target: aarch64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # A cold build (the first run after Cargo.lock changes, when the cache is
+    # keyed away) takes the Intel macOS runner past 15 minutes; 15 was enough
+    # only with a warm cache, and the merge commit of #334 was cancelled by it.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
@@ -155,7 +164,7 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:18-alpine
+        image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
         env:
           POSTGRES_PASSWORD: test
           POSTGRES_DB: e6irc_test
@@ -189,7 +198,7 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:18-alpine
+        image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
         env:
           POSTGRES_PASSWORD: test
           POSTGRES_DB: e6irc_test
@@ -225,7 +234,7 @@ jobs:
         run: |
           docker run -d --name dex -p 15556:5556 \
             -v "$PWD/tools/dex-config.yaml:/etc/dex/config.yaml" \
-            ghcr.io/dexidp/dex:v2.41.1 dex serve /etc/dex/config.yaml
+            ghcr.io/dexidp/dex:v2.41.1@sha256:bc7cfce7c17f52864e2bb2a4dc1d2f86a41e3019f6d42e81d92a301fad0c8a1d dex serve /etc/dex/config.yaml
           for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:15556/dex/.well-known/openid-configuration >/dev/null && break
             [ "$i" = 30 ] && { echo "dex did not become ready"; docker logs dex; exit 1; }
@@ -271,7 +280,7 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:18-alpine
+        image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
         env:
           POSTGRES_PASSWORD: test
           POSTGRES_DB: e6irc_test
@@ -294,7 +303,7 @@ jobs:
             tools/dex-config.yaml > /tmp/e6irc-dex-config.yaml
           docker run -d --name dex -p 15556:5556 \
             -v /tmp/e6irc-dex-config.yaml:/etc/dex/config.yaml \
-            ghcr.io/dexidp/dex:v2.41.1 dex serve /etc/dex/config.yaml
+            ghcr.io/dexidp/dex:v2.41.1@sha256:bc7cfce7c17f52864e2bb2a4dc1d2f86a41e3019f6d42e81d92a301fad0c8a1d dex serve /etc/dex/config.yaml
           for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:15556/dex/.well-known/openid-configuration >/dev/null && break
             [ "$i" = 30 ] && { echo "dex did not become ready"; docker logs dex; exit 1; }
@@ -312,7 +321,7 @@ jobs:
             -e E6IRC_TEST_DATABASE_URL=postgres://postgres:test@host.docker.internal:5432/e6irc_test \
             -e E6IRC_TEST_DEX_URL=http://host.docker.internal:15556/dex \
             -e E6IRC_BROWSER_ARTIFACTS_DIR=test-results/browser \
-            mcr.microsoft.com/playwright:v1.61.1-noble \
+            mcr.microsoft.com/playwright:v1.61.1-noble@sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48 \
             node tools/test-oidc-browser.mjs
       - name: Retain failed browser diagnostics
         if: failure()
@@ -467,7 +476,7 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:18-alpine
+        image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
         env:
           POSTGRES_PASSWORD: test
           POSTGRES_DB: irctest
@@ -548,7 +557,7 @@ jobs:
           docker run -d --name conduit -p 16167:6167 \
             -e CONDUIT_CONFIG=/etc/conduit.toml \
             -v "$PWD/vendor/tests/external-oracles/conduit/conduit.toml:/etc/conduit.toml:ro" \
-            matrixconduit/matrix-conduit:v0.9.0
+            matrixconduit/matrix-conduit:v0.9.0@sha256:4ae051b1b56ee9c1292ffc87653da6078a52310f71aa4fe701c66432159997dd
           for i in $(seq 1 40); do
             curl -sf http://127.0.0.1:16167/_matrix/client/versions >/dev/null && break
             [ "$i" = 40 ] && { echo "conduit did not become ready"; docker logs conduit; exit 1; }

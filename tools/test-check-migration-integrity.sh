@@ -34,6 +34,14 @@ git mv migrations/0001_one.sql migrations/0002_one.sql
 expect_fail rename
 printf '%s\n' 'CREATE TABLE zero ();' > migrations/0000_zero.sql
 expect_fail ordering
+# The same number as the last applied migration, under a later-sorting name.
+printf '%s\n' 'CREATE TABLE dup ();' > migrations/0001_zzz_duplicate.sql
+expect_fail duplicate-number
+# A base that does not resolve is a failure, not a clean report.
+if tools/check-migration-integrity.sh no-such-ref-xyz >/dev/null 2>&1; then
+    echo "expected migration-integrity failure: unresolvable base" >&2
+    exit 1
+fi
 printf '%s\n' 'CREATE TABLE two ();' > migrations/0002_two.sql
 git add migrations/0002_two.sql
 tools/check-migration-integrity.sh "$base"

@@ -13,7 +13,8 @@ the only one this repository describes step by step.
 ## Image
 
 `Dockerfile` builds the Vite frontend and embeds it into `e6ircd` before
-copying the complete server onto a slim Debian base. No build tool or startup
+copying the complete server onto a distroless base
+(`gcr.io/distroless/cc-debian12`). No build tool or startup
 build step exists in the runtime image. The `.github/workflows/release.yml`
 workflow publishes `ghcr.io/e6qu/e6irc:<short-sha>` plus the direct
 `<short-sha>-amd64` and `<short-sha>-arm64` images for every commit on `main`
@@ -72,9 +73,10 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now e6ircd
 ```
 
-The unit uses SIGTERM and a 35-second stop budget, exceeding the daemon’s
-30-second bounded PostgreSQL flush budget so systemd cannot kill a still-clean
-shutdown first. It grants no capabilities, makes the host filesystem read-only
+The unit uses SIGTERM and a 40-second stop budget, exceeding the daemon’s
+bounded shutdown — up to 5 seconds draining the core shards, then up to 30
+seconds flushing PostgreSQL — so systemd cannot kill a still-clean shutdown
+first. It grants no capabilities, makes the host filesystem read-only
 to the process, gives it private pseudo-devices and only its own `/proc`
 entries, forbids new namespaces, and restricts it to native-architecture system
 calls in systemd's `@system-service` set (a call outside it fails with `EPERM`
@@ -98,7 +100,10 @@ validation a configuration file gets (the deployment injects secrets —
 `E6IRC_DATABASE_URL`, `E6IRC_OIDC_CLIENT_SECRET` — from AWS Secrets Manager).
 Nothing is written to disk, so there is no secrets-bearing file to protect or
 to find. A host that prefers a file mounts one and replaces the command with
-`--config /path/to/e6irc.toml`. `e6ircd check-config --config-from-environment`
+`--config /path/to/e6irc.toml`; such a container must also set
+`E6IRC_HTTP_ADDR` to the file's `[http].addr` (or override the health check
+with `e6ircd healthcheck --addr ip:port`), because the probe reads the
+environment, not the file. `e6ircd check-config --config-from-environment`
 validates the environment and exits. Missing required values fail the
 container loudly rather than starting half-configured, and so do two kinds of
 malformed value, each refused by variable name without printing the value: a
@@ -183,19 +188,22 @@ e6ircd recover-administrator --account NAME --config /etc/e6irc/e6irc.toml
 ```
 
 It acts on one existing, active account: prints a new password once, grants
-durable administrator authority, ends that account's browser sessions, and
+durable administrator authority, revokes every credential that account held
+(app passwords, personal access tokens, device grants, browser sessions), and
 writes an `ADMINISTRATOR_RECOVERY` audit record. An unknown or suspended account
-is refused and nothing is changed. Restart e6ircd afterwards — administrator
-authority is read at start — then sign in and change the password.
+is refused and nothing is changed. A running e6ircd honours the authority at
+once — it reads an account's authority on every request — so sign in and change
+the password.
 
 ## Stop timeout
 
-On SIGTERM the daemon stops accepting work and flushes buffered writes to
-PostgreSQL for at most 30 seconds. Give the container at least 35 seconds
-before it is killed, as `e6ircd.service` does: `stopTimeout: 35` (or more) in
-the ECS container definition, `docker stop --time 35`, or
-`stop_grace_period: 35s` in Compose. The Docker default of 10 seconds and the
-ECS default of 30 can both kill a shutdown that was still flushing cleanly.
+On SIGTERM the daemon stops accepting work, drains its core shards for at most
+5 seconds, then flushes buffered writes to PostgreSQL for at most 30 seconds.
+Give the container at least 40 seconds before it is killed, as
+`e6ircd.service` does: `stopTimeout: 40` (or more) in the ECS container
+definition, `docker stop --time 40`, or `stop_grace_period: 40s` in Compose.
+The Docker default of 10 seconds and the ECS default of 30 can both kill a
+shutdown that was still flushing cleanly.
 
 ## Running on any container host
 
@@ -232,18 +240,17 @@ Any host that runs an OCI image can run e6irc. It has to provide:
   renders no TLS listener; IRC clients reach the server over `/ws/irc`. The
   optional BNC listener an administrator can enable in the console is a raw
   TCP port of its own and needs a host that can publish one.
-- **A stop timeout of at least 35 seconds** ([Stop timeout](#stop-timeout)).
-- **A stable, writable `E6IRC_CONFIG_PATH`** when `e6ircd rotate-secrets` will
-  be run in the container ([Rotate the credential key](#rotate-the-credential-key)).
+- **A stop timeout of at least 40 seconds** ([Stop timeout](#stop-timeout)).
 - **Outbound network access** to PostgreSQL, to the OpenID Connect issuer, and
   — for always-on networks and bridges — to the IRC networks (TCP 6697 for the
   curated ones), Matrix homeservers, Discord, and Slack. On an account's
   behalf the daemon will not dial a link-local address (which includes the
   cloud metadata endpoint `169.254.169.254`), nor an unspecified, multicast,
   broadcast, or documentation address; it checks every address a hostname
-  resolves to at dial time. Loopback and private addresses are allowed, so an
-  upstream on the host's own network works, and the host's network policy is
-  what keeps accounts away from internal services that should not be reachable.
+  resolves to at dial time. Loopback, RFC 1918, carrier-grade NAT and
+  unique-local addresses are refused too, by default and at dial time; only a
+  configuration file's `internal_upstreams = "allow"` (meant for test
+  harnesses) admits them, and the container exposes no variable for it.
 
 ### Egress and public IRC networks
 

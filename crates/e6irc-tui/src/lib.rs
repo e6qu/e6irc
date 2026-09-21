@@ -3,4 +3,5 @@
 //! terminal and a live connection.
 
 pub mod app;
+pub mod liveness;
 pub mod reconnect;
