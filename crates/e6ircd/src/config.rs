@@ -1528,10 +1528,10 @@ impl Config {
     /// Left to the system, the second bind fails at start as a bare "address
     /// already in use" that names neither section. Two sockets collide when
     /// they ask for the same nonzero port on the same address, or on a wildcard
-    /// address of the same family (`0.0.0.0` covers every IPv4 address). Port 0
-    /// asks for any free port and never collides. A wildcard of the *other*
-    /// family is not judged: whether `[::]` also takes IPv4 is the host's
-    /// `bindv6only` setting, which this file cannot see.
+    /// address of the same family (`0.0.0.0` covers every IPv4 address), or when
+    /// one is `[::]` and the other any IPv4 address: the daemon binds `[::]`
+    /// dual-stack on every platform (`net::bind_listener`), so it covers every
+    /// IPv4 address too. Port 0 asks for any free port and never collides.
     fn refuse_colliding_listeners(&self) -> Result<(), ConfigError> {
         let mut sockets: Vec<(String, std::net::SocketAddr)> = self
             .listeners
@@ -1545,13 +1545,18 @@ impl Config {
                 .map(|http| ("[http]".to_string(), http.addr)),
         );
         sockets.extend(self.bnc.iter().map(|bnc| ("[bnc]".to_string(), bnc.addr)));
+        let dual_stack_over = |wide: std::net::SocketAddr, other: std::net::SocketAddr| {
+            wide.is_ipv6() && wide.ip().is_unspecified() && other.is_ipv4()
+        };
         let collide = |left: std::net::SocketAddr, right: std::net::SocketAddr| {
             left.port() != 0
                 && left.port() == right.port()
-                && left.is_ipv4() == right.is_ipv4()
-                && (left.ip() == right.ip()
-                    || left.ip().is_unspecified()
-                    || right.ip().is_unspecified())
+                && ((left.is_ipv4() == right.is_ipv4()
+                    && (left.ip() == right.ip()
+                        || left.ip().is_unspecified()
+                        || right.ip().is_unspecified()))
+                    || dual_stack_over(left, right)
+                    || dual_stack_over(right, left))
         };
         for (index, (first, first_addr)) in sockets.iter().enumerate() {
             for (second, second_addr) in &sockets[index + 1..] {
@@ -2114,6 +2119,9 @@ mod tests {
         // A wildcard address covers every address of its family.
         config.listeners = vec![listener_on("0.0.0.0:6667"), listener_on("127.0.0.1:6667")];
         assert!(refusal(&config).contains("127.0.0.1:6667"));
+        // `[::]` is bound dual-stack, so it covers every IPv4 address as well.
+        config.listeners = vec![listener_on("127.0.0.1:6667"), listener_on("[::]:6667")];
+        assert!(refusal(&config).contains("[::]:6667"));
 
         config.listeners = vec![listener_on("127.0.0.1:6667")];
         config.database = Some(DatabaseConfig {

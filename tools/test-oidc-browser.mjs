@@ -186,6 +186,17 @@ try {
   if (browserName === "chromium") {
     launchOptions.executablePath = required("PLAYWRIGHT_EXECUTABLE_PATH");
   }
+  if (browserName === "firefox") {
+    // Pages send `Cross-Origin-Opener-Policy: same-origin`. Firefox replaces
+    // the browsing context on such a navigation and Playwright's Firefox driver
+    // then loses the page's events, so a reload intermittently never reaches
+    // "load" (microsoft/playwright#42731; about one run in five here). The
+    // header still reaches the browser; only the driver-breaking context swap
+    // is turned off, as that issue documents.
+    launchOptions.firefoxUserPrefs = {
+      "browser.tabs.remote.useCrossOriginOpenerPolicy": false,
+    };
+  }
   browser = await browserType.launch({
     ...launchOptions,
   });

@@ -332,6 +332,11 @@ enum CapabilityNegotiation {
 /// then be misread as a lost connection.
 const CAP_DISCOVERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a registration whose write found the server gone reads what the
+/// server sent before leaving. Everything it sent is already buffered or in
+/// flight on a closed connection, so this bounds only a peer that half-closed.
+const PEER_GONE_READ: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The server's answer to one `CAP REQ`.
 #[derive(Debug, PartialEq, Eq)]
 enum CapabilityVerdict {
@@ -1442,6 +1447,16 @@ impl Connection {
         account: &str,
         password: &str,
     ) -> io::Result<String> {
+        let outcome = self.register_sasl_steps(identity, account, password).await;
+        self.told_before_it_left(outcome).await
+    }
+
+    async fn register_sasl_steps(
+        &mut self,
+        identity: &Identity<'_>,
+        account: &str,
+        password: &str,
+    ) -> io::Result<String> {
         self.transport.admit("SASL credentials")?;
         self.send_server_password(identity).await?;
         self.begin_sasl("PLAIN").await?;
@@ -1506,6 +1521,15 @@ impl Connection {
         identity: &Identity<'_>,
         token: &str,
     ) -> io::Result<String> {
+        let outcome = self.register_oauthbearer_steps(identity, token).await;
+        self.told_before_it_left(outcome).await
+    }
+
+    async fn register_oauthbearer_steps(
+        &mut self,
+        identity: &Identity<'_>,
+        token: &str,
+    ) -> io::Result<String> {
         self.transport.admit("a bearer token")?;
         self.send_server_password(identity).await?;
         self.begin_sasl("OAUTHBEARER").await?;
@@ -1519,6 +1543,45 @@ impl Connection {
     /// Register with a nick and realname, answering PINGs, until the
     /// welcome (001) arrives. Returns the confirmed nick.
     pub async fn register(&mut self, identity: &Identity<'_>) -> io::Result<String> {
+        let outcome = self.register_steps(identity).await;
+        self.told_before_it_left(outcome).await
+    }
+
+    /// A registration that failed because the server went away is reported by
+    /// what the server said before it left. A server that refuses (a wrong
+    /// server password, a ban) sends its numeric or `ERROR` and closes; a
+    /// client still writing its registration lines then fails on the write,
+    /// and "broken pipe" would replace the reason already in its receive
+    /// buffer.
+    async fn told_before_it_left<T>(&mut self, outcome: io::Result<T>) -> io::Result<T> {
+        let error = match outcome {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                error
+            }
+            other => return other,
+        };
+        let said = tokio::time::timeout(PEER_GONE_READ, async {
+            while let Ok(Some(message)) = self.next_message().await {
+                if let Some(refusal) = self.registration_refused(&message) {
+                    return Some(refusal);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        Err(said.unwrap_or(error))
+    }
+
+    async fn register_steps(&mut self, identity: &Identity<'_>) -> io::Result<String> {
         self.send_server_password(identity).await?;
         match self.begin_cap().await? {
             CapabilityNegotiation::Open => {
@@ -3119,6 +3182,35 @@ mod tests {
             )
             .contains("hunter2")
         );
+    }
+
+    /// A server that refuses and closes can make the client's next write fail
+    /// before the refusal is read. The failure is still reported as the refusal
+    /// the server sent, not as the broken pipe it caused.
+    #[tokio::test]
+    async fn a_write_that_finds_the_server_gone_reports_what_it_said() {
+        let (mut connection, server) = scripted(vec![Send(":srv 464 * :Password incorrect")]);
+        connection.server_password_sent = ServerPasswordSent::Yes;
+        let error = connection
+            .told_before_it_left::<()>(Err(io::ErrorKind::BrokenPipe.into()))
+            .await
+            .expect_err("still a failure");
+        assert_eq!(
+            RegistrationRefusal::from_error(&error),
+            Some(RegistrationRefusal::ServerPasswordRejected),
+            "{error}"
+        );
+        drop(connection);
+        server.await.expect("server");
+
+        // With nothing said, the write failure itself is the report.
+        let (mut connection, server) = scripted(vec![]);
+        drop(server);
+        let error = connection
+            .told_before_it_left::<()>(Err(io::ErrorKind::BrokenPipe.into()))
+            .await
+            .expect_err("still a failure");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 
     /// A 464 means one of two things, and only the client knows which: with no

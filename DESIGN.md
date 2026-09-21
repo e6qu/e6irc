@@ -2486,7 +2486,10 @@ explicit override. Both native clients take a server password from
 `--server-password-file`, `E6IRC_SERVER_PASSWORD`, or `--server-password`
 (visible in the process list), through the same resolver and precedence as the
 SASL secrets; it is sent as the first line, falls under the same cleartext
-refusal, and a 464 tells a missing password from a rejected one.
+refusal, and a 464 tells a missing password from a rejected one. A server
+that refuses and closes can make the client's next registration write fail
+first; the client then reads what the server sent before it left (for at most
+two seconds) and reports that refusal, not the broken pipe.
 
 `e6irc login` implements the RFC 8628 device flow: it prints the verification
 URI and user code, honors the server's polling interval/slow-down/expiry
@@ -2860,7 +2863,10 @@ Layers, bottom to top:
    over real sockets, including TLS.
 8. **UI tests**: Playwright drives real OIDC and local-password authentication
    through Chromium, Firefox, and WebKit; exact Shauth qualification uses
-   Chromium. Focused replay/race/membership cases use
+   Chromium. Firefox runs with `browser.tabs.remote.useCrossOriginOpenerPolicy`
+   off: pages send `Cross-Origin-Opener-Policy: same-origin`, and the context
+   swap it causes makes Playwright's Firefox driver lose a page's events
+   (microsoft/playwright#42731), so a reload hung about one run in five. Focused replay/race/membership cases use
    browser-side network/history/WebSocket doubles. A separate full-stack case
    edits every managed-configuration subsection and credential collection,
    proves persisted themes and the desktop-notification boundary, creates a
@@ -2923,9 +2929,10 @@ Layers, bottom to top:
 - A configuration that parses but cannot work is refused at load and at every
   console save. Two listening sockets that cannot both bind — the same nonzero
   port on the same address, or on a wildcard of the same family — are refused
-  naming both sections (`[[listeners]] #n`, `[http]`, `[bnc]`); a cross-family
-  wildcard is not judged, because whether `[::]` also takes IPv4 is the host's
-  `bindv6only`. Sizes have upper bounds as well as lower ones: `core_workers`
+  naming both sections (`[[listeners]] #n`, `[http]`, `[bnc]`). Every listener
+  binds `[::]` dual-stack on every platform (Linux defaults a v6 socket to
+  dual-stack, Windows and several BSDs to v6-only), so `[::]` also collides
+  with any IPv4 address on its port. Sizes have upper bounds as well as lower ones: `core_workers`
   ≤ 64, `core_queue` ≤ 1,048,576, `sendq` ≤ 65,536, `max_hot_channels` ≤
   1,048,576, a network's `buffer_cap` ≤ 100,000. `usize::MAX` workers used to
   validate.
