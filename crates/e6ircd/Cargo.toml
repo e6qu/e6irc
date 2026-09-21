@@ -41,6 +41,10 @@ bytes = { version = "1.12.1", default-features = false }
 # url 2.5.8 is already in the tree through reqwest and openidconnect; named
 # here because `egress` judges upstream addresses by what its parser reads.
 url = "2.5.8"
+# socket2 0.6.5 is already in the tree through tokio and hyper-util; named here
+# because `net::bind_listener` makes the IPv6 wildcard dual-stack on every
+# platform, which tokio's `TcpListener::bind` cannot express.
+socket2 = "0.6.5"
 tokio = { version = "1.53.0", default-features = false, features = [
     "rt-multi-thread",
     "net",

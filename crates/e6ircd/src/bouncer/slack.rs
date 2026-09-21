@@ -1545,7 +1545,7 @@ mod tests {
         }
 
         async fn bridge(options: Options) -> Bridge {
-            let mut oracle = bridge_oracle::start_with(
+            let oracle = bridge_oracle::start_with(
                 Provider::Slack,
                 Options {
                     manual: true,
@@ -1564,27 +1564,13 @@ mod tests {
             let (handle, mut ends) = NetworkHandle::channels(64);
             let events = handle.subscribe();
             let session = tokio::spawn(async move { session_once(&config, &mut ends).await });
-            connected(&mut oracle, 0).await;
+            oracle.wait_connected(0).await;
             Bridge {
                 oracle,
                 handle,
                 events,
                 session,
             }
-        }
-
-        async fn connected(oracle: &mut Oracle, connection: usize) {
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    if let Some(OracleEvent::Connected(n)) = oracle.events.recv().await
-                        && n == connection
-                    {
-                        return;
-                    }
-                }
-            })
-            .await
-            .unwrap_or_else(|_| panic!("socket {connection} never connected"));
         }
 
         async fn acked(oracle: &mut Oracle, connection: usize, envelope: &str) {
@@ -1661,7 +1647,7 @@ mod tests {
                     .await
                     .ends_with(":two on the old socket")
             );
-            connected(&mut b.oracle, 1).await;
+            b.oracle.wait_connected(1).await;
             b.oracle.send(
                 1,
                 slack_envelope("env-3", slack_message("three on the new socket")),
@@ -1693,7 +1679,7 @@ mod tests {
                 0,
                 json!({ "type": "disconnect", "reason": "refresh_requested" }),
             );
-            connected(&mut b.oracle, 1).await;
+            b.oracle.wait_connected(1).await;
             b.oracle.close(0, 1000);
             b.oracle.send(
                 1,

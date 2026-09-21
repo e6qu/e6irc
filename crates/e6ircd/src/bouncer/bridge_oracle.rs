@@ -154,6 +154,20 @@ impl Oracle {
             .unwrap_or_else(|_| panic!("oracle connection {connection} already ended"));
     }
 
+    /// Manual mode: wait until connection `connection` has been accepted.
+    /// Reads the connection registry, not the event stream: the `Connected`
+    /// event can already have been skipped by [`Oracle::next_frame`] while a
+    /// test waited for a frame on an older socket.
+    pub async fn wait_connected(&self, connection: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while self.writers.lock().expect("oracle writers").len() <= connection {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("socket {connection} never connected"));
+    }
+
     /// The next event, or a panic naming `label` after two seconds.
     pub async fn next(&mut self, label: &str) -> OracleEvent {
         recv_oracle(self, label).await

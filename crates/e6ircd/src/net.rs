@@ -403,11 +403,9 @@ impl BncListenerController {
             })?),
             None => None,
         };
-        let listener = TcpListener::bind(requested.addr)
-            .await
-            .inspect_err(|_error| {
-                self.telemetry.record_error(ErrorKind::Bouncer);
-            })?;
+        let listener = bind_listener(requested.addr).inspect_err(|_error| {
+            self.telemetry.record_error(ErrorKind::Bouncer);
+        })?;
         let bound = listener.local_addr().inspect_err(|_error| {
             self.telemetry.record_error(ErrorKind::ConnectionSetup);
         })?;
@@ -969,7 +967,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
 
     let http_addr = match &config.http {
         Some(http_config) => {
-            let listener = TcpListener::bind(http_config.addr).await?;
+            let listener = bind_listener(http_config.addr)?;
             let bound = listener.local_addr()?;
             let state = app_state
                 .clone()
@@ -1122,7 +1120,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
 
     let mut addrs = Vec::new();
     for listener_config in &config.listeners {
-        let listener = TcpListener::bind(listener_config.addr).await?;
+        let listener = bind_listener(listener_config.addr)?;
         addrs.push(listener.local_addr()?);
         if listener_config.websocket {
             // A dedicated WS-IRC listener: serve the ws-irc router at the root
@@ -1178,6 +1176,30 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             bnc_registry,
         },
     })
+}
+
+/// Bind a listening socket as `tokio::net::TcpListener::bind` does (address
+/// reuse off Windows, backlog 1024), except that the IPv6 wildcard `[::]` is
+/// dual-stack on every platform. Linux defaults a v6 socket to dual-stack,
+/// Windows and several BSDs to v6-only, so the same configuration refused IPv4
+/// clients on some hosts and not others.
+fn bind_listener(addr: SocketAddr) -> io::Result<TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    if let SocketAddr::V6(v6) = addr
+        && v6.ip().is_unspecified()
+    {
+        socket.set_only_v6(false)?;
+    }
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    TcpListener::from_std(socket.into())
 }
 
 /// Who may open an HTTP connection: at most [`MAX_HTTP_CONNECTIONS_PER_IP`]
