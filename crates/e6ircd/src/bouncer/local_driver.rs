@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use e6irc_queue::{Config as QueueConfig, Policy, queue};
+use e6irc_queue::{Config as QueueConfig, Policy, Receiver, queue};
 
 use super::{ConnectionEvent, DriverEnds, NetworkConfig, NetworkDriver, NetworkHandle};
-use crate::core::{ConnectionIdAllocator, CoreIngress, Input, Output};
+use crate::core::{ConnId, ConnectionIdAllocator, CoreIngress, Input, Output};
 
 /// The in-process network's name — the driver `kind`, the session host, and the
 /// network a slash-less BNC attach defaults to (DESIGN §10.4: bare = `local`).
@@ -25,6 +25,7 @@ pub struct CoreHandles {
 pub struct LocalDriver {
     core: CoreHandles,
     nick: String,
+    username: String,
     realname: String,
     autojoin: Vec<String>,
     buffer_cap: usize,
@@ -36,9 +37,12 @@ impl LocalDriver {
     pub fn new(core: CoreHandles, config: NetworkConfig) -> Self {
         Self {
             core,
-            nick: config.nick,
-            realname: config.realname,
-            autojoin: config.autojoin,
+            // Already parsed: the same one-parameter guarantees hold for the
+            // lines this driver injects into the in-process core.
+            nick: config.nick.to_string(),
+            username: config.username.to_string(),
+            realname: config.realname.as_str().to_string(),
+            autojoin: config.autojoin.iter().map(ToString::to_string).collect(),
             buffer_cap: config.buffer_cap,
         }
     }
@@ -55,6 +59,7 @@ impl NetworkDriver for LocalDriver {
         let session = LocalSession {
             core: this.core,
             nick: this.nick,
+            username: this.username,
             realname: this.realname,
             autojoin: this.autojoin,
         };
@@ -67,6 +72,7 @@ impl NetworkDriver for LocalDriver {
 struct LocalSession {
     core: CoreHandles,
     nick: String,
+    username: String,
     realname: String,
     autojoin: Vec<String>,
 }
@@ -80,6 +86,73 @@ async fn run(session: LocalSession, mut ends: DriverEnds) {
         Box::pin(session_once(session, ends))
     })
     .await;
+}
+
+/// How long the in-process core may take to welcome a registration. The core
+/// is a queue away, so this only has to outlast a loaded core loop; it exists
+/// so that a wedged core is a reported failure rather than a silent wait.
+const WELCOME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The core's welcome: the nickname it granted, and the 001 line itself, which
+/// is the first line of the session it begins.
+struct Welcome {
+    nick: String,
+    line: String,
+}
+
+/// Queue one line for the core. `false` means the core is gone.
+async fn say(core: &CoreIngress, conn: ConnId, line: String) -> bool {
+    core.push(Input::Line {
+        conn,
+        line: line.into_bytes(),
+    })
+    .await
+    .is_ok()
+}
+
+/// Read the core's replies until it welcomes the session under the configured
+/// nickname. A refusal is read by the same table the IRC driver's registration
+/// uses, so it takes the refusal schedule and parks like any other upstream's —
+/// not the transient schedule of a connection that was made and lost. Lines
+/// that are neither are the core talking to its new client, and are relayed.
+async fn await_welcome(
+    session: &LocalSession,
+    conn: ConnId,
+    out_rx: &mut Receiver<Output>,
+    ends: &DriverEnds,
+) -> Result<Welcome, super::SessionOutcome> {
+    use super::SessionOutcome::{Dropped, RegistrationRejected, Stopped};
+    loop {
+        let Some(envelope) = out_rx.pop().await else {
+            return Err(Dropped(super::NetworkFailure::ConnectionLost));
+        };
+        let line = String::from_utf8_lossy(&envelope.payload.0)
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
+        let Ok(parsed) = e6irc_proto::message::Message::parse(&line) else {
+            ends.emit_line(line);
+            continue;
+        };
+        let message = e6irc_client::OwnedMessage::from(&parsed);
+        if let Some(rejection) = e6irc_client::RegistrationRejection::from_reply(&message) {
+            return Err(RegistrationRejected(rejection));
+        }
+        match message.command.as_str() {
+            "001" => {
+                let welcomed = message.params.first().cloned().unwrap_or_default();
+                let nick = super::irc_driver::configured_nick_was_granted(&session.nick, welcomed)
+                    .map_err(RegistrationRejected)?;
+                return Ok(Welcome { nick, line });
+            }
+            "PING" => {
+                let token = message.params.first().cloned().unwrap_or_default();
+                if !say(&session.core.core_tx, conn, format!("PONG :{token}")).await {
+                    return Err(Stopped);
+                }
+            }
+            _ => ends.emit_line(line),
+        }
+    }
 }
 
 async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::SessionOutcome {
@@ -110,40 +183,51 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
     {
         return Stopped; // core shutting down
     }
-    // Register in-process, then auto-join.
+    let core = &session.core.core_tx;
+    // Register in-process. Queueing NICK and USER is only a request: the core
+    // answers like any server, and it is the welcome that makes a session.
     for line in [
         format!("NICK {}", session.nick),
-        format!("USER {} 0 * :{}", session.nick, session.realname),
+        format!("USER {} 0 * :{}", session.username, session.realname),
     ] {
-        if session
-            .core
-            .core_tx
-            .push(Input::Line {
-                conn,
-                line: line.into_bytes(),
-            })
-            .await
-            .is_err()
-        {
+        if !say(core, conn, line).await {
             return Stopped;
         }
     }
+    let welcomed = tokio::select! {
+        _ = ends.stop_signal() => return Stopped,
+        welcome = tokio::time::timeout(
+            WELCOME_DEADLINE,
+            await_welcome(session, conn, &mut out_rx, ends),
+        ) => welcome.unwrap_or(Err(super::SessionOutcome::Dropped(
+            super::NetworkFailure::RegistrationTimedOut,
+        ))),
+    };
+    let welcome = match welcomed {
+        Ok(welcome) => welcome,
+        Err(outcome) => {
+            // Whatever the core made of the attempt is closed here rather than
+            // left for its liveness reaper; a closed core queue changes nothing.
+            drop(
+                core.push(Input::Closed {
+                    conn,
+                    reason: "local driver registration ended".into(),
+                })
+                .await,
+            );
+            return outcome;
+        }
+    };
     for chan in &session.autojoin {
-        if session
-            .core
-            .core_tx
-            .push(Input::Line {
-                conn,
-                line: format!("JOIN {chan}").into_bytes(),
-            })
-            .await
-            .is_err()
-        {
+        if !say(core, conn, format!("JOIN {chan}")).await {
             return Stopped;
         }
     }
-    ends.begin_irc_session(session.nick.clone());
+    ends.begin_irc_session(welcome.nick);
     ends.emit(ConnectionEvent::Connected);
+    if ends.emit_session_line(welcome.line).is_err() {
+        return super::SessionOutcome::Dropped(super::NetworkFailure::ChannelLimitExceeded);
+    }
 
     loop {
         tokio::select! {
@@ -178,7 +262,11 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
                         }
                         continue;
                     }
-                    ends.emit_line(line);
+                    if ends.emit_session_line(line).is_err() {
+                        return super::SessionOutcome::Dropped(
+                            super::NetworkFailure::ChannelLimitExceeded,
+                        );
+                    }
                 }
                 // Core closed our session: reconnect with a fresh ConnId (and
                 // emit Disconnected via run_with_backoff) rather than die.
@@ -236,7 +324,7 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use e6irc_queue::{Receiver, Sender};
+    use e6irc_queue::Sender;
     use tokio::sync::broadcast;
 
     fn core_queue(capacity: usize) -> (Sender<Input>, Receiver<Input>) {
@@ -262,6 +350,7 @@ mod tests {
                 sendq: 8,
             },
             nick: "alice".into(),
+            username: "ident".into(),
             realname: "Alice".into(),
             autojoin,
         };
@@ -276,7 +365,7 @@ mod tests {
         let Input::Open { tx, .. } = open else {
             panic!("expected Open");
         };
-        for expected in ["NICK alice", "USER alice 0 * :Alice"] {
+        for expected in ["NICK alice", "USER ident 0 * :Alice"] {
             let input = core_rx.pop().await.expect("registration line").payload;
             let Input::Line { line, .. } = input else {
                 panic!("expected registration line");
@@ -284,6 +373,56 @@ mod tests {
             assert_eq!(String::from_utf8(line).unwrap(), expected);
         }
         tx
+    }
+
+    async fn core_says(out_tx: &Sender<Output>, line: &str) {
+        out_tx
+            .push(Output(Bytes::from(format!("{line}\r\n"))))
+            .await
+            .expect("local output queue");
+    }
+
+    /// A refused nickname used to look like a connection that was made and
+    /// then lost: "connected" to every client, counters reset, and a re-dial
+    /// every 200 ms forever. It is a registration refusal, on the refusal
+    /// schedule, with the core's own reason.
+    #[tokio::test]
+    async fn a_refused_nickname_is_a_registration_refusal_not_a_lost_connection() {
+        for (reply, refusal) in [
+            (
+                ":e6.example 433 * alice :Nickname is already in use",
+                e6irc_client::RegistrationRefusal::NicknameInUse,
+            ),
+            (
+                ":e6.example 432 * alice :Erroneous nickname",
+                e6irc_client::RegistrationRefusal::InvalidNickname,
+            ),
+            (
+                ":e6.example 001 Alicia :Welcome",
+                e6irc_client::RegistrationRefusal::InvalidNickname,
+            ),
+        ] {
+            let (core_tx, mut core_rx) = core_queue(8);
+            let (handle, _events, task) = spawn_session(core_tx, vec!["#room".into()]);
+            let out_tx = finish_registration(&mut core_rx).await;
+            core_says(&out_tx, reply).await;
+            let super::super::SessionOutcome::RegistrationRejected(rejection) = stopped(task).await
+            else {
+                panic!("{reply} was not read as a registration refusal");
+            };
+            assert_eq!(rejection.refusal(), refusal, "{reply}");
+            assert_ne!(
+                handle.runtime_snapshot().lifecycle,
+                super::super::NetworkLifecycle::Connected
+            );
+            assert!(handle.irc_session_snapshot().is_none());
+            // The half-made core session is closed, never left to the reaper,
+            // and nothing was joined under a nickname that was not granted.
+            assert!(matches!(
+                core_rx.pop().await.expect("close").payload,
+                Input::Closed { .. }
+            ));
+        }
     }
 
     async fn stopped(
@@ -308,6 +447,16 @@ mod tests {
         let (core_tx, mut core_rx) = core_queue(8);
         let (handle, mut events, task) = spawn_session(core_tx, Vec::new());
         let out_tx = finish_registration(&mut core_rx).await;
+        // Queueing NICK and USER is a request, not a registration.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "the driver reported a session before the core welcomed it"
+        );
+        core_says(&out_tx, ":e6.example 001 alice :Welcome").await;
         assert!(matches!(
             events.recv().await,
             Ok(super::super::DriverEvent::Session(
@@ -326,19 +475,13 @@ mod tests {
 
     #[tokio::test]
     async fn autojoin_failure_stops_before_connected() {
-        // Capacity one lets registration fill the queue with USER and park on
-        // JOIN. Closing the receiver then deterministically fails auto-join.
+        // Capacity one lets the first JOIN fill the queue and park the second.
+        // Closing the receiver then deterministically fails auto-join.
         let (core_tx, mut core_rx) = core_queue(1);
-        let (_handle, mut events, task) = spawn_session(core_tx.clone(), vec!["#room".into()]);
-
-        assert!(matches!(
-            core_rx.pop().await.expect("Open").payload,
-            Input::Open { .. }
-        ));
-        assert!(matches!(
-            core_rx.pop().await.expect("NICK").payload,
-            Input::Line { .. }
-        ));
+        let (_handle, mut events, task) =
+            spawn_session(core_tx.clone(), vec!["#room".into(), "#other".into()]);
+        let out_tx = finish_registration(&mut core_rx).await;
+        core_says(&out_tx, ":e6.example 001 alice :Welcome").await;
         while core_tx.depth() == 0 {
             tokio::task::yield_now().await;
         }

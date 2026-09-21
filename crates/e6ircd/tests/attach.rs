@@ -4,6 +4,7 @@
 
 use e6ircd::bouncer::{IrcNetwork, NetworkConfig, NetworkHandle, attach};
 use e6ircd::config::{Config, ListenerConfig};
+use e6ircd::egress::InternalUpstreams;
 use e6ircd::net;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -54,8 +55,9 @@ async fn attached_client_gets_playback_and_live_and_can_send() {
     // driver joins #room on the upstream
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bnc".into(),
-        autojoin: vec!["#room".into()],
+        nick: "bnc".parse().expect("test nickname"),
+        autojoin: vec!["#room".parse().expect("test channel")],
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     wait_connected(&handle).await;
@@ -64,7 +66,13 @@ async fn attached_client_gets_playback_and_live_and_can_send() {
     let mut peer = e6irc_client::Connection::connect(&addr.to_string())
         .await
         .unwrap();
-    peer.register("peer", "peer").await.unwrap();
+    peer.register(&e6irc_client::Identity {
+        nick: "peer",
+        username: "peer",
+        realname: "peer",
+    })
+    .await
+    .unwrap();
     peer.send_line("JOIN #room").await.unwrap();
     loop {
         if peer.next_message().await.unwrap().unwrap().command == "366" {
@@ -91,6 +99,7 @@ async fn attached_client_gets_playback_and_live_and_can_send() {
             Default::default(),
             "attacher",
             "attacher",
+            e6ircd::bouncer::ATTACH_LIVENESS_INTERVAL,
         )
         .await;
     });
@@ -163,8 +172,9 @@ async fn two_clients_attach_to_one_always_on_network() {
     let addr = upstream().await;
     let handle = std::sync::Arc::new(IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "shared".into(),
-        autojoin: vec!["#multi".into()],
+        nick: "shared".parse().expect("test nickname"),
+        autojoin: vec!["#multi".parse().expect("test channel")],
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     }));
     wait_connected(&handle).await;
@@ -174,7 +184,15 @@ async fn two_clients_attach_to_one_always_on_network() {
     let (c2, s2) = tokio::io::duplex(64 * 1024);
     for (h, s) in [(handle.clone(), s1), (handle.clone(), s2)] {
         tokio::spawn(async move {
-            let _ = attach(s, &h, Default::default(), "attacher", "attacher").await;
+            let _ = attach(
+                s,
+                &h,
+                Default::default(),
+                "attacher",
+                "attacher",
+                e6ircd::bouncer::ATTACH_LIVENESS_INTERVAL,
+            )
+            .await;
         });
     }
     // small delay so both attaches subscribe before the live message
@@ -184,7 +202,13 @@ async fn two_clients_attach_to_one_always_on_network() {
     let mut peer = e6irc_client::Connection::connect(&addr.to_string())
         .await
         .unwrap();
-    peer.register("mpeer", "mpeer").await.unwrap();
+    peer.register(&e6irc_client::Identity {
+        nick: "mpeer",
+        username: "mpeer",
+        realname: "mpeer",
+    })
+    .await
+    .unwrap();
     peer.send_line("JOIN #multi").await.unwrap();
     loop {
         if peer.next_message().await.unwrap().unwrap().command == "366" {
@@ -230,6 +254,7 @@ async fn lagged_attach_is_not_left_open_with_stale_session_state() {
             Default::default(),
             "attacher",
             "attacher",
+            e6ircd::bouncer::ATTACH_LIVENESS_INTERVAL,
         )
         .await
     });
@@ -277,7 +302,15 @@ fn attach_client(
     let (client_side, server_side) = tokio::io::duplex(64 * 1024);
     let attach_handle = handle.clone();
     let task = tokio::spawn(async move {
-        let _ = attach(server_side, &attach_handle, caps, "attacher", "attacher").await;
+        let _ = attach(
+            server_side,
+            &attach_handle,
+            caps,
+            "attacher",
+            "attacher",
+            e6ircd::bouncer::ATTACH_LIVENESS_INTERVAL,
+        )
+        .await;
     });
     let (cr, cw) = tokio::io::split(client_side);
     (BufReader::new(cr), cw, task)
@@ -309,8 +342,9 @@ async fn self_echo_excluded_for_originator_but_reaches_others_and_buffer() {
     let addr = upstream().await;
     let handle = std::sync::Arc::new(IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "echobot".into(),
-        autojoin: vec!["#echo".into()],
+        nick: "echobot".parse().expect("test nickname"),
+        autojoin: vec!["#echo".parse().expect("test channel")],
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     }));
     wait_connected(&handle).await;
@@ -374,8 +408,9 @@ async fn self_echo_delivered_once_when_negotiated() {
     let addr = upstream().await;
     let handle = std::sync::Arc::new(IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "echobot".into(),
-        autojoin: vec!["#echo".into()],
+        nick: "echobot".parse().expect("test nickname"),
+        autojoin: vec!["#echo".parse().expect("test channel")],
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     }));
     wait_connected(&handle).await;
@@ -405,4 +440,135 @@ async fn self_echo_delivered_once_when_negotiated() {
     })
     .await;
     assert!(second.is_err(), "exactly one echo: {second:?}");
+}
+
+/// Wait for the next command the driver receives.
+async fn next_driver_command(ends: &mut e6ircd::bouncer::DriverEnds) -> String {
+    tokio::time::timeout(std::time::Duration::from_secs(5), ends.next_command())
+        .await
+        .expect("driver command timeout")
+        .expect("driver command queue closed")
+        .line
+}
+
+/// Every IRC client sends `QUIT` when it exits. The upstream session is the
+/// account's always-on presence, shared by every other attachment, so one
+/// client leaving ends that client's attachment and nothing else.
+#[tokio::test(flavor = "multi_thread")]
+async fn attached_client_quit_ends_the_attachment_and_never_reaches_the_driver() {
+    let (handle, mut ends) = NetworkHandle::channels(8);
+    let handle = std::sync::Arc::new(handle);
+    let (mut reader, mut writer, task) = attach_client(&handle, Default::default());
+    read_until(&mut reader, "upstream disconnected").await;
+
+    writer.write_all(b"QUIT :leaving\r\n").await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("QUIT did not end the attachment")
+        .expect("attach task panicked");
+
+    let mut rest = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reader.read_to_string(&mut rest),
+    )
+    .await
+    .expect("the attach stream stayed open after QUIT")
+    .unwrap();
+    assert!(rest.contains("ERROR :"), "{rest}");
+
+    // The first command the driver ever sees is this marker: the QUIT was not
+    // queued ahead of it.
+    assert_eq!(
+        handle.send("PRIVMSG #room :marker"),
+        e6ircd::bouncer::SendOutcome::Sent
+    );
+    assert_eq!(
+        next_driver_command(&mut ends).await,
+        "PRIVMSG #room :marker"
+    );
+}
+
+/// A client's lag-check `PING` is answered by the bouncer itself: the upstream
+/// may be reconnecting or parked, and its `PONG` would otherwise be buffered and
+/// broadcast to the account's other clients.
+#[tokio::test(flavor = "multi_thread")]
+async fn attached_client_ping_is_answered_locally_and_pong_is_consumed() {
+    let (handle, mut ends) = NetworkHandle::channels(8);
+    let handle = std::sync::Arc::new(handle);
+    let (mut reader, mut writer, _task) = attach_client(&handle, Default::default());
+    read_until(&mut reader, "upstream disconnected").await;
+
+    writer
+        .write_all(b"PING :lag 1234\r\nPONG :unsolicited\r\nPRIVMSG #room :marker\r\n")
+        .await
+        .unwrap();
+    let pong = read_until(&mut reader, "PONG").await;
+    assert_eq!(pong, ":*bnc* PONG *bnc* :lag 1234\r\n");
+    assert_eq!(
+        next_driver_command(&mut ends).await,
+        "PRIVMSG #room :marker"
+    );
+}
+
+/// A quiet or parked network writes nothing to its clients, so a half-open
+/// client was never written to, never errored, and held its task, its socket
+/// and its place in `attached_clients` until the next broadcast line. The
+/// bouncer asks; a client that answers stays, and one that does not is let go.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_client_is_pinged_and_then_let_go_while_an_answering_one_stays() {
+    let interval = std::time::Duration::from_millis(100);
+    let (handle, _ends) = NetworkHandle::channels(8);
+    let handle = std::sync::Arc::new(handle);
+    let attach_with_liveness = |handle: &std::sync::Arc<NetworkHandle>| {
+        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+        let handle = handle.clone();
+        let task = tokio::spawn(async move {
+            attach(
+                server_side,
+                &handle,
+                Default::default(),
+                "attacher",
+                "attacher",
+                interval,
+            )
+            .await
+        });
+        let (reader, writer) = tokio::io::split(client_side);
+        (BufReader::new(reader), writer, task)
+    };
+
+    // The half-open client: the socket stays open and says nothing.
+    let (mut silent_reader, _silent_writer, silent) = attach_with_liveness(&handle);
+    // The live client answers every PING it is sent.
+    let (mut live_reader, mut live_writer, live) = attach_with_liveness(&handle);
+    let answering = tokio::spawn(async move {
+        loop {
+            let ping = read_until(&mut live_reader, "PING").await;
+            let token = ping.trim_end().rsplit(':').next().unwrap_or_default();
+            if live_writer
+                .write_all(format!("PONG :{token}\r\n").as_bytes())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+
+    let ping = read_until(&mut silent_reader, "PING").await;
+    assert!(ping.starts_with(":*bnc* PING "), "{ping}");
+    let end = tokio::time::timeout(std::time::Duration::from_secs(5), silent)
+        .await
+        .expect("a client that answers nothing stayed attached")
+        .expect("attach task panicked")
+        .expect("attach returned an I/O error");
+    assert_eq!(end, e6ircd::bouncer::AttachEnd::ClientUnresponsive);
+
+    // Many intervals later the answering client is still there, and it is the
+    // only one counted.
+    tokio::time::sleep(interval * 6).await;
+    assert!(!live.is_finished(), "a client that answers was let go");
+    assert_eq!(handle.runtime_snapshot().attached_clients, 1);
+    answering.abort();
 }

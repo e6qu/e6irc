@@ -4,8 +4,8 @@ use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use e6irc_client::TerminalSafe;
 use e6irc_client::token_cache::{CachedToken, default_token_path, load_token, store_token};
+use e6irc_client::{CleartextCredentials, TerminalSafe};
 use reqwest::{Client, Method, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 
@@ -133,8 +133,14 @@ fn client() -> io::Result<Client> {
         .map_err(transport_error)
 }
 
-pub async fn login(base: &str, cache_path: &Path) -> io::Result<()> {
+pub async fn login(
+    base: &str,
+    cache_path: &Path,
+    cleartext: CleartextCredentials,
+) -> io::Result<()> {
     let base = normalized_base(base)?;
+    // The whole exchange exists to obtain a token, so it is decided up front.
+    token_may_cross(&base, true, cleartext)?;
     let client = client()?;
     let start_response = client
         .post(endpoint(&base, "/api/v1/auth/device/start")?)
@@ -263,12 +269,8 @@ pub async fn api(
     explicit_token: Option<String>,
     body: Option<String>,
     cache_path: Option<&Path>,
+    cleartext: CleartextCredentials,
 ) -> io::Result<()> {
-    let explicit_token = explicit_token.or_else(|| {
-        std::env::var("E6IRC_API_TOKEN")
-            .ok()
-            .filter(|value| !value.is_empty())
-    });
     let cached = if explicit_token.is_none() {
         let resolved_cache;
         let cache_path = match cache_path {
@@ -299,6 +301,7 @@ pub async fn api(
         }
         (None, None) => None,
     };
+    token_may_cross(&base, token.is_some(), cleartext)?;
     let method = Method::from_bytes(method.as_bytes()).map_err(invalid_input)?;
     let mut request = client()?.request(method, endpoint(&base, path)?);
     if let Some(token) = token {
@@ -312,10 +315,11 @@ pub async fn api(
     let response = request.send().await.map_err(transport_error)?;
     let status = response.status();
     let response_body = bounded_body(response, MAX_API_RESPONSE).await?;
-    use std::io::Write as _;
+    use std::io::{IsTerminal as _, Write as _};
     let mut stdout = io::stdout().lock();
-    stdout.write_all(&response_body)?;
-    if !response_body.ends_with(b"\n") {
+    let shown = body_for_stdout(&response_body, stdout.is_terminal());
+    stdout.write_all(&shown)?;
+    if !shown.ends_with(b"\n") {
         stdout.write_all(b"\n")?;
     }
     if status.is_success() {
@@ -328,9 +332,127 @@ pub async fn api(
     }
 }
 
+/// A response body as stdout should receive it. The body is whatever the
+/// server sent, so on a terminal its control characters are neutralized line by
+/// line (the line breaks of a formatted body are kept). Anywhere else the
+/// reader is a program — `e6irc api … | jq`, a file — and gets the exact bytes:
+/// a replacement character there would silently change the data.
+/// Whether a request to `base` may carry (or, for `login`, obtain) a bearer
+/// token. A token is a password with an expiry: over `http://` to another
+/// machine it is readable by everything on the path. The rule, the override
+/// and the meaning of "this machine" are the IRC commands' own
+/// ([`CleartextCredentials`], `e6irc_client::is_loopback_host`), so one flag
+/// means one thing across the tool.
+fn token_may_cross(
+    base: &str,
+    sends_token: bool,
+    cleartext: CleartextCredentials,
+) -> io::Result<()> {
+    let url = reqwest::Url::parse(base).map_err(invalid_input)?;
+    let exposed = sends_token
+        && url.scheme() == "http"
+        && cleartext == CleartextCredentials::Refuse
+        && !url.host_str().is_some_and(e6irc_client::is_loopback_host);
+    if exposed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to send a bearer token in cleartext to {base}; use an https:// base, \
+                 or pass --allow-cleartext-credentials to send it unprotected"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Environment variable consulted for the `api` bearer token, resolved by the
+/// same rules as the IRC secrets (flag, else file, else this).
+pub(crate) const API_TOKEN_ENVIRONMENT: &str = "E6IRC_API_TOKEN";
+
+pub(crate) fn body_for_stdout(body: &[u8], stdout_is_terminal: bool) -> std::borrow::Cow<'_, [u8]> {
+    if !stdout_is_terminal {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let text = String::from_utf8_lossy(body);
+    let safe: Vec<String> = text
+        .split('\n')
+        .map(|line| TerminalSafe::from_untrusted(line).to_string())
+        .collect();
+    std::borrow::Cow::Owned(safe.join("\n").into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bearer token is a password with an expiry. Over `http://` it — and, for
+    /// `login`, the device code that becomes one — is readable by everything on
+    /// the path. Refused before a single request is made, the same way the IRC
+    /// commands refuse SASL without TLS.
+    #[tokio::test]
+    async fn a_bearer_token_never_crosses_plaintext_http_to_another_machine() {
+        async fn refused(call: impl Future<Output = io::Result<()>>) -> io::Error {
+            // TEST-NET-1 is never dialed when the refusal comes first.
+            tokio::time::timeout(Duration::from_secs(3), call)
+                .await
+                .expect("a request was attempted before the refusal")
+                .expect_err("plaintext to another machine")
+        }
+        let cache = std::env::temp_dir().join("e6irc-cli-never-written-token.json");
+        let remote = "http://192.0.2.1";
+        for error in [
+            refused(login(remote, &cache, CleartextCredentials::Refuse)).await,
+            refused(api(
+                "GET",
+                "/api/v1/me",
+                Some(remote),
+                Some("secret-token".into()),
+                None,
+                None,
+                CleartextCredentials::Refuse,
+            ))
+            .await,
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+            assert!(error.to_string().contains("cleartext"), "{error}");
+            assert!(
+                error.to_string().contains("--allow-cleartext-credentials"),
+                "{error}"
+            );
+        }
+        assert!(!cache.exists());
+
+        // What is, and is not, a credential crossing the network in the clear.
+        use CleartextCredentials::{Allow, Refuse};
+        for (base, sends_token, cleartext, allowed) in [
+            ("https://irc.example", true, Refuse, true),
+            ("http://127.0.0.1:8080", true, Refuse, true),
+            ("http://localhost:8080", true, Refuse, true),
+            ("http://[::1]:8080", true, Refuse, true),
+            ("http://irc.example", false, Refuse, true),
+            ("http://irc.example", true, Allow, true),
+            ("http://irc.example", true, Refuse, false),
+            ("http://192.0.2.1", true, Refuse, false),
+        ] {
+            assert_eq!(
+                token_may_cross(base, sends_token, cleartext).is_ok(),
+                allowed,
+                "{base} sends_token={sends_token} {cleartext:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_api_body_is_neutralized_for_a_terminal_and_exact_for_a_program() {
+        let body = "{\n  \"name\": \"x\u{1b}[2J\u{9b}y\u{7f}\"\r\n}\n".as_bytes();
+        assert_eq!(&*body_for_stdout(body, false), body);
+        let shown = String::from_utf8(body_for_stdout(body, true).into_owned()).unwrap();
+        assert!(
+            !shown.chars().any(|c| c.is_control() && c != '\n'),
+            "{shown:?}"
+        );
+        assert_eq!(shown.matches('\n').count(), 3, "line structure is kept");
+    }
 
     #[test]
     fn origins_and_paths_are_not_ambiguous() {
@@ -414,7 +536,13 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("e6irc-device-login-test-{}", std::process::id()));
         let path = directory.join("token.json");
-        login(&format!("http://{address}"), &path).await.unwrap();
+        login(
+            &format!("http://{address}"),
+            &path,
+            CleartextCredentials::Refuse,
+        )
+        .await
+        .expect("plaintext to this machine is never refused");
         server.await.unwrap();
         let cached = load_token(&path).unwrap().unwrap();
         assert_eq!(cached.base_url(), format!("http://{address}"));

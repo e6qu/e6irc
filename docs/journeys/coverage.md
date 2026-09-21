@@ -51,9 +51,9 @@ a design target rather than current behavior.
 | [Operate and protect the network through IRC](irc-and-services.md#operate-and-protect-the-network-through-irc) | Proven | Core operator/ban tests and atomic PostgreSQL policy/audit tests | — |
 | [Connect through IRC-over-WebSocket](irc-and-services.md#connect-through-irc-over-websocket) | Proven | Real WebSocket protocol integration across supported framing modes | A third-party browser client is not driven |
 | [Make network management available](networks-and-bouncer.md#make-network-management-available) | Proven | Configuration validation and live runtime listener management tests | — |
-| [Add Libera Chat, OFTC, EFnet, Snoonet, or a custom IRC network](networks-and-bouncer.md#add-libera-chat-oftc-efnet-snoonet-or-a-custom-irc-network) | Partially proven | Chromium, Firefox, and WebKit verify the optional connection test, PostgreSQL creation, and a local live driver; Chromium verifies the chat dialog's request and session token; real-socket tests verify one dial on rejected credentials and the slow, reason-keeping refusal schedule; the Scaleway container registered and joined channels on OFTC and Ergo Testnet on 2026-08-23 | EFnet and Snoonet did not complete a deployed registration probe; Libera rejected the deployed IPv4 path without an existing verified SASL account |
+| [Add Libera Chat, OFTC, EFnet, Snoonet, or a custom IRC network](networks-and-bouncer.md#add-libera-chat-oftc-efnet-snoonet-or-a-custom-irc-network) | Partially proven | Chromium, Firefox, and WebKit find **Add network** enabled before any test, verify that the optional **Test connection** creates nothing, then verify PostgreSQL creation and a local live driver; Chromium verifies the chat dialog's request and session token and that a known network is added from a nickname alone; real-socket tests verify one dial on rejected credentials and the slow, reason-keeping refusal schedule; the Scaleway container registered and joined channels on OFTC and Ergo Testnet on 2026-08-23 | EFnet and Snoonet did not complete a deployed registration probe; Libera rejected the deployed IPv4 path without an existing verified SASL account |
 | [Register and verify an upstream IRC account](networks-and-bouncer.md#register-and-verify-an-upstream-irc-account) | Proven | Closed API/unit contracts plus real-driver Chromium REGISTER/VERIFY, visible replies, secret redaction, sealed credential save, re-enable, SASL PLAIN, and rejoin | A third-party provider's actual email delivery and address policy remain provider-controlled |
-| [Read the raw IRC protocol while it happens](networks-and-bouncer.md#read-the-raw-irc-protocol-while-it-happens) | Partially proven | The sidebar entry and its states are covered by the Chromium/Firefox/WebKit visual and axe accessibility suites; the parked-state guidance and the sensitive-command redaction classifier both have unit tests | No test drives a live upstream NickServ exchange and then reads it back off the tape; the closest real-driver evidence is the registration journey above |
+| [Read the raw IRC protocol while it happens](networks-and-bouncer.md#read-the-raw-irc-protocol-while-it-happens) | Partially proven | Chromium, Firefox, and WebKit each open **Server log** against a local live upstream, read a replayed `PRIVMSG` off it verbatim, and close it again; the Chromium visual and axe suites cover the sidebar entry and its states; the parked-state guidance and the sensitive-command redaction classifier both have unit tests | No test drives a live upstream NickServ exchange and then reads it back off the Server log; the closest real-driver evidence is the registration journey above |
 | [Diagnose an upstream connection](networks-and-bouncer.md#diagnose-an-upstream-connection) | Proven | Runtime snapshot/error-ledger tests, bounded upstream registration diagnostics, terminal-send refusal, and Chromium transcript inspection | — |
 | [Attach any IRC client to an owned network](networks-and-bouncer.md#attach-any-irc-client-to-an-owned-network) | Proven | Real listener/upstream/PostgreSQL authentication, routing, and refusal tests | — |
 | [Persist and replay while detached or across restart](networks-and-bouncer.md#persist-and-replay-while-detached-or-across-restart) | Proven | Real PostgreSQL restart, trim, deletion, and wire-form tests | — |
@@ -131,7 +131,8 @@ their evidence. Local oracle success is not provider qualification.
 
 Source portability and multi-architecture containers are proven. The
 repository ships a validated hardened systemd unit; every published
-architecture image has signed build provenance and an SPDX SBOM attestation,
+architecture image has signed build provenance and an SPDX software bill of
+materials (SBOM) attestation,
 and the assembled manifest has signed provenance. Matching version tags publish
 the daemon, CLI, and TUI for the same six native targets in deterministic
 archives with per-archive build provenance and SHA-256 checksums. Musl/static
@@ -149,13 +150,15 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 
 | CI job | Product risk addressed |
 |---|---|
-| `lint` | formatting, warnings, all-feature and per-bridge compilation, frontend unit tests/build, no-op/dead-public/duplication/no-deferral guards |
-| `deny` | licenses, advisories, bans, and dependency-source policy |
+| `lint` | formatting, warnings, all-feature and per-bridge compilation, frontend unit tests/build; shell syntax of every script; the backup/restore, load-sweep, qualification, migration-integrity, and no-deferral guard contracts; no-op/dead-code/dead-public/duplication/no-deferral/fuzz-lock/journey/client-capability/template-accessibility/API-first guards |
+| `deny` | licenses, advisories, bans (including one version of each network stack), and dependency-source policy, for the workspace and for the separate `fuzz/` package |
 | `test` | all-feature workspace behavior on six OS/architecture cells |
 | `coverage` | all-feature workspace line-coverage regression floor |
-| `db-tests` | real PostgreSQL storage/all-feature HTTP bridge management/OIDC/browser/BNC/`ws_ui`/CLI journeys |
+| `db-tests` | real PostgreSQL storage/all-feature HTTP bridge management/OIDC/browser/BNC/`ws_ui`/`ws_scope`/CLI journeys |
+| `cross-browser` | the complete OIDC, console, network, and chat browser journey repeated in Firefox and WebKit against the real daemon, PostgreSQL, and a local live upstream |
+| `visual-regression` | Chromium visual snapshots and axe accessibility checks of the chat and console shells against the development server |
 | `postgres-recovery` | isolated empty PostgreSQL first boot plus live stop/start degradation and recovery under HTTP and IRC traffic |
-| `production-container` | deployable image and embedded web-client shape |
+| `production-container` | deployable image and embedded web-client shape; the built distroless image booted with its real command against PostgreSQL to a served `/healthz`, a ready `/readyz`, the login page, its own `healthcheck` probe, user 10001, no shell, a missing variable refused by name, and a clean exit on SIGTERM within the stop budget |
 | `load-smoke` | real daemon with 64 clients, eight channels, duplicate-proof exact fan-out, generous numeric thresholds, and graceful shutdown |
 | `native-client-journeys` | deterministic archive contract plus real PTY render/message/terminal-restore journey |
 | `shauth-sso` | exact external single-sign-on/logout integration |
@@ -164,11 +167,15 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 | `loom` | queue concurrency interleavings |
 | `fuzz-smoke` | parser, serializer, stateful core, multi-client core, and hostile TUI server output |
 | `size-report` | informational release binary-size visibility |
+| `ci-ok` | the single required check: it needs every job above and fails unless each one succeeded, so a failed, cancelled, or skipped job cannot merge green; the release workflow publishes only from a `main` commit whose CI run concluded successfully |
 
-The `Release image and native archives` workflow publishes direct amd64/arm64
+The `Release image and native archives` workflow runs when CI completes and
+publishes only from a `main` commit whose CI concluded successfully, building
+that exact commit. It publishes direct amd64/arm64
 images, verifies the assembled manifest, emits signed build/SBOM attestations,
 verifies those attestations as a consumer, and prunes complete old image
-groups. On a matching version tag it also builds all six native targets,
+groups. On a matching version tag, and only when the tagged commit has a
+successful CI run on `main`, it also builds all six native targets,
 attests each deterministic archive, checks that the complete six-file set
 arrived, writes sorted SHA-256 checksums, and creates the GitHub release.
 

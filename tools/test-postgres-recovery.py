@@ -8,10 +8,12 @@ import os
 import pathlib
 import signal
 import socket
+import stat
 import subprocess
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -20,8 +22,52 @@ SERVER = pathlib.Path(
     os.environ.get("E6IRC_TEST_SERVER_BINARY", ROOT / "target/debug/e6ircd")
 ).resolve()
 POSTGRES_IMAGE = os.environ.get("E6IRC_TEST_POSTGRES_IMAGE", "postgres:18-alpine")
-POSTGRES_PASSWORD = "recovery-test-password"
+# Every reserved URL delimiter appears in the password, so a consumer that
+# forgets to percent-decode it (or that splits the URL on the wrong `@`, `:` or
+# `/`) cannot authenticate.
+POSTGRES_PASSWORD = "recovery test:p@ss/word#1"
+POSTGRES_PASSWORD_IN_URL = urllib.parse.quote(POSTGRES_PASSWORD, safe="")
+POSTGRES_DATABASE = "e6irc_recovery"
+# PostgreSQL listens off its default port inside the container, so a client
+# there reaches it only by honoring the port in the database URL.
+POSTGRES_CONTAINER_PORT = 5544
 TIMEOUT = 30.0
+
+# Stands in for `pg_dump`, `psql` and `pg_restore` on PATH: the real client of
+# the server's own version runs inside the PostgreSQL container, receiving the
+# connection exactly as the script under test exported it. Files cross the
+# container boundary on standard input and output.
+CONTAINER_CLIENT = """#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+
+tool = os.path.basename(sys.argv[0])
+arguments = sys.argv[1:]
+with open(os.environ["E6IRC_TEST_CLIENT_LOG"], "a", encoding="utf-8") as log:
+    log.write(" ".join([tool, *arguments]) + "\\n")
+forwarded = []
+for name in sorted(os.environ):
+    if name.startswith("PG"):
+        forwarded += ["--env", name]
+command = [
+    "docker", "exec", "--interactive", *forwarded,
+    os.environ["E6IRC_TEST_POSTGRES_CONTAINER"], tool,
+]
+standard_input = subprocess.DEVNULL
+standard_output = None
+if tool == "pg_dump":
+    target = [a for a in arguments if a.startswith("--file=")]
+    arguments = [a for a in arguments if not a.startswith("--file=")]
+    standard_output = open(target[0][len("--file="):], "wb")
+elif tool == "pg_restore":
+    standard_input = open(arguments.pop(), "rb")
+sys.exit(
+    subprocess.run(
+        command + arguments, stdin=standard_input, stdout=standard_output
+    ).returncode
+)
+"""
 
 
 def available_port() -> int:
@@ -40,16 +86,53 @@ def docker(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[s
     )
 
 
-def docker_bytes(
-    *arguments: str, input_bytes: bytes | None = None
-) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(
-        ["docker", *arguments],
-        check=True,
-        input=input_bytes,
-        capture_output=True,
+def container_sql(container: str, statement: str) -> str:
+    return docker(
+        "exec",
+        container,
+        "psql",
+        "--port",
+        str(POSTGRES_CONTAINER_PORT),
+        "--username",
+        "postgres",
+        "--dbname",
+        POSTGRES_DATABASE,
+        "--tuples-only",
+        "--no-align",
+        "--command",
+        statement,
+    ).stdout.strip()
+
+
+def install_container_clients(directory: pathlib.Path) -> None:
+    directory.mkdir()
+    for tool in ("pg_dump", "psql", "pg_restore"):
+        client = directory / tool
+        client.write_text(CONTAINER_CLIENT, encoding="utf-8")
+        client.chmod(client.stat().st_mode | stat.S_IXUSR)
+
+
+def run_database_tool(
+    script: str,
+    *arguments: str,
+    environment: dict[str, str],
+    expect_success: bool = True,
+) -> str:
+    """Run one shipped backup/restore script and return everything it printed."""
+    result = subprocess.run(
+        [str(ROOT / "tools" / script), *arguments],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
         timeout=TIMEOUT,
     )
+    output = result.stdout
+    for secret in (POSTGRES_PASSWORD, POSTGRES_PASSWORD_IN_URL):
+        assert secret not in output, f"{script} printed the database password"
+    assert (result.returncode == 0) == expect_success, (script, arguments, output)
+    return output
 
 
 def wait_for_postgres(container: str) -> None:
@@ -62,10 +145,12 @@ def wait_for_postgres(container: str) -> None:
             "pg_isready",
             "--host",
             "127.0.0.1",
+            "--port",
+            str(POSTGRES_CONTAINER_PORT),
             "--username",
             "postgres",
             "--dbname",
-            "e6irc_recovery",
+            POSTGRES_DATABASE,
             check=False,
         )
         if result.returncode == 0:
@@ -167,8 +252,8 @@ def main() -> None:
     http_port = available_port()
     origin = f"http://127.0.0.1:{http_port}"
     database_url = (
-        f"postgres://postgres:{POSTGRES_PASSWORD}@127.0.0.1:"
-        f"{postgres_port}/e6irc_recovery"
+        f"postgres://postgres:{POSTGRES_PASSWORD_IN_URL}@127.0.0.1:"
+        f"{postgres_port}/{POSTGRES_DATABASE}"
     )
     clients: list[IrcClient] = []
     server: subprocess.Popen[bytes] | None = None
@@ -201,10 +286,12 @@ def main() -> None:
                 "--env",
                 f"POSTGRES_PASSWORD={POSTGRES_PASSWORD}",
                 "--env",
-                "POSTGRES_DB=e6irc_recovery",
+                f"POSTGRES_DB={POSTGRES_DATABASE}",
                 "--publish",
-                f"127.0.0.1:{postgres_port}:5432",
+                f"127.0.0.1:{postgres_port}:{POSTGRES_CONTAINER_PORT}",
                 POSTGRES_IMAGE,
+                "-c",
+                f"port={POSTGRES_CONTAINER_PORT}",
             )
             container_created = True
             wait_for_postgres(container)
@@ -225,38 +312,19 @@ def main() -> None:
                 }, ready
 
                 migration_count = int(
-                    docker(
-                        "exec",
+                    container_sql(
                         container,
-                        "psql",
-                        "--username",
-                        "postgres",
-                        "--dbname",
-                        "e6irc_recovery",
-                        "--tuples-only",
-                        "--no-align",
-                        "--command",
                         "SELECT count(*) FROM _sqlx_migrations WHERE success",
-                    ).stdout.strip()
+                    )
                 )
                 expected_migrations = len(list((ROOT / "migrations").glob("*.sql")))
                 assert migration_count == expected_migrations, (
                     migration_count,
                     expected_migrations,
                 )
-                settings_count = docker(
-                    "exec",
-                    container,
-                    "psql",
-                    "--username",
-                    "postgres",
-                    "--dbname",
-                    "e6irc_recovery",
-                    "--tuples-only",
-                    "--no-align",
-                    "--command",
-                    "SELECT count(*) FROM server_settings",
-                ).stdout.strip()
+                settings_count = container_sql(
+                    container, "SELECT count(*) FROM server_settings"
+                )
                 assert settings_count == "1", settings_count
 
                 alice = IrcClient(irc_port, "alice")
@@ -327,87 +395,118 @@ def main() -> None:
 
             # Back up after real migrations, managed import, traffic, and a
             # device grant. Destroy two durable proof families, transactionally
-            # restore the custom archive, and boot the daemon from it.
+            # restore the custom archive, and boot the daemon from it. The
+            # shipped scripts do all of it, given nothing but a database URL.
             expected_grants = int(
-                docker(
-                    "exec",
-                    container,
-                    "psql",
-                    "--username",
-                    "postgres",
-                    "--dbname",
-                    "e6irc_recovery",
-                    "--tuples-only",
-                    "--no-align",
-                    "--command",
-                    "SELECT count(*) FROM device_grants",
-                ).stdout.strip()
+                container_sql(container, "SELECT count(*) FROM device_grants")
             )
             assert expected_grants >= 1, expected_grants
-            archive = docker_bytes(
-                "exec",
+
+            # The container's own bridge address, not its loopback: the image
+            # trusts loopback clients, and only a password-checked connection
+            # proves the scripts delivered the password.
+            container_address = docker(
+                "inspect",
+                "--format",
+                "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
                 container,
-                "pg_dump",
-                "--username",
-                "postgres",
-                "--dbname",
-                "e6irc_recovery",
-                "--format=custom",
-                "--no-owner",
-                "--no-privileges",
-            ).stdout
-            assert len(archive) > 1024, len(archive)
-            docker_bytes(
-                "exec",
-                "--interactive",
-                container,
-                "pg_restore",
-                "--list",
-                input_bytes=archive,
+            ).stdout.strip()
+            assert container_address, "PostgreSQL container has no network address"
+
+            def tool_url(password: str, sslmode: str = "disable") -> str:
+                return (
+                    f"postgresql://postgres:{password}@{container_address}:"
+                    f"{POSTGRES_CONTAINER_PORT}/{POSTGRES_DATABASE}"
+                    f"?sslmode={sslmode}&application_name=e6irc%20recovery"
+                )
+
+            client_log = temporary / "postgres-clients.log"
+            install_container_clients(temporary / "bin")
+            tool_environment = {
+                **{
+                    name: value
+                    for name, value in os.environ.items()
+                    if not name.startswith("PG")
+                },
+                "PATH": f"{temporary / 'bin'}{os.pathsep}{os.environ['PATH']}",
+                "E6IRC_TEST_POSTGRES_CONTAINER": container,
+                "E6IRC_TEST_CLIENT_LOG": str(client_log),
+                "E6IRC_DATABASE_URL": tool_url(POSTGRES_PASSWORD_IN_URL),
+            }
+            backup = temporary / "e6irc.dump"
+
+            rejected = run_database_tool(
+                "backup-postgres.sh",
+                str(temporary / "rejected.dump"),
+                environment={
+                    **tool_environment,
+                    "E6IRC_DATABASE_URL": tool_url("not-the-password"),
+                },
+                expect_success=False,
             )
-            docker(
-                "exec",
-                container,
-                "psql",
-                "--username",
-                "postgres",
-                "--dbname",
-                "e6irc_recovery",
-                "--command",
-                "DELETE FROM device_grants; DELETE FROM server_settings",
+            assert "password authentication failed" in rejected, rejected
+            assert not (temporary / "rejected.dump").exists()
+
+            # This server offers no TLS, so a backup that asks for it must
+            # fail: a dropped `sslmode` would connect in the clear instead.
+            unencrypted = run_database_tool(
+                "backup-postgres.sh",
+                str(temporary / "unencrypted.dump"),
+                environment={
+                    **tool_environment,
+                    "E6IRC_DATABASE_URL": tool_url(
+                        POSTGRES_PASSWORD_IN_URL, sslmode="require"
+                    ),
+                },
+                expect_success=False,
             )
-            docker_bytes(
-                "exec",
-                "--interactive",
-                container,
-                "pg_restore",
-                "--exit-on-error",
-                "--single-transaction",
-                "--clean",
-                "--if-exists",
-                "--no-owner",
-                "--no-privileges",
-                "--username",
-                "postgres",
-                "--dbname",
-                "e6irc_recovery",
-                input_bytes=archive,
+            assert "server does not support SSL" in unencrypted, unencrypted
+            assert not (temporary / "unencrypted.dump").exists()
+
+            run_database_tool(
+                "backup-postgres.sh", str(backup), environment=tool_environment
             )
-            restored = docker(
-                "exec",
+            assert backup.stat().st_size > 1024, backup.stat().st_size
+            container_sql(
+                container, "DELETE FROM device_grants; DELETE FROM server_settings"
+            )
+
+            refused = run_database_tool(
+                "restore-postgres.sh",
+                str(backup),
+                "another_database",
+                environment={
+                    **tool_environment,
+                    "E6IRC_RESTORE_CONFIRM": "another_database",
+                },
+                expect_success=False,
+            )
+            assert f"connected database is {POSTGRES_DATABASE}" in refused, refused
+            assert (
+                container_sql(container, "SELECT count(*) FROM server_settings") == "0"
+            ), "a refused restore changed the database"
+
+            run_database_tool(
+                "restore-postgres.sh",
+                str(backup),
+                POSTGRES_DATABASE,
+                environment={
+                    **tool_environment,
+                    "E6IRC_RESTORE_CONFIRM": POSTGRES_DATABASE,
+                },
+            )
+            restored = container_sql(
                 container,
-                "psql",
-                "--username",
-                "postgres",
-                "--dbname",
-                "e6irc_recovery",
-                "--tuples-only",
-                "--no-align",
-                "--command",
                 "SELECT (SELECT count(*) FROM server_settings), "
                 "(SELECT count(*) FROM device_grants)",
-            ).stdout.strip()
+            )
             assert restored == f"1|{expected_grants}", restored
+            client_arguments = client_log.read_text(encoding="utf-8")
+            for secret in (POSTGRES_PASSWORD, POSTGRES_PASSWORD_IN_URL, "postgresql://"):
+                assert secret not in client_arguments, (
+                    "a PostgreSQL client received the database URL or password "
+                    "as a command argument"
+                )
 
             with server_log_path.open("ab") as server_log:
                 server = subprocess.Popen(
@@ -422,13 +521,15 @@ def main() -> None:
                 assert server.wait(timeout=10) == 0
 
             server_output = server_log_path.read_text(encoding="utf-8", errors="replace")
-            assert POSTGRES_PASSWORD not in server_output, (
-                "database password leaked into daemon output"
-            )
+            for secret in (POSTGRES_PASSWORD, POSTGRES_PASSWORD_IN_URL):
+                assert secret not in server_output, (
+                    "database password leaked into daemon output"
+                )
             print(
                 "PostgreSQL recovery journey passed: fresh boot, migrations, "
                 "bounded readiness, hot IRC traffic, visible dependency failure, "
-                "recovery, graceful shutdown, custom backup, transactional restore, "
+                "recovery, graceful shutdown, scripted custom backup, guarded "
+                "transactional restore, "
                 "and restored boot"
             )
         except Exception:

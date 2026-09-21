@@ -89,18 +89,15 @@ pub(super) fn send_whox_row(
 
 /// WHO status flags: H (here) or G (gone/away), `*` for opers, then the
 /// channel prefix sigil.
-pub(super) fn who_flags(session: &crate::core::state::Session, sigil: &str) -> String {
-    let here = if session.away.is_some() { "G" } else { "H" };
-    let star = if session.oper { "*" } else { "" };
-    let bot = if session.bot { "B" } else { "" };
+pub(super) fn who_flags(away: bool, oper: bool, bot: bool, sigil: &str) -> String {
+    let here = if away { "G" } else { "H" };
+    let star = if oper { "*" } else { "" };
+    let bot = if bot { "B" } else { "" };
     format!("{here}{star}{bot}{sigil}")
 }
 
 fn who_flags_profile(profile: &crate::core::state::ChannelMemberProfile, sigil: &str) -> String {
-    let here = if profile.away { "G" } else { "H" };
-    let star = if profile.oper { "*" } else { "" };
-    let bot = if profile.bot { "B" } else { "" };
-    format!("{here}{star}{bot}{sigil}")
+    who_flags(profile.away, profile.oper, profile.bot, sigil)
 }
 
 struct WhoRowData {
@@ -184,7 +181,7 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                             flags: who_flags_profile(profile, sigil),
                             realname: profile.realname.clone(),
                             account: profile.account.clone(),
-                            idle_secs: now.saturating_sub(profile.last_active).as_secs(),
+                            idle_secs: now.saturating_sub(profile.last_active.get()).as_secs(),
                         }
                     })
                     .collect()
@@ -223,46 +220,41 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         // under the server casemapping.
         let match_all = mask == "*" || mask == "0";
         let casemap = state.casemap;
-        let targets: Vec<ConnId> = state
-            .sessions
-            .iter()
-            .filter(|(_, s)| s.is_registered())
-            .filter(|(_, s)| !opers_only || s.oper)
-            .filter(|(_, s)| {
-                match_all || {
-                    let nick = s.nick().unwrap_or("");
-                    e6irc_proto::mask::matches(casemap, mask, nick)
-                        || e6irc_proto::mask::matches(casemap, mask, &s.host)
-                }
-            })
-            .map(|(c, _)| *c)
-            .collect();
         // Invisible users are hidden unless the requester is themselves, shares
         // a channel, or named them *by their exact nick*. "Named exactly" means
         // a wildcard-free mask that matches the nick specifically: the mask is
-        // also matched against the host above, so a literal host like
-        // `WHO 10.0.0.5` (no wildcards) would otherwise reveal every `+i` user
-        // on that host, and a nick wildcard like `bo*` must still hide them.
+        // also matched against the host, so a literal host like `WHO 10.0.0.5`
+        // (no wildcards) would otherwise reveal every `+i` user on that host,
+        // and a nick wildcard like `bo*` must still hide them.
         let is_wildcard = match_all || mask.contains('*') || mask.contains('?');
-        let targets: Vec<ConnId> = targets
+        // Every registered user, on whichever shard: the published records.
+        let targets: Vec<_> = state
+            .registered_users()
             .into_iter()
-            .filter(|&peer| {
-                let s = &state.sessions[&peer];
-                let named_by_nick = !is_wildcard
-                    && e6irc_proto::mask::matches(casemap, mask, s.nick().unwrap_or(""));
-                peer == conn || !s.invisible || state.share_channel(conn, peer) || named_by_nick
+            .filter(|user| !opers_only || user.oper)
+            .filter(|user| {
+                match_all
+                    || e6irc_proto::mask::matches(casemap, mask, &user.nick)
+                    || e6irc_proto::mask::matches(casemap, mask, &user.host)
+            })
+            .filter(|user| {
+                let named_by_nick =
+                    !is_wildcard && e6irc_proto::mask::matches(casemap, mask, &user.nick);
+                user.conn() == conn
+                    || !user.invisible
+                    || state.share_channel(conn, user.conn())
+                    || named_by_nick
             })
             .collect();
-        for peer in targets {
-            let s = &state.sessions[&peer];
+        for user in targets {
             let row = WhoRowData {
-                user: s.user().map(String::from).expect("registered"),
-                host: s.host.clone(),
-                nick: s.nick().map(String::from).expect("registered"),
-                realname: s.realname().map(String::from).expect("registered"),
-                account: s.account.clone(),
-                flags: who_flags(s, ""),
-                idle_secs: now.saturating_sub(s.last_active).as_secs(),
+                user: user.user.clone(),
+                host: user.host.clone(),
+                nick: user.nick.clone(),
+                realname: user.realname.clone(),
+                account: user.account.clone(),
+                flags: who_flags(user.away.is_some(), user.oper, user.bot, ""),
+                idle_secs: now.saturating_sub(user.last_active.get()).as_secs(),
             };
             match &whox {
                 Some(req) => send_whox_row(
@@ -325,89 +317,57 @@ pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     let key = state.nick_key(target);
-    match state.registered_peer(&key) {
-        Some(peer) => {
-            let s = &state.sessions[&peer];
-            let (nick, user, host, realname) = (
-                s.nick().map(String::from).expect("registered"),
-                s.user().map(String::from).expect("registered"),
-                s.host.clone(),
-                s.realname().map(String::from).expect("registered"),
-            );
-            let mut chans: Vec<String> = s
-                .channels
-                .iter()
-                .filter_map(|k| {
-                    let chan = state.channels.get(k)?;
-                    let modes = chan.member(peer)?;
-                    // A +s (secret) channel is disclosed only to a requester
-                    // who also shares it, so WHOIS can't enumerate hidden
-                    // channels a target is in.
-                    if chan.hidden_from(conn).is_some() {
-                        return None;
-                    }
-                    let sigil = if modes.op {
-                        "@"
-                    } else if modes.voice {
-                        "+"
-                    } else {
-                        ""
-                    };
-                    Some(format!("{sigil}{}", chan.name))
-                })
-                .collect();
-            chans.sort();
+    // Answered from the user's published record and the channel owners'
+    // published facts, never from this shard's own sessions and channels: the
+    // user and their channels may live on any shard, and the answer must not
+    // depend on which.
+    match state.registered_user(&key) {
+        Some(user) => {
+            let (nick, user_name, host, realname) =
+                (&user.nick, &user.user, &user.host, &user.realname);
+            let chans = state.whois_channels(user.conn(), conn);
             let server = state.config.server_name.clone();
             let network = state.config.network_name.clone();
             state.numeric(
                 conn,
                 RPL_WHOISUSER,
-                &[&nick, &user, &host, "*"],
-                Some(&realname),
+                &[nick, user_name, host, "*"],
+                Some(realname),
             );
             // Split across as many 319 lines as needed so none exceeds the
             // 512-byte wire limit (the same guard NAMES applies to 353).
-            state.numeric_list(conn, RPL_WHOISCHANNELS, &[&nick], &chans, ' ');
-            if state.sessions[&peer].bot {
-                state.numeric(conn, RPL_WHOISBOT, &[&nick], Some("is a bot"));
+            state.numeric_list(conn, RPL_WHOISCHANNELS, &[nick], &chans, ' ');
+            if user.bot {
+                state.numeric(conn, RPL_WHOISBOT, &[nick], Some("is a bot"));
             }
-            if state.sessions[&peer].oper {
-                state.numeric(
-                    conn,
-                    RPL_WHOISOPERATOR,
-                    &[&nick],
-                    Some("is an IRC operator"),
-                );
+            if user.oper {
+                state.numeric(conn, RPL_WHOISOPERATOR, &[nick], Some("is an IRC operator"));
             }
-            state.numeric(conn, RPL_WHOISSERVER, &[&nick, &server], Some(&network));
-            {
-                let s = &state.sessions[&peer];
-                // RPL_WHOISIDLE reports seconds idle (elapsed monotonic time
-                // since last activity) and a Unix-*second* signon *timestamp*
-                // (wall clock) — the two clocks the type split keeps separate.
-                let idle = (state.config.mono_clock)()
-                    .saturating_sub(s.last_active)
-                    .as_secs();
-                let signon = s.signon.as_secs();
-                state.numeric(
-                    conn,
-                    RPL_WHOISIDLE,
-                    &[&nick, &idle.to_string(), &signon.to_string()],
-                    Some("seconds idle, signon time"),
-                );
+            state.numeric(conn, RPL_WHOISSERVER, &[nick, &server], Some(&network));
+            // RPL_WHOISIDLE reports seconds idle (elapsed monotonic time since
+            // last activity) and a Unix-*second* signon *timestamp* (wall
+            // clock) — the two clocks the type split keeps separate.
+            let idle = (state.config.mono_clock)()
+                .saturating_sub(user.last_active.get())
+                .as_secs();
+            state.numeric(
+                conn,
+                RPL_WHOISIDLE,
+                &[nick, &idle.to_string(), &user.signon.as_secs().to_string()],
+                Some("seconds idle, signon time"),
+            );
+            if let Some(away) = &user.away {
+                state.numeric(conn, RPL_AWAY, &[nick], Some(away));
             }
-            if let Some(away) = state.sessions[&peer].away.clone() {
-                state.numeric(conn, RPL_AWAY, &[&nick], Some(&away));
-            }
-            if let Some(account) = state.sessions[&peer].account.clone() {
+            if let Some(account) = &user.account {
                 state.numeric(
                     conn,
                     RPL_WHOISACCOUNT,
-                    &[&nick, &account],
+                    &[nick, account],
                     Some("is logged in as"),
                 );
             }
-            state.numeric(conn, RPL_ENDOFWHOIS, &[&nick], Some("End of /WHOIS list"));
+            state.numeric(conn, RPL_ENDOFWHOIS, &[nick], Some("End of /WHOIS list"));
         }
         None => {
             // `target` is raw client input; clip_echo keeps an empty or
@@ -458,7 +418,13 @@ pub(super) fn cmd_setname(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // SETNAME echoes to the originator (its own client sees the change), then
     // to the channel-peer / extended-monitor fan-out.
     state.send_timed(conn, &line);
-    notify_event(state, conn, &line, |c| c.setname, false);
+    notify_event(
+        state,
+        conn,
+        &line,
+        crate::core::state::UserEventAudience::Setname,
+        false,
+    );
 }
 
 // ---- WHOWAS -------------------------------------------------------------
@@ -476,13 +442,7 @@ pub(super) fn cmd_whowas(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     };
     let key = state.nick_key(target);
     let server = state.config.server_name.clone();
-    let matches: Vec<crate::core::state::WhowasEntry> = state
-        .whowas
-        .iter()
-        .filter(|e| state.nick_key(&e.nick) == key)
-        .take(limit)
-        .cloned()
-        .collect();
+    let matches = state.whowas.of(state.casemap, &key, limit);
     if matches.is_empty() {
         // Raw client input; keep an empty/':'-leading target from breaking the
         // echo's framing.
@@ -635,10 +595,7 @@ pub(super) fn cmd_ison(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let online: Vec<String> = p
         .iter()
         .flat_map(|arg| arg.split_whitespace())
-        .filter_map(|nick| {
-            let peer = state.registered_peer(&state.nick_key(nick))?;
-            state.sessions[&peer].nick().map(String::from)
-        })
+        .filter_map(|nick| Some(state.registered_user(&state.nick_key(nick))?.nick.clone()))
         .collect();
     // RPL_ISON is a single reply by RFC 2812 (splitting it would be
     // non-conformant), yet the echoed list is bounded only by the input frame

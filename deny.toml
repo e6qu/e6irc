@@ -17,6 +17,16 @@ allow = [
     "CDLA-Permissive-2.0",
 ]
 
+# libfuzzer-sys bundles LLVM's libFuzzer runtime, part of which is under the
+# NCSA licence: permissive, OSI-approved, FSF-free, and GPL-compatible. It is
+# allowed for that crate alone. The crate is in the `fuzz/` package only — a
+# test harness that is never compiled into a shipped binary — and that
+# manifest is checked against this same policy in CI. The workspace check
+# therefore reports this exception as not encountered; that warning is expected.
+[[licenses.exceptions]]
+crate = "libfuzzer-sys"
+allow = ["NCSA"]
+
 [bans]
 # Transitive minor/patch version duplication is unavoidable across a
 # large tree (sqlx + openidconnect + argon2 pull differing versions of
@@ -28,6 +38,20 @@ deny = [
     { crate = "openssl" },
     { crate = "openssl-sys" },
     { crate = "native-tls" },
+    # One of each network stack in the binary (DESIGN §1), enforced rather than
+    # warned about. A direct dependency that gets ahead of what axum or the
+    # openidconnect chain still uses is held back in its manifest until they
+    # move: tokio-tungstenite stays on 0.29 while axum 0.8 serves WebSockets
+    # through it, and reqwest on 0.12 while oauth2 5 does.
+    { crate = "tokio-tungstenite", deny-multiple-versions = true },
+    { crate = "tungstenite", deny-multiple-versions = true },
+    { crate = "reqwest", deny-multiple-versions = true },
+    { crate = "hyper", deny-multiple-versions = true },
+    { crate = "axum", deny-multiple-versions = true },
+    { crate = "rustls", deny-multiple-versions = true },
+    { crate = "tokio-rustls", deny-multiple-versions = true },
+    { crate = "tokio", deny-multiple-versions = true },
+    { crate = "sqlx", deny-multiple-versions = true },
 ]
 
 [advisories]

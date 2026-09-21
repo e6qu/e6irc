@@ -31,5 +31,23 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
+# It binds sockets, reads its configuration, and connects out. It opens no
+# device (randomness comes from the pseudo-devices PrivateDevices keeps), starts
+# no process, creates no namespace, uses no System V IPC, and reads nothing
+# under /proc but its own entries.
+PrivateDevices=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RemoveIPC=true
+SystemCallArchitectures=native
+# A call outside the set fails with EPERM instead of killing the daemon, so a
+# C library newer than this systemd's idea of @system-service degrades to its
+# fallback path rather than to a crash loop.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
 [Install]
 WantedBy=multi-user.target

@@ -6,106 +6,44 @@ use super::*;
 
 pub(super) const MONITOR_LIMIT: usize = 100;
 
-/// Remove `conn` from the watcher set for `key`, dropping the set if it
-/// becomes empty. Shared by MONITOR − and MONITOR C.
-fn unmonitor(state: &mut ServerState, conn: ConnId, key: &crate::core::state::NickKey) {
-    if let Some(watchers) = state.monitors.get_mut(key) {
-        watchers.remove(&conn);
-        if watchers.is_empty() {
-            state.monitors.remove(key);
-        }
-    }
-}
-
-fn monitor_watchers(state: &ServerState, nick: &str) -> Option<Vec<ConnId>> {
-    let key = state.nick_key(nick);
-    state
-        .monitors
-        .get(&key)
-        .map(|watchers| watchers.iter().copied().collect())
-}
-
-/// Notify everyone monitoring `nick` that it is now (`online`) or no
-/// longer (`offline`) present. `subject` is the full prefix when
-/// online, the bare nick when offline (per the monitor spec).
+/// Notify everyone monitoring `nick`, on whichever shard they live, that it
+/// is now (`online`) or no longer (`offline`) present. The subject is the full
+/// prefix when online, the bare nick when offline (per the monitor spec).
 pub(crate) fn monitor_notify(state: &mut ServerState, nick: &str, online: bool) {
     let key = state.nick_key(nick);
-    let Some(watchers) = monitor_watchers(state, nick) else {
-        return;
-    };
-    let subject = if online {
-        state
-            .registered_peer(&key)
-            .map(|c| state.sessions[&c].prefix())
-            .unwrap_or_else(|| nick.to_string())
-    } else {
-        nick.to_string()
-    };
-    let code = if online {
+    let subject = online
+        .then(|| state.registered_user(&key))
+        .flatten()
+        .map(|user| user.prefix())
+        .unwrap_or_else(|| nick.to_string());
+    let code = e6irc_proto::numerics::code_str(if online {
         RPL_MONONLINE
     } else {
         RPL_MONOFFLINE
-    };
-    for watcher in watchers {
-        state.numeric(watcher, code, &[], Some(&subject));
-    }
-}
-
-/// extended-monitor: watchers of `nick` also see the user's AWAY, ACCOUNT,
-/// SETNAME, and CHGHOST lines, each event still gated on the watcher holding
-/// that event's own cap. `already` is the recipient set an adjacent
-/// channel-peer fan-out just served, so a watcher who also shares a channel
-/// with the subject is never sent the same line twice.
-pub(crate) fn monitor_event(
-    state: &mut ServerState,
-    nick: &str,
-    line: &str,
-    event_cap: fn(&crate::core::state::Caps) -> bool,
-    already: &std::collections::HashSet<ConnId>,
-) {
-    let Some(watchers) = monitor_watchers(state, nick) else {
-        return;
-    };
-    for watcher in watchers {
-        if already.contains(&watcher) {
+    });
+    let server = state.config.server_name.clone();
+    for watcher in state.monitors.watchers(&key) {
+        let Some(watcher) = state.user(watcher) else {
             continue;
-        }
-        let wants = state
-            .sessions
-            .get(&watcher)
-            .is_some_and(|s| s.caps.extended_monitor && event_cap(&s.caps));
-        if wants {
-            state.send_timed(watcher, line);
-        }
+        };
+        let line = format!(":{server} {code} {} :{subject}\r\n", watcher.nick);
+        state.send_recipient_uncaptured(watcher.recipient, bytes::Bytes::from(line));
     }
 }
 
 /// The shared fan-out for a user-state event (AWAY, ACCOUNT, SETNAME,
-/// CHGHOST): deliver `line` to the subject's channel peers holding
-/// `event_cap`, then to extended-monitor watchers of the subject's nick —
-/// deduplicated against those peers. `include_self` echoes the line to the
-/// subject itself (SETHOST, which the renamed user must see); identity events
-/// that the client already originated skip it.
+/// CHGHOST): deliver `line` once to each of the subject's channel peers and
+/// extended-monitor watchers holding the event's capability. `include_self`
+/// echoes the line to the subject itself (SETHOST, which the renamed user must
+/// see); identity events that the client already originated skip it.
 pub(crate) fn notify_event(
     state: &mut ServerState,
     subject: ConnId,
     line: &str,
-    event_cap: fn(&crate::core::state::Caps) -> bool,
+    audience: crate::core::state::UserEventAudience,
     include_self: bool,
 ) {
-    let mut recipients: std::collections::HashSet<ConnId> =
-        state.channel_peers(subject).into_iter().collect();
-    if include_self {
-        recipients.insert(subject);
-    }
-    for peer in &recipients {
-        if state.sessions.get(peer).is_some_and(|s| event_cap(&s.caps)) {
-            state.send_timed(*peer, line);
-        }
-    }
-    if let Some(nick) = state.sessions[&subject].nick().map(String::from) {
-        monitor_event(state, &nick, line, event_cap, &recipients);
-    }
+    state.notify_user_event(subject, line, audience, include_self);
 }
 
 pub(super) fn monitor_status(
@@ -116,8 +54,8 @@ pub(super) fn monitor_status(
     let mut online = Vec::new();
     let mut offline = Vec::new();
     for (key, shown) in targets {
-        match state.registered_peer(key) {
-            Some(c) => online.push(state.sessions[&c].prefix()),
+        match state.registered_user(key) {
+            Some(user) => online.push(user.prefix()),
             None => offline.push(shown.clone()),
         }
     }
@@ -160,7 +98,7 @@ pub(super) fn cmd_monitor(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     .expect("checked")
                     .monitoring
                     .insert(key.clone(), nick.to_string());
-                state.monitors.entry(key.clone()).or_default().insert(conn);
+                state.monitors.watch(key.clone(), conn);
                 added.push((key, nick.to_string()));
             }
             if !rejected.is_empty() {
@@ -194,13 +132,13 @@ pub(super) fn cmd_monitor(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     .expect("checked")
                     .monitoring
                     .remove(&key);
-                unmonitor(state, conn, &key);
+                state.monitors.unwatch(&key, conn);
             }
         }
         "C" | "c" => {
             let keys: Vec<_> = state.sessions[&conn].monitoring.keys().cloned().collect();
             for key in keys {
-                unmonitor(state, conn, &key);
+                state.monitors.unwatch(&key, conn);
             }
             state
                 .sessions

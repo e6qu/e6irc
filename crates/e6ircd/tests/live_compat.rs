@@ -16,7 +16,12 @@ async fn probe(addr: &str, server_name: &str) -> std::io::Result<(bool, HashMap<
     let mut conn = Connection::connect_tls(addr, server_name, webpki_root_store()).await?;
     // Use a brief unique nick.
     let nick = format!("e6c{:05}", std::process::id() % 100000);
-    conn.register(&nick, "e6irc interop probe").await?;
+    conn.register(&e6irc_client::Identity {
+        nick: &nick,
+        username: "tester",
+        realname: "e6irc interop probe",
+    })
+    .await?;
 
     let mut welcomed = false;
     let mut isupport: HashMap<String, String> = HashMap::new();

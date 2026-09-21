@@ -10,6 +10,7 @@ if [ "$#" -ne 2 ]; then
 fi
 : "${E6IRC_DATABASE_URL:?E6IRC_DATABASE_URL is required}"
 
+tools=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 backup=$1
 expected_database=$2
 checksum="${backup}.sha256"
@@ -37,14 +38,18 @@ if [ "$actual_digest" != "$expected_digest" ]; then
   exit 1
 fi
 
-export PGDATABASE="$E6IRC_DATABASE_URL"
-actual_database=$(psql --no-psqlrc --tuples-only --no-align --command='SELECT current_database()')
+# The connection comes from the environment alone: the empty --dbname below
+# makes pg_restore connect rather than print SQL, and names no database itself.
+with_database() {
+  python3 "$tools/postgres-url-environment.py" "$@"
+}
+actual_database=$(with_database psql --no-psqlrc --tuples-only --no-align --command='SELECT current_database()')
 if [ "$actual_database" != "$expected_database" ]; then
   echo "refusing restore: connected database is $actual_database, expected $expected_database" >&2
   exit 1
 fi
 pg_restore --list "$backup" >/dev/null
-pg_restore \
+with_database pg_restore \
   --exit-on-error \
   --single-transaction \
   --clean \

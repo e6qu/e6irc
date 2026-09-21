@@ -34,19 +34,36 @@ impl HistoryPageSize {
     }
 }
 
-fn parse_history_query(params: &HistoryParams) -> Result<crate::core::HistoryQuery, &'static str> {
+/// Why a history request is refused, and the query parameter at fault.
+///
+/// This API positions a page by time only. A message id is not a position it
+/// accepts — `before=<msgid>` is an invalid timestamp, refused here — so it has
+/// no way to be asked for the page beside a message the store no longer holds,
+/// and an empty page always means "nothing in that window".
+#[derive(Debug, PartialEq, Eq)]
+struct HistoryQueryRefusal {
+    message: &'static str,
+    field: &'static str,
+}
+
+fn parse_history_query(
+    params: &HistoryParams,
+) -> Result<crate::core::HistoryQuery, HistoryQueryRefusal> {
+    let refuse = |field, message| HistoryQueryRefusal { message, field };
     if params.target.is_empty() {
-        return Err("target must not be empty");
+        return Err(refuse("target", "target must not be empty"));
     }
-    let limit = HistoryPageSize::parse(params.limit)?.get();
+    let limit = HistoryPageSize::parse(params.limit)
+        .map_err(|message| refuse("limit", message))?
+        .get();
     match (&params.before, &params.after) {
-        (Some(_), Some(_)) => Err("before and after are mutually exclusive"),
+        (Some(_), Some(_)) => Err(refuse("after", "before and after are mutually exclusive")),
         (Some(ts), None) => e6irc_proto::time::parse_server_time_millis(ts)
             .map(|before_ts| crate::core::HistoryQuery::Before { before_ts, limit })
-            .ok_or("invalid before timestamp"),
+            .ok_or(refuse("before", "before must be an RFC 3339 timestamp")),
         (None, Some(ts)) => e6irc_proto::time::parse_server_time_millis(ts)
             .map(|after_ts| crate::core::HistoryQuery::After { after_ts, limit })
-            .ok_or("invalid after timestamp"),
+            .ok_or(refuse("after", "after must be an RFC 3339 timestamp")),
         (None, None) => Ok(crate::core::HistoryQuery::Latest { limit }),
     }
 }
@@ -67,13 +84,20 @@ struct HistoryResponse {
 }
 pub(super) async fn history(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Query(params): Query<HistoryParams>,
 ) -> Response {
     let pool = pool_of(&state);
     let query = match parse_history_query(&params) {
         Ok(query) => query,
-        Err(message) => return problem(StatusCode::BAD_REQUEST, message, None),
+        Err(refusal) => {
+            return problem_at_field(
+                StatusCode::BAD_REQUEST,
+                refusal.message,
+                None,
+                Some(refusal.field),
+            );
+        }
     };
     let target_folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&params.target);
     let account_folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account);
@@ -120,11 +144,10 @@ pub(super) async fn history(
             body: row.body,
         })
         .collect();
-    axum::Json(HistoryResponse {
+    json_no_store(HistoryResponse {
         target: params.target,
         messages,
     })
-    .into_response()
 }
 
 #[cfg(test)]
@@ -164,6 +187,24 @@ mod tests {
                 Some("2026-01-02T00:00:00.000Z"),
             ))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn a_refused_window_names_the_parameter_at_fault() {
+        let field = |params| parse_history_query(&params).expect_err("refused").field;
+        assert_eq!(field(params(Some(0), None, None)), "limit");
+        // A message id is not a position this API accepts.
+        assert_eq!(field(params(None, Some("01JABCDEFmsgid"), None)), "before");
+        assert_eq!(field(params(None, None, Some("01JABCDEFmsgid"))), "after");
+        assert_eq!(
+            field(HistoryParams {
+                target: String::new(),
+                before: None,
+                after: None,
+                limit: None,
+            }),
+            "target"
         );
     }
 }

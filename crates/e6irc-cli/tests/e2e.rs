@@ -71,7 +71,11 @@ async fn cli_send_reaches_a_tailing_client() {
         .await
         .expect("connect");
     observer
-        .register("watcher", "watcher")
+        .register(&e6irc_client::Identity {
+            nick: "watcher",
+            username: "watcher",
+            realname: "watcher",
+        })
         .await
         .expect("register");
     observer.send_line("JOIN #cli").await.expect("join");
@@ -93,6 +97,8 @@ async fn cli_send_reaches_a_tailing_client() {
                     "--server",
                     &addr,
                     "--nick",
+                    "sender",
+                    "--username",
                     "sender",
                     "send",
                     "#cli",
@@ -129,7 +135,14 @@ async fn cli_json_tail_is_machine_safe_against_a_real_server() {
     let mut sender = Connection::connect(&addr.to_string())
         .await
         .expect("connect");
-    sender.register("sender", "sender").await.expect("register");
+    sender
+        .register(&e6irc_client::Identity {
+            nick: "sender",
+            username: "sender",
+            realname: "sender",
+        })
+        .await
+        .expect("register");
     sender.send_line("JOIN #json").await.expect("join");
     loop {
         let message = sender.next_message().await.unwrap().unwrap();
@@ -147,6 +160,8 @@ async fn cli_json_tail_is_machine_safe_against_a_real_server() {
                     "--server",
                     &addr,
                     "--nick",
+                    "jsonreader",
+                    "--username",
                     "jsonreader",
                     "tail",
                     "#json",
@@ -204,7 +219,15 @@ async fn cli_send_to_missing_nick_exits_nonzero() {
         move || {
             Command::new(bin)
                 .args([
-                    "--server", &addr, "--nick", "sender2", "send", "nobody", "hi",
+                    "--server",
+                    &addr,
+                    "--nick",
+                    "sender2",
+                    "--username",
+                    "sender2",
+                    "send",
+                    "nobody",
+                    "hi",
                 ])
                 .output()
                 .expect("run cli")
@@ -233,12 +256,19 @@ async fn cli_sasl_login() {
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    e6ircd::db::create_account(&pool, "cliuser", "clipass")
+    e6ircd::db::create_account_with_contact(&pool, "cliuser", "clipass", None)
         .await
         .expect("create");
-    let oauth_token = e6ircd::db::issue_api_token(&pool, "cliuser", "cli-e2e")
-        .await
-        .expect("issue OAuth token");
+    let oauth_token = e6ircd::db::issue_scoped_api_token(
+        &pool,
+        "cliuser",
+        "cli-e2e",
+        e6ircd::identity::ApiTokenScopes::new(e6ircd::identity::ApiTokenScope::ALL)
+            .expect("every scope is a non-empty set"),
+        e6ircd::identity::ApiTokenLifetimeDays::DEFAULT,
+    )
+    .await
+    .expect("issue OAuth token");
 
     let config = e6ircd::config::Config {
         server_name: "irc.clisasl.example".into(),
@@ -266,7 +296,11 @@ async fn cli_sasl_login() {
         .await
         .expect("connect");
     observer
-        .register("watch2", "watch2")
+        .register(&e6irc_client::Identity {
+            nick: "watch2",
+            username: "watch2",
+            realname: "watch2",
+        })
         .await
         .expect("register");
     observer.send_line("JOIN #s").await.expect("join");
@@ -286,6 +320,8 @@ async fn cli_sasl_login() {
                     "--server",
                     &addr,
                     "--nick",
+                    "cliuser",
+                    "--username",
                     "cliuser",
                     "--account",
                     "cliuser",
@@ -323,7 +359,14 @@ async fn cli_sasl_login() {
         let token_path = token_path.clone();
         move || {
             Command::new(bin)
-                .args(["--server", &addr, "--nick", "oauthcli"])
+                .args([
+                    "--server",
+                    &addr,
+                    "--nick",
+                    "oauthcli",
+                    "--username",
+                    "oauthcli",
+                ])
                 .arg("--oauth-from-cache")
                 .arg("--token-file")
                 .arg(token_path)
@@ -387,10 +430,11 @@ async fn cli_sasl_login() {
     })
     .await
     .expect("receive task");
-    assert!(
+    assert_eq!(
         e6ircd::db::approve_device_grant(&pool, &user_code, "cliuser")
             .await
             .expect("approve grant"),
+        e6ircd::db::DeviceApproval::Approved,
         "device grant was not pending"
     );
     let (status, transcript) = login.await.expect("device login task");
@@ -452,6 +496,8 @@ async fn cli_rejects_one_credential_flag_without_the_other() {
                     &addr,
                     "--nick",
                     "half",
+                    "--username",
+                    "half",
                     "--account",
                     "alice",
                     "send",
@@ -478,7 +524,14 @@ async fn cli_history_reads_recent_messages() {
     let mut seeder = Connection::connect(&addr.to_string())
         .await
         .expect("connect");
-    seeder.register("seeder", "seeder").await.expect("register");
+    seeder
+        .register(&e6irc_client::Identity {
+            nick: "seeder",
+            username: "seeder",
+            realname: "seeder",
+        })
+        .await
+        .expect("register");
     seeder.send_line("JOIN #hist").await.expect("join");
     loop {
         let m = seeder.next_message().await.expect("read").expect("msg");
@@ -510,7 +563,16 @@ async fn cli_history_reads_recent_messages() {
         move || {
             std::process::Command::new(bin)
                 .args([
-                    "--server", &addr, "--nick", "reader", "history", "#hist", "--count", "10",
+                    "--server",
+                    &addr,
+                    "--nick",
+                    "reader",
+                    "--username",
+                    "reader",
+                    "history",
+                    "#hist",
+                    "--count",
+                    "10",
                 ])
                 .output()
                 .expect("run cli")
@@ -569,7 +631,14 @@ async fn client_tls_connect() {
     let mut conn = e6irc_client::Connection::connect_tls(&addr.to_string(), "localhost", roots)
         .await
         .expect("tls connect");
-    let nick = conn.register("tlsclient", "tls").await.expect("register");
+    let nick = conn
+        .register(&e6irc_client::Identity {
+            nick: "tlsclient",
+            username: "tlsclient",
+            realname: "tls",
+        })
+        .await
+        .expect("register");
     assert_eq!(nick, "tlsclient");
 
     std::fs::remove_dir_all(&dir).ok();
@@ -680,4 +749,176 @@ async fn cli_api_hits_rest_endpoints() {
     .await
     .unwrap();
     assert!(!out.status.success(), "404 must be a nonzero exit");
+}
+
+/// A server that welcomes the CLI, confirms whatever it joins, and then drops
+/// the connection. Yields every line the CLI sent.
+async fn server_that_drops_after_the_join() -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let served = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = socket.into_split();
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        let mut seen = Vec::new();
+        // A CLI that never joins must not hold the test open.
+        let join_window = std::time::Duration::from_secs(2);
+        while let Ok(Ok(Some(line))) = tokio::time::timeout(join_window, lines.next_line()).await {
+            let reply = match line.split_once(' ') {
+                Some(("CAP", "LS 302")) => ":srv CAP * LS :\r\n".to_string(),
+                Some(("CAP", "END")) => ":srv 001 tailer :Welcome\r\n".to_string(),
+                Some(("JOIN", channel)) => format!(":srv 366 tailer {channel} :End of NAMES\r\n"),
+                _ => String::new(),
+            };
+            writer.write_all(reply.as_bytes()).await.unwrap();
+            let joined = line.starts_with("JOIN ");
+            seen.push(line);
+            if joined {
+                break;
+            }
+        }
+        seen
+    });
+    (address, served)
+}
+
+async fn tail_forever(address: String, target: &'static str) -> std::process::Output {
+    let bin = env!("CARGO_BIN_EXE_e6irc");
+    tokio::task::spawn_blocking(move || {
+        Command::new(bin)
+            .args([
+                "--server",
+                &address,
+                "--nick",
+                "tailer",
+                "--username",
+                "tailer",
+                "tail",
+                target,
+            ])
+            .output()
+            .expect("run tail")
+    })
+    .await
+    .expect("join")
+}
+
+/// An unbounded tail has no successful end: the only way it stops by itself is
+/// the server going away, and a supervisor must be able to see that.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_tail_forever_fails_when_the_server_drops_the_connection() {
+    let (address, served) = server_that_drops_after_the_join().await;
+    let output = tail_forever(address, "#room").await;
+    served.await.unwrap();
+    assert!(
+        !output.status.success(),
+        "a dropped connection ended an unbounded tail with success"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("closed"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `&` channels are channels: tailing one must join it, not wait in silence
+/// for messages the server will never relay to a non-member.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_tail_joins_a_local_channel() {
+    let (address, served) = server_that_drops_after_the_join().await;
+    tail_forever(address, "&local").await;
+    let seen = served.await.unwrap();
+    assert!(seen.contains(&"JOIN &local".to_string()), "{seen:?}");
+}
+
+/// Run `e6irc` with SASL PLAIN for `alice` against TEST-NET-1, which is never
+/// dialed when the command is refused first. Yields (succeeded, stderr).
+async fn send_as_alice(
+    arguments: Vec<String>,
+    environment: &'static [(&'static str, &'static str)],
+) -> (bool, String) {
+    let bin = env!("CARGO_BIN_EXE_e6irc");
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || {
+            Command::new(bin)
+                .args([
+                    "--server",
+                    "192.0.2.1:6667",
+                    "--nick",
+                    "alice",
+                    "--username",
+                    "alice",
+                ])
+                .args(["--account", "alice", "--response-timeout", "2"])
+                .args(arguments)
+                .args(["send", "bob", "hello"])
+                .env_remove("E6IRC_PASSWORD")
+                .env_remove("E6IRC_OAUTH_TOKEN")
+                .envs(environment.iter().copied())
+                .output()
+                .expect("run cli")
+        }),
+    )
+    .await
+    .expect("the command neither finished nor failed")
+    .expect("join");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn arguments(values: &[&str]) -> Vec<String> {
+    values.iter().map(ToString::to_string).collect()
+}
+
+/// SASL PLAIN is the password in base64. Without --tls it crosses the network
+/// readable by anyone on the path, so it is refused unless asked for.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_refuses_to_send_a_password_in_cleartext_to_another_machine() {
+    let (succeeded, stderr) = send_as_alice(arguments(&["--password", "secret"]), &[]).await;
+    assert!(!succeeded);
+    assert!(stderr.contains("cleartext"), "{stderr}");
+    assert!(stderr.contains("--allow-cleartext-credentials"), "{stderr}");
+
+    // Asked for, it is attempted: the failure is then the unreachable server's.
+    let (succeeded, stderr) = send_as_alice(
+        arguments(&["--password", "secret", "--allow-cleartext-credentials"]),
+        &[],
+    )
+    .await;
+    assert!(!succeeded);
+    assert!(!stderr.contains("cleartext"), "{stderr}");
+}
+
+/// A password never has to appear in the process list: the environment and a
+/// private file are both read, and a file others can read is refused.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn cli_takes_the_password_from_the_environment_or_a_private_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Reaching the cleartext refusal proves a password was found.
+    let (_, stderr) = send_as_alice(Vec::new(), &[("E6IRC_PASSWORD", "from-env")]).await;
+    assert!(stderr.contains("cleartext"), "{stderr}");
+    let (_, stderr) = send_as_alice(Vec::new(), &[]).await;
+    assert!(stderr.contains("--account needs a password"), "{stderr}");
+
+    let directory = std::env::temp_dir().join(format!("e6irc-cli-secret-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("password");
+    let from_file = || arguments(&["--password-file", path.to_str().expect("UTF-8 path")]);
+    std::fs::write(&path, "from-file\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (_, stderr) = send_as_alice(from_file(), &[]).await;
+    assert!(stderr.contains("cleartext"), "{stderr}");
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (succeeded, stderr) = send_as_alice(from_file(), &[]).await;
+    assert!(!succeeded);
+    assert!(stderr.contains("chmod 600"), "{stderr}");
+    std::fs::remove_dir_all(&directory).unwrap();
 }

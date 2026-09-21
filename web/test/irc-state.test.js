@@ -15,6 +15,7 @@ import {
   parseIrc,
   reconcileChannelSnapshot,
   splitSigil,
+  stripFormatting,
   tagValue,
   topicReply,
 } from "../src/irc-state.js";
@@ -196,4 +197,24 @@ test("authoritative session channels replace stale replay membership by casefold
       joined: ["#keep", "#New"],
     },
   );
+});
+
+test("formatting codes are removed rather than shown as digits and control bytes", () => {
+  assert.equal(stripFormatting("\x0304,01red on black\x03 plain"), "red on black plain");
+  assert.equal(stripFormatting("\x02bold\x02 \x1ditalic\x1d \x1funder\x1f \x1estrike\x1e \x11mono\x11 \x16rev\x16\x0f"), "bold italic under strike mono rev");
+  assert.equal(stripFormatting("\x04ff0000,00ff00hex\x04"), "hex");
+  // A bare ^C resets colour; digits that are not a colour stay text.
+  assert.equal(stripFormatting("price\x03 42"), "price 42");
+  assert.equal(stripFormatting("\x033three"), "three");
+  assert.equal(stripFormatting(undefined), "");
+  assert.deepEqual(asMessage("msg", "bot", "\x0303ok\x03"), { kind: "msg", from: "bot", text: "ok" });
+});
+
+test("a CTCP other than ACTION is named, not shown as raw control bytes", () => {
+  assert.deepEqual(asMessage("msg", "alice", "\x01VERSION\x01"), {
+    kind: "event", from: null, text: "alice sent a CTCP VERSION request",
+  });
+  assert.deepEqual(asMessage("msg", "alice", "\x01PING 12345\x01"), {
+    kind: "event", from: null, text: "alice sent a CTCP PING request: 12345",
+  });
 });

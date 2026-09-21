@@ -15,6 +15,37 @@ const MAX_IRC_WS_FRAME: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN;
 /// before deserialization while admitting every wire-sized composer command.
 const MAX_UI_WS_FRAME: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN * 6 + 512;
 
+/// How long one outbound frame may wait for the peer to take it.
+const SOCKET_SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Why an outbound frame was not delivered. Either way the connection is over.
+#[derive(Debug)]
+enum SendFailure {
+    Transport,
+    Stalled,
+}
+
+/// Write one frame, giving up on a peer that has stopped reading.
+///
+/// A peer that keeps the connection open but advertises a zero receive window
+/// parks a bare `send` forever. The task would then never observe its network
+/// being removed or its send queue being closed, and would hold the network
+/// handle and the per-IP connection slot for as long as the peer liked.
+async fn send_frame(socket: &mut WebSocket, frame: WsMessage) -> Result<(), SendFailure> {
+    within_send_deadline(SOCKET_SEND_DEADLINE, socket.send(frame)).await
+}
+
+async fn within_send_deadline<E>(
+    deadline: std::time::Duration,
+    send: impl Future<Output = Result<(), E>>,
+) -> Result<(), SendFailure> {
+    match tokio::time::timeout(deadline, send).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(SendFailure::Transport),
+        Err(_) => Err(SendFailure::Stalled),
+    }
+}
+
 /// Outbound WebSocket frame discipline, fixed for the connection by ircv3
 /// subprotocol negotiation (<https://ircv3.net/specs/extensions/websocket>).
 #[derive(Clone, Copy)]
@@ -148,15 +179,13 @@ pub(super) async fn ws_irc_conn(
                 // than being corrupted by lossy U+FFFD replacement; under the
                 // text subprotocol the client asked for text, so it is replaced.
                 let sent = match mode {
-                    WsFrameMode::Binary => socket.send(WsMessage::binary(line.to_vec())).await,
+                    WsFrameMode::Binary => send_frame(&mut socket, WsMessage::binary(line.to_vec())).await,
                     WsFrameMode::Text => {
-                        socket
-                            .send(WsMessage::text(String::from_utf8_lossy(line).into_owned()))
-                            .await
+                        send_frame(&mut socket, WsMessage::text(String::from_utf8_lossy(line).into_owned())).await
                     }
                     WsFrameMode::Auto => match std::str::from_utf8(line) {
-                        Ok(text) => socket.send(WsMessage::text(text)).await,
-                        Err(_) => socket.send(WsMessage::binary(line.to_vec())).await,
+                        Ok(text) => send_frame(&mut socket, WsMessage::text(text)).await,
+                        Err(_) => send_frame(&mut socket, WsMessage::binary(line.to_vec())).await,
                     },
                 };
                 if sent.is_err() {
@@ -218,6 +247,145 @@ pub(super) struct UiParams {
     pub(super) network: String,
 }
 
+/// Whether composer frames from this socket may reach the upstream.
+///
+/// The upgrade is a `GET`, so the method-to-scope rule admits a `read` token.
+/// Reading the stream is what `read` grants; speaking as the owner on a
+/// third-party network — `/raw` included — is a write.
+#[derive(Clone, Copy)]
+pub(super) enum ComposerAuthority {
+    MaySend,
+    ReadOnly,
+}
+
+impl From<&RequestCredential> for ComposerAuthority {
+    fn from(credential: &RequestCredential) -> Self {
+        if credential.grants_write() {
+            Self::MaySend
+        } else {
+            Self::ReadOnly
+        }
+    }
+}
+
+/// Refuse a browser upgrade from any origin but this application's.
+///
+/// `SameSite=Lax` keeps the session cookie off a cross-*site* handshake, but a
+/// sibling subdomain is same-site: its page could open this socket with the
+/// owner's cookie, read private-message replay, and send `/raw`. The origin to
+/// compare against is the configured public URL; without one it is the
+/// authority the browser itself addressed (`Host`), and an `Origin` that
+/// matches neither is refused rather than waved through. A request with no
+/// `Origin` is not a browser and carries no ambient cookie authority.
+fn require_same_origin_upgrade(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> ResponseResult<()> {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return Ok(());
+    };
+    let verified = origin
+        .to_str()
+        .is_ok_and(|origin| match state.public_url.as_deref() {
+            Some(public) => same_origin(origin, public),
+            None => headers
+                .get(header::HOST)
+                .and_then(|host| host.to_str().ok())
+                .is_some_and(|host| origin_names_host(origin, host)),
+        });
+    if verified {
+        return Ok(());
+    }
+    Err(ResponseRejection::from(problem(
+        StatusCode::FORBIDDEN,
+        "Cross-origin WebSocket rejected",
+        Some(if state.public_url.is_some() {
+            "The Origin header does not match the configured public URL."
+        } else {
+            "The Origin header does not match the Host header. Configure the public URL when a proxy rewrites Host."
+        }),
+    )))
+}
+
+/// Whether a serialized `Origin` (`scheme://host[:port]`) names exactly the
+/// authority in `Host`. Both come from the same browser, which omits a default
+/// port from both, so the comparison needs no knowledge of the scheme — which
+/// the server does not have behind a TLS-terminating proxy.
+fn origin_names_host(origin: &str, host: &str) -> bool {
+    origin.split_once("://").is_some_and(|(scheme, authority)| {
+        matches!(scheme, "http" | "https")
+            && !authority.is_empty()
+            && authority.eq_ignore_ascii_case(host)
+    })
+}
+
+/// Most live chat sockets one account may hold at once, across all of its
+/// networks and browser sessions. The web client holds one per open tab, so
+/// this matches the most browser sessions an account may have
+/// (`MAX_BROWSER_SESSIONS_PER_ACCOUNT`). Each socket is a task, a broadcast
+/// subscription with its replay, and a slot in the service-wide connection
+/// bound; without a per-account bound one credential could take all of them.
+pub(crate) const MAX_UI_SOCKETS_PER_ACCOUNT: usize = 32;
+
+/// WebSocket close code 1008, "policy violation" (RFC 6455 §7.4.1).
+const CLOSE_POLICY_VIOLATION: u16 = 1008;
+
+/// What a refused socket's close frame says. The web client shows a close
+/// reason verbatim; a close reason is at most 123 bytes.
+const UI_SOCKET_LIMIT_REASON: &str = "This account has 32 live chat connections open, the most allowed. Close another tab and retry.";
+
+/// Live chat sockets open per folded account.
+pub(crate) struct UiSocketLimiter {
+    open: Mutex<HashMap<String, usize>>,
+}
+
+/// One account's admission to hold one live chat socket, for as long as the
+/// socket's task runs.
+pub(crate) struct UiSocketSlot {
+    limiter: Arc<UiSocketLimiter>,
+    account: String,
+}
+
+impl UiSocketLimiter {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            open: Mutex::default(),
+        })
+    }
+
+    /// A slot for `account`, or `None` when it already holds
+    /// [`MAX_UI_SOCKETS_PER_ACCOUNT`].
+    fn admit(self: &Arc<Self>, account: &str) -> Option<UiSocketSlot> {
+        let account = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account);
+        let mut open = self.open.lock().expect("live chat socket limiter lock");
+        let held = open.entry(account.clone()).or_insert(0);
+        if *held >= MAX_UI_SOCKETS_PER_ACCOUNT {
+            return None;
+        }
+        *held += 1;
+        Some(UiSocketSlot {
+            limiter: self.clone(),
+            account,
+        })
+    }
+}
+
+impl Drop for UiSocketSlot {
+    fn drop(&mut self) {
+        let mut open = self
+            .limiter
+            .open
+            .lock()
+            .expect("live chat socket limiter lock");
+        if let Some(held) = open.get_mut(&self.account) {
+            *held -= 1;
+            if *held == 0 {
+                open.remove(&self.account);
+            }
+        }
+    }
+}
+
 /// The web client's live socket: cookie-authenticated, attaches to one
 /// of the caller's networks, and pushes line, status, and replay-complete JSON
 /// events that the browser client parses into buffers and a member list.
@@ -227,27 +395,14 @@ pub(super) struct UiParams {
 pub(super) async fn ws_ui(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-    Authenticated(account): Authenticated,
+    Authenticated(account, credential): Authenticated,
     Query(params): Query<UiParams>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // Reject a cross-origin WebSocket upgrade when a public_url is configured.
-    // SameSite=Lax already blocks the classic cross-site hijack (a Lax cookie
-    // isn't sent on a cross-site WS handshake); an explicit Origin allowlist
-    // also closes the same-site-subdomain gap. A missing Origin (a non-browser
-    // client) is allowed — it carries no ambient cookie authority.
-    if let Some(public) = state.public_url.as_deref()
-        && let Some(origin) = headers
-            .get(axum::http::header::ORIGIN)
-            .and_then(|v| v.to_str().ok())
-        && !same_origin(origin, public)
-    {
-        return problem(
-            StatusCode::FORBIDDEN,
-            "Cross-origin WebSocket rejected",
-            None,
-        );
+    if let Err(refusal) = require_same_origin_upgrade(&state, &headers) {
+        return refusal.into();
     }
+    let composer = ComposerAuthority::from(&credential);
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
@@ -256,17 +411,52 @@ pub(super) async fn ws_ui(
     let Some(handle) = registry.get_owned(&account, &params.network) else {
         return problem(StatusCode::NOT_FOUND, "No such network", None);
     };
+    // Counted before the upgrade, so sockets still in their handshake count.
+    let slot = state.ui_sockets.admit(&account);
     ws.max_message_size(MAX_UI_WS_FRAME)
         .max_frame_size(MAX_UI_WS_FRAME)
-        .on_upgrade(move |socket| ws_ui_conn(handle, socket))
+        .on_upgrade(move |socket| {
+            ws_ui_conn(
+                handle,
+                socket,
+                composer,
+                slot,
+                crate::bouncer::ATTACH_LIVENESS_INTERVAL,
+            )
+        })
 }
 
+/// Serve one live chat socket until either side ends it.
+///
+/// `slot` is the account's admission; without one the socket is closed at once
+/// with a policy-violation code and a reason — after the upgrade, because a
+/// browser gives its page no status or body for a refused upgrade, only a
+/// close frame's code and reason.
+///
+/// `liveness` bounds how long a silent peer is believed: after one interval
+/// without a frame it is sent a WebSocket Ping, and after a second it is given
+/// up on. A browser answers Ping by itself, so a live peer on a quiet network
+/// costs one small frame per interval, and a half-open connection — a laptop
+/// that slept, a NAT that forgot the flow — stops holding its task, its socket,
+/// and its place in the attached-client count.
 pub(super) async fn ws_ui_conn(
     handle: std::sync::Arc<crate::bouncer::NetworkHandle>,
     mut socket: WebSocket,
+    composer: ComposerAuthority,
+    slot: Option<UiSocketSlot>,
+    liveness: std::time::Duration,
 ) {
     use crate::bouncer::DriverEvent;
     use tokio::sync::broadcast::error::RecvError;
+
+    let Some(_slot) = slot else {
+        let close = axum::extract::ws::CloseFrame {
+            code: CLOSE_POLICY_VIOLATION,
+            reason: UI_SOCKET_LIMIT_REASON.into(),
+        };
+        drop(send_frame(&mut socket, WsMessage::Close(Some(close))).await);
+        return;
+    };
 
     // Watch the stop signal too. The event broadcast never closes while this
     // task holds an `Arc<NetworkHandle>` (the handle keeps a sender), so
@@ -299,8 +489,7 @@ pub(super) async fn ws_ui_conn(
     // exists precisely to close this subscribe-timing gap.
     let runtime = handle.runtime_snapshot();
     let mut status_revision = runtime.status_revision;
-    if socket
-        .send(WsMessage::text(runtime_status_event(&runtime)))
+    if send_frame(&mut socket, WsMessage::text(runtime_status_event(&runtime)))
         .await
         .is_err()
     {
@@ -309,8 +498,7 @@ pub(super) async fn ws_ui_conn(
 
     // Playback: everything buffered while detached, as JSON line events.
     for line in buffer_snapshot {
-        if socket
-            .send(WsMessage::text(line_event(&line)))
+        if send_frame(&mut socket, WsMessage::text(line_event(&line)))
             .await
             .is_err()
         {
@@ -321,8 +509,7 @@ pub(super) async fn ws_ui_conn(
     // authoritative identity and memberships after it so an aged-out JOIN or a
     // stale PART cannot leave the browser attached to the wrong conversations.
     if let Some(session) = session_snapshot
-        && socket
-            .send(WsMessage::text(session_event(&session)))
+        && send_frame(&mut socket, WsMessage::text(session_event(&session)))
             .await
             .is_err()
     {
@@ -331,13 +518,14 @@ pub(super) async fn ws_ui_conn(
     // Delimit replay from live traffic. The browser waits for this typed
     // boundary before requesting authoritative NAMES snapshots, so old NAMES
     // rows in the detached buffer cannot race and overwrite the fresh result.
-    if socket
-        .send(WsMessage::text(snapshot_event()))
+    if send_frame(&mut socket, WsMessage::text(snapshot_event()))
         .await
         .is_err()
     {
         return;
     }
+    let mut peer_silence = crate::bouncer::SilenceDeadline::new(liveness);
+    let mut awaiting_pong = false;
     loop {
         tokio::select! {
             // Network removed/replaced/disabled: send a typed terminal status
@@ -352,9 +540,7 @@ pub(super) async fn ws_ui_conn(
             ev = events.recv() => match ev {
                 Ok(event @ (DriverEvent::Line(_) | DriverEvent::Notice(_))) => {
                     let line = event.display_line().expect("display event carries a line");
-                    if socket
-                        .send(WsMessage::text(line_event(line)))
-                        .await
+                    if send_frame(&mut socket, WsMessage::text(line_event(line))).await
                         .is_err()
                     {
                         break;
@@ -366,9 +552,7 @@ pub(super) async fn ws_ui_conn(
                     // would double-render. Echoes from the account's *other*
                     // sessions are real conversation and render normally.
                     if origin != attach_id
-                        && socket
-                            .send(WsMessage::text(line_event(&line)))
-                            .await
+                        && send_frame(&mut socket, WsMessage::text(line_event(&line))).await
                             .is_err()
                     {
                         break;
@@ -378,18 +562,14 @@ pub(super) async fn ws_ui_conn(
                     if !crate::bouncer::accept_status_revision(&mut status_revision, revision) {
                         continue;
                     }
-                    if socket
-                        .send(WsMessage::text(driver_status_event(status)))
-                        .await
+                    if send_frame(&mut socket, WsMessage::text(driver_status_event(status))).await
                         .is_err()
                     {
                         break;
                     }
                 }
                 Ok(DriverEvent::Session(session)) => {
-                    if socket
-                        .send(WsMessage::text(session_event(&session)))
-                        .await
+                    if send_frame(&mut socket, WsMessage::text(session_event(&session))).await
                         .is_err()
                     {
                         break;
@@ -401,9 +581,7 @@ pub(super) async fn ws_ui_conn(
                 Ok(DriverEvent::ReadMarker { .. }) => {}
                 Err(RecvError::Lagged(n)) => {
                     let notice = format!(":*bnc* NOTICE * :{n} line(s) skipped (slow connection)");
-                    if socket
-                        .send(WsMessage::text(line_event(&notice)))
-                        .await
+                    if send_frame(&mut socket, WsMessage::text(line_event(&notice))).await
                         .is_err()
                     {
                         break;
@@ -419,7 +597,22 @@ pub(super) async fn ws_ui_conn(
                     break;
                 }
             },
-            frame = socket.recv() => match frame {
+            frame = peer_silence.bound(socket.recv()) => {
+                let Some(frame) = frame else {
+                    if awaiting_pong {
+                        break;
+                    }
+                    awaiting_pong = true;
+                    peer_silence.restart();
+                    if send_frame(&mut socket, WsMessage::Ping(Default::default())).await.is_err() {
+                        break;
+                    }
+                    continue;
+                };
+                // Any frame is a sign of life, not only the Pong.
+                awaiting_pong = false;
+                peer_silence.restart();
+                match frame {
                 Some(Ok(WsMessage::Text(t))) => {
                     let request = match composer_request(&t) {
                         Ok(request) => request,
@@ -428,21 +621,33 @@ pub(super) async fn ws_ui_conn(
                                 request_id: error.request_id.as_ref().map(ComposerRequestId::as_str),
                                 message: error.message,
                             });
-                            if socket.send(WsMessage::text(event)).await.is_err() {
+                            if send_frame(&mut socket, WsMessage::text(event)).await.is_err() {
                                 break;
                             }
                             continue;
                         }
                     };
+                    if let ComposerAuthority::ReadOnly = composer {
+                        let event = composer_result_event(ComposerResult::Rejected {
+                            request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
+                            message: "this token is read-only; sending needs the write scope. Nothing was sent",
+                        });
+                        if send_frame(&mut socket, WsMessage::text(event)).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     match handle.send_from(attach_id, &request.line) {
                         crate::bouncer::SendOutcome::Sent => {
                             if let Some(request_id) = request.request_id
-                                && socket
-                                    .send(WsMessage::text(composer_result_event(
-                                        ComposerResult::Sent(request_id.as_str()),
-                                    )))
-                                    .await
-                                    .is_err()
+                                && send_frame(
+                                    &mut socket,
+                                    WsMessage::text(composer_result_event(ComposerResult::Sent(
+                                        request_id.as_str(),
+                                    ))),
+                                )
+                                .await
+                                .is_err()
                             {
                                 break;
                             }
@@ -452,7 +657,7 @@ pub(super) async fn ws_ui_conn(
                                 request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
                                 message: "upstream busy; line not sent, try again",
                             });
-                            if socket.send(WsMessage::text(event)).await.is_err() {
+                            if send_frame(&mut socket, WsMessage::text(event)).await.is_err() {
                                 break;
                             }
                         }
@@ -465,7 +670,7 @@ pub(super) async fn ws_ui_conn(
                                 request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
                                 message: "upstream registration is parked; reconfigure the network before sending",
                             });
-                            if socket.send(WsMessage::text(event)).await.is_err() {
+                            if send_frame(&mut socket, WsMessage::text(event)).await.is_err() {
                                 break;
                             }
                         }
@@ -474,7 +679,7 @@ pub(super) async fn ws_ui_conn(
                                 request_id: request.request_id.as_ref().map(ComposerRequestId::as_str),
                                 message: error.message(),
                             });
-                            if socket.send(WsMessage::text(event)).await.is_err() {
+                            if send_frame(&mut socket, WsMessage::text(event)).await.is_err() {
                                 break;
                             }
                         }
@@ -485,17 +690,18 @@ pub(super) async fn ws_ui_conn(
                         request_id: None,
                         message: "composer requests must be text JSON",
                     });
-                    if socket.send(WsMessage::text(event)).await.is_err() {
+                    if send_frame(&mut socket, WsMessage::text(event)).await.is_err() {
                         break;
                     }
                 }
                 Some(Ok(WsMessage::Ping(payload))) => {
-                    if socket.send(WsMessage::Pong(payload)).await.is_err() {
+                    if send_frame(&mut socket, WsMessage::Pong(payload)).await.is_err() {
                         break;
                     }
                 }
                 Some(Ok(WsMessage::Pong(_))) => {}
                 Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
+                }
             },
         }
     }
@@ -503,9 +709,11 @@ pub(super) async fn ws_ui_conn(
 
 async fn send_unavailable(socket: &mut WebSocket) {
     drop(
-        socket
-            .send(WsMessage::text(status_event(ConnStatus::Unavailable, None)))
-            .await,
+        send_frame(
+            socket,
+            WsMessage::text(status_event(ConnStatus::Unavailable, None)),
+        )
+        .await,
     );
 }
 
@@ -595,6 +803,26 @@ struct ComposerRequestError {
     message: &'static str,
 }
 
+/// Why the composer will not send `command` upstream, if it will not.
+///
+/// The upstream session belongs to the bouncer: it stays connected while no
+/// browser is open, so a `QUIT` from one tab would end what the product exists
+/// to keep. Liveness, capability negotiation, authentication, history, and read
+/// markers are the attach layer's conversation with its own client — the raw
+/// attach path answers them locally and never forwards them. This is asked of
+/// the command the final line parses to, so `/raw`, `/quote`, tags, a source
+/// prefix, or letter case cannot carry one past it.
+fn composer_command_refusal(command: &str) -> Option<&'static str> {
+    const SESSION: &str = "QUIT would disconnect this always-on network; disable the network instead. Nothing was sent";
+    const ATTACH_LAYER: &str =
+        "e6irc answers this command itself, so the network never sees it. Nothing was sent";
+    match command.to_ascii_uppercase().as_str() {
+        "QUIT" => Some(SESSION),
+        "PING" | "PONG" | "CAP" | "AUTHENTICATE" | "CHATHISTORY" | "MARKREAD" => Some(ATTACH_LAYER),
+        _ => None,
+    }
+}
+
 /// Parse and bound one browser composer frame.
 fn composer_request(frame: &str) -> Result<ComposerRequest, ComposerRequestError> {
     if frame.len() > MAX_UI_WS_FRAME {
@@ -628,10 +856,14 @@ fn composer_request(frame: &str) -> Result<ComposerRequest, ComposerRequestError
             message: "message exceeds the IRC wire limit; nothing was sent",
         });
     }
-    if e6irc_proto::message::Message::parse(&line).is_err() {
+    let refusal = match e6irc_proto::message::Message::parse(&line) {
+        Ok(message) => composer_command_refusal(message.command),
+        Err(_) => Some("message is not a complete IRC command; nothing was sent"),
+    };
+    if let Some(message) = refusal {
         return Err(ComposerRequestError {
             request_id: frame.id,
-            message: "message is not a complete IRC command; nothing was sent",
+            message,
         });
     }
     Ok(ComposerRequest {
@@ -972,7 +1204,7 @@ mod tests {
         let tagged = serde_json::json!({
             "id": "send-tags",
             "target": "",
-            "message": format!("/raw @example={} PING", "a".repeat(600)),
+            "message": format!("/raw @example={} TAGMSG #rust", "a".repeat(600)),
         })
         .to_string();
         assert!(
@@ -1000,6 +1232,40 @@ mod tests {
             let error = composer_request(malformed)
                 .expect_err("an empty IRC command must not be acknowledged as sent");
             assert!(error.message.contains("nothing was sent"), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn composer_refuses_commands_that_are_not_the_upstreams_to_answer() {
+        for message in [
+            "/quit",
+            "/QUIT bye",
+            "/raw QUIT :bye",
+            "/quote quit",
+            "/raw @label=x :nick QUIT",
+            "/ping x",
+            "/raw PONG :x",
+            "/raw CAP LS",
+            "/raw AUTHENTICATE PLAIN",
+            "/chathistory LATEST #rust * 10",
+            "/raw MARKREAD #rust",
+        ] {
+            let frame = serde_json::json!({ "id": "a1", "target": "#rust", "message": message });
+            let error = composer_request(&frame.to_string()).expect_err(message);
+            assert_eq!(
+                error.request_id.as_ref().map(ComposerRequestId::as_str),
+                Some("a1")
+            );
+            assert!(
+                error.message.contains("othing was sent"),
+                "{message}: {}",
+                error.message
+            );
+        }
+        // Text that merely mentions a command is conversation.
+        for message in ["QUIT", "/me will QUIT soon", "/msg friend PING me"] {
+            let frame = serde_json::json!({ "target": "#rust", "message": message });
+            assert!(composer_request(&frame.to_string()).is_ok(), "{message}");
         }
     }
 
@@ -1046,5 +1312,165 @@ mod tests {
         assert_eq!(rejected["t"], "send-error");
         assert_eq!(rejected["v"], "a2");
         assert_eq!(rejected["message"], "not sent");
+    }
+}
+
+#[cfg(test)]
+mod send_deadline_tests {
+    use super::{SendFailure, within_send_deadline};
+
+    #[tokio::test]
+    async fn a_peer_that_never_takes_the_frame_ends_the_send() {
+        let deadline = std::time::Duration::from_millis(20);
+        let stalled =
+            within_send_deadline(deadline, std::future::pending::<Result<(), ()>>()).await;
+        assert!(matches!(stalled, Err(SendFailure::Stalled)));
+        let delivered = within_send_deadline(deadline, async { Ok::<(), ()>(()) }).await;
+        assert!(delivered.is_ok());
+        let failed = within_send_deadline(deadline, async { Err::<(), ()>(()) }).await;
+        assert!(matches!(failed, Err(SendFailure::Transport)));
+    }
+}
+
+#[cfg(test)]
+mod ui_socket_bound_tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message as Peer;
+
+    const LIVENESS: std::time::Duration = std::time::Duration::from_millis(150);
+
+    /// Serve `ws_ui_conn` for one test network on a loopback port.
+    async fn serve(
+        handle: Arc<crate::bouncer::NetworkHandle>,
+        limiter: Arc<UiSocketLimiter>,
+    ) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let app = Router::new().route(
+            "/ws",
+            get(move |ws: WebSocketUpgrade| {
+                let (handle, limiter) = (handle.clone(), limiter.clone());
+                async move {
+                    let slot = limiter.admit("Alice");
+                    ws.on_upgrade(move |socket| {
+                        ws_ui_conn(handle, socket, ComposerAuthority::MaySend, slot, LIVENESS)
+                    })
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        addr
+    }
+
+    fn attachable_network() -> (
+        Arc<crate::bouncer::NetworkHandle>,
+        crate::bouncer::DriverEnds,
+    ) {
+        let (handle, ends) = crate::bouncer::NetworkHandle::channels(8);
+        handle.history_restored();
+        (Arc::new(handle), ends)
+    }
+
+    async fn attached_clients_become(handle: &crate::bouncer::NetworkHandle, expected: u64) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while handle.runtime_snapshot().attached_clients != expected {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "attached clients stayed at {}, expected {expected}",
+                handle.runtime_snapshot().attached_clients
+            )
+        });
+    }
+
+    /// A peer whose TCP connection stays open but which never answers — a
+    /// laptop that slept, a NAT that forgot the flow — must not hold its task,
+    /// its socket, and its place in the attached-client count forever.
+    #[tokio::test]
+    async fn a_peer_that_stops_answering_pings_is_detached() {
+        let (handle, _ends) = attachable_network();
+        let addr = serve(handle.clone(), UiSocketLimiter::new()).await;
+        // Never polled again after the handshake, so it never answers a ping.
+        let (_silent, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("connect");
+        attached_clients_become(&handle, 1).await;
+        attached_clients_become(&handle, 0).await;
+    }
+
+    #[tokio::test]
+    async fn a_quiet_peer_that_answers_pings_stays_attached() {
+        let (handle, _ends) = attachable_network();
+        let addr = serve(handle.clone(), UiSocketLimiter::new()).await;
+        let (mut peer, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("connect");
+        // Reading is what lets the client library answer each ping.
+        let mut pings = 0;
+        let quiet = tokio::time::timeout(LIVENESS * 5, async {
+            while let Some(frame) = peer.next().await {
+                match frame.expect("frame") {
+                    Peer::Ping(_) => pings += 1,
+                    Peer::Close(_) => return,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            quiet.is_err(),
+            "the server closed a peer that was answering"
+        );
+        assert!(
+            pings >= 2,
+            "the server pinged {pings} time(s) across five intervals"
+        );
+        assert_eq!(handle.runtime_snapshot().attached_clients, 1);
+    }
+
+    #[tokio::test]
+    async fn one_account_holds_a_bounded_number_of_sockets_and_is_told_why() {
+        let (handle, _ends) = attachable_network();
+        let limiter = UiSocketLimiter::new();
+        let addr = serve(handle.clone(), limiter.clone()).await;
+        let held: Vec<_> = (0..MAX_UI_SOCKETS_PER_ACCOUNT)
+            .map(|_| limiter.admit("alice").expect("under the cap"))
+            .collect();
+        assert!(
+            limiter.admit("ALICE").is_none(),
+            "the cap is per folded account"
+        );
+        assert!(
+            limiter.admit("bob").is_some(),
+            "another account is unaffected"
+        );
+
+        let (mut refused, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("the upgrade itself succeeds so the browser can read the reason");
+        let close = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            match refused.next().await {
+                Some(Ok(Peer::Close(frame))) => frame.expect("close frame"),
+                Some(Ok(other)) => panic!("sent {other:?} to a refused socket"),
+                other => panic!("no close frame: {other:?}"),
+            }
+        })
+        .await
+        .expect("close");
+        assert_eq!(u16::from(close.code), 1008);
+        assert!(close.reason.contains("32"), "{}", close.reason);
+        assert_eq!(handle.runtime_snapshot().attached_clients, 0);
+
+        drop(held);
+        assert!(
+            limiter.admit("alice").is_some(),
+            "a closed socket frees its slot"
+        );
     }
 }

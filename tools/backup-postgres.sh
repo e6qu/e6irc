@@ -1,7 +1,8 @@
 #!/bin/sh
 # Create a private, validated PostgreSQL custom-format backup plus SHA-256
-# sidecar. The database URL stays in PGDATABASE rather than the process
-# argument list. Existing output is never overwritten.
+# sidecar. The database URL reaches pg_dump as libpq environment variables
+# (tools/postgres-url-environment.py), never as a process argument. Existing
+# output is never overwritten.
 set -eu
 umask 077
 
@@ -11,6 +12,7 @@ if [ "$#" -ne 1 ]; then
 fi
 : "${E6IRC_DATABASE_URL:?E6IRC_DATABASE_URL is required}"
 
+tools=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 output=$1
 checksum="${output}.sha256"
 if [ -e "$output" ] || [ -e "$checksum" ]; then
@@ -42,8 +44,7 @@ trap cleanup EXIT HUP INT TERM
 temporary=$(mktemp "$directory/.${name}.tmp.XXXXXX")
 checksum_temporary=$(mktemp "$directory/.${name}.sha256.tmp.XXXXXX")
 
-export PGDATABASE="$E6IRC_DATABASE_URL"
-pg_dump \
+python3 "$tools/postgres-url-environment.py" pg_dump \
   --format=custom \
   --compress=9 \
   --no-owner \

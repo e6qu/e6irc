@@ -3,6 +3,9 @@
 # e6ircd and print one result line per count. The server must already be
 # listening at $ADDR.
 #
+# Portable to bash 3.2: under `set -u` it takes the plain expansion of an empty
+# array for an unbound variable, hence `${ARRAY[@]+"${ARRAY[@]}"}` below.
+#
 #   tools/load/sweep.sh [ADDR] [COUNTS] [BURST] [--report-dir DIR] [E6IRC-LOAD OPTIONS...]
 #
 # Defaults: ADDR=127.0.0.1:6667, COUNTS="100 500 1000 5000", BURST=20.
@@ -31,7 +34,7 @@ for ((index = 0; index < ${#EXTRA_ARGS[@]}; index++)); do
     FILTERED_ARGS+=("$arg")
   fi
 done
-EXTRA_ARGS=("${FILTERED_ARGS[@]}")
+EXTRA_ARGS=(${FILTERED_ARGS[@]+"${FILTERED_ARGS[@]}"})
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="$ROOT/target/release/e6irc-load"
@@ -47,7 +50,7 @@ fi
 echo "sweep against $ADDR (burst=$BURST)"
 for n in $COUNTS; do
   echo "--- clients=$n ---"
-  run_args=(--addr "$ADDR" --clients "$n" --burst "$BURST" "${EXTRA_ARGS[@]}")
+  run_args=(--addr "$ADDR" --clients "$n" --burst "$BURST" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"})
   if [[ -n "$REPORT_DIR" ]]; then
     run_args+=(--report-json "$REPORT_DIR/$n.json")
   fi

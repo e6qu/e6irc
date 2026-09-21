@@ -3,10 +3,13 @@
 export const MAX_API_JSON_BYTES = 1024 * 1024;
 
 export class ApiError extends Error {
-  constructor(status, message) {
+  // `field` is the request field the server says is at fault, when the failure
+  // belongs to one, so a form can mark and focus that input.
+  constructor(status, message, field = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.field = field;
   }
 }
 
@@ -169,8 +172,12 @@ export function parseApiSchema(schema, value, label = "API response", path = "$"
     schemaError(label, path);
   }
   if (typeof value === "string") {
-    if (Number.isInteger(schema.minLength) && value.length < schema.minLength) schemaError(label, path);
-    if (Number.isInteger(schema.maxLength) && value.length > schema.maxLength) schemaError(label, path);
+    if (Number.isInteger(schema.minLength) && [...value].length < schema.minLength) schemaError(label, path);
+    // JSON Schema lengths count characters (code points), which is also what
+    // the server bounds. `.length` counts UTF-16 units, so a refusal quoting
+    // emoji would fail a 160-character limit at 81 and take the whole network
+    // list down with it.
+    if (Number.isInteger(schema.maxLength) && [...value].length > schema.maxLength) schemaError(label, path);
     if (typeof schema.pattern === "string" && !(new RegExp(schema.pattern).test(value))) schemaError(label, path);
     return value;
   }
@@ -424,7 +431,7 @@ async function apiFailure(response) {
       ? problem.title
       : "";
   if (!detail) throw new ApiError(response.status, "The server returned an invalid error response.");
-  throw new ApiError(response.status, detail);
+  throw new ApiError(response.status, detail, typeof problem.field === "string" ? problem.field : null);
 }
 
 export async function getApiObject(fetcher, url, options = {}) {

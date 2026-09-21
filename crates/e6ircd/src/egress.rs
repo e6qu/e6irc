@@ -1,0 +1,217 @@
+//! Where a network driver may connect to.
+//!
+//! An account holder types an upstream address and e6irc dials it from the
+//! server's own network position. Some destinations are never a network — the
+//! cloud metadata endpoint, multicast, broadcast, the unspecified address — and
+//! are refused always. Loopback and the private ranges are refused too, by
+//! default: on a host that sits beside internal services, letting any account
+//! ask the daemon to connect to `10.0.0.5:5432` and report whether it answers
+//! is an internal port probe. The daemon has no internal upstream of its own to
+//! reach, so nothing is lost. `internal_upstreams = "allow"` in the server
+//! configuration is the one, operator-level exception; the test harnesses set
+//! it because their upstreams are in-process listeners on loopback.
+//!
+//! Every dial goes through here with the *resolved* address, not only the
+//! literal an account typed: a hostname that resolves — now or after a DNS
+//! rebind — to a refused address is refused at connect time.
+
+use std::net::{IpAddr, Ipv4Addr};
+
+/// The server-level policy on upstream addresses inside the host's own network.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InternalUpstreams {
+    /// Loopback, RFC 1918, carrier-grade NAT and unique-local addresses are
+    /// refused as upstreams. The default.
+    #[default]
+    Refuse,
+    /// They may be dialled. For test harnesses whose upstreams listen on
+    /// loopback, and for nothing else yet.
+    Allow,
+}
+
+/// Why an address may not be dialled as an upstream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpstreamRefusal {
+    /// Never a network: link-local (the cloud metadata endpoint among them),
+    /// broadcast, documentation, multicast or unspecified.
+    NeverAnUpstream,
+    /// Inside the host's own network, and the policy is [`InternalUpstreams::Refuse`].
+    Internal,
+}
+
+impl UpstreamRefusal {
+    /// The sentence a refusal shows. It describes the rule, never the address,
+    /// so a refusal cannot itself be used to map what the rule protects.
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::NeverAnUpstream => {
+                "addr must not be a link-local, unspecified, multicast, broadcast, or documentation IP"
+            }
+            Self::Internal => {
+                "addr must not be a loopback or private (internal) IP; this server does not connect to internal infrastructure"
+            }
+        }
+    }
+}
+
+impl InternalUpstreams {
+    /// Why `ip` may not be dialled under this policy, or `None` when it may.
+    ///
+    /// The address is canonicalized first: a V4-mapped V6 literal like
+    /// `::ffff:169.254.169.254` connects, at the kernel, to the V4 address, so
+    /// it is classified by the V4 rules.
+    pub fn refusal(self, ip: IpAddr) -> Option<UpstreamRefusal> {
+        let ip = ip.to_canonical();
+        if ip.is_unspecified() || ip.is_multicast() {
+            return Some(UpstreamRefusal::NeverAnUpstream);
+        }
+        let (never, internal) = match ip {
+            IpAddr::V4(v4) => (
+                v4.is_link_local() || v4.is_broadcast() || v4.is_documentation(),
+                v4.is_loopback() || v4.is_private() || is_carrier_grade_nat(v4),
+            ),
+            // `to_canonical` has already mapped any V4-in-V6 form to V4, so
+            // what reaches here is a genuine V6 address.
+            IpAddr::V6(v6) => {
+                let [first, second, ..] = v6.segments();
+                (
+                    // Link-local, and the documentation prefix 2001:db8::/32.
+                    (first & 0xffc0) == 0xfe80 || (first == 0x2001 && second == 0x0db8),
+                    // Loopback, and unique-local fc00::/7.
+                    v6.is_loopback() || (first & 0xfe00) == 0xfc00,
+                )
+            }
+        };
+        if never {
+            Some(UpstreamRefusal::NeverAnUpstream)
+        } else if internal && self == Self::Refuse {
+            Some(UpstreamRefusal::Internal)
+        } else {
+            None
+        }
+    }
+
+    /// Whether `ip` may be dialled under this policy.
+    pub fn permits(self, ip: IpAddr) -> bool {
+        self.refusal(ip).is_none()
+    }
+
+    /// Why the address an account typed may not be an upstream, judged from its
+    /// literal form: `host[:port]`, `[v6]:port`, or a URL. A hostname cannot be
+    /// judged without DNS and passes here; it is judged, resolved, at dial time.
+    pub fn refusal_for_addr(self, addr: &str) -> Option<UpstreamRefusal> {
+        let hostport = addr.split_once("://").map_or(addr, |(_, rest)| rest);
+        let hostport = hostport.split(['/', '?', '#']).next().unwrap_or(hostport);
+        let host = if let Some(rest) = hostport.strip_prefix('[') {
+            rest.split(']').next().unwrap_or(rest)
+        } else {
+            hostport
+                .rsplit_once(':')
+                .map(|(h, _)| h)
+                .unwrap_or(hostport)
+        };
+        host.parse::<IpAddr>().ok().and_then(|ip| self.refusal(ip))
+    }
+}
+
+/// RFC 6598 shared address space, `100.64.0.0/10`: the inside of a carrier or
+/// cloud provider's NAT, which is internal for this purpose.
+fn is_carrier_grade_nat(ip: Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    a == 100 && (64..=127).contains(&b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refusal(policy: InternalUpstreams, addr: &str) -> Option<UpstreamRefusal> {
+        policy.refusal_for_addr(addr)
+    }
+
+    #[test]
+    fn what_is_never_an_upstream_is_refused_under_either_policy() {
+        for addr in [
+            "169.254.169.254:80", // cloud metadata
+            "0.0.0.0:6667",
+            "255.255.255.255:6667",
+            "[fe80::1]:6697",
+            "203.0.113.7:6697", // TEST-NET-3
+            "224.0.0.1:6667",
+            "[::ffff:169.254.169.254]:80",
+            "[::ffff:0.0.0.0]:6667",
+            "[2001:db8::1]:6697", // v6 documentation
+            "http://169.254.169.254",
+            "https://[fe80::1]/api",
+        ] {
+            for policy in [InternalUpstreams::Refuse, InternalUpstreams::Allow] {
+                assert_eq!(
+                    refusal(policy, addr),
+                    Some(UpstreamRefusal::NeverAnUpstream),
+                    "{addr} under {policy:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn internal_addresses_are_refused_by_default_and_only_by_default() {
+        for addr in [
+            "127.0.0.1:6667",
+            "[::1]:6697",
+            "10.0.0.5:6667",
+            "172.16.4.4:6667",
+            "192.168.1.10:6667",
+            "100.64.0.9:6667", // carrier-grade NAT
+            "[fc00::1]:6697",
+            "[fd12::1]:6697",
+            "[::ffff:127.0.0.1]:6667",
+            "[::ffff:10.0.0.5]:6667",
+            "http://127.0.0.1:8008",
+            "http://192.168.1.10:8008",
+        ] {
+            assert_eq!(
+                refusal(InternalUpstreams::Refuse, addr),
+                Some(UpstreamRefusal::Internal),
+                "{addr}"
+            );
+            assert_eq!(refusal(InternalUpstreams::Allow, addr), None, "{addr}");
+        }
+    }
+
+    #[test]
+    fn public_addresses_and_hostnames_pass_the_literal_check() {
+        for addr in [
+            "93.184.216.34:6697",
+            "[2606:4700::1111]:6697",
+            "irc.libera.chat:6697",
+            "https://matrix.org",
+            "100.128.0.1:6667", // just past the CGNAT block
+            "172.32.0.1:6667",  // just past 172.16/12
+        ] {
+            assert_eq!(refusal(InternalUpstreams::Refuse, addr), None, "{addr}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_names_the_rule_and_not_the_address() {
+        for refusal in [UpstreamRefusal::NeverAnUpstream, UpstreamRefusal::Internal] {
+            assert!(refusal.reason().starts_with("addr must not be"));
+        }
+    }
+
+    #[test]
+    fn the_policy_reads_from_configuration_and_refuses_by_default() {
+        #[derive(serde::Deserialize)]
+        struct Holder {
+            #[serde(default)]
+            internal_upstreams: InternalUpstreams,
+        }
+        let holder: Holder = toml::from_str("").unwrap();
+        assert_eq!(holder.internal_upstreams, InternalUpstreams::Refuse);
+        let holder: Holder = toml::from_str("internal_upstreams = \"allow\"").unwrap();
+        assert_eq!(holder.internal_upstreams, InternalUpstreams::Allow);
+        assert!(toml::from_str::<Holder>("internal_upstreams = \"yes\"").is_err());
+    }
+}

@@ -9,6 +9,12 @@ pub(super) fn cmd_oper(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.err_needmoreparams(conn, "OPER");
         return;
     };
+    // OPER is a password check like SASL and IDENTIFY, so every attempt spends
+    // the same per-connection budget: a registered client cannot pipeline
+    // guesses at line rate, and the link closes when the budget runs out.
+    if !credential_attempt_ok(state, conn) {
+        return;
+    }
     // Always run the constant-time compare — against a dummy secret when the
     // operator name is unknown — so response timing is name-independent and can't
     // be used to enumerate valid operator names. Short-circuiting on an unknown
@@ -20,6 +26,17 @@ pub(super) fn cmd_oper(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .unwrap_or(b"\0no-such-oper\0");
     let matched = constant_time_eq(candidate_pw, password.as_bytes()) && stored.is_some();
     if !matched {
+        // A security event, logged like a failed SASL attempt (one bounded
+        // line per denial; the budget above caps how many one socket makes).
+        // The offered operator name is client text, so it is logged escaped.
+        let (nick, host) = {
+            let session = &state.sessions[&conn];
+            (
+                session.nick().unwrap_or("*").to_string(),
+                session.host.clone(),
+            )
+        };
+        eprintln!("ircd: OPER authentication failed for {nick} from {host} as {name:?}");
         state.numeric(conn, ERR_PASSWDMISMATCH, &[], Some("Password incorrect"));
         return;
     }
@@ -85,35 +102,53 @@ pub(super) fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.err_needmoreparams(conn, "KILL");
         return;
     };
-    let key = state.nick_key(target);
-    if state.nick_connection(&key).is_none() {
+    let Some(victim) = state.registered_user(&state.nick_key(target)) else {
         state.err_nosuchnick(conn, target);
         return;
-    }
-    let comment = p.get(1).copied().unwrap_or("Killed");
-    let oper_nick = state.sessions[&conn]
+    };
+    let killer = state.sessions[&conn]
         .nick()
         .map(String::from)
         .expect("registered");
-    kill_by_nick(state, target, comment, &oper_nick);
+    session_action(
+        state,
+        victim.conn(),
+        crate::core::state::SessionAction::Kill {
+            comment: p.get(1).copied().unwrap_or("Killed").to_string(),
+            killer,
+        },
+    );
 }
 
-/// Disconnect the session currently holding `target` (by nick): audit it, snotice
-/// the other opers, send the standard KILL close `ERROR`, and close it. Returns
-/// whether a session was found and closed. `killer` is the display name
-/// attributed in the reason and audit — an oper's nick, or an admin account for
-/// the HTTP console. Shared by oper KILL and the admin console.
-pub(crate) fn kill_by_nick(
+/// Carry out `action` on `conn`'s session: here if it lives on this shard,
+/// otherwise by sending it to the shard it does live on. A session that is gone
+/// by the time the action arrives has nothing left to act on.
+pub(crate) fn session_action(
     state: &mut ServerState,
-    target: &str,
-    comment: &str,
-    killer: &str,
-) -> bool {
-    let key = state.nick_key(target);
-    let Some(victim) = state.nick_connection(&key) else {
-        return false;
-    };
-    kill_connection(state, victim, comment, killer)
+    conn: ConnId,
+    action: crate::core::state::SessionAction,
+) {
+    let session = state.session_shard(conn);
+    if !state.owns_session(session) {
+        state.route_input(crate::core::Input::SessionAction { session, action });
+        return;
+    }
+    match action {
+        crate::core::state::SessionAction::Kill { comment, killer } => {
+            kill_connection(state, conn, &comment, &killer);
+        }
+        crate::core::state::SessionAction::Ghost { by } => {
+            let server = state.config.server_name.clone();
+            let reason = format!("GHOST command used by {by}");
+            state.send(conn, &format!("ERROR :Closing Link: {server} ({reason})"));
+            state.close(conn, &reason);
+        }
+        crate::core::state::SessionAction::SetHost {
+            host,
+            oper,
+            oper_nick,
+        } => set_host(state, conn, &host, oper, &oper_nick),
+    }
 }
 
 /// Disconnect one exact registered connection. HTTP control-plane rows carry
@@ -207,20 +242,23 @@ pub(crate) fn record_audit_by(
 /// notice rather than subscribing to flags. Best-effort, like any NOTICE.
 pub(super) fn notify_opers(state: &mut ServerState, except: Option<ConnId>, text: &str) {
     let server = state.config.server_name.clone();
-    let recipients: Vec<(ConnId, String)> = state
-        .sessions
-        .iter()
-        .filter(|(c, s)| s.is_registered() && s.oper && Some(**c) != except)
-        .filter_map(|(&c, s)| s.nick().map(|n| (c, n.to_string())))
+    // Every operator, on whichever shard: the published records.
+    let recipients: Vec<_> = state
+        .registered_users()
+        .into_iter()
+        .filter(|user| user.oper && Some(user.conn()) != except)
         .collect();
-    for (c, nick) in recipients {
+    for user in recipients {
         // `text` can embed client-controlled, unbounded data (a KILL comment, a
         // ban reason), so fit it to the wire limit per recipient — the head's
         // length varies with the recipient's nick — or a maximal comment pushes
         // the line past 512 and the recipient's framing discards it whole.
-        let head = format!(":{server} NOTICE {nick} :*** Notice -- ");
+        let head = format!(":{server} NOTICE {} :*** Notice -- ", user.nick);
         let fitted = fit_trailing(&head, text);
-        state.send(c, &format!("{head}{fitted}"));
+        state.send_recipient_uncaptured(
+            user.recipient,
+            bytes::Bytes::from(format!("{head}{fitted}\r\n")),
+        );
     }
 }
 
@@ -537,13 +575,14 @@ pub(crate) fn remove_server_ban_hot(
     state.server_bans.len() < before
 }
 
-fn acknowledge_server_ban_oper(
+/// Answer the operator whose server-ban command has been waiting on its
+/// database verdict. Every verdict for an operator requester ends here, so the
+/// reply the connection's output is held behind always arrives.
+fn server_ban_oper_verdict(
     state: &mut ServerState,
     conn: ConnId,
     response_label: Option<String>,
-    action: &str,
-    kind_label: &str,
-    mask: &crate::core::state::MaskKey,
+    text: &str,
 ) {
     if !state.sessions.contains_key(&conn) {
         return;
@@ -551,13 +590,7 @@ fn acknowledge_server_ban_oper(
     let server = state.config.server_name.clone();
     let nick = state.sessions[&conn].nick().unwrap_or("*").to_string();
     state.emit_deferred_labeled(conn, response_label, |state| {
-        state.send(
-            conn,
-            &format!(
-                ":{server} NOTICE {nick} :{action} {kind_label} for {}",
-                mask.as_str()
-            ),
-        );
+        state.send(conn, &format!(":{server} NOTICE {nick} :{text}"));
     });
 }
 
@@ -581,17 +614,29 @@ pub(crate) fn server_ban_result(
         return None;
     }
     if result == crate::core::ServerBanResult::Missing {
-        if let crate::core::ServerBanRequester::Admin { request_id, .. } = requester {
-            finish_admin_server_ban(
-                state,
-                request_id,
-                crate::core::AdminReply::BanErr {
-                    kind: crate::core::BanControlError::NotFound,
-                    message: "server ban no longer exists".into(),
-                },
-            );
-        }
-        return None;
+        // A removal keyed only by (mask, kind) found no row, so the database
+        // holds no such ban and the hot list must stop enforcing one. A removal
+        // pinned to a row id proves only that *that* row is gone — the mask may
+        // have been banned again under a new id — so it reconciles nothing.
+        let unstored = matches!(
+            &mutation,
+            crate::core::ServerBanMutation::Remove {
+                expected_id: None,
+                ..
+            }
+        );
+        let (crate::core::ServerBanMutation::Add { mask_display, .. }
+        | crate::core::ServerBanMutation::Remove { mask_display, .. }) = &mutation;
+        finish_server_ban(
+            state,
+            requester,
+            &format!("No stored {} for {mask_display}", kind.label()),
+            crate::core::AdminReply::BanErr {
+                kind: crate::core::BanControlError::NotFound,
+                message: "server ban no longer exists".into(),
+            },
+        );
+        return unstored.then_some(mutation);
     }
 
     let (mask_display, action) = match &mutation {
@@ -599,27 +644,30 @@ pub(crate) fn server_ban_result(
         crate::core::ServerBanMutation::Remove { mask_display, .. } => (mask_display, "Removed"),
     };
     let mask = crate::core::state::MaskKey::new(mask_display, state.casemap);
-    finish_server_ban_success(state, requester, action, kind.label(), &mask);
+    let text = format!("{action} {} for {}", kind.label(), mask.as_str());
+    finish_server_ban(
+        state,
+        requester,
+        &text,
+        crate::core::AdminReply::Ok(text.clone()),
+    );
     Some(mutation)
 }
 
-fn finish_server_ban_success(
+/// Deliver one server-ban verdict to whoever asked for the change: the
+/// operator's NOTICE, or the administrative request's reply.
+fn finish_server_ban(
     state: &mut ServerState,
     requester: crate::core::ServerBanRequester,
-    action: &str,
-    kind_label: &str,
-    mask: &crate::core::state::MaskKey,
+    operator_text: &str,
+    admin_reply: crate::core::AdminReply,
 ) {
     match requester {
         crate::core::ServerBanRequester::Oper { session, label } => {
-            acknowledge_server_ban_oper(state, session.conn(), label, action, kind_label, mask);
+            server_ban_oper_verdict(state, session.conn(), label, operator_text);
         }
         crate::core::ServerBanRequester::Admin { request_id, .. } => {
-            finish_admin_server_ban(
-                state,
-                request_id,
-                crate::core::AdminReply::Ok(format!("{action} {kind_label} for {}", mask.as_str())),
-            );
+            finish_admin_server_ban(state, request_id, admin_reply);
         }
     }
 }
@@ -679,31 +727,15 @@ fn finish_server_ban_unavailable(
     requester: crate::core::ServerBanRequester,
     reason: &str,
 ) {
-    match requester {
-        crate::core::ServerBanRequester::Oper { session, label } => {
-            let conn = session.conn();
-            if state.sessions.contains_key(&conn) {
-                let server = state.config.server_name.clone();
-                let nick = state.sessions[&conn].nick().unwrap_or("*").to_string();
-                state.emit_deferred_labeled(conn, label, |state| {
-                    state.send(
-                        conn,
-                        &format!(":{server} NOTICE {nick} :Server-ban change failed: {reason}"),
-                    );
-                });
-            }
-        }
-        crate::core::ServerBanRequester::Admin { request_id, .. } => {
-            finish_admin_server_ban(
-                state,
-                request_id,
-                crate::core::AdminReply::BanErr {
-                    kind: crate::core::BanControlError::Unavailable,
-                    message: format!("server-ban change failed: {reason}"),
-                },
-            );
-        }
-    }
+    finish_server_ban(
+        state,
+        requester,
+        &format!("Server-ban change failed: {reason}"),
+        crate::core::AdminReply::BanErr {
+            kind: crate::core::BanControlError::Unavailable,
+            message: format!("server-ban change failed: {reason}"),
+        },
+    );
 }
 
 fn finish_admin_server_ban(
@@ -807,27 +839,57 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
-    let nk = state.nick_key(nick);
-    let Some(target) = state.registered_peer(&nk) else {
+    let Some(target) = state.registered_user(&state.nick_key(nick)) else {
         state.err_nosuchnick(conn, clip_echo(nick));
         return;
     };
-    let (user, old_prefix) = {
-        let s = &state.sessions[&target];
-        (s.user().map(String::from).unwrap_or_default(), s.prefix())
+    record_audit(state, conn, "SETHOST", nick, newhost);
+    let oper = state.session_shard(conn);
+    session_action(
+        state,
+        target.conn(),
+        crate::core::state::SessionAction::SetHost {
+            host: newhost.to_string(),
+            oper,
+            oper_nick,
+        },
+    );
+}
+
+/// Apply a SETHOST on the shard the target's session lives on.
+fn set_host(
+    state: &mut ServerState,
+    target: ConnId,
+    newhost: &str,
+    oper: crate::core::SessionOwner,
+    oper_nick: &str,
+) {
+    let Some(session) = state.sessions.get_mut(&target) else {
+        return;
     };
-    state.sessions.get_mut(&target).expect("checked").host = newhost.to_string();
+    let (nick, user, old_prefix) = (
+        session.nick().map(String::from).unwrap_or_default(),
+        session.user().map(String::from).unwrap_or_default(),
+        session.prefix(),
+    );
+    session.host = newhost.to_string();
 
     // Announce with the old prefix so clients can match, to every
     // chghost-capable peer (including the target), then to extended-monitor
     // watchers of the target's nick.
     let chghost = format!(":{old_prefix} CHGHOST {user} {newhost}");
-    notify_event(state, target, &chghost, |c| c.chghost, true);
+    notify_event(
+        state,
+        target,
+        &chghost,
+        crate::core::state::UserEventAudience::Chghost,
+        state.sessions[&target].caps.chghost,
+    );
     // A chghost-capable target learned of the change from the CHGHOST above; a
     // client without the cap would otherwise never be told its own host moved.
     // Fill that gap with RPL_VISIBLEHOST so every target learns its new visible
     // host — the CHGHOST is for *other* clients' view, 396 is for the target's.
-    if state.sessions.get(&target).is_some_and(|s| !s.caps.chghost) {
+    if !state.sessions[&target].caps.chghost {
         state.numeric(
             target,
             RPL_VISIBLEHOST,
@@ -835,10 +897,12 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             Some("is now your visible host"),
         );
     }
-    record_audit(state, conn, "SETHOST", nick, newhost);
-    state.send(
-        conn,
-        &format!(":{server} NOTICE {oper_nick} :Set host of {nick} to {newhost}"),
+    let server = state.config.server_name.clone();
+    state.send_recipient_uncaptured(
+        crate::core::state::Recipient::new(oper, Default::default()),
+        bytes::Bytes::from(format!(
+            ":{server} NOTICE {oper_nick} :Set host of {nick} to {newhost}\r\n"
+        )),
     );
 }
 
@@ -859,13 +923,13 @@ pub(super) fn cmd_wallops(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let head = format!(":{prefix} WALLOPS :");
     let text = crate::core::handler::fit_trailing(&head, text);
     let line = format!("{head}{text}");
-    let recipients: Vec<ConnId> = state
-        .sessions
-        .iter()
-        .filter(|(_, s)| s.is_registered() && s.wallops)
-        .map(|(c, _)| *c)
+    let recipients: Vec<_> = state
+        .registered_users()
+        .into_iter()
+        .filter(|user| user.wallops)
+        .map(|user| user.recipient)
         .collect();
     for recipient in recipients {
-        state.send_timed(recipient, &line);
+        state.send_timed_recipient(recipient, &line);
     }
 }

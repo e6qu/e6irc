@@ -12,6 +12,24 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 mod support;
 
+/// A full-access personal access token with the default lifetime, minted the
+/// way the REST endpoint mints one.
+async fn issue_api_token(
+    pool: &sqlx::PgPool,
+    account: &str,
+    label: &str,
+) -> Result<String, e6ircd::db::DbError> {
+    e6ircd::db::issue_scoped_api_token(
+        pool,
+        account,
+        label,
+        e6ircd::identity::ApiTokenScopes::new(e6ircd::identity::ApiTokenScope::ALL)
+            .expect("every scope is a non-empty set"),
+        e6ircd::identity::ApiTokenLifetimeDays::DEFAULT,
+    )
+    .await
+}
+
 async fn upstream() -> std::net::SocketAddr {
     let cfg = Config {
         server_name: "irc.up.example".into(),
@@ -33,12 +51,10 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    e6ircd::db::create_account(&pool, "alice", "s3cr3t")
+    e6ircd::db::create_account_with_contact(&pool, "alice", "s3cr3t", None)
         .await
         .expect("acct");
-    let token = e6ircd::db::issue_api_token(&pool, "alice", "web")
-        .await
-        .expect("token");
+    let token = issue_api_token(&pool, "alice", "web").await.expect("token");
     drop(pool);
 
     let up = upstream().await;
@@ -65,6 +81,7 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
             addr: up.to_string(),
             tls: false,
             nick: "alicebnc".into(),
+            username: Some("tester".into()),
             realname: Some("alicebnc".into()),
             autojoin: vec!["#lobby".into()],
             buffer_cap: 1000,
@@ -74,6 +91,7 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -86,7 +104,13 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
     let mut peer = e6irc_client::Connection::connect(&up.to_string())
         .await
         .unwrap();
-    peer.register("peer", "peer").await.unwrap();
+    peer.register(&e6irc_client::Identity {
+        nick: "peer",
+        username: "peer",
+        realname: "peer",
+    })
+    .await
+    .unwrap();
     peer.send_line("JOIN #lobby").await.unwrap();
     loop {
         if peer.next_message().await.unwrap().unwrap().command == "366" {
@@ -314,6 +338,7 @@ async fn ws_ui_requires_authentication() {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -353,12 +378,10 @@ async fn ws_ui_detaches_when_its_network_is_removed() {
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    e6ircd::db::create_account(&pool, "alice", "s3cr3t")
+    e6ircd::db::create_account_with_contact(&pool, "alice", "s3cr3t", None)
         .await
         .expect("acct");
-    let token = e6ircd::db::issue_api_token(&pool, "alice", "web")
-        .await
-        .expect("token");
+    let token = issue_api_token(&pool, "alice", "web").await.expect("token");
     drop(pool);
 
     let up = upstream().await;
@@ -380,6 +403,7 @@ async fn ws_ui_detaches_when_its_network_is_removed() {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     };
     let http = net::start(config)
@@ -391,7 +415,7 @@ async fn ws_ui_detaches_when_its_network_is_removed() {
     // Create the network via REST (a config network has no DB row and can't be
     // deleted; a REST-created one can).
     let body = format!(
-        r#"{{"kind":"irc","name":"up","addr":"{up}","tls":false,"nick":"alicebnc","realname":"Alice BNC","autojoin":[]}}"#
+        r#"{{"kind":"irc","name":"up","addr":"{up}","tls":false,"nick":"alicebnc","username":"alicebnc","realname":"Alice BNC","autojoin":[]}}"#
     );
     let (status, _) = http_req(
         http,

@@ -26,6 +26,7 @@
       <div><span>Server</span><code data-network-field="addr">—</code></div>
       <div><span>Connection</span><strong data-network-field="transport">—</strong></div>
       <div><span data-network-label="nick">Nickname</span><code data-network-field="nick">—</code></div>
+      <div><span>Username</span><code data-network-field="username">—</code></div>
       <div><span>Real name</span><code data-network-field="realname">—</code></div>
       <div><span data-network-label="autojoin">Channels to join</span><code data-network-field="autojoin">—</code></div>
       <div><span data-network-label="account-credential">NickServ account</span><strong data-network-field="account-credential">—</strong></div>
@@ -43,8 +44,8 @@
       </div>
       <form class="network-form" method="post" data-api-network-account-save>
         <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-        <label class="field"><span>NickServ account</span><input name="sasl_account" autocomplete="username" maxlength="255" required /></label>
-        <label class="field"><span>NickServ password</span><input type="password" name="sasl_password" autocomplete="current-password" maxlength="200" required /></label>
+        <label class="field"><span>NickServ account</span><input name="sasl_account" autocomplete="off" maxlength="255" required /></label>
+        <label class="field"><span>NickServ password</span><input type="password" name="sasl_password" autocomplete="new-password" maxlength="512" required /></label>
         <div class="form-actions field-wide"><button class="primary" type="submit">Save and reconnect</button></div>
       </form>
       <details class="advanced account-registration" data-network-account-registration>

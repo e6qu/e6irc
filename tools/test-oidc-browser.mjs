@@ -55,6 +55,17 @@ async function expectStatus(page, pattern) {
   assert.match(await banner.innerText(), pattern);
 }
 
+// End only e6irc's session, as the application's own script would: the POST
+// is cookie-authenticated, so it carries the session-bound CSRF value.
+async function endApplicationSession(request) {
+  const identity = await request.get(`${applicationOrigin}/api/v1/me`);
+  assert.equal(identity.status(), 200, await identity.text());
+  const logout = await request.post(`${applicationOrigin}/api/v1/auth/logout`, {
+    headers: { "X-E6IRC-CSRF": (await identity.json()).csrf_token },
+  });
+  assert.equal(logout.status(), 204, await logout.text());
+}
+
 async function waitForConfigurationServerName(page, value) {
   await page.waitForFunction(
     (expected) => document.querySelector('form.settings-form input[name="server_name"]')?.value === expected,
@@ -91,6 +102,9 @@ await writeFile(
   configPath,
   `server_name = "irc.browser.example"
 network_name = "BrowserNet"
+# The journey's mock upstream listens on loopback, which the daemon refuses to
+# dial by default.
+internal_upstreams = "allow"
 
 [[listeners]]
 addr = "127.0.0.1:0"
@@ -448,7 +462,7 @@ try {
   ]);
   assert.equal(passwordResponse.status(), 204);
   await expectStatus(page, /Local password added/);
-  assert.equal((await context.request.post(`${applicationOrigin}/api/v1/auth/logout`)).status(), 204);
+  await endApplicationSession(context.request);
   await page.goto(`${applicationOrigin}/login`);
   await page.getByLabel("Account", { exact: true }).fill(accountName);
   await page.getByLabel("Password", { exact: true }).fill("browser-local-password");
@@ -611,24 +625,28 @@ try {
   await networkDriver.selectOption("local");
   assert.equal(await networkForm.locator('[name="addr"]').isVisible(), true);
   assert.equal(await networkForm.locator('[name="nick"]').isVisible(), true);
+  assert.equal(await networkForm.locator('[name="username"]').isVisible(), true);
+  assert.equal(await networkForm.locator('[name="username"]').getAttribute("required"), "");
   assert.equal(await networkForm.locator('[name="realname"]').isVisible(), true);
   assert.equal(await networkForm.locator('[name="sasl_account"]').isVisible(), false);
   assert.equal(await networkForm.locator('[name="sasl_password"]').isVisible(), false);
   await networkDriver.selectOption("irc");
   assert.equal(await networkForm.locator('[name="addr"]').getAttribute("required"), "");
   assert.equal(await networkForm.locator('[name="nick"]').getAttribute("required"), "");
+  assert.equal(await networkForm.locator('[name="username"]').getAttribute("required"), "");
   assert.equal(await networkForm.locator('[name="realname"]').getAttribute("required"), "");
   assert.equal(await networkForm.locator('[name="sasl_password"]').getAttribute("required"), null);
   // The captions are the shared vocabulary; the fields are then addressed by
   // name, because a password label also carries its reveal button's text.
   assert.deepEqual(
     await networkForm.locator("label:not([hidden]) > span:first-child").allInnerTexts(),
-    ["Name", "Owner blank for shared", "Type", "Server", "Nickname", "Real name", "Channels to join",
+    ["Name", "Owner blank for shared", "Type", "Server", "Nickname", "Username", "Real name", "Channels to join",
       "Buffer capacity", "NickServ account", "NickServ password"],
   );
   await networkForm.locator('[name="name"]').fill("shared-browser");
   await networkForm.locator('[name="addr"]').fill(upstream.address);
   await networkForm.locator('[name="nick"]').fill("sharedbrowser");
+  await networkForm.locator('[name="username"]').fill("sharedid");
   await networkForm.locator('[name="realname"]').fill("Shared Browser");
   await networkForm.locator('[name="autojoin"]').fill("#shared");
   await networkForm.locator('[name="tls"]').uncheck();
@@ -673,6 +691,12 @@ try {
     });
     const row = section.locator("article, .compact-list > div").filter({ hasText: item });
     await row.getByRole("button", { name: "Remove" }).click();
+    // Removing a provider locks out everyone who signs in through it, so the
+    // console asks first, naming what it is about to remove.
+    const removal = page.getByRole("dialog", { name: "Confirm action", exact: true });
+    await removal.waitFor();
+    assert.match(await removal.innerText(), new RegExp(`Remove .*${item}\\?`));
+    await removal.getByRole("button", { name: "Remove", exact: true }).click();
     await expectStatus(page, new RegExp(outcome));
   }
   // The success banner is rendered before the API-hydrated revision text on
@@ -1073,15 +1097,19 @@ try {
   await page.locator('input[name="name"]').fill("journey");
   await page.locator('input[name="addr"]').fill(upstream.address);
   await page.locator('input[name="nick"]').fill("webjourney");
+  await page.locator('input[name="username"]').fill("webident");
   await page.locator('input[name="realname"]').fill("Web Journey");
   await page.locator('input[name="autojoin"]').fill("#journey");
   await page.locator('input[name="tls"]').uncheck();
   const preflightResponse = page.waitForResponse(
-    (response) => response.url() === `${applicationOrigin}/api/v1/me/networks/preflight`
+    (response) => response.url() === `${applicationOrigin}/api/v1/me/network-preflight`
       && response.request().method() === "POST",
     { timeout: 45_000 },
   );
+  // The user name typed in the form is what the upstream is sent -- by the
+  // connection test and by the network itself -- not something made from the nick.
   await page.getByRole("button", { name: "Test connection", exact: true }).click();
+  await upstream.waitForLine((line) => line === "USER webident 0 * :Web Journey");
   const preflight = await preflightResponse;
   assert.equal(preflight.status(), 200, await preflight.text());
   await page.getByRole("status").filter({ hasText: /Registered as webjourney/ }).waitFor({ timeout: 45_000 });
@@ -1462,6 +1490,7 @@ try {
             addr: "irc.example:6697",
             tls: true,
             nick: "webnick",
+            username: "webident",
             realname: null,
             autojoin: [],
             sasl_account: null,
@@ -1748,7 +1777,7 @@ try {
   await page.getByRole("button", { name: "Retry now" }).waitFor();
   await page.getByRole("button", { name: "Retry now" }).click();
   await manualReconnect;
-  await page.getByText("demo: upstream connected", { exact: true }).waitFor();
+  await page.getByText("demo: connected", { exact: true }).waitFor();
   assert.equal(socketConnections, 2, "manual retry created exactly one replacement socket");
 
   // Inactive conversations distinguish ordinary unread traffic from messages
@@ -1966,7 +1995,7 @@ try {
   // intact. Opening the application entry goes to the login page; clicking
   // the provider link restores access without prompting at the provider
   // (the IdP session is still valid).
-  assert.equal((await context.request.post(`${applicationOrigin}/api/v1/auth/logout`)).status(), 204);
+  await endApplicationSession(context.request);
   assert.equal((await context.request.get(`${applicationOrigin}/api/v1/me`)).status(), 401);
   await page.goto(`${applicationOrigin}/`);
   assert.equal(page.url(), `${applicationOrigin}/login`);
@@ -1981,7 +2010,7 @@ try {
 
   // The provider's registered post-logout return is public, persistent, and
   // recoverable through the application's own OIDC starter after a reload.
-  assert.equal((await context.request.post(`${applicationOrigin}/api/v1/auth/logout`)).status(), 204);
+  await endApplicationSession(context.request);
   await page.goto(`${applicationOrigin}/auth/signed-out`);
   await page.getByRole("heading", { name: "You are signed out" }).waitFor();
   let signIn = page.getByRole("link", { name: "Sign in with dex" });

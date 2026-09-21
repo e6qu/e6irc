@@ -133,6 +133,10 @@ async fn full_oidc_login_provisions_account_and_session() {
     // 5. logout kills the session
     let resp = client
         .post(format!("{base}/api/v1/auth/logout"))
+        .header(
+            "X-E6IRC-CSRF",
+            me["csrf_token"].as_str().expect("session CSRF value"),
+        )
         .send()
         .await
         .expect("logout");
@@ -152,7 +156,7 @@ async fn pat_bearer_auth_works() {
     let pool = e6ircd::db::connect_and_migrate(&db_url)
         .await
         .expect("connect");
-    e6ircd::db::create_account(&pool, "patuser", "pw")
+    e6ircd::db::create_account_with_contact(&pool, "patuser", "pw", None)
         .await
         .expect("create");
     let session = e6ircd::db::create_web_session(&pool, "patuser", None)
@@ -241,10 +245,10 @@ async fn oidc_identity_link_flow_and_conflict() {
     let pool = e6ircd::db::connect_and_migrate(&db_url)
         .await
         .expect("connect");
-    e6ircd::db::create_account(&pool, "alice", "pw")
+    e6ircd::db::create_account_with_contact(&pool, "alice", "pw", None)
         .await
         .expect("alice");
-    e6ircd::db::create_account(&pool, "bob", "pw")
+    e6ircd::db::create_account_with_contact(&pool, "bob", "pw", None)
         .await
         .expect("bob");
     let alice_session = e6ircd::db::create_web_session(&pool, "alice", None)

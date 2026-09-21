@@ -77,12 +77,13 @@ fn verify_denied(
 }
 
 /// Charge one credential-verification attempt against the connection's budget
-/// before an (expensive) argon2 verify is dispatched. Returns false — and closes
-/// the connection — once the budget is exceeded, bounding the online
-/// brute-force / CPU-exhaustion surface even when per-IP rate limits are off.
+/// before the secret is checked (an expensive argon2 verify, or OPER's compare).
+/// Returns false — and closes the connection — once the budget is exceeded,
+/// bounding the online brute-force / CPU-exhaustion surface even when per-IP
+/// rate limits are off.
 ///
-/// This budget is shared across *every* command that can drive an argon2 op —
-/// SASL AUTHENTICATE, NickServ IDENTIFY, and NickServ REGISTER — so no single
+/// This budget is shared across *every* command that checks a secret — SASL
+/// AUTHENTICATE, NickServ IDENTIFY, NickServ REGISTER, and OPER — so no single
 /// path can be looped to bypass the cap the others enforce.
 pub(super) fn credential_attempt_ok(state: &mut ServerState, conn: ConnId) -> bool {
     if !state
@@ -342,10 +343,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
     if !state.sessions.contains_key(&conn)
         && !matches!(
             reply,
-            crate::core::DbReply::ChannelRegistered { .. }
-                | crate::core::DbReply::ChannelExists { .. }
-                | crate::core::DbReply::ChannelRegisterUnavailable { .. }
-                | crate::core::DbReply::ChannelTopicSet { .. }
+            crate::core::DbReply::ChannelTopicSet { .. }
                 | crate::core::DbReply::ChannelTopicFailed { .. }
                 | crate::core::DbReply::ReadMarkerStored { .. }
                 | crate::core::DbReply::ReadMarkerUnavailable { .. }
@@ -488,16 +486,6 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                 }
             }
         }
-        crate::core::DbReply::ChannelRegisterUnavailable { channel, label } => {
-            let key = state.chan_key(&channel);
-            state.pending_channel_registrations.remove(&key);
-            super::services::chanserv_deferred_notice(
-                state,
-                conn,
-                label,
-                "Services are temporarily unavailable. Try again later.".into(),
-            );
-        }
         crate::core::DbReply::AccountCreated { account, origin } => {
             state.sessions.get_mut(&conn).expect("checked").account = Some(account.clone());
             match origin {
@@ -547,48 +535,6 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     });
                 }
             }
-        }
-        crate::core::DbReply::ChannelRegistered {
-            channel,
-            founder_account,
-            topic,
-            label,
-        } => {
-            // Record ownership in the hot copy so the founder is re-opped on
-            // future joins without waiting for a restart. Seed it from the
-            // account the DB row was actually written with (echoed on the
-            // reply), not the live session — a LOGOUT/IDENTIFY between the
-            // request and this reply would otherwise record the wrong founder
-            // (or none), diverging the hot map from storage until restart.
-            let key = state.chan_key(&channel);
-            state.pending_channel_registrations.remove(&key);
-            state.set_founder(&channel, &founder_account);
-            if let Some((text, set_by, set_at_secs)) = topic {
-                state.registered_topics.set(
-                    key,
-                    Topic {
-                        text,
-                        set_by,
-                        set_at_secs,
-                    },
-                );
-            }
-            super::services::chanserv_deferred_notice(
-                state,
-                conn,
-                label,
-                format!("\x02{channel}\x02 is now registered to your account."),
-            );
-        }
-        crate::core::DbReply::ChannelExists { channel, label } => {
-            let key = state.chan_key(&channel);
-            state.pending_channel_registrations.remove(&key);
-            super::services::chanserv_deferred_notice(
-                state,
-                conn,
-                label,
-                "That channel is already registered.".into(),
-            );
         }
         crate::core::DbReply::ChannelTopicSet {
             channel,
@@ -707,5 +653,11 @@ pub(super) fn notify_account_change(state: &mut ServerState, conn: ConnId, accou
     }
     let prefix = state.sessions[&conn].prefix();
     let line = format!(":{prefix} ACCOUNT {account}");
-    notify_event(state, conn, &line, |c| c.account_notify, false);
+    notify_event(
+        state,
+        conn,
+        &line,
+        crate::core::state::UserEventAudience::AccountNotify,
+        false,
+    );
 }

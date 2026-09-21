@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  ApiError,
   ApiSchemaError,
   apiContractLoader,
   getOperationJson,
@@ -202,11 +203,11 @@ test("operation parser gives a literal path precedence over a template", () => {
   };
   const document = {
     paths: {
-      "/api/v1/me/networks/{name}": { get: { responses: { 200: { content: { "application/json": { schema: templateSchema } } } } } },
-      "/api/v1/me/networks/preflight": { get: { responses: { 200: { content: { "application/json": { schema: literalSchema } } } } } },
+      "/api/v1/examples/{name}": { get: { responses: { 200: { content: { "application/json": { schema: templateSchema } } } } } },
+      "/api/v1/examples/preflight": { get: { responses: { 200: { content: { "application/json": { schema: literalSchema } } } } } },
     },
   };
-  assert.deepEqual(parseOperationResponse(document, "GET", "/api/v1/me/networks/preflight", { preflight: true }), { preflight: true });
+  assert.deepEqual(parseOperationResponse(document, "GET", "/api/v1/examples/preflight", { preflight: true }), { preflight: true });
 });
 
 test("operation parser rejects ambiguous templates", () => {
@@ -511,6 +512,36 @@ test("operation requests preserve an API problem detail", async () => {
     ),
     /Profile storage unavailable/,
   );
+});
+
+test("string length limits count characters, as the server does, not UTF-16 units", () => {
+  const limited = { type: "string", minLength: 2, maxLength: 4 };
+  // Four emoji are eight UTF-16 units but four characters.
+  assert.equal(parseApiSchema(limited, "😀😀😀😀", "value"), "😀😀😀😀");
+  assert.throws(() => parseApiSchema(limited, "😀😀😀😀😀", "value"), ApiSchemaError);
+  // One emoji is two units but a single character: below the minimum.
+  assert.throws(() => parseApiSchema(limited, "😀", "value"), ApiSchemaError);
+});
+
+test("an API problem carries the request field it belongs to", async () => {
+  const refuse = (problem) => getOperationJson(
+    async () => new Response(JSON.stringify(problem), {
+      status: 400,
+      headers: { "content-type": "application/problem+json" },
+    }),
+    { paths: { "/api/v1/me/profile": { patch: { responses: {} } } } },
+    "PATCH",
+    "/api/v1/me/profile",
+    { csrf: "session-bound" },
+  );
+  await assert.rejects(
+    refuse({ title: "Invalid IRC identity", detail: "nick must be one word", field: "nick" }),
+    (error) => error instanceof ApiError && error.status === 400 && error.field === "nick" && /one word/.test(error.message),
+  );
+  // Absent, or not a string, is "no particular field" -- never a guess.
+  for (const problem of [{ title: "Conflict" }, { title: "Conflict", field: 7 }]) {
+    await assert.rejects(refuse(problem), (error) => error instanceof ApiError && error.field === null);
+  }
 });
 
 test("undeclared operations fail before a request leaves the browser", async () => {

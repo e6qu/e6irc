@@ -30,6 +30,14 @@ impl LogLine {
     }
 }
 
+/// Whether `command` is an IRC error reply (400–599).
+fn is_error_numeric(command: &str) -> bool {
+    command.len() == 3
+        && command
+            .parse::<u16>()
+            .is_ok_and(|numeric| (400..600).contains(&numeric))
+}
+
 /// One conversation: a channel or a query (PM) with its own scrollback.
 #[derive(Debug, Clone)]
 pub struct Buffer {
@@ -143,6 +151,8 @@ pub struct App {
     input_cursor: usize,
     pub should_quit: bool,
     connected: bool,
+    /// The network task stopped reconnecting; nothing typed will ever be sent.
+    gave_up: bool,
     pending_read_marker: Option<String>,
     invalid_time_reported: bool,
     /// The buffer cap has been reported to the user; say it once, not per line.
@@ -191,6 +201,7 @@ impl App {
             input_cursor: 0,
             should_quit: false,
             connected: true,
+            gave_up: false,
             pending_read_marker: None,
             invalid_time_reported: false,
             buffer_limit_reported: false,
@@ -199,11 +210,28 @@ impl App {
         }
     }
 
+    /// Adopt the nickname the server confirmed at registration. It is the
+    /// server's to choose, and the only name under which this client's own
+    /// messages and joins come back.
+    pub fn set_nick(&mut self, nick: &str) {
+        self.nick = nick.to_owned();
+    }
+
     /// Update whether sends can reach the server. The network task reconnects
     /// independently; the model refuses input while it is down so a line is
     /// never rendered as sent and queued for surprise delivery later.
     pub fn set_connected(&mut self, connected: bool) {
         self.connected = connected;
+    }
+
+    /// The network task will not reconnect: say so instead of "reconnecting".
+    pub fn stop_reconnecting(&mut self) {
+        self.connected = false;
+        self.gave_up = true;
+    }
+
+    pub fn gave_up(&self) -> bool {
+        self.gave_up
     }
 
     pub fn connected(&self) -> bool {
@@ -294,6 +322,7 @@ impl App {
             .and_then(|s| s.split('!').next())
             .unwrap_or("?")
             .to_string();
+        let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
         match msg.command.as_str() {
             "PRIVMSG" | "NOTICE" => {
                 let Some(target) = msg.params.first().cloned() else {
@@ -302,7 +331,7 @@ impl App {
                 let text = msg.params.get(1).cloned().unwrap_or_default();
                 // A channel message lands in that channel's buffer; a PM to
                 // us opens/uses a query buffer named after the sender.
-                let buffer = if e6irc_proto::casemap::CaseMapping::Rfc1459.eq(&target, &self.nick) {
+                let buffer = if casemap.eq(&target, &self.nick) {
                     sender.clone()
                 } else {
                     target
@@ -350,16 +379,30 @@ impl App {
                 }
             }
             "QUIT" => {
-                // A quit affects the channels we share and any open query with
-                // the quitter. This client tracks no per-channel membership, so
-                // channel buffers are the closest honest scope — but a query
-                // buffer with an *unrelated* user must not report it: that
-                // would attribute an event to a conversation it never touched.
-                for b in &mut self.buffers {
-                    if b.name.starts_with('#') || b.name.starts_with('&') || b.name == sender {
-                        b.push(LogLine::new("*", &format!("{sender} quit")));
-                    }
+                self.note_about_user(&sender, &format!("{sender} quit"));
+            }
+            "NICK" => {
+                let Some(new_nick) = msg.params.first() else {
+                    return;
+                };
+                if casemap.eq(&sender, &self.nick) {
+                    self.nick = new_nick.clone();
+                    self.status(format!("you are now known as {new_nick}"));
+                } else {
+                    self.note_about_user(&sender, &format!("{sender} is now known as {new_nick}"));
                 }
+            }
+            "KICK" => {
+                let (Some(channel), Some(kicked)) = (msg.params.first(), msg.params.get(1)) else {
+                    return;
+                };
+                let reason = msg.params.get(2).map(String::as_str).unwrap_or("");
+                let who = if casemap.eq(kicked, &self.nick) {
+                    "you were"
+                } else {
+                    &format!("{kicked} was")
+                };
+                self.note_in(channel, &format!("{who} kicked by {sender}: {reason}"));
             }
             "MARKREAD" => {
                 let Some(target) = msg.params.first() else {
@@ -385,7 +428,43 @@ impl App {
                     self.buffers[index].unread = 0;
                 }
             }
+            // The server closing the link, or answering a command with a
+            // standard reply, is the only account the user gets of it.
+            "ERROR" => self.status(format!("server error: {}", msg.params.join(" "))),
+            command @ ("FAIL" | "WARN" | "NOTE") => {
+                self.status(format!("{command} {}", msg.params.join(" ")));
+            }
+            // 400–599 are the error replies. The local echo shows a message as
+            // sent the moment it is queued, so a refusal that is not shown
+            // leaves the user believing it was delivered. `params[0]` is our
+            // own nick; what follows names the subject, then says why.
+            numeric if is_error_numeric(numeric) => {
+                let subject = msg.params.get(1).map(String::as_str).unwrap_or("");
+                let detail = msg.params.get(1..).unwrap_or_default().join(" ");
+                self.note_in(subject, &format!("{detail} ({numeric})"));
+            }
+            // Everything else (the welcome burst, NAMES, MODE, …) is state this
+            // client does not model, not an outcome the user is waiting on.
             _ => {}
+        }
+    }
+
+    /// Say `text` in the buffer named `buffer`, or where the user is looking
+    /// when there is no such buffer — never nowhere.
+    fn note_in(&mut self, buffer: &str, text: &str) {
+        let index = self.buffer_index(buffer).unwrap_or(self.current);
+        self.buffers[index].push(LogLine::new("*", text));
+    }
+
+    /// Say `text` wherever `nick` may be present. This client tracks no
+    /// per-channel membership, so channel buffers are the closest honest scope
+    /// — but a query buffer with an *unrelated* user must not report it: that
+    /// would attribute an event to a conversation it never touched.
+    fn note_about_user(&mut self, nick: &str, text: &str) {
+        for buffer in &mut self.buffers {
+            if e6irc_client::is_channel_target(&buffer.name) || buffer.name == nick {
+                buffer.push(LogLine::new("*", text));
+            }
         }
     }
 
@@ -834,6 +913,90 @@ mod tests {
                 .map(|i| app.buffers[i].log[0].text.as_str().to_string()),
             Some("elsewhere".into())
         );
+    }
+
+    fn last_line(app: &App, buffer: &str) -> String {
+        let index = app.buffer_index(buffer).expect("buffer");
+        app.buffers[index]
+            .log
+            .last()
+            .map(|line| line.text.to_string())
+            .unwrap_or_default()
+    }
+
+    /// The local echo appears as soon as a line is queued, so the server's
+    /// refusal is the only thing that tells the user it was not delivered.
+    #[test]
+    fn a_refused_message_is_said_in_the_buffer_it_was_sent_from() {
+        let mut app = App::new("#home".into(), "me".into());
+        app.on_message(&msg(":me!u@h JOIN #moderated"));
+        app.on_message(&msg(":srv 404 me #moderated :Cannot send to channel"));
+        assert_eq!(
+            last_line(&app, "#moderated"),
+            "#moderated Cannot send to channel (404)"
+        );
+        // A refusal about something with no buffer is said where the user is.
+        app.on_message(&msg(":srv 401 me nosuchnick :No such nick/channel"));
+        assert_eq!(
+            last_line(&app, "#home"),
+            "nosuchnick No such nick/channel (401)"
+        );
+        app.on_message(&msg(":srv 473 me #inviteonly :Cannot join channel (+i)"));
+        assert_eq!(
+            last_line(&app, "#home"),
+            "#inviteonly Cannot join channel (+i) (473)"
+        );
+    }
+
+    #[test]
+    fn kicks_standard_replies_and_server_errors_are_never_dropped() {
+        let mut app = App::new("#home".into(), "me".into());
+        app.on_message(&msg(":op!u@h KICK #home me :enough"));
+        assert_eq!(last_line(&app, "#home"), "you were kicked by op: enough");
+        app.on_message(&msg(":op!u@h KICK #home troll :bye"));
+        assert_eq!(last_line(&app, "#home"), "troll was kicked by op: bye");
+        app.on_message(&msg(
+            ":srv FAIL CHATHISTORY INVALID_TARGET #x :no such target",
+        ));
+        assert_eq!(
+            last_line(&app, "#home"),
+            "FAIL CHATHISTORY INVALID_TARGET #x no such target"
+        );
+        app.on_message(&msg("ERROR :Closing Link: me (Ping timeout)"));
+        assert_eq!(
+            last_line(&app, "#home"),
+            "server error: Closing Link: me (Ping timeout)"
+        );
+        // An ordinary informational numeric is still not conversation.
+        let before = app.buffers[0].log.len();
+        app.on_message(&msg(":srv 372 me :- message of the day"));
+        assert_eq!(app.buffers[0].log.len(), before);
+    }
+
+    /// The server confirms the nickname; a bouncer's is the upstream's. A
+    /// direct message is recognised by the confirmed name, and it follows every
+    /// NICK whose source is that name.
+    #[test]
+    fn direct_messages_are_recognised_by_the_nick_the_server_confirmed() {
+        let mut app = App::new("#home".into(), "requested".into());
+        app.set_nick("Upstream");
+        app.on_message(&msg(":alice!u@h PRIVMSG upstream :hello"));
+        assert!(app.buffer_index("alice").is_some());
+        assert!(
+            app.buffer_index("upstream").is_none(),
+            "a message to us opened a buffer where replies would go to ourselves"
+        );
+
+        app.on_message(&msg(":UPSTREAM!u@h NICK renamed"));
+        assert_eq!(app.nick, "renamed");
+        assert_eq!(last_line(&app, "#home"), "you are now known as renamed");
+        app.on_message(&msg(":bob!u@h PRIVMSG renamed :hi"));
+        assert!(app.buffer_index("bob").is_some());
+        assert!(app.buffer_index("renamed").is_none());
+
+        app.on_message(&msg(":alice!u@h NICK alicia"));
+        assert_eq!(app.nick, "renamed");
+        assert_eq!(last_line(&app, "alice"), "alice is now known as alicia");
     }
 
     #[test]

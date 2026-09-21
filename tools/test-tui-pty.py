@@ -179,6 +179,8 @@ def main() -> None:
                     f"127.0.0.1:{port}",
                     "--nick",
                     "ptyclient",
+                    "--username",
+                    "ptyclient",
                     "--channel",
                     "#pty",
                     "--history-lines",

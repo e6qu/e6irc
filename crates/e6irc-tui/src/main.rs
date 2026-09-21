@@ -3,14 +3,18 @@
 //! messages to the render loop over a channel.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use e6irc_client::token_cache::{default_token_path, load_token};
-use e6irc_client::{Authentication, ClientEvent, Connection, ConnectionOptions, OwnedMessage};
+use e6irc_client::credentials::{CredentialArguments, SecretSources, process_environment};
+use e6irc_client::{
+    CleartextCredentials, ClientEvent, Connection, ConnectionOptions, JoinRefusal, OwnedMessage,
+    Registered,
+};
 use e6irc_tui::app::{Action, App};
+use e6irc_tui::reconnect::{AfterFailure, ReconnectPolicy};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position};
@@ -29,36 +33,63 @@ struct Cli {
     /// Nickname to register with.
     #[arg(long, short)]
     nick: String,
+    /// IRC user name (ident) sent in USER. When absent, --nick is used, and
+    /// only if it is itself a legal user name (ASCII letters, digits, '_' and
+    /// '-', starting with a letter or digit, at most 10 bytes). A nick that is
+    /// not — `_bot`, `ada|away` — is never rewritten to fit: the client stops
+    /// and asks for --username.
+    #[arg(long, short)]
+    username: Option<String>,
     /// Initial channel to join.
     #[arg(long, short)]
     channel: String,
-    /// SASL PLAIN account. For BNC attachment use account/network.
-    #[arg(long, requires = "password", conflicts_with = "oauth_token")]
+    /// SASL PLAIN account. For BNC attachment use account/network. Its
+    /// password comes from --password-file, E6IRC_PASSWORD, or --password.
+    #[arg(long)]
     account: Option<String>,
-    /// SASL PLAIN password.
-    #[arg(long, requires = "account", conflicts_with = "oauth_token")]
+    /// SASL PLAIN password. A value typed here is visible to every local user
+    /// in the process list and is kept by the shell's history: prefer
+    /// --password-file or E6IRC_PASSWORD.
+    #[arg(long, conflicts_with = "password_file")]
     password: Option<String>,
-    /// SASL OAUTHBEARER token.
-    #[arg(long, conflicts_with_all = ["account", "password", "oauth_from_cache"])]
+    /// File holding the SASL PLAIN password (one trailing line break is
+    /// dropped). Refused if group or other users can read it.
+    #[arg(long)]
+    password_file: Option<PathBuf>,
+    /// SASL OAUTHBEARER token; E6IRC_OAUTH_TOKEN when no flag is given. A value
+    /// typed here is visible to other local users: prefer --oauth-token-file.
+    #[arg(long, conflicts_with = "oauth_token_file")]
     oauth_token: Option<String>,
+    /// File holding the SASL OAUTHBEARER token, under the same rules as
+    /// --password-file.
+    #[arg(long)]
+    oauth_token_file: Option<PathBuf>,
     /// Load the OAUTHBEARER token created by `e6irc login`.
-    #[arg(
-        long,
-        conflicts_with_all = ["account", "password", "oauth_token"]
-    )]
+    #[arg(long)]
     oauth_from_cache: bool,
     /// Token-cache path used by --oauth-from-cache.
     #[arg(long, requires = "oauth_from_cache")]
     token_file: Option<PathBuf>,
+    /// Send SASL credentials over a connection without --tls to a server that
+    /// is not this machine. Without this flag that is refused: the password or
+    /// token would cross the network readable by anyone on the path.
+    #[arg(long)]
+    allow_cleartext_credentials: bool,
     /// Connect over TLS using the public CA set.
     #[arg(long)]
     tls: bool,
     /// TLS certificate server name; defaults to the host in --server.
     #[arg(long, requires = "tls")]
     tls_name: Option<String>,
-    /// Seconds between reconnect attempts after a live connection drops.
+    /// Seconds before the first reconnect attempt after a live connection
+    /// drops. Each further failed attempt doubles the wait, up to five minutes;
+    /// rejected credentials and bans are not retried at all.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=300))]
     reconnect_delay: u64,
+    /// Seconds the server may take to finish registration, and afterwards to
+    /// confirm each JOIN with its history, before the attempt is abandoned.
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=600))]
+    response_timeout: u64,
     /// Latest messages loaded for each joined channel. Zero disables history.
     #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u64).range(0..=1000))]
     history_lines: u64,
@@ -78,10 +109,13 @@ const OUT_QUEUE_DEPTH: usize = 256;
 
 /// Events the render loop consumes.
 enum Ev {
-    Net(OwnedMessage),
-    RejectedInput(String),
-    Connected,
+    Net(ClientEvent),
+    /// A new session is registered under this server-confirmed nickname.
+    Connected(String),
+    JoinRefused(JoinRefusal),
     Reconnecting(String),
+    /// The network task gave up for good; the text says why.
+    Stopped(String),
     DroppedOutbound(usize),
 }
 
@@ -94,49 +128,45 @@ fn main() -> io::Result<()> {
 }
 
 async fn async_main(cli: Cli) -> io::Result<()> {
-    let authentication = match (
-        cli.account,
-        cli.password,
-        cli.oauth_token,
-        cli.oauth_from_cache,
-    ) {
-        (Some(account), Some(password), None, false) => Authentication::Plain { account, password },
-        (None, None, Some(token), false) => Authentication::OAuthBearer { token },
-        (None, None, None, true) => {
-            let path = token_path(cli.token_file.as_deref())?;
-            let cached = load_token(&path)?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("no cached token at {}; run e6irc login", path.display()),
-                )
-            })?;
-            Authentication::OAuthBearer {
-                token: cached.access_token().to_owned(),
-            }
-        }
-        (None, None, None, false) => Authentication::None,
-        // clap makes this unreachable for command-line input. Keeping the
-        // validation here too protects programmatic/parser changes.
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "choose anonymous, paired --account/--password, --oauth-token, or --oauth-from-cache",
-            ));
-        }
-    };
+    let authentication = CredentialArguments {
+        account: cli.account,
+        password: SecretSources {
+            argument: cli.password,
+            file: cli.password_file,
+        },
+        oauth_token: SecretSources {
+            argument: cli.oauth_token,
+            file: cli.oauth_token_file,
+        },
+        oauth_from_cache: cli.oauth_from_cache,
+        token_file: cli.token_file,
+    }
+    .resolve(&process_environment)?;
     let connection_options = ConnectionOptions {
         address: cli.server,
         tls: cli.tls,
         tls_server_name: cli.tls_name,
         nick: cli.nick.clone(),
+        username: e6irc_client::stated_or_nick_username(cli.username.as_deref(), &cli.nick)?,
         realname: "e6irc-tui".into(),
         authentication,
+        response_deadline: Duration::from_secs(cli.response_timeout),
+        cleartext_credentials: if cli.allow_cleartext_credentials {
+            CleartextCredentials::Allow
+        } else {
+            CleartextCredentials::Refuse
+        },
     };
     let read_markers = !cli.no_read_markers;
-    let joined_channels = std::collections::BTreeSet::from([cli.channel.clone()]);
-    let (mut conn, bootstrap) = connect_and_join(
+    let mut joined_channels = std::collections::BTreeSet::from([cli.channel.clone()]);
+    let Session {
+        connection: mut conn,
+        nick: confirmed_nick,
+        bootstrap,
+        refused,
+    } = connect_and_join(
         &connection_options,
-        &joined_channels,
+        &mut joined_channels,
         cli.history_lines as usize,
         read_markers,
     )
@@ -151,12 +181,12 @@ async fn async_main(cli: Cli) -> io::Result<()> {
 
     // Networking task: read messages up, write outbound lines down, and
     // reconnect with the same explicit transport/authentication request.
-    let reconnect_delay = Duration::from_secs(cli.reconnect_delay);
+    let mut policy = ReconnectPolicy::new(Duration::from_secs(cli.reconnect_delay));
+    let mut own_nick = confirmed_nick.clone();
     let reconnect_options = connection_options.clone();
     let reconnect_history_lines = cli.history_lines as usize;
     let reconnect_read_markers = read_markers;
     tokio::spawn(async move {
-        let mut joined_channels = joined_channels;
         loop {
             let failure = loop {
                 tokio::select! {
@@ -171,15 +201,11 @@ async fn async_main(cli: Cli) -> io::Result<()> {
                                     break format!("PING response failed: {error}");
                                 }
                             }
-                            update_joined_channels(
-                                &mut joined_channels,
-                                &reconnect_options.nick,
-                                &m,
-                            );
-                            if net_tx.send(Ev::Net(m)).await.is_err() { return; }
+                            track_own_state(&mut joined_channels, &mut own_nick, &m);
+                            if net_tx.send(Ev::Net(ClientEvent::Message(m))).await.is_err() { return; }
                         }
-                        Ok(Some(ClientEvent::Rejected(rejected))) => {
-                            if net_tx.send(Ev::RejectedInput(rejected.to_string())).await.is_err() {
+                        Ok(Some(rejected @ ClientEvent::Rejected(_))) => {
+                            if net_tx.send(Ev::Net(rejected)).await.is_err() {
                                 return;
                             }
                         }
@@ -198,6 +224,7 @@ async fn async_main(cli: Cli) -> io::Result<()> {
                 return;
             }
 
+            let mut delay = policy.first_delay();
             loop {
                 // Reject anything that raced the disconnect notification.
                 // Delivering it after reconnect would be a surprising delayed
@@ -209,35 +236,52 @@ async fn async_main(cli: Cli) -> io::Result<()> {
                 if dropped > 0 && net_tx.send(Ev::DroppedOutbound(dropped)).await.is_err() {
                     return;
                 }
-                tokio::time::sleep(reconnect_delay).await;
-                match connect_and_join(
+                tokio::time::sleep(delay).await;
+                let attempt = connect_and_join(
                     &reconnect_options,
-                    &joined_channels,
+                    &mut joined_channels,
                     reconnect_history_lines,
                     reconnect_read_markers,
                 )
-                .await
-                {
-                    Ok((reconnected, bootstrap)) => {
-                        conn = reconnected;
-                        if net_tx.send(Ev::Connected).await.is_err() {
-                            return;
+                .await;
+                let outcome = match attempt {
+                    Ok(session) => {
+                        policy.connected();
+                        conn = session.connection;
+                        own_nick = session.nick.clone();
+                        let mut events = vec![Ev::Connected(session.nick)];
+                        events.extend(session.refused.into_iter().map(Ev::JoinRefused));
+                        events.extend(session.bootstrap.into_iter().map(Ev::Net));
+                        Ok(events)
+                    }
+                    Err(error) => match policy.after(&error) {
+                        AfterFailure::Stop(status) => Err(Ev::Stopped(status)),
+                        AfterFailure::RetryAfter(next) => {
+                            delay = next;
+                            Ok(vec![Ev::Reconnecting(format!(
+                                "reconnect failed: {error}; next attempt in {}s",
+                                next.as_secs()
+                            ))])
                         }
-                        for message in bootstrap {
-                            if net_tx.send(Ev::Net(message)).await.is_err() {
+                    },
+                };
+                match outcome {
+                    Ok(events) => {
+                        let connected = matches!(events.first(), Some(Ev::Connected(_)));
+                        for event in events {
+                            if net_tx.send(event).await.is_err() {
                                 return;
                             }
                         }
-                        break;
-                    }
-                    Err(error) => {
-                        if net_tx
-                            .send(Ev::Reconnecting(format!("reconnect failed: {error}")))
-                            .await
-                            .is_err()
-                        {
-                            return;
+                        if connected {
+                            break;
                         }
+                    }
+                    // Dropping `out_rx` with this task is what makes the UI
+                    // refuse further input instead of queueing it for nobody.
+                    Err(stopped) => {
+                        drop(net_tx.send(stopped).await);
+                        return;
                     }
                 }
             }
@@ -245,9 +289,12 @@ async fn async_main(cli: Cli) -> io::Result<()> {
     });
 
     let mut terminal = ratatui::init();
-    let mut app = App::new(cli.channel, cli.nick);
-    for message in bootstrap {
-        app.on_message(&message);
+    let mut app = App::new(cli.channel, confirmed_nick);
+    for refusal in refused {
+        apply(&mut app, Ev::JoinRefused(refusal));
+    }
+    for event in bootstrap {
+        apply(&mut app, Ev::Net(event));
     }
     let result = run_ui(&mut terminal, &mut app, &mut net_rx, &out_tx).await;
     let restore = ratatui::try_restore();
@@ -260,20 +307,28 @@ async fn async_main(cli: Cli) -> io::Result<()> {
     }
 }
 
-fn token_path(explicit: Option<&Path>) -> io::Result<PathBuf> {
-    explicit
-        .map(Path::to_path_buf)
-        .map(Ok)
-        .unwrap_or_else(default_token_path)
+/// A registered connection and everything the UI starts a session from.
+struct Session {
+    connection: Connection,
+    /// The nickname the server confirmed, which is not always the one asked for.
+    nick: String,
+    bootstrap: Vec<ClientEvent>,
+    refused: Vec<JoinRefusal>,
 }
 
+/// Register and join `channels`. A channel the server refuses is taken out of
+/// the set and reported: one closed channel must not fail the whole session,
+/// or every reconnect registers, is refused the same channel, and drops again.
 async fn connect_and_join(
     options: &ConnectionOptions,
-    channels: &std::collections::BTreeSet<String>,
+    channels: &mut std::collections::BTreeSet<String>,
     history_lines: usize,
     read_markers: bool,
-) -> io::Result<(Connection, Vec<OwnedMessage>)> {
-    let mut connection = options.connect_registered().await?;
+) -> io::Result<Session> {
+    let Registered {
+        mut connection,
+        nick,
+    } = options.connect_registered().await?;
     let mut capabilities = Vec::new();
     if history_lines > 0 {
         capabilities.extend(["batch", "draft/chathistory", "server-time"]);
@@ -283,22 +338,41 @@ async fn connect_and_join(
     }
     connection.require_capabilities(&capabilities).await?;
     let mut bootstrap = Vec::new();
-    for channel in channels {
-        bootstrap.extend(connection.join_with_history(channel, history_lines).await?);
+    let mut refused = Vec::new();
+    for channel in channels.clone() {
+        match connection.join_with_history(&channel, history_lines).await {
+            Ok(events) => bootstrap.extend(events),
+            Err(error) => {
+                let Some(refusal) = JoinRefusal::from_error(&error) else {
+                    return Err(error);
+                };
+                channels.remove(&channel);
+                refused.push(refusal);
+            }
+        }
     }
-    Ok((connection, bootstrap))
+    Ok(Session {
+        connection,
+        nick,
+        bootstrap,
+        refused,
+    })
 }
 
-fn update_joined_channels(
+/// Keep what a reconnect needs in step with the server: the channels this
+/// client is in, and the nickname it is known by — own JOIN, PART and KICK are
+/// only recognisable under the current one.
+fn track_own_state(
     channels: &mut std::collections::BTreeSet<String>,
-    own_nick: &str,
+    own_nick: &mut String,
     message: &OwnedMessage,
 ) {
+    let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
     if message.command == "KICK"
         && message
             .params
             .get(1)
-            .is_some_and(|nick| e6irc_proto::casemap::CaseMapping::Rfc1459.eq(nick, own_nick))
+            .is_some_and(|nick| casemap.eq(nick, own_nick))
     {
         if let Some(channel) = message.params.first() {
             remove_channel(channels, channel);
@@ -309,22 +383,15 @@ fn update_joined_channels(
         .source
         .as_deref()
         .and_then(|source| source.split('!').next());
-    if !source_nick
-        .is_some_and(|nick| e6irc_proto::casemap::CaseMapping::Rfc1459.eq(nick, own_nick))
-    {
+    if !source_nick.is_some_and(|nick| casemap.eq(nick, own_nick)) {
         return;
     }
-    match message.command.as_str() {
-        "JOIN" => {
-            if let Some(channel) = message.params.first() {
-                channels.insert(channel.clone());
-            }
+    match (message.command.as_str(), message.params.first()) {
+        ("JOIN", Some(channel)) => {
+            channels.insert(channel.clone());
         }
-        "PART" => {
-            if let Some(channel) = message.params.first() {
-                remove_channel(channels, channel);
-            }
-        }
+        ("PART", Some(channel)) => remove_channel(channels, channel),
+        ("NICK", Some(nick)) => own_nick.clone_from(nick),
         _ => {}
     }
 }
@@ -350,25 +417,7 @@ async fn run_ui(
         // Drain any pending network events.
         while let Ok(ev) = net_rx.try_recv() {
             dirty = true;
-            match ev {
-                Ev::Net(m) => app.on_message(&m),
-                Ev::RejectedInput(reason) => {
-                    app.status(format!("server input rejected: {reason}"));
-                }
-                Ev::Connected => {
-                    app.set_connected(true);
-                    app.status("reconnected");
-                }
-                Ev::Reconnecting(reason) => {
-                    app.set_connected(false);
-                    app.status(format!("{reason}; reconnecting"));
-                }
-                Ev::DroppedOutbound(count) => {
-                    app.status(format!(
-                        "{count} outbound message(s) were not sent during disconnect"
-                    ));
-                }
-            }
+            apply(app, ev);
         }
         flush_read_marker(app, out_tx);
         if dirty {
@@ -426,6 +475,37 @@ async fn run_ui(
     }
 }
 
+/// Fold one network-task event into the UI state.
+fn apply(app: &mut App, event: Ev) {
+    match event {
+        Ev::Net(ClientEvent::Message(message)) => app.on_message(&message),
+        Ev::Net(ClientEvent::Rejected(rejected)) => {
+            app.status(format!("server input rejected: {rejected}"));
+        }
+        Ev::Connected(nick) => {
+            app.set_nick(&nick);
+            app.set_connected(true);
+            app.status(format!("reconnected as {nick}"));
+        }
+        Ev::JoinRefused(refusal) => {
+            app.status(format!("{refusal}; it will not be rejoined"));
+        }
+        Ev::Reconnecting(reason) => {
+            app.set_connected(false);
+            app.status(format!("{reason}; reconnecting"));
+        }
+        Ev::Stopped(reason) => {
+            app.stop_reconnecting();
+            app.status(reason);
+        }
+        Ev::DroppedOutbound(count) => {
+            app.status(format!(
+                "{count} outbound message(s) were not sent during disconnect"
+            ));
+        }
+    }
+}
+
 fn flush_read_marker(app: &mut App, out_tx: &mpsc::Sender<String>) {
     let Some(command) = app.take_read_marker_command() else {
         return;
@@ -462,6 +542,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
+        )
+    } else if app.gave_up() {
+        Span::styled(
+            "● DISCONNECTED",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )
     } else {
         Span::styled(
@@ -659,6 +744,8 @@ mod tests {
                 "irc.example:6697",
                 "--nick",
                 "alice",
+                "--username",
+                "alice",
                 "--channel",
                 "#chat",
             ]
@@ -679,16 +766,19 @@ mod tests {
             "token.json"
         ]));
         assert!(!parses(&["--token-file", "token.json"]));
-        assert!(!parses(&["--account", "alice"]));
-        assert!(!parses(&["--password", "secret"]));
+        // An account's password may come from the environment, which only
+        // resolution can see (`e6irc_client::credentials` owns and tests which
+        // combinations are mistakes); parsing refuses one secret given twice.
+        assert!(parses(&["--account", "alice"]));
+        assert!(parses(&["--account", "alice", "--password-file", "pw"]));
+        assert!(!parses(&["--password", "typed", "--password-file", "pw"]));
         assert!(!parses(&[
-            "--account",
-            "alice",
-            "--password",
-            "secret",
             "--oauth-token",
-            "device-token",
+            "typed",
+            "--oauth-token-file",
+            "token",
         ]));
+        assert!(parses(&["--allow-cleartext-credentials"]));
     }
 
     #[test]
@@ -759,15 +849,104 @@ mod tests {
     #[test]
     fn reconnect_channels_track_self_join_part_and_kick_case_insensitively() {
         let mut channels = std::collections::BTreeSet::from(["#Home".to_owned()]);
-        update_joined_channels(&mut channels, "Me", &message(":me!u@h JOIN #Other"));
+        let mut nick = "Me".to_owned();
+        track_own_state(&mut channels, &mut nick, &message(":me!u@h JOIN #Other"));
         assert!(channels.contains("#Other"));
-        update_joined_channels(&mut channels, "Me", &message(":ME!u@h PART #other :bye"));
+        track_own_state(
+            &mut channels,
+            &mut nick,
+            &message(":ME!u@h PART #other :bye"),
+        );
         assert!(
             !channels
                 .iter()
                 .any(|channel| channel.eq_ignore_ascii_case("#other"))
         );
-        update_joined_channels(&mut channels, "Me", &message(":op!u@h KICK #home mE :gone"));
-        assert!(channels.is_empty());
+        // Own joins are only recognisable under the current nickname.
+        track_own_state(&mut channels, &mut nick, &message(":me!u@h NICK Renamed"));
+        assert_eq!(nick, "Renamed");
+        track_own_state(
+            &mut channels,
+            &mut nick,
+            &message(":renamed!u@h JOIN #later"),
+        );
+        assert!(channels.contains("#later"));
+        track_own_state(&mut channels, &mut nick, &message(":me!u@h JOIN #not-ours"));
+        assert!(!channels.contains("#not-ours"));
+        track_own_state(
+            &mut channels,
+            &mut nick,
+            &message(":op!u@h KICK #home RENAMED :gone"),
+        );
+        assert_eq!(
+            channels,
+            std::collections::BTreeSet::from(["#later".to_owned()])
+        );
+    }
+
+    /// One closed channel used to fail the whole connect, so every reconnect
+    /// registered, was refused the same channel, and dropped again.
+    #[tokio::test]
+    async fn a_refused_channel_is_dropped_from_the_session_not_fatal_to_it() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let reply = match line.as_str() {
+                    "CAP LS 302" => ":bnc CAP * LS :",
+                    "CAP END" => ":bnc 001 upstream :Welcome",
+                    "JOIN #closed" => ":bnc 473 upstream #closed :Cannot join channel (+i)",
+                    "JOIN #open" => ":bnc 366 upstream #open :End of NAMES",
+                    _ => continue,
+                };
+                writer
+                    .write_all(format!("{reply}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let options = ConnectionOptions {
+            address,
+            tls: false,
+            tls_server_name: None,
+            nick: "requested".into(),
+            username: "ident".into(),
+            realname: "real".into(),
+            authentication: e6irc_client::Authentication::None,
+            response_deadline: Duration::from_secs(5),
+            cleartext_credentials: CleartextCredentials::Refuse,
+        };
+        let mut channels =
+            std::collections::BTreeSet::from(["#closed".to_owned(), "#open".to_owned()]);
+        let session = connect_and_join(&options, &mut channels, 0, false)
+            .await
+            .expect("a refused channel does not fail the session");
+        assert_eq!(session.nick, "upstream");
+        assert_eq!(
+            channels,
+            std::collections::BTreeSet::from(["#open".to_owned()])
+        );
+        assert_eq!(session.refused.len(), 1);
+
+        let mut app = App::new("#open".into(), session.nick);
+        for refusal in session.refused {
+            apply(&mut app, Ev::JoinRefused(refusal));
+        }
+        let shown = app.current().log.last().expect("status").text.to_string();
+        assert_eq!(
+            shown,
+            "cannot join #closed: Cannot join channel (+i); it will not be rejoined"
+        );
+
+        apply(
+            &mut app,
+            Ev::Stopped("the server banned this connection".into()),
+        );
+        assert!(app.gave_up() && !app.connected());
     }
 }

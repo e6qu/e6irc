@@ -33,12 +33,16 @@ impl Role {
 
 // ---- OIDC login ---------------------------------------------------------
 
+/// A relying-party client whose authorization *and* token endpoints are known.
+/// Discovery makes the token endpoint optional; a client built without one can
+/// start a login it can never finish, so that state is refused at construction
+/// rather than `expect()`ed at the code exchange.
 pub(super) type OidcClient = openidconnect::core::CoreClient<
     openidconnect::EndpointSet,
     openidconnect::EndpointNotSet,
     openidconnect::EndpointNotSet,
     openidconnect::EndpointNotSet,
-    openidconnect::EndpointMaybeSet,
+    openidconnect::EndpointSet,
     openidconnect::EndpointMaybeSet,
 >;
 
@@ -71,6 +75,10 @@ pub(super) async fn discover_client(
 ) -> Result<OidcClient, String> {
     use openidconnect::{ClientId, ClientSecret, RedirectUrl};
     let metadata = discover_metadata(provider).await?;
+    let token_endpoint = metadata
+        .token_endpoint()
+        .cloned()
+        .ok_or("discovery document has no token_endpoint")?;
     let public_url = state
         .public_url
         .as_deref()
@@ -94,12 +102,14 @@ pub(super) async fn discover_client(
         ClientId::new(provider.client_id.clone()),
         Some(ClientSecret::new(provider.client_secret.clone())),
     )
+    .set_token_uri(token_endpoint)
     .set_redirect_uri(redirect)
     .set_auth_type(auth_type))
 }
 
-/// Discover the client, or answer `BAD_GATEWAY` when the IdP is unreachable —
-/// the shared failure shape of the start and callback handlers.
+/// Discover the client, or answer `BAD_GATEWAY` when the IdP is unreachable or
+/// its discovery document cannot support the authorization-code flow — the
+/// shared failure shape of the start and callback handlers.
 async fn discover_client_or_bad_gateway(
     state: &AppState,
     provider: &OidcProviderConfig,
@@ -108,8 +118,8 @@ async fn discover_client_or_bad_gateway(
         eprintln!("oidc: {e}");
         ResponseRejection::from(problem(
             StatusCode::BAD_GATEWAY,
-            "OIDC provider unreachable",
-            None,
+            "OIDC provider unavailable",
+            Some("The identity provider is unreachable or its discovery document is unusable."),
         ))
     })
 }
@@ -202,7 +212,10 @@ pub(super) async fn oidc_link_start(
     // discovery fetch and grows `pending_auth` — gated for parity with its
     // siblings.
     _rl: RateLimited,
-    Authenticated(account): Authenticated,
+    // Whoever finishes this flow at the provider becomes a login identity of
+    // the account. A bearer admitted here could link its holder's own identity
+    // and sign in as the owner, with nothing more than the `read` scope.
+    BrowserSession(account, _): BrowserSession,
     Path(provider_name): Path<String>,
 ) -> Response {
     oidc_authorize(&state, &provider_name, Some(account), false).await
@@ -447,7 +460,6 @@ pub(super) async fn oidc_callback(
     };
     let token_response = match client
         .exchange_code(AuthorizationCode::new(code))
-        .expect("token endpoint present after discovery")
         .set_pkce_verifier(PkceCodeVerifier::new(pending.pkce_verifier))
         .request_async(&oidc_http_client())
         .await
@@ -981,14 +993,21 @@ where
     }
 }
 
-/// An authenticated account, extracted before the handler body runs.
+/// An authenticated account and the credential that proved it, extracted
+/// before the handler body runs.
 ///
 /// Every authenticated route opened with the same eight lines: call
 /// `authenticate`, return its rejection, then re-derive the pool it had already
 /// proved was there. As an extractor that prologue does not exist to be
 /// repeated — a route is authenticated because it asks for this in its
 /// signature, which is also where a reader looks to find out.
-pub(crate) struct Authenticated(pub(crate) String);
+///
+/// The credential travels with the account because it is the only verified
+/// answer to "which browser session is this?" and "may this caller write?". A
+/// handler that re-read the `Cookie` header for that answer trusted a value
+/// nobody had checked against the account: a bearer beside a junk cookie made
+/// "every session except the current one" mean every session.
+pub(crate) struct Authenticated(pub(crate) String, pub(crate) RequestCredential);
 
 impl axum::extract::FromRequestParts<Arc<AppState>> for Authenticated {
     type Rejection = Response;
@@ -998,20 +1017,51 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for Authenticated {
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
         let principal = authenticate_principal(state, &parts.headers).await?;
-        authorize_api_request(state, &principal.credential, parts, false)
-            .map_err(|denial| api_authorization_response(denial, parts.uri.path()))?;
-        spend_api_budget(state, &principal.account, false).map_err(rate_limit_response)?;
-        Ok(Authenticated(principal.account))
+        admit_api_request(state, &principal, parts)?;
+        Ok(Authenticated(principal.account, principal.credential))
+    }
+}
+
+/// An account authenticated by its browser session and nothing else, with the
+/// verified session token.
+///
+/// Some operations are about the browser session itself (which one to keep,
+/// which one is current) or hand authority to whoever completes them (linking a
+/// login identity). A bearer cannot name a browser session and must not be able
+/// to acquire one, so those routes ask for this instead of [`Authenticated`] and
+/// a token is refused before the handler exists to be reached.
+pub(crate) struct BrowserSession(pub(crate) String, pub(crate) String);
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for BrowserSession {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let principal = authenticate_principal(state, &parts.headers).await?;
+        let RequestCredential::Session(session) = &principal.credential else {
+            return Err(problem(
+                StatusCode::UNAUTHORIZED,
+                "Browser session required",
+                Some("A bearer token cannot act for a browser session."),
+            ));
+        };
+        let session = session.clone();
+        admit_api_request(state, &principal, parts)?;
+        Ok(BrowserSession(principal.account, session))
     }
 }
 
 /// A cookie-authenticated, session-bound browser mutation.
 ///
-/// Token issuance and device approval can mint new bearer authority. Allowing
-/// an existing bearer to call either endpoint would let a narrow token expand
-/// its own scopes. Requiring the browser session and its constant-time checked
-/// CSRF header makes that escalation unrepresentable at the handler boundary.
-pub(crate) struct SessionMutation(pub(crate) String);
+/// Token issuance, device approval, the primary password, the recovery
+/// contact, and login identities can each mint or redirect authority over the
+/// account. Allowing an existing bearer to call any of them would let a narrow
+/// token expand its own scopes or become the account outright. Requiring the
+/// browser session — whose unsafe methods must carry the constant-time checked
+/// CSRF header — makes that escalation unrepresentable at the handler boundary.
+pub(crate) struct SessionMutation(pub(crate) String, pub(crate) String);
 
 impl axum::extract::FromRequestParts<Arc<AppState>> for SessionMutation {
     type Rejection = Response;
@@ -1020,48 +1070,9 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for SessionMutation {
         parts: &mut axum::http::request::Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let Some(session) = session_token(&parts.headers, state.secure_cookies) else {
-            return Err(problem(
-                StatusCode::UNAUTHORIZED,
-                "Browser session required",
-                None,
-            ));
-        };
-        let csrf = parts
-            .headers
-            .get("x-e6irc-csrf")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        if !state.csrf_valid(&session, csrf) {
-            return Err(problem(
-                StatusCode::FORBIDDEN,
-                "Invalid or missing CSRF token",
-                None,
-            ));
-        }
-        let pool = state.pool.as_ref().ok_or_else(|| {
-            problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No database configured",
-                None,
-            )
-        })?;
-        match crate::db::session_account(pool, &session).await {
-            Ok(Some(account)) => {
-                let account = require_active_account(pool, account).await?;
-                spend_api_budget(state, &account, false).map_err(rate_limit_response)?;
-                Ok(SessionMutation(account))
-            }
-            Ok(None) => Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None)),
-            Err(error) => {
-                eprintln!("http: session mutation lookup failed: {error}");
-                Err(problem(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Database unavailable",
-                    None,
-                ))
-            }
-        }
+        let BrowserSession(account, session) =
+            BrowserSession::from_request_parts(parts, state).await?;
+        Ok(SessionMutation(account, session))
     }
 }
 
@@ -1164,12 +1175,32 @@ struct RequestPrincipal {
 }
 
 #[derive(Debug, Clone)]
-enum RequestCredential {
+pub(crate) enum RequestCredential {
     /// Browser sessions carry interactive authority but unsafe REST methods
     /// must prove possession of the session-bound CSRF value.
     Session(String),
     /// Tokens carry only the explicit grant checked for the requested method.
     ApiToken(crate::identity::ApiTokenScopes),
+}
+
+impl RequestCredential {
+    /// The verified browser session token, when a cookie authenticated the
+    /// request.
+    pub(crate) fn browser_session(&self) -> Option<&str> {
+        match self {
+            Self::Session(session) => Some(session),
+            Self::ApiToken(_) => None,
+        }
+    }
+
+    /// Whether the credential may originate a mutation that no HTTP method
+    /// announces — a composer frame sent up a socket whose upgrade was a `GET`.
+    pub(crate) fn grants_write(&self) -> bool {
+        match self {
+            Self::Session(_) => true,
+            Self::ApiToken(scopes) => scopes.contains(crate::identity::ApiTokenScope::Write),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1242,6 +1273,20 @@ async fn authenticate_principal(
     Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None).into())
 }
 
+/// The shared admission rule for an ordinary authenticated route: the
+/// credential authorizes this method, then the request spends the account's
+/// budget.
+fn admit_api_request(
+    state: &AppState,
+    principal: &RequestPrincipal,
+    parts: &axum::http::request::Parts,
+) -> ResponseResult<()> {
+    authorize_api_request(state, &principal.credential, parts, false)
+        .map_err(|denial| api_authorization_response(denial, parts.uri.path()))?;
+    spend_api_budget(state, &principal.account, false)
+        .map_err(|retry_after| rate_limit_response(retry_after).into())
+}
+
 fn authorize_api_request(
     state: &AppState,
     credential: &RequestCredential,
@@ -1253,12 +1298,7 @@ fn authorize_api_request(
             let RequestCredential::Session(session) = credential else {
                 unreachable!("closed request credential set")
             };
-            let csrf = parts
-                .headers
-                .get("x-e6irc-csrf")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default();
-            if !state.csrf_valid(session, csrf) {
+            if !csrf_header_valid(state, session, &parts.headers) {
                 return Err(ApiAuthorizationDenial::Csrf);
             }
         }
@@ -1279,11 +1319,28 @@ fn authorize_api_request(
     Ok(())
 }
 
+/// Whether the request carries the `X-E6IRC-CSRF` value bound to `session`. A
+/// cross-site page can make a browser send the cookie, but cannot read the
+/// value or set the header.
+pub(super) fn csrf_header_valid(
+    state: &AppState,
+    session: &str,
+    headers: &axum::http::HeaderMap,
+) -> bool {
+    let csrf = headers
+        .get("x-e6irc-csrf")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    state.csrf_valid(session, csrf)
+}
+
+pub(super) fn csrf_refusal() -> Response {
+    problem(StatusCode::FORBIDDEN, "Invalid or missing CSRF token", None)
+}
+
 fn api_authorization_response(denial: ApiAuthorizationDenial, path: &str) -> Response {
     match denial {
-        ApiAuthorizationDenial::Csrf => {
-            problem(StatusCode::FORBIDDEN, "Invalid or missing CSRF token", None)
-        }
+        ApiAuthorizationDenial::Csrf => csrf_refusal(),
         ApiAuthorizationDenial::Scope(scope) => problem(
             StatusCode::FORBIDDEN,
             "Token scope denied",
@@ -1301,7 +1358,7 @@ fn api_authorization_response(denial: ApiAuthorizationDenial, path: &str) -> Res
 }
 
 const MAX_API_RATE_BUCKETS: usize = 65_536;
-const API_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+pub(super) const API_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 const API_RATE_BUCKET_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 
 fn spend_api_budget(state: &AppState, account: &str, administrator: bool) -> Result<(), u64> {
@@ -1325,9 +1382,12 @@ fn spend_api_budget(state: &AppState, account: &str, administrator: bool) -> Res
     spend_api_bucket(&mut buckets, key, burst, now)
 }
 
-fn spend_api_bucket(
-    buckets: &mut std::collections::HashMap<(String, bool), (f64, std::time::Instant)>,
-    key: (String, bool),
+/// Spend one token from `key`'s bucket, which holds `burst` tokens and refills
+/// to full over [`API_RATE_WINDOW`]. A refusal is the whole seconds until the
+/// next token exists.
+pub(super) fn spend_api_bucket<K: std::hash::Hash + Eq>(
+    buckets: &mut std::collections::HashMap<K, (f64, std::time::Instant)>,
+    key: K,
     burst: usize,
     now: std::time::Instant,
 ) -> Result<(), u64> {
@@ -1346,11 +1406,17 @@ fn spend_api_bucket(
 }
 
 fn rate_limit_response(retry_after: u64) -> Response {
-    let mut response = problem(
-        StatusCode::TOO_MANY_REQUESTS,
+    retry_later(
         "Account request limit exceeded",
-        Some("Retry after the interval in the Retry-After header."),
-    );
+        "Retry after the interval in the Retry-After header.",
+        retry_after,
+    )
+}
+
+/// A `429` problem carrying the seconds after which the same request can
+/// succeed.
+pub(super) fn retry_later(title: &str, detail: &str, retry_after: u64) -> Response {
+    let mut response = problem(StatusCode::TOO_MANY_REQUESTS, title, Some(detail));
     response.headers_mut().insert(
         header::RETRY_AFTER,
         retry_after

@@ -70,6 +70,11 @@ const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 /// restart forever.
 const SHUTDOWN_DB_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long graceful shutdown waits for every core shard to stop. Stopping is
+/// a drain — each shard serves the others until nothing is passing between
+/// them — and normally takes milliseconds.
+const SHUTDOWN_CORE_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn core_queue_name(index: usize) -> &'static str {
     Box::leak(format!("core-{index}").into_boxed_str())
 }
@@ -174,7 +179,11 @@ impl ShutdownHandle {
     /// connections, ask the core to notify clients and stop, then wait for the
     /// DB worker to flush its buffered history. Returns once the worker has
     /// drained or the bounded timeout elapses.
-    pub async fn run(mut self) -> ShutdownOutcome {
+    pub async fn run(self) -> ShutdownOutcome {
+        self.run_within(SHUTDOWN_CORE_STOP_TIMEOUT).await
+    }
+
+    async fn run_within(mut self, core_stop_timeout: std::time::Duration) -> ShutdownOutcome {
         // 1. Stop accepting: abort every listener task up front so nothing new
         //    is admitted while we drain.
         for listener in &self.listeners {
@@ -196,29 +205,41 @@ impl ShutdownHandle {
         // producer count up. (The core breaks on the Shutdown event regardless;
         // this just keeps the shutdown intent honest.)
         drop(core_tx);
-        while !self.core_workers.is_empty() {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                self.core_workers.join_next(),
-            )
-            .await
-            {
+        // Every shard is joined, whatever happens to one of them. A shard that
+        // failed has lost its own state, but the database worker still holds
+        // buffered history that is good — and it can only flush once *every*
+        // core has dropped its end of the database queue. So a failure here is
+        // remembered and reported after the flush, never instead of it.
+        let mut core_failure = None;
+        let deadline = tokio::time::Instant::now() + core_stop_timeout;
+        loop {
+            match tokio::time::timeout_at(deadline, self.core_workers.join_next()).await {
                 Ok(Some(Ok(()))) => {}
-                Ok(Some(Err(_join_error))) => return ShutdownOutcome::CorePanicked,
+                Ok(Some(Err(_join_error))) => {
+                    core_failure.get_or_insert(ShutdownOutcome::CorePanicked);
+                }
                 Ok(None) => break,
-                Err(_elapsed) => return ShutdownOutcome::CoreTimedOut,
+                Err(_elapsed) => {
+                    core_failure.get_or_insert(ShutdownOutcome::CoreTimedOut);
+                    // A shard that will not stop (a failed shard's peers wait
+                    // for traffic it will never settle) is ended here, which
+                    // drops its core and with it its hold on the database queue.
+                    self.core_workers.shutdown().await;
+                    break;
+                }
             }
         }
         // 3. Wait for the DB worker to observe its now-dropped sender, drain,
         //    and flush. Bounded so a wedged database can't hang the shutdown.
-        let Some(worker) = self.db_worker.take() else {
-            return ShutdownOutcome::Flushed;
+        let flush = match self.db_worker.take() {
+            None => ShutdownOutcome::Flushed,
+            Some(worker) => match tokio::time::timeout(SHUTDOWN_DB_FLUSH_TIMEOUT, worker).await {
+                Ok(Ok(())) => ShutdownOutcome::Flushed,
+                Ok(Err(_join_err)) => ShutdownOutcome::WorkerPanicked,
+                Err(_elapsed) => ShutdownOutcome::FlushTimedOut,
+            },
         };
-        match tokio::time::timeout(SHUTDOWN_DB_FLUSH_TIMEOUT, worker).await {
-            Ok(Ok(())) => ShutdownOutcome::Flushed,
-            Ok(Err(_join_err)) => ShutdownOutcome::WorkerPanicked,
-            Err(_elapsed) => ShutdownOutcome::FlushTimedOut,
-        }
+        core_failure.unwrap_or(flush)
     }
 }
 
@@ -560,11 +581,12 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                     sendq: config.sendq,
                 },
                 telemetry.clone(),
+                config.internal_upstreams,
             )
             .map_err(io::Error::other)?,
         );
         if let Some(pool) = &pool {
-            for (owner, row) in crate::db::list_all_bnc_networks(pool)
+            for (owner, row) in crate::db::list_startable_bnc_networks(pool)
                 .await
                 .map_err(io::Error::other)?
             {
@@ -575,7 +597,12 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 // that one network is down until fixed — rather than brick the
                 // shared daemon for every user. Config-file networks still fail
                 // hard (they are the operator's own, checked at start).
-                match crate::bouncer::driver_from_row(&row, secret_key.as_deref(), &owner) {
+                match crate::bouncer::driver_from_row(
+                    &row,
+                    secret_key.as_deref(),
+                    &owner,
+                    config.internal_upstreams,
+                ) {
                     Ok(driver) => {
                         // A configuration-file network may already hold this
                         // key. The operator's own entry wins; say so rather
@@ -706,6 +733,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             public_url,
             http_bind: config.http.as_ref().map(|http| http.addr),
             secure_cookies,
+            internal_upstreams: config.internal_upstreams,
             oidc_providers: config.oidc_providers.clone(),
             application_release_revision: config.application_release_revision.clone(),
             monitoring_token_digest,
@@ -734,6 +762,8 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             api_rate_burst: config.limits.api_rate_burst,
             administrator_api_rate_burst: config.limits.administrator_api_rate_burst,
             api_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
+            preflight_limiter: crate::http::PreflightLimiter::new(),
+            ui_sockets: crate::http::UiSocketLimiter::new(),
             conn_limiter: limiter.clone(),
             request_id_prefix: {
                 use aws_lc_rs::rand::SecureRandom;
@@ -999,7 +1029,12 @@ async fn core_worker(
     if ready.send(()).is_err() {
         return;
     }
-    CoreWorker::new(core, rx, ingress).run().await;
+    let exit = CoreWorker::new(core, rx, ingress).run().await;
+    if exit != crate::core::CoreWorkerExit::Stopped {
+        // Whoever supervises this task treats its end as the failure it is;
+        // this says which.
+        eprintln!("e6ircd: IRC core shard stopped without a shutdown request: {exit:?}");
+    }
 }
 
 /// Per-IP concurrent-connection cap. When `max_per_ip` is `None` the
@@ -1626,6 +1661,60 @@ mod tests {
             command_burst: None,
             registration_burst: None,
         }
+    }
+
+    fn shutdown_handle(
+        core_workers: tokio::task::JoinSet<()>,
+        flushed: Arc<std::sync::atomic::AtomicBool>,
+    ) -> ShutdownHandle {
+        let (core_tx, _core_rx) = queue::<Input>(e6irc_queue::Config {
+            name: "t-shutdown-core",
+            capacity: 4,
+            policy: Policy::Fifo,
+        });
+        let (_failures_tx, critical_failures) = tokio::sync::mpsc::unbounded_channel();
+        ShutdownHandle {
+            listeners: Vec::new(),
+            core_tx: Some(CoreIngress::single(core_tx)),
+            core_workers,
+            // Stands in for the database worker's final flush.
+            db_worker: Some(tokio::spawn(async move {
+                // Longer than any wait below: only a caller that awaits the
+                // flush sees it happen.
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                flushed.store(true, std::sync::atomic::Ordering::SeqCst);
+            })),
+            critical_failures,
+            bnc_listener: None,
+        }
+    }
+
+    /// A shard that panicked has lost its own state; what the database worker
+    /// has buffered is still good, and leaving without flushing it turns one
+    /// shard's failure into lost history for every channel.
+    #[tokio::test]
+    async fn a_core_panic_is_reported_after_the_database_flush_not_instead_of_it() {
+        let flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut core_workers = tokio::task::JoinSet::new();
+        core_workers.spawn(async { panic!("shard failure under test") });
+        core_workers.spawn(async {});
+        let outcome = shutdown_handle(core_workers, flushed.clone()).run().await;
+        assert_eq!(outcome, ShutdownOutcome::CorePanicked);
+        assert!(flushed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A shard that will not stop holds the database queue open. It is ended,
+    /// so the flush can still happen, and the timeout is what gets reported.
+    #[tokio::test]
+    async fn a_core_shard_that_will_not_stop_is_ended_so_the_database_can_flush() {
+        let flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut core_workers = tokio::task::JoinSet::new();
+        core_workers.spawn(std::future::pending());
+        let outcome = shutdown_handle(core_workers, flushed.clone())
+            .run_within(std::time::Duration::from_millis(100))
+            .await;
+        assert_eq!(outcome, ShutdownOutcome::CoreTimedOut);
+        assert!(flushed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// The graceful-shutdown chain that guarantees no buffered history is lost:

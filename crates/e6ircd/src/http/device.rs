@@ -299,7 +299,7 @@ pub(super) async fn device_start(State(state): State<Arc<AppState>>, _rl: RateLi
     };
     let pool = require_pool!(state);
     match crate::db::create_device_grant(pool).await {
-        Ok((device_code, user_code)) => json_response(DeviceStartResponse {
+        Ok((device_code, user_code)) => json_no_store(DeviceStartResponse {
             device_code,
             user_code,
             verification_uri,
@@ -347,11 +347,12 @@ pub(super) async fn device_token(
     // The grant is consumed and the token minted in one transaction inside
     // `poll_device_grant`, so a mint failure can't destroy an approved grant.
     match crate::db::poll_device_grant(pool, &req.device_code, "device").await {
-        Ok(crate::db::DeviceStatus::Approved(token)) => json_response(DeviceTokenResponse {
+        Ok(crate::db::DeviceStatus::Approved(token)) => json_no_store(DeviceTokenResponse {
             access_token: token,
             token_type: "bearer",
         }),
         Ok(crate::db::DeviceStatus::Pending) => oauth_err("authorization_pending"),
+        Ok(crate::db::DeviceStatus::Denied) => oauth_err("access_denied"),
         Ok(crate::db::DeviceStatus::Expired) => oauth_err("expired_token"),
         Ok(crate::db::DeviceStatus::Unknown) => oauth_err("invalid_grant"),
         Err(e) => {
@@ -371,6 +372,10 @@ pub(super) struct DeviceApproveReq {
     pub(super) user_code: String,
 }
 
+/// What the person approving a device is told when their account is at the
+/// personal access token cap: the device's token would be one more.
+pub(super) const DEVICE_TOKEN_LIMIT_DETAIL: &str = "This account already holds the most personal access tokens allowed (32). Revoke one, then approve the device again.";
+
 /// Normalise a user-typed code (users may type it lowercase or with a
 /// separator) and approve its pending grant as `account`. Shared by the JSON
 /// API and the `/device` verification page.
@@ -378,7 +383,7 @@ pub(super) async fn approve_user_code(
     state: &AppState,
     account: &str,
     raw_code: &str,
-) -> Result<bool, crate::db::DbError> {
+) -> Result<crate::db::DeviceApproval, crate::db::DbError> {
     let pool = pool_of(state);
     let code: String = raw_code
         .chars()
@@ -405,11 +410,11 @@ mod tests {
 
     #[test]
     fn managed_network_requests_are_driver_specific() {
-        assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"irc","revision":1,"name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#).is_ok());
+        assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"irc","revision":1,"name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#).is_ok());
         assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"irc","revision":1,"name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#).is_err());
         assert!(serde_json::from_str::<AdminNetworkBody>(r#"{"kind":"discord","revision":1,"name":"bot","addr":"","tls":true,"nick":"alice","autojoin":[],"buffer_cap":1000,"sasl_password":"token"}"#).is_err());
         for request in [
-            r#"{"kind":"local","revision":1,"name":"home","addr":"","tls":false,"nick":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000}"#,
+            r#"{"kind":"local","revision":1,"name":"home","addr":"","tls":false,"nick":"alice","username":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000}"#,
             r#"{"kind":"matrix","revision":1,"name":"matrix","addr":"https://matrix.example.test","tls":true,"nick":"@alice:example.test","autojoin":[],"buffer_cap":1000,"sasl_password":"password"}"#,
             r#"{"kind":"discord","revision":1,"name":"discord","addr":"","tls":true,"autojoin":[],"buffer_cap":1000,"sasl_password":"token"}"#,
             r#"{"kind":"slack","revision":1,"name":"slack","addr":"","tls":true,"autojoin":[],"buffer_cap":1000,"sasl_account":"xoxb-token","sasl_password":"xapp-token"}"#,
@@ -420,11 +425,11 @@ mod tests {
             );
         }
         for request in [
-            r#"{"kind":"irc","revision":1,"name":"irc","addr":"irc.example:6697","tls":true,"nick":"alice","realname":" ","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#,
+            r#"{"kind":"irc","revision":1,"name":"irc","addr":"irc.example:6697","tls":true,"nick":"alice","username":"alice","realname":" ","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#,
             r#"{"kind":"matrix","revision":1,"name":"matrix","addr":"","tls":true,"nick":"@alice:example.test","autojoin":[],"buffer_cap":1000,"sasl_password":"password"}"#,
-            r#"{"kind":"irc","revision":1,"name":"irc","owner":" ","addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#,
-            r#"{"kind":"irc","revision":1,"name":"irc","addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[" "],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#,
-            r#"{"kind":"irc","revision":1,"name":"irc","addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"sasl_account":" ","sasl_password":" "}"#,
+            r#"{"kind":"irc","revision":1,"name":"irc","owner":" ","addr":"irc.example:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#,
+            r#"{"kind":"irc","revision":1,"name":"irc","addr":"irc.example:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice","autojoin":[" "],"buffer_cap":1000,"sasl_account":null,"sasl_password":null}"#,
+            r#"{"kind":"irc","revision":1,"name":"irc","addr":"irc.example:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice","autojoin":[],"buffer_cap":1000,"sasl_account":" ","sasl_password":" "}"#,
         ] {
             assert!(
                 admin_network_request(serde_json::from_str::<AdminNetworkBody>(request).unwrap())
@@ -452,12 +457,19 @@ mod tests {
 /// Approve a device grant as the signed-in user (cookie-authenticated).
 pub(super) async fn device_approve(
     State(state): State<Arc<AppState>>,
-    SessionMutation(account): SessionMutation,
+    SessionMutation(account, _): SessionMutation,
     JsonBody(req): JsonBody<DeviceApproveReq>,
 ) -> Response {
     match approve_user_code(&state, &account, &req.user_code).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => problem(StatusCode::NOT_FOUND, "No such pending code", None),
+        Ok(crate::db::DeviceApproval::Approved) => StatusCode::NO_CONTENT.into_response(),
+        Ok(crate::db::DeviceApproval::NoPendingGrant) => {
+            problem(StatusCode::NOT_FOUND, "No such pending code", None)
+        }
+        Ok(crate::db::DeviceApproval::TokenLimitReached) => problem(
+            StatusCode::CONFLICT,
+            "Too many tokens",
+            Some(DEVICE_TOKEN_LIMIT_DETAIL),
+        ),
         Err(e) => {
             eprintln!("http: device approve failed: {e}");
             problem(
@@ -1192,7 +1204,7 @@ pub(super) async fn admin_patch_configuration(
         );
     }
     let settings = body.settings.apply_to(&current.settings);
-    if let Err(error) = settings.validate() {
+    if let Err(error) = settings.validate(state.http_bind) {
         return problem(
             StatusCode::BAD_REQUEST,
             "Invalid configuration",
@@ -1228,10 +1240,7 @@ pub(super) async fn admin_patch_configuration(
             );
         }
     }
-    let mut restart_comparison = current.settings.clone();
-    restart_comparison.bnc_addr = settings.bnc_addr;
-    restart_comparison.observability = settings.observability.clone();
-    let restart_required = restart_comparison != settings;
+    let restart_required = current.settings.requires_restart_to_reach(&settings);
     let detail = format!(
         "revision {}; BNC listener {}; restart {}",
         current.revision + 1,
@@ -1564,7 +1573,7 @@ async fn mutate_managed_configuration(
             );
         }
     };
-    if let Err(error) = settings.validate() {
+    if let Err(error) = settings.validate(state.http_bind) {
         return problem(
             StatusCode::BAD_REQUEST,
             "Invalid configuration change",
@@ -2248,21 +2257,17 @@ mod admin_query_tests {
 
 pub(super) async fn me(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
-    headers: axum::http::HeaderMap,
+    Authenticated(account, credential): Authenticated,
 ) -> Response {
-    // A *valid* session cookie yields the rich OIDC identity (email/role/
-    // provider/logout URL). A stale or absent cookie falls through to Bearer —
-    // the precedence every other route uses — so a valid PAT still works
-    // alongside a stale cookie (previously that combination returned 401). A DB
-    // fault is the one case that does not fall through: it is reported, not
-    // masked as "no session".
-    if let (Some(token), Some(pool)) = (session_token(&headers, state.secure_cookies), &state.pool)
-    {
-        match crate::db::session_identity(pool, &token).await {
+    // The browser session that authenticated this request yields the rich OIDC
+    // identity (email/role/provider/logout URL) and its CSRF value; a bearer
+    // names only the account. A DB fault is reported, not masked as "no
+    // session".
+    if let Some(token) = credential.browser_session() {
+        match crate::db::session_identity(pool_of(&state), token).await {
             Ok(Some(identity)) => {
-                let csrf_token = state.csrf_token(&token);
-                let mut response = json_response(SessionIdentityResponse {
+                let csrf_token = state.csrf_token(token);
+                return json_no_store(SessionIdentityResponse {
                     account: identity.account,
                     email: identity.email,
                     role: identity.role,
@@ -2271,12 +2276,9 @@ pub(super) async fn me(
                     logout_url: format!("/api/v1/auth/logout?csrf={csrf_token}"),
                     csrf_token,
                 });
-                // This body carries the session-bound CSRF token; keep it out of
-                // any shared/proxy cache.
-                no_store(response.headers_mut());
-                return response;
             }
-            Ok(None) => {} // stale cookie: fall through to Bearer
+            // Revoked between authentication and this read.
+            Ok(None) => {}
             Err(error) => {
                 eprintln!("http: identity lookup failed: {error}");
                 return problem(
@@ -2287,7 +2289,7 @@ pub(super) async fn me(
             }
         }
     }
-    json_response(AccountResponse { account })
+    json_no_store(AccountResponse { account })
 }
 
 #[derive(Deserialize)]
@@ -2368,7 +2370,7 @@ mod token_request_tests {
 /// Mint a PAT for the authenticated account (shown once).
 pub(super) async fn create_api_token(
     State(state): State<Arc<AppState>>,
-    SessionMutation(account): SessionMutation,
+    SessionMutation(account, _): SessionMutation,
     body: Result<axum::Json<TokenRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let req = match super::parse_json(body) {
@@ -2393,21 +2395,17 @@ pub(super) async fn create_api_token(
         );
     };
     let pool = pool_of(&state);
-    // The per-account PAT cap is enforced atomically inside `issue_api_token`
+    // The per-account PAT cap is enforced atomically inside `issue_scoped_api_token`
     // (count + insert in one FOR UPDATE transaction), so there is no racy
     // list-then-insert here: two concurrent creates can't both slip past cap-1.
     match crate::db::issue_scoped_api_token(pool, &account, &req.label, scopes, lifetime).await {
-        Ok(token) => (
-            StatusCode::CREATED,
-            axum::Json(ApiTokenCreatedResponse {
-                token,
-                label: req.label,
-                scopes: scopes.iter().collect(),
-                expires_in_days: lifetime.value(),
-                note: "Store this now; it is not retrievable later.",
-            }),
-        )
-            .into_response(),
+        Ok(token) => created_no_store(ApiTokenCreatedResponse {
+            token,
+            label: req.label,
+            scopes: scopes.iter().collect(),
+            expires_in_days: lifetime.value(),
+            note: "Store this now; it is not retrievable later.",
+        }),
         Err(crate::db::DbError::TooManyCredentials) => problem(
             StatusCode::CONFLICT,
             "Too many tokens",
@@ -2424,20 +2422,28 @@ pub(super) async fn create_api_token(
     }
 }
 
+/// End the browser session named by the cookie. This route authenticates
+/// nothing — a request without a session has nothing to end — so the CSRF rule
+/// every cookie-authenticated unsafe method gets from [`Authenticated`] is
+/// applied here by hand: without it any page could sign a visitor out with a
+/// cross-site form.
 pub(super) async fn logout(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
     let pool = require_pool!(state);
-    if let Some(token) = session_token(&headers, state.secure_cookies)
-        && let Err(e) = crate::db::delete_web_session(pool, &token).await
-    {
-        eprintln!("http: logout failed: {e}");
-        return problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Database unavailable",
-            None,
-        );
+    if let Some(token) = session_token(&headers, state.secure_cookies) {
+        if !csrf_header_valid(&state, &token, &headers) {
+            return csrf_refusal();
+        }
+        if let Err(e) = crate::db::delete_web_session(pool, &token).await {
+            eprintln!("http: logout failed: {e}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            );
+        }
     }
     (
         StatusCode::NO_CONTENT,
@@ -2487,7 +2493,7 @@ pub(super) async fn logout_sso(
         .as_deref()
         .is_some_and(|c| state.csrf_valid(&token, c))
     {
-        return problem(StatusCode::FORBIDDEN, "Invalid or missing CSRF token", None);
+        return csrf_refusal();
     }
     let crate::db::SessionLogoutHint { id_token, provider } =
         match crate::db::session_logout_hint(pool, &token).await {

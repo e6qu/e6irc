@@ -63,6 +63,9 @@ pub struct Registry {
     mutations: tokio::sync::Mutex<()>,
     pool: Option<PgPool>,
     telemetry: Option<Arc<crate::observability::Telemetry>>,
+    /// The server's policy on upstreams inside its own network, applied to
+    /// every driver this registry builds.
+    internal_upstreams: crate::egress::InternalUpstreams,
 }
 
 /// A registered network: its driver handle plus the persistence task that
@@ -122,12 +125,9 @@ impl Registry {
     /// Start a driver per configured (server-level) network. `pool`, when
     /// present, enables buffer persistence and backlog restore; `core`
     /// (the in-process handles) is required for any `local` network.
-    pub fn start(
-        entries: &[NetworkEntry],
-        pool: Option<PgPool>,
-        core: super::CoreHandles,
-    ) -> Result<Self, String> {
-        Self::start_inner(entries, pool, core, None)
+    /// The server's policy on upstreams inside its own network.
+    pub fn internal_upstreams(&self) -> crate::egress::InternalUpstreams {
+        self.internal_upstreams
     }
 
     pub(crate) fn start_observed(
@@ -135,8 +135,9 @@ impl Registry {
         pool: Option<PgPool>,
         core: super::CoreHandles,
         telemetry: Arc<crate::observability::Telemetry>,
+        internal_upstreams: crate::egress::InternalUpstreams,
     ) -> Result<Self, String> {
-        Self::start_inner(entries, pool, core, Some(telemetry))
+        Self::start_inner(entries, pool, core, Some(telemetry), internal_upstreams)
     }
 
     fn start_inner(
@@ -144,6 +145,7 @@ impl Registry {
         pool: Option<PgPool>,
         core: super::CoreHandles,
         telemetry: Option<Arc<crate::observability::Telemetry>>,
+        internal_upstreams: crate::egress::InternalUpstreams,
     ) -> Result<Self, String> {
         use crate::config::NetworkKind;
         let registry = Self {
@@ -151,6 +153,7 @@ impl Registry {
             mutations: tokio::sync::Mutex::new(()),
             pool,
             telemetry,
+            internal_upstreams,
         };
         for e in entries {
             // `local` needs the in-process core handles, so it stays special; all
@@ -167,30 +170,43 @@ impl Registry {
                 NetworkKind::Matrix | NetworkKind::Discord | NetworkKind::Slack => String::new(),
             };
             let driver: Box<dyn super::NetworkDriver> = if e.kind == NetworkKind::Local {
+                let identity_error = |error: super::UpstreamIdentityError| {
+                    format!("network '{}' (kind=local) has invalid {error}", e.name)
+                };
+                let username = e.username.as_deref().ok_or_else(|| {
+                    format!("network '{}' (kind=local) requires username", e.name)
+                })?;
                 let config = NetworkConfig {
                     addr: e.addr.clone(),
                     tls: e.tls,
-                    nick: e.nick.clone(),
-                    realname,
-                    autojoin: e.autojoin.clone(),
+                    nick: e.nick.parse().map_err(identity_error)?,
+                    username: username.parse().map_err(identity_error)?,
+                    realname: realname.parse().map_err(identity_error)?,
+                    autojoin: super::UpstreamChannel::parse_list(&e.autojoin)
+                        .map_err(identity_error)?,
                     buffer_cap: e.buffer_cap,
                     sasl: None,
                     keepalive_idle: super::KEEPALIVE_IDLE,
                     rejection_retry_floor: super::REJECTION_RETRY_FLOOR,
+                    internal_upstreams,
                 };
                 Box::new(super::LocalDriver::new(core.clone(), config))
             } else {
-                super::build_driver(
-                    e.kind,
-                    e.addr.clone(),
-                    e.tls,
-                    e.nick.clone(),
+                super::build_driver(super::DriverSpec {
+                    kind: e.kind,
+                    owner: e.owner.clone(),
+                    name: e.name.clone(),
+                    addr: e.addr.clone(),
+                    tls: e.tls,
+                    nick: e.nick.clone(),
+                    username: e.username.clone(),
                     realname,
-                    e.autojoin.clone(),
-                    e.buffer_cap,
-                    e.sasl_account.clone(),
-                    e.sasl_password.clone(),
-                )
+                    autojoin: e.autojoin.clone(),
+                    buffer_cap: e.buffer_cap,
+                    sasl_account: e.sasl_account.clone(),
+                    sasl_password: e.sasl_password.clone(),
+                    internal_upstreams,
+                })
                 .map_err(|msg| format!("network '{}': {msg}", e.name))?
             };
             registry
@@ -622,7 +638,19 @@ where
     write.flush().await?;
 
     let joined = read.unsplit(write);
-    attach(joined, &handle, caps, &account, &downstream_nick).await
+    let end = attach(
+        joined,
+        &handle,
+        caps,
+        &account,
+        &downstream_nick,
+        super::ATTACH_LIVENESS_INTERVAL,
+    )
+    .await?;
+    // Why it ended, not just that it did: "client quit" and "client stopped
+    // answering" are different stories to whoever reads this log.
+    eprintln!("bnc: {account} detached from '{network}': {end}");
+    Ok(())
 }
 
 /// Drive registration to a `Registered` verdict. Requires a successful
@@ -1054,12 +1082,8 @@ fn cap_names(caps: Option<super::AttachCaps>) -> String {
 
 fn cap_reply(server_name: &str, target: &str, verb: &str, request: &str) -> (bool, String) {
     let head = format!(":{server_name} CAP {target} {verb} :");
-    let budget = e6irc_proto::message::MAX_LINE_LEN - 2 - head.len();
-    let fitted = request
-        .char_indices()
-        .take_while(|(index, character)| index + character.len_utf8() <= budget)
-        .map(|(_, character)| character)
-        .collect::<String>();
+    let budget = (e6irc_proto::message::MAX_LINE_LEN - 2).saturating_sub(head.len());
+    let fitted = e6irc_proto::message::truncate_on_char_boundary(request, budget);
     (fitted.len() == request.len(), format!("{head}{fitted}\r\n"))
 }
 
@@ -1076,6 +1100,9 @@ pub(super) async fn handle_cap<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    // The nick is the upstream's to choose once attached; every reply below
+    // repeats it, so it is bounded once, as `write_attach_numeric` bounds it.
+    let target = e6irc_proto::message::truncate_on_char_boundary(target, 64);
     match msg
         .params
         .first()
@@ -1209,6 +1236,47 @@ mod cap_tests {
         let (fits, reply) = cap_reply("bnc.example", "*", "ACK", &request);
         assert!(!fits);
         assert!(reply.len() <= e6irc_proto::message::MAX_LINE_LEN);
+    }
+
+    /// The target is the client's nick, which the upstream can change to
+    /// anything after attach. A head longer than the line used to underflow
+    /// the budget: a panic in debug, an over-long line in release.
+    #[tokio::test]
+    async fn a_long_target_cannot_overflow_any_cap_reply() {
+        let target = "n".repeat(e6irc_proto::message::MAX_LINE_LEN);
+        let (fits, _) = cap_reply("bnc.example", &target, "ACK", "server-time");
+        assert!(
+            !fits,
+            "a head that fills the line leaves no room, and says so"
+        );
+
+        for command in [
+            "CAP LS 302",
+            "CAP LIST",
+            "CAP REQ :server-time",
+            "CAP REQ :bogus",
+        ] {
+            let (mut client, mut server) = tokio::io::duplex(8192);
+            handle_cap(
+                &mut server,
+                "bnc.example",
+                &target,
+                &Message::parse(command).expect("CAP command"),
+                false,
+                &mut false,
+                &mut super::super::AttachCaps::default(),
+            )
+            .await
+            .expect("CAP reply");
+            server.shutdown().await.expect("close server half");
+            let mut reply = String::new();
+            client.read_to_string(&mut reply).await.expect("reply");
+            assert!(
+                !reply.is_empty() && reply.len() <= e6irc_proto::message::MAX_LINE_LEN,
+                "{command}: {} bytes",
+                reply.len()
+            );
+        }
     }
 
     #[tokio::test]
@@ -1431,6 +1499,7 @@ mod key_tests {
             mutations: tokio::sync::Mutex::new(()),
             pool: None,
             telemetry: None,
+            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
         }
     }
 
@@ -1497,6 +1566,7 @@ mod key_tests {
             mutations: tokio::sync::Mutex::new(()),
             pool: None,
             telemetry: None,
+            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
         };
         registry
             .add(

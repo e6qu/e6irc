@@ -25,11 +25,11 @@ struct BrowserSessionBulkDeleteResponse {
 /// permit revocation; token hashes never leave PostgreSQL.
 pub(super) async fn list_browser_sessions(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-    Authenticated(account): Authenticated,
+    Authenticated(account, credential): Authenticated,
 ) -> Response {
-    let current = session_token(&headers, state.secure_cookies);
-    match crate::db::list_web_sessions(pool_of(&state), &account, current.as_deref()).await {
+    match crate::db::list_web_sessions(pool_of(&state), &account, credential.browser_session())
+        .await
+    {
         Ok(rows) => {
             let sessions = rows
                 .into_iter()
@@ -65,13 +65,16 @@ pub(super) async fn list_browser_sessions(
 /// visibly logged-in but invalid credential.
 pub(super) async fn revoke_browser_session(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-    Authenticated(account): Authenticated,
+    Authenticated(account, credential): Authenticated,
     Path(id): Path<i64>,
 ) -> Response {
-    let current = session_token(&headers, state.secure_cookies);
-    match crate::db::delete_web_session_by_id(pool_of(&state), &account, id, current.as_deref())
-        .await
+    match crate::db::delete_web_session_by_id(
+        pool_of(&state),
+        &account,
+        id,
+        credential.browser_session(),
+    )
+    .await
     {
         Ok(Some(was_current)) => {
             let mut response = StatusCode::NO_CONTENT.into_response();
@@ -109,9 +112,8 @@ pub(super) struct BrowserSessionBulkDeleteQuery {
 /// cannot broaden into a destructive account-wide operation.
 pub(super) async fn revoke_other_browser_sessions(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
     Query(query): Query<BrowserSessionBulkDeleteQuery>,
-    Authenticated(account): Authenticated,
+    BrowserSession(account, current): BrowserSession,
 ) -> Response {
     if query.except.as_deref() != Some("current") {
         return problem(
@@ -120,13 +122,6 @@ pub(super) async fn revoke_other_browser_sessions(
             Some("DELETE /api/v1/me/sessions requires except=current."),
         );
     }
-    let Some(current) = session_token(&headers, state.secure_cookies) else {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "Browser session required",
-            Some("A bearer token cannot identify the browser session to preserve."),
-        );
-    };
     match crate::db::delete_other_web_sessions(pool_of(&state), &account, &current).await {
         Ok(revoked) => json_no_store(BrowserSessionBulkDeleteResponse { revoked }),
         Err(error) => {
@@ -360,7 +355,7 @@ pub(super) async fn admin_connections(
 
 pub(super) async fn me_connections(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Query(params): Query<OwnLiveConnectionQueryParams>,
 ) -> Response {
     let query = match validate_live_connection_query(params.into(), 100) {
@@ -464,7 +459,7 @@ pub(super) async fn admin_disconnect_connection(
 
 pub(super) async fn me_disconnect_connection(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Path(connection_id): Path<u64>,
     Query(params): Query<DisconnectConnectionQuery>,
 ) -> Response {

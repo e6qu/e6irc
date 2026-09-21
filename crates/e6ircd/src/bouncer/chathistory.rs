@@ -154,6 +154,7 @@ async fn require_history(
 }
 
 /// Which paging direction a CHATHISTORY subcommand asks for.
+#[derive(Clone, Copy)]
 enum Paging {
     Latest,
     Before,
@@ -225,8 +226,32 @@ async fn paged(
             Ok(rows) => rows,
             Err(e) => return db_error(write, e).await,
         };
-    let selected = resolve_window(&rows, paging, &selector, &selector2, limit as usize);
-    reply_lines(write, caps, target, &selected).await
+    match resolve_window(&rows, paging, &selector, &selector2, limit as usize) {
+        Ok(selected) => reply_lines(write, caps, target, &selected).await,
+        Err(UnknownMsgid) => {
+            write
+                .write_all(unknown_msgid_reply(params[0], target).as_bytes())
+                .await?;
+            write.flush().await
+        }
+    }
+}
+
+/// A `msgid=` selector that names no message in the buffer being paged. It is
+/// not an empty page: a client resuming from the last message it saw would read
+/// an empty page as "nothing new" when the truth is "that position is gone".
+/// (A timestamp always names a position, so one that matches nothing is a
+/// genuinely empty page.)
+#[derive(Debug, PartialEq, Eq)]
+struct UnknownMsgid;
+
+/// The spec's `MESSAGE_ERROR the_given_command the_given_target`. `target` has
+/// passed [`valid_target`], so it is one bounded parameter.
+fn unknown_msgid_reply(subcommand: &str, target: &str) -> String {
+    format!(
+        ":*bnc* FAIL CHATHISTORY MESSAGE_ERROR {} {target} :unknown msgid\r\n",
+        subcommand.to_ascii_uppercase()
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -262,27 +287,28 @@ fn resolve_window<'a>(
     selector: &HistorySelector,
     selector2: &HistorySelector,
     limit: usize,
-) -> Vec<&'a crate::db::BncHistoryLine> {
+) -> Result<Vec<&'a crate::db::BncHistoryLine>, UnknownMsgid> {
     let n = rows.len();
-    let lower_start = |selector: &HistorySelector| match selector {
+    // Where a selector sits in `rows`: the index of the message it names, and
+    // whether it names one (a timestamp names the gap before `index`). `*` is
+    // refused for everything but an unbounded LATEST before this is reached.
+    let position = |selector: &HistorySelector, inclusive: bool| match selector {
         HistorySelector::Msgid(msgid) => rows
             .iter()
             .position(|row| row.msgid.as_deref() == Some(msgid))
-            .map(|position| position + 1),
-        HistorySelector::Timestamp(timestamp) => {
-            Some(rows.partition_point(|row| row.sent_at.as_str() <= timestamp.as_str()))
-        }
-        HistorySelector::Star => None,
+            .map(|position| position + usize::from(inclusive))
+            .ok_or(UnknownMsgid),
+        HistorySelector::Timestamp(timestamp) => Ok(rows.partition_point(|row| {
+            if inclusive {
+                row.sent_at.as_str() <= timestamp.as_str()
+            } else {
+                row.sent_at.as_str() < timestamp.as_str()
+            }
+        })),
+        HistorySelector::Star => Ok(if inclusive { 0 } else { n }),
     };
-    let upper_end = |selector: &HistorySelector| match selector {
-        HistorySelector::Msgid(msgid) => rows
-            .iter()
-            .position(|row| row.msgid.as_deref() == Some(msgid)),
-        HistorySelector::Timestamp(timestamp) => {
-            Some(rows.partition_point(|row| row.sent_at.as_str() < timestamp.as_str()))
-        }
-        HistorySelector::Star => None,
-    };
+    let lower_start = |selector: &HistorySelector| position(selector, true);
+    let upper_end = |selector: &HistorySelector| position(selector, false);
     let newest = |start: usize, end: usize| {
         let end = end.min(n);
         let start = end.saturating_sub(limit).max(start.min(end));
@@ -293,30 +319,28 @@ fn resolve_window<'a>(
         let start = start.min(end);
         rows[start..(start + limit).min(end)].iter().collect()
     };
-    match paging {
-        Paging::Latest if matches!(selector, HistorySelector::Star) => newest(0, n),
-        Paging::Latest => lower_start(selector).map_or_else(Vec::new, |start| newest(start, n)),
-        Paging::Before => upper_end(selector).map_or_else(Vec::new, |end| newest(0, end)),
-        Paging::After => lower_start(selector).map_or_else(Vec::new, |start| oldest(start, n)),
-        Paging::Around => upper_end(selector).map_or_else(Vec::new, |pivot| {
+    Ok(match paging {
+        Paging::Latest => newest(lower_start(selector)?, n),
+        Paging::Before => newest(0, upper_end(selector)?),
+        Paging::After => oldest(lower_start(selector)?, n),
+        Paging::Around => {
+            let pivot = upper_end(selector)?;
             let before = limit / 2;
             let start = pivot.saturating_sub(before);
             let end = (pivot + (limit - before)).min(n);
             rows[start..end].iter().collect()
-        }),
-        Paging::Between => match (upper_end(selector), upper_end(selector2)) {
-            (Some(first), Some(second)) => {
-                let newest_first = first > second;
-                let older = if first <= second { selector } else { selector2 };
-                match lower_start(older) {
-                    Some(start) if newest_first => newest(start, first.max(second)),
-                    Some(start) => oldest(start, first.max(second)),
-                    None => Vec::new(),
-                }
+        }
+        Paging::Between => {
+            let (first, second) = (upper_end(selector)?, upper_end(selector2)?);
+            let older = if first <= second { selector } else { selector2 };
+            let start = lower_start(older)?;
+            if first > second {
+                newest(start, first.max(second))
+            } else {
+                oldest(start, first.max(second))
             }
-            _ => Vec::new(),
-        },
-    }
+        }
+    })
 }
 
 /// `CHATHISTORY TARGETS <timestamp> <timestamp> <target-count>`: list the
@@ -635,51 +659,70 @@ mod tests {
         let ids = |selected: Vec<&crate::db::BncHistoryLine>| {
             selected.into_iter().map(|row| row.id).collect::<Vec<_>>()
         };
+        let window = |rows, paging, first: &HistorySelector, second: &HistorySelector, limit| {
+            resolve_window(rows, paging, first, second, limit).expect("known selectors")
+        };
         let star = HistorySelector::Star;
         let msgid = |id| HistorySelector::Msgid(format!("m{id}"));
         assert_eq!(
-            ids(resolve_window(&rows, Paging::Latest, &star, &star, 2)),
+            ids(window(&rows, Paging::Latest, &star, &star, 2)),
             vec![5, 6]
         );
         assert_eq!(
-            ids(resolve_window(&rows, Paging::Latest, &msgid(2), &star, 2)),
+            ids(window(&rows, Paging::Latest, &msgid(2), &star, 2)),
             vec![5, 6],
             "bounded LATEST keeps the newest messages after its pivot"
         );
         assert_eq!(
-            ids(resolve_window(&rows, Paging::Before, &msgid(5), &star, 2)),
+            ids(window(&rows, Paging::Before, &msgid(5), &star, 2)),
             vec![3, 4]
         );
         assert_eq!(
-            ids(resolve_window(&rows, Paging::After, &msgid(2), &star, 2)),
+            ids(window(&rows, Paging::After, &msgid(2), &star, 2)),
             vec![3, 4]
         );
         assert_eq!(
-            ids(resolve_window(&rows, Paging::Around, &msgid(4), &star, 4)),
+            ids(window(&rows, Paging::Around, &msgid(4), &star, 4)),
             vec![2, 3, 4, 5]
         );
         assert_eq!(
-            ids(resolve_window(
-                &rows,
-                Paging::Between,
-                &msgid(2),
-                &msgid(6),
-                2
-            )),
+            ids(window(&rows, Paging::Between, &msgid(2), &msgid(6), 2)),
             vec![3, 4]
         );
         assert_eq!(
-            ids(resolve_window(
-                &rows,
-                Paging::Between,
-                &msgid(6),
-                &msgid(2),
-                2
-            )),
+            ids(window(&rows, Paging::Between, &msgid(6), &msgid(2), 2)),
             vec![4, 5],
             "a reverse BETWEEN window limits from its first, newer endpoint"
         );
-        assert!(resolve_window(&rows, Paging::Before, &msgid(99), &star, 2).is_empty());
+        // A msgid this buffer does not hold names no position. An empty page
+        // would tell a resuming client "nothing new"; it is an error instead.
+        for paging in [
+            Paging::Latest,
+            Paging::Before,
+            Paging::After,
+            Paging::Around,
+        ] {
+            assert_eq!(
+                resolve_window(&rows, paging, &msgid(99), &star, 2).map(ids),
+                Err(UnknownMsgid)
+            );
+        }
+        for (first, second) in [(msgid(99), msgid(2)), (msgid(2), msgid(99))] {
+            assert_eq!(
+                resolve_window(&rows, Paging::Between, &first, &second, 2).map(ids),
+                Err(UnknownMsgid)
+            );
+        }
+        // A timestamp that matches nothing is a position with nothing after it.
+        let late = HistorySelector::Timestamp("2027-01-01T00:00:00.000Z".into());
+        assert_eq!(
+            resolve_window(&rows, Paging::After, &late, &star, 2).map(ids),
+            Ok(vec![])
+        );
+        assert_eq!(
+            unknown_msgid_reply("AFTER", "#room"),
+            ":*bnc* FAIL CHATHISTORY MESSAGE_ERROR AFTER #room :unknown msgid\r\n"
+        );
     }
 
     #[tokio::test]

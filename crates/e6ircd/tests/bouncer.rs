@@ -7,6 +7,7 @@ use e6ircd::bouncer::{
     NetworkLifecycle, SendOutcome, preflight_irc,
 };
 use e6ircd::config::{Config, ListenerConfig, NetworkKind};
+use e6ircd::egress::InternalUpstreams;
 use e6ircd::net;
 
 mod support;
@@ -81,12 +82,16 @@ async fn wait_connected(
 #[tokio::test(flavor = "multi_thread")]
 async fn preflight_uses_the_real_driver_registration_path_without_starting_a_network() {
     let addr = upstream().await;
-    let result = preflight_irc(&NetworkConfig {
-        addr: addr.to_string(),
-        nick: "preflight".into(),
-        realname: "preflight qualification".into(),
-        ..NetworkConfig::default()
-    })
+    let result = preflight_irc(
+        &NetworkConfig {
+            addr: addr.to_string(),
+            nick: "preflight".parse().expect("test nickname"),
+            realname: "preflight qualification".parse().expect("test real name"),
+            internal_upstreams: InternalUpstreams::Allow,
+            ..NetworkConfig::default()
+        },
+        std::time::Duration::from_secs(25),
+    )
     .await
     .expect("local upstream qualifies");
 
@@ -103,9 +108,10 @@ async fn driver_registers_relays_and_buffers() {
 
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
-        realname: "bnc".into(),
-        autojoin: vec!["#bnc".into()],
+        nick: "bncbot".parse().expect("test nickname"),
+        realname: "bnc".parse().expect("test real name"),
+        autojoin: vec!["#bnc".parse().expect("test channel")],
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -116,7 +122,11 @@ async fn driver_registers_relays_and_buffers() {
         .await
         .expect("connect");
     other
-        .register("speaker", "speaker")
+        .register(&e6irc_client::Identity {
+            nick: "speaker",
+            username: "speaker",
+            realname: "speaker",
+        })
         .await
         .expect("register");
     other.send_line("JOIN #bnc").await.unwrap();
@@ -197,6 +207,7 @@ async fn driver_reconnects_after_upstream_drop() {
     // retrying (doesn't stop) until the handle is dropped.
     let handle = IrcNetwork::start(NetworkConfig {
         addr: "127.0.0.1:1".into(), // nothing listening
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -294,9 +305,10 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
 
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
-        realname: "bnc".into(),
+        nick: "bncbot".parse().expect("test nickname"),
+        realname: "bnc".parse().expect("test real name"),
         autojoin: vec![],
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -362,7 +374,7 @@ async fn bnc_account_db(test: &str, account: &str, password: &str) -> String {
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    e6ircd::db::create_account(&pool, account, password)
+    e6ircd::db::create_account_with_contact(&pool, account, password, None)
         .await
         .expect("create");
     drop(pool);
@@ -388,6 +400,7 @@ fn bnc_config(up: std::net::SocketAddr, url: String) -> Config {
                 addr: up.to_string(),
                 tls: false,
                 nick: "bncnick".into(),
+                username: Some("tester".into()),
                 realname: Some("bncnick".into()),
                 autojoin: vec!["#lobby".into()],
                 buffer_cap: 1000,
@@ -402,6 +415,7 @@ fn bnc_config(up: std::net::SocketAddr, url: String) -> Config {
                 addr: up.to_string(),
                 tls: false,
                 nick: "bobnick".into(),
+                username: Some("tester".into()),
                 realname: Some("bobnick".into()),
                 autojoin: vec![],
                 buffer_cap: 1000,
@@ -412,6 +426,7 @@ fn bnc_config(up: std::net::SocketAddr, url: String) -> Config {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     }
 }
@@ -436,7 +451,13 @@ async fn bnc_listener_authenticates_and_routes_client_to_network() {
     let mut peer = e6irc_client::Connection::connect(&up.to_string())
         .await
         .unwrap();
-    peer.register("uppeer", "peer").await.unwrap();
+    peer.register(&e6irc_client::Identity {
+        nick: "uppeer",
+        username: "uppeer",
+        realname: "peer",
+    })
+    .await
+    .unwrap();
     peer.send_line("JOIN #lobby").await.unwrap();
     loop {
         if peer.next_message().await.unwrap().unwrap().command == "366" {
@@ -450,7 +471,15 @@ async fn bnc_listener_authenticates_and_routes_client_to_network() {
         .await
         .unwrap();
     let confirmed = client
-        .register_sasl("alice/up", "Me", "alice", "s3cr3t")
+        .register_sasl(
+            &e6irc_client::Identity {
+                nick: "alice/up",
+                username: "aliceup",
+                realname: "Me",
+            },
+            "alice",
+            "s3cr3t",
+        )
         .await
         .expect("bnc SASL auth");
     assert_eq!(confirmed, "bncnick", "{confirmed}");
@@ -516,7 +545,13 @@ async fn bnc_listener_rejects_unauthenticated_and_wrong_password() {
         .await
         .unwrap();
     assert!(
-        anon.register("alice/up", "Me").await.is_err(),
+        anon.register(&e6irc_client::Identity {
+            nick: "alice/up",
+            username: "aliceup",
+            realname: "Me"
+        })
+        .await
+        .is_err(),
         "unauthenticated attach must be refused"
     );
 
@@ -525,9 +560,17 @@ async fn bnc_listener_rejects_unauthenticated_and_wrong_password() {
         .await
         .unwrap();
     assert!(
-        bad.register_sasl("alice/up", "Me", "alice", "wrong")
-            .await
-            .is_err(),
+        bad.register_sasl(
+            &e6irc_client::Identity {
+                nick: "alice/up",
+                username: "aliceup",
+                realname: "Me"
+            },
+            "alice",
+            "wrong"
+        )
+        .await
+        .is_err(),
         "wrong password must be refused"
     );
 
@@ -540,7 +583,15 @@ async fn bnc_listener_rejects_unauthenticated_and_wrong_password() {
         .unwrap();
     assert!(
         cross
-            .register_sasl("alice/bobnet", "Me", "alice", "s3cr3t")
+            .register_sasl(
+                &e6irc_client::Identity {
+                    nick: "alice/bobnet",
+                    username: "alicebobne",
+                    realname: "Me"
+                },
+                "alice",
+                "s3cr3t"
+            )
             .await
             .is_err(),
         "alice must not attach to bob's network"
@@ -649,7 +700,7 @@ async fn driver_authenticates_to_sasl_upstream() {
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    e6ircd::db::create_account(&pool, "bncacct", "bncpass")
+    e6ircd::db::create_account_with_contact(&pool, "bncacct", "bncpass", None)
         .await
         .expect("create");
     drop(pool);
@@ -671,9 +722,10 @@ async fn driver_authenticates_to_sasl_upstream() {
     // driver with SASL creds
     let handle = IrcNetwork::start(NetworkConfig {
         addr: up.to_string(),
-        nick: "bncacct".into(),
-        realname: "bnc".into(),
+        nick: "bncacct".parse().expect("test nickname"),
+        realname: "bnc".parse().expect("test real name"),
         sasl: Some(("bncacct".into(), "bncpass".into())),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -685,7 +737,14 @@ async fn driver_authenticates_to_sasl_upstream() {
     let mut observer = e6irc_client::Connection::connect(&up.to_string())
         .await
         .unwrap();
-    observer.register("obs", "obs").await.unwrap();
+    observer
+        .register(&e6irc_client::Identity {
+            nick: "obs",
+            username: "obs",
+            realname: "obs",
+        })
+        .await
+        .unwrap();
     observer.send_line("WHOIS bncacct").await.unwrap();
     let logged_in = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -725,7 +784,13 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
     let mut peer = e6irc_client::Connection::connect(&up.to_string())
         .await
         .unwrap();
-    peer.register("uppeer", "peer").await.unwrap();
+    peer.register(&e6irc_client::Identity {
+        nick: "uppeer",
+        username: "uppeer",
+        realname: "peer",
+    })
+    .await
+    .unwrap();
     peer.send_line("JOIN #lobby").await.unwrap();
     loop {
         if peer.next_message().await.unwrap().unwrap().command == "366" {
@@ -774,6 +839,7 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
             addr: "127.0.0.1:1".into(), // unreachable: no live traffic
             tls: false,
             nick: "bncnick".into(),
+            username: Some("tester".into()),
             realname: Some("bncnick".into()),
             autojoin: vec![],
             buffer_cap: 1000,
@@ -783,6 +849,7 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     };
     let running_b = net::start(config_b).await.expect("start B");
@@ -794,7 +861,15 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
         .await
         .unwrap();
     client
-        .register_sasl("alice/up", "Me", "alice", "s3cr3t")
+        .register_sasl(
+            &e6irc_client::Identity {
+                nick: "alice/up",
+                username: "aliceup",
+                realname: "Me",
+            },
+            "alice",
+            "s3cr3t",
+        )
         .await
         .expect("attach");
     // Playback of the restored backlog contains the persisted line.
@@ -846,6 +921,7 @@ async fn local_driver_presents_the_in_process_network() {
             addr: String::new(),
             tls: false,
             nick: "alicelocal".into(),
+            username: Some("tester".into()),
             realname: Some("Alice Local".into()),
             autojoin: vec!["#local".into()],
             buffer_cap: 1000,
@@ -855,6 +931,7 @@ async fn local_driver_presents_the_in_process_network() {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -868,7 +945,13 @@ async fn local_driver_presents_the_in_process_network() {
     let mut peer = e6irc_client::Connection::connect(&irc.to_string())
         .await
         .unwrap();
-    peer.register("peer", "peer").await.unwrap();
+    peer.register(&e6irc_client::Identity {
+        nick: "peer",
+        username: "peer",
+        realname: "peer",
+    })
+    .await
+    .unwrap();
     peer.send_line("JOIN #local").await.unwrap();
     loop {
         if peer.next_message().await.unwrap().unwrap().command == "366" {
@@ -882,7 +965,15 @@ async fn local_driver_presents_the_in_process_network() {
         .await
         .unwrap();
     client
-        .register_sasl("alice/home", "Me", "alice", "s3cr3t")
+        .register_sasl(
+            &e6irc_client::Identity {
+                nick: "alice/home",
+                username: "alicehome",
+                realname: "Me",
+            },
+            "alice",
+            "s3cr3t",
+        )
         .await
         .expect("attach to local network");
 
@@ -936,9 +1027,13 @@ async fn persisted_bnc_buffer_is_trimmed_by_its_own_traffic() {
     let mut peer = e6irc_client::Connection::connect(&up.to_string())
         .await
         .expect("peer connect");
-    peer.register("uppeer", "peer")
-        .await
-        .expect("peer register");
+    peer.register(&e6irc_client::Identity {
+        nick: "uppeer",
+        username: "uppeer",
+        realname: "peer",
+    })
+    .await
+    .expect("peer register");
     peer.send_line("JOIN #lobby").await.expect("join");
     loop {
         if peer.next_message().await.unwrap().unwrap().command == "366" {
@@ -1031,9 +1126,13 @@ async fn buffered_upstream_lines_keep_their_wire_form() {
     let mut peer = e6irc_client::Connection::connect(&up.to_string())
         .await
         .expect("peer connect");
-    peer.register("uppeer", "peer")
-        .await
-        .expect("peer register");
+    peer.register(&e6irc_client::Identity {
+        nick: "uppeer",
+        username: "uppeer",
+        realname: "peer",
+    })
+    .await
+    .expect("peer register");
     peer.send_line("JOIN #lobby").await.expect("join");
     loop {
         if peer.next_message().await.unwrap().unwrap().command == "366" {
@@ -1100,24 +1199,27 @@ impl FakeSession {
             .expect("upstream write failed");
     }
 
+    /// The driver asks once for the whole advertised metadata set.
+    async fn acknowledge_metadata(&mut self) {
+        let metadata = "server-time message-tags account-tag";
+        assert_eq!(self.read_line().await, format!("CAP REQ :{metadata}"));
+        self.send(&format!(":up CAP * ACK :{metadata}")).await;
+    }
+
     async fn negotiate_capabilities(&mut self) {
         assert_eq!(self.read_line().await, "CAP LS 302");
         self.send(":up CAP * LS :server-time message-tags account-tag")
             .await;
-        for capability in ["server-time", "message-tags", "account-tag"] {
-            assert_eq!(self.read_line().await, format!("CAP REQ :{capability}"));
-            self.send(&format!(":up CAP * ACK :{capability}")).await;
-        }
+        self.acknowledge_metadata().await;
     }
 
     async fn negotiate_sasl_capabilities(&mut self) {
         assert_eq!(self.read_line().await, "CAP LS 302");
         self.send(":up CAP * LS :sasl=PLAIN server-time message-tags account-tag")
             .await;
-        for capability in ["sasl", "server-time", "message-tags", "account-tag"] {
-            assert_eq!(self.read_line().await, format!("CAP REQ :{capability}"));
-            self.send(&format!(":up CAP * ACK :{capability}")).await;
-        }
+        assert_eq!(self.read_line().await, "CAP REQ :sasl");
+        self.send(":up CAP * ACK :sasl").await;
+        self.acknowledge_metadata().await;
     }
 
     /// Read until the registration burst (NICK/USER) completes, then welcome
@@ -1141,6 +1243,135 @@ async fn fake_accept(listener: &tokio::net::TcpListener) -> FakeSession {
         reader: tokio::io::BufReader::new(read),
         writer,
     }
+}
+
+/// The connection test's budget belongs to the whole test: the stage that is
+/// running when it ends reports its OWN timeout, and the upstream still hears a
+/// goodbye rather than a dropped socket.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_test_out_of_budget_names_its_stage_and_still_quits() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.negotiate_capabilities().await;
+        // Registration is never answered; record whatever else arrives.
+        loop {
+            let line = session.read_line().await;
+            if line.is_empty() {
+                break;
+            }
+            if line.starts_with("QUIT") {
+                heard_tx.send(line).await.unwrap();
+            }
+        }
+    });
+    let failure = preflight_irc(
+        &NetworkConfig {
+            addr: addr.to_string(),
+            nick: "preflight".parse().expect("test nickname"),
+            internal_upstreams: InternalUpstreams::Allow,
+            ..NetworkConfig::default()
+        },
+        std::time::Duration::from_millis(400),
+    )
+    .await
+    .expect_err("an upstream that never welcomes cannot qualify");
+    assert_eq!(failure.code(), "registration_timed_out");
+    let goodbye = tokio::time::timeout(std::time::Duration::from_secs(5), heard_rx.recv())
+        .await
+        .expect("the upstream never heard a goodbye")
+        .expect("upstream script ended");
+    assert_eq!(goodbye, "QUIT :connection test complete");
+}
+
+/// The driver and the connection test put exactly the configured user name on
+/// the wire. It used to be the first ten bytes of the nickname, so a legal
+/// nickname such as `_bot` sent `USER _bot`, which Solanum refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_configured_username_is_what_the_upstream_is_sent() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (user_tx, mut user_rx) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        loop {
+            let mut session = fake_accept(&listener).await;
+            session.negotiate_capabilities().await;
+            loop {
+                let line = session.read_line().await;
+                if line.starts_with("USER ") {
+                    user_tx.send(line).await.expect("test is still listening");
+                    session.send(":up 001 _bot :welcome").await;
+                    break;
+                }
+            }
+            while !session.read_line().await.is_empty() {}
+        }
+    });
+    let config = NetworkConfig {
+        addr: addr.to_string(),
+        nick: "_bot".parse().expect("a legal nickname"),
+        username: "botident".parse().expect("test user name"),
+        realname: "Real Name".parse().expect("test real name"),
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    };
+    preflight_irc(&config, std::time::Duration::from_secs(10))
+        .await
+        .expect("the connection test registers");
+    let handle = IrcNetwork::start(config);
+    for registration in ["the connection test", "the driver"] {
+        let user = tokio::time::timeout(std::time::Duration::from_secs(10), user_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{registration} never sent USER"))
+            .expect("upstream script ended");
+        assert_eq!(user, "USER botident 0 * :Real Name", "{registration}");
+    }
+    drop(handle);
+}
+
+/// A refused channel fails the test, and the test still leaves politely.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_test_with_a_refused_channel_still_quits() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.complete_registration("preflight").await;
+        loop {
+            let line = session.read_line().await;
+            if line.is_empty() {
+                break;
+            }
+            if line.starts_with("JOIN ") {
+                session
+                    .send(":up 473 preflight #closed :Cannot join channel (+i)")
+                    .await;
+            }
+            if line.starts_with("QUIT") {
+                heard_tx.send(line).await.unwrap();
+            }
+        }
+    });
+    let failure = preflight_irc(
+        &NetworkConfig {
+            addr: addr.to_string(),
+            nick: "preflight".parse().expect("test nickname"),
+            autojoin: vec!["#closed".parse().expect("test channel")],
+            internal_upstreams: InternalUpstreams::Allow,
+            ..NetworkConfig::default()
+        },
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .expect_err("an invite-only channel cannot be joined");
+    assert_eq!(failure.code(), "channel_join_failed");
+    tokio::time::timeout(std::time::Duration::from_secs(5), heard_rx.recv())
+        .await
+        .expect("the upstream never heard a goodbye")
+        .expect("upstream script ended");
 }
 
 /// A taken nickname is reported, never worked around. The driver does not
@@ -1189,8 +1420,9 @@ async fn a_taken_nickname_is_reported_and_never_replaced() {
 
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
+        nick: "bncbot".parse().expect("test nickname"),
         rejection_retry_floor: std::time::Duration::from_millis(200),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -1253,7 +1485,8 @@ async fn driver_tracks_forced_upstream_nick_change() {
 
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
+        nick: "bncbot".parse().expect("test nickname"),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -1329,8 +1562,9 @@ async fn runtime_joined_channels_are_rejoined_after_reconnect() {
 
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
-        autojoin: vec!["#static".into()],
+        nick: "bncbot".parse().expect("test nickname"),
+        autojoin: vec!["#static".parse().expect("test channel")],
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -1401,8 +1635,9 @@ async fn silent_upstream_trips_keepalive_and_reconnects() {
 
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
+        nick: "bncbot".parse().expect("test nickname"),
         keepalive_idle: std::time::Duration::from_millis(150),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -1430,18 +1665,173 @@ async fn silent_upstream_trips_keepalive_and_reconnects() {
     );
 }
 
-/// An upstream that rejects registration on every attempt is retried with
-/// backoff and then parked loudly, not hammered forever.
+/// A server that truncates to its NICKLEN welcomes the connection under a
+/// nickname the owner never chose. The driver does not run under it: the
+/// identity on an upstream is the configured one or none.
 #[tokio::test(flavor = "multi_thread")]
-async fn repeated_registration_rejection_parks_the_driver() {
-    let addr = upstream().await;
-    // A DB-less upstream does not advertise SASL, so requiring it makes every
-    // registration attempt fail with a terminal (non-transient) rejection.
+async fn a_welcome_under_a_different_nickname_is_a_refusal_not_an_identity() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.complete_registration("averyveryverylon").await;
+        // Hold later dials open so the driver stays in its retry wait.
+        let _held = fake_accept(&listener).await;
+        std::future::pending::<()>().await;
+    });
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
-        sasl: Some(("account".into(), "secret".into())),
+        nick: "averyveryverylongnick".parse().expect("test nickname"),
+        rejection_retry_floor: std::time::Duration::from_secs(30),
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    });
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let snapshot = handle.runtime_snapshot();
+            assert_ne!(
+                snapshot.lifecycle,
+                NetworkLifecycle::Connected,
+                "the driver ran under a nickname nobody configured"
+            );
+            if snapshot.last_error.is_some() {
+                return snapshot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the welcome was neither accepted nor refused");
+    assert_eq!(
+        snapshot.last_error,
+        Some(e6ircd::bouncer::NetworkFailure::InvalidNickname),
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.last_error_diagnostic.as_deref(),
+        Some("requested averyveryverylongnick, but the server welcomed averyveryverylon"),
+        "{snapshot:?}"
+    );
+    assert!(handle.irc_session_snapshot().is_none());
+}
+
+/// Capabilities are negotiated hop by hop. An attached client negotiated with
+/// the bouncer; the upstream's `CAP NEW`/`CAP DEL` describe a negotiation the
+/// client is not part of, and a client that acts on one (requesting `sasl` from
+/// the bouncer because the upstream gained it) is answered about the wrong hop.
+#[tokio::test(flavor = "multi_thread")]
+async fn upstream_capability_changes_are_not_relayed_to_attached_clients() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.complete_registration("bncbot").await;
+        session.send(":up CAP bncbot NEW :sasl=PLAIN").await;
+        session.send(":up CAP bncbot DEL :account-tag").await;
+        session
+            .send(":friend!u@h PRIVMSG bncbot :after the capability change")
+            .await;
+        while !session.read_line().await.is_empty() {}
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    });
+    let lines = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let lines = handle.buffer_snapshot();
+            if lines
+                .iter()
+                .any(|line| line.contains("after the capability change"))
+            {
+                return lines;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the marker after the CAP lines was never buffered");
+    assert!(
+        !lines.iter().any(|line| line.contains(" CAP ")),
+        "an upstream CAP line reached the client-facing stream: {lines:?}"
+    );
+}
+
+/// The idle window measures the *upstream's* silence. A client that keeps
+/// typing into a half-open link must not keep it looking alive: each command
+/// used to restart the window, so the dead upstream was never noticed for as
+/// long as anyone was talking into it.
+#[tokio::test(flavor = "multi_thread")]
+async fn downstream_traffic_does_not_hide_a_silent_upstream() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.complete_registration("bncbot").await;
+        // Read and discard everything, the keepalive PING included.
+        while !session.read_line().await.is_empty() {}
+        let _held = fake_accept(&listener).await;
+        std::future::pending::<()>().await;
+    });
+
+    let handle = std::sync::Arc::new(IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        keepalive_idle: std::time::Duration::from_millis(150),
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    }));
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    let typist = handle.clone();
+    let typing = tokio::spawn(async move {
+        loop {
+            typist.send("PRIVMSG #room :still typing");
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+    });
+    let tripped = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match events.recv().await {
+                Ok(DriverEvent::Status {
+                    status: DriverConnectionStatus::Reconnecting(failure),
+                    ..
+                }) => return failure,
+                Ok(_) => {}
+                Err(_) => panic!("event stream ended before the keepalive trip"),
+            }
+        }
+    })
+    .await;
+    typing.abort();
+    assert_eq!(
+        tripped.expect("a silent upstream stayed connected while a client typed"),
+        e6ircd::bouncer::NetworkFailure::KeepaliveTimedOut
+    );
+}
+
+/// An upstream that rejects registration on every attempt, for a reason only a
+/// change of configuration can clear, is retried on the refusal schedule and
+/// then parked loudly, not hammered forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_registration_rejection_parks_the_driver() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let mut session = fake_accept(&listener).await;
+            session.negotiate_capabilities().await;
+            while !session.read_line().await.starts_with("USER ") {}
+            session.send(":up 432 * bncbot :Erroneous nickname").await;
+        }
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
         rejection_retry_floor: std::time::Duration::from_millis(20),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -1466,7 +1856,72 @@ async fn repeated_registration_rejection_parks_the_driver() {
         snapshot.lifecycle,
         e6ircd::bouncer::NetworkLifecycle::RegistrationFailed
     );
-    assert!(snapshot.connection_attempts >= 5, "{snapshot:?}");
+    assert_eq!(snapshot.connection_attempts, 5, "{snapshot:?}");
+}
+
+/// Solanum withdraws the `sasl` capability while services are down. That
+/// clears by itself, so it must never park: parked networks stay down until
+/// their owner re-saves them, and a few minutes of services downtime would
+/// take every SASL network with it. The reason stays readable for the whole
+/// wait, and the driver connects by itself once services are back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_services_outage_is_outlasted_not_parked() {
+    const OUTAGE_DIALS: u32 = 8;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (dial_tx, mut dial_rx) = tokio::sync::mpsc::channel(32);
+    tokio::spawn(async move {
+        for _ in 0..OUTAGE_DIALS {
+            let mut session = fake_accept(&listener).await;
+            assert_eq!(session.read_line().await, "CAP LS 302");
+            session.send(":up CAP * LS :server-time").await;
+            dial_tx.send(()).await.expect("test is still listening");
+        }
+        // Services are back.
+        let mut session = fake_accept(&listener).await;
+        session.negotiate_sasl_capabilities().await;
+        assert_eq!(session.read_line().await, "AUTHENTICATE PLAIN");
+        session.send("AUTHENTICATE +").await;
+        while !session.read_line().await.starts_with("AUTHENTICATE ") {}
+        session
+            .send(":up 903 bncbot :SASL authentication successful")
+            .await;
+        assert_eq!(session.read_line().await, "CAP END");
+        session.send(":up 001 bncbot :welcome").await;
+        while !session.read_line().await.is_empty() {}
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        sasl: Some(("account".into(), "secret".into())),
+        rejection_retry_floor: std::time::Duration::from_millis(5),
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    });
+    for dial in 1..=OUTAGE_DIALS {
+        tokio::time::timeout(std::time::Duration::from_secs(10), dial_rx.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the driver stopped dialing after {} attempts: {:?}",
+                    dial - 1,
+                    handle.runtime_snapshot()
+                )
+            });
+        if dial > 1 {
+            // The previous refusal has been recorded by the time of this dial.
+            let waiting = handle.runtime_snapshot();
+            assert_ne!(waiting.lifecycle, NetworkLifecycle::RegistrationFailed);
+            assert_eq!(
+                waiting.last_error,
+                Some(e6ircd::bouncer::NetworkFailure::SaslUnavailable),
+                "the reason stays visible for the whole outage: {waiting:?}"
+            );
+        }
+    }
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    assert!(handle.runtime_snapshot().connection_attempts > u64::from(OUTAGE_DIALS));
 }
 
 /// Rejected credentials are never re-sent: a retry can only fail the same way,
@@ -1494,9 +1949,10 @@ async fn rejected_credentials_park_without_a_second_dial() {
     });
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
+        nick: "bncbot".parse().expect("test nickname"),
         sasl: Some(("account".into(), "wrong".into())),
         rejection_retry_floor: std::time::Duration::from_millis(20),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     wait_lifecycle(&handle, NetworkLifecycle::AuthenticationFailed).await;
@@ -1507,7 +1963,73 @@ async fn rejected_credentials_park_without_a_second_dial() {
             .is_err(),
         "a parked driver must not dial the upstream again"
     );
-    assert_eq!(handle.runtime_snapshot().connection_attempts, 1);
+    let snapshot = handle.runtime_snapshot();
+    assert_eq!(snapshot.connection_attempts, 1);
+    assert_eq!(
+        snapshot.last_error_diagnostic.as_deref(),
+        Some("SASL authentication failed"),
+        "the owner reads the upstream's own words: {snapshot:?}"
+    );
+}
+
+/// An upstream that offers SASL but not PLAIN says nothing about the password.
+/// Parking it as rejected credentials sent the owner to retype a correct
+/// password forever; it is a worded registration refusal, and no credential is
+/// ever put on the wire.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_without_the_sasl_mechanism_is_not_a_credential_rejection() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let mut session = fake_accept(&listener).await;
+            assert_eq!(session.read_line().await, "CAP LS 302");
+            session
+                .send(":up CAP * LS :sasl=EXTERNAL,SCRAM-SHA-256 server-time")
+                .await;
+            assert_eq!(
+                session.read_line().await,
+                "",
+                "the driver must hang up without starting a credential exchange"
+            );
+        }
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        sasl: Some(("account".into(), "correct".into())),
+        rejection_retry_floor: std::time::Duration::from_millis(20),
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    });
+    // Wait on exactly what is asserted: the recorded refusal. (It is retried,
+    // never parked — see `a_services_outage_is_outlasted_not_parked`.)
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let snapshot = handle.runtime_snapshot();
+            if snapshot.last_error.is_some() {
+                return snapshot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the refusal was never recorded");
+    assert_ne!(
+        snapshot.lifecycle,
+        NetworkLifecycle::AuthenticationFailed,
+        "a missing mechanism says nothing about the password: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.last_error,
+        Some(e6ircd::bouncer::NetworkFailure::SaslUnavailable),
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.last_error_diagnostic.as_deref(),
+        Some("requested PLAIN; the server offers EXTERNAL,SCRAM-SHA-256"),
+        "{snapshot:?}"
+    );
 }
 
 /// A refusing upstream's own connection throttle shows up as dials that die
@@ -1539,8 +2061,9 @@ async fn a_dropped_dial_between_refusals_does_not_reset_the_park_count() {
     });
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
+        nick: "bncbot".parse().expect("test nickname"),
         rejection_retry_floor: std::time::Duration::from_millis(20),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     wait_lifecycle(&handle, NetworkLifecycle::RegistrationFailed).await;
@@ -1571,8 +2094,9 @@ async fn a_refused_registration_keeps_its_reason_while_retrying() {
     });
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
+        nick: "bncbot".parse().expect("test nickname"),
         rejection_retry_floor: std::time::Duration::from_secs(30),
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let snapshot = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -1602,7 +2126,13 @@ async fn full_buffer_evicts_oldest() {
     let mut peer = e6irc_client::Connection::connect(&addr.to_string())
         .await
         .unwrap();
-    peer.register("speaker", "speaker").await.unwrap();
+    peer.register(&e6irc_client::Identity {
+        nick: "speaker",
+        username: "speaker",
+        realname: "speaker",
+    })
+    .await
+    .unwrap();
     peer.send_line("JOIN #ring").await.unwrap();
     loop {
         if peer.next_message().await.unwrap().unwrap().command == "366" {
@@ -1611,9 +2141,10 @@ async fn full_buffer_evicts_oldest() {
     }
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
-        nick: "bncbot".into(),
-        autojoin: vec!["#ring".into()],
+        nick: "bncbot".parse().expect("test nickname"),
+        autojoin: vec!["#ring".parse().expect("test channel")],
         buffer_cap: 3,
+        internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
@@ -1681,7 +2212,15 @@ async fn self_echo_is_persisted_to_the_backlog() {
         .await
         .unwrap();
     client
-        .register_sasl("alice/up", "Me", "alice", "s3cr3t")
+        .register_sasl(
+            &e6irc_client::Identity {
+                nick: "alice/up",
+                username: "aliceup",
+                realname: "Me",
+            },
+            "alice",
+            "s3cr3t",
+        )
         .await
         .expect("bnc SASL auth");
     client
@@ -1807,7 +2346,13 @@ async fn bnc_listener_serves_chathistory_and_markread() {
     let mut peer = e6irc_client::Connection::connect(&up.to_string())
         .await
         .unwrap();
-    peer.register("uppeer", "peer").await.unwrap();
+    peer.register(&e6irc_client::Identity {
+        nick: "uppeer",
+        username: "uppeer",
+        realname: "peer",
+    })
+    .await
+    .unwrap();
     peer.send_line("JOIN #lobby").await.unwrap();
     loop {
         if peer.next_message().await.unwrap().unwrap().command == "366" {
@@ -1936,9 +2481,29 @@ async fn bnc_listener_serves_chathistory_and_markread() {
     }
     assert_eq!(after.len(), 5, "AFTER the 2024 marker returns everything");
 
-    // An unknown msgid selector is an empty page, not an error.
+    // An unknown msgid names no position. An empty page would tell a resuming
+    // client "nothing new"; it is said to be an error, in the line the core
+    // also sends.
     client
         .send_line("CHATHISTORY BEFORE #lobby msgid=doesnotexist 10")
+        .await
+        .unwrap();
+    let refused = client.next_message().await.unwrap().expect("FAIL reply");
+    assert_eq!(refused.command, "FAIL", "{refused:?}");
+    assert_eq!(
+        refused.params,
+        [
+            "CHATHISTORY",
+            "MESSAGE_ERROR",
+            "BEFORE",
+            "#lobby",
+            "unknown msgid"
+        ],
+    );
+    // A timestamp always names a position: past the newest message is a
+    // genuinely empty page.
+    client
+        .send_line("CHATHISTORY AFTER #lobby timestamp=2099-01-01T00:00:00.000Z 10")
         .await
         .unwrap();
     let open = client.next_message().await.unwrap().expect("batch open");

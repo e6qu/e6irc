@@ -43,6 +43,14 @@ pub(super) enum SelectorError {
 }
 
 impl Selector {
+    /// The message id this selector names, if it names one.
+    fn msgid(&self) -> Option<&str> {
+        match self {
+            Selector::Msgid(msgid) => Some(msgid),
+            Selector::Timestamp(_) | Selector::Star => None,
+        }
+    }
+
     /// Parse a wire selector token. The single classification point for
     /// `*` / `msgid=` / `timestamp=`; a malformed timestamp is a hard error
     /// here rather than a silently-defaulted bound later.
@@ -93,6 +101,17 @@ impl ChathistorySub {
             "AROUND" => Some(Self::Around),
             "BETWEEN" => Some(Self::Between),
             _ => None,
+        }
+    }
+
+    /// The canonical spelling, as a failure names the subcommand it refuses.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Latest => "LATEST",
+            Self::Before => "BEFORE",
+            Self::After => "AFTER",
+            Self::Around => "AROUND",
+            Self::Between => "BETWEEN",
         }
     }
 
@@ -157,6 +176,11 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
     if target.starts_with('#') {
         let owner = state.channel_owner(target);
         if !state.owns_channel(&owner) {
+            // Counted here, where the session is: the owner may have to ask
+            // the database, and it has no session of ours to count against.
+            if !state.history_request_started(conn) {
+                return too_many_history_requests(state, conn, &[sub, target]);
+            }
             let label = state.channel_reply_label(conn, &owner);
             state.route_channel_command(crate::core::state::ChannelCommand::new(
                 owner,
@@ -176,7 +200,7 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
     // participant in a direct-message conversation, which the requester is a
     // participant of by construction — the key is derived from their own nick,
     // so a client can only ever ask for a conversation it is part of.
-    let (hist_key, history_targets) = if target.starts_with('#') {
+    let (hist_key, stored) = if target.starts_with('#') {
         let key = state.chan_key(target);
         let is_member = state.is_channel_member(conn, &key);
         if !is_member {
@@ -190,8 +214,7 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
             return;
         }
         let history_key = crate::core::state::HistoryKey::from(&key);
-        let targets = crate::core::HistoryTargets::Exact(history_key.as_str().to_string());
-        (history_key, targets)
+        (history_key, true)
     } else {
         if state.sessions[&conn].nick().is_none() {
             chathistory_fail(
@@ -206,17 +229,11 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
         let me = state.conn_identity(conn);
         let peer = state.nick_identity(target);
         let key = state.dm_conversation(&me, &peer).0;
-        let targets =
-            if state.registered_peer(&state.nick_key(target)).is_none() && !peer.starts_with('~') {
-                let fallback = state.dm_conversation(&me, &format!("~{peer}")).0;
-                crate::core::HistoryTargets::PreferExisting {
-                    primary: key.as_str().to_string(),
-                    fallback: fallback.as_str().to_string(),
-                }
-            } else {
-                crate::core::HistoryTargets::Exact(key.as_str().to_string())
-            };
-        (key, targets)
+        // Only a conversation between two accounts is stored. One with an
+        // unauthenticated party lives in the ring alone and is never asked of
+        // the database (see `record_history`).
+        let stored = !me.starts_with('~') && !peer.starts_with('~');
+        (key, stored)
     };
     // Parse the subcommand once into a typed value: the ring resolver and the DB
     // query builder both consume it, so they can no longer enumerate the
@@ -350,7 +367,7 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
 
     // Ring miss with a database available: page from PostgreSQL instead,
     // preserving one code path for rendering (history_page).
-    if !covered && state.config.sasl_enabled {
+    if !covered && stored && state.config.sasl_enabled {
         // A `msgid=` pivot pages on the composite (ts, id), which stays exact
         // even if two messages share a millisecond; a `timestamp=` pivot carries
         // its already-parsed millisecond bound (no re-parse, no silent default).
@@ -416,38 +433,26 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
         let label = state.capture.as_ref().and_then(|c| c.label.clone());
         let request = crate::core::DbRequest::QueryHistory {
             conn,
-            targets: history_targets,
+            target: hist_key.as_str().to_string(),
             display: display.clone(),
             batch_ref,
             caps: response_caps,
             query,
             label,
         };
-        if state.db_tx.try_push(request).is_err() {
-            // Enqueue failed: fall through to a synchronous FAIL, which the
-            // labeled-response framer still handles normally.
-            chathistory_fail(
-                state,
-                conn,
-                "MESSAGE_ERROR",
-                &[sub, target],
-                "History temporarily unavailable",
-            );
-        } else {
-            // Queued: hold this connection's later output behind the batch so
-            // the reply order matches the command order.
-            state.defer_reply(conn);
-            if let Some(cap) = state.capture.as_mut() {
-                // The labeled batch is emitted when the DB replies, so tell the
-                // framer not to ACK this command as an empty response.
-                if cap.label.is_some() {
-                    cap.deferred = true;
-                }
-            }
-        }
+        queue_history_request(state, conn, request, &[sub, target]);
         return;
     }
 
+    // The ring is the authority here — it holds the buffer's whole history, or
+    // there is no database behind it — so a msgid it does not hold is unknown.
+    if [&selector, &selector2].into_iter().any(|selector| {
+        selector
+            .msgid()
+            .is_some_and(|msgid| !history.iter().any(|entry| entry.msgid == msgid))
+    }) {
+        return unknown_msgid_fail(state, conn, None, parsed_sub.name(), target);
+    }
     let rows: Vec<crate::core::HistoryRow> = entries
         .into_iter()
         .map(|e| crate::core::HistoryRow {
@@ -475,6 +480,47 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
     );
 }
 
+fn too_many_history_requests(state: &mut ServerState, conn: ConnId, context: &[&str]) {
+    chathistory_fail(
+        state,
+        conn,
+        "MESSAGE_ERROR",
+        context,
+        "Too many history requests in flight",
+    );
+}
+
+/// Hand a history request to the database and hold the connection's later
+/// output behind its answer, so replies keep the order of the commands. A
+/// request that cannot be queued is refused here and now — the labeled-response
+/// framer handles that like any other synchronous reply — and holds nothing.
+fn queue_history_request(
+    state: &mut ServerState,
+    conn: ConnId,
+    request: crate::core::DbRequest,
+    context: &[&str],
+) {
+    // A session on another shard was counted there before its request was
+    // sent here (see `cmd_chathistory`); only a local one is counted now.
+    let local = state.sessions.contains_key(&conn);
+    if local && !state.history_request_started(conn) {
+        too_many_history_requests(state, conn, context);
+    } else if state.db_tx.try_push(request).is_err() {
+        state.history_request_finished(conn);
+        chathistory_fail(
+            state,
+            conn,
+            "MESSAGE_ERROR",
+            context,
+            "History temporarily unavailable",
+        );
+    } else {
+        // The batch answers the command when the database replies; nothing
+        // here may answer it as empty.
+        state.defer_captured_reply(conn);
+    }
+}
+
 pub(super) fn history_on_owner(
     state: &mut ServerState,
     command: crate::core::state::ChannelCommand,
@@ -490,7 +536,10 @@ pub(super) fn history_on_owner(
     let parameters: Vec<&str> = request.parameters.iter().map(String::as_str).collect();
     cmd_chathistory(state, conn, &parameters);
     let capture = state.capture.take().expect("CHATHISTORY capture installed");
-    if capture.lines.is_empty() {
+    // Only a queued database page leaves the requester waiting. An answer
+    // with no lines (an empty page for a client without `batch`) is still the
+    // answer, and must release the requester like any other.
+    if capture.deferred {
         crate::core::state::ChannelHistoryResult::Deferred
     } else {
         crate::core::state::ChannelHistoryResult::Replies(
@@ -580,45 +629,6 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
     let batch_ref = state.next_msgid();
     let response_caps = crate::core::HistoryResponseCaps::from(caps);
 
-    if state.config.sasl_enabled {
-        let channels = keys.iter().map(|k| k.as_str().to_string()).collect();
-        // Carry the labeled-response label (if any) onto the deferred batch.
-        let label = state.capture.as_ref().and_then(|c| c.label.clone());
-        let request = crate::core::DbRequest::QueryTargets {
-            conn,
-            channels,
-            me,
-            min_ts,
-            max_ts,
-            limit,
-            batch_ref,
-            caps: response_caps,
-            label,
-        };
-        if state.db_tx.try_push(request).is_err() {
-            // Enqueue failed: fall through to a synchronous FAIL the framer
-            // still handles normally.
-            chathistory_fail(
-                state,
-                conn,
-                "MESSAGE_ERROR",
-                &["TARGETS"],
-                "History temporarily unavailable",
-            );
-        } else {
-            state.defer_reply(conn);
-            if let Some(cap) = state.capture.as_mut() {
-                // The labeled batch is emitted when the DB replies, so don't
-                // ACK this command as an empty response.
-                if cap.label.is_some() {
-                    cap.deferred = true;
-                }
-            }
-        }
-        return;
-    }
-
-    // No database: enumerate from the hot rings.
     // A buffer qualifies on its *latest* message falling inside the window,
     // not on merely containing one: newer activity means the client has
     // already moved past it.
@@ -628,30 +638,57 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
         let latest = state.history.get(key)?.entries.iter().map(|e| e.ts).max()?;
         (latest > min_ts && latest < max_ts).then_some(latest)
     };
-    let mut targets: Vec<(String, e6irc_proto::time::Millis)> = Vec::new();
-    for key in &keys {
-        if let Some(latest) = latest_in_window(state, &key.into())
-            && let Some(chan) = state.channels.get(key)
-        {
-            targets.push((chan.name.clone(), latest));
-        }
-    }
     // Conversations: every hot key that is not a channel and lists the
     // requester as a participant. The correspondent is the other participant
-    // (or the requester, for a conversation with oneself).
-    let conversations: Vec<(crate::core::state::HistoryKey, String)> = state
+    // (or the requester, for a conversation with oneself). The raw correspondent
+    // *identity* is kept; `targets_page` is the single site that resolves an
+    // identity to a display nick, so the ring and the database (which also
+    // yields identities) convert identically.
+    let mut conversations: Vec<(String, e6irc_proto::time::Millis)> = state
         .history
         .keys()
-        .filter_map(|k| dm_correspondent(k, &me).map(|peer| (k.clone(), peer)))
+        .filter_map(|key| {
+            let peer = dm_correspondent(key, &me)?;
+            Some((peer, latest_in_window(state, key)?))
+        })
         .collect();
-    for (key, peer) in conversations {
-        if let Some(latest) = latest_in_window(state, &key) {
-            // Push the raw correspondent *identity*; `targets_page` is the single
-            // site that resolves an identity to a display nick, so this path and
-            // the DB path (which also yields identities) convert identically.
-            targets.push((peer, latest));
-        }
+
+    if state.config.sasl_enabled {
+        let channels = keys.iter().map(|k| k.as_str().to_string()).collect();
+        // The database holds the channels and the conversations between two
+        // accounts. One with an unauthenticated party exists only in the rings
+        // (see `record_history`), so those ride along to be merged in.
+        conversations.retain(|(peer, _)| me.starts_with('~') || peer.starts_with('~'));
+        // Carry the labeled-response label (if any) onto the deferred batch.
+        let label = state.capture.as_ref().and_then(|c| c.label.clone());
+        let request = crate::core::DbRequest::QueryTargets {
+            conn,
+            channels,
+            me: (!me.starts_with('~')).then_some(me),
+            session_only: conversations,
+            min_ts,
+            max_ts,
+            limit,
+            batch_ref,
+            caps: response_caps,
+            label,
+        };
+        queue_history_request(state, conn, request, &["TARGETS"]);
+        return;
     }
+
+    // No database: enumerate from the hot rings.
+    let mut targets: Vec<(String, e6irc_proto::time::Millis)> = Vec::new();
+    // A channel's ring lives with the channel's owner, which may be another
+    // shard; its owner publishes when it last saw a message, and that is what
+    // is read here — for a channel this shard owns too, so the answer cannot
+    // depend on where the channel lives.
+    targets.extend(
+        keys.iter()
+            .filter_map(|key| state.channel_activity(key))
+            .filter(|(_, latest)| *latest > min_ts && *latest < max_ts),
+    );
+    targets.append(&mut conversations);
     // Oldest activity first; a limit therefore keeps the oldest buffers.
     targets.sort_by_key(|t| t.1);
     targets.truncate(limit);
@@ -707,6 +744,29 @@ fn history_tag_prefix(
     } else {
         format!("@{} ", tags.join(";"))
     }
+}
+
+/// Refuse a window positioned by a msgid the authoritative store does not hold
+/// for this buffer. An empty page would tell a client resuming from that msgid
+/// that nothing is newer; this tells it the position is gone, so it can fall
+/// back to a timestamp. The bouncer's CHATHISTORY emits this same line, so a
+/// client sees one behaviour whichever served it.
+fn unknown_msgid_fail(
+    state: &mut ServerState,
+    conn: ConnId,
+    label: Option<&str>,
+    subcommand: &str,
+    target: &str,
+) {
+    let context = [subcommand, crate::core::handler::clip_echo(target)];
+    let line = super::fail_line(
+        &state.config.server_name,
+        "CHATHISTORY",
+        "MESSAGE_ERROR",
+        &context,
+        "unknown msgid",
+    );
+    state.send(conn, &with_label(label, line));
 }
 
 /// Emit the store-fault FAIL for a CHATHISTORY page: a store fault answers
@@ -963,7 +1023,7 @@ pub(crate) fn history_page(
     display: &str,
     batch_ref: &str,
     caps: crate::core::HistoryResponseCaps,
-    rows: Result<Vec<crate::core::HistoryRow>, ()>,
+    rows: Result<Vec<crate::core::HistoryRow>, crate::core::HistoryFault>,
     label: Option<&str>,
 ) {
     // A disconnected client can leave a DB reply in flight. A synchronous
@@ -991,13 +1051,16 @@ pub(crate) fn history_page(
     // same MESSAGE_ERROR.
     let rows = match rows {
         Ok(rows) => rows,
-        Err(()) => {
+        Err(crate::core::HistoryFault::Unavailable) => {
             return chathistory_store_fault(
                 state,
                 conn,
                 label,
                 crate::core::handler::clip_echo(display),
             );
+        }
+        Err(crate::core::HistoryFault::UnknownMsgid { subcommand }) => {
+            return unknown_msgid_fail(state, conn, label, subcommand, display);
         }
     };
     let server = state.config.server_name.clone();

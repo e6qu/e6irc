@@ -119,6 +119,36 @@ async fn runtime_shards_deliver_and_stop_together() {
             assert!(line.contains("shard"), "unexpected delivery: {line}");
         }
 
+        // Connection identifiers are handed out in order and a session lives
+        // on shard `id % workers`, so neighbours in this list are on different
+        // shards: everything below crosses from one worker to another.
+        let (asker, rest) = clients.split_first_mut().expect("clients");
+        let peer = &mut rest[0];
+        let peer_nick = format!("shard{core_workers}_1");
+        asker
+            .send(&format!("PRIVMSG {peer_nick} :across the shards"))
+            .await;
+        let line = peer.expect("across the shards").await;
+        assert!(line.contains(&format!("PRIVMSG {peer_nick} :")), "{line}");
+
+        asker.send(&format!("WHOIS {peer_nick}")).await;
+        let user = asker.expect(" 311 ").await;
+        assert!(user.contains(&peer_nick), "{user}");
+        let channels = asker.expect(" 319 ").await;
+        assert!(channels.contains("#runtime"), "{channels}");
+        asker.expect(" 318 ").await;
+
+        let watched = format!("late{core_workers}");
+        asker.send(&format!("MONITOR + {watched}")).await;
+        asker.expect(" 731 ").await;
+        let mut late = Client::connect(addr).await;
+        late.register(&watched).await;
+        let online = asker.expect(" 730 ").await;
+        assert!(online.contains(&format!("{watched}!")), "{online}");
+        late.send("QUIT :done").await;
+        let offline = asker.expect(" 731 ").await;
+        assert!(offline.contains(&watched), "{offline}");
+
         assert_eq!(
             running.shutdown.run().await,
             net::ShutdownOutcome::Flushed,
@@ -276,9 +306,13 @@ async fn per_ip_connection_limit_refuses_excess() {
         let mut c = e6irc_client::Connection::connect(&addr.to_string())
             .await
             .unwrap();
-        c.register(&format!("keep{i}"), "k")
-            .await
-            .expect("register");
+        c.register(&e6irc_client::Identity {
+            nick: &format!("keep{i}"),
+            username: "tester",
+            realname: "k",
+        })
+        .await
+        .expect("register");
         held.push(c);
     }
 
@@ -287,7 +321,14 @@ async fn per_ip_connection_limit_refuses_excess() {
         .await
         .unwrap();
     assert!(
-        third.register("third", "t").await.is_err(),
+        third
+            .register(&e6irc_client::Identity {
+                nick: "third",
+                username: "third",
+                realname: "t"
+            })
+            .await
+            .is_err(),
         "third connection from the same IP must be refused"
     );
 
@@ -299,7 +340,11 @@ async fn per_ip_connection_limit_refuses_excess() {
         .await
         .unwrap();
     again
-        .register("again", "a")
+        .register(&e6irc_client::Identity {
+            nick: "again",
+            username: "again",
+            realname: "a",
+        })
         .await
         .expect("a freed slot should admit a new connection");
 }
@@ -328,7 +373,13 @@ async fn command_flood_throttle_closes_excess() {
     let mut c = e6irc_client::Connection::connect(&addr.to_string())
         .await
         .unwrap();
-    c.register("flooder", "f").await.expect("register");
+    c.register(&e6irc_client::Identity {
+        nick: "flooder",
+        username: "flooder",
+        realname: "f",
+    })
+    .await
+    .expect("register");
 
     // Burst well past the bucket within the same second; the socket may
     // close mid-burst, so send errors are expected and ignored.

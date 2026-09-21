@@ -21,7 +21,8 @@ import {
   networkStateIsFailure,
   networkStateLabel,
   networksFrom,
-  saveSettings,
+  SETTINGS_KEY,
+  saveSetting,
 } from "./client-state.js";
 import { apiContractLoader, getOperationJson } from "./api-contract.js";
 import { serializeComposerRequest } from "./composer-request.js";
@@ -45,6 +46,7 @@ import {
   parseIrc,
   reconcileChannelSnapshot,
   splitSigil,
+  stripFormatting,
   stripSigil,
   tagValue,
   topicReply,
@@ -126,7 +128,16 @@ const rawTape = [];
 const loadedSettings = loadSettings(() => window.localStorage);
 const settings = loadedSettings.settings;
 
+// What was last reported under each key, so a condition that is re-detected on
+// a timer is said once: the alert is neither rebuilt (a role=alert whose text
+// is reassigned is announced again) nor resurrected after it was dismissed.
+// Clearing the key -- the condition ended -- lets it be reported afresh.
+const reportedAlerts = new Map();
+
 function showAlert(key, text, tone = "warning", action = null) {
+  const report = `${tone}\n${text}\n${action?.label ?? ""}`;
+  if (reportedAlerts.get(key) === report) return;
+  reportedAlerts.set(key, report);
   let alert = alertsEl.querySelector(`[data-alert="${CSS.escape(key)}"]`);
   if (!alert) {
     alert = document.createElement("div");
@@ -163,11 +174,12 @@ function showAlert(key, text, tone = "warning", action = null) {
 }
 
 function clearAlert(key) {
+  reportedAlerts.delete(key);
   alertsEl.querySelector(`[data-alert="${CSS.escape(key)}"]`)?.remove();
 }
 
-function persistSettings() {
-  const warning = saveSettings(() => window.localStorage, settings);
+function persistSetting(key) {
+  const warning = saveSetting(() => window.localStorage, key, settings[key]);
   const storageState = el("storage-state");
   if (warning) {
     storageState.textContent = warning;
@@ -200,6 +212,18 @@ const buffers = new Map();
 const namesSnapshots = new Set();
 const namesRequested = new Set();
 let active = null;
+// Channels this client asked to join (folded), so that only those joins move
+// the view. Bounded: a channel that never confirms is forgotten with the rest
+// when the list is full.
+const requestedJoins = new Set();
+const MAX_REQUESTED_JOINS = 64;
+function rememberRequestedJoins(list) {
+  for (const channel of String(list).split(",")) {
+    if (!isChannel(channel)) continue;
+    if (requestedJoins.size >= MAX_REQUESTED_JOINS) requestedJoins.clear();
+    requestedJoins.add(fold(channel));
+  }
+}
 let myNick = null;
 let socket = null;
 let upstreamConnected = false;
@@ -306,6 +330,10 @@ if (sidebarToggle) {
 }
 
 document.addEventListener("keydown", (event) => {
+  // An open modal owns Escape. Cancelling the event here for the rail or the
+  // preferences menu beneath it would also cancel the dialog's close request,
+  // so the dialog would need a second press.
+  if (document.querySelector("dialog[open]")) return;
   if (event.key === "Escape" && document.body.classList.contains("sidebar-open")) {
     event.preventDefault();
     closeMobileSidebar({ restoreFocus: true });
@@ -395,7 +423,7 @@ function ensureBuffer(name, kind) {
   if (buffers.size >= MAX_BUFFERS) {
     showAlert(
       "buffers",
-      `The ${MAX_BUFFERS}-conversation display limit was reached. New conversation lines are being shown in the server buffer.`,
+      `The ${MAX_BUFFERS}-conversation display limit was reached. New conversations are being shown under "server".`,
     );
     return buffers.get(SERVER);
   }
@@ -695,8 +723,43 @@ function renderNickList() {
   }
 }
 
+// Which conversation was open on each network, so opening the network again
+// returns to it. Replay no longer decides the view (it used to leave whichever
+// channel it mentioned last), so something the person chose has to. Storage
+// being unavailable only means there is nothing to return to.
+const openConversationKey = () => `e6irc.conversation.${fold(network)}`;
+function rememberOpenConversation() {
+  if (!network) return;
+  try {
+    if (active === SERVER) window.localStorage.removeItem(openConversationKey());
+    else window.localStorage.setItem(openConversationKey(), active);
+  } catch {
+    // Already reported by the preferences load; nothing is lost but the memory.
+  }
+}
+
+// Once per page, when the attach replay has finished: reopen what was open,
+// else open a network's only conversation (not a choice), else leave the view
+// where it is for the person to pick. Never "the last channel replay showed".
+let initialViewSettled = false;
+function settleInitialView() {
+  if (initialViewSettled) return;
+  initialViewSettled = true;
+  if (active !== SERVER) return; // the person already went somewhere
+  let remembered = null;
+  try {
+    remembered = window.localStorage.getItem(openConversationKey());
+  } catch {
+    remembered = null;
+  }
+  const conversations = Array.from(buffers.values()).filter((b) => b.key !== SERVER);
+  const target = (remembered && buffers.get(remembered)) || (conversations.length === 1 ? conversations[0] : null);
+  if (target) setActive(target.display);
+}
+
 function setActive(name) {
   active = fold(name);
+  if (initialViewSettled) rememberOpenConversation();
   const b = buffers.get(active);
   if (b) {
     b.unread = 0;
@@ -783,7 +846,7 @@ function addLine(bufName, kind, bufKind, from, text, tags = null, wire = null) {
     // Trim on the actual DOM node count — the model was already clamped above,
     // so a guard on `b.lines.length` would never fire and the DOM would grow
     // without bound while pinned to one channel.
-    while (messagesEl.children.length > MAX_LINES && messagesEl.firstChild) {
+    while (messagesEl.children.length > lineLimit && messagesEl.firstChild) {
       messagesEl.removeChild(messagesEl.firstChild);
     }
     if (atLatest) {
@@ -854,6 +917,18 @@ function renameNick(from, to) {
   const fromKey = fold(stripSigil(from));
   const toName = stripSigil(to);
   if (!fromKey || !toName) return;
+  const conversation = buffers.get(fromKey);
+  if (conversation && conversation.kind === "dm" && !buffers.has(fold(toName))) {
+    // Sends to the old nick would go nowhere while echoing here as delivered.
+    buffers.delete(fromKey);
+    conversation.key = fold(toName);
+    conversation.display = toName;
+    buffers.set(conversation.key, conversation);
+    if (active === fromKey) active = conversation.key;
+    addEvent(toName, `${stripSigil(from)} is now ${toName}`);
+    renderBufferList();
+    if (active === conversation.key) renderActive();
+  }
   for (const b of buffers.values()) {
     if (b.kind !== "channel") continue;
     const entry = b.nicks.get(fromKey);
@@ -870,7 +945,7 @@ function renameNick(from, to) {
 function setTopic(chan, topic) {
   const b = ensureBuffer(chan, "channel");
   if (b.kind !== "channel") return;
-  b.topic = topic || "";
+  b.topic = stripFormatting(topic);
   if (b.key === active) buftopicEl.textContent = b.topic;
 }
 
@@ -912,7 +987,7 @@ function maybeNotify(b, line) {
     new Notification(title, { body: line.text, tag: b.key });
   } catch (error) {
     settings.notifications = false;
-    persistSettings();
+    persistSetting("notifications");
     updateSettingsUI();
     showAlert(
       "notifications",
@@ -969,7 +1044,11 @@ function handleLine(raw) {
         if (isMe(m.nick)) {
           const buffer = ensureBuffer(channel, "channel");
           if (buffer.kind === "channel") buffer.joined = true;
-          setActive(channel);
+          // Only a join asked for here moves the view. The bouncer rejoins
+          // every channel after an upstream reconnect, and another attached
+          // client can join too; following those would yank the reader out of
+          // the conversation they are in, once per channel.
+          if (requestedJoins.delete(fold(channel))) setActive(channel);
         } else if (m.nick) {
           addNick(channel, m.nick);
           addEvent(channel, `${m.nick} joined`);
@@ -1110,6 +1189,9 @@ let reconnectDelay = 0;
 let reconnectTimer = null;
 let reconnectAttempt = 0;
 let terminalSocket = false;
+// WebSocket close code 1008: the peer refused the connection as a matter of
+// policy. A dropped link is retried; a refusal is not.
+const POLICY_VIOLATION = 1008;
 const RECONNECT_MIN = 1000;
 const RECONNECT_MAX = 30000;
 
@@ -1125,7 +1207,7 @@ function scheduleReconnect() {
   );
   showAlert(
     "socket",
-    `The live connection to ${network} closed. e6irc will retry with bounded backoff.`,
+    `The live connection to ${network} closed. e6irc keeps retrying, waiting longer each time.`,
     "error",
     { label: "Retry now", onClick: retryConnectionNow },
   );
@@ -1155,7 +1237,7 @@ async function reconcileUnavailableNetwork() {
     if (replacement && replacement.enabled !== false && replacement.runtime != null) {
       terminalSocket = false;
       clearAlert("network-unavailable");
-      setStatus(`${replacement.name}: reconfigured, reattaching…`, "connecting");
+      setStatus(`${replacement.name}: settings changed, reconnecting…`, "connecting");
       if (!reconnectTimer) {
         reconnectTimer = window.setTimeout(() => {
           reconnectTimer = null;
@@ -1190,7 +1272,7 @@ function connect() {
   upstreamConnected = false;
   snapshotComplete = false;
   setComposerAvailable(false);
-  setStatus(`attaching to ${network}…`, "connecting");
+  setStatus(`opening ${network}…`, "connecting");
   rejectAllPendingSends("the connection was replaced");
   // Drop any previous socket so overlapping connections can't both feed events.
   if (socket) {
@@ -1211,7 +1293,7 @@ function connect() {
     reconnectDelay = 0; // healthy connection: reset backoff
     reconnectAttempt = 0;
     setComposerAvailable(true);
-    setStatus(`attached to ${network}`, "ok");
+    setStatus(`${network}: open`, "ok");
     clearAlert("socket");
     clearAlert("send");
     clearAlert("socket-close");
@@ -1221,7 +1303,7 @@ function connect() {
     if (socket !== liveSocket) return;
     showAlert(
       "socket",
-      `The live connection to ${network} failed. e6irc will keep retrying with bounded backoff.`,
+      `The live connection to ${network} failed. e6irc keeps retrying, waiting longer each time.`,
       "error",
       { label: "Retry now", onClick: retryConnectionNow },
     );
@@ -1234,6 +1316,20 @@ function connect() {
     setComposerAvailable(false);
     if (terminalSocket) {
       setStatus(`${network} unavailable`, "error");
+      return;
+    }
+    if (event.code === POLICY_VIOLATION) {
+      // The server refused this connection for a stated reason (too many live
+      // connections for the account). Nothing about that changes by asking
+      // again every few seconds, so it is said once and left to the person.
+      const reason = event.reason || "The server refused this connection.";
+      setStatus("live connection refused", "error");
+      showAlert(
+        "socket",
+        `${reason} e6irc is not retrying by itself.`,
+        "error",
+        { label: "Retry now", onClick: retryConnectionNow },
+      );
       return;
     }
     const detail = event.reason ? `: ${event.reason}` : event.code === 1006 ? " unexpectedly" : "";
@@ -1258,26 +1354,27 @@ function connect() {
     }
     else if (event.type === "sent") {
       if (!acceptPendingSend(event.value)) {
-        showAlert("protocol", "The server acknowledged an unknown composer request.", "error");
+        showAlert("protocol", "The server confirmed a message this page did not send.", "error");
       }
     } else if (event.type === "send-error") {
       if (!rejectPendingSend(event.value, event.message)) {
-        showAlert("protocol", "The server rejected an unknown composer request.", "error");
+        showAlert("protocol", "The server rejected a message this page did not send.", "error");
       }
     } else if (event.type === "status" && event.value === "connected") {
       const becameConnected = !upstreamConnected;
       upstreamConnected = true;
-      setStatus(`${network}: upstream connected`, "ok");
+      setStatus(`${network}: connected`, "ok");
       if (becameConnected && snapshotComplete) resyncMemberships();
     } else if (event.type === "status" && event.value === "disconnected") {
       upstreamConnected = false;
       // The server includes the classified failure summary when it knows why
       // the upstream dropped — say it, don't leave the user guessing.
       const why = event.reason ? ` — ${event.reason}` : "";
-      setStatus(`${network}: upstream reconnecting${why}`, "error");
+      setStatus(`${network}: reconnecting${why}`, "error");
     } else if (event.type === "snapshot") {
       snapshotComplete = true;
       if (upstreamConnected) resyncMemberships();
+      settleInitialView();
     } else if (event.type === "session") {
       applySessionSnapshot(event.nick, event.channels);
     } else if (event.type === "status" && event.value === "unavailable") {
@@ -1365,7 +1462,7 @@ composer.addEventListener("submit", (e) => {
   // raw IRC line and bounce back as "421 Unknown command". Require a /command
   // (e.g. /join #chan) there instead of emitting a bogus line.
   if (!b && !text.startsWith("/")) {
-    addServer("No active channel/query — use a /command here (e.g. /join #chan) or pick a buffer.");
+    addServer("There is no conversation open to send that to — use a command here (for example /join #channel) or pick a conversation.");
     messageInput.focus();
     return;
   }
@@ -1373,12 +1470,14 @@ composer.addEventListener("submit", (e) => {
     addServer(`Not sending more than ${MAX_PENDING_SENDS} messages without server confirmation.`);
     showAlert(
       "send",
-      `The outbound confirmation queue is full (${MAX_PENDING_SENDS}); wait or reconnect before retrying.`,
+      `${MAX_PENDING_SENDS} messages are still waiting to be confirmed; wait or reconnect before sending more.`,
       "error",
     );
     return;
   }
   const target = b ? b.display : "";
+  const joining = text.match(/^\/(?:join|j)\s+(\S+)/i);
+  if (joining) rememberRequestedJoins(joining[1]);
   nextSendId += 1;
   const requestId = nextSendId.toString(36);
   pendingSends.set(requestId, { buffer: b, text });
@@ -1405,6 +1504,7 @@ if (joinForm) {
     if (!chan) return;
     if (!isChannel(chan)) chan = "#" + chan;
     if (socket && socket.readyState === WebSocket.OPEN) {
+      rememberRequestedJoins(chan);
       try {
         if (!sendComposer("", `/join ${chan}`)) {
           addServer("Not connected — cannot join yet.");
@@ -1455,6 +1555,7 @@ function renderNetworkList(networks, failure = null) {
   for (const item of networks) {
     const row = document.createElement("li");
     row.className = "network-row";
+    row.dataset.network = item.name;
     if (network !== null && fold(item.name) === fold(network)) row.classList.add("is-active");
 
     const open = document.createElement("a");
@@ -1491,13 +1592,20 @@ function renderNetworkList(networks, failure = null) {
       open.append(note);
     }
 
-    const cog = document.createElement("button");
-    cog.type = "button";
+    // The dialog speaks IRC: nickname, NickServ, server. A bridge's fields are
+    // a token and room identifiers, which the console's per-type form owns.
+    const irc = item.kind === "irc";
+    const cog = document.createElement(irc ? "button" : "a");
     cog.className = "network-cog";
     cog.title = `Settings for ${item.name}`;
     cog.setAttribute("aria-label", `Settings for ${item.name}`);
     cog.textContent = "⚙";
-    cog.addEventListener("click", () => void openNetworkDialog(item.name));
+    if (irc) {
+      cog.type = "button";
+      cog.addEventListener("click", () => void openNetworkDialog(item.name));
+    } else {
+      cog.href = `/console/networks/${encodeURIComponent(item.name)}`;
+    }
 
     row.append(open, cog);
     networksEl.append(row);
@@ -1509,6 +1617,42 @@ function setDialogError(message) {
   if (!box) return;
   box.textContent = message || "";
   box.hidden = !message;
+}
+
+// The API names the request field a refusal belongs to. Mark and focus that
+// input -- opening Advanced when it lives there -- so the sentence above does
+// not have to be matched to a box by eye.
+const NETWORK_FIELD_INPUTS = Object.freeze({
+  name: "nf-name",
+  addr: "nf-addr",
+  nick: "nf-nick",
+  username: "nf-username",
+  realname: "nf-realname",
+  autojoin: "nf-autojoin",
+  sasl_account: "nf-sasl-account",
+  sasl_password: "nf-sasl-password",
+});
+
+function clearFieldMarks() {
+  for (const id of Object.values(NETWORK_FIELD_INPUTS)) {
+    el(id)?.removeAttribute("aria-invalid");
+    el(id)?.removeAttribute("aria-describedby");
+  }
+}
+
+function markFieldAtFault(field) {
+  const input = el(NETWORK_FIELD_INPUTS[field]);
+  if (!input) return;
+  if (el("nf-advanced").contains(input)) el("nf-advanced").open = true;
+  input.setAttribute("aria-invalid", "true");
+  input.setAttribute("aria-describedby", "nf-error");
+  input.focus();
+}
+
+function setNetworkFieldsLocked(locked) {
+  for (const control of networkForm.elements) {
+    if (!(control instanceof HTMLButtonElement)) control.disabled = locked;
+  }
 }
 
 // The curated networks come from the server's one catalog, so the chat client
@@ -1526,11 +1670,33 @@ function applyPreset() {
     return;
   }
   // Custom: the name and server are now the person's to fill in, so show them.
-  el("nf-name").value = "";
-  el("nf-addr").value = "";
+  // Only a known network's own values are cleared -- anything the person typed
+  // survives flipping the select back and forth.
+  const known = (field) => networkPresets.some((item) => item[field] === el(`nf-${field}`).value);
+  if (known("name")) el("nf-name").value = "";
+  if (known("addr")) el("nf-addr").value = "";
   el("nf-advanced").open = true;
   el("nf-name").focus();
 }
+
+// The reveal switch changes the input's type, which form.reset() does not
+// undo: without this a password shown, then cancelled, is still in clear (under
+// a button reading "Hide") the next time the dialog opens.
+function hideRevealedSecrets() {
+  for (const button of document.querySelectorAll("[data-reveal]")) {
+    const field = el(button.dataset.reveal);
+    if (!field) continue;
+    field.type = "password";
+    button.textContent = "Show";
+    button.setAttribute("aria-pressed", "false");
+    button.setAttribute("aria-label", "Show password");
+  }
+}
+// A typed secret does not outlive the dialog it was typed into.
+networkDialog?.addEventListener("close", () => {
+  networkForm?.reset();
+  hideRevealedSecrets();
+});
 
 // A required field inside a closed <details> would refuse the submit with no
 // visible reason. Open the section the moment the browser reports one.
@@ -1540,10 +1706,20 @@ el("nf-preset")?.addEventListener("change", applyPreset);
 // Editing shows what is configured but never a stored password: the API does
 // not return one, and this deliberately does not ask it to. Leaving the field
 // empty keeps whatever is already sealed, which is why the note changes.
+// Each opening gets a number. A slow response for an earlier opening must not
+// fill in -- or throw inside -- a later one: two quick clicks on different cogs
+// used to be able to save one network's server and nickname under the other's
+// name.
+let dialogOpening = 0;
+
 async function openNetworkDialog(name = null) {
   if (!networkDialog || !networkForm) return;
+  dialogOpening += 1;
+  const opening = dialogOpening;
   setDialogError("");
+  clearFieldMarks();
   networkForm.reset();
+  hideRevealedSecrets();
   networkForm.dataset.editing = name || "";
   const editing = name !== null;
   el("network-dialog-title").textContent = editing ? `Settings — ${name}` : "Add a network";
@@ -1558,19 +1734,39 @@ async function openNetworkDialog(name = null) {
     ? "Leave blank to keep the stored password. Stored encrypted; never shown again."
     : "Stored encrypted; never shown again once saved.";
   el("nf-tls").checked = true;
+  // The suggested nickname needs nothing from the server, so it goes in before
+  // anything is awaited: set after the catalog arrived, it replaced whatever
+  // the person had typed in the meantime.
+  if (!editing) el("nf-nick").value = el("account-link").dataset.shauthUser ?? "";
+
+  // Shown at once, so the click visibly did something, but not saveable until
+  // what it edits has arrived. When editing, every box is about to be filled
+  // from the server, so none can be typed into until it has been: what was
+  // typed would be silently replaced. (A form that never loads stays locked,
+  // and Cancel is a button, which this leaves alone.)
+  setNetworkFieldsLocked(editing);
+  el("nf-save").disabled = true;
+  networkForm.setAttribute("aria-busy", "true");
+  if (!networkDialog.open) networkDialog.showModal();
 
   try {
     if (editing) {
       const detail = await apiGet(`/api/v1/me/networks/${encodeURIComponent(name)}`);
+      if (opening !== dialogOpening) return;
+      setNetworkFieldsLocked(false);
+      el("nf-name").disabled = true;
       el("nf-name").value = detail.name ?? name;
       el("nf-addr").value = detail.addr ?? "";
       el("nf-tls").checked = detail.tls !== false;
       el("nf-nick").value = detail.nick ?? "";
+      el("nf-username").value = detail.username ?? "";
       el("nf-realname").value = detail.realname ?? "";
       el("nf-autojoin").value = Array.isArray(detail.autojoin) ? detail.autojoin.join(", ") : "";
       el("nf-sasl-account").value = detail.sasl_account ?? "";
     } else {
-      networkPresets = (await apiGet("/api/v1/network-presets")).presets;
+      const catalog = (await apiGet("/api/v1/network-presets")).presets;
+      if (opening !== dialogOpening) return;
+      networkPresets = catalog;
       const options = [...networkPresets, { id: CUSTOM_PRESET, label: "Another network…" }];
       el("nf-preset").replaceChildren(...options.map((preset) => {
         const option = document.createElement("option");
@@ -1581,14 +1777,25 @@ async function openNetworkDialog(name = null) {
       // The first curated network (Libera) is the interop target this server is
       // tested against, so it is the default rather than a blank form.
       applyPreset();
-      el("nf-nick").value = el("account-link").dataset.shauthUser ?? "";
     }
+    el("nf-save").disabled = false;
   } catch (error) {
+    if (opening !== dialogOpening) return;
     setDialogError(errorMessage(editing ? `load ${name}` : "load the known networks", error));
+    if (editing) {
+      // Saving a form that never loaded would overwrite the stored channels
+      // and real name with blanks. Save stays off; reopening tries again.
+      return;
+    }
+    // Adding still works without the catalog: the person types the server.
+    networkPresets = [];
+    el("nf-preset-row").hidden = true;
     el("nf-advanced").open = true;
+    el("nf-save").disabled = false;
+  } finally {
+    if (opening === dialogOpening) networkForm.removeAttribute("aria-busy");
   }
 
-  networkDialog.showModal();
   (editing ? el("nf-sasl-account") : el("nf-nick")).focus();
 }
 
@@ -1596,6 +1803,7 @@ if (networkForm) {
   networkForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     setDialogError("");
+    clearFieldMarks();
     const editing = networkForm.dataset.editing || "";
     const save = el("nf-save");
     const name = editing || el("nf-name").value.trim();
@@ -1608,6 +1816,7 @@ if (networkForm) {
       addr: el("nf-addr").value,
       tls: el("nf-tls").checked,
       nick,
+      username: el("nf-username").value,
       realname: el("nf-realname").value,
       autojoin: el("nf-autojoin").value,
       account,
@@ -1622,8 +1831,7 @@ if (networkForm) {
     } catch (error) {
       if (!(error instanceof NetworkRequestError)) throw error;
       setDialogError(error.message);
-      el("nf-advanced").open = true;
-      (account || !password ? el("nf-addr") : el("nf-sasl-account")).focus();
+      markFieldAtFault(error.field);
       return;
     }
 
@@ -1646,6 +1854,7 @@ if (networkForm) {
       addServer(`Saved ${editing}. The connection restarts with the new settings.`);
     } catch (error) {
       setDialogError(errorMessage(editing ? `save ${editing}` : "add the network", error));
+      if (error instanceof ApiError && error.field) markFieldAtFault(error.field);
     } finally {
       save.disabled = false;
     }
@@ -1687,7 +1896,7 @@ function syncServerLogLink() {
 if (serverLogLink) {
   serverLogLink.addEventListener("click", () => {
     settings.rawOutput = !settings.rawOutput;
-    persistSettings();
+    persistSetting("rawOutput");
     renderRawOutput();
     syncServerLogLink();
     if (settings.rawOutput) {
@@ -1760,18 +1969,52 @@ function renderLanding(networks, failure = null) {
 // the list is re-read while the page is visible. A failed refresh keeps the
 // last good list on screen and says so once, rather than blanking it.
 const NETWORK_REFRESH_MS = 10_000;
+let networkListTimer = null;
+let renderedNetworks = null;
+
+// Re-rendering replaces every row, which drops keyboard focus and any hover
+// text; so an unchanged list is left alone, and a changed one hands focus back
+// to the same control of the same network.
+function renderNetworkListKeepingFocus(networks) {
+  const rendered = JSON.stringify(networks);
+  if (rendered === renderedNetworks) return;
+  renderedNetworks = rendered;
+  const focused = document.activeElement;
+  const row = focused instanceof HTMLElement && networksEl.contains(focused) ? focused.closest(".network-row") : null;
+  const name = row?.dataset.network ?? null;
+  const control = focused?.classList.contains("network-cog") ? ".network-cog" : ".network-open";
+  renderNetworkList(networks);
+  if (name === null) return;
+  const again = Array.from(networksEl.querySelectorAll(".network-row")).find((item) => item.dataset.network === name);
+  again?.querySelector(control)?.focus();
+}
+
 async function refreshNetworkList() {
   try {
-    renderNetworkList(networksFrom(await apiGet("/api/v1/me/networks")));
+    renderNetworkListKeepingFocus(networksFrom(await apiGet("/api/v1/me/networks")));
     clearAlert("networks");
   } catch (error) {
-    showAlert("networks", errorMessage("refresh your networks", error), "error");
+    const expired = error instanceof ApiError && error.status === 401;
+    showAlert(
+      "networks",
+      errorMessage("refresh your networks", error),
+      "error",
+      expired ? { href: "/login", label: "Sign in" } : null,
+    );
+    // Asking again cannot succeed until the person signs in.
+    if (expired && networkListTimer !== null) {
+      window.clearInterval(networkListTimer);
+      networkListTimer = null;
+    }
   }
 }
 function keepNetworkListCurrent() {
-  window.setInterval(() => {
+  const refreshWhenShown = () => {
     if (document.visibilityState === "visible" && !networkDialog?.open) void refreshNetworkList();
-  }, NETWORK_REFRESH_MS);
+  };
+  networkListTimer = window.setInterval(refreshWhenShown, NETWORK_REFRESH_MS);
+  // Coming back to the tab should not show up to ten seconds of stale state.
+  document.addEventListener("visibilitychange", refreshWhenShown);
 }
 
 // ---- load earlier history ----------------------------------------------
@@ -1846,6 +2089,14 @@ if (loadEarlierBtn) loadEarlierBtn.addEventListener("click", loadEarlier);
 const themeSelect = el("theme-select");
 const notifyBtn = el("notify-toggle");
 
+// Another tab (the console's theme picker, a second chat) changed a preference.
+window.addEventListener("storage", (event) => {
+  if (event.key !== null && event.key !== SETTINGS_KEY) return;
+  Object.assign(settings, loadSettings(() => window.localStorage).settings);
+  applyTheme();
+  updateSettingsUI();
+});
+
 function updateSettingsUI() {
   if (themeSelect) themeSelect.value = settings.theme;
   if (notifyBtn) {
@@ -1860,7 +2111,7 @@ function updateSettingsUI() {
 if (themeSelect) {
   themeSelect.addEventListener("change", () => {
     settings.theme = themeSelect.value;
-    persistSettings();
+    persistSetting("theme");
     applyTheme();
   });
 }
@@ -1888,7 +2139,7 @@ if (notifyBtn) {
     } else {
       settings.notifications = false;
     }
-    persistSettings();
+    persistSetting("notifications");
     updateSettingsUI();
   });
 }

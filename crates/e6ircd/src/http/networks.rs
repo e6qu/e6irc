@@ -43,7 +43,7 @@ impl NetworkMutationError {
     }
 
     pub(super) fn into_response(self) -> Response {
-        problem(self.status, self.title, self.detail.as_deref())
+        problem_at_field(self.status, self.title, self.detail.as_deref(), self.field)
     }
 }
 
@@ -75,7 +75,7 @@ async fn audit_network_mutation(
     )
     .await
     {
-        eprintln!("http: network {action} audit for {account}/{name}: {error}");
+        eprintln!("http: network {action} audit for {account:?}/{name:?}: {error}");
     }
 }
 
@@ -186,6 +186,8 @@ pub(super) enum CreateNetwork {
         addr: String,
         tls: bool,
         nick: String,
+        /// The IRC `USER` name. Required: it is never derived from the nick.
+        username: String,
         realname: String,
         autojoin: Vec<String>,
         #[serde(default)]
@@ -224,6 +226,8 @@ struct NetworkCreation {
     addr: String,
     tls: bool,
     nick: String,
+    /// `Some` exactly for `kind=irc`; a bridge request cannot carry one.
+    username: Option<String>,
     realname: String,
     autojoin: Vec<String>,
     sasl_account: Option<String>,
@@ -239,6 +243,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 addr,
                 tls,
                 nick,
+                username,
                 realname,
                 autojoin,
                 sasl_account,
@@ -249,6 +254,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 addr,
                 tls,
                 nick,
+                username: Some(username),
                 realname,
                 autojoin,
                 sasl_account,
@@ -267,6 +273,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 addr,
                 tls,
                 nick,
+                username: None,
                 realname: String::new(),
                 autojoin,
                 sasl_account: None,
@@ -284,6 +291,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 addr,
                 tls,
                 nick: String::new(),
+                username: None,
                 realname: String::new(),
                 autojoin,
                 sasl_account: None,
@@ -302,6 +310,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 addr,
                 tls,
                 nick: String::new(),
+                username: None,
                 realname: String::new(),
                 autojoin,
                 sasl_account: Some(sasl_account),
@@ -320,6 +329,7 @@ pub(super) struct PreflightNetwork {
     pub(super) addr: String,
     pub(super) tls: bool,
     pub(super) nick: String,
+    pub(super) username: String,
     pub(super) realname: String,
     #[serde(default)]
     pub(super) autojoin: Vec<String>,
@@ -449,6 +459,8 @@ pub(super) struct NetworkResponse {
     addr: String,
     tls: bool,
     nick: String,
+    /// The IRC `USER` name; `null` for a bridge.
+    username: Option<String>,
     realname: Option<String>,
     autojoin: Vec<String>,
     sasl_account: Option<String>,
@@ -571,6 +583,7 @@ pub(super) fn network_response(
         addr: network.addr,
         tls: network.tls,
         nick: network.nick,
+        username: network.username,
         realname: network.realname,
         autojoin: network.autojoin,
         sasl_account: account,
@@ -585,7 +598,7 @@ pub(super) fn network_response(
 /// The account's own networks (metadata only — never the secret).
 pub(super) async fn list_networks(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
 ) -> Response {
     // A read of "my networks" with no bouncer is an empty collection, not an
     // error: returning 200 `{networks:[]}` lets the web client's network picker
@@ -624,7 +637,7 @@ pub(super) async fn list_networks(
 /// diagnostics. Secret material is represented only by presence booleans.
 pub(super) async fn get_network(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Path(name): Path<String>,
 ) -> Response {
     let pool = pool_of(&state);
@@ -652,7 +665,7 @@ pub(super) async fn get_network(
 /// driver.
 pub(super) async fn create_network(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     JsonBody(req): JsonBody<CreateNetwork>,
 ) -> Response {
     let Some(registry) = &state.bnc_registry else {
@@ -677,10 +690,11 @@ pub(super) async fn create_network(
 /// the exact production driver path. No row is written and no reconnecting
 /// driver survives the response.
 pub(super) async fn preflight_network(
-    Authenticated(_account): Authenticated,
+    State(state): State<Arc<AppState>>,
+    _permit: PreflightPermit,
     JsonBody(req): JsonBody<PreflightNetwork>,
 ) -> Response {
-    match preflight_network_core(req).await {
+    match preflight_network_core(req, state.internal_upstreams).await {
         Ok(result) => axum::Json(PreflightNetworkResponse { ok: true, result }).into_response(),
         Err(error) => error.into_response(),
     }
@@ -688,8 +702,16 @@ pub(super) async fn preflight_network(
 
 pub(super) async fn preflight_network_core(
     req: PreflightNetwork,
+    internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<crate::bouncer::IrcPreflight, NetworkMutationError> {
-    validate_irc_upstream(&req.addr, &req.nick, Some(&req.realname), &req.autojoin)?;
+    let identity = validate_irc_upstream(
+        &req.addr,
+        &req.nick,
+        Some(&req.username),
+        Some(&req.realname),
+        &req.autojoin,
+        internal_upstreams,
+    )?;
     if let Some(account) = req.sasl_account.as_deref()
         && let Err(error) = validate_credential_field(account, 255)
     {
@@ -711,15 +733,21 @@ pub(super) async fn preflight_network_core(
     let config = crate::bouncer::NetworkConfig {
         addr: req.addr,
         tls: req.tls,
-        nick: req.nick,
-        realname: req.realname,
-        autojoin: req.autojoin,
+        nick: identity.nick,
+        username: identity.username,
+        realname: identity
+            .realname
+            .expect("the preflight request's realname was supplied and parsed"),
+        autojoin: identity.autojoin,
         buffer_cap: 1,
         sasl: req.sasl_account.zip(req.sasl_password),
         keepalive_idle: crate::bouncer::KEEPALIVE_IDLE,
         rejection_retry_floor: crate::bouncer::REJECTION_RETRY_FLOOR,
+        internal_upstreams,
     };
-    crate::bouncer::preflight_irc(&config)
+    // Below the request deadline, so the test's own typed timeout is what the
+    // caller reads rather than a generic "request timed out".
+    crate::bouncer::preflight_irc(&config, REQUEST_DEADLINE - Duration::from_secs(5))
         .await
         .map_err(|failure| {
             network_error(
@@ -738,7 +766,7 @@ pub(super) async fn preflight_network_core(
 /// are visible in the same live/persisted transcript as every other command.
 pub(super) async fn network_account_command(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Path(name): Path<String>,
     JsonBody(request): JsonBody<NetworkAccountCommand>,
 ) -> Response {
@@ -821,8 +849,18 @@ pub(super) async fn network_account_command(
                     Some(&detail),
                 );
             }
+            // NickServ verifies the account named after the nick this session
+            // holds now, which a `/nick` since connecting made different from
+            // the configured one.
+            let Some(session) = handle.irc_session_snapshot() else {
+                return problem(
+                    StatusCode::CONFLICT,
+                    "IRC network is not connected",
+                    Some("wait for the network to reach connected state and try again"),
+                );
+            };
             (
-                format!("PRIVMSG NickServ :VERIFY REGISTER {} {code}", network.nick),
+                format!("PRIVMSG NickServ :VERIFY REGISTER {} {code}", session.nick),
                 "verify",
             )
         }
@@ -874,70 +912,6 @@ fn validate_single_service_token(value: &str, maximum: usize, field: &str) -> Re
     Ok(())
 }
 
-/// Whether `addr` has an IP-literal host that points at a target that is never a
-/// legitimate upstream and that the server must not be tricked into dialing: the
-/// cloud-metadata link-local range (169.254/fe80), unspecified, multicast,
-/// broadcast, and documentation ranges.
-///
-/// Accepts both an IRC `host:port` (IPv6 bracketed) **and** a bridge base URL
-/// (`scheme://host[:port]/path`): a bridge address is a URL, and the bridge HTTP
-/// client only routes *named* hosts through its dial-time vetting resolver — an
-/// IP-literal URL host would otherwise reach an internal target unvetted, the
-/// exact metadata-SSRF this exists to stop. Extracting the host from either form
-/// closes that at the create boundary for every kind.
-///
-/// Loopback and RFC-1918 / unique-local *private* ranges are deliberately
-/// **allowed** — a self-hosted or LAN upstream (including `127.0.0.1`) is a
-/// first-class e6irc use case. A hostname (non-literal) returns `false` here —
-/// the concrete reported vector is the IP literal; hostname resolution is vetted
-/// at dial time.
-fn upstream_addr_is_internal(addr: &str) -> bool {
-    // Strip a URL scheme and any path/query/fragment, leaving `host[:port]`.
-    let hostport = addr.split_once("://").map_or(addr, |(_, rest)| rest);
-    let hostport = hostport.split(['/', '?', '#']).next().unwrap_or(hostport);
-    let host = if let Some(rest) = hostport.strip_prefix('[') {
-        rest.split(']').next().unwrap_or(rest) // [ipv6]:port
-    } else {
-        hostport
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(hostport)
-    };
-    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
-        return false; // hostname — not classifiable without DNS (vetted at dial)
-    };
-    is_blocked_upstream_ip(ip)
-}
-
-/// Is `ip` an SSRF-blocked upstream target — link-local (incl. the cloud
-/// metadata endpoint `169.254.169.254`), broadcast, documentation, unspecified,
-/// or multicast? Loopback and RFC-1918 / unique-local are deliberately *allowed*
-/// (a self-hosted or LAN upstream is a first-class use case).
-///
-/// The address is canonicalized first: a V4-mapped V6 literal like
-/// `::ffff:169.254.169.254` connects, at the kernel, to the V4 address, so it
-/// must be classified by the V4 rules — the V6-only link-local test
-/// (`fe80::/10`) is `false` for a mapped form and would otherwise wave the
-/// metadata endpoint straight through. Used both on the creation-time literal
-/// and, crucially, on every *resolved* address at dial time (`irc_driver`), so a
-/// hostname that resolves — now or after a DNS rebind — to an internal target
-/// cannot be reached.
-pub(crate) fn is_blocked_upstream_ip(ip: std::net::IpAddr) -> bool {
-    let ip = ip.to_canonical();
-    if ip.is_unspecified() || ip.is_multicast() {
-        return true;
-    }
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_link_local() || v4.is_broadcast() || v4.is_documentation()
-        }
-        // Unique-local (fc00::/7) is the private analogue of RFC-1918 and is
-        // allowed, like loopback; `to_canonical` has already mapped any
-        // V4-in-V6 form to V4, so what reaches here is a genuine V6 address.
-        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
-    }
-}
-
 /// A network name is a client-facing `/network` selector that is interpolated
 /// into URL path segments, HTML attributes and JS-string confirm dialogs.
 /// Restricting it to an unambiguous token charset (letters, digits, `-`, `_`,
@@ -959,6 +933,7 @@ pub(super) fn check_upstream_bounds(
     nick: &str,
     realname: Option<&str>,
     autojoin: &[String],
+    internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<(), NetworkMutationError> {
     let overlong = if addr.len() > 255 {
         Some(("addr", "addr is limited to 255 bytes"))
@@ -997,27 +972,62 @@ pub(super) fn check_upstream_bounds(
         )
         .with_field(field));
     }
-    if upstream_addr_is_internal(addr) {
+    // Judged from the literal here; a hostname is judged, resolved, at dial
+    // time (`crate::egress`).
+    if let Some(refusal) = internal_upstreams.refusal_for_addr(addr) {
         return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Disallowed upstream address",
-            Some(
-                "addr must not be a link-local, unspecified, multicast, broadcast, or documentation IP",
-            ),
+            Some(refusal.reason()),
         )
         .with_field("addr"));
     }
     Ok(())
 }
 
+/// The identity fields of an IRC upstream, parsed. Holding the parsed values is
+/// what lets the preflight build a driver configuration without a second,
+/// possibly different, notion of what a valid nickname is.
+#[derive(Debug)]
+pub(super) struct IrcUpstreamIdentity {
+    pub(super) nick: crate::bouncer::UpstreamNick,
+    pub(super) username: crate::bouncer::UpstreamUsername,
+    pub(super) realname: Option<crate::bouncer::UpstreamRealname>,
+    pub(super) autojoin: Vec<crate::bouncer::UpstreamChannel>,
+}
+
+fn identity_problem(error: crate::bouncer::UpstreamIdentityError) -> NetworkMutationError {
+    network_error(
+        StatusCode::BAD_REQUEST,
+        "Invalid IRC identity",
+        Some(&error.to_string()),
+    )
+    .with_field(error.field())
+}
+
 /// Full validation for an IRC upstream's connection/identity fields (create and
-/// edit): `addr`/`nick` required, plus the shared [`check_upstream_bounds`].
+/// edit): `addr`/`nick` required, the shared [`check_upstream_bounds`], and the
+/// one identity grammar the driver factory also applies.
 pub(super) fn validate_irc_upstream(
     addr: &str,
     nick: &str,
+    username: Option<&str>,
     realname: Option<&str>,
     autojoin: &[String],
-) -> Result<(), NetworkMutationError> {
+    internal_upstreams: crate::egress::InternalUpstreams,
+) -> Result<IrcUpstreamIdentity, NetworkMutationError> {
+    // Required, and never derived from the nick: a legal nickname (`_bot`) is
+    // not a legal user name, and an upstream answers a bad one by closing the
+    // link. Absent is said before anything else so a client that predates the
+    // field learns which one it is missing.
+    let Some(username) = username else {
+        return Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Missing required fields",
+            Some("username is required for IRC networks"),
+        )
+        .with_field("username"));
+    };
     if addr.is_empty() || nick.is_empty() {
         return Err(network_error(
             StatusCode::BAD_REQUEST,
@@ -1038,7 +1048,17 @@ pub(super) fn validate_irc_upstream(
         )
         .with_field("addr"));
     }
-    check_upstream_bounds(addr, nick, realname, autojoin)
+    check_upstream_bounds(addr, nick, realname, autojoin, internal_upstreams)?;
+    Ok(IrcUpstreamIdentity {
+        nick: nick.parse().map_err(identity_problem)?,
+        username: username.parse().map_err(identity_problem)?,
+        realname: realname
+            .map(str::parse)
+            .transpose()
+            .map_err(identity_problem)?,
+        autojoin: crate::bouncer::UpstreamChannel::parse_list(autojoin)
+            .map_err(identity_problem)?,
+    })
 }
 
 /// Resolve one owner-scoped row for an API mutation.
@@ -1210,16 +1230,41 @@ fn apply_network_credentials(
     }
 }
 
+/// The connection fields of a bridge network as a request states them, named:
+/// seven positional strings and flags were one transposition from a real name
+/// checked as a user name.
+struct BridgeUpstreamFields<'a> {
+    addr: &'a str,
+    tls: bool,
+    nick: &'a str,
+    username: Option<&'a str>,
+    realname: Option<&'a str>,
+    autojoin: &'a [String],
+}
+
 fn validate_bridge_upstream(
     kind: crate::config::NetworkKind,
-    addr: &str,
-    tls: bool,
-    nick: &str,
-    realname: Option<&str>,
-    autojoin: &[String],
+    fields: BridgeUpstreamFields<'_>,
+    internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<(), NetworkMutationError> {
     use crate::config::NetworkKind;
-    check_upstream_bounds(addr, nick, realname, autojoin)?;
+    let BridgeUpstreamFields {
+        addr,
+        tls,
+        nick,
+        username,
+        realname,
+        autojoin,
+    } = fields;
+    check_upstream_bounds(addr, nick, realname, autojoin, internal_upstreams)?;
+    if username.is_some() {
+        return Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Unsupported bridge field",
+            Some("username applies only to IRC networks"),
+        )
+        .with_field("username"));
+    }
     if !tls {
         return Err(network_error(
             StatusCode::BAD_REQUEST,
@@ -1273,11 +1318,87 @@ fn prospective_network_driver(
     if !should_run && !validate_while_stopped {
         return Ok(None);
     }
-    let driver = crate::bouncer::driver_from_row(row, state.secret_key.as_deref(), account)
-        .map_err(|error| {
-            network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error))
-        })?;
+    let driver = stored_network_driver(state, account, row)?;
     Ok(should_run.then_some(driver))
+}
+
+/// The driver a stored row describes, or the conflict that keeps it from
+/// starting (a missing master key, a bridge feature this binary lacks).
+fn stored_network_driver(
+    state: &AppState,
+    account: &str,
+    row: &crate::db::BncNetworkRow,
+) -> Result<Box<dyn crate::bouncer::NetworkDriver>, NetworkMutationError> {
+    crate::bouncer::driver_from_row(
+        row,
+        state.secret_key.as_deref(),
+        account,
+        state.internal_upstreams,
+    )
+    .map_err(|error| network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error)))
+}
+
+/// The registry mutation lane, entered for an owner whose drivers may run.
+///
+/// Suspension keeps `bnc_networks.enabled` set so that reactivation can restore
+/// the owner's networks, which makes that flag alone the wrong question for
+/// "may this driver start?". Suspension stops the owner's drivers while holding
+/// this same lane, so an owner found active on entry stays active until the
+/// lane is released — and because the lane is the only way this module starts
+/// a driver, a start for a suspended owner has no path: not an administrator
+/// toggling the network, not a create or edit authorized a moment before the
+/// suspension committed.
+struct ActiveOwnerLane<'a> {
+    registry: &'a crate::bouncer::Registry,
+    owner: &'a str,
+    _mutation: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl<'a> ActiveOwnerLane<'a> {
+    async fn enter(
+        state: &AppState,
+        registry: &'a crate::bouncer::Registry,
+        owner: &'a str,
+    ) -> Result<Self, NetworkMutationError> {
+        let mutation = registry.mutation_guard().await;
+        match crate::db::account_flags(pool_of(state), owner).await {
+            Ok(Some(flags)) if flags.is_suspended() => Err(network_error(
+                StatusCode::CONFLICT,
+                "Owner suspended",
+                Some("a suspended account's networks cannot run; reactivate the account first"),
+            )),
+            Ok(Some(_)) => Ok(Self {
+                registry,
+                owner,
+                _mutation: mutation,
+            }),
+            Ok(None) => Err(network_error(
+                StatusCode::NOT_FOUND,
+                "No such network",
+                None,
+            )),
+            Err(error) => {
+                eprintln!("http: network owner posture lookup: {error}");
+                Err(network_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database unavailable",
+                    None,
+                ))
+            }
+        }
+    }
+
+    /// Stop any predecessor, then start `driver` (create and edit).
+    async fn supersede(&self, name: &str, driver: Box<dyn crate::bouncer::NetworkDriver>) {
+        self.registry.replace(Some(self.owner), name, driver).await;
+    }
+
+    /// Start `driver` unless a working one is already registered (enable).
+    async fn ensure_running(&self, name: &str, driver: Box<dyn crate::bouncer::NetworkDriver>) {
+        self.registry
+            .ensure_running(Some(self.owner), name, driver)
+            .await;
+    }
 }
 
 /// Update all mutable configuration of one caller-owned network and replace its
@@ -1292,11 +1413,12 @@ pub(super) async fn update_network_core(
     addr: &str,
     tls: bool,
     nick: &str,
+    username: Option<&str>,
     realname: Option<&str>,
     autojoin: &[String],
     credentials: NetworkCredentialUpdate<'_>,
 ) -> Result<(), NetworkMutationError> {
-    let _mutation = registry.mutation_guard().await;
+    let lane = ActiveOwnerLane::enter(state, registry, account).await?;
     let pool = pool_of(state);
     let mut row = editable_network(state, account, name, "update").await?;
     if row.kind == crate::config::NetworkKind::Irc && realname.is_none() {
@@ -1308,13 +1430,32 @@ pub(super) async fn update_network_core(
         .with_field("realname"));
     }
     if row.kind == crate::config::NetworkKind::Irc {
-        validate_irc_upstream(addr, nick, realname, autojoin)?;
+        validate_irc_upstream(
+            addr,
+            nick,
+            username,
+            realname,
+            autojoin,
+            state.internal_upstreams,
+        )?;
     } else {
-        validate_bridge_upstream(row.kind, addr, tls, nick, realname, autojoin)?;
+        validate_bridge_upstream(
+            row.kind,
+            BridgeUpstreamFields {
+                addr,
+                tls,
+                nick,
+                username,
+                realname,
+                autojoin,
+            },
+            state.internal_upstreams,
+        )?;
     }
     row.addr = addr.to_string();
     row.tls = tls;
     row.nick = nick.to_string();
+    row.username = username.map(str::to_string);
     row.realname = realname.map(str::to_string);
     row.autojoin = autojoin.to_vec();
     apply_network_credentials(state, account, &mut row, credentials)?;
@@ -1326,14 +1467,14 @@ pub(super) async fn update_network_core(
         "update failed",
     )?;
     if let Some(driver) = driver {
-        registry.replace(Some(account), name, driver).await;
+        lane.supersede(name, driver).await;
     }
     audit_network_mutation(
         state,
         account,
         "NETWORK_UPDATE",
         account,
-        name,
+        &row.name,
         row.kind.as_db_str(),
     )
     .await;
@@ -1377,9 +1518,27 @@ async fn create_network_core(
     // interpolated into NICK/USER/JOIN lines, so a CR/LF/NUL there is a
     // line-injection primitive; `addr` is SSRF-vetted; all are length-bounded.
     if kind == NetworkKind::Irc {
-        validate_irc_upstream(&req.addr, &req.nick, Some(&req.realname), &req.autojoin)?;
+        validate_irc_upstream(
+            &req.addr,
+            &req.nick,
+            req.username.as_deref(),
+            Some(&req.realname),
+            &req.autojoin,
+            state.internal_upstreams,
+        )?;
     } else {
-        validate_bridge_upstream(kind, &req.addr, req.tls, &req.nick, None, &req.autojoin)?;
+        validate_bridge_upstream(
+            kind,
+            BridgeUpstreamFields {
+                addr: &req.addr,
+                tls: req.tls,
+                nick: &req.nick,
+                username: req.username.as_deref(),
+                realname: None,
+                autojoin: &req.autojoin,
+            },
+            state.internal_upstreams,
+        )?;
     }
     // Fields that are create-only (the name) or SASL-specific (bounds + the NUL
     // check that matters because PLAIN uses NUL as its field separator, and the
@@ -1441,17 +1600,21 @@ async fn create_network_core(
 
     // Build before inserting. A factory rejection must not create durable state
     // that then depends on a best-effort compensating delete.
-    let driver = crate::bouncer::build_driver(
+    let driver = crate::bouncer::build_driver(crate::bouncer::DriverSpec {
         kind,
-        req.addr.clone(),
-        req.tls,
-        req.nick.clone(),
-        req.realname.clone(),
-        req.autojoin.clone(),
-        1000,
-        req.sasl_account.clone(),
-        req.sasl_password.clone(),
-    )
+        owner: Some(account.to_string()),
+        name: req.name.clone(),
+        addr: req.addr.clone(),
+        tls: req.tls,
+        nick: req.nick.clone(),
+        username: req.username.clone(),
+        realname: req.realname.clone(),
+        autojoin: req.autojoin.clone(),
+        buffer_cap: 1000,
+        sasl_account: req.sasl_account.clone(),
+        sasl_password: req.sasl_password.clone(),
+        internal_upstreams: state.internal_upstreams,
+    })
     .map_err(|error| network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error)))?;
 
     let row = crate::db::BncNetworkRow {
@@ -1460,6 +1623,7 @@ async fn create_network_core(
         addr: req.addr.clone(),
         tls: req.tls,
         nick: req.nick.clone(),
+        username: req.username.clone(),
         realname: (kind == NetworkKind::Irc).then(|| req.realname.clone()),
         autojoin: req.autojoin.clone(),
         sasl_account: stored_account,
@@ -1471,7 +1635,7 @@ async fn create_network_core(
     // `create_bnc_network` (count + insert in one FOR UPDATE transaction), so
     // there is no racy list-then-insert here — two concurrent creates can't both
     // slip past cap-1 and each spawn an always-on driver.
-    let _mutation = registry.mutation_guard().await;
+    let lane = ActiveOwnerLane::enter(state, registry, account).await?;
     match crate::db::create_bnc_network(pool, account, &row).await {
         Ok(_) => {}
         Err(crate::db::DbError::TooManyNetworks) => {
@@ -1499,7 +1663,7 @@ async fn create_network_core(
     }
     // The row was just inserted under the uniqueness constraint, so anything
     // already registered under this key has no durable definition: supersede it.
-    registry.replace(Some(account), &req.name, driver).await;
+    lane.supersede(&req.name, driver).await;
     audit_network_mutation(
         state,
         account,
@@ -1537,7 +1701,7 @@ pub(super) struct BufferQuery {
 /// buffer; a stopped driver falls back to persisted history.
 pub(super) async fn network_buffer(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Path(name): Path<String>,
     axum::extract::Query(params): axum::extract::Query<BufferQuery>,
 ) -> Response {
@@ -1603,6 +1767,10 @@ pub(super) struct UpdateNetwork {
     pub(super) addr: String,
     pub(super) tls: bool,
     pub(super) nick: String,
+    /// Required when the stored network is `kind=irc`, refused for a bridge;
+    /// which one applies is known only once the row is loaded.
+    #[serde(default)]
+    pub(super) username: Option<String>,
     #[serde(default)]
     pub(super) realname: Option<String>,
     #[serde(default)]
@@ -1628,7 +1796,7 @@ pub(super) enum UpdateNetworkCredentials {
 /// stable name, driver kind, and enabled state are unchanged.
 pub(super) async fn update_network(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Path(name): Path<String>,
     JsonBody(req): JsonBody<UpdateNetwork>,
 ) -> Response {
@@ -1651,6 +1819,7 @@ pub(super) async fn update_network(
         &req.addr,
         req.tls,
         &req.nick,
+        req.username.as_deref(),
         req.realname.as_deref(),
         &req.autojoin,
         credentials,
@@ -1662,9 +1831,11 @@ pub(super) async fn update_network(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Persist a network's enabled flag and start or stop its always-on driver.
-/// Enabling builds from the stored row first, so a missing key/factory failure
-/// cannot require a compensating database rollback.
+/// Persist a network's enabled flag and start or stop its always-on driver,
+/// answering with the network's stored name. Enabling builds from the stored
+/// row first, so a missing key/factory failure cannot require a compensating
+/// database rollback. Disabling needs no active owner: stopping a suspended
+/// account's network is always allowed.
 pub(super) async fn set_network_enabled_core(
     state: &AppState,
     registry: &crate::bouncer::Registry,
@@ -1672,53 +1843,38 @@ pub(super) async fn set_network_enabled_core(
     account: &str,
     name: &str,
     enabled: bool,
-) -> Result<(), NetworkMutationError> {
-    let _mutation = registry.mutation_guard().await;
+) -> Result<String, NetworkMutationError> {
     let pool = pool_of(state);
-
-    let driver = if enabled {
-        let row = match crate::db::get_bnc_network(pool, account, name).await {
-            Ok(Some(row)) => row,
-            Ok(None) => {
-                return Err(network_error(
-                    StatusCode::NOT_FOUND,
-                    "No such network",
-                    None,
-                ));
-            }
-            Err(error) => {
-                eprintln!("http: network enable lookup failed: {error}");
-                return Err(network_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Database unavailable",
-                    None,
-                ));
-            }
-        };
-        prospective_network_driver(state, account, &row, true, false)?
+    let stored_name = if enabled {
+        let lane = ActiveOwnerLane::enter(state, registry, account).await?;
+        let row = editable_network(state, account, name, "enable").await?;
+        let driver = stored_network_driver(state, account, &row)?;
+        require_network_updated(
+            crate::db::set_bnc_network_enabled(pool, account, name, true).await,
+            "enable failed",
+        )?;
+        lane.ensure_running(&row.name, driver).await;
+        row.name
     } else {
-        None
+        let _mutation = registry.mutation_guard().await;
+        let row = editable_network(state, account, name, "disable").await?;
+        require_network_updated(
+            crate::db::set_bnc_network_enabled(pool, account, name, false).await,
+            "disable failed",
+        )?;
+        registry.remove(Some(account), &row.name).await;
+        row.name
     };
-
-    require_network_updated(
-        crate::db::set_bnc_network_enabled(pool, account, name, enabled).await,
-        "enable/disable failed",
-    )?;
-    if let Some(driver) = driver {
-        registry.ensure_running(Some(account), name, driver).await;
-    } else {
-        registry.remove(Some(account), name).await;
-    }
     audit_network_mutation(
         state,
         actor,
         "NETWORK_TOGGLE",
         account,
-        name,
+        &stored_name,
         if enabled { "enabled" } else { "disabled" },
     )
     .await;
-    Ok(())
+    Ok(stored_name)
 }
 
 /// Delete one owner-scoped network and stop its driver under the same mutation
@@ -1731,13 +1887,13 @@ pub(super) async fn delete_network_core(
     name: &str,
 ) -> Result<(), NetworkMutationError> {
     let _mutation = registry.mutation_guard().await;
-    editable_network(state, account, name, "delete").await?;
+    let row = editable_network(state, account, name, "delete").await?;
     require_network_updated(
         crate::db::delete_bnc_network(pool_of(state), account, name).await,
         "delete failed",
     )?;
     registry.remove(Some(account), name).await;
-    audit_network_mutation(state, account, "NETWORK_DELETE", account, name, "").await;
+    audit_network_mutation(state, account, "NETWORK_DELETE", account, &row.name, "").await;
     Ok(())
 }
 
@@ -1745,23 +1901,21 @@ pub(super) async fn delete_network_core(
 /// start/stop its always-on driver.
 pub(super) async fn patch_network(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Path(name): Path<String>,
     JsonBody(req): JsonBody<PatchNetwork>,
 ) -> Response {
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
-    if let Err(error) =
-        set_network_enabled_core(&state, registry, &account, &account, &name, req.enabled).await
-    {
-        return error.into_response();
+    match set_network_enabled_core(&state, registry, &account, &account, &name, req.enabled).await {
+        Ok(name) => axum::Json(NetworkEnabledResponse {
+            name,
+            enabled: req.enabled,
+        })
+        .into_response(),
+        Err(error) => error.into_response(),
     }
-    axum::Json(NetworkEnabledResponse {
-        name,
-        enabled: req.enabled,
-    })
-    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -1781,22 +1935,20 @@ pub(super) async fn patch_admin_network(
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
-    if let Err(error) =
-        set_network_enabled_core(&state, registry, &actor, &owner, &name, req.enabled).await
-    {
-        return error.into_response();
+    match set_network_enabled_core(&state, registry, &actor, &owner, &name, req.enabled).await {
+        Ok(name) => json_no_store(AdminNetworkEnabledResponse {
+            owner,
+            name,
+            enabled: req.enabled,
+        }),
+        Err(error) => error.into_response(),
     }
-    json_no_store(AdminNetworkEnabledResponse {
-        owner,
-        name,
-        enabled: req.enabled,
-    })
 }
 
 /// Delete one of the caller's networks and stop its driver.
 pub(super) async fn delete_network(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    Authenticated(account, _): Authenticated,
     Path(name): Path<String>,
 ) -> Response {
     let Some(registry) = &state.bnc_registry else {
@@ -1811,21 +1963,21 @@ pub(super) async fn delete_network(
 #[cfg(test)]
 mod tests {
     use super::{
-        BufferQuery, CreateNetwork, IRC_NETWORK_PRESETS, NetworkAccountCommand, PreflightNetwork,
-        network_name_ok, runtime_response, upstream_addr_is_internal, validate_irc_upstream,
-        validate_single_service_token,
+        BridgeUpstreamFields, BufferQuery, CreateNetwork, IRC_NETWORK_PRESETS,
+        NetworkAccountCommand, PreflightNetwork, network_name_ok, runtime_response,
+        validate_bridge_upstream, validate_irc_upstream, validate_single_service_token,
     };
 
     #[test]
     fn network_creation_is_complete_and_kind_specific() {
-        let irc = r#"{"kind":"irc","name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[]}"#;
+        let irc = r#"{"kind":"irc","name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice","autojoin":[]}"#;
         assert!(serde_json::from_str::<CreateNetwork>(irc).is_ok());
         assert!(serde_json::from_str::<CreateNetwork>(
-            r#"{"name":"implicit","addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":[]}"#
+            r#"{"name":"implicit","addr":"irc.example:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice","autojoin":[]}"#
         )
         .is_err());
         assert!(serde_json::from_str::<CreateNetwork>(
-            r#"{"kind":"irc","name":"incomplete","addr":"irc.example:6697","nick":"alice","realname":"Alice","autojoin":[]}"#
+            r#"{"kind":"irc","name":"incomplete","addr":"irc.example:6697","nick":"alice","username":"alice","realname":"Alice","autojoin":[]}"#
         )
         .is_err());
         assert!(serde_json::from_str::<CreateNetwork>(
@@ -1838,7 +1990,7 @@ mod tests {
     fn preflight_requires_explicit_transport_and_identity() {
         assert!(
             serde_json::from_str::<PreflightNetwork>(
-                r#"{"addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice"}"#
+                r#"{"addr":"irc.example:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice"}"#
             )
             .is_ok()
         );
@@ -1940,12 +2092,146 @@ mod tests {
         assert!(axum::extract::Query::<BufferQuery>::try_from_uri(&uri).is_err());
     }
 
+    /// The user name is stated by the owner. A nickname that is legal but whose
+    /// first ten bytes are not a legal user name (`_bot`) used to get its network
+    /// refused by the upstream with nothing the owner could correct.
+    #[test]
+    fn an_irc_network_states_its_username_and_a_bridge_cannot() {
+        let with_username = |username: Option<&str>| {
+            validate_irc_upstream(
+                "irc.example:6697",
+                "_bot",
+                username,
+                Some("Bot"),
+                &[],
+                crate::egress::InternalUpstreams::Refuse,
+            )
+        };
+        assert_eq!(
+            with_username(Some("bot"))
+                .expect("stated")
+                .username
+                .as_str(),
+            "bot"
+        );
+        for (username, detail) in [
+            (None, "username is required for IRC networks"),
+            (Some(""), "username is required"),
+            (
+                Some("_bot"),
+                "username must begin with an ASCII letter or digit",
+            ),
+            (
+                Some("first.last"),
+                "username may contain only ASCII letters, digits, '_' and '-'",
+            ),
+            (Some("elevenbytes"), "username is limited to 10 bytes"),
+        ] {
+            let error = with_username(username).expect_err("must be refused");
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+            assert_eq!(error.field, Some("username"), "{username:?}: {error:?}");
+            assert!(error.message().ends_with(detail), "{username:?}: {error:?}");
+        }
+
+        let bridge = validate_bridge_upstream(
+            crate::config::NetworkKind::Discord,
+            BridgeUpstreamFields {
+                addr: "",
+                tls: true,
+                nick: "",
+                username: Some("bot"),
+                realname: None,
+                autojoin: &[],
+            },
+            crate::egress::InternalUpstreams::Refuse,
+        )
+        .expect_err("a bridge has no IRC registration");
+        assert_eq!(bridge.field, Some("username"));
+        assert!(
+            bridge
+                .message()
+                .ends_with("username applies only to IRC networks")
+        );
+
+        // The request shapes themselves: required on create and on the
+        // connection test, and not a field a bridge request has at all.
+        let irc = |username: &str| {
+            format!(
+                r#"{{"kind":"irc","name":"libera","addr":"irc.libera.chat:6697","tls":true,"nick":"alice",{username}"realname":"Alice","autojoin":[]}}"#
+            )
+        };
+        assert!(serde_json::from_str::<CreateNetwork>(&irc(r#""username":"alice","#)).is_ok());
+        assert!(serde_json::from_str::<CreateNetwork>(&irc("")).is_err());
+        assert!(
+            serde_json::from_str::<CreateNetwork>(
+                r#"{"kind":"discord","name":"d","addr":"","tls":true,"autojoin":[],"sasl_password":"t","username":"bot"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<PreflightNetwork>(
+                r#"{"addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice"}"#
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn malformed_irc_upstream_is_rejected_before_it_can_be_persisted() {
         for addr in ["irc.example", "irc.example:0", "irc.example:not-a-port"] {
-            let error = validate_irc_upstream(addr, "alice", None, &[])
-                .expect_err("malformed address must fail");
+            let error = validate_irc_upstream(
+                addr,
+                "alice",
+                Some("alice"),
+                None,
+                &[],
+                crate::egress::InternalUpstreams::Refuse,
+            )
+            .expect_err("malformed address must fail");
             assert!(error.message().contains("host:port"), "{addr}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn an_identity_that_would_reshape_a_wire_line_is_refused_at_its_field() {
+        let ok = |nick: &str, realname: Option<&str>, autojoin: &[&str]| {
+            let autojoin: Vec<String> = autojoin.iter().map(ToString::to_string).collect();
+            validate_irc_upstream(
+                "irc.example:6697",
+                nick,
+                Some("ident"),
+                realname,
+                &autojoin,
+                crate::egress::InternalUpstreams::Refuse,
+            )
+        };
+        let identity = ok("alice", Some("Alice Example"), &["#e6irc", "&local"])
+            .expect("an ordinary identity");
+        assert_eq!(identity.nick.as_str(), "alice");
+        assert_eq!(identity.username.as_str(), "ident");
+        assert_eq!(identity.autojoin.len(), 2);
+
+        for (nick, realname, autojoin, field) in [
+            // `NICK al ice` carries two parameters.
+            ("al ice", Some("Alice"), &[][..], "nick"),
+            ("#alice", Some("Alice"), &[][..], "nick"),
+            ("alice!x@y", Some("Alice"), &[][..], "nick"),
+            ("alice", Some("two\u{1b}[2Jlines"), &[][..], "realname"),
+            // `JOIN 0` leaves every channel.
+            ("alice", Some("Alice"), &["0"][..], "autojoin"),
+            // A key nobody configured, and a second channel in one entry.
+            ("alice", Some("Alice"), &["#a key"][..], "autojoin"),
+            ("alice", Some("Alice"), &["#a,#b"][..], "autojoin"),
+            ("alice", Some("Alice"), &["e6irc"][..], "autojoin"),
+        ] {
+            let error = ok(nick, realname, autojoin).expect_err("must be refused");
+            assert_eq!(
+                error.status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "{error:?}"
+            );
+            assert_eq!(error.field, Some(field), "{nick:?} {autojoin:?}: {error:?}");
+            assert!(error.message().contains(field), "{error:?}");
         }
     }
 
@@ -1973,57 +2259,5 @@ mod tests {
         // Path-traversal segments.
         assert!(!network_name_ok("."));
         assert!(!network_name_ok(".."));
-    }
-
-    #[test]
-    fn internal_upstream_addresses_are_refused() {
-        // The cloud link-local metadata range, unspecified, multicast, broadcast
-        // and documentation ranges are refused so a tenant can't make the server
-        // dial them — none is ever a legitimate IRC upstream.
-        assert!(upstream_addr_is_internal("169.254.169.254:80")); // cloud metadata
-        assert!(upstream_addr_is_internal("0.0.0.0:6667"));
-        assert!(upstream_addr_is_internal("255.255.255.255:6667")); // broadcast
-        assert!(upstream_addr_is_internal("[fe80::1]:6697")); // v6 link-local
-        assert!(upstream_addr_is_internal("203.0.113.7:6697")); // TEST-NET-3 (documentation)
-        // V4-mapped V6 literals connect to the V4 address at the kernel, so the
-        // mapped spelling of a blocked target must be caught too — the metadata
-        // endpoint written as `::ffff:169.254.169.254` was the SSRF bypass.
-        assert!(upstream_addr_is_internal("[::ffff:169.254.169.254]:80"));
-        assert!(upstream_addr_is_internal("[::ffff:0.0.0.0]:6667"));
-        // The mapped form of an *allowed* address stays allowed (canonicalized to
-        // the V4 loopback/private rules, not the V6 ones).
-        assert!(!upstream_addr_is_internal("[::ffff:127.0.0.1]:6667"));
-        assert!(!upstream_addr_is_internal("[::ffff:10.0.0.5]:6667"));
-        // Loopback and private ranges ARE allowed: a self-hosted / LAN IRC
-        // upstream (including 127.0.0.1) is a first-class use case.
-        assert!(!upstream_addr_is_internal("127.0.0.1:6667"));
-        assert!(!upstream_addr_is_internal("[::1]:6697"));
-        assert!(!upstream_addr_is_internal("10.0.0.5:6667"));
-        assert!(!upstream_addr_is_internal("192.168.1.10:6667"));
-        assert!(!upstream_addr_is_internal("[fc00::1]:6697")); // v6 unique-local (private)
-        // Real public IPs and hostnames are allowed (the dialer resolves names).
-        assert!(!upstream_addr_is_internal("93.184.216.34:6697"));
-        assert!(!upstream_addr_is_internal("irc.libera.chat:6697"));
-    }
-
-    #[test]
-    fn bridge_url_addr_ssrf_is_classified() {
-        // A bridge base is a URL. An IP-literal host in URL form must be
-        // classified the same as `host:port` — the metadata endpoint reached via
-        // `http://169.254.169.254` bypassed the check before (URL didn't parse as
-        // host:port) and was never vetted by the HTTP client's named-host-only
-        // resolver.
-        assert!(upstream_addr_is_internal("http://169.254.169.254"));
-        assert!(upstream_addr_is_internal("https://169.254.169.254/gateway"));
-        assert!(upstream_addr_is_internal(
-            "http://169.254.169.254:8443/x?y=1"
-        ));
-        assert!(upstream_addr_is_internal("https://[fe80::1]/api"));
-        assert!(upstream_addr_is_internal("http://[::ffff:169.254.169.254]"));
-        // A real homeserver / API base (hostname, or an allowed private literal).
-        assert!(!upstream_addr_is_internal("https://matrix.org"));
-        assert!(!upstream_addr_is_internal("https://slack.com/api"));
-        assert!(!upstream_addr_is_internal("http://127.0.0.1:8008")); // self-hosted, allowed
-        assert!(!upstream_addr_is_internal("http://192.168.1.10:8008")); // LAN, allowed
     }
 }

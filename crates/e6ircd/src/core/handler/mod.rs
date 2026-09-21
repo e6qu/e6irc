@@ -28,7 +28,7 @@ pub(crate) use chanops::*;
 pub(crate) use history::*;
 use message::*;
 pub(crate) use monitor::*;
-use oper::*;
+pub(crate) use oper::*;
 use query::*;
 pub(crate) use read_marker::*;
 use registration::*;
@@ -185,11 +185,7 @@ pub(crate) fn channel_command(
         }
     };
     if let Some(result) = result {
-        if state.owns_session(session) {
-            channel_command_result(state, session.conn(), result, label);
-        } else {
-            state.route_channel_command_result(session, result, label);
-        }
+        state.route_channel_command_result(session, result, label);
     }
 }
 
@@ -223,8 +219,10 @@ pub(crate) fn channel_command_result(
         }
         crate::core::state::ChannelCommandResult::History(result) => match result {
             crate::core::state::ChannelHistoryResult::Replies(replies) => {
+                state.history_request_finished(conn);
                 channel::emit_channel_command_replies(state, conn, replies, label)
             }
+            // Its database page answers it, and frees its slot then.
             crate::core::state::ChannelHistoryResult::Deferred => {}
         },
         crate::core::state::ChannelCommandResult::ModeQuery(result) => {
@@ -361,6 +359,7 @@ pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {
             reply_caps: None,
             label: Some(label.to_string()),
             deferred: false,
+            deferrals: 0,
         });
         dispatch_parsed(state, conn, &msg);
         let cap = state.capture.take();
@@ -368,6 +367,7 @@ pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {
         // PostgreSQL) emits its own labeled batch when the reply lands; framing
         // an empty ACK here would wrongly tell the client there was no response.
         if cap.as_ref().is_some_and(|c| c.deferred) {
+            state.await_labeled_answers(cap.expect("checked above"));
             return;
         }
         let captured = cap.map(|c| c.lines).unwrap_or_default();
@@ -551,6 +551,7 @@ fn begin_channel_capture(
         reply_caps: Some(actor.recipient.caps()),
         label,
         deferred: false,
+        deferrals: 0,
     });
     conn
 }
@@ -639,22 +640,15 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
     // is alive, so it answers an outstanding liveness PING: the reaper must not
     // close an actively-sending client merely because its traffic happened to
     // be its own PINGs and never a literal PONG (a real class of minimal bots).
-    let refresh_member_profile = if let Some(session) = state.sessions.get_mut(&conn) {
+    if let Some(session) = state.sessions.get_mut(&conn) {
         session.awaiting_pong = false;
         // WHOIS idle / WHOX `l`, on the other hand, measures time since real
         // activity, so a keepalive must not reset it — only a non-keepalive
-        // command bumps `last_active`.
+        // command bumps `last_active`. Every channel's record of this member
+        // reads that same value (see `LastActive`), so nothing is sent to them.
         if command != "PING" && command != "PONG" {
-            session.last_active = (state.config.mono_clock)();
-            session.is_registered()
-        } else {
-            false
+            session.last_active.set((state.config.mono_clock)());
         }
-    } else {
-        false
-    };
-    if refresh_member_profile {
-        state.sync_channel_member(conn, crate::core::state::ChannelMemberChange::Identity);
     }
 
     // Commands legal before registration.
@@ -778,7 +772,7 @@ pub(crate) fn reap_idle(state: &mut ServerState, now: e6irc_proto::time::MonoMil
                 expired.push((conn, "Ping timeout"));
             }
         } else if now
-            .saturating_sub(s.last_active.max(s.last_ping_sent))
+            .saturating_sub(s.last_active.get().max(s.last_ping_sent))
             .as_millis()
             >= IDLE_PING_INTERVAL_MS
         {

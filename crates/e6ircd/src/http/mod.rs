@@ -25,6 +25,7 @@ pub(crate) mod networks;
 mod observation;
 mod oidc;
 mod openapi;
+mod preflight;
 mod sessions;
 mod ws;
 
@@ -36,7 +37,10 @@ use networks::*;
 use observation::*;
 use oidc::*;
 use openapi::*;
+pub(crate) use preflight::PreflightLimiter;
+use preflight::PreflightPermit;
 use sessions::*;
+pub(crate) use ws::UiSocketLimiter;
 use ws::*;
 
 /// The database pool for an unauthenticated endpoint, or a 503 problem
@@ -101,6 +105,8 @@ pub struct AppState {
     /// Bootstrap HTTP bind; shown with provenance in the configuration console.
     pub http_bind: Option<std::net::SocketAddr>,
     pub secure_cookies: bool,
+    /// The server's policy on upstreams inside its own network (`crate::egress`).
+    pub internal_upstreams: crate::egress::InternalUpstreams,
     pub oidc_providers: Vec<OidcProviderConfig>,
     pub application_release_revision: Option<String>,
     /// SHA-256 of the deployment-owned token for the machine-readable
@@ -152,6 +158,11 @@ pub struct AppState {
     pub api_rate_burst: usize,
     pub administrator_api_rate_burst: usize,
     pub api_buckets: Mutex<HashMap<(String, bool), (f64, std::time::Instant)>>,
+    /// Admission control for connection tests, which dial third parties from
+    /// the address every tenant shares.
+    pub(crate) preflight_limiter: Arc<PreflightLimiter>,
+    /// Live chat sockets open per account.
+    pub(crate) ui_sockets: Arc<UiSocketLimiter>,
     /// The per-IP connection cap, shared with the TCP listeners so IRC sessions
     /// opened over `/ws/irc` count against the same budget as raw-socket ones.
     pub(crate) conn_limiter: crate::net::ConnLimiter,
@@ -363,15 +374,30 @@ struct ProblemResponse<'a> {
     title: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<&'a str>,
+    /// The request field at fault, when the failure belongs to one, so a form
+    /// can mark and focus that input instead of leaving the person to map a
+    /// sentence onto it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field: Option<&'a str>,
 }
 
 fn problem(status: StatusCode, title: &str, detail: Option<&str>) -> Response {
+    problem_at_field(status, title, detail, None)
+}
+
+fn problem_at_field(
+    status: StatusCode,
+    title: &str,
+    detail: Option<&str>,
+    field: Option<&str>,
+) -> Response {
     let mut response = (
         status,
         axum::Json(ProblemResponse {
             status: status.as_u16(),
             title,
             detail,
+            field,
         }),
     )
         .into_response();
@@ -407,9 +433,18 @@ pub(super) fn json_response(value: impl serde::Serialize) -> Response {
     axum::Json(value).into_response()
 }
 
+/// JSON that is private to its caller — account data, message content, or a
+/// credential shown once — and so must never be kept by a shared cache.
 pub(super) fn json_no_store(value: impl serde::Serialize) -> Response {
     let mut response = json_response(value);
     no_store(response.headers_mut());
+    response
+}
+
+/// [`json_no_store`] for a resource this request created.
+pub(super) fn created_no_store(value: impl serde::Serialize) -> Response {
+    let mut response = json_no_store(value);
+    *response.status_mut() = StatusCode::CREATED;
     response
 }
 
@@ -518,17 +553,21 @@ pub(super) async fn mutate_account_suspension(
             })?;
         let mut prepared = Vec::new();
         for row in rows.into_iter().filter(|row| row.enabled) {
-            let driver =
-                crate::bouncer::driver_from_row(&row, state.secret_key.as_deref(), &target_name)
-                    .map_err(|error| {
-                        (
-                            StatusCode::CONFLICT,
-                            format!(
-                                "Cannot reactivate while network {} is invalid: {error}",
-                                row.name
-                            ),
-                        )
-                    })?;
+            let driver = crate::bouncer::driver_from_row(
+                &row,
+                state.secret_key.as_deref(),
+                &target_name,
+                state.internal_upstreams,
+            )
+            .map_err(|error| {
+                (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Cannot reactivate while network {} is invalid: {error}",
+                        row.name
+                    ),
+                )
+            })?;
             prepared.push((row.name, driver));
         }
         prepared
@@ -828,24 +867,26 @@ mod query_limit_tests {
     use super::*;
 
     #[test]
-    fn problem_response_has_one_closed_optional_detail() {
-        let without_detail = serde_json::to_string(&ProblemResponse {
+    fn problem_response_members_are_closed_and_optional_ones_are_omitted() {
+        let bare = serde_json::to_string(&ProblemResponse {
             status: 404,
             title: "Not Found",
             detail: None,
+            field: None,
         })
         .expect("problem response");
-        assert_eq!(without_detail, r#"{"status":404,"title":"Not Found"}"#);
+        assert_eq!(bare, r#"{"status":404,"title":"Not Found"}"#);
 
-        let with_detail = serde_json::to_string(&ProblemResponse {
+        let at_a_field = serde_json::to_string(&ProblemResponse {
             status: 400,
-            title: "Invalid request",
-            detail: Some("unknown field"),
+            title: "Invalid IRC identity",
+            detail: Some("nick must be one word"),
+            field: Some("nick"),
         })
         .expect("problem response");
         assert_eq!(
-            with_detail,
-            r#"{"status":400,"title":"Invalid request","detail":"unknown field"}"#
+            at_a_field,
+            r#"{"status":400,"title":"Invalid IRC identity","detail":"nick must be one word","field":"nick"}"#
         );
     }
 
@@ -1173,7 +1214,7 @@ documented_routes! {
     "/api/v1/me/credentials" => { get: list_credentials, post: create_session_app_password },
     "/api/v1/me/credentials/{id}" => { delete: revoke_credential },
     "/api/v1/me/networks" => { get: list_networks, post: create_network },
-    "/api/v1/me/networks/preflight" => { post: preflight_network },
+    "/api/v1/me/network-preflight" => { post: preflight_network },
     "/api/v1/me/networks/{name}" => {
         get: get_network,
         put: update_network,
@@ -1288,7 +1329,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(web::index))
         .route("/favicon.ico", get(web::favicon))
         .route("/assets/{*path}", get(web::asset));
-    router
+    let router = router
         .fallback(async || problem(StatusCode::NOT_FOUND, "Not Found", None))
         // Defense-in-depth: every response (including the JSON/problem+json API
         // paths, which don't go through security_headers) carries nosniff, so a
@@ -1304,14 +1345,45 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             observe_http,
-        ))
+        ));
+    bound_requests(router, MAX_CONCURRENT_REQUESTS).with_state(state)
+}
+
+/// Requests the whole HTTP service works on at once.
+const MAX_CONCURRENT_REQUESTS: usize = 1024;
+/// How long the service works on one request before answering `408`.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The resource bounds every request passes before work can consume unbounded
+/// process resources: body size, aggregate concurrency, and a deadline.
+///
+/// The concurrency bound is one semaphore for the service. `Router::layer`
+/// builds its layer once per route and method, and an ordinary
+/// `ConcurrencyLimitLayer` makes a new semaphore each time it is built, which
+/// turned "1,024 requests" into 1,024 per endpoint.
+fn bound_requests<S>(router: Router<S>, concurrent_requests: usize) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router
         .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024))
-        .layer(tower::limit::ConcurrencyLimitLayer::new(1024))
-        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            std::time::Duration::from_secs(30),
+        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+            concurrent_requests,
         ))
-        .with_state(state)
+        .layer(axum::middleware::from_fn(request_deadline))
+}
+
+/// Abandon a request at the deadline with the same problem document every
+/// other refusal uses, so a client can tell a timeout from a dropped connection.
+async fn request_deadline(request: Request<axum::body::Body>, next: Next) -> Response {
+    match tokio::time::timeout(REQUEST_DEADLINE, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => problem(
+            StatusCode::REQUEST_TIMEOUT,
+            "Request timed out",
+            Some("The server stopped working on this request at its 30-second deadline."),
+        ),
+    }
 }
 
 /// A minimal router that serves IRC-over-WebSocket at the root path (`/`). Used
@@ -2091,8 +2163,10 @@ mod pages {
                 Ok(Some(account)) => account,
                 Ok(None) => {
                     // A failed web login is a security event; one bounded line
-                    // per denial, without the password.
-                    eprintln!("web: login failed for account {}", form.account);
+                    // per denial, without the password. The name is whatever an
+                    // unauthenticated caller typed, so it is logged escaped: a
+                    // raw line feed in it would forge the lines that follow.
+                    eprintln!("web: login failed for account {:?}", form.account);
                     return login_response(
                         &state,
                         form.account,
@@ -2828,7 +2902,7 @@ mod pages {
     /// Bounded owner-scoped network runtime and persisted backlog.
     pub async fn owner_network_operations(
         State(state): State<Arc<AppState>>,
-        Authenticated(account): Authenticated,
+        Authenticated(account, _): Authenticated,
         Path(name): Path<String>,
     ) -> Response {
         let network = match crate::db::get_bnc_network(pool_of(&state), &account, &name).await {
@@ -3113,11 +3187,16 @@ mod pages {
         }
         let (outcome, approved) =
             match super::device::approve_user_code(&state, &account, &fields.user_code).await {
-                Ok(true) => ("Device approved — you can return to it now.", true),
-                Ok(false) => (
+                Ok(crate::db::DeviceApproval::Approved) => {
+                    ("Device approved — you can return to it now.", true)
+                }
+                Ok(crate::db::DeviceApproval::NoPendingGrant) => (
                     "No pending device with that code — check it and try again.",
                     false,
                 ),
+                Ok(crate::db::DeviceApproval::TokenLimitReached) => {
+                    (super::device::DEVICE_TOKEN_LIMIT_DETAIL, false)
+                }
                 Err(e) => {
                     eprintln!("http: device approve failed: {e}");
                     (
@@ -3726,5 +3805,76 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
             .unwrap()
             .insert("sid".into(), serde_json::json!("  "));
         assert!(verify(no_id).is_err(), "blank sid and sub must be rejected");
+    }
+}
+
+#[cfg(test)]
+mod request_bound_tests {
+    use super::{Request, Router, StatusCode, bound_requests, get};
+    use std::sync::Arc;
+    use tower::Service;
+
+    /// A route that reports having started work and then holds its permit until
+    /// the test lets go.
+    fn held_route(
+        entered: tokio::sync::mpsc::UnboundedSender<&'static str>,
+        release: Arc<tokio::sync::Semaphore>,
+        name: &'static str,
+    ) -> axum::routing::MethodRouter {
+        get(move || {
+            let (entered, release) = (entered.clone(), release.clone());
+            async move {
+                entered.send(name).expect("test is listening");
+                release
+                    .acquire()
+                    .await
+                    .expect("release gate stays open")
+                    .forget();
+                StatusCode::NO_CONTENT
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn the_concurrency_bound_is_shared_across_routes() {
+        let (entered, mut started) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let router = bound_requests(
+            Router::new()
+                .route(
+                    "/first",
+                    held_route(entered.clone(), release.clone(), "first"),
+                )
+                .route("/second", held_route(entered, release.clone(), "second")),
+            1,
+        );
+        let call = |path: &'static str| {
+            let mut router = router.clone();
+            tokio::spawn(async move {
+                let request = Request::builder()
+                    .uri(path)
+                    .body(axum::body::Body::empty())
+                    .expect("request");
+                router.call(request).await.expect("infallible").status()
+            })
+        };
+
+        let first = call("/first");
+        assert_eq!(started.recv().await, Some("first"));
+        let second = call("/second");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), started.recv())
+                .await
+                .is_err(),
+            "a request to another route started while the only permit was held"
+        );
+        release.add_permits(1);
+        assert_eq!(first.await.expect("first request"), StatusCode::NO_CONTENT);
+        assert_eq!(started.recv().await, Some("second"));
+        release.add_permits(1);
+        assert_eq!(
+            second.await.expect("second request"),
+            StatusCode::NO_CONTENT
+        );
     }
 }

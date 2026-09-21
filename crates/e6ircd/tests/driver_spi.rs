@@ -114,6 +114,7 @@ async fn attach_relays_over_the_loopback_driver() {
             Default::default(),
             "attacher",
             "attacher",
+            e6ircd::bouncer::ATTACH_LIVENESS_INTERVAL,
         )
         .await
     });
@@ -160,4 +161,54 @@ async fn attach_relays_over_the_loopback_driver() {
     .await
     .expect("timeout");
     assert!(echoed, "client line not relayed back through attach");
+}
+
+/// A driver written against the public SPI can begin an IRC session, so it must
+/// also be able to feed it: the session's lines go through
+/// `emit_session_line`, which is what keeps the authoritative membership an
+/// attaching client is told about. A name the tracker cannot hold is said out
+/// loud, live, and is never silently dropped from the session.
+#[tokio::test]
+async fn an_spi_driver_that_begins_an_irc_session_can_track_its_membership() {
+    let (handle, ends) = NetworkHandle::channels(16);
+    let mut events = handle.subscribe();
+    ends.begin_irc_session("spi".to_string());
+
+    let change = ends
+        .emit_session_line(":spi!u@h JOIN #tracked".to_string())
+        .expect("one channel is within the limit");
+    assert_eq!(
+        change
+            .joined
+            .iter()
+            .map(|channel| channel.as_str())
+            .collect::<Vec<_>>(),
+        ["#tracked"]
+    );
+    assert!(change.untracked.is_empty());
+
+    let change = ends
+        .emit_session_line(":spi!u@h JOIN notachannel".to_string())
+        .expect("an untrackable name is not an overflow");
+    assert_eq!(change.untracked, ["notachannel"]);
+    assert!(
+        wait_for(&mut events, |event| matches!(
+            event,
+            DriverEvent::Notice(notice)
+                if notice.contains("*bnc*") && notice.contains("cannot track: notachannel")
+        ))
+        .await,
+        "an untracked own JOIN must be announced live"
+    );
+    assert!(
+        !handle
+            .buffer_snapshot()
+            .iter()
+            .any(|line| line.contains("cannot track")),
+        "the announcement is live-only and must not displace backlog"
+    );
+
+    let session = handle.irc_session_snapshot().expect("a begun session");
+    assert_eq!(session.nick, "spi");
+    assert_eq!(session.channels, ["#tracked"]);
 }

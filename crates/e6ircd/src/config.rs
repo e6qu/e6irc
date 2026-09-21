@@ -9,6 +9,22 @@ use serde::{Deserialize, Serialize};
 fn default_nicklen() -> usize {
     16
 }
+/// Most core shards. Each is a task with its own `core_queue`-slot inbound
+/// queue, and every broadcast (a tick, a channel event with members elsewhere)
+/// is one message per shard, so shards past the machine's cores only add cost.
+pub const MAX_CORE_WORKERS: usize = 64;
+/// Most inbound events one core shard may have queued (16× the default).
+pub const MAX_CORE_QUEUE: usize = 1 << 20;
+/// Most outbound events queued for one connection before it is killed for
+/// SendQ (64× the default). This is per connection: it bounds what one slow
+/// reader can pin.
+pub const MAX_SENDQ: usize = 1 << 16;
+/// Most channels that may hold an in-memory history ring at once.
+pub const MAX_HOT_CHANNELS: usize = 1 << 20;
+/// Most lines one configured network keeps in memory for replay (100× the
+/// default). Every attach copies the whole buffer.
+pub const MAX_NETWORK_BUFFER_CAP: usize = 100_000;
+
 fn default_sendq() -> usize {
     1024
 }
@@ -169,6 +185,13 @@ pub struct Config {
     /// The bouncer listener, where clients attach as nick/network.
     #[serde(default)]
     pub bnc: Option<BncConfig>,
+    /// Whether a network may have an upstream inside this host's own network
+    /// (loopback, RFC 1918, carrier-grade NAT, unique-local). Refused by
+    /// default: an account holder could otherwise make this server connect to
+    /// internal infrastructure and learn what answers. `allow` is for test
+    /// harnesses whose upstreams listen on loopback.
+    #[serde(default)]
+    pub internal_upstreams: crate::egress::InternalUpstreams,
     /// Source of the key that decrypts sealed (`enc:v1:`/`enc:v2:`) secrets. When
     /// absent, the `E6IRC_SECRET_KEY` env var is consulted instead.
     #[serde(default)]
@@ -289,6 +312,22 @@ pub struct ManagedConfig {
 }
 
 impl ManagedConfig {
+    /// Whether reaching `next` from this configuration needs a restart.
+    ///
+    /// The one definition of which settings apply live, so the answer an
+    /// administrator is given cannot drift from what the process does: the BNC
+    /// attach listener is rebound in place, and the observability sampler and
+    /// storage maintenance each re-read their settings every cycle. Everything
+    /// else is read once, at start. (Storage used to be missing here, so a
+    /// retention-only change was reported as needing a restart it did not.)
+    pub fn requires_restart_to_reach(&self, next: &Self) -> bool {
+        let mut reached_live = self.clone();
+        reached_live.bnc_addr = next.bnc_addr;
+        reached_live.observability = next.observability.clone();
+        reached_live.storage = next.storage.clone();
+        reached_live != *next
+    }
+
     pub fn from_config(
         config: &Config,
         key: Option<&crate::secret::SecretKeyring>,
@@ -390,13 +429,19 @@ impl ManagedConfig {
     /// Bootstrap prerequisites are supplied with inert, valid values solely so
     /// this operational subset can be checked without reimplementing its
     /// invariants in an HTTP handler.
-    pub fn validate(&self) -> Result<(), ConfigError> {
+    ///
+    /// `http_listener` is the address the running HTTP listener was configured
+    /// with — it comes from the file, not from these settings — so a listener
+    /// or bouncer address edited here is checked against it too. `None` means
+    /// there is no HTTP listener for anything to collide with.
+    pub fn validate(&self, http_listener: Option<std::net::SocketAddr>) -> Result<(), ConfigError> {
         let mut config = Config {
             database: Some(DatabaseConfig {
                 url: "postgresql://control-plane-validation".into(),
             }),
             http: Some(HttpConfig {
-                addr: "127.0.0.1:0".parse().expect("literal socket address"),
+                addr: http_listener
+                    .unwrap_or_else(|| "127.0.0.1:0".parse().expect("literal socket address")),
                 public_url: None,
                 secure_cookies: false,
                 admin_accounts: Vec::new(),
@@ -442,6 +487,11 @@ pub struct NetworkEntry {
     /// marker that the transport is HTTP(S), whose URL scheme controls security.
     pub tls: bool,
     pub nick: String,
+    /// The `USER` name (ident) an `irc` or `local` network registers with.
+    /// Stated, never derived from the nick: a legal nickname (`_bot`) is not a
+    /// legal user name. Bridges have none.
+    #[serde(default)]
+    pub username: Option<String>,
     #[serde(default)]
     pub realname: Option<String>,
     #[serde(default)]
@@ -468,6 +518,7 @@ pub(crate) enum NetworkEntryWire {
         #[serde(flatten)]
         common: NetworkEntryCommon,
         nick: String,
+        username: String,
         realname: String,
         sasl_account: Option<String>,
         sasl_password: Option<String>,
@@ -476,6 +527,7 @@ pub(crate) enum NetworkEntryWire {
         #[serde(flatten)]
         common: NetworkEntryCommon,
         nick: String,
+        username: String,
         realname: String,
     },
     Matrix {
@@ -516,21 +568,29 @@ impl From<NetworkEntryWire> for NetworkEntry {
             NetworkEntryWire::Irc {
                 common,
                 nick,
+                username,
                 realname,
                 sasl_account,
                 sasl_password,
-            } => common.into_entry(
-                NetworkKind::Irc,
-                nick,
-                Some(realname),
-                sasl_account,
-                sasl_password,
-            ),
+            } => NetworkEntry {
+                username: Some(username),
+                ..common.into_entry(
+                    NetworkKind::Irc,
+                    nick,
+                    Some(realname),
+                    sasl_account,
+                    sasl_password,
+                )
+            },
             NetworkEntryWire::Local {
                 common,
                 nick,
+                username,
                 realname,
-            } => common.into_entry(NetworkKind::Local, nick, Some(realname), None, None),
+            } => NetworkEntry {
+                username: Some(username),
+                ..common.into_entry(NetworkKind::Local, nick, Some(realname), None, None)
+            },
             NetworkEntryWire::Matrix {
                 common,
                 nick,
@@ -577,6 +637,7 @@ impl NetworkEntryCommon {
             addr: self.addr,
             tls: self.tls,
             nick,
+            username: None,
             realname,
             autojoin: self.autojoin,
             buffer_cap: self.buffer_cap,
@@ -608,6 +669,7 @@ impl NetworkEntry {
         self.owner = self.owner.map(|owner| owner.trim().to_string());
         self.addr = self.addr.trim().to_string();
         self.nick = self.nick.trim().to_string();
+        self.username = self.username.map(|username| username.trim().to_string());
         self.realname = self.realname.map(|realname| realname.trim().to_string());
         self.autojoin = self
             .autojoin
@@ -623,6 +685,11 @@ impl NetworkEntry {
 
     /// Validate fields shared by every configuration ingress.
     pub(crate) fn validate_connection_intent(&self) -> Result<(), String> {
+        if self.buffer_cap > MAX_NETWORK_BUFFER_CAP {
+            return Err(format!(
+                "buffer_cap must be at most {MAX_NETWORK_BUFFER_CAP}"
+            ));
+        }
         if !crate::sanitize::valid_network_name(&self.name) {
             return Err(
                 "network name must be a 1-64 byte path-safe token (letters, digits, '-', '_' or '.')"
@@ -671,6 +738,7 @@ impl NetworkEntry {
                 if self.nick.trim().is_empty() {
                     return Err("kind=irc requires a non-blank nick".into());
                 }
+                self.require_username()?;
                 if !crate::bouncer::validate_irc_upstream_addr(&self.addr) {
                     return Err(
                         "kind=irc requires addr as host:port with a nonzero numeric port".into(),
@@ -688,6 +756,7 @@ impl NetworkEntry {
                 if self.nick.trim().is_empty() {
                     return Err("kind=local requires a non-blank nick".into());
                 }
+                self.require_username()?;
             }
             NetworkKind::Matrix | NetworkKind::Discord | NetworkKind::Slack => {
                 if !self.tls {
@@ -699,6 +768,12 @@ impl NetworkEntry {
                 if self.realname.is_some() {
                     return Err(format!(
                         "kind={} does not accept realname",
+                        self.kind.as_db_str()
+                    ));
+                }
+                if self.username.is_some() {
+                    return Err(format!(
+                        "kind={} does not accept username",
                         self.kind.as_db_str()
                     ));
                 }
@@ -738,6 +813,24 @@ impl NetworkEntry {
             }
         }
         Ok(())
+    }
+}
+
+impl NetworkEntry {
+    /// An `irc` or `local` network states its `USER` name, in the one grammar
+    /// the driver will accept ([`crate::bouncer::UpstreamUsername`]).
+    fn require_username(&self) -> Result<(), String> {
+        let username = self.username.as_deref().ok_or_else(|| {
+            format!(
+                "kind={} requires username (the IRC user name sent in USER; it is never \
+                 derived from the nick)",
+                self.kind.as_db_str()
+            )
+        })?;
+        username
+            .parse::<crate::bouncer::UpstreamUsername>()
+            .map(|_| ())
+            .map_err(|error| format!("kind={} has invalid {error}", self.kind.as_db_str()))
     }
 }
 
@@ -866,8 +959,8 @@ pub struct HttpConfig {
 #[serde(deny_unknown_fields)]
 pub struct BootstrapConfig {
     /// High-entropy one-time secret entered in the first-run browser form.
-    /// The environment entrypoint writes it only to its mode-0600 bootstrap
-    /// file, and the HTTP state retains only its SHA-256 digest.
+    /// Stated from the environment it is never written to a file, and the HTTP
+    /// state retains only its SHA-256 digest.
     pub token: String,
 }
 
@@ -954,6 +1047,7 @@ impl Default for Config {
             opers: Vec::new(),
             networks: Vec::new(),
             bnc: None,
+            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
             secrets: None,
             limits: LimitsConfig::default(),
             observability: ObservabilityConfig::default(),
@@ -1026,7 +1120,17 @@ fn open_secret(
 impl Config {
     pub fn load(path: &std::path::Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
-        let mut config: Self = toml::from_str(&text).map_err(ConfigError::Parse)?;
+        Self::checked(toml::from_str(&text).map_err(ConfigError::Parse)?)
+    }
+
+    /// A configuration stated as a document already in memory (the container
+    /// environment; see `environment_config`). It gets exactly the validation a
+    /// file does.
+    pub fn from_table(table: toml::Table) -> Result<Self, ConfigError> {
+        Self::checked(table.try_into().map_err(ConfigError::Parse)?)
+    }
+
+    fn checked(mut config: Self) -> Result<Self, ConfigError> {
         config.validate()?;
         config.resolve_secrets()?;
         Ok(config)
@@ -1149,6 +1253,48 @@ impl Config {
         Ok(())
     }
 
+    /// Refuse two listening sockets that cannot both bind.
+    ///
+    /// Left to the system, the second bind fails at start as a bare "address
+    /// already in use" that names neither section. Two sockets collide when
+    /// they ask for the same nonzero port on the same address, or on a wildcard
+    /// address of the same family (`0.0.0.0` covers every IPv4 address). Port 0
+    /// asks for any free port and never collides. A wildcard of the *other*
+    /// family is not judged: whether `[::]` also takes IPv4 is the host's
+    /// `bindv6only` setting, which this file cannot see.
+    fn refuse_colliding_listeners(&self) -> Result<(), ConfigError> {
+        let mut sockets: Vec<(String, std::net::SocketAddr)> = self
+            .listeners
+            .iter()
+            .enumerate()
+            .map(|(index, listener)| (format!("[[listeners]] #{}", index + 1), listener.addr))
+            .collect();
+        sockets.extend(
+            self.http
+                .iter()
+                .map(|http| ("[http]".to_string(), http.addr)),
+        );
+        sockets.extend(self.bnc.iter().map(|bnc| ("[bnc]".to_string(), bnc.addr)));
+        let collide = |left: std::net::SocketAddr, right: std::net::SocketAddr| {
+            left.port() != 0
+                && left.port() == right.port()
+                && left.is_ipv4() == right.is_ipv4()
+                && (left.ip() == right.ip()
+                    || left.ip().is_unspecified()
+                    || right.ip().is_unspecified())
+        };
+        for (index, (first, first_addr)) in sockets.iter().enumerate() {
+            for (second, second_addr) in &sockets[index + 1..] {
+                if collide(*first_addr, *second_addr) {
+                    return Err(ConfigError::Invalid(format!(
+                        "{first} ({first_addr}) and {second} ({second_addr}) cannot both listen: they ask for the same address and port"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.listeners.is_empty() {
             return Err(ConfigError::Invalid(
@@ -1231,6 +1377,19 @@ impl Config {
         if self.nicklen == 0 || self.sendq == 0 || self.core_queue == 0 || self.core_workers == 0 {
             return Err(ConfigError::Invalid("limits must be nonzero".into()));
         }
+        for (knob, value, most) in [
+            ("core_workers", self.core_workers, MAX_CORE_WORKERS),
+            ("core_queue", self.core_queue, MAX_CORE_QUEUE),
+            ("sendq", self.sendq, MAX_SENDQ),
+            ("max_hot_channels", self.max_hot_channels, MAX_HOT_CHANNELS),
+        ] {
+            if value > most {
+                return Err(ConfigError::Invalid(format!(
+                    "{knob} must be at most {most} (it is {value})"
+                )));
+            }
+        }
+        self.refuse_colliding_listeners()?;
         // The advertised NICKLEN rides every relayed line's source prefix, so an
         // unbounded nick can blow past the 512-byte wire limit (the same reason
         // server_name/network_name are capped at 64) and inflates per-nick
@@ -1593,6 +1752,103 @@ mod tests {
         }
     }
 
+    fn listener_on(addr: &str) -> ListenerConfig {
+        ListenerConfig {
+            addr: addr.parse().expect("socket address"),
+            ..listener()
+        }
+    }
+
+    fn refusal(config: &Config) -> String {
+        match config.validate() {
+            Err(ConfigError::Invalid(message)) => message,
+            other => panic!("expected an invalid configuration, got {other:?}"),
+        }
+    }
+
+    /// Two listeners on one address cannot both bind. The second bind fails at
+    /// start with a bare "address in use" that names neither section; the
+    /// configuration can say which two collide before anything is bound.
+    #[test]
+    fn listeners_that_cannot_both_bind_are_refused_by_name() {
+        let mut config = listening_config();
+        config.listeners = vec![listener_on("127.0.0.1:6667"), listener_on("127.0.0.1:6667")];
+        let message = refusal(&config);
+        assert!(
+            message.contains("[[listeners]] #1") && message.contains("[[listeners]] #2"),
+            "{message}"
+        );
+
+        // A wildcard address covers every address of its family.
+        config.listeners = vec![listener_on("0.0.0.0:6667"), listener_on("127.0.0.1:6667")];
+        assert!(refusal(&config).contains("127.0.0.1:6667"));
+
+        config.listeners = vec![listener_on("127.0.0.1:6667")];
+        config.database = Some(DatabaseConfig {
+            url: "postgres://localhost/e6irc".into(),
+        });
+        config.http = Some(HttpConfig {
+            addr: "127.0.0.1:6667".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        });
+        assert!(refusal(&config).contains("[http]"));
+        config.http.as_mut().unwrap().addr = "127.0.0.1:8080".parse().unwrap();
+        config.bnc = Some(BncConfig {
+            addr: "127.0.0.1:8080".parse().unwrap(),
+        });
+        let message = refusal(&config);
+        assert!(
+            message.contains("[http]") && message.contains("[bnc]"),
+            "{message}"
+        );
+
+        // Port 0 asks the system for any free port, so it never collides; nor
+        // do different ports, or the same port on two distinct addresses.
+        config.bnc = Some(BncConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+        });
+        config.http.as_mut().unwrap().addr = "127.0.0.1:0".parse().unwrap();
+        config.listeners = vec![
+            listener_on("127.0.0.1:0"),
+            listener_on("127.0.0.1:0"),
+            listener_on("127.0.0.1:6667"),
+            listener_on("127.0.0.2:6667"),
+            listener_on("[::1]:6667"),
+        ];
+        assert!(config.validate().is_ok(), "{:?}", config.validate());
+    }
+
+    /// Each of these sizes something the process allocates or spawns per unit.
+    /// A value that parses but cannot be served is refused at load, not found
+    /// as an out-of-memory kill under load.
+    #[test]
+    fn numeric_knobs_have_upper_bounds() {
+        for (knob, set) in [
+            (
+                "core_workers",
+                (|config, value| config.core_workers = value) as fn(&mut Config, usize),
+            ),
+            ("core_queue", |config, value| config.core_queue = value),
+            ("sendq", |config, value| config.sendq = value),
+            ("max_hot_channels", |config, value| {
+                config.max_hot_channels = value
+            }),
+        ] {
+            let mut config = listening_config();
+            set(&mut config, usize::MAX);
+            let message = refusal(&config);
+            assert!(message.contains(knob), "{knob}: {message}");
+        }
+        let mut config = listening_config();
+        config.core_workers = MAX_CORE_WORKERS;
+        config.core_queue = MAX_CORE_QUEUE;
+        config.sendq = MAX_SENDQ;
+        config.max_hot_channels = MAX_HOT_CHANNELS;
+        assert!(config.validate().is_ok(), "{:?}", config.validate());
+    }
+
     #[test]
     fn parses_minimal_config() {
         let c: Config = toml::from_str(
@@ -1762,6 +2018,7 @@ mod tests {
             addr = "irc.libera.chat:6697"
             tls = true
             nick = "n"
+            username = "ident"
             realname = "n"
             autojoin = []
             buffer_cap = 0
@@ -1807,8 +2064,8 @@ mod tests {
     #[test]
     fn static_network_entries_are_driver_specific() {
         for entry in [
-            "kind = 'irc'\nname = 'irc'\naddr = 'irc.example:6697'\ntls = true\nnick = 'alice'\nrealname = 'Alice'\nautojoin = []\nbuffer_cap = 1000\nsasl_account = 'alice'\nsasl_password = 'password'",
-            "kind = 'local'\nname = 'local'\naddr = ''\ntls = false\nnick = 'alice'\nrealname = 'Alice'\nautojoin = []\nbuffer_cap = 1000",
+            "kind = 'irc'\nname = 'irc'\naddr = 'irc.example:6697'\ntls = true\nnick = 'alice'\nusername = 'alice'\nrealname = 'Alice'\nautojoin = []\nbuffer_cap = 1000\nsasl_account = 'alice'\nsasl_password = 'password'",
+            "kind = 'local'\nname = 'local'\naddr = ''\ntls = false\nnick = 'alice'\nusername = 'alice'\nrealname = 'Alice'\nautojoin = []\nbuffer_cap = 1000",
             "kind = 'matrix'\nname = 'matrix'\naddr = 'https://matrix.example.test'\ntls = true\nnick = '@alice:example.test'\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'password'",
             "kind = 'discord'\nname = 'discord'\naddr = ''\ntls = true\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'token'",
             "kind = 'slack'\nname = 'slack'\naddr = ''\ntls = true\nautojoin = []\nbuffer_cap = 1000\nsasl_account = 'xoxb-token'\nsasl_password = 'xapp-token'",
@@ -1829,8 +2086,8 @@ mod tests {
     #[test]
     fn static_network_ingress_rejects_invalid_driver_fields() {
         for network in [
-            "kind = 'irc'\nrevision = 1\nname = 'irc'\naddr = 'irc.example:6697'\ntls = true\nnick = 'alice'\nrealname = 'Alice'\nautojoin = []\nbuffer_cap = 1000\nsasl_account = 'alice'\nsasl_password = 'password'",
-            "kind = 'local'\nname = 'local'\naddr = ''\ntls = false\nnick = 'alice'\nrealname = 'Alice'\nautojoin = ['   ']\nbuffer_cap = 1000",
+            "kind = 'irc'\nrevision = 1\nname = 'irc'\naddr = 'irc.example:6697'\ntls = true\nnick = 'alice'\nusername = 'alice'\nrealname = 'Alice'\nautojoin = []\nbuffer_cap = 1000\nsasl_account = 'alice'\nsasl_password = 'password'",
+            "kind = 'local'\nname = 'local'\naddr = ''\ntls = false\nnick = 'alice'\nusername = 'alice'\nrealname = 'Alice'\nautojoin = ['   ']\nbuffer_cap = 1000",
             "kind = 'matrix'\nname = 'matrix'\naddr = '   '\ntls = true\nnick = '@alice:example.test'\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'password'",
             "kind = 'matrix'\nname = 'matrix'\naddr = 'https://matrix.example.test'\ntls = true\nnick = '   '\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'password'",
             "kind = 'discord'\nname = 'discord'\naddr = ''\ntls = true\nautojoin = []\nbuffer_cap = 1000\nsasl_password = '   '",
@@ -1861,6 +2118,7 @@ mod tests {
             addr = "irc.libera.chat:6697"
             tls = true
             nick = "n"
+            username = "ident"
             realname = " "
             "#,
         );
@@ -1868,6 +2126,48 @@ mod tests {
             config.is_err(),
             "IRC identity must fail at the parse boundary"
         );
+    }
+
+    /// New configuration never receives an implicit user name: a network whose
+    /// file omits it does not start, and says which field is missing.
+    #[test]
+    fn irc_and_local_networks_state_their_username() {
+        let config = |kind: &str, username: &str| {
+            toml::from_str::<Config>(&format!(
+                r#"
+                server_name = "irc.x.example"
+                network_name = "XNet"
+                [[listeners]]
+                addr = "127.0.0.1:0"
+                [database]
+                url = "postgres://localhost/x"
+                [bnc]
+                addr = "127.0.0.1:0"
+                [[network]]
+                name = "net"
+                kind = "{kind}"
+                addr = "irc.libera.chat:6697"
+                tls = true
+                nick = "_bot"
+                {username}
+                realname = "Bot"
+                autojoin = []
+                buffer_cap = 1000
+                "#
+            ))
+        };
+        for kind in ["irc", "local"] {
+            assert!(config(kind, r#"username = "bot""#).is_ok(), "{kind}");
+            let missing = config(kind, "").expect_err("no derived default");
+            assert!(missing.to_string().contains("username"), "{missing}");
+            let derived = config(kind, r#"username = "_bot""#).expect_err("not a user name");
+            assert!(
+                derived
+                    .to_string()
+                    .contains("must begin with an ASCII letter or digit"),
+                "{derived}"
+            );
+        }
     }
 
     #[test]
@@ -1955,6 +2255,7 @@ mod tests {
                 addr: "irc.libera.chat:6697".into(),
                 tls: true,
                 nick: "e6bnc".into(),
+                username: Some("e6bnc".into()),
                 realname: Some("e6bnc".into()),
                 autojoin: Vec::new(),
                 buffer_cap: 1000,
@@ -2027,6 +2328,7 @@ mod tests {
             addr: "irc.example:6667".into(),
             tls: false,
             nick: "n".into(),
+            username: Some("n".into()),
             realname: Some("n".into()),
             autojoin: Vec::new(),
             buffer_cap: 1000,
@@ -2119,6 +2421,7 @@ mod tests {
         matrix.tls = true;
         matrix.nick = "@alice:matrix.example".into();
         matrix.realname = None;
+        matrix.username = None;
         matrix.sasl_password = Some("secret".into());
         bridge_config(matrix.clone())
             .validate()
@@ -2139,6 +2442,7 @@ mod tests {
         slack.tls = true;
         slack.nick.clear();
         slack.realname = None;
+        slack.username = None;
         slack.sasl_account = Some("xoxb-token".into());
         slack.sasl_password = Some("xapp-token".into());
         bridge_config(slack.clone())
@@ -2174,6 +2478,7 @@ mod tests {
         slack.tls = true;
         slack.nick.clear();
         slack.realname = None;
+        slack.username = None;
         slack.sasl_account = Some(String::new());
         slack.sasl_password = Some("xapp-token".into());
         assert!(
@@ -2694,5 +2999,27 @@ account_claim = "preferred_username"
         std::fs::remove_file(&path).ok();
         assert_eq!(cfg.opers[0].password, "operpass");
         assert_eq!(cfg.oidc_providers[0].client_secret, "oidcsecret");
+    }
+    #[test]
+    fn only_settings_the_process_re_reads_avoid_a_restart() {
+        let current = ManagedConfig::from_config(&Config::default(), None).unwrap();
+        assert!(!current.requires_restart_to_reach(&current));
+
+        // Applied live: storage maintenance and the sampler re-read these every
+        // cycle, and the BNC attach listener is rebound in place.
+        let mut retention = current.clone();
+        retention.storage.history_retention_days += 1;
+        assert!(!current.requires_restart_to_reach(&retention));
+        let mut listener = current.clone();
+        listener.bnc_addr = Some("127.0.0.1:6699".parse().unwrap());
+        assert!(!current.requires_restart_to_reach(&listener));
+
+        // Read once, at start.
+        let mut renamed = retention.clone();
+        renamed.server_name = "irc.other.example".into();
+        assert!(current.requires_restart_to_reach(&renamed));
+        let mut resized = current.clone();
+        resized.sendq += 1;
+        assert!(current.requires_restart_to_reach(&resized));
     }
 }

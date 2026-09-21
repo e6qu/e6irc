@@ -16,8 +16,12 @@ The console reads and writes only through `/api/v1`. Browser chat and console
 load the served OpenAPI contract, parse each successful API response into a
 closed immutable projection, and serialize each JSON mutation from its closed
 request shape before a view uses or sends it. Browser chat does the same for UI
-WebSocket events and composer requests. Immutable console mutation operations
-are checked against the router. Successful mutations refresh their API-backed
+WebSocket events and composer requests. Each console operation is matched
+against that served contract before it is sent, and the repository gate matches
+every method/URL pair, URL literal, and form action in the console against the
+router's route table, refusing to pass when it extracts none; it also forbids
+POST routes under `/console`, document reloads, and console forms that bypass
+`/api/v1`. Successful mutations refresh their API-backed
 view without a document reload. Bridge provider frames and REST bodies cross
 typed contracts. Server routes emit closed response models, including one
 current-schema observability snapshot/history contract and a bearer-protected
@@ -38,7 +42,8 @@ Advanced disclosure. The chat client opens an account's sole runnable network
 by itself (with several, the person chooses), opens a network it has just added, and has one control for each thing: one network
 list, one Server log switch, one command reference. The console navigation
 leads with the account holder's own pages and groups the administrator's. Browser snapshots cover all
-three shells; interaction tests cover WCAG AA contrast, keyboard focus, Escape
+three shells; interaction tests cover Web Content Accessibility Guidelines level AA
+contrast, keyboard focus, Escape
 dismissal, reduced motion, responsive controls, and non-interactive unavailable
 network routes. On phones, the console brings its active route into the
 horizontal navigation viewport. Confirmations repeat the initiating action,
@@ -101,7 +106,7 @@ taken.
 
 Neither browser surface gates saving on a connection test: **Test connection**
 is an optional diagnostic that says `QUIT` when it is done. The console has a bounded,
-owner-scoped component-log view for IRC and every bridge driver. Its API reads
+owner-scoped **Network log** view for IRC and every bridge driver. Its API reads
 the live buffer while active and persisted history after stop; typed lifecycle
 and operational failures are safe notices, and storage-failure notices cannot
 retry through the failed writer. Administrators also have a bounded live server
@@ -140,8 +145,12 @@ past while retaining their transcript, and routes server notices to the server
 buffer rather than creating phantom direct messages.
 The BNC marker schema retains the account table's full BIGINT identity width,
 and capacity checks serialize on the durable account row.
-One live/history routing policy maps STATUSMSG `@#channel` and `+#channel`
-traffic to the underlying channel. Composer commands with missing targets or
+For external networks one routing policy (`conversation_target`) maps
+STATUSMSG `@#channel` and `+#channel` traffic to the underlying channel for live
+delivery, bridge routing, and backlog filing alike; the backlog used to file
+such a line under its sender as a direct message. The core's own STATUSMSG
+handling is separate by design: its channel types are its own, and it needs
+the sigil to choose the audience. Composer commands with missing targets or
 required operands fail as correlated, retryable errors instead of becoming a
 different raw IRC command.
 Its IRC state applies the protocol's last-duplicate-tag rule and handles every
@@ -158,6 +167,110 @@ The browser network rail now distinguishes the driver's parked lifecycle from
 its latest failure code, so rejected Libera credentials and verified-account
 registration policy produce the promised Server log and settings recovery
 guidance instead of a bare failed-state label.
+
+A 2026-09-20 review of the whole tree after #333 found, and this change fixes:
+
+- **Privilege.** A write-scoped bearer token could install a password on a
+  single-sign-on-only account and unlink its identity, taking the account over;
+  a read-only token could send on the owner's upstream through `/ws/ui`; a
+  bearer token beside any cookie could revoke every browser session; POST
+  logout skipped the session token; a suspended owner's network could be
+  enabled by an administrator and came back at every boot. Password, identity
+  and session changes need a browser session; sending needs `write`; startable
+  networks exclude suspended owners at one source.
+- **The shared egress.** The connection test had no bound of its own, so one
+  account could run hundreds of registrations a minute against a public network
+  from the address every tenant shares. It is limited per account and per
+  process, answers 429, has one budget below the request deadline so its typed
+  timeouts are what the caller reads, and says `QUIT` on every exit. Its verb
+  moved out of the network name space (`POST /api/v1/me/network-preflight`): a
+  network named `preflight` was unreachable, and a startup check now refuses any
+  two route patterns one URL could satisfy.
+- **The bouncer.** An attached client's `QUIT` and `PING` were forwarded
+  upstream, so every client exit ended the always-on session; upstream-confirmed
+  channels were tracked without bound; a long outage evicted the real backlog
+  with identical reconnect notices; a missing SASL mechanism parked at once as
+  "rejected credentials"; downstream traffic hid a dead upstream from the
+  keepalive. The identity put on the wire is parsed, not checked.
+- **The core.** A refused ChanServ REGISTER deferred a reply that no verdict
+  would ever release, silencing the caller's connection for good; FLAGS, SET
+  FOUNDER, a labeled LIST, a server-ban verdict for an operator, and a
+  cross-shard CHATHISTORY with nothing to send were the same class. The worker
+  awaited pushes into its own bounded queue and could park forever; it now
+  handles its own effects inline. QUIT and NICK reached a peer once per shared
+  channel. OPER had no attempt budget. Two session lookups could panic the
+  worker. Deleting an account that had ever sent a bouncer MARKREAD failed on a
+  foreign key, and deletion and export missed the account's own messages by
+  matching the folded name against a column that stores the display name. Two
+  administrators demoting each other could both commit. An invitation recorded
+  while a channel was open later passed `+i`; TOPIC, KICK and INVITE told a
+  non-member whether a secret channel exists; a CTCP hidden in a multiline
+  continuation passed `+C`.
+- **The native clients.** The terminal client dropped every error numeric, KICK
+  and server ERROR while echoing the refused message as sent, and retried
+  rejected credentials every two seconds forever; no client wait had a deadline.
+- **The browser.** Credential fields invited the browser to autofill the e6irc
+  login into a third-party network's form; two quick settings clicks could save
+  one network under another's name; background refreshes took focus, reset logs
+  to their top, and detached a confirmation's form so confirming did nothing.
+- **Operations.** The backup and restore scripts could not reach a database
+  given as a URL (libpq does not expand one from `PGDATABASE`) and leaked the
+  password trying; a configuration parse error printed the offending line,
+  which can be a secret; a trailing comma in the administrator list crash-looped
+  the container silently; CI syntax-checked only the first of its shell scripts;
+  the journey guard never resolved the tests a journey cites; the console
+  operation check compared an empty set.
+
+The owner decisions that review raised were all taken as "fix it", in the same
+change:
+
+- **Several core workers.** `core_workers > 1` answered differently from one
+  worker: a message, WHOIS, ISON, USERHOST, MONITOR, KILL or GHOST aimed at a
+  nick on another shard did not find it, LUSERS and WHOWAS counted one shard,
+  a labeled command answered in pieces lost the pieces, a join could outlive
+  its session, and two workers with full queues deadlocked on each other. Every
+  shard — a lone one included — now answers from the same process-wide
+  directories, publication is tracked rather than remembered, a worker never
+  waits on another's queue, shutdown is a drain, readiness needs every shard's
+  heartbeat, and irctest passes unchanged at two workers.
+- **Conversations with unauthenticated users** are never stored or read from
+  the database (migration 0058 purges the old ones): a stranger taking a
+  released nick used to inherit the previous holder's direct messages.
+- **CHATHISTORY** with a msgid the store does not hold answers `FAIL … :unknown
+  msgid` from the core, the bouncer and the REST API instead of an empty page,
+  and a session's database history requests are capped.
+- **The IRC user name is configured, never derived** (`username`, migration
+  0057, required for `irc` and `local` networks on every ingress). The forms
+  and native clients share one stated default — blank means the nickname, only
+  when the nickname is a legal user name — and never rewrite one to fit.
+- **The bouncer.** A services outage no longer parks a SASL network; a welcome
+  under another nickname is a refusal; the `local` driver waits for its 001; a
+  half-open attached client is pinged and detached; the failure and its retry
+  time are one transition. Matrix: permanent refusals park, one login per
+  driver with a stable device and a logout, and a filtered sync.
+- **Native clients.** Secrets come from a file or the environment as well as a
+  flag, and neither client — nor `e6irc api`/`login` — sends a credential over
+  a connection that is neither TLS nor loopback without an explicit override.
+- **Accounts and the API.** Every personal access token is minted under one
+  per-account cap, the device grant included. A login attempt costs two Argon2
+  computations whatever the account holds (app passwords are found by lookup,
+  migration 0059) instead of up to 33. `/ws/ui` is capped per account and pings
+  a silent browser. A configuration whose listeners collide or whose sizes are
+  absurd is refused. `e6ircd recover-administrator` is the explicit, local,
+  audited way back in for an operator who lost every administrator login. A
+  bouncer upstream inside the server's own network (loopback, RFC 1918,
+  carrier-grade NAT, unique-local) is refused by default at every ingress and
+  at dial time; `internal_upstreams = "allow"` is the operator-level exception
+  the test harnesses use. Six
+  unaudited test-only side doors in the database layer are gone, and shutdown
+  flushes held output before the closing `ERROR`.
+- **Delivery.** One `ci-ok` job gates every other; a release is published only
+  from a commit whose CI run succeeded; every action and base image is pinned
+  to a digest; the runtime image is distroless — the daemon states its own
+  configuration from the environment (`--config-from-environment`), in memory,
+  so the shell entrypoint, its temporary secrets file and its TOML quoting are
+  gone; the container has a `HEALTHCHECK` backed by `e6ircd healthcheck`; the systemd unit is hardened; the fuzz lockfile is checked for
+  drift; the dead-public guard sees `pub async fn`.
 
 ## Remaining qualification
 

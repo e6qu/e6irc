@@ -63,9 +63,19 @@ export function loadSettings(storage) {
   };
 }
 
-export function saveSettings(storage, settings) {
+/**
+ * Change ONE preference. The stored value is re-read first, so a tab only ever
+ * writes the setting it changed: the chat and the console share this record,
+ * and a whole-object write from a snapshot taken at page load silently undid
+ * whatever the other tab had saved since (turn notifications on in chat, change
+ * the theme in an already-open console tab, and notifications were off again).
+ * There is deliberately no whole-object save.
+ */
+export function saveSetting(storage, key, value) {
+  if (!Object.hasOwn(DEFAULT_SETTINGS, key)) throw new TypeError(`unknown preference: ${key}`);
+  const current = loadSettings(storage).settings;
   try {
-    storageValue(storage).setItem(SETTINGS_KEY, JSON.stringify(normalized(settings).settings));
+    storageValue(storage).setItem(SETTINGS_KEY, JSON.stringify(normalized({ ...current, [key]: value }).settings));
     return null;
   } catch {
     return "Browser storage rejected this change. The preference will last only until this tab closes.";

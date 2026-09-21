@@ -29,6 +29,7 @@ mod matrix;
 mod serve;
 #[cfg(feature = "slack")]
 mod slack;
+mod upstream_identity;
 
 #[cfg(feature = "discord")]
 pub use discord::{DiscordConfig, DiscordDriver};
@@ -37,10 +38,27 @@ pub(crate) use irc_driver::validate_irc_upstream_addr;
 pub use irc_driver::{IrcNetwork, IrcPreflight, IrcPreflightFailure, NetworkConfig, preflight_irc};
 pub use local_driver::{CoreHandles, LocalDriver};
 #[cfg(feature = "matrix")]
-pub use matrix::{MatrixConfig, MatrixDriver};
+pub use matrix::{MatrixConfig, MatrixDevice, MatrixDriver};
 pub use serve::{NetworkStatus, Registry, bnc_serve};
 #[cfg(feature = "slack")]
 pub use slack::{SlackConfig, SlackDriver};
+pub use upstream_identity::{
+    ConfirmedChannel, UpstreamChannel, UpstreamIdentityError, UpstreamNick, UpstreamRealname,
+    UpstreamUsername,
+};
+
+/// The conversation a message target belongs to: a STATUSMSG (`@#chan`,
+/// `+#chan`) is that channel's conversation with a narrower audience, so its
+/// one status sigil comes off; anything else is already the conversation. A
+/// sigil in front of something that is not a channel is part of a nickname.
+/// Bridge routing and backlog filing both read targets through this, so a
+/// message cannot be delivered to one conversation and stored under another.
+pub(crate) fn conversation_target(target: &str) -> &str {
+    match target.strip_prefix(['@', '+']) {
+        Some(channel) if channel.starts_with(['#', '&']) => channel,
+        _ => target,
+    }
+}
 
 /// The secret-context a BNC upstream password is sealed under: its *owning*
 /// e6irc account, casefolded, with a `bnc:` purpose tag. Binding the blob to the
@@ -76,7 +94,7 @@ pub(crate) fn validate_network_credential(value: &str, maximum: usize) -> Result
 /// drivers supply only their lookup request and failure classification, so
 /// Discord and Slack cannot drift on the mapping invariants.
 #[cfg(any(feature = "discord", feature = "slack"))]
-async fn resolve_bridge_channels<F, Fut, E>(
+async fn resolve_bridge_channels<F, Fut, L, E>(
     provider: &str,
     ids: &[String],
     mut fetch_name: F,
@@ -84,23 +102,26 @@ async fn resolve_bridge_channels<F, Fut, E>(
 ) -> Result<(HashMap<String, String>, HashMap<String, String>), SessionOutcome>
 where
     F: FnMut(String) -> Fut,
-    Fut: Future<Output = Result<String, String>>,
-    E: Fn(&str, &str) -> SessionOutcome,
+    Fut: Future<Output = Result<String, L>>,
+    E: Fn(&str, L) -> SessionOutcome,
 {
     let mut id_to_channel = HashMap::new();
     let mut channel_to_id = HashMap::new();
     for id in ids {
         let name = match fetch_name(id.clone()).await {
             Ok(name) => name,
-            Err(error) => return Err(classify_lookup_error(id, &error)),
+            Err(error) => return Err(classify_lookup_error(id, error)),
         };
         let channel = format!("#{name}");
         if !crate::sanitize::valid_channel_name(&channel) {
             eprintln!(
                 "{provider}: channel {id} has an unsafe name {name:?}; refusing to bridge it"
             );
-            return Err(SessionOutcome::Dropped(
-                NetworkFailure::ChannelMappingFailed,
+            return Err(SessionOutcome::ConfigurationRejected(
+                ConfigurationRefusal::new(
+                    NetworkFailure::ChannelMappingFailed,
+                    &format!("channel {id} has a name that is not a safe IRC channel name"),
+                ),
             ));
         }
         let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&channel);
@@ -109,8 +130,11 @@ where
                 "{provider}: channel {id} name {name:?} collides with an already-bridged \
                  channel {channel:?}; refusing to bridge it"
             );
-            return Err(SessionOutcome::Dropped(
-                NetworkFailure::ChannelMappingFailed,
+            return Err(SessionOutcome::ConfigurationRejected(
+                ConfigurationRefusal::new(
+                    NetworkFailure::ChannelMappingFailed,
+                    &format!("channel {id} maps to {channel}, which another channel already uses"),
+                ),
             ));
         }
         id_to_channel.insert(id.clone(), channel);
@@ -169,22 +193,51 @@ pub(crate) fn validate_bridge_base(
 /// Build the driver for a network of `kind` from its *plaintext* fields — the
 /// one feature-gated factory that maps the generic network fields onto each
 /// backend's config. A bridge kind whose build feature is absent is a loud
+/// Everything a driver is built from, as named fields: the factory's callers
+/// (static configuration, stored rows, the API) each hold these under their own
+/// names, and a positional list of nine strings and options is one
+/// transposition away from a real name registered as a user name.
+pub struct DriverSpec {
+    pub kind: crate::config::NetworkKind,
+    /// The owning account, or `None` for a server-level network. With `name` it
+    /// is the network's identity towards an upstream that tracks devices.
+    pub owner: Option<String>,
+    pub name: String,
+    pub addr: String,
+    pub tls: bool,
+    pub nick: String,
+    /// The IRC `USER` name. Required for `kind=irc`, refused for a bridge.
+    pub username: Option<String>,
+    /// Required for `kind=irc`; empty for a bridge.
+    pub realname: String,
+    pub autojoin: Vec<String>,
+    pub buffer_cap: usize,
+    pub sasl_account: Option<String>,
+    pub sasl_password: Option<String>,
+    /// The server's policy on upstreams inside its own network.
+    pub internal_upstreams: crate::egress::InternalUpstreams,
+}
+
 /// error (never a silent fall-through to IRC), and `local` is not creatable as a
 /// bouncer network. Used by config-network startup, DB-network boot, runtime
 /// create, and re-enable, so no site can construct a driver by kind differently.
-#[allow(clippy::too_many_arguments)]
-pub fn build_driver(
-    kind: crate::config::NetworkKind,
-    addr: String,
-    tls: bool,
-    nick: String,
-    realname: String,
-    autojoin: Vec<String>,
-    buffer_cap: usize,
-    sasl_account: Option<String>,
-    sasl_password: Option<String>,
-) -> Result<Box<dyn NetworkDriver>, String> {
+pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> {
     use crate::config::NetworkKind;
+    let DriverSpec {
+        kind,
+        owner,
+        name,
+        addr,
+        tls,
+        nick,
+        username,
+        realname,
+        autojoin,
+        buffer_cap,
+        sasl_account,
+        sasl_password,
+        internal_upstreams,
+    } = spec;
     let required_field = |value: String, field: &str, maximum: usize| {
         validate_network_credential(&value, maximum)
             .map(|()| value)
@@ -197,9 +250,16 @@ pub fn build_driver(
             maximum,
         )
     };
+    if kind.is_bridge() && username.is_some() {
+        return Err(format!(
+            "kind={} does not accept a username; it applies only to IRC networks",
+            kind.as_db_str()
+        ));
+    }
     match kind {
-        // The Irc arm uses every parameter, so they are never "unused" even in a
-        // build with no bridge features — the bridge arms below just don't run.
+        // The Irc arm uses every parameter but the network's identity, so they
+        // are never "unused" even in a build with no bridge features — the
+        // bridge arms below just don't run.
         NetworkKind::Irc => {
             if !validate_irc_upstream_addr(&addr) {
                 return Err(
@@ -218,16 +278,21 @@ pub fn build_driver(
                     );
                 }
             };
+            let identity_error =
+                |error: UpstreamIdentityError| format!("kind=irc has invalid {error}");
+            let username = username.ok_or("kind=irc requires a username")?;
             Ok(Box::new(IrcDriver::new(NetworkConfig {
                 addr,
                 tls,
-                nick,
-                realname,
-                autojoin,
+                nick: nick.parse().map_err(identity_error)?,
+                username: username.parse().map_err(identity_error)?,
+                realname: realname.parse().map_err(identity_error)?,
+                autojoin: UpstreamChannel::parse_list(&autojoin).map_err(identity_error)?,
                 buffer_cap,
                 sasl,
                 keepalive_idle: KEEPALIVE_IDLE,
                 rejection_retry_floor: REJECTION_RETRY_FLOOR,
+                internal_upstreams,
             })))
         }
         NetworkKind::Local => {
@@ -248,16 +313,18 @@ pub fn build_driver(
             #[cfg(feature = "matrix")]
             {
                 Ok(Box::new(MatrixDriver::new(MatrixConfig {
+                    device: matrix::MatrixDevice::for_network(owner.as_deref(), &name),
                     homeserver: addr,
                     user: nick,
                     password,
                     rooms: autojoin,
                     buffer_cap,
+                    internal_upstreams,
                 })))
             }
             #[cfg(not(feature = "matrix"))]
             {
-                drop(password);
+                drop((password, owner, name));
                 Err("kind=matrix but this binary was built without the `matrix` feature".into())
             }
         }
@@ -280,6 +347,7 @@ pub fn build_driver(
                     api_base: addr,
                     channels: autojoin,
                     buffer_cap,
+                    internal_upstreams,
                 })))
             }
             #[cfg(not(feature = "discord"))]
@@ -306,6 +374,7 @@ pub fn build_driver(
                     api_base: addr,
                     channels: autojoin,
                     buffer_cap,
+                    internal_upstreams,
                 })))
             }
             #[cfg(not(feature = "slack"))]
@@ -325,6 +394,7 @@ pub fn driver_from_row(
     row: &crate::db::BncNetworkRow,
     key: Option<&crate::secret::SecretKeyring>,
     owner: &str,
+    internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<Box<dyn NetworkDriver>, String> {
     if row.kind.is_bridge() && row.realname.is_some() {
         return Err(format!(
@@ -356,17 +426,21 @@ pub fn driver_from_row(
         | crate::config::NetworkKind::Discord
         | crate::config::NetworkKind::Slack => String::new(),
     };
-    build_driver(
-        row.kind,
-        row.addr.clone(),
-        row.tls,
-        row.nick.clone(),
+    build_driver(DriverSpec {
+        kind: row.kind,
+        owner: Some(owner.to_string()),
+        name: row.name.clone(),
+        addr: row.addr.clone(),
+        tls: row.tls,
+        nick: row.nick.clone(),
+        username: row.username.clone(),
         realname,
-        row.autojoin.clone(),
-        DB_NETWORK_BUFFER_CAP,
-        account,
-        password,
-    )
+        autojoin: row.autojoin.clone(),
+        buffer_cap: DB_NETWORK_BUFFER_CAP,
+        sasl_account: account,
+        sasl_password: password,
+        internal_upstreams,
+    })
 }
 
 use tokio::sync::mpsc;
@@ -439,7 +513,11 @@ impl Backoff {
         floor: std::time::Duration,
         consecutive_rejections: u32,
     ) -> std::time::Duration {
-        let doublings = consecutive_rejections.saturating_sub(1).min(16);
+        // The schedule ends where parking used to end it (30s, 1m, 2m, 4m). A
+        // refusal that is retried past that point stays at the last step.
+        let doublings = consecutive_rejections
+            .saturating_sub(1)
+            .min(MAX_CONSECUTIVE_REGISTRATION_REJECTIONS - 2);
         floor.saturating_mul(1 << doublings) + std::time::Duration::from_millis(self.jitter_offset)
     }
 }
@@ -461,13 +539,83 @@ pub(crate) enum SessionOutcome {
     /// The upstream rejected the credentials. A retry re-sends the same
     /// password and can only fail the same way, while every failure counts
     /// against the account on the upstream, so [`run_with_backoff`] parks on
-    /// the first one until the network is reconfigured.
-    AuthRejected,
+    /// the first one until the network is reconfigured. An IRC upstream's own
+    /// words ride along; a bridge, whose rejection is an HTTP status or a close
+    /// code, has none.
+    AuthRejected(Option<e6irc_client::SaslRejection>),
     /// The upstream refused registration for a reason that may clear by itself
     /// (a ghost holding the nick, a connection throttle, a ban that expires).
     /// [`run_with_backoff`] retries these on the slow rejection schedule and
     /// parks after [`MAX_CONSECUTIVE_REGISTRATION_REJECTIONS`] in a row.
     RegistrationRejected(e6irc_client::RegistrationRejection),
+    /// A bridge's upstream refused something this network's *configuration*
+    /// asks for — a room it may not join, a channel that cannot be mapped.
+    /// Retrying changes nothing, so it takes the same slow schedule and parks.
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    ConfigurationRejected(ConfigurationRefusal),
+}
+
+/// Why a bridge cannot serve its configuration, in the closed vocabulary plus a
+/// bounded, control-free detail that names the offending room or channel. It
+/// never carries provider response text, which can hold request details.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigurationRefusal {
+    failure: NetworkFailure,
+    diagnostic: String,
+}
+
+impl ConfigurationRefusal {
+    pub fn new(failure: NetworkFailure, diagnostic: &str) -> Self {
+        Self {
+            failure,
+            diagnostic: e6irc_client::bounded_diagnostic(diagnostic),
+        }
+    }
+
+    pub const fn failure(&self) -> NetworkFailure {
+        self.failure
+    }
+
+    pub fn diagnostic(&self) -> &str {
+        &self.diagnostic
+    }
+}
+
+/// A refusal the shared runner retries slowly and then parks on, whichever kind
+/// of upstream gave it.
+enum Refusal {
+    Registration(e6irc_client::RegistrationRejection),
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    Configuration(ConfigurationRefusal),
+}
+
+impl Refusal {
+    /// Parking waits for the owner to change something. A refusal that ends by
+    /// itself gives them nothing to change, so it is retried at the schedule's
+    /// last step for as long as it lasts.
+    fn parks(&self) -> bool {
+        match self {
+            Self::Registration(rejection) => !rejection.refusal().clears_without_reconfiguration(),
+            #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+            Self::Configuration(_) => true,
+        }
+    }
+
+    fn retrying(self) -> ConnectionEvent {
+        match self {
+            Self::Registration(rejection) => ConnectionEvent::RegistrationRetrying(rejection),
+            #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+            Self::Configuration(refusal) => ConnectionEvent::ConfigurationRetrying(refusal),
+        }
+    }
+
+    fn parked(self) -> ConnectionEvent {
+        match self {
+            Self::Registration(rejection) => ConnectionEvent::RegistrationFailed(rejection),
+            #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+            Self::Configuration(refusal) => ConnectionEvent::ConfigurationFailed(refusal),
+        }
+    }
 }
 
 /// Consecutive upstream registration rejections before a driver stops
@@ -488,63 +636,59 @@ pub(crate) const REJECTION_RETRY_FLOOR: std::time::Duration = std::time::Duratio
 /// Each line is already bounded by `MAX_CLIENT_FRAME_LEN`, so this bounds memory.
 const BNC_COMMAND_QUEUE: usize = 256;
 
-/// Whether an HTTP status from a bridge's auth/login call means the *credentials*
-/// were rejected (401/403) — a permanent failure retrying won't fix, so the
-/// caller returns [`SessionOutcome::AuthRejected`] rather than `Dropped`. Gives
-/// the chat bridges the same "stop hammering the upstream with a bad token"
-/// backstop the IRC driver already has, instead of reconnecting forever.
+/// Why a bridge request that presents the credentials failed. Distinguishes a
+/// credential rejection ([`SessionOutcome::AuthRejected`] — stop re-dialing)
+/// from any other failure ([`SessionOutcome::Dropped`] — retry with backoff),
+/// giving the chat bridges the same "stop hammering the upstream with a bad
+/// token" backstop the IRC driver has. The `From<String>` / `From<&str>`
+/// conversions make every ordinary `?` fall through as `Transient`, so only
+/// [`bridge_send_credentials`] has to name `Auth`.
 ///
-/// Gated on `matrix` because that is the only bridge whose auth rejection is an
-/// HTTP status; Slack signals it in a 200 body (`slack_failure`) and Discord via
-/// a gateway close code, each handled inline. The `lint` CI job builds each
-/// bridge feature on its own with `-Dwarnings`, so a helper compiled but unused
-/// under a single feature is a hard error — hence the narrow gate.
-#[cfg(feature = "matrix")]
-pub(crate) fn is_http_auth_rejection(status: Option<reqwest::StatusCode>) -> bool {
-    matches!(
-        status,
-        Some(reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN)
-    )
-}
-
-/// Why a bridge failed to establish a session. Distinguishes a credential
-/// rejection ([`SessionOutcome::AuthRejected`] — stop re-dialing) from any other
-/// failure ([`SessionOutcome::Dropped`] — retry with backoff). The `From<String>`
-/// / `From<&str>` conversions make every ordinary `?` in a bridge's `connect`
-/// fall through as `Transient`, so only the one credential-rejection site has to
-/// name `Auth` explicitly. Gated on `matrix` — the only bridge with a `connect`
-/// that returns a `Result` (see `is_http_auth_rejection` for why the gate is
-/// narrow).
-#[cfg(feature = "matrix")]
+/// Gated on the bridges whose rejection is an HTTP status; Slack signals it in
+/// a 200 body (`slack_failure`). The `lint` CI job builds each bridge feature
+/// on its own with `-Dwarnings`, so a helper compiled but unused under a
+/// single feature is a hard error — hence the narrow gate.
+#[cfg(any(feature = "matrix", feature = "discord"))]
 pub(crate) enum ConnectFail {
     Auth(String),
     Transient(String),
+    /// The upstream will not serve what the configuration asks for. Only
+    /// Matrix learns that while connecting (a forbidden join); the WebSocket
+    /// bridges learn it from `resolve_bridge_channels`, which answers with the
+    /// session outcome directly.
+    #[cfg(feature = "matrix")]
+    Configuration(ConfigurationRefusal),
 }
 
-#[cfg(feature = "matrix")]
+#[cfg(any(feature = "matrix", feature = "discord"))]
 impl ConnectFail {
     pub(crate) fn into_outcome(self, who: &str) -> SessionOutcome {
         match self {
             Self::Auth(e) => {
                 eprintln!("{who}: authentication rejected, will stop retrying: {e}");
-                SessionOutcome::AuthRejected
+                SessionOutcome::AuthRejected(None)
             }
             Self::Transient(e) => {
                 eprintln!("{who}: connect failed: {e}");
                 SessionOutcome::Dropped(NetworkFailure::UpstreamRequestFailed)
             }
+            #[cfg(feature = "matrix")]
+            Self::Configuration(refusal) => {
+                eprintln!("{who}: configuration refused: {}", refusal.diagnostic());
+                SessionOutcome::ConfigurationRejected(refusal)
+            }
         }
     }
 }
 
-#[cfg(feature = "matrix")]
+#[cfg(any(feature = "matrix", feature = "discord"))]
 impl From<String> for ConnectFail {
     fn from(e: String) -> Self {
         Self::Transient(e)
     }
 }
 
-#[cfg(feature = "matrix")]
+#[cfg(any(feature = "matrix", feature = "discord"))]
 impl From<&str> for ConnectFail {
     fn from(e: &str) -> Self {
         Self::Transient(e.to_string())
@@ -580,14 +724,7 @@ async fn wait_for_reconnect(
     delay: std::time::Duration,
     sleep: impl Future<Output = ()>,
 ) -> bool {
-    ends.emit(event);
-    if let Err(lifecycle) = ends.schedule_retry(delay) {
-        eprintln!(
-            "bnc: cannot schedule reconnect from {} state",
-            lifecycle.as_str()
-        );
-        return false;
-    }
+    ends.publish(event, Some(delay));
     tokio::select! {
         biased;
         _ = ends.shutdown_signalled() => false,
@@ -624,25 +761,15 @@ pub(crate) async fn run_with_backoff<C>(
         }
         ends.begin_attempt();
         let started = tokio::time::Instant::now();
-        match session(&config, ends).await {
+        let refusal = match session(&config, ends).await {
             SessionOutcome::Stopped => return,
-            SessionOutcome::AuthRejected => {
-                park(ends, ConnectionEvent::AuthenticationFailed).await;
+            SessionOutcome::AuthRejected(rejection) => {
+                park(ends, ConnectionEvent::AuthenticationFailed(rejection)).await;
                 return;
             }
-            SessionOutcome::RegistrationRejected(rejection) => {
-                consecutive_rejections += 1;
-                if consecutive_rejections >= MAX_CONSECUTIVE_REGISTRATION_REJECTIONS {
-                    park(ends, ConnectionEvent::RegistrationFailed(rejection)).await;
-                    return;
-                }
-                let delay =
-                    backoff.rejection_delay(ends.rejection_retry_floor, consecutive_rejections);
-                let retrying = ConnectionEvent::RegistrationRetrying(rejection);
-                if !wait_for_reconnect(ends, retrying, delay, tokio::time::sleep(delay)).await {
-                    return;
-                }
-            }
+            SessionOutcome::RegistrationRejected(rejection) => Refusal::Registration(rejection),
+            #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+            SessionOutcome::ConfigurationRejected(refusal) => Refusal::Configuration(refusal),
             SessionOutcome::Dropped(failure) => {
                 // Only a session that actually registered proves the upstream
                 // accepts this configuration. A drop *before* that (a throttled
@@ -659,7 +786,17 @@ pub(crate) async fn run_with_backoff<C>(
                 if !wait_for_reconnect(ends, reconnecting, delay, backoff.wait(elapsed)).await {
                     return;
                 }
+                continue;
             }
+        };
+        consecutive_rejections = consecutive_rejections.saturating_add(1);
+        if consecutive_rejections >= MAX_CONSECUTIVE_REGISTRATION_REJECTIONS && refusal.parks() {
+            park(ends, refusal.parked()).await;
+            return;
+        }
+        let delay = backoff.rejection_delay(ends.rejection_retry_floor, consecutive_rejections);
+        if !wait_for_reconnect(ends, refusal.retrying(), delay, tokio::time::sleep(delay)).await {
+            return;
         }
     }
 }
@@ -720,11 +857,7 @@ pub(crate) fn route_privmsg(
         .split(',')
         .filter(|t| !t.is_empty())
         .map(|t| {
-            // Strip one STATUSMSG prefix; fold for the case-insensitive lookup.
-            let bare = t
-                .strip_prefix('@')
-                .or_else(|| t.strip_prefix('+'))
-                .unwrap_or(t);
+            let bare = conversation_target(t);
             match targets.get(&casemap.casefold(bare)) {
                 Some(id) => RouteResult::Deliver(id.clone(), text.to_string()),
                 None => RouteResult::Unmapped(bare.to_string()),
@@ -783,28 +916,29 @@ pub(crate) async fn relay_routed<F, Fut>(
 }
 
 /// A reqwest DNS resolver that vets every resolved address and drops the ones a
-/// bridge must never dial — the same SSRF control the IRC driver applies at
-/// connect time (`is_blocked_upstream_ip`: cloud-metadata link-local, multicast,
-/// broadcast, documentation, unspecified). Resolution happens per request, so a
-/// host that resolves to an internal address — now or after a DNS rebind — is
-/// refused at dial time, not just at config time.
+/// bridge may not dial — the same control the IRC driver applies at connect
+/// time (`crate::egress`: never an upstream, or internal under the server's
+/// policy). Resolution happens per request, so a host that resolves to a
+/// refused address — now or after a DNS rebind — is refused at dial time, not
+/// just at config time.
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-struct VettingResolver;
+struct VettingResolver(crate::egress::InternalUpstreams);
 
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 impl reqwest::dns::Resolve for VettingResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let policy = self.0;
         Box::pin(async move {
             let host = name.as_str().to_string();
             let resolved = tokio::net::lookup_host((host.as_str(), 0)).await?;
-            let vetted: Vec<std::net::SocketAddr> = resolved
-                .filter(|sa| !crate::http::networks::is_blocked_upstream_ip(sa.ip()))
-                .collect();
+            let vetted: Vec<std::net::SocketAddr> =
+                resolved.filter(|sa| policy.permits(sa.ip())).collect();
             if vetted.is_empty() {
                 // Either DNS returned nothing or every address was blocked; both
                 // are a refusal, not a silent fall-through to the OS resolver.
                 return Err(format!(
-                    "{host}: no permitted address (all resolved addresses are SSRF-blocked)"
+                    "{host}: no permitted address (every resolved address is internal or \
+                     never an upstream)"
                 )
                 .into());
             }
@@ -820,11 +954,14 @@ impl reqwest::dns::Resolve for VettingResolver {
 /// constructor so all three bridges share the discipline rather than each
 /// rebuilding it (and drifting).
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-pub(crate) fn bridge_http_client(timeout: std::time::Duration) -> reqwest::Result<reqwest::Client> {
+pub(crate) fn bridge_http_client(
+    timeout: std::time::Duration,
+    internal_upstreams: crate::egress::InternalUpstreams,
+) -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
-        .dns_resolver(std::sync::Arc::new(VettingResolver))
+        .dns_resolver(std::sync::Arc::new(VettingResolver(internal_upstreams)))
         .build()
 }
 
@@ -857,8 +994,9 @@ pub(crate) fn assert_bridge_api_base(base: &mut String, default: &str, override_
 pub(crate) fn bridge_http_or_outcome(
     tag: &str,
     timeout: std::time::Duration,
+    internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<reqwest::Client, SessionOutcome> {
-    bridge_http_client(timeout).map_err(|e| {
+    bridge_http_client(timeout, internal_upstreams).map_err(|e| {
         eprintln!("{tag}: http client build failed: {e}");
         SessionOutcome::Dropped(NetworkFailure::UpstreamRequestFailed)
     })
@@ -877,10 +1015,11 @@ pub(crate) async fn bridge_ws_open(
     url: &str,
     tag: &str,
     transport: &str,
+    internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<BridgeWs, SessionOutcome> {
     match tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        bridge_ws_connect(url, bridge_ws_config()),
+        bridge_ws_connect(url, bridge_ws_config(), internal_upstreams),
     )
     .await
     {
@@ -893,6 +1032,39 @@ pub(crate) async fn bridge_ws_open(
             eprintln!("{tag}: {transport} connect timed out");
             Err(SessionOutcome::Dropped(NetworkFailure::ConnectionTimedOut))
         }
+    }
+}
+
+/// When an upstream must next show a sign of life.
+///
+/// A driver's session loop is a `select!` whose every turn abandons the read it
+/// was waiting on, so a timeout *started by the read* is restarted by whatever
+/// else ends a turn: a downstream command, a heartbeat tick. A silent upstream
+/// then looks alive for as long as anything else is happening. The deadline
+/// lives here instead, outside the loop's turns, and only [`Self::restart`]
+/// moves it.
+pub(crate) struct SilenceDeadline {
+    window: std::time::Duration,
+    at: tokio::time::Instant,
+}
+
+impl SilenceDeadline {
+    pub(crate) fn new(window: std::time::Duration) -> Self {
+        Self {
+            window,
+            at: tokio::time::Instant::now() + window,
+        }
+    }
+
+    /// The upstream was heard from (or was just asked to speak): a full window
+    /// starts now.
+    pub(crate) fn restart(&mut self) {
+        self.at = tokio::time::Instant::now() + self.window;
+    }
+
+    /// `read`'s output, or `None` once the whole window has passed in silence.
+    pub(crate) async fn bound<T>(&self, read: impl Future<Output = T>) -> Option<T> {
+        tokio::time::timeout_at(self.at, read).await.ok()
     }
 }
 
@@ -921,19 +1093,17 @@ pub(crate) enum BridgeRead {
 pub(crate) async fn next_bridge_frame(
     read: &mut futures_util::stream::SplitStream<BridgeWs>,
     write: &mut futures_util::stream::SplitSink<BridgeWs, tokio_tungstenite::tungstenite::Message>,
-    read_timeout: std::time::Duration,
+    silence: &mut SilenceDeadline,
     tag: &str,
     transport: &str,
 ) -> BridgeRead {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message as Ws;
-    let frame = match tokio::time::timeout(read_timeout, read.next()).await {
-        Ok(frame) => frame,
-        Err(_) => {
-            eprintln!("{tag}: {transport} idle past timeout; reconnecting");
-            return BridgeRead::Idle;
-        }
+    let Some(frame) = silence.bound(read.next()).await else {
+        eprintln!("{tag}: {transport} idle past timeout; reconnecting");
+        return BridgeRead::Idle;
     };
+    silence.restart();
     match frame {
         Some(Ok(Ws::Text(t))) => BridgeRead::Text(t.as_str().to_string()),
         Some(Ok(Ws::Ping(p))) => {
@@ -962,12 +1132,12 @@ pub(crate) async fn next_bridge_frame(
 pub(crate) async fn next_bridge_text(
     read: &mut futures_util::stream::SplitStream<BridgeWs>,
     write: &mut futures_util::stream::SplitSink<BridgeWs, tokio_tungstenite::tungstenite::Message>,
-    read_timeout: std::time::Duration,
+    silence: &mut SilenceDeadline,
     tag: &str,
     transport: &str,
     on_close: impl FnOnce(Option<u16>) -> SessionOutcome,
 ) -> Result<Option<String>, SessionOutcome> {
-    match next_bridge_frame(read, write, read_timeout, tag, transport).await {
+    match next_bridge_frame(read, write, silence, tag, transport).await {
         BridgeRead::Text(t) => Ok(Some(t)),
         BridgeRead::Skip => Ok(None),
         BridgeRead::Idle => Err(SessionOutcome::Dropped(NetworkFailure::KeepaliveTimedOut)),
@@ -997,8 +1167,9 @@ pub(crate) use bridge_start;
 
 /// The `run` loop for a bridge driver: reconnect from scratch with backoff on
 /// any session drop rather than dying and silently dropping all later
-/// messages; only a dropped handle stops the driver.
-#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+/// messages; only a dropped handle stops the driver. (Matrix writes its own:
+/// it keeps a login across reconnects and logs it out when the loop ends.)
+#[cfg(any(feature = "discord", feature = "slack"))]
 macro_rules! bridge_run {
     ($config:ty) => {
         async fn run(config: $config, mut ends: DriverEnds) {
@@ -1009,7 +1180,7 @@ macro_rules! bridge_run {
         }
     };
 }
-#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+#[cfg(any(feature = "discord", feature = "slack"))]
 pub(crate) use bridge_run;
 
 /// Open a bridge gateway WebSocket to `url`, vetting the resolved IP the same way
@@ -1023,6 +1194,7 @@ pub(crate) use bridge_run;
 pub(crate) async fn bridge_ws_connect(
     url: &str,
     config: tokio_tungstenite::tungstenite::protocol::WebSocketConfig,
+    internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     String,
@@ -1033,8 +1205,8 @@ pub(crate) async fn bridge_ws_connect(
     let vetted = tokio::net::lookup_host((host.as_str(), port))
         .await
         .map_err(|e| e.to_string())?
-        .find(|sa| !crate::http::networks::is_blocked_upstream_ip(sa.ip()))
-        .ok_or_else(|| format!("{host}: no permitted address (SSRF-blocked)"))?;
+        .find(|sa| internal_upstreams.permits(sa.ip()))
+        .ok_or_else(|| format!("{host}: no permitted address (internal or never an upstream)"))?;
     let tcp = tokio::net::TcpStream::connect(vetted)
         .await
         .map_err(|e| e.to_string())?;
@@ -1083,6 +1255,52 @@ pub(crate) async fn bridge_send(req: reqwest::RequestBuilder) -> Result<reqwest:
         .map_err(|e| e.to_string())?
         .error_for_status()
         .map_err(|e| e.to_string())
+}
+
+/// [`bridge_send`] for a request that presents the network's credentials: a
+/// 401/403 means the upstream rejected *them*, which no retry can fix. Written
+/// once so every bridge reads the same statuses the same way — the Discord
+/// channel lookup used to call a refused token a transient failure while the
+/// gateway's refusal of the same token parked the network.
+#[cfg(any(feature = "matrix", feature = "discord"))]
+pub(crate) async fn bridge_send_credentials(
+    req: reqwest::RequestBuilder,
+    what: &str,
+) -> Result<reqwest::Response, ConnectFail> {
+    let response = req.send().await.map_err(|e| e.to_string())?;
+    let status = response.status();
+    response.error_for_status().map_err(|e| {
+        let detail = format!("{what} rejected: {e}");
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            ConnectFail::Auth(detail)
+        } else {
+            ConnectFail::Transient(detail)
+        }
+    })
+}
+
+/// A WebSocket bridge's whole downstream arm: route the client's command to its
+/// bridged channels and relay each outcome. `None` means every handle was
+/// dropped (or the network was shut down) and the session must stop. Discord
+/// and Slack differ only in how one message is sent, which is `deliver`.
+#[cfg(any(feature = "discord", feature = "slack"))]
+pub(crate) async fn relay_channel_command<F, Fut>(
+    ends: &DriverEnds,
+    command: Option<ClientCommand>,
+    channel_to_id: &HashMap<String, String>,
+    platform: &str,
+    deliver: F,
+) -> Option<()>
+where
+    F: FnMut(String, String) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    let routed = route_privmsg(&command?.line, channel_to_id);
+    relay_routed(ends, routed, platform, "channel", deliver).await;
+    Some(())
 }
 
 /// WebSocket config for the Discord/Slack gateways: cap the inbound frame and
@@ -1293,10 +1511,53 @@ pub struct IrcSessionSnapshot {
     pub channels: Vec<String>,
 }
 
+/// Most channels one IRC session is tracked in. The names and their number
+/// are the upstream's to choose, and a tenant may point a network at any
+/// server, so without a bound one hostile upstream grows this shared daemon's
+/// memory at will. Libera's `CHANLIMIT` is 250.
+pub const MAX_TRACKED_CHANNELS: usize = 512;
+
+/// An upstream confirmed more memberships than [`MAX_TRACKED_CHANNELS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelLimitExceeded;
+
+/// What one upstream line changed about the tracked session. The IRC driver
+/// folds this into its reconnect intent, so the tracker and the next rejoin
+/// set read every line through one set of membership rules.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SessionChange {
+    /// Our new nickname, when the line renamed us.
+    pub nick: Option<String>,
+    /// Channels that were not tracked before this line.
+    pub joined: Vec<upstream_identity::ConfirmedChannel>,
+    /// RFC1459-folded names of channels this line took us out of. A `QUIT`
+    /// reports none: it ends the live membership, not the intent to be there.
+    pub left: Vec<String>,
+    /// Names the upstream confirmed us in that are not one channel as any IRC
+    /// server could mean it, each cut to [`UNTRACKED_NAME_SHOWN`] bytes. They
+    /// are not tracked, so they are not rejoined after a reconnect.
+    pub untracked: Vec<String>,
+}
+
+/// Bytes of an untrackable channel name repeated back in its notice.
+const UNTRACKED_NAME_SHOWN: usize = 64;
+
+impl SessionChange {
+    fn leave(
+        &mut self,
+        channels: &mut std::collections::HashMap<String, upstream_identity::ConfirmedChannel>,
+        key: String,
+    ) {
+        if channels.remove(&key).is_some() {
+            self.left.push(key);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct IrcSessionState {
     nick: Option<String>,
-    channels: std::collections::HashMap<String, String>,
+    channels: std::collections::HashMap<String, upstream_identity::ConfirmedChannel>,
 }
 
 impl IrcSessionState {
@@ -1306,64 +1567,101 @@ impl IrcSessionState {
         self.snapshot().expect("a begun IRC session has a nick")
     }
 
-    fn observe(&mut self, line: &str) {
+    /// Apply one line. A `JOIN` that would exceed the bound changes nothing.
+    fn observe(&mut self, line: &str) -> Result<SessionChange, ChannelLimitExceeded> {
+        let mut change = SessionChange::default();
         let Some(current_nick) = self.nick.as_ref() else {
-            return;
+            return Ok(change);
         };
         let Ok(message) = e6irc_proto::message::Message::parse(line) else {
-            return;
+            return Ok(change);
         };
         let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
         let source_nick = message.source.as_ref().map(|source| source.name);
         let is_us = |candidate: Option<&str>| {
             candidate.is_some_and(|candidate| casemap.eq(candidate, current_nick))
         };
+        let list = |index: usize| -> Vec<&str> {
+            message
+                .params
+                .get(index)
+                .map(|value| value.split(',').filter(|item| !item.is_empty()).collect())
+                .unwrap_or_default()
+        };
         match message.command.to_ascii_uppercase().as_str() {
             "NICK" if is_us(source_nick) => {
                 if let Some(nick) = message.params.first() {
                     self.nick = Some((*nick).to_string());
+                    change.nick = self.nick.clone();
                 }
             }
             "JOIN" if is_us(source_nick) => {
-                if let Some(channels) = message.params.first() {
-                    for channel in channels.split(',').filter(|channel| !channel.is_empty()) {
-                        self.channels
-                            .insert(casemap.casefold(channel), channel.to_string());
+                let mut confirmed = std::collections::HashMap::new();
+                for name in list(0) {
+                    match upstream_identity::ConfirmedChannel::parse(name) {
+                        Some(channel) => {
+                            confirmed.insert(casemap.casefold(channel.as_str()), channel);
+                        }
+                        None => change.untracked.push(
+                            e6irc_proto::message::truncate_on_char_boundary(
+                                name,
+                                UNTRACKED_NAME_SHOWN,
+                            )
+                            .to_string(),
+                        ),
+                    }
+                }
+                let added = confirmed
+                    .keys()
+                    .filter(|key| !self.channels.contains_key(*key))
+                    .count();
+                if self.channels.len() + added > MAX_TRACKED_CHANNELS {
+                    return Err(ChannelLimitExceeded);
+                }
+                for (key, channel) in confirmed {
+                    if self.channels.insert(key, channel.clone()).is_none() {
+                        change.joined.push(channel);
                     }
                 }
             }
             "PART" if is_us(source_nick) => {
-                if let Some(channels) = message.params.first() {
-                    for channel in channels.split(',').filter(|channel| !channel.is_empty()) {
-                        self.channels.remove(&casemap.casefold(channel));
-                    }
+                for channel in list(0) {
+                    change.leave(&mut self.channels, casemap.casefold(channel));
                 }
             }
             "KICK" => {
-                let channels: Vec<&str> = message
-                    .params
-                    .first()
-                    .map(|value| value.split(',').filter(|item| !item.is_empty()).collect())
-                    .unwrap_or_default();
-                let targets: Vec<&str> = message
-                    .params
-                    .get(1)
-                    .map(|value| value.split(',').filter(|item| !item.is_empty()).collect())
-                    .unwrap_or_default();
+                let channels = list(0);
+                let targets = list(1);
                 if channels.len() == targets.len() {
                     for (channel, target) in channels.into_iter().zip(targets) {
                         if is_us(Some(target)) {
-                            self.channels.remove(&casemap.casefold(channel));
+                            change.leave(&mut self.channels, casemap.casefold(channel));
                         }
                     }
                 } else if channels.len() == 1
                     && targets.into_iter().any(|target| is_us(Some(target)))
                 {
-                    self.channels.remove(&casemap.casefold(channels[0]));
+                    change.leave(&mut self.channels, casemap.casefold(channels[0]));
                 }
             }
             "QUIT" if is_us(source_nick) => self.channels.clear(),
             _ => {}
+        }
+        Ok(change)
+    }
+
+    /// Track `line` as something an attached client is about to read, and
+    /// return what that client should read. A replayed backlog can hold the
+    /// confirmed channels of many past sessions, so it is bounded like the
+    /// live tracker: a line past the bound is withheld, because a membership
+    /// the client saw but this mirror does not hold could never be reconciled
+    /// against the authoritative snapshot.
+    fn mirror<'line>(&mut self, line: &'line str) -> &'line str {
+        match self.observe(line) {
+            Ok(_) => line,
+            Err(ChannelLimitExceeded) => {
+                ":*bnc* NOTICE * :upstream line omitted: it exceeds the tracked channel limit"
+            }
         }
     }
 
@@ -1373,13 +1671,18 @@ impl IrcSessionState {
         self.channels = snapshot
             .channels
             .iter()
-            .map(|channel| (casemap.casefold(channel), channel.clone()))
+            .filter_map(|channel| upstream_identity::ConfirmedChannel::parse(channel))
+            .map(|channel| (casemap.casefold(channel.as_str()), channel))
             .collect();
     }
 
     fn snapshot(&self) -> Option<IrcSessionSnapshot> {
         let nick = self.nick.clone()?;
-        let mut channels: Vec<String> = self.channels.values().cloned().collect();
+        let mut channels: Vec<String> = self
+            .channels
+            .values()
+            .map(|channel| channel.as_str().to_string())
+            .collect();
         channels
             .sort_by_key(|channel| e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(channel));
         Some(IrcSessionSnapshot { nick, channels })
@@ -1472,10 +1775,18 @@ pub enum ConnectionEvent {
     /// refusal rides along so its sanitized upstream text stays visible for
     /// the whole wait instead of only once the driver parks.
     RegistrationRetrying(e6irc_client::RegistrationRejection),
-    /// Credential rejection parked the driver until it is reconfigured.
-    AuthenticationFailed,
+    /// Credential rejection parked the driver until it is reconfigured. The
+    /// upstream's sanitized reason rides along when it gave one.
+    AuthenticationFailed(Option<e6irc_client::SaslRejection>),
     /// Repeated IRC registration rejection parked the driver until reconfigured.
     RegistrationFailed(e6irc_client::RegistrationRejection),
+    /// A bridge's upstream refused what the configuration asks for, and a
+    /// slower attempt follows.
+    ConfigurationRetrying(ConfigurationRefusal),
+    /// Repeated configuration refusal parked the driver until reconfigured. It
+    /// shares the registration-failed lifecycle: both mean "this network's
+    /// settings do not work against this upstream".
+    ConfigurationFailed(ConfigurationRefusal),
 }
 
 /// A handle to a running, always-on network driver. Events are
@@ -1560,13 +1871,17 @@ pub enum NetworkFailure {
     ServerPasswordRejected,
     NetworkBanned,
     AuthenticationRejected,
+    SaslUnavailable,
+    SaslFailed,
     AutojoinFailed,
     ConnectionLost,
     KeepaliveTimedOut,
+    ChannelLimitExceeded,
     UpstreamWriteFailed,
     UpstreamRequestFailed,
     UpstreamProtocolFailed,
     ChannelMappingFailed,
+    ChannelJoinRefused,
     BacklogStorageFailed,
     BacklogStorageLagged,
     CommandQueueFull,
@@ -1590,13 +1905,17 @@ impl NetworkFailure {
             Self::ServerPasswordRejected => "server_password_rejected",
             Self::NetworkBanned => "network_banned",
             Self::AuthenticationRejected => "authentication_rejected",
+            Self::SaslUnavailable => "sasl_unavailable",
+            Self::SaslFailed => "sasl_failed",
             Self::AutojoinFailed => "autojoin_failed",
             Self::ConnectionLost => "connection_lost",
             Self::KeepaliveTimedOut => "keepalive_timed_out",
+            Self::ChannelLimitExceeded => "channel_limit_exceeded",
             Self::UpstreamWriteFailed => "upstream_write_failed",
             Self::UpstreamRequestFailed => "upstream_request_failed",
             Self::UpstreamProtocolFailed => "upstream_protocol_failed",
             Self::ChannelMappingFailed => "channel_mapping_failed",
+            Self::ChannelJoinRefused => "channel_join_refused",
             Self::BacklogStorageFailed => "backlog_storage_failed",
             Self::BacklogStorageLagged => "backlog_storage_lagged",
             Self::CommandQueueFull => "command_queue_full",
@@ -1622,9 +1941,16 @@ impl NetworkFailure {
             Self::ServerPasswordRejected => "The upstream rejected the configured server password.",
             Self::NetworkBanned => "The upstream network banned this connection.",
             Self::AuthenticationRejected => "The upstream rejected the configured credentials.",
+            Self::SaslUnavailable => {
+                "The upstream does not offer the SASL authentication this network is configured for."
+            }
+            Self::SaslFailed => "SASL authentication ended without a verdict on the credentials.",
             Self::AutojoinFailed => "A configured JOIN could not be sent during startup.",
             Self::ConnectionLost => "The established upstream connection was lost.",
             Self::KeepaliveTimedOut => "The upstream stopped responding to keepalive checks.",
+            Self::ChannelLimitExceeded => {
+                "The upstream confirmed more than 512 channels; the session was ended."
+            }
             Self::UpstreamWriteFailed => "A message could not be sent to the upstream.",
             Self::UpstreamRequestFailed => "An upstream API request failed.",
             Self::UpstreamProtocolFailed => {
@@ -1632,6 +1958,9 @@ impl NetworkFailure {
             }
             Self::ChannelMappingFailed => {
                 "A configured bridged channel could not be mapped safely."
+            }
+            Self::ChannelJoinRefused => {
+                "The upstream refused to let this network join a configured channel."
             }
             Self::BacklogStorageFailed => "The detached backlog could not be stored.",
             Self::BacklogStorageLagged => {
@@ -1742,7 +2071,12 @@ struct NetworkRuntimeState {
 
 #[derive(Clone, Copy)]
 enum FailureDisposition {
-    Retry,
+    /// Another attempt follows; after this long, when the shared runner is
+    /// the one waiting. (A driver that reports a retry through the public
+    /// `emit` schedules its own and has no time to give.)
+    Retry {
+        next_attempt_in: Option<std::time::Duration>,
+    },
     Terminal(TerminalNetworkLifecycle),
 }
 
@@ -1849,18 +2183,6 @@ impl NetworkRuntime {
         }
     }
 
-    fn schedule_retry(&self, delay: std::time::Duration) -> Result<(), NetworkLifecycle> {
-        let mut state = self.state.lock().expect("network runtime poisoned");
-        let NetworkRuntimePhase::Reconnecting { next_retry_at } = &mut state.phase else {
-            return Err(state.phase.lifecycle());
-        };
-        let at = epoch_millis()
-            .as_millis()
-            .saturating_add(delay.as_millis() as u64);
-        *next_retry_at = Some(e6irc_proto::time::Millis::from_millis(at));
-        Ok(())
-    }
-
     fn begin_attempt(&self) {
         let mut state = self.state.lock().expect("network runtime poisoned");
         state.phase = if state.connection_attempts == 0 {
@@ -1911,8 +2233,15 @@ impl NetworkRuntime {
         let now = epoch_millis();
         let mut state = self.state.lock().expect("network runtime poisoned");
         state.phase = match disposition {
-            FailureDisposition::Retry => NetworkRuntimePhase::Reconnecting {
-                next_retry_at: None,
+            // The failure and when the next attempt fires are one transition,
+            // published under this one lock: a reader must never see a network
+            // that is retrying after a failure with no next attempt.
+            FailureDisposition::Retry { next_attempt_in } => NetworkRuntimePhase::Reconnecting {
+                next_retry_at: next_attempt_in.map(|delay| {
+                    e6irc_proto::time::Millis::from_millis(
+                        now.as_millis().saturating_add(delay.as_millis() as u64),
+                    )
+                }),
             },
             FailureDisposition::Terminal(lifecycle) => NetworkRuntimePhase::Terminal(lifecycle),
         };
@@ -2048,7 +2377,7 @@ impl Buffer {
 /// framing discards, and the silence came back. It is truncated to fit.
 #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
 pub(crate) fn unmapped_target_notice(platform: &str, kind: &str, target: &str) -> String {
-    let shown = truncate_on_char_boundary(target, 64);
+    let shown = e6irc_proto::message::truncate_on_char_boundary(target, 64);
     format!(":*bnc* NOTICE {shown} :not delivered: no bridged {platform} {kind} for {shown}")
 }
 
@@ -2060,7 +2389,7 @@ pub(crate) fn unmapped_target_notice(platform: &str, kind: &str, target: &str) -
 /// the very outcome this notice exists to prevent.
 #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
 pub(crate) fn undelivered_notice(platform: &str, kind: &str, target: &str) -> String {
-    let shown = truncate_on_char_boundary(target, 64);
+    let shown = e6irc_proto::message::truncate_on_char_boundary(target, 64);
     format!(":*bnc* NOTICE * :not delivered: {platform} send to {kind} {shown} failed")
 }
 
@@ -2071,19 +2400,6 @@ fn rejected_bridge_command_notice(platform: &str, rejection: BridgeCommandReject
         BridgeCommandRejection::UnsupportedCommand => "the bridge supports PRIVMSG only",
     };
     format!(":*bnc* NOTICE * :not delivered to {platform}: {reason}")
-}
-
-/// `s` cut to at most `max` bytes, never inside a character.
-#[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
-fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut cut = max;
-    while cut > 0 && !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    &s[..cut]
 }
 
 /// Render a bridged message as one or more IRC `PRIVMSG` lines: the sender is
@@ -2420,6 +2736,7 @@ impl NetworkHandle {
             telemetry,
             reconnect_seed,
             rejection_retry_floor: REJECTION_RETRY_FLOOR,
+            buffered_status: std::sync::Mutex::new(None),
         };
         (handle, ends)
     }
@@ -2545,6 +2862,8 @@ pub struct DriverEnds {
     /// First delay after the upstream refuses registration; see
     /// [`REJECTION_RETRY_FLOOR`].
     rejection_retry_floor: std::time::Duration,
+    /// The connection state whose notice last entered the backlog.
+    buffered_status: std::sync::Mutex<Option<DriverConnectionStatus>>,
 }
 
 impl Drop for DriverEnds {
@@ -2558,7 +2877,7 @@ impl Drop for DriverEnds {
 impl DriverEnds {
     /// Start a newly registered IRC session and publish its authoritative
     /// identity. This clears memberships from the previous transport; JOIN
-    /// confirmations repopulate them through [`DriverEnds::emit_line`].
+    /// confirmations repopulate them through [`DriverEnds::emit_session_line`].
     pub fn begin_irc_session(&self, nick: String) {
         let mut irc_session = self.irc_session.lock().expect("IRC session state poisoned");
         let snapshot = irc_session.begin(nick);
@@ -2586,29 +2905,56 @@ impl DriverEnds {
     /// is neutralized first (see [`crate::sanitize::upstream_line`]) so a bridge that
     /// builds it from free-form remote text cannot inject a second IRC line
     /// into an attached client's stream.
+    ///
+    /// The line does not reach the IRC session tracker; a driver that began an
+    /// IRC session reports that session's traffic through
+    /// [`DriverEnds::emit_session_line`].
     pub fn emit_line(&self, line: String) {
-        self.emit_buffered_line(line, true);
+        let line = crate::sanitize::upstream_line(line);
+        self.record_input(line.len());
+        self.publish_buffered(line);
     }
 
-    fn emit_notice(&self, line: String) {
-        self.emit_buffered_line(line, false);
-    }
-
-    fn emit_buffered_line(&self, line: String, count_as_input: bool) {
+    /// [`DriverEnds::emit_line`] for a line of the IRC session begun with
+    /// [`DriverEnds::begin_irc_session`]: the nick and membership tracker reads
+    /// it under the same locks that publish it, and the caller learns what it
+    /// changed. A line that would take the session past
+    /// [`MAX_TRACKED_CHANNELS`] is not published, and the driver ends the
+    /// session with [`NetworkFailure::ChannelLimitExceeded`].
+    ///
+    /// Public because [`DriverEnds::begin_irc_session`] is: a driver that can
+    /// begin a session through the SPI must be able to feed it.
+    pub fn emit_session_line(&self, line: String) -> Result<SessionChange, ChannelLimitExceeded> {
         let line = crate::sanitize::upstream_line(line);
         let mut irc_session = self.irc_session.lock().expect("IRC session state poisoned");
-        irc_session.observe(&line);
-        if count_as_input {
-            self.runtime.record_input(line.len());
-            if let Some(telemetry) = self
-                .telemetry
-                .lock()
-                .expect("telemetry hook poisoned")
-                .as_ref()
-            {
-                telemetry.record_bnc_input(line.len());
-            }
+        let change = irc_session.observe(&line)?;
+        self.record_input(line.len());
+        self.publish_buffered(line);
+        // The raw line was delivered, so the client believes in a membership
+        // this session does not hold and will not restore. Say so to whoever is
+        // attached; it is not conversation, so it stays out of the backlog.
+        for name in &change.untracked {
+            let notice = crate::sanitize::upstream_line(format!(
+                ":*bnc* NOTICE * :upstream confirmed a channel name e6irc cannot track: {name}"
+            ));
+            drop(self.events.send(DriverEvent::Notice(notice)));
         }
+        Ok(change)
+    }
+
+    fn record_input(&self, bytes: usize) {
+        self.runtime.record_input(bytes);
+        if let Some(telemetry) = self
+            .telemetry
+            .lock()
+            .expect("telemetry hook poisoned")
+            .as_ref()
+        {
+            telemetry.record_bnc_input(bytes);
+        }
+    }
+
+    fn publish_buffered(&self, line: String) {
         let mut buffer = self.buffer.lock().expect("buffer poisoned");
         buffer.push(line.clone());
         // A detached network legitimately has no live subscribers; the line is
@@ -2641,15 +2987,20 @@ impl DriverEnds {
     /// ([`DriverEnds::emit_line`]) because they need sanitizing and buffering;
     /// see [`ConnectionEvent`].
     pub fn emit(&self, event: ConnectionEvent) {
-        let (broadcast, notice) = match event {
+        self.publish(event, None);
+    }
+
+    /// [`DriverEnds::emit`], with when the next attempt fires for an event that
+    /// announces a retry (visible in the runtime snapshot as `next_retry_at`
+    /// until the attempt begins). One step, so the two cannot be seen apart.
+    fn publish(&self, event: ConnectionEvent, next_attempt_in: Option<std::time::Duration>) {
+        let (status, revision, notice) = match event {
             ConnectionEvent::Connected => {
                 let revision = self.runtime.connected();
                 eprintln!("bnc: {} connected", self.runtime.label());
                 (
-                    DriverEvent::Status {
-                        status: DriverConnectionStatus::Connected,
-                        revision,
-                    },
+                    DriverConnectionStatus::Connected,
+                    revision,
                     format!(
                         ":*bnc* NOTICE * :component connected: {}",
                         self.runtime.label()
@@ -2660,7 +3011,7 @@ impl DriverEnds {
                 let (status, disposition, failure, diagnostic) = match failure_event {
                     ConnectionEvent::Reconnecting(failure) => (
                         DriverConnectionStatus::Reconnecting(failure),
-                        FailureDisposition::Retry,
+                        FailureDisposition::Retry { next_attempt_in },
                         failure,
                         None,
                     ),
@@ -2668,18 +3019,30 @@ impl DriverEnds {
                         let failure = registration_failure(rejection.refusal());
                         (
                             DriverConnectionStatus::Reconnecting(failure),
-                            FailureDisposition::Retry,
+                            FailureDisposition::Retry { next_attempt_in },
                             failure,
                             Some(rejection.diagnostic()),
                         )
                     }
-                    ConnectionEvent::AuthenticationFailed => (
+                    ConnectionEvent::ConfigurationRetrying(ref refusal) => (
+                        DriverConnectionStatus::Reconnecting(refusal.failure()),
+                        FailureDisposition::Retry { next_attempt_in },
+                        refusal.failure(),
+                        Some(refusal.diagnostic()),
+                    ),
+                    ConnectionEvent::ConfigurationFailed(ref refusal) => (
+                        DriverConnectionStatus::RegistrationFailed(refusal.failure()),
+                        FailureDisposition::Terminal(TerminalNetworkLifecycle::RegistrationFailed),
+                        refusal.failure(),
+                        Some(refusal.diagnostic()),
+                    ),
+                    ConnectionEvent::AuthenticationFailed(ref rejection) => (
                         DriverConnectionStatus::AuthenticationFailed,
                         FailureDisposition::Terminal(
                             TerminalNetworkLifecycle::AuthenticationFailed,
                         ),
                         NetworkFailure::AuthenticationRejected,
-                        None,
+                        rejection.as_ref().map(|rejection| rejection.diagnostic()),
                     ),
                     ConnectionEvent::RegistrationFailed(ref rejection) => {
                         let failure = registration_failure(rejection.refusal());
@@ -2712,7 +3075,7 @@ impl DriverEnds {
                         lifecycle.lifecycle().as_str(),
                         failure.summary(),
                     ),
-                    FailureDisposition::Retry => eprintln!(
+                    FailureDisposition::Retry { .. } => eprintln!(
                         "bnc: {} disconnected ({}); reconnecting",
                         self.runtime.label(),
                         failure.code(),
@@ -2720,15 +3083,29 @@ impl DriverEnds {
                 }
                 let state = status.lifecycle().as_str();
                 (
-                    DriverEvent::Status { status, revision },
+                    status,
+                    revision,
                     lifecycle_notice(state, failure, diagnostic),
                 )
             }
         };
         // Connection state is sticky in `connected`; zero live subscribers is
         // therefore not a delivery failure.
-        drop(self.events.send(broadcast));
-        self.emit_notice(notice);
+        drop(self.events.send(DriverEvent::Status { status, revision }));
+        // The backlog records each change of state once. An unreachable
+        // upstream repeats the same failure on every retry for as long as the
+        // outage lasts; buffering each repeat would evict the conversation the
+        // backlog exists to keep, so attached clients hear a repeat live only.
+        let notice = crate::sanitize::upstream_line(notice);
+        let mut buffered_status = self
+            .buffered_status
+            .lock()
+            .expect("buffered status poisoned");
+        if buffered_status.replace(status) == Some(status) {
+            drop(self.events.send(DriverEvent::Notice(notice)));
+        } else {
+            self.publish_buffered(notice);
+        }
     }
 
     fn begin_attempt(&self) {
@@ -2745,12 +3122,6 @@ impl DriverEnds {
     /// configuration carries its own floor applies it before its run loop.
     pub fn set_rejection_retry_floor(&mut self, floor: std::time::Duration) {
         self.rejection_retry_floor = floor;
-    }
-
-    /// Record when the next reconnect attempt fires (visible in the runtime
-    /// snapshot as `next_retry_at`), then cleared when a session connects.
-    fn schedule_retry(&self, delay: std::time::Duration) -> Result<(), NetworkLifecycle> {
-        self.runtime.schedule_retry(delay)
     }
 
     /// Await the next downstream command; `None` when every handle is dropped
@@ -2778,6 +3149,16 @@ impl DriverEnds {
     /// command). Lets `run_with_backoff` abandon its reconnect wait promptly.
     pub fn is_shutdown(&self) -> bool {
         *self.shutdown.borrow()
+    }
+
+    /// [`DriverEnds::shutdown_signalled`] as a future that owns its receiver,
+    /// for racing against work that itself needs this endpoint.
+    pub(crate) fn stop_signal(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut shutdown = self.shutdown.clone();
+        async move {
+            // `Ok` is the stop flag turning true; `Err` is the registry gone.
+            drop(shutdown.wait_for(|stop| *stop).await);
+        }
     }
 
     /// Resolve once the network is shut down; for racing against a driver's
@@ -2812,6 +3193,8 @@ const fn registration_failure(refusal: e6irc_client::RegistrationRefusal) -> Net
         }
         e6irc_client::RegistrationRefusal::NetworkBanned => NetworkFailure::NetworkBanned,
         e6irc_client::RegistrationRefusal::NotRegistered => NetworkFailure::RegistrationRejected,
+        e6irc_client::RegistrationRefusal::SaslUnavailable => NetworkFailure::SaslUnavailable,
+        e6irc_client::RegistrationRefusal::SaslFailed => NetworkFailure::SaslFailed,
     }
 }
 
@@ -2876,6 +3259,44 @@ impl NetworkDriver for LoopbackDriver {
     }
 }
 
+impl std::fmt::Display for AttachEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ClientClosed => "the client closed the connection",
+            Self::ClientQuit => "the client quit",
+            Self::ClientTooSlow => "the client fell too far behind the live stream",
+            Self::ClientUnresponsive => "the client stopped answering liveness pings",
+            Self::NetworkRemoved => "the network was removed or replaced",
+            Self::DriverStopped => "the network's driver stopped",
+        })
+    }
+}
+
+/// How long an attached client may stay silent before the bouncer pings it,
+/// and again before it gives up on it. A quiet or parked network writes
+/// nothing to its clients, so without this a half-open client (a laptop that
+/// slept, a NAT that forgot the flow) is never written to, never errors, and
+/// holds its task, its socket and its place in `attached_clients` until the
+/// next broadcast line — which on a parked network never comes.
+pub const ATTACH_LIVENESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Why an attachment ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachEnd {
+    /// The client closed its side of the stream.
+    ClientClosed,
+    /// The client sent `QUIT`.
+    ClientQuit,
+    /// The client fell too far behind the live stream to be resynchronised.
+    ClientTooSlow,
+    /// The client answered nothing for two liveness intervals.
+    ClientUnresponsive,
+    /// The network was removed or replaced.
+    NetworkRemoved,
+    /// The network's driver is gone.
+    DriverStopped,
+}
+
 /// Attach a downstream client stream to a running network: replay the
 /// detached buffer, then bidirectionally relay driver events to the
 /// client and client lines to the upstream. Returns when either side
@@ -2884,13 +3305,17 @@ impl NetworkDriver for LoopbackDriver {
 ///
 /// `account` is the authenticated account, used to key the BNC-local
 /// per-target read markers (shared networks keep per-account positions).
+/// `liveness` is how long the client may stay silent before it is pinged, and
+/// then again before it is given up on ([`ATTACH_LIVENESS_INTERVAL`] in
+/// production).
 pub async fn attach<S>(
     stream: S,
     handle: &NetworkHandle,
     mut caps: AttachCaps,
     account: &str,
     downstream_nick: &str,
-) -> std::io::Result<()>
+    liveness: std::time::Duration,
+) -> std::io::Result<AttachEnd>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -2915,14 +3340,14 @@ where
             .write_all(b":*bnc* NOTICE * :network removed; detaching\r\n")
             .await?;
         write.flush().await?;
-        return Ok(());
+        return Ok(AttachEnd::NetworkRemoved);
     }
     if !handle.wait_for_history().await {
         write
             .write_all(b":*bnc* NOTICE * :network removed; detaching\r\n")
             .await?;
         write.flush().await?;
-        return Ok(());
+        return Ok(AttachEnd::NetworkRemoved);
     }
     let _attachment = handle.track_attachment();
     let attach_id = handle.next_attachment_id();
@@ -2947,8 +3372,8 @@ where
     let mut downstream_session = IrcSessionState::default();
     downstream_session.begin(downstream_nick.to_string());
     for line in buffer_snapshot {
-        downstream_session.observe(&line);
-        if let Some(line) = filter_tags(&line, caps) {
+        let line = downstream_session.mirror(&line);
+        if let Some(line) = filter_tags(line, caps) {
             write.write_all(line.as_bytes()).await?;
             write.write_all(b"\r\n").await?;
         }
@@ -2969,6 +3394,10 @@ where
     let mut framing = LineBuffer::new(e6irc_proto::message::MAX_CLIENT_FRAME_LEN);
     let mut read_buf = vec![0u8; 8192];
     let mut parsed = Vec::new();
+    // Anything the client sends shows it is there; only its silence is timed,
+    // and lines written *to* it prove nothing about a half-open socket.
+    let mut client_silence = SilenceDeadline::new(liveness);
+    let mut awaiting_pong = false;
     loop {
         tokio::select! {
             // Network removed/replaced: tell the client and detach.
@@ -2978,14 +3407,14 @@ where
                         .write_all(b":*bnc* NOTICE * :network removed; detaching\r\n")
                         .await?;
                     write.flush().await?;
-                    return Ok(());
+                    return Ok(AttachEnd::NetworkRemoved);
                 }
             }
             // Upstream -> client.
             ev = events.recv() => match ev {
                 Ok(event @ (DriverEvent::Line(_) | DriverEvent::Notice(_))) => {
                     let line = event.display_line().expect("display event carries a line");
-                    downstream_session.observe(line);
+                    let line = downstream_session.mirror(line);
                     write_filtered_line(&mut write, line, caps).await?;
                 }
                 Ok(DriverEvent::Echo { line, origin }) => {
@@ -3049,14 +3478,25 @@ where
                         )
                         .await?;
                     write.flush().await?;
-                    return Ok(());
+                    return Ok(AttachEnd::ClientTooSlow);
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Ok(AttachEnd::DriverStopped);
+                }
             },
             // Client -> upstream.
-            n = read.read(&mut read_buf) => match n {
-                Ok(0) => break, // client detached
-                Ok(n) => {
+            n = client_silence.bound(read.read(&mut read_buf)) => match n {
+                None if awaiting_pong => return Ok(AttachEnd::ClientUnresponsive),
+                None => {
+                    awaiting_pong = true;
+                    client_silence.restart();
+                    write.write_all(ATTACH_LIVENESS_PING).await?;
+                    write.flush().await?;
+                }
+                Some(Ok(0)) => return Ok(AttachEnd::ClientClosed),
+                Some(Ok(n)) => {
+                    awaiting_pong = false;
+                    client_silence.restart();
                     framing.feed(&read_buf[..n], &mut parsed);
                     for event in parsed.drain(..) {
                         match event {
@@ -3074,11 +3514,39 @@ where
                                     // upstream connection. CAP mutates only
                                     // this downstream's view; SASL is already
                                     // complete; history and markers belong to
-                                    // the BNC store.
+                                    // the BNC store; liveness and QUIT concern
+                                    // this one downstream transport, while the
+                                    // upstream session outlives every client.
                                     let mut handled = true;
                                     let cmd = msg.command.to_ascii_uppercase();
                                     let params: Vec<&str> = msg.params.to_vec();
                                     match cmd.as_str() {
+                                        "PING" => match params.first() {
+                                            Some(token) => {
+                                                write
+                                                    .write_all(attach_pong(token).as_bytes())
+                                                    .await?;
+                                                write.flush().await?;
+                                            }
+                                            None => {
+                                                write_attach_numeric(
+                                                    &mut write,
+                                                    downstream_nick,
+                                                    409,
+                                                    None,
+                                                    "No origin specified",
+                                                )
+                                                .await?;
+                                            }
+                                        },
+                                        // A reply, never a request: it answers
+                                        // nothing the upstream asked this client.
+                                        "PONG" => {}
+                                        "QUIT" => {
+                                            write.write_all(ATTACH_QUIT_REPLY).await?;
+                                            write.flush().await?;
+                                            return Ok(AttachEnd::ClientQuit);
+                                        }
                                         "CAP" => {
                                             let target = downstream_session
                                                 .snapshot()
@@ -3154,7 +3622,7 @@ where
                                                 write.flush().await?;
                                             }
                                             SendOutcome::Closed => {
-                                                return Ok(()); // driver gone
+                                                return Ok(AttachEnd::DriverStopped);
                                             }
                                             SendOutcome::Unavailable => {
                                                 write
@@ -3196,12 +3664,15 @@ where
                         }
                     }
                 }
-                Err(e) => return Err(e),
+                Some(Err(e)) => return Err(e),
             },
         }
     }
-    Ok(())
 }
+
+/// The bouncer's own liveness check of an attached client. Its `PONG` is
+/// consumed by the attach loop like any other, and never reaches the upstream.
+const ATTACH_LIVENESS_PING: &[u8] = b":*bnc* PING :*bnc*-liveness\r\n";
 
 async fn write_filtered_line<W>(write: &mut W, line: &str, caps: AttachCaps) -> std::io::Result<()>
 where
@@ -3214,6 +3685,19 @@ where
         write.flush().await?;
     }
     Ok(())
+}
+
+/// What a raw attached client reads after its `QUIT`, before the stream closes.
+const ATTACH_QUIT_REPLY: &[u8] =
+    b":*bnc* ERROR :Closing Link: client detached; the network session keeps running\r\n";
+
+/// The bouncer's own answer to an attached client's `PING`, cut to the wire
+/// limit the way the delivery funnel cuts any other over-long reply.
+fn attach_pong(token: &str) -> String {
+    const HEAD: &str = ":*bnc* PONG *bnc* :";
+    let budget = e6irc_proto::message::MAX_LINE_LEN - 2 - HEAD.len();
+    let token = e6irc_proto::message::truncate_on_char_boundary(token, budget);
+    format!("{HEAD}{token}\r\n")
 }
 
 async fn write_attach_numeric<W>(
@@ -3386,17 +3870,21 @@ mod tests {
         account: Option<&str>,
         password: Option<&str>,
     ) -> String {
-        build_driver(
+        build_driver(DriverSpec {
             kind,
-            addr.into(),
-            true,
-            nick.into(),
-            nick.into(),
-            vec![],
-            16,
-            account.map(str::to_string),
-            password.map(str::to_string),
-        )
+            owner: Some("owner".into()),
+            name: "network".into(),
+            addr: addr.into(),
+            tls: true,
+            nick: nick.into(),
+            username: (kind == crate::config::NetworkKind::Irc).then(|| "ident".into()),
+            realname: nick.into(),
+            autojoin: vec![],
+            buffer_cap: 16,
+            sasl_account: account.map(str::to_string),
+            sasl_password: password.map(str::to_string),
+            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
+        })
         .err()
         .expect("invalid driver configuration should be rejected")
     }
@@ -3476,15 +3964,21 @@ mod tests {
             addr: String::new(),
             tls: true,
             nick: String::new(),
+            username: None,
             realname: Some("silently ignored before this invariant".into()),
             autojoin: vec![],
             sasl_account: None,
             sasl_password_sealed: Some("sealed-but-no-key".into()),
             enabled: false,
         };
-        let error = driver_from_row(&row, None, "owner")
-            .err()
-            .expect("noncanonical stored bridge should be rejected");
+        let error = driver_from_row(
+            &row,
+            None,
+            "owner",
+            crate::egress::InternalUpstreams::Refuse,
+        )
+        .err()
+        .expect("noncanonical stored bridge should be rejected");
         assert!(error.contains("real name field"), "{error}");
     }
 
@@ -3496,15 +3990,21 @@ mod tests {
             addr: "irc.libera.chat:6697".into(),
             tls: true,
             nick: "alice".into(),
+            username: Some("alice".into()),
             realname: None,
             autojoin: vec![],
             sasl_account: None,
             sasl_password_sealed: None,
             enabled: false,
         };
-        let error = driver_from_row(&row, None, "owner")
-            .err()
-            .expect("stored IRC network without realname should fail");
+        let error = driver_from_row(
+            &row,
+            None,
+            "owner",
+            crate::egress::InternalUpstreams::Refuse,
+        )
+        .err()
+        .expect("stored IRC network without realname should fail");
         assert!(error.contains("no realname"), "{error}");
     }
 
@@ -3553,11 +4053,15 @@ mod tests {
             reconnecting.recent_failures.last().map(|record| record.at),
             "the latest error and its timestamp come from one record"
         );
-        ends.schedule_retry(std::time::Duration::from_secs(1))
-            .expect("reconnecting state accepts a retry schedule");
-        assert!(handle.runtime_snapshot().next_retry_at.is_some());
+        // A driver's own `emit` has no attempt time to give. The shared runner
+        // does, and publishes it with the failure rather than after it.
 
-        ends.emit(ConnectionEvent::AuthenticationFailed);
+        // A terminal event carries no next attempt, whatever accompanies it:
+        // there is no separate scheduling step left to revive a parked network.
+        ends.publish(
+            ConnectionEvent::AuthenticationFailed(None),
+            Some(std::time::Duration::from_secs(1)),
+        );
         let failed = handle.runtime_snapshot();
         assert_eq!(failed.lifecycle, NetworkLifecycle::AuthenticationFailed);
         assert_eq!(failed.connected_at, None);
@@ -3565,11 +4069,6 @@ mod tests {
         assert_eq!(
             failed.last_error,
             Some(NetworkFailure::AuthenticationRejected)
-        );
-        assert_eq!(
-            ends.schedule_retry(std::time::Duration::from_secs(1)),
-            Err(NetworkLifecycle::AuthenticationFailed),
-            "a parked network cannot be revived by retry scheduling"
         );
         assert_eq!(
             handle.runtime_snapshot().lifecycle,
@@ -3602,10 +4101,69 @@ mod tests {
         );
     }
 
+    /// The backlog exists to keep what was said while nobody was attached. An
+    /// unreachable upstream retries every few seconds for as long as the
+    /// outage lasts, so its identical notices must not push that history out.
+    #[test]
+    fn repeated_lifecycle_notices_are_buffered_once_per_transition() {
+        let (handle, ends) = NetworkHandle::channels(16);
+        let mut events = handle.subscribe();
+        let live_notices = |events: &mut tokio::sync::broadcast::Receiver<DriverEvent>| {
+            let mut buffered = 0;
+            let mut live_only = 0;
+            while let Ok(event) = events.try_recv() {
+                match event {
+                    DriverEvent::Line(_) => buffered += 1,
+                    DriverEvent::Notice(_) => live_only += 1,
+                    _ => {}
+                }
+            }
+            (buffered, live_only)
+        };
+
+        ends.emit_line(":peer PRIVMSG #room :said while detached".into());
+        for _ in 0..50 {
+            ends.emit(ConnectionEvent::Reconnecting(
+                NetworkFailure::ConnectionLost,
+            ));
+        }
+        assert_eq!(
+            handle.buffer_snapshot().len(),
+            2,
+            "{:?}",
+            handle.buffer_snapshot()
+        );
+        assert_eq!(
+            live_notices(&mut events),
+            (2, 49),
+            "an attached client still hears every retry"
+        );
+        assert_eq!(handle.runtime_snapshot().errors, 50);
+
+        // A different failure, and a recovery in between, are transitions.
+        ends.emit(ConnectionEvent::Reconnecting(
+            NetworkFailure::ConnectionTimedOut,
+        ));
+        ends.emit(ConnectionEvent::Reconnecting(
+            NetworkFailure::ConnectionLost,
+        ));
+        ends.emit(ConnectionEvent::Connected);
+        ends.emit(ConnectionEvent::Reconnecting(
+            NetworkFailure::ConnectionLost,
+        ));
+        assert_eq!(
+            handle.buffer_snapshot().len(),
+            6,
+            "{:?}",
+            handle.buffer_snapshot()
+        );
+        assert_eq!(live_notices(&mut events), (4, 0));
+    }
+
     #[test]
     fn terminally_parked_driver_cannot_accept_an_undeliverable_command() {
         let (handle, mut ends) = NetworkHandle::channels(8);
-        ends.emit(ConnectionEvent::AuthenticationFailed);
+        ends.emit(ConnectionEvent::AuthenticationFailed(None));
         assert_eq!(
             handle.send("PRIVMSG #room :this cannot drain"),
             SendOutcome::Unavailable
@@ -3649,7 +4207,8 @@ mod tests {
             "the immutable replay side cannot acquire a live line"
         );
 
-        ends.emit_line(":upstream!u@h JOIN #after".into());
+        ends.emit_session_line(":upstream!u@h JOIN #after".into())
+            .expect("within the channel limit");
         assert!(
             session
                 .as_ref()
@@ -3852,6 +4411,7 @@ mod tests {
                 AttachCaps::default(),
                 "testuser",
                 "testuser",
+                ATTACH_LIVENESS_INTERVAL,
             ),
         )
         .await;
@@ -3880,13 +4440,38 @@ mod tests {
     #[tokio::test]
     #[cfg(any(feature = "discord", feature = "slack"))]
     async fn bridge_ws_connect_refuses_an_ssrf_blocked_gateway() {
-        let err = bridge_ws_connect("wss://169.254.169.254/gateway", bridge_ws_config())
-            .await
-            .expect_err("a link-local gateway must be refused");
-        assert!(
-            err.contains("permitted") || err.contains("SSRF"),
-            "refusal must name the SSRF block, got: {err}"
-        );
+        for policy in [
+            crate::egress::InternalUpstreams::Refuse,
+            crate::egress::InternalUpstreams::Allow,
+        ] {
+            let err =
+                bridge_ws_connect("wss://169.254.169.254/gateway", bridge_ws_config(), policy)
+                    .await
+                    .expect_err("a link-local gateway must be refused");
+            assert!(
+                err.contains("permitted"),
+                "refusal must name the rule, got: {err}"
+            );
+        }
+        // A loopback gateway is internal: refused by default, dialled only
+        // under the operator's explicit allowance (here: nothing listens, so
+        // the refusal gives way to a connection error).
+        let err = bridge_ws_connect(
+            "ws://127.0.0.1:9/gateway",
+            bridge_ws_config(),
+            crate::egress::InternalUpstreams::Refuse,
+        )
+        .await
+        .expect_err("a loopback gateway is refused by default");
+        assert!(err.contains("permitted"), "{err}");
+        let err = bridge_ws_connect(
+            "ws://127.0.0.1:9/gateway",
+            bridge_ws_config(),
+            crate::egress::InternalUpstreams::Allow,
+        )
+        .await
+        .expect_err("nothing listens on port 9");
+        assert!(!err.contains("permitted"), "{err}");
     }
 
     #[test]
@@ -4145,8 +4730,10 @@ mod tests {
         assert_eq!(handle.irc_session_snapshot(), None);
 
         ends.begin_irc_session("Alice".to_string());
-        ends.emit_line(":Alice!u@h JOIN #One,,#Two".to_string());
-        ends.emit_line(":srv NOTICE Alice :joined".to_string());
+        ends.emit_session_line(":Alice!u@h JOIN #One,,#Two".to_string())
+            .expect("within the channel limit");
+        ends.emit_session_line(":srv NOTICE Alice :joined".to_string())
+            .expect("within the channel limit");
         assert_eq!(handle.buffer_snapshot(), vec![":srv NOTICE Alice :joined"]);
         assert_eq!(
             handle.irc_session_snapshot(),
@@ -4156,8 +4743,10 @@ mod tests {
             })
         );
 
-        ends.emit_line(":Alice!u@h NICK :Alicia".to_string());
-        ends.emit_line(":op!u@h KICK #one,#two Alicia,Other :gone".to_string());
+        ends.emit_session_line(":Alice!u@h NICK :Alicia".to_string())
+            .expect("within the channel limit");
+        ends.emit_session_line(":op!u@h KICK #one,#two Alicia,Other :gone".to_string())
+            .expect("within the channel limit");
         assert_eq!(
             handle.irc_session_snapshot(),
             Some(IrcSessionSnapshot {
@@ -4178,6 +4767,165 @@ mod tests {
         );
     }
 
+    /// A reader — the networks API, an attaching client — takes a snapshot
+    /// whenever it likes. Recording the failure and then, under a second lock
+    /// acquisition, when the next attempt fires left a window in which a
+    /// network was "reconnecting" after a failure with no next attempt at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retry_is_published_with_its_next_attempt_time_in_one_step() {
+        let (handle, mut ends) = NetworkHandle::channels(4);
+        let handle = std::sync::Arc::new(handle);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = std::thread::spawn({
+            let (handle, stop) = (handle.clone(), stop.clone());
+            move || {
+                let mut torn = 0_u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let snapshot = handle.runtime_snapshot();
+                    if snapshot.lifecycle == NetworkLifecycle::Reconnecting
+                        && snapshot.last_error.is_some()
+                        && snapshot.next_retry_at.is_none()
+                    {
+                        torn += 1;
+                    }
+                }
+                torn
+            }
+        });
+        for _ in 0..20_000 {
+            let waited = wait_for_reconnect(
+                &mut ends,
+                ConnectionEvent::Reconnecting(NetworkFailure::ConnectionLost),
+                std::time::Duration::from_secs(30),
+                std::future::ready(()),
+            )
+            .await;
+            assert!(waited);
+            let after = handle.runtime_snapshot();
+            assert!(after.last_error.is_some() && after.next_retry_at.is_some());
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            reader.join().expect("reader"),
+            0,
+            "snapshots showed a retry with a failure but no next attempt time"
+        );
+    }
+
+    /// Every driver loop abandons its read whenever something else happens.
+    /// Those abandoned reads must not push the silence deadline out.
+    #[tokio::test]
+    async fn a_silence_window_is_not_restarted_by_abandoned_reads() {
+        let silence = SilenceDeadline::new(std::time::Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        loop {
+            tokio::select! {
+                read = silence.bound(std::future::pending::<()>()) => {
+                    assert_eq!(read, None);
+                    break;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                    assert!(
+                        started.elapsed() < std::time::Duration::from_secs(2),
+                        "other activity kept a silent upstream looking alive"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn upstream_confirmed_channels_are_bounded_and_structural() {
+        let (handle, ends) = NetworkHandle::channels(4);
+        ends.begin_irc_session("alice".to_string());
+        let change = ends
+            .emit_session_line(":alice!u@h JOIN 0,notachannel,#real".to_string())
+            .expect("one channel is within the limit");
+        assert_eq!(
+            change
+                .joined
+                .iter()
+                .map(|channel| channel.as_str())
+                .collect::<Vec<_>>(),
+            ["#real"]
+        );
+        assert_eq!(
+            handle.irc_session_snapshot().expect("session").channels,
+            vec!["#real".to_string()]
+        );
+        for index in 1..MAX_TRACKED_CHANNELS {
+            ends.emit_session_line(format!(":alice!u@h JOIN #flood{index}"))
+                .expect("within the channel limit");
+        }
+        // A membership that is already tracked is not a new one.
+        assert_eq!(
+            ends.emit_session_line(":alice!u@h JOIN #REAL".to_string()),
+            Ok(SessionChange::default())
+        );
+
+        let lines_before = handle.buffer_snapshot();
+        assert_eq!(
+            ends.emit_session_line(":alice!u@h JOIN #one-too-many,#and-another".to_string()),
+            Err(ChannelLimitExceeded)
+        );
+        assert_eq!(
+            handle
+                .irc_session_snapshot()
+                .expect("session")
+                .channels
+                .len(),
+            MAX_TRACKED_CHANNELS,
+            "a refused line changes nothing"
+        );
+        assert_eq!(
+            handle.buffer_snapshot(),
+            lines_before,
+            "a refused line is not published for attached mirrors to overflow on"
+        );
+        assert!(
+            NetworkFailure::ChannelLimitExceeded
+                .summary()
+                .contains(&MAX_TRACKED_CHANNELS.to_string()),
+            "the summary names the real limit"
+        );
+
+        let change = ends
+            .emit_session_line(":alice!u@h PART #flood1,#never-joined".to_string())
+            .expect("a PART cannot exceed the limit");
+        assert_eq!(change.left, ["#flood1"]);
+        let change = ends
+            .emit_session_line(":alice!u@h QUIT :bye".to_string())
+            .expect("a QUIT cannot exceed the limit");
+        assert_eq!(
+            change,
+            SessionChange::default(),
+            "a QUIT ends live membership without touching the reconnect intent"
+        );
+        assert!(
+            handle
+                .irc_session_snapshot()
+                .expect("session")
+                .channels
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn replayed_backlog_cannot_grow_an_attach_mirror_past_the_channel_limit() {
+        let mut mirror = IrcSessionState::default();
+        mirror.begin("alice".to_string());
+        for index in 0..MAX_TRACKED_CHANNELS {
+            let line = format!(":alice!u@h JOIN #past{index}");
+            assert_eq!(mirror.mirror(&line), line);
+        }
+        let shown = mirror.mirror(":alice!u@h JOIN #past-the-limit");
+        assert!(
+            shown.starts_with(":*bnc* NOTICE * :upstream line omitted"),
+            "{shown}"
+        );
+        assert_eq!(mirror.channels.len(), MAX_TRACKED_CHANNELS);
+    }
+
     #[tokio::test]
     async fn raw_attach_snapshot_renames_and_rejoins_the_downstream_client() {
         use tokio::io::AsyncReadExt;
@@ -4185,9 +4933,18 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(4096);
         let (handle, ends) = NetworkHandle::channels(4);
         ends.begin_irc_session("upstreamNick".to_string());
-        ends.emit_line(":upstreamNick!u@h JOIN #current".to_string());
+        ends.emit_session_line(":upstreamNick!u@h JOIN #current".to_string())
+            .expect("within the channel limit");
         let attach = tokio::spawn(async move {
-            attach(server, &handle, AttachCaps::default(), "alice", "alice").await
+            attach(
+                server,
+                &handle,
+                AttachCaps::default(),
+                "alice",
+                "alice",
+                ATTACH_LIVENESS_INTERVAL,
+            )
+            .await
         });
 
         let mut bytes = vec![0; 4096];
@@ -4237,7 +4994,15 @@ mod tests {
         let (handle, mut ends) = NetworkHandle::channels(4);
         ends.begin_irc_session("alice".to_string());
         let attach = tokio::spawn(async move {
-            attach(server, &handle, AttachCaps::default(), "alice", "alice").await
+            attach(
+                server,
+                &handle,
+                AttachCaps::default(),
+                "alice",
+                "alice",
+                ATTACH_LIVENESS_INTERVAL,
+            )
+            .await
         });
 
         let mut bytes = vec![0; 4096];

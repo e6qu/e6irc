@@ -62,7 +62,7 @@
                 type="button"
                 title="IRC commands"
                 aria-label="IRC commands"
-                aria-expanded="false"
+                aria-haspopup="dialog"
               >?</button>
             </span>
           </div>
@@ -140,7 +140,7 @@
 
           <label class="field">
             <span>Nickname</span>
-            <input id="nf-nick" name="nick" required maxlength="32" autocomplete="username" />
+            <input id="nf-nick" name="nick" required maxlength="64" autocomplete="off" />
           </label>
 
           <fieldset id="nf-credentials">
@@ -152,7 +152,7 @@
 
             <label class="field">
               <span>NickServ account</span>
-              <input id="nf-sasl-account" name="sasl_account" maxlength="255" autocomplete="username" />
+              <input id="nf-sasl-account" name="sasl_account" maxlength="255" autocomplete="off" />
             </label>
 
             <label class="field">
@@ -163,8 +163,11 @@
                   name="sasl_password"
                   type="password"
                   maxlength="512"
-                  autocomplete="current-password"
+                  autocomplete="new-password"
                 />
+                <!-- new-password, not current-password: the only credential a
+                     browser holds for this origin is the e6irc login, and
+                     offering it here would send it to a third-party network. -->
                 <!-- A pasted password cannot be checked any other way, and this
                      is exactly where a silent typo costs a failed SASL round
                      trip that reads as "wrong credentials". -->
@@ -211,6 +214,14 @@
             </label>
 
             <label class="field">
+              <span>Username <em>optional</em></span>
+              <!-- autocomplete="off", not "username": that token means the
+                   e6irc login, and this value goes to a third-party network. -->
+              <input id="nf-username" name="username" maxlength="10" autocomplete="off" autocapitalize="none" spellcheck="false" />
+              <small>The ident shown before the @ in your address. Your nickname is used when this is blank.</small>
+            </label>
+
+            <label class="field">
               <span>Real name <em>optional</em></span>
               <input id="nf-realname" name="realname" maxlength="128" />
               <small>Shown to others in /whois. Your nickname is used when this is blank.</small>
@@ -239,7 +250,7 @@
           <li><code>/join #channel</code> — join a channel</li>
           <li><code>/part [#channel]</code> — leave a channel</li>
           <li><code>/query nick [message]</code> — open a private conversation</li>
-          <li><code>/msg nick text</code> — send without opening a buffer</li>
+          <li><code>/msg nick text</code> — send without opening a conversation</li>
           <li><code>/notice nick text</code> — send a notice</li>
           <li><code>/nick name</code> — change nickname</li>
           <li><code>/topic [text]</code> — read or set the topic</li>

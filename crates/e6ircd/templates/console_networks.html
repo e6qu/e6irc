@@ -50,7 +50,7 @@
           </label>
           <label class="field">
             <span>NickServ account <em>optional</em></span>
-            <input name="sasl_account" autocomplete="username" value="{{ form.sasl_account }}" maxlength="255" {% if !can_store_secrets %}disabled{% endif %} />
+            <input name="sasl_account" autocomplete="off" value="{{ form.sasl_account }}" maxlength="255" {% if !can_store_secrets %}disabled{% endif %} />
           </label>
           <label class="field">
             <span>NickServ password <em>optional</em></span>
@@ -65,7 +65,7 @@
           <label class="field field-wide">
             <span>Channels to join <em>optional</em></span>
             <input name="autojoin" autocomplete="off" value="{{ form.autojoin }}" placeholder="#e6irc, #rust" />
-            <small>Comma-separated channel names.</small>
+            <small>Separate channels with commas or spaces.</small>
           </label>
           <details class="advanced field-wide" data-network-advanced {% if form.preset == "custom" || form.preset == "" %}open{% endif %}>
             <summary>Advanced</summary>
@@ -82,6 +82,11 @@
               <label class="check field-wide">
                 <input type="checkbox" name="tls" data-network-tls {% if form.tls %}checked{% endif %} />
                 <span><strong>Use TLS</strong><small>Recommended for public IRC networks.</small></span>
+              </label>
+              <label class="field field-wide">
+                <span>Username <em>optional</em></span>
+                <input name="username" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="10" pattern="[A-Za-z0-9][A-Za-z0-9_\-]{0,9}" title="Letters, digits, - and _ only, starting with a letter or digit, at most 10 characters" />
+                <small>The ident shown before the @ in your address. Your nickname is used when this is blank.</small>
               </label>
               <label class="field field-wide">
                 <span>Real name <em>optional</em></span>

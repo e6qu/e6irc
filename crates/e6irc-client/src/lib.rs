@@ -7,6 +7,7 @@
 
 #![deny(clippy::let_underscore_must_use)]
 
+pub mod credentials;
 pub mod token_cache;
 
 use std::io;
@@ -25,6 +26,11 @@ type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 /// authentication must produce the same message metadata when the server
 /// supports it.
 const METADATA_CAPABILITIES: [&str; 3] = ["server-time", "message-tags", "account-tag"];
+
+/// Capabilities one server may advertise. `CAP LS` continues for as long as the
+/// server keeps sending `*` lines, so without a bound the peer decides how much
+/// this connection remembers. Real networks advertise a few dozen.
+const MAX_ADVERTISED_CAPABILITIES: usize = 256;
 
 /// Server-supplied text with every terminal control byte neutralized — the only
 /// form untrusted text may take once it reaches the user's terminal.
@@ -79,6 +85,129 @@ pub struct Connection {
     /// events from the same socket read.
     pending: std::collections::VecDeque<LineEvent>,
     read_buf: Vec<u8>,
+    /// The bound on each request this library waits on, from
+    /// [`ConnectionOptions::response_deadline`]. `None` for a connection built
+    /// directly from a socket, whose owner bounds its own calls (the bouncer
+    /// wraps every stage in its own timeout).
+    response_deadline: Option<std::time::Duration>,
+    /// What the server said it offers, recorded during capability discovery so
+    /// registration asks only for what exists and can name what is missing.
+    advertised: AdvertisedCapabilities,
+}
+
+/// The capability set a server advertised in `CAP LS`, with each capability's
+/// value (`sasl=PLAIN,EXTERNAL`). Bounded by
+/// [`MAX_ADVERTISED_CAPABILITIES`]; each entry is already bounded by the frame
+/// limit of the line that carried it.
+#[derive(Debug, Default)]
+struct AdvertisedCapabilities(std::collections::HashMap<String, Option<String>>);
+
+impl AdvertisedCapabilities {
+    /// Fold one `CAP LS` line's space-separated `name[=value]` list in.
+    fn record(&mut self, list: &str) -> io::Result<()> {
+        for token in list.split_whitespace() {
+            let (name, value) = match token.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (token, None),
+            };
+            if !self.0.contains_key(name) && self.0.len() >= MAX_ADVERTISED_CAPABILITIES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "server advertised more than {MAX_ADVERTISED_CAPABILITIES} capabilities"
+                    ),
+                ));
+            }
+            self.0.insert(name.to_owned(), value.map(str::to_owned));
+        }
+        Ok(())
+    }
+
+    fn offers(&self, capability: &str) -> bool {
+        self.0.contains_key(capability)
+    }
+
+    /// The advertised SASL mechanism list, or `None` when the server named no
+    /// mechanisms (a pre-3.2 `sasl` without a value) and they are unknown.
+    fn sasl_mechanisms(&self) -> Option<&str> {
+        self.0
+            .get("sasl")
+            .and_then(|value| value.as_deref())
+            .filter(|mechanisms| !mechanisms.is_empty())
+    }
+
+    /// 908 names the mechanisms authoritatively, after the fact.
+    fn replace_sasl_mechanisms(&mut self, mechanisms: &str) {
+        self.0
+            .insert("sasl".to_owned(), Some(mechanisms.to_owned()));
+    }
+
+    /// `Err` with the offered list when a known mechanism list omits
+    /// `mechanism`.
+    fn sasl_mechanism_offered(&self, mechanism: &str) -> Result<(), SaslRejection> {
+        match self.sasl_mechanisms() {
+            Some(offered) if !offered.split(',').any(|candidate| candidate == mechanism) => {
+                Err(SaslRejection::new(
+                    SaslFailure::MechanismNotOffered,
+                    &format!("requested {mechanism}; the server offers {offered}"),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Whether the server took part in capability negotiation at all. A server
+/// that answers `CAP` with 421 has no negotiation to end, so `CAP END` must not
+/// be sent to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilityNegotiation {
+    Open,
+    Unsupported,
+}
+
+/// The server's answer to one `CAP REQ`.
+#[derive(Debug, PartialEq, Eq)]
+enum CapabilityVerdict {
+    Acknowledged,
+    /// NAK or 410, with the bounded reason.
+    Refused(String),
+}
+
+/// Read `message` as the verdict on the one outstanding `CAP REQ` for
+/// `requested`. Requests are sent serially, so a verdict that omits a requested
+/// name is a malformed response, not permission to continue with an unknown
+/// capability state. `Ok(None)` means the message is not a verdict.
+fn capability_verdict(
+    message: &OwnedMessage,
+    requested: &[&str],
+) -> io::Result<Option<CapabilityVerdict>> {
+    if message.command == "410" {
+        return Ok(Some(CapabilityVerdict::Refused(registration_diagnostic(
+            message,
+        ))));
+    }
+    if message.command != "CAP" {
+        return Ok(None);
+    }
+    let Some(verdict @ ("ACK" | "NAK")) = message.params.get(1).map(String::as_str) else {
+        return Ok(None);
+    };
+    let names = message.params.last().map(String::as_str).unwrap_or("");
+    if let Some(omitted) = requested
+        .iter()
+        .find(|capability| !names.split_whitespace().any(|name| name == **capability))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("server capability {verdict} omitted requested capability {omitted}"),
+        ));
+    }
+    Ok(Some(if verdict == "ACK" {
+        CapabilityVerdict::Acknowledged
+    } else {
+        CapabilityVerdict::Refused("the server sent CAP NAK".to_owned())
+    }))
 }
 
 /// An owned message read from the server (its borrowed form would tie
@@ -177,14 +306,79 @@ pub struct ConnectionOptions {
     /// syntactic host portion of `address` is used.
     pub tls_server_name: Option<String>,
     pub nick: String,
+    /// The user name (ident) sent in `USER`. Stated, never derived: a legal
+    /// nickname (`_bot`) is not a legal user name, and servers answer a bad one
+    /// by closing the link.
+    pub username: String,
     pub realname: String,
     pub authentication: Authentication,
+    /// How long the server may take to finish registration, and afterwards to
+    /// answer each request this library waits on (a capability request, a
+    /// JOIN with its history). Required: a peer that holds the socket open
+    /// while saying nothing relevant would otherwise hang a scripted client
+    /// forever, and only the caller knows how long its user will wait.
+    pub response_deadline: std::time::Duration,
+    /// Whether SASL credentials may cross a plaintext connection to a server
+    /// that is not this machine. Required, so that sending a password in the
+    /// clear is something a caller's user asked for, never a default.
+    pub cleartext_credentials: CleartextCredentials,
+}
+
+/// See [`ConnectionOptions::cleartext_credentials`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleartextCredentials {
+    Refuse,
+    Allow,
+}
+
+/// Who a connection registers as. Named fields, because three adjacent strings
+/// in a call are one transposition away from a real name sent as the user name.
+#[derive(Debug, Clone, Copy)]
+pub struct Identity<'a> {
+    pub nick: &'a str,
+    /// The `USER` name (ident). Stated by the caller; see
+    /// [`ConnectionOptions::username`].
+    pub username: &'a str,
+    pub realname: &'a str,
+}
+
+/// A connection the server has welcomed, with the nickname it confirmed —
+/// which is the server's to choose (a bouncer answers with the upstream's
+/// nickname, a network may truncate or rename) and is the only name under
+/// which this client will recognise its own JOINs and direct messages.
+pub struct Registered {
+    pub connection: Connection,
+    pub nick: String,
 }
 
 impl ConnectionOptions {
     /// Connect, negotiate the selected transport/authentication, and return
     /// only after the server confirms registration.
-    pub async fn connect_registered(&self) -> io::Result<Connection> {
+    pub async fn connect_registered(&self) -> io::Result<Registered> {
+        within(
+            Some(self.response_deadline),
+            "connecting and registering",
+            self.connect_and_register(),
+        )
+        .await
+    }
+
+    async fn connect_and_register(&self) -> io::Result<Registered> {
+        // SASL PLAIN is the password in base64 and OAUTHBEARER is the token
+        // itself, so without TLS both are readable by everything on the path.
+        // Decided before dialing: nothing leaves the machine first.
+        if !self.tls
+            && !matches!(self.authentication, Authentication::None)
+            && self.cleartext_credentials == CleartextCredentials::Refuse
+            && !is_loopback_host(tls_server_name(&self.address)?)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to send SASL credentials in cleartext to a server that is not this \
+                 machine; connect with --tls, or pass --allow-cleartext-credentials to send \
+                 them unprotected",
+            ));
+        }
         let mut connection = if self.tls {
             let name = match self.tls_server_name.as_deref() {
                 Some(name) if !name.trim().is_empty() => name,
@@ -200,22 +394,92 @@ impl ConnectionOptions {
         } else {
             Connection::connect(&self.address).await?
         };
-        match &self.authentication {
-            Authentication::None => {
-                connection.register(&self.nick, &self.realname).await?;
-            }
+        let identity = Identity {
+            nick: &self.nick,
+            username: &self.username,
+            realname: &self.realname,
+        };
+        let nick = match &self.authentication {
+            Authentication::None => connection.register(&identity).await?,
             Authentication::Plain { account, password } => {
                 connection
-                    .register_sasl(&self.nick, &self.realname, account, password)
-                    .await?;
+                    .register_sasl(&identity, account, password)
+                    .await?
             }
             Authentication::OAuthBearer { token } => {
-                connection
-                    .register_oauthbearer(&self.nick, &self.realname, token)
-                    .await?;
+                connection.register_oauthbearer(&identity, token).await?
             }
-        }
-        Ok(connection)
+        };
+        connection.response_deadline = Some(self.response_deadline);
+        Ok(Registered { connection, nick })
+    }
+}
+
+/// Run one exchange with the server under `deadline`. A peer that keeps the
+/// socket open while sending lines that answer nothing defeats any per-read
+/// timeout, so the bound is on the whole exchange.
+async fn within<T>(
+    deadline: Option<std::time::Duration>,
+    what: &str,
+    exchange: impl Future<Output = io::Result<T>>,
+) -> io::Result<T> {
+    let Some(deadline) = deadline else {
+        return exchange.await;
+    };
+    tokio::time::timeout(deadline, exchange)
+        .await
+        .unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("the server did not finish {what} within {deadline:?}"),
+            ))
+        })
+}
+
+/// Whether `host` is this machine: `localhost`, a name under `.localhost`
+/// (RFC 6761), or a loopback address, bracketed or not. The one rule for "a
+/// plaintext connection that cannot be overheard"; the qualification harness
+/// applies the same rule to plaintext HTTP.
+pub fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+/// Whether `word` is a `USER` name every server accepts: 1–10 bytes, an ASCII
+/// letter or digit first, then ASCII letters, digits, `_` and `-`. A server
+/// answers a user name it dislikes by closing the link rather than with a
+/// numeric, so the portable grammar is the strict one. e6ircd's
+/// `UpstreamUsername` is the same grammar with reasons, and is tested against
+/// this predicate.
+pub fn is_portable_username(word: &str) -> bool {
+    let mut bytes = word.bytes();
+    word.len() <= 10
+        && bytes
+            .next()
+            .is_some_and(|first| first.is_ascii_alphanumeric())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+/// The `USER` name of a native client: the one stated, else the nickname —
+/// the one default both clients document — and that only when the nickname is
+/// itself a portable user name. A nickname that is not (`_bot`, `ada|away`,
+/// anything past ten bytes) is never shortened or rewritten into one; the
+/// caller is told to state a user name instead.
+pub fn stated_or_nick_username(stated: Option<&str>, nick: &str) -> io::Result<String> {
+    match stated {
+        Some(username) => Ok(username.to_owned()),
+        None if is_portable_username(nick) => Ok(nick.to_owned()),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the nickname {nick} cannot double as the IRC user name (ASCII letters, digits, \
+                 '_' and '-', starting with a letter or digit, at most 10 bytes); pass --username"
+            ),
+        )),
     }
 }
 
@@ -341,6 +605,8 @@ impl Connection {
             framing: LineBuffer::new(e6irc_proto::message::MAX_SERVER_FRAME_LEN),
             pending: std::collections::VecDeque::new(),
             read_buf: vec![0u8; 8192],
+            response_deadline: None,
+            advertised: AdvertisedCapabilities::default(),
         }
     }
 
@@ -531,16 +797,30 @@ impl Connection {
         Ok(false)
     }
 
-    async fn begin_cap(&mut self) -> io::Result<()> {
+    /// Discover what the server offers. A server with no capability
+    /// negotiation (421 for `CAP`) advertises nothing; whether that is
+    /// acceptable is the caller's decision, because only the caller knows
+    /// whether authentication was required.
+    async fn begin_cap(&mut self) -> io::Result<CapabilityNegotiation> {
         self.send_line("CAP LS 302").await?;
         loop {
             let msg = self.recv("closed during CAP discovery").await?;
             if let Some(err) = registration_refused(&msg) {
                 return Err(err);
             }
+            if msg.command == "421"
+                && msg
+                    .params
+                    .get(1)
+                    .is_some_and(|command| command.eq_ignore_ascii_case("CAP"))
+            {
+                return Ok(CapabilityNegotiation::Unsupported);
+            }
             if msg.command == "CAP" && msg.params.get(1).map(String::as_str) == Some("LS") {
+                self.advertised
+                    .record(msg.params.last().map(String::as_str).unwrap_or(""))?;
                 if msg.params.get(2).map(String::as_str) != Some("*") {
-                    return Ok(());
+                    return Ok(CapabilityNegotiation::Open);
                 }
             } else {
                 self.answer_ping(&msg).await?;
@@ -548,61 +828,61 @@ impl Connection {
         }
     }
 
-    /// Request `sasl` after capability discovery, returning once the server
-    /// acknowledges it. The shared prologue of every SASL path.
-    async fn negotiate_sasl_cap(&mut self) -> io::Result<()> {
-        self.begin_cap().await?;
-        if self.request_capability("sasl").await? {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "server refused SASL",
-            ))
+    /// Discover capabilities and enable `sasl` for `mechanism`. The shared
+    /// prologue of every SASL path. Everything that makes SASL impossible is
+    /// decided here, before any credential exchange starts, and is reported as
+    /// what it is rather than as a credential failure.
+    async fn negotiate_sasl_cap(&mut self, mechanism: &str) -> io::Result<()> {
+        let unavailable = |diagnostic: &str| {
+            Err(SaslRejection::new(SaslFailure::CapabilityNotOffered, diagnostic).into_error())
+        };
+        if self.begin_cap().await? == CapabilityNegotiation::Unsupported {
+            return unavailable("the server does not support capability negotiation");
+        }
+        if !self.advertised.offers("sasl") {
+            return unavailable("the server does not advertise the sasl capability");
+        }
+        self.advertised
+            .sasl_mechanism_offered(mechanism)
+            .map_err(SaslRejection::into_error)?;
+        match self.request_capabilities(&["sasl"]).await? {
+            CapabilityVerdict::Acknowledged => Ok(()),
+            CapabilityVerdict::Refused(reason) => {
+                unavailable(&format!("the server refused the sasl capability: {reason}"))
+            }
         }
     }
 
-    /// Ask for each optional metadata capability after discovery. A refusal is
-    /// harmless, but its reply must be consumed before registration continues.
+    /// Ask, in one request, for the metadata capabilities the server
+    /// advertised. They are optional, so a refusal is consumed and
+    /// registration continues without them.
     async fn request_metadata_capabilities(&mut self) -> io::Result<()> {
-        for capability in METADATA_CAPABILITIES {
-            // Optional metadata may be NAKed, but an ACK/NAK for some other
-            // capability cannot complete this outstanding request.
-            let _enabled = self.request_capability(capability).await?;
+        let wanted: Vec<&str> = METADATA_CAPABILITIES
+            .into_iter()
+            .filter(|capability| self.advertised.offers(capability))
+            .collect();
+        if wanted.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        match self.request_capabilities(&wanted).await? {
+            CapabilityVerdict::Acknowledged | CapabilityVerdict::Refused(_) => Ok(()),
+        }
     }
 
-    /// Request one capability and consume exactly its ACK/NAK. Registration
-    /// sends these requests serially, so a CAP verdict that omits the sole
-    /// outstanding name is a malformed peer response, not permission to
-    /// advance the state machine with an unknown capability state.
-    async fn request_capability(&mut self, capability: &str) -> io::Result<bool> {
-        self.send_line(&format!("CAP REQ :{capability}")).await?;
+    /// Request `capabilities` atomically and consume exactly their verdict.
+    async fn request_capabilities(
+        &mut self,
+        capabilities: &[&str],
+    ) -> io::Result<CapabilityVerdict> {
+        self.send_line(&format!("CAP REQ :{}", capabilities.join(" ")))
+            .await?;
         loop {
             let msg = self.recv("closed during capability negotiation").await?;
             if let Some(err) = registration_refused(&msg) {
                 return Err(err);
             }
-            if msg.command == "410" {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "server rejected capability negotiation",
-                ));
-            }
-            if msg.command == "CAP"
-                && let Some(verdict @ ("ACK" | "NAK")) = msg.params.get(1).map(String::as_str)
-            {
-                let names = msg.params.last().map(String::as_str).unwrap_or("");
-                if !names.split_whitespace().any(|name| name == capability) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "server capability {verdict} omitted requested capability {capability}"
-                        ),
-                    ));
-                }
-                return Ok(verdict == "ACK");
+            if let Some(verdict) = capability_verdict(&msg, capabilities)? {
+                return Ok(verdict);
             }
             self.answer_ping(&msg).await?;
         }
@@ -610,9 +890,9 @@ impl Connection {
 
     /// Wait for the server's empty `AUTHENTICATE +` challenge after a mechanism
     /// has been offered.
-    async fn await_authenticate_challenge(&mut self) -> io::Result<()> {
+    async fn await_authenticate_challenge(&mut self, mechanism: &str) -> io::Result<()> {
         loop {
-            let msg = self.recv_sasl_message().await?;
+            let msg = self.recv_sasl_message(mechanism).await?;
             if msg.command == "AUTHENTICATE" {
                 if msg.params.as_slice() == ["+"] {
                     return Ok(());
@@ -625,9 +905,9 @@ impl Connection {
         }
     }
 
-    async fn recv_sasl_message(&mut self) -> io::Result<OwnedMessage> {
+    async fn recv_sasl_message(&mut self, mechanism: &str) -> io::Result<OwnedMessage> {
         let msg = self.recv("closed during SASL").await?;
-        if let Some(err) = self.sasl_terminal_error(&msg).await? {
+        if let Some(err) = self.sasl_terminal_error(&msg, mechanism).await? {
             return Err(err);
         }
         Ok(msg)
@@ -637,30 +917,56 @@ impl Connection {
     /// numeric (a rejected NICK can arrive mid-SASL, before the welcome) or a
     /// SASL failure numeric. `Ok(None)` means keep looping; a PING was
     /// answered on the way.
-    async fn sasl_terminal_error(&mut self, msg: &OwnedMessage) -> io::Result<Option<io::Error>> {
+    ///
+    /// 908 is not a verdict: it lists the mechanisms and precedes the 904 that
+    /// is. It is remembered so that 904 can be told apart — a 904 for a
+    /// mechanism the server does not offer says nothing about the credentials.
+    async fn sasl_terminal_error(
+        &mut self,
+        msg: &OwnedMessage,
+        mechanism: &str,
+    ) -> io::Result<Option<io::Error>> {
         if let Some(err) = registration_refused(msg) {
             return Ok(Some(err));
         }
-        if matches!(
-            msg.command.as_str(),
-            "902" | "904" | "905" | "906" | "907" | "908"
-        ) {
-            return Ok(Some(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "SASL authentication failed",
-            )));
-        }
-        self.answer_ping(msg).await?;
-        Ok(None)
+        let failure = match msg.command.as_str() {
+            "908" => {
+                if let Some(mechanisms) = msg.params.get(1) {
+                    self.advertised.replace_sasl_mechanisms(mechanisms);
+                }
+                return Ok(None);
+            }
+            "902" => SaslFailure::NickLocked,
+            "904" => {
+                if let Err(not_offered) = self.advertised.sasl_mechanism_offered(mechanism) {
+                    return Ok(Some(not_offered.into_error()));
+                }
+                SaslFailure::Failed
+            }
+            "905" => SaslFailure::TooLong,
+            "906" => SaslFailure::Aborted,
+            "907" => SaslFailure::AlreadyAuthenticated,
+            _ => {
+                self.answer_ping(msg).await?;
+                return Ok(None);
+            }
+        };
+        Ok(Some(
+            SaslRejection::new(failure, &registration_diagnostic(msg)).into_error(),
+        ))
     }
 
     /// After the credential is sent: wait for the SASL verdict, finish CAP on
     /// success (903), then wait for the welcome (001). The shared epilogue of
     /// every SASL path — waiting for the verdict before `CAP END` so the server
     /// can't complete registration ahead of it and mask a failure.
-    async fn finish_sasl_then_welcome(&mut self, nick: &str) -> io::Result<String> {
+    async fn finish_sasl_then_welcome(
+        &mut self,
+        nick: &str,
+        mechanism: &str,
+    ) -> io::Result<String> {
         loop {
-            let msg = self.recv_sasl_message().await?;
+            let msg = self.recv_sasl_message(mechanism).await?;
             // 903 RPL_SASLSUCCESS: authenticated — now finish CAP.
             if msg.command == "903" {
                 self.send_line("CAP END").await?;
@@ -698,15 +1004,11 @@ impl Connection {
     /// during CAP negotiation, then register `nick`.
     pub async fn register_sasl(
         &mut self,
-        nick: &str,
-        realname: &str,
+        identity: &Identity<'_>,
         account: &str,
         password: &str,
     ) -> io::Result<String> {
-        self.negotiate_sasl_cap().await?;
-        self.request_metadata_capabilities().await?;
-        self.send_line("AUTHENTICATE PLAIN").await?;
-        self.await_authenticate_challenge().await?;
+        self.begin_sasl("PLAIN").await?;
         let payload = {
             let mut bytes = vec![0u8];
             bytes.extend_from_slice(account.as_bytes());
@@ -714,7 +1016,16 @@ impl Connection {
             bytes.extend_from_slice(password.as_bytes());
             e6irc_proto::base64::encode(&bytes)
         };
-        self.register_with_sasl(nick, realname, payload).await
+        self.register_with_sasl(identity, payload, "PLAIN").await
+    }
+
+    /// Negotiate SASL, offer `mechanism`, and wait for the server's empty
+    /// challenge — everything before the mechanism-specific payload.
+    async fn begin_sasl(&mut self, mechanism: &str) -> io::Result<()> {
+        self.negotiate_sasl_cap(mechanism).await?;
+        self.request_metadata_capabilities().await?;
+        self.send_line(&format!("AUTHENTICATE {mechanism}")).await?;
+        self.await_authenticate_challenge(mechanism).await
     }
 
     /// Send the registration info while CAP is still open, then the
@@ -723,13 +1034,14 @@ impl Connection {
     /// payload built, which is all that differs between them).
     async fn register_with_sasl(
         &mut self,
-        nick: &str,
-        realname: &str,
+        identity: &Identity<'_>,
         payload: String,
+        mechanism: &str,
     ) -> io::Result<String> {
-        self.send_registration_identity(nick, realname).await?;
+        self.send_registration_identity(identity).await?;
         self.send_sasl_payload(&payload).await?;
-        self.finish_sasl_then_welcome(nick).await
+        self.finish_sasl_then_welcome(identity.nick, mechanism)
+            .await
     }
 
     async fn send_sasl_payload(&mut self, payload: &str) -> io::Result<()> {
@@ -755,35 +1067,51 @@ impl Connection {
     /// e6irc API token) during CAP negotiation, then register `nick`.
     pub async fn register_oauthbearer(
         &mut self,
-        nick: &str,
-        realname: &str,
+        identity: &Identity<'_>,
         token: &str,
     ) -> io::Result<String> {
-        self.negotiate_sasl_cap().await?;
-        self.request_metadata_capabilities().await?;
-        self.send_line("AUTHENTICATE OAUTHBEARER").await?;
-        self.await_authenticate_challenge().await?;
+        self.begin_sasl("OAUTHBEARER").await?;
         // RFC 7628 client response: gs2 header, then the bearer credential.
         let payload =
             e6irc_proto::base64::encode(format!("n,,\x01auth=Bearer {token}\x01\x01").as_bytes());
-        self.register_with_sasl(nick, realname, payload).await
+        self.register_with_sasl(identity, payload, "OAUTHBEARER")
+            .await
     }
 
     /// Register with a nick and realname, answering PINGs, until the
     /// welcome (001) arrives. Returns the confirmed nick.
-    pub async fn register(&mut self, nick: &str, realname: &str) -> io::Result<String> {
-        self.begin_cap().await?;
-        self.request_metadata_capabilities().await?;
-        self.send_registration_identity(nick, realname).await?;
-        self.send_line("CAP END").await?;
-        self.await_welcome(nick).await
+    pub async fn register(&mut self, identity: &Identity<'_>) -> io::Result<String> {
+        match self.begin_cap().await? {
+            CapabilityNegotiation::Open => {
+                self.request_metadata_capabilities().await?;
+                self.send_registration_identity(identity).await?;
+                self.send_line("CAP END").await?;
+            }
+            // Nothing is authenticated on this path, so a server without
+            // capability negotiation costs only the optional metadata.
+            CapabilityNegotiation::Unsupported => {
+                self.send_registration_identity(identity).await?;
+            }
+        }
+        self.await_welcome(identity.nick).await
     }
 
-    async fn send_registration_identity(&mut self, nick: &str, realname: &str) -> io::Result<()> {
-        self.send_line(&format!("NICK {nick}")).await?;
+    async fn send_registration_identity(&mut self, identity: &Identity<'_>) -> io::Result<()> {
+        // `NICK` and the first `USER` parameter are single words on the wire;
+        // an empty one, or one with a space in it, silently becomes a different
+        // command (`USER 0 * :real` names the user "0").
+        for (what, word) in [("nick", identity.nick), ("username", identity.username)] {
+            if word.is_empty() || word.contains(char::is_whitespace) || word.starts_with(':') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("the registration {what} must be one non-empty word"),
+                ));
+            }
+        }
+        self.send_line(&format!("NICK {}", identity.nick)).await?;
         self.send_line(&format!(
-            "USER {} 0 * :{realname}",
-            registration_username(nick)
+            "USER {} 0 * :{}",
+            identity.username, identity.realname
         ))
         .await
     }
@@ -795,63 +1123,21 @@ impl Connection {
         if capabilities.is_empty() {
             return Ok(());
         }
-        self.send_line(&format!("CAP REQ :{}", capabilities.join(" ")))
-            .await?;
-        loop {
-            let msg = self.recv("closed during capability negotiation").await?;
-            match msg.command.as_str() {
-                "CAP" => match msg.params.get(1).map(String::as_str) {
-                    Some("ACK") => {
-                        let acknowledged = msg.params.last().map(String::as_str).unwrap_or("");
-                        let all_acknowledged = capabilities.iter().all(|required| {
-                            acknowledged
-                                .split_whitespace()
-                                .any(|capability| capability == *required)
-                        });
-                        if all_acknowledged {
-                            return Ok(());
-                        }
-                        return Err(io::Error::other(format!(
-                            "server capability ACK omitted a requested capability: {}",
-                            capabilities.join(" ")
-                        )));
-                    }
-                    Some("NAK") => {
-                        let rejected = msg.params.last().map(String::as_str).unwrap_or("");
-                        let all_rejected = capabilities.iter().all(|required| {
-                            rejected
-                                .split_whitespace()
-                                .any(|capability| capability == *required)
-                        });
-                        if !all_rejected {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "server capability NAK omitted a requested capability: {}",
-                                    capabilities.join(" ")
-                                ),
-                            ));
-                        }
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            format!(
-                                "server does not support required capabilities: {}",
-                                capabilities.join(" ")
-                            ),
-                        ));
-                    }
-                    _ => {}
-                },
-                "410" => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "server rejected capability negotiation",
-                    ));
-                }
-                _ => {
-                    self.answer_ping(&msg).await?;
-                }
-            }
+        let verdict = within(
+            self.response_deadline,
+            "answering a capability request",
+            self.request_capabilities(capabilities),
+        )
+        .await?;
+        match verdict {
+            CapabilityVerdict::Acknowledged => Ok(()),
+            CapabilityVerdict::Refused(reason) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "server does not support required capabilities: {} ({reason})",
+                    capabilities.join(" ")
+                ),
+            )),
         }
     }
 
@@ -862,7 +1148,7 @@ impl Connection {
         &mut self,
         target: &str,
         history_count: usize,
-    ) -> io::Result<Vec<OwnedMessage>> {
+    ) -> io::Result<Vec<ClientEvent>> {
         self.join_history(target, history_count, true).await
     }
 
@@ -874,7 +1160,7 @@ impl Connection {
         &mut self,
         target: &str,
         history_count: usize,
-    ) -> io::Result<Vec<OwnedMessage>> {
+    ) -> io::Result<Vec<ClientEvent>> {
         self.join_history(target, history_count, false).await
     }
 
@@ -883,61 +1169,111 @@ impl Connection {
         target: &str,
         history_count: usize,
         resume_after_marker: bool,
-    ) -> io::Result<Vec<OwnedMessage>> {
-        self.send_line(&format!("JOIN {target}")).await?;
-        let mut messages = Vec::new();
-        loop {
-            let msg = self.recv("closed before JOIN was confirmed").await?;
-            if is_join_refusal(&msg.command) {
-                let detail = msg.params.last().map(String::as_str).unwrap_or("");
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("cannot join {target}: {detail}"),
-                ));
+    ) -> io::Result<Vec<ClientEvent>> {
+        within(
+            self.response_deadline,
+            "confirming a JOIN and its history",
+            self.join_and_replay(target, history_count, resume_after_marker),
+        )
+        .await
+    }
+
+    /// The next event of a JOIN or history exchange. Read as the steady-state
+    /// stream is: a Latin-1 topic or an over-long history line is reported in
+    /// place, because neither is a reason to abandon the connection.
+    async fn next_join_event(
+        &mut self,
+        events: &mut Vec<ClientEvent>,
+        limit: usize,
+        context: &'static str,
+    ) -> io::Result<Option<OwnedMessage>> {
+        if events.len() >= limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the server sent more than {limit} lines without finishing the exchange"),
+            ));
+        }
+        let event = self
+            .next_event_lossy()
+            .await?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, context))?;
+        match event {
+            ClientEvent::Message(message) if self.answer_ping(&message).await? => Ok(None),
+            ClientEvent::Message(message) => Ok(Some(message)),
+            rejected @ ClientEvent::Rejected(_) => {
+                events.push(rejected);
+                Ok(None)
             }
-            let joined = msg.command == "366"
+        }
+    }
+
+    async fn join_and_replay(
+        &mut self,
+        target: &str,
+        history_count: usize,
+        resume_after_marker: bool,
+    ) -> io::Result<Vec<ClientEvent>> {
+        let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
+        self.send_line(&format!("JOIN {target}")).await?;
+        let mut events = Vec::new();
+        let mut read_marker = None;
+        loop {
+            let Some(msg) = self
+                .next_join_event(
+                    &mut events,
+                    MAX_JOIN_BURST_LINES,
+                    "closed before JOIN was confirmed",
+                )
+                .await?
+            else {
+                continue;
+            };
+            if let Some(refusal) = JoinRefusal::from_reply(target, &msg) {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, refusal));
+            }
+            let joined =
+                msg.command == "366" && msg.params.iter().any(|value| casemap.eq(value, target));
+            if msg.command == "MARKREAD"
                 && msg
                     .params
-                    .iter()
-                    .any(|value| e6irc_proto::casemap::CaseMapping::Rfc1459.eq(value, target));
-            self.answer_ping(&msg).await?;
-            if msg.command != "PING" {
-                messages.push(msg);
+                    .first()
+                    .is_some_and(|candidate| casemap.eq(candidate, target))
+            {
+                read_marker = msg
+                    .params
+                    .get(1)
+                    .and_then(|marker| marker.strip_prefix("timestamp="))
+                    .and_then(e6irc_proto::time::parse_server_time_millis)
+                    .map(e6irc_proto::time::server_time);
             }
+            events.push(ClientEvent::Message(msg));
             if joined {
                 break;
             }
         }
         if history_count == 0 {
-            return Ok(messages);
+            return Ok(events);
         }
 
-        let read_marker = if resume_after_marker {
-            messages.iter().rev().find_map(|message| {
-                (message.command == "MARKREAD"
-                    && message.params.first().is_some_and(|candidate| {
-                        e6irc_proto::casemap::CaseMapping::Rfc1459.eq(candidate, target)
-                    }))
-                .then(|| message.params.get(1))
-                .flatten()
-                .and_then(|marker| marker.strip_prefix("timestamp="))
-                .and_then(e6irc_proto::time::parse_server_time_millis)
-                .map(e6irc_proto::time::server_time)
-            })
-        } else {
-            None
-        };
-        let request = match read_marker {
+        let request = match read_marker.filter(|_| resume_after_marker) {
             Some(marker) => {
                 format!("CHATHISTORY AFTER {target} timestamp={marker} {history_count}")
             }
             None => format!("CHATHISTORY LATEST {target} * {history_count}"),
         };
         self.send_line(&request).await?;
+        let limit = events
+            .len()
+            .saturating_add(history_count)
+            .saturating_add(MAX_JOIN_BURST_LINES);
         let mut history_batch = None;
         loop {
-            let msg = self.recv("closed during CHATHISTORY playback").await?;
-            self.answer_ping(&msg).await?;
+            let Some(msg) = self
+                .next_join_event(&mut events, limit, "closed during CHATHISTORY playback")
+                .await?
+            else {
+                continue;
+            };
             if msg.command == "FAIL"
                 && msg
                     .params
@@ -964,34 +1300,88 @@ impl Connection {
                     break;
                 }
             }
-            if msg.command != "PING" {
-                messages.push(msg);
-            }
+            events.push(ClientEvent::Message(msg));
         }
-        Ok(messages)
+        Ok(events)
     }
 }
 
-/// The JOIN-refusal numerics (the set a client waits on to know a JOIN was
-/// rejected) — shared by the client crate's own drain loops and the CLI,
-/// which must fail on the same conditions rather than wait for a 366 that
-/// never comes.
-pub fn is_join_refusal(command: &str) -> bool {
+/// Lines a server may send between a `JOIN` and its end-of-names, or around a
+/// history batch, before this client stops accumulating them. A large channel's
+/// NAMES list is a few hundred lines; the bound only has to stop a peer from
+/// choosing how much memory a join costs.
+const MAX_JOIN_BURST_LINES: usize = 4096;
+
+/// A server's refusal to let this client into a channel, typed so a caller can
+/// tell "this one channel is closed to me" from a failed connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinRefusal {
+    channel: String,
+    forwarded_to: Option<String>,
+    diagnostic: String,
+}
+
+impl JoinRefusal {
+    pub fn from_error(error: &io::Error) -> Option<Self> {
+        typed_cause(error)
+    }
+
+    pub fn channel(&self) -> &str {
+        &self.channel
+    }
+
+    /// Read `reply` as the server's refusal of a `JOIN` of `channel`. 470 is a
+    /// refusal too: the server joined some other channel on its own initiative,
+    /// and the 366 that follows names that one, never `channel`.
+    fn from_reply(channel: &str, reply: &OwnedMessage) -> Option<Self> {
+        let forwarded_to = (reply.command == "470")
+            .then(|| reply.params.get(2))
+            .flatten()
+            .map(|forward| bounded_diagnostic(forward));
+        (forwarded_to.is_some() || is_join_refusal(&reply.command)).then(|| Self {
+            channel: channel.to_owned(),
+            forwarded_to,
+            diagnostic: registration_diagnostic(reply),
+        })
+    }
+
+    /// The channel a 470 says the server moved this client to instead.
+    pub fn forwarded_to(&self) -> Option<&str> {
+        self.forwarded_to.as_deref()
+    }
+}
+
+impl std::fmt::Display for JoinRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cannot join {}: {}", self.channel, self.diagnostic)?;
+        match &self.forwarded_to {
+            Some(forward) => write!(
+                f,
+                " (the server joined {forward} instead; this client did not ask for it)"
+            ),
+            None => Ok(()),
+        }
+    }
+}
+
+impl std::error::Error for JoinRefusal {}
+
+/// Whether a message target names a channel rather than a nickname. `&` marks
+/// a server-local channel and is as much a channel as `#`; the native clients
+/// share this so none of them joins one kind and silently ignores the other.
+pub fn is_channel_target(target: &str) -> bool {
+    target.starts_with(['#', '&'])
+}
+
+/// The JOIN-refusal numerics: the replies that mean the 366 a join waits for
+/// will never come. Every client joins through [`Connection::join_with_history`]
+/// or its sibling, so this is read in exactly one place
+/// ([`JoinRefusal::from_reply`]).
+fn is_join_refusal(command: &str) -> bool {
     matches!(
         command,
         "403" | "405" | "471" | "473" | "474" | "475" | "476" | "477" | "480"
     )
-}
-
-/// Return a USER field that fits the portable ten-character limit.
-fn registration_username(nick: &str) -> &str {
-    let end = nick
-        .char_indices()
-        .map(|(start, character)| start + character.len_utf8())
-        .take_while(|&end| end <= 10)
-        .last()
-        .unwrap_or(0);
-    &nick[..end]
 }
 
 /// Map a registration-refusal numeric to a terminal error, if it is one. These
@@ -1006,6 +1396,13 @@ pub enum RegistrationRefusal {
     ServerPasswordRejected,
     NetworkBanned,
     NotRegistered,
+    /// The server does not offer the SASL capability or mechanism this
+    /// connection was asked to authenticate with. Built only from a
+    /// [`SaslRejection`].
+    SaslUnavailable,
+    /// SASL ended without a verdict on the credentials (a locked account, an
+    /// aborted or over-long exchange). Built only from a [`SaslRejection`].
+    SaslFailed,
 }
 
 /// A server-supplied registration refusal whose detail is bounded and safe to
@@ -1025,14 +1422,46 @@ impl RegistrationRejection {
         }
     }
 
+    /// The server welcomed the connection, but under a nickname other than the
+    /// one requested (a server truncating to its NICKLEN, say). Whether that is
+    /// acceptable is the caller's decision — a bouncer's attach listener answers
+    /// with the upstream's nickname on purpose — so this is a value a caller
+    /// builds, not an error this library raises.
+    pub fn welcomed_as(requested: &str, welcomed: &str) -> Self {
+        Self {
+            refusal: RegistrationRefusal::InvalidNickname,
+            diagnostic: bounded_diagnostic(&format!(
+                "requested {requested}, but the server welcomed {welcomed}"
+            )),
+        }
+    }
+
+    /// Read a pre-welcome server reply as a refusal to register, if it is one.
+    /// Public because not every registration goes through this library's
+    /// socket: the bouncer's in-process network registers over a queue and must
+    /// read the core's replies by the same table, not a second copy of it.
+    pub fn from_reply(message: &OwnedMessage) -> Option<Self> {
+        let refusal = match message.command.as_str() {
+            "ERROR" => RegistrationRefusal::NotRegistered,
+            "432" => RegistrationRefusal::InvalidNickname,
+            "468" => RegistrationRefusal::InvalidUsername,
+            "433" => RegistrationRefusal::NicknameInUse,
+            "464" => RegistrationRefusal::ServerPasswordRejected,
+            "465" => RegistrationRefusal::NetworkBanned,
+            "451" => RegistrationRefusal::NotRegistered,
+            _ => return None,
+        };
+        Some(Self {
+            refusal,
+            diagnostic: registration_diagnostic(message),
+        })
+    }
+
     pub fn from_error(error: &io::Error) -> Option<Self> {
-        error
-            .get_ref()?
-            .downcast_ref::<RegistrationRefusalError>()
-            .map(|error| Self {
-                refusal: error.refusal,
-                diagnostic: error.diagnostic.clone(),
-            })
+        typed_cause::<RegistrationRefusalError>(error).map(|error| Self {
+            refusal: error.refusal,
+            diagnostic: error.diagnostic,
+        })
     }
 
     pub const fn refusal(&self) -> RegistrationRefusal {
@@ -1044,7 +1473,14 @@ impl RegistrationRejection {
     }
 }
 
-#[derive(Debug)]
+/// The typed cause this library attached to `error`, when it is a `T`. Every
+/// refusal a caller must act on differently travels this way, because an
+/// `io::ErrorKind` cannot tell a rejected password from a missing mechanism.
+fn typed_cause<T: std::error::Error + Clone + 'static>(error: &io::Error) -> Option<T> {
+    error.get_ref()?.downcast_ref::<T>().cloned()
+}
+
+#[derive(Debug, Clone)]
 struct RegistrationRefusalError {
     refusal: RegistrationRefusal,
     diagnostic: String,
@@ -1063,26 +1499,45 @@ impl std::fmt::Display for RegistrationRefusalError {
 impl std::error::Error for RegistrationRefusalError {}
 
 impl RegistrationRefusal {
+    /// Whether this refusal ends by itself, with nothing about the client's
+    /// configuration changed. A caller that gives up on repeated refusals must
+    /// not give up on these: whoever it serves would have to notice and re-save
+    /// settings that were never wrong.
+    ///
+    /// `SaslUnavailable` is the one such refusal: Solanum-family servers
+    /// withdraw the `sasl` capability for as long as services are down.
+    /// `NotRegistered` is deliberately not one, although a connection throttle
+    /// arrives that way: a pre-welcome `ERROR` also carries bans, "SASL access
+    /// only" and rejected usernames, and only the server's prose tells them
+    /// apart. A throttle is outlasted by any slow retry schedule; the permanent
+    /// closures never are, and retrying those forever is the worse mistake.
+    pub const fn clears_without_reconfiguration(self) -> bool {
+        match self {
+            Self::SaslUnavailable => true,
+            Self::InvalidNickname
+            | Self::InvalidUsername
+            | Self::NicknameInUse
+            | Self::ServerPasswordRejected
+            | Self::NetworkBanned
+            | Self::NotRegistered
+            | Self::SaslFailed => false,
+        }
+    }
+
     pub fn from_error(error: &io::Error) -> Option<Self> {
         RegistrationRejection::from_error(error).map(|rejection| rejection.refusal())
     }
 
-    fn error(self, message: &OwnedMessage) -> io::Error {
-        let kind = match self {
+    const fn error_kind(self) -> io::ErrorKind {
+        match self {
             Self::NicknameInUse => io::ErrorKind::AlreadyExists,
             Self::InvalidNickname => io::ErrorKind::InvalidInput,
             Self::InvalidUsername => io::ErrorKind::InvalidInput,
             Self::ServerPasswordRejected => io::ErrorKind::PermissionDenied,
             Self::NetworkBanned => io::ErrorKind::ConnectionAborted,
-            Self::NotRegistered => io::ErrorKind::Other,
-        };
-        io::Error::new(
-            kind,
-            RegistrationRefusalError {
-                refusal: self,
-                diagnostic: registration_diagnostic(message),
-            },
-        )
+            Self::NotRegistered | Self::SaslFailed => io::ErrorKind::Other,
+            Self::SaslUnavailable => io::ErrorKind::Unsupported,
+        }
     }
 }
 
@@ -1092,25 +1547,32 @@ impl RegistrationRefusal {
 /// "SASL access only" — and it can arrive at any of those stages, so it is
 /// classified here rather than by whichever loop happens to be running.
 fn registration_refused(message: &OwnedMessage) -> Option<io::Error> {
-    let refusal = match message.command.as_str() {
-        "ERROR" => RegistrationRefusal::NotRegistered,
-        "432" => RegistrationRefusal::InvalidNickname,
-        "468" => RegistrationRefusal::InvalidUsername,
-        "433" => RegistrationRefusal::NicknameInUse,
-        "464" => RegistrationRefusal::ServerPasswordRejected,
-        "465" => RegistrationRefusal::NetworkBanned,
-        "451" => RegistrationRefusal::NotRegistered,
-        _ => return None,
-    };
-    Some(refusal.error(message))
+    RegistrationRejection::from_reply(message).map(|rejection| {
+        io::Error::new(
+            rejection.refusal.error_kind(),
+            RegistrationRefusalError {
+                refusal: rejection.refusal,
+                diagnostic: rejection.diagnostic,
+            },
+        )
+    })
 }
 
 fn registration_diagnostic(message: &OwnedMessage) -> String {
-    let detail = message
-        .params
-        .last()
-        .map(String::as_str)
-        .unwrap_or("no detail");
+    bounded_diagnostic(
+        message
+            .params
+            .last()
+            .map(String::as_str)
+            .unwrap_or("no detail"),
+    )
+}
+
+/// The one bound on server-influenced text carried inside a typed refusal:
+/// short enough for a status line, and free of control characters so it can be
+/// relayed as an IRC NOTICE or printed to a terminal. Public so that a caller
+/// with refusals of its own (the bouncer's bridges) bounds them identically.
+pub fn bounded_diagnostic(detail: &str) -> String {
     detail
         .chars()
         .take(160)
@@ -1123,6 +1585,112 @@ fn registration_diagnostic(message: &OwnedMessage) -> String {
         })
         .collect()
 }
+
+/// Why SASL did not authenticate this connection.
+///
+/// Only [`SaslFailure::Failed`] says anything about the credentials. Every
+/// other variant is a property of the server, the account's state, or the
+/// exchange, and retyping a correct password can never clear it — which is why
+/// callers must not collapse them into one "authentication failed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaslFailure {
+    /// 904 for a mechanism the server does offer: the credentials are wrong.
+    Failed,
+    /// 902: the account is locked, held, or otherwise unavailable.
+    NickLocked,
+    /// 905: the server refused the length of the authentication message.
+    TooLong,
+    /// 906: the exchange was aborted.
+    Aborted,
+    /// 907: the connection had already authenticated.
+    AlreadyAuthenticated,
+    /// The server offers SASL, but not the mechanism this client was asked to
+    /// use (its advertised `sasl=` list, or a 908 list, omits it).
+    MechanismNotOffered,
+    /// The server does not offer SASL at all: no `sasl` capability, a refused
+    /// capability request, or no capability negotiation.
+    CapabilityNotOffered,
+}
+
+/// A typed SASL failure with a bounded, control-free diagnostic, carried as the
+/// inner value of the `io::Error` a registration call returns — the same shape
+/// as [`RegistrationRejection`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaslRejection {
+    failure: SaslFailure,
+    diagnostic: String,
+}
+
+/// What a [`SaslRejection`] obliges its caller to do. A credential rejection
+/// must never be retried (each attempt counts against the account upstream); any
+/// other SASL failure is an ordinary registration refusal. Splitting them here
+/// means no caller can route wrong credentials onto a retry schedule, or park a
+/// correct password as "rejected".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaslRejectionClass {
+    CredentialsRejected(SaslRejection),
+    RegistrationRefused(RegistrationRejection),
+}
+
+impl SaslRejection {
+    fn new(failure: SaslFailure, diagnostic: &str) -> Self {
+        Self {
+            failure,
+            diagnostic: bounded_diagnostic(diagnostic),
+        }
+    }
+
+    pub fn from_error(error: &io::Error) -> Option<Self> {
+        typed_cause(error)
+    }
+
+    pub const fn failure(&self) -> SaslFailure {
+        self.failure
+    }
+
+    pub fn diagnostic(&self) -> &str {
+        &self.diagnostic
+    }
+
+    pub fn class(self) -> SaslRejectionClass {
+        let refusal = match self.failure {
+            SaslFailure::Failed => return SaslRejectionClass::CredentialsRejected(self),
+            SaslFailure::MechanismNotOffered | SaslFailure::CapabilityNotOffered => {
+                RegistrationRefusal::SaslUnavailable
+            }
+            SaslFailure::NickLocked
+            | SaslFailure::TooLong
+            | SaslFailure::Aborted
+            | SaslFailure::AlreadyAuthenticated => RegistrationRefusal::SaslFailed,
+        };
+        SaslRejectionClass::RegistrationRefused(RegistrationRejection {
+            refusal,
+            diagnostic: self.diagnostic,
+        })
+    }
+
+    fn into_error(self) -> io::Error {
+        let kind = match self.failure {
+            SaslFailure::Failed => io::ErrorKind::PermissionDenied,
+            SaslFailure::MechanismNotOffered | SaslFailure::CapabilityNotOffered => {
+                io::ErrorKind::Unsupported
+            }
+            SaslFailure::NickLocked
+            | SaslFailure::TooLong
+            | SaslFailure::Aborted
+            | SaslFailure::AlreadyAuthenticated => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, self)
+    }
+}
+
+impl std::fmt::Display for SaslRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SASL {:?}: {}", self.failure, self.diagnostic)
+    }
+}
+
+impl std::error::Error for SaslRejection {}
 
 /// Install aws-lc-rs as the process rustls provider, once.
 fn install_crypto_provider() {
@@ -1164,13 +1732,6 @@ mod tests {
             assert_eq!(rejection.refusal(), expected);
             assert_eq!(rejection.diagnostic(), "refused");
         }
-    }
-
-    #[test]
-    fn registration_username_fits_the_portable_limit() {
-        assert_eq!(registration_username("alice_updated"), "alice_upda");
-        assert_eq!(registration_username("short"), "short");
-        assert_eq!(registration_username("ééééééééééx"), "ééééé");
     }
 
     #[test]
@@ -1264,22 +1825,325 @@ mod tests {
             .unwrap();
         assert_eq!(lines.next_line().await.unwrap().unwrap(), "CAP REQ :sasl");
         writer.write_all(b":srv CAP * ACK :sasl\r\n").await.unwrap();
-        for capability in METADATA_CAPABILITIES {
-            assert_eq!(
-                lines.next_line().await.unwrap().unwrap(),
-                format!("CAP REQ :{capability}")
-            );
-            writer
-                .write_all(format!(":srv CAP * ACK :{capability}\r\n").as_bytes())
-                .await
-                .unwrap();
-        }
+        assert_eq!(
+            lines.next_line().await.unwrap().unwrap(),
+            "CAP REQ :server-time message-tags account-tag"
+        );
+        writer
+            .write_all(b":srv CAP * ACK :server-time message-tags account-tag\r\n")
+            .await
+            .unwrap();
         assert_eq!(
             lines.next_line().await.unwrap().unwrap(),
             format!("AUTHENTICATE {mechanism}")
         );
         (lines, writer)
     }
+
+    /// One step of a scripted server: a line it must receive next, or a line it
+    /// sends.
+    enum Step {
+        Expect(&'static str),
+        Send(&'static str),
+    }
+    use Step::{Expect, Send};
+
+    /// A client wired to a server that plays `steps`, then reads to end of
+    /// stream and yields every line the client sent that no step expected.
+    fn scripted(steps: Vec<Step>) -> (Connection, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (connection, server_io) = duplex_connection(16 * 1024);
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server_io);
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            for step in steps {
+                match step {
+                    Expect(line) => assert_eq!(
+                        lines.next_line().await.unwrap().as_deref(),
+                        Some(line),
+                        "the client's next line"
+                    ),
+                    Send(line) => writer
+                        .write_all(format!("{line}\r\n").as_bytes())
+                        .await
+                        .unwrap(),
+                }
+            }
+            let mut unexpected = Vec::new();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                unexpected.push(line);
+            }
+            unexpected
+        });
+        (connection, server)
+    }
+
+    /// A server that answers capability discovery with `advertised`, then
+    /// plays `rest`.
+    fn after_discovery(advertised: &'static str, rest: Vec<Step>) -> Vec<Step> {
+        let mut steps = vec![Expect("CAP LS 302"), Send(advertised)];
+        steps.extend(rest);
+        steps
+    }
+
+    /// How a registration against the scripted server must end.
+    enum Ending {
+        Welcomed,
+        SaslRefused(SaslFailure, &'static str),
+    }
+
+    /// Register against `steps` — with SASL PLAIN when the ending is a SASL
+    /// one — and require that ending, and that the client sent nothing the
+    /// script did not expect. A registration that waits forever is the defect
+    /// several of these tests exist to catch, so the wait is bounded.
+    async fn assert_registration(steps: Vec<Step>, ending: Ending) -> Option<SaslRejection> {
+        let (mut connection, server) = scripted(steps);
+        let registration = async {
+            match ending {
+                Ending::Welcomed => connection.register(&TEST_IDENTITY).await,
+                Ending::SaslRefused(..) => {
+                    connection.register_sasl(&TEST_IDENTITY, "acct", "pw").await
+                }
+            }
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), registration)
+            .await
+            .expect("registration neither finished nor failed");
+        let rejection = match ending {
+            Ending::Welcomed => {
+                assert_eq!(result.expect("registered"), "nick");
+                None
+            }
+            Ending::SaslRefused(failure, diagnostic) => {
+                let error = result.expect_err("SASL must be refused");
+                let rejection = SaslRejection::from_error(&error)
+                    .unwrap_or_else(|| panic!("not a typed SASL rejection: {error:?}"));
+                assert_eq!(rejection.failure(), failure);
+                assert_eq!(rejection.diagnostic(), diagnostic);
+                Some(rejection)
+            }
+        };
+        drop(connection);
+        assert_eq!(
+            server.await.unwrap(),
+            Vec::<String>::new(),
+            "the client sent lines the server never asked for"
+        );
+        rejection
+    }
+
+    const IDENTITY_THEN_WELCOME: [Step; 4] = [
+        Expect("NICK nick"),
+        Expect("USER ident 0 * :real"),
+        Expect("CAP END"),
+        Send(":srv 001 nick :Welcome"),
+    ];
+
+    #[tokio::test]
+    async fn sasl_stops_before_authenticate_when_the_mechanism_is_not_advertised() {
+        let rejection = assert_registration(
+            after_discovery(
+                ":srv CAP * LS :sasl=EXTERNAL,SCRAM-SHA-256 server-time",
+                Vec::new(),
+            ),
+            Ending::SaslRefused(
+                SaslFailure::MechanismNotOffered,
+                "requested PLAIN; the server offers EXTERNAL,SCRAM-SHA-256",
+            ),
+        )
+        .await
+        .expect("a rejection");
+        assert!(matches!(
+            rejection.class(),
+            SaslRejectionClass::RegistrationRefused(refused)
+                if refused.refusal() == RegistrationRefusal::SaslUnavailable
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_multi_line_capability_list_is_accumulated_and_metadata_is_one_request() {
+        let mut steps = after_discovery(
+            ":srv CAP * LS * :server-time message-tags unrelated=x",
+            vec![
+                Send(":srv CAP * LS :account-tag"),
+                Expect("CAP REQ :server-time message-tags account-tag"),
+                Send(":srv CAP * ACK :server-time message-tags account-tag"),
+            ],
+        );
+        steps.extend(IDENTITY_THEN_WELCOME);
+        assert_registration(steps, Ending::Welcomed).await;
+    }
+
+    #[tokio::test]
+    async fn only_advertised_metadata_is_requested() {
+        let mut one = after_discovery(
+            ":srv CAP * LS :server-time",
+            vec![
+                Expect("CAP REQ :server-time"),
+                Send(":srv CAP * ACK :server-time"),
+            ],
+        );
+        one.extend(IDENTITY_THEN_WELCOME);
+        assert_registration(one, Ending::Welcomed).await;
+
+        let mut none = after_discovery(":srv CAP * LS :", Vec::new());
+        none.extend(IDENTITY_THEN_WELCOME);
+        assert_registration(none, Ending::Welcomed).await;
+    }
+
+    #[tokio::test]
+    async fn the_sasl_mechanism_list_numeric_is_remembered_not_mistaken_for_the_verdict() {
+        assert_registration(
+            // No `sasl=` value: the mechanisms are unknown until 908.
+            after_discovery(
+                ":srv CAP * LS :sasl",
+                vec![
+                    Expect("CAP REQ :sasl"),
+                    Send(":srv CAP * ACK :sasl"),
+                    Expect("AUTHENTICATE PLAIN"),
+                    Send(":srv 908 * EXTERNAL,SCRAM-SHA-256 :are available SASL mechanisms"),
+                    Send(":srv 904 * :SASL authentication failed"),
+                ],
+            ),
+            Ending::SaslRefused(
+                SaslFailure::MechanismNotOffered,
+                "requested PLAIN; the server offers EXTERNAL,SCRAM-SHA-256",
+            ),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sasl_failure_numerics_are_distinguished_and_keep_the_server_reason() {
+        for (verdict, expected) in [
+            (
+                ":srv 902 * :the server's own words",
+                SaslFailure::NickLocked,
+            ),
+            (":srv 904 * :the server's own words", SaslFailure::Failed),
+            (":srv 905 * :the server's own words", SaslFailure::TooLong),
+            (":srv 906 * :the server's own words", SaslFailure::Aborted),
+            (
+                ":srv 907 * :the server's own words",
+                SaslFailure::AlreadyAuthenticated,
+            ),
+        ] {
+            let rejection = assert_registration(
+                after_discovery(
+                    ":srv CAP * LS :sasl=PLAIN",
+                    vec![
+                        Expect("CAP REQ :sasl"),
+                        Send(":srv CAP * ACK :sasl"),
+                        Expect("AUTHENTICATE PLAIN"),
+                        Send(verdict),
+                    ],
+                ),
+                Ending::SaslRefused(expected, "the server's own words"),
+            )
+            .await
+            .expect("a rejection");
+            assert_eq!(
+                matches!(
+                    rejection.class(),
+                    SaslRejectionClass::CredentialsRejected(_)
+                ),
+                expected == SaslFailure::Failed,
+                "only a 904 for an offered mechanism is about the credentials"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_sasl_capability_is_a_worded_refusal() {
+        assert_registration(
+            after_discovery(":srv CAP * LS :server-time message-tags", Vec::new()),
+            Ending::SaslRefused(
+                SaslFailure::CapabilityNotOffered,
+                "the server does not advertise the sasl capability",
+            ),
+        )
+        .await;
+        for (refusal, diagnostic) in [
+            (
+                ":srv CAP * NAK :sasl",
+                "the server refused the sasl capability: the server sent CAP NAK",
+            ),
+            (
+                ":srv 410 * REQ :Invalid CAP command",
+                "the server refused the sasl capability: Invalid CAP command",
+            ),
+        ] {
+            assert_registration(
+                after_discovery(
+                    ":srv CAP * LS :sasl=PLAIN",
+                    vec![Expect("CAP REQ :sasl"), Send(refusal)],
+                ),
+                Ending::SaslRefused(SaslFailure::CapabilityNotOffered, diagnostic),
+            )
+            .await;
+        }
+    }
+
+    /// Configured SASL must never degrade to an unauthenticated registration,
+    /// and `CAP END` means nothing to a server that does not know `CAP`.
+    #[tokio::test]
+    async fn a_server_without_capability_negotiation_registers_plainly_but_never_skips_sasl() {
+        assert_registration(
+            after_discovery(
+                ":srv 421 * CAP :Unknown command",
+                vec![
+                    Expect("NICK nick"),
+                    Expect("USER ident 0 * :real"),
+                    Send(":srv 001 nick :Welcome"),
+                ],
+            ),
+            Ending::Welcomed,
+        )
+        .await;
+        assert_registration(
+            after_discovery(":srv 421 * CAP :Unknown command", Vec::new()),
+            Ending::SaslRefused(
+                SaslFailure::CapabilityNotOffered,
+                "the server does not support capability negotiation",
+            ),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_endless_capability_list_is_refused_not_accumulated() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut connection, server_io) = duplex_connection(1024 * 1024);
+        let server = tokio::spawn(async move {
+            let (_reader, mut writer) = tokio::io::split(server_io);
+            for line in 0..=MAX_ADVERTISED_CAPABILITIES {
+                writer
+                    .write_all(format!(":srv CAP * LS * :vendor/cap-{line}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            writer
+        });
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connection.register(&TEST_IDENTITY),
+        )
+        .await
+        .expect("an endless list must end the registration")
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        drop(server.await.unwrap());
+    }
+
+    /// A user name that is visibly not the nickname: nothing may derive one
+    /// from the other.
+    const TEST_IDENTITY: Identity<'static> = Identity {
+        nick: "nick",
+        username: "ident",
+        realname: "real",
+    };
 
     fn duplex_connection(capacity: usize) -> (Connection, tokio::io::DuplexStream) {
         let (client_io, server_io) = tokio::io::duplex(capacity);
@@ -1288,6 +2152,38 @@ mod tests {
             Connection::from_halves(Box::new(reader), Box::new(writer)),
             server_io,
         )
+    }
+
+    /// `USER  0 * :real` names the user "0", and `USER al ice 0 * :real` shifts
+    /// every parameter after it. Neither may reach the wire.
+    #[tokio::test]
+    async fn an_empty_or_spaced_registration_word_is_refused_before_it_is_sent() {
+        for (nick, username) in [
+            ("nick", ""),
+            ("nick", "al ice"),
+            ("", "ident"),
+            ("nick", ":x"),
+        ] {
+            let (mut connection, server_io) = duplex_connection(4096);
+            let identity = Identity {
+                nick,
+                username,
+                realname: "real",
+            };
+            let error = connection
+                .send_registration_identity(&identity)
+                .await
+                .expect_err("not one word");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            drop(connection);
+            let mut sent = Vec::new();
+            tokio::io::split(server_io)
+                .0
+                .read_to_end(&mut sent)
+                .await
+                .unwrap();
+            assert!(sent.is_empty(), "{nick:?}/{username:?} reached the wire");
+        }
     }
 
     #[tokio::test]
@@ -1309,7 +2205,7 @@ mod tests {
         });
 
         let error = connection
-            .request_capability("server-time")
+            .request_capabilities(&["server-time"])
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -1325,9 +2221,7 @@ mod tests {
         // failure numeric and holds the socket open. Without the terminal-numeric
         // handling in `await_authenticate_challenge`, this loops forever; with it,
         // register_sasl returns an error promptly.
-        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
-        let (cr, cw) = tokio::io::split(client_io);
-        let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
+        let (mut conn, server_io) = duplex_connection(16 * 1024);
 
         let server = tokio::spawn(async move {
             let (lines, mut sw) = negotiate_sasl(server_io, "PLAIN").await;
@@ -1347,7 +2241,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            conn.register_sasl("nick", "real", "acct", "pw"),
+            conn.register_sasl(&TEST_IDENTITY, "acct", "pw"),
         )
         .await;
         assert!(
@@ -1374,7 +2268,7 @@ mod tests {
         });
 
         let error = conn
-            .register_sasl("nick", "real", "acct", "pw")
+            .register_sasl(&TEST_IDENTITY, "acct", "pw")
             .await
             .unwrap_err();
         let rejection = RegistrationRejection::from_error(&error)
@@ -1391,9 +2285,7 @@ mod tests {
     async fn register_fails_loudly_on_error_before_welcome() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
-        let (cr, cw) = tokio::io::split(client_io);
-        let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
+        let (mut conn, server_io) = duplex_connection(16 * 1024);
         let server = tokio::spawn(async move {
             let (mut reader, mut writer) = tokio::io::split(server_io);
             writer
@@ -1404,7 +2296,7 @@ mod tests {
             while reader.read(&mut buffer).await.unwrap_or(0) != 0 {}
         });
 
-        let error = conn.register("nick", "real").await.unwrap_err();
+        let error = conn.register(&TEST_IDENTITY).await.unwrap_err();
         let rejection = RegistrationRejection::from_error(&error)
             .expect("a server ERROR before CAP completes is a typed refusal");
         assert_eq!(rejection.refusal(), RegistrationRefusal::NotRegistered);
@@ -1427,7 +2319,7 @@ mod tests {
             assert_eq!(lines.next_line().await.unwrap().unwrap(), "NICK nick");
             assert_eq!(
                 lines.next_line().await.unwrap().unwrap(),
-                "USER nick 0 * :real"
+                "USER ident 0 * :real"
             );
             assert!(
                 lines
@@ -1446,7 +2338,7 @@ mod tests {
 
         assert_eq!(
             connection
-                .register_oauthbearer("nick", "real", "token")
+                .register_oauthbearer(&TEST_IDENTITY, "token")
                 .await
                 .unwrap(),
             "nick"
@@ -1530,9 +2422,7 @@ mod tests {
     async fn relay_preserves_the_server_tag_allowance_but_rejects_an_overlong_body() {
         use tokio::io::AsyncWriteExt;
 
-        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
-        let (cr, cw) = tokio::io::split(client_io);
-        let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
+        let (mut conn, server_io) = duplex_connection(16 * 1024);
         let (_reader, mut writer) = tokio::io::split(server_io);
         let tagged = format!("@example={} :srv NOTICE nick :ok", "a".repeat(600));
         writer.write_all(tagged.as_bytes()).await.unwrap();
@@ -1559,9 +2449,7 @@ mod tests {
         // A Latin-1 body (0xE9 = 'é') any channel member can post is not valid
         // UTF-8. Strict `next_message` errors on it (the handshake wants that);
         // the interactive steady-state read must lossily decode and keep going.
-        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
-        let (cr, cw) = tokio::io::split(client_io);
-        let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
+        let (mut conn, server_io) = duplex_connection(16 * 1024);
 
         let (_sr, mut sw) = tokio::io::split(server_io);
         sw.write_all(b":nick PRIVMSG #c :caf\xe9\r\n")
@@ -1592,12 +2480,262 @@ mod tests {
         drop(sw);
     }
 
+    fn messages_of(events: &[ClientEvent]) -> Vec<&OwnedMessage> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ClientEvent::Message(message) => Some(message),
+                ClientEvent::Rejected(_) => None,
+            })
+            .collect()
+    }
+
+    /// A peer that keeps the socket busy with lines that answer nothing.
+    async fn chatter(mut writer: impl AsyncWrite + Unpin) {
+        while writer
+            .write_all(b":srv NOTICE * :still here\r\n")
+            .await
+            .is_ok()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Bound a call this test expects to give up by itself, so the defect shows
+    /// as a failure rather than a hung test run.
+    async fn must_give_up<T>(call: impl Future<Output = io::Result<T>>) -> io::Error {
+        tokio::time::timeout(std::time::Duration::from_secs(3), call)
+            .await
+            .expect("the call waited on the peer without a deadline")
+            .err()
+            .expect("the call cannot have succeeded")
+    }
+
+    fn anonymous(address: String, response_deadline: std::time::Duration) -> ConnectionOptions {
+        ConnectionOptions {
+            address,
+            tls: false,
+            tls_server_name: None,
+            nick: "requested".into(),
+            username: "ident".into(),
+            realname: "real".into(),
+            authentication: Authentication::None,
+            response_deadline,
+            cleartext_credentials: CleartextCredentials::Refuse,
+        }
+    }
+
+    /// SASL PLAIN is the password, base64-encoded; OAUTHBEARER is the token.
+    /// Without TLS either is readable by everything on the path.
+    #[tokio::test]
+    async fn credentials_are_not_sent_in_cleartext_to_another_machine() {
+        let plain = Authentication::Plain {
+            account: "account".into(),
+            password: "secret".into(),
+        };
+        let bearer = Authentication::OAuthBearer {
+            token: "token".into(),
+        };
+        for authentication in [plain.clone(), bearer] {
+            // TEST-NET-1: never dialed, because the refusal comes first.
+            let mut options = anonymous("192.0.2.1:6667".into(), std::time::Duration::from_secs(2));
+            options.authentication = authentication;
+            let error = must_give_up(options.connect_registered()).await;
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+            assert!(error.to_string().contains("cleartext"), "{error}");
+        }
+
+        // Loopback never leaves the machine; anonymous has nothing to protect;
+        // and the caller's user may insist. None of these is refused up front
+        // (the dial to a closed loopback port then fails as a dial).
+        for (address, authentication, cleartext) in [
+            ("127.0.0.1:1", plain.clone(), CleartextCredentials::Refuse),
+            ("localhost:1", plain.clone(), CleartextCredentials::Refuse),
+            ("[::1]:1", plain.clone(), CleartextCredentials::Refuse),
+            (
+                "192.0.2.1:1",
+                Authentication::None,
+                CleartextCredentials::Refuse,
+            ),
+            ("192.0.2.1:1", plain, CleartextCredentials::Allow),
+        ] {
+            let mut options = anonymous(address.into(), std::time::Duration::from_millis(200));
+            options.authentication = authentication;
+            options.cleartext_credentials = cleartext;
+            let error = must_give_up(options.connect_registered()).await;
+            assert_ne!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "{address}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unstated_username_is_the_nick_only_when_the_nick_is_a_legal_one() {
+        assert_eq!(
+            stated_or_nick_username(None, "alice").unwrap(),
+            "alice",
+            "a nick that is a legal user name doubles as one"
+        );
+        assert_eq!(
+            stated_or_nick_username(Some("ident"), "_bot").unwrap(),
+            "ident",
+            "a stated user name is used as stated"
+        );
+        // Never shortened, stripped or otherwise made to fit.
+        for nick in ["_bot", "ada|away", "[away]", "adalovelace", "zoë", ""] {
+            let error = stated_or_nick_username(None, nick).expect_err(nick);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{nick}");
+            assert!(error.to_string().contains("--username"), "{error}");
+        }
+    }
+
+    #[test]
+    fn loopback_hosts_are_recognised_by_name_and_by_address() {
+        for host in [
+            "localhost",
+            "irc.localhost",
+            "127.0.0.1",
+            "127.8.8.8",
+            "::1",
+            "[::1]",
+        ] {
+            assert!(is_loopback_host(host), "{host}");
+        }
+        for host in ["localhost.example", "192.0.2.1", "::2", "irc.example", ""] {
+            assert!(!is_loopback_host(host), "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_gives_up_at_the_response_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (_reader, writer) = socket.into_split();
+            chatter(writer).await;
+        });
+        let options = anonymous(address, std::time::Duration::from_millis(150));
+        let error = must_give_up(options.connect_registered()).await;
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+    }
+
+    #[tokio::test]
+    async fn requests_after_registration_give_up_at_the_response_deadline() {
+        for join in [false, true] {
+            let (mut connection, server_io) = duplex_connection(16 * 1024);
+            connection.response_deadline = Some(std::time::Duration::from_millis(150));
+            let (_reader, writer) = tokio::io::split(server_io);
+            let peer = tokio::spawn(chatter(writer));
+            let error = if join {
+                must_give_up(connection.join_with_history("#room", 0)).await
+            } else {
+                must_give_up(connection.require_capabilities(&["batch"])).await
+            };
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+            peer.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn the_server_confirmed_nick_is_returned() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let reply: &[u8] = match line.as_str() {
+                    "CAP LS 302" => b":bnc CAP * LS :\r\n",
+                    "CAP END" => b":bnc 001 upstream_nick :Welcome\r\n",
+                    _ => continue,
+                };
+                writer.write_all(reply).await.unwrap();
+            }
+        });
+        let registered = anonymous(address, std::time::Duration::from_secs(5))
+            .connect_registered()
+            .await
+            .expect("registered");
+        assert_eq!(registered.nick, "upstream_nick");
+    }
+
+    /// Join `#room` against a server that answers with exactly `reply`. Bounded,
+    /// because never finishing is one of the outcomes under test.
+    async fn join_answered_with(reply: &'static [u8]) -> io::Result<Vec<ClientEvent>> {
+        let (mut connection, server_io) = duplex_connection(16 * 1024);
+        let (_reader, mut writer) = tokio::io::split(server_io);
+        writer.write_all(reply).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            connection.join_with_latest_history("#room", 0),
+        )
+        .await
+        .expect("the join waited on the peer without a deadline")
+    }
+
+    /// A topic or history line in Latin-1 is routine on real networks. It is
+    /// read like the steady-state stream reads it, not as a fatal error.
+    #[tokio::test]
+    async fn a_non_utf8_line_while_joining_is_delivered_not_fatal() {
+        let events = join_answered_with(
+            b":srv 332 nick #room :caf\xe9\r\n:srv 366 nick #room :End of NAMES\r\n",
+        )
+        .await
+        .expect("a Latin-1 topic does not end the join");
+        let messages = messages_of(&events);
+        assert_eq!(
+            messages[0].params.last().map(String::as_str),
+            Some("caf\u{fffd}")
+        );
+    }
+
+    /// 470 means the server put this client somewhere it did not ask to be.
+    /// Waiting for a 366 that names the original channel never ends; treating
+    /// the forward's 366 as success silently follows it.
+    #[tokio::test]
+    async fn a_channel_forward_is_a_loud_refusal_naming_the_forward() {
+        let error = join_answered_with(
+            b":srv 470 nick #room #overflow :Forwarding to another channel\r\n\
+              :nick!u@h JOIN #overflow\r\n:srv 366 nick #overflow :End of NAMES\r\n",
+        )
+        .await
+        .expect_err("a forward is not the channel that was asked for");
+        let refusal = JoinRefusal::from_error(&error).expect("a typed join refusal");
+        assert_eq!(refusal.channel(), "#room");
+        assert_eq!(refusal.forwarded_to(), Some("#overflow"));
+        assert!(error.to_string().contains("#overflow"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_join_burst_without_end_is_bounded() {
+        let (mut connection, server_io) = duplex_connection(1024 * 1024);
+        let (_reader, mut writer) = tokio::io::split(server_io);
+        let flood = tokio::spawn(async move {
+            for _ in 0..=MAX_JOIN_BURST_LINES {
+                if writer
+                    .write_all(b":srv NOTICE nick :noise\r\n")
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            writer
+        });
+        let error = must_give_up(connection.join_with_latest_history("#room", 0)).await;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        drop(flood.await);
+    }
+
     async fn assert_history_request(expected_request: &'static str, resume_after_marker: bool) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
-        let (cr, cw) = tokio::io::split(client_io);
-        let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
+        let (mut conn, server_io) = duplex_connection(16 * 1024);
         let server = tokio::spawn(async move {
             let (sr, mut sw) = tokio::io::split(server_io);
             let mut lines = tokio::io::BufReader::new(sr).lines();
@@ -1643,6 +2781,7 @@ mod tests {
         } else {
             conn.join_with_latest_history("#Room", 50).await.unwrap()
         };
+        let messages = messages_of(&messages);
         assert!(messages.iter().any(|message| message.command == "MARKREAD"));
         assert!(messages.iter().any(|message| {
             message.command == "PRIVMSG"
@@ -1669,9 +2808,7 @@ mod tests {
     async fn required_capability_nak_is_not_a_downgrade() {
         use tokio::io::AsyncWriteExt;
 
-        let (client_io, server_io) = tokio::io::duplex(8192);
-        let (cr, cw) = tokio::io::split(client_io);
-        let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
+        let (mut conn, server_io) = duplex_connection(8192);
         let (_sr, mut sw) = tokio::io::split(server_io);
         sw.write_all(b":srv CAP nick NAK :draft/read-marker\r\n")
             .await

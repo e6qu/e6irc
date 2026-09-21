@@ -15,9 +15,9 @@ import {
   networkStateIsFailure,
   networksFrom,
   networkStateLabel,
-  saveSettings,
+  saveSetting,
 } from "../src/client-state.js";
-import { loadSettings as loadSharedSettings, saveSettings as saveSharedSettings } from "../src/settings.js";
+import { loadSettings as loadSharedSettings, saveSetting as saveSharedSetting } from "../src/settings.js";
 
 function storage(value, failure = null) {
   return {
@@ -68,11 +68,16 @@ test("console and chat share the same preference boundary", () => {
     getItem() { return stored; },
     setItem(_key, value) { stored = value; },
   };
-  assert.equal(saveSharedSettings(sharedStorage, { theme: "dark", notifications: true, rawOutput: true }), null);
+  // The chat turns notifications on; an already-open console tab, whose own
+  // snapshot predates that, then changes the theme. Each writes only what it
+  // changed, so neither undoes the other.
+  assert.equal(saveSharedSetting(sharedStorage, "notifications", true), null);
+  assert.equal(saveSetting(sharedStorage, "theme", "dark"), null);
   assert.deepEqual(loadSettings(sharedStorage), {
-    settings: { theme: "dark", notifications: true, rawOutput: true },
+    settings: { theme: "dark", notifications: true, rawOutput: false },
     warning: null,
   });
+  assert.throws(() => saveSetting(sharedStorage, "colour", "red"), TypeError);
 });
 
 test("storage denial is explicit on read and write", () => {
@@ -87,7 +92,7 @@ test("storage denial is explicit on read and write", () => {
   );
 
   assert.match(
-    saveSettings(storage(null, "write"), { theme: "light", notifications: true }),
+    saveSetting(storage(null, "write"), "theme", "light"),
     /rejected/,
   );
 });
@@ -220,9 +225,28 @@ test("a refusal quotes the network's own reason, while retrying as well as once 
   );
 });
 
+test("a refusal with no specific repair still quotes the network", () => {
+  assert.equal(
+    networkStateHelp({ state: "reconnecting", failureCode: "network_banned", failureDetail: "Trying to reconnect too fast." }),
+    "The network said: “Trying to reconnect too fast.”",
+  );
+  assert.equal(networkStateHelp({ state: "reconnecting", failureCode: "connection_lost", failureDetail: null }), null);
+});
+
+test("a network with no driver on this server is not reported as starting", () => {
+  assert.equal(networkStateLabel({ enabled: true, connected: null, runtime: null, state: null }), "not running");
+  assert.equal(networkStateLabel({ enabled: true, connected: false, runtime: { state: null }, state: null }), "starting");
+});
+
 test("a connected network carries no advice from an earlier failure", () => {
   assert.equal(
     networkStateHelp({ connected: true, state: "connected", failureCode: "registration_rejected" }),
     null,
   );
+});
+
+test("an error that already ends its sentence is not given a second full stop", () => {
+  assert.equal(errorMessage("load Libera", new Error("The API path schema is invalid.")), "Could not load Libera. The API path schema is invalid.");
+  assert.equal(errorMessage("load Libera", new Error("Database unavailable")), "Could not load Libera. Database unavailable.");
+  assert.equal(errorMessage("load Libera", new Error("")), "Could not load Libera.");
 });
