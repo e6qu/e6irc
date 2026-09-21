@@ -902,10 +902,20 @@ async fn slack_oracle_proves_all_required_phases_and_cleanup() {
     // arrived on.
     assert_eq!(oracle.opens.load(Ordering::SeqCst), 3);
     assert_eq!(oracle.posts.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        *oracle.acks.lock().expect("acks lock"),
-        ["env-other", "env-marker"]
-    );
+    // The campaign returns once its ack is written; the oracle reads that frame
+    // on its own task, so wait for it rather than race it.
+    let acks = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let acks = oracle.acks.lock().expect("acks lock").clone();
+            if acks.len() >= 2 {
+                return acks;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| oracle.acks.lock().expect("acks lock").clone());
+    assert_eq!(acks, ["env-other", "env-marker"]);
     assert_eq!(oracle.reads.load(Ordering::SeqCst), 1);
     assert_eq!(oracle.deletes.load(Ordering::SeqCst), 1);
 }

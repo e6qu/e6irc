@@ -962,18 +962,25 @@ pub(super) async fn oidc_frontchannel_logout(
     QueryParams(query): QueryParams<FrontchannelLogoutQuery>,
 ) -> Response {
     let pool = require_pool!(state);
-    if query.sid.trim().is_empty()
-        || !state
-            .oidc_providers
-            .iter()
-            .any(|provider| provider.issuer_url == query.iss)
-    {
+    // The provider loads this in an iframe (OpenID Connect Front-Channel
+    // Logout 1.0 §2), so its origin, and only its origin, may frame the answer.
+    // The baseline for `/api/` denies all framing, which blocked every logout.
+    let Some(frame_policy) = (!query.sid.trim().is_empty())
+        .then(|| {
+            state
+                .oidc_providers
+                .iter()
+                .find(|provider| provider.issuer_url == query.iss)
+        })
+        .flatten()
+        .and_then(|provider| frontchannel_frame_policy(&provider.issuer_url))
+    else {
         return problem(
             StatusCode::BAD_REQUEST,
             "Invalid front-channel logout",
             None,
         );
-    }
+    };
     if let Err(error) =
         crate::db::revoke_oidc_frontchannel_sessions(pool, &query.iss, &query.sid).await
     {
@@ -988,6 +995,7 @@ pub(super) async fn oidc_frontchannel_logout(
         StatusCode::OK,
         [
             (header::CACHE_CONTROL, "no-store".to_string()),
+            (header::CONTENT_SECURITY_POLICY, frame_policy),
             (
                 header::SET_COOKIE,
                 clear_session_cookie(state.secure_cookies),
@@ -996,6 +1004,19 @@ pub(super) async fn oidc_frontchannel_logout(
         "",
     )
         .into_response()
+}
+
+/// The front-channel logout answer's policy: nothing may load, and only the
+/// issuer's origin may frame it. `None` for an issuer with no tuple origin,
+/// which no provider can frame from.
+fn frontchannel_frame_policy(issuer_url: &str) -> Option<String> {
+    let origin = url::Url::parse(issuer_url).ok()?.origin();
+    origin.is_tuple().then(|| {
+        format!(
+            "default-src 'none'; frame-ancestors {}",
+            origin.ascii_serialization()
+        )
+    })
 }
 
 /// The single authentication choke point for the REST API: session
@@ -1768,6 +1789,16 @@ pub(super) fn session_user_agent(
 #[cfg(test)]
 mod domain_policy_tests {
     use super::*;
+
+    #[test]
+    fn frontchannel_logout_may_be_framed_by_its_issuer_only() {
+        assert_eq!(
+            frontchannel_frame_policy("https://id.example:8443/realms/main").as_deref(),
+            Some("default-src 'none'; frame-ancestors https://id.example:8443")
+        );
+        assert_eq!(frontchannel_frame_policy("not a url"), None);
+        assert_eq!(frontchannel_frame_policy("data:text/plain,x"), None);
+    }
 
     #[test]
     fn jwt_string_claims_parse_only_string_claims() {

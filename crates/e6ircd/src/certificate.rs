@@ -197,6 +197,7 @@ impl CertificateReloads {
     }
 
     /// Reload every certificate now (`SIGHUP`), reporting each outcome.
+    #[cfg(unix)]
     fn reload_all(&self) {
         for certificate in self.live() {
             match certificate.reload() {
