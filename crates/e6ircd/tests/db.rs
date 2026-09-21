@@ -7020,7 +7020,10 @@ async fn startup_database_wait_retries_a_refused_port_then_gives_up() {
         "postgres://postgres:postgres@127.0.0.1:{}/x",
         refusing_port()
     );
-    let wait = db::StartupDatabaseWait::from_seconds(2).expect("bounded");
+    // Eight seconds, not two: on Windows a connect to a closed loopback port
+    // can run into the two-second probe bound instead of failing at once, and
+    // the wait must still fit an attempt, the one-second pause, and a retry.
+    let wait = db::StartupDatabaseWait::from_seconds(8).expect("bounded");
     let mut reported: Vec<(u32, Option<std::time::Duration>)> = Vec::new();
     let started = std::time::Instant::now();
     let error = db::connect_and_migrate_with_retry(&url, wait, |attempt| {
@@ -7036,7 +7039,7 @@ async fn startup_database_wait_retries_a_refused_port_then_gives_up() {
     let elapsed = started.elapsed();
     assert!(
         elapsed >= std::time::Duration::from_secs(2)
-            && elapsed < std::time::Duration::from_secs(10),
+            && elapsed < std::time::Duration::from_secs(20),
         "the wait is the budget: {elapsed:?}"
     );
     let db::DbError::StartupWaitExhausted { attempts, last, .. } = error else {
@@ -7101,7 +7104,7 @@ fn daemon_exits_non_zero_after_its_startup_database_wait() {
             "server_name = \"irc.wait.test\"\nnetwork_name = \"WaitNet\"\n\
              [[listeners]]\naddr = \"127.0.0.1:0\"\n\
              [database]\nurl = \"postgres://postgres:postgres@127.0.0.1:{}/x\"\n\
-             startup_wait_seconds = 1\n",
+             startup_wait_seconds = 8\n",
             refusing_port()
         ),
     )
@@ -7114,15 +7117,17 @@ fn daemon_exits_non_zero_after_its_startup_database_wait() {
     let _ = std::fs::remove_dir_all(&directory);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{stderr}");
+    // The reason is the operating system's (refused here, a timed-out probe
+    // where a closed loopback port answers slowly); the shape is ours.
     assert!(
         stderr.contains("database connection attempt 1 failed")
-            && stderr.contains("Connection refused")
+            && stderr.contains("database connect failed")
             && stderr.contains("retrying in"),
         "{stderr}"
     );
     assert!(
         stderr.contains("database connection attempt 2 failed"),
-        "at least one retry within the one-second wait: {stderr}"
+        "at least one retry within the eight-second wait: {stderr}"
     );
     assert!(stderr.contains("giving up"), "{stderr}");
     assert!(
