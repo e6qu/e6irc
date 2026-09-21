@@ -1,0 +1,60 @@
+{
+  "admin_accounts": [],
+  "bnc_addr": null,
+  "core_queue": 65536,
+  "core_workers": 1,
+  "credentials_from_bootstrap": true,
+  "description": "e6irc server",
+  "limits": {
+    "administrator_api_rate_burst": 60,
+    "api_rate_burst": 240,
+    "auth_rate_burst": null,
+    "command_burst": null,
+    "max_connections_per_ip": null,
+    "registration_burst": null,
+    "trusted_proxies": []
+  },
+  "listeners": [
+    {
+      "addr": "127.0.0.1:6667",
+      "tls": null,
+      "websocket": false
+    }
+  ],
+  "max_hot_channels": 8192,
+  "motd": [],
+  "network_name": "e6qu",
+  "networks": [],
+  "nicklen": 16,
+  "observability": {
+    "enabled": true,
+    "retention_hours": 168,
+    "sample_interval_seconds": 15
+  },
+  "oidc_providers": [
+    {
+      "account_claim": "preferred_username",
+      "allowed_email_domains": [],
+      "client_id": "e6irc-dev",
+      "client_secret": "",
+      "end_session_endpoint": "https://auth.dev.e6qu.dev/oauth2/sessions/logout",
+      "issuer_url": "https://auth.dev.e6qu.dev",
+      "name": "shauth",
+      "scopes": [],
+      "token_endpoint_auth_method": "client_secret_post"
+    }
+  ],
+  "opers": [],
+  "public_url": "https://e6irc.dev.e6qu.dev",
+  "registration": {
+    "before_connect": false,
+    "require_email": false
+  },
+  "secure_cookies": true,
+  "sendq": 1024,
+  "server_name": "e6irc.dev.e6qu.dev",
+  "storage": {
+    "audit_retention_days": 365,
+    "history_retention_days": 30
+  }
+}

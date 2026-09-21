@@ -342,6 +342,127 @@ async fn half_sent_headers_and_idle_keep_alive_are_closed_at_the_header_deadline
     );
 }
 
+/// Only the half-sent request is a refusal. hyper reports the same timeout for
+/// a kept-alive connection that sat idle after its response, and a reverse
+/// proxy holding idle upstream connections made the deployed daemon log
+/// "refused … headers not received in time" every ten seconds.
+#[tokio::test]
+async fn an_idle_kept_alive_connection_is_not_logged_as_a_refusal() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a free port")
+        .port();
+    let directory = std::env::temp_dir().join(format!("e6irc-idle-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("config directory");
+    let config_path = directory.join("e6irc.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "server_name = \"irc.idle.example\"\nnetwork_name = \"IdleNet\"\n\
+             [[listeners]]\naddr = \"127.0.0.1:0\"\n\
+             [http]\naddr = \"127.0.0.1:{port}\"\nsecure_cookies = false\n"
+        ),
+    )
+    .expect("write config");
+    let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_e6ircd"))
+        .arg("--config")
+        .arg(&config_path)
+        .env_clear()
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("start e6ircd");
+    // Read stderr as it is written: the refusal is logged just after the
+    // socket closes, so reading only after a kill would race it.
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let reader = {
+        use std::io::BufRead as _;
+        let stderr = daemon.stderr.take().expect("piped stderr");
+        let lines = lines.clone();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr)
+                .lines()
+                .map_while(Result::ok)
+            {
+                lines.lock().expect("stderr lines").push(line);
+            }
+        })
+    };
+    let refusals = || {
+        lines
+            .lock()
+            .expect("stderr lines")
+            .iter()
+            .filter(|line| line.contains("headers not received in time"))
+            .count()
+    };
+    let http: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let started = std::time::Instant::now();
+    while TcpStream::connect(http).await.is_err() {
+        if let Some(status) = daemon.try_wait().expect("poll e6ircd") {
+            panic!("e6ircd exited before listening: {status}");
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "e6ircd never listened on {http}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let mut idle = TcpStream::connect(http).await.expect("connect");
+    idle.write_all(b"GET /healthz HTTP/1.1\r\nHost: t\r\n\r\n")
+        .await
+        .expect("a keep-alive request");
+    let mut response = [0u8; 1024];
+    let read = idle.read(&mut response).await.expect("response");
+    assert!(String::from_utf8_lossy(&response[..read]).starts_with("HTTP/1.1 200"));
+    let mut rest = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        idle.read_to_end(&mut rest),
+    )
+    .await
+    .expect("the idle connection is closed at the deadline")
+    .expect("read");
+
+    // Give a mistaken refusal line the time it would take to appear.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        refusals(),
+        0,
+        "the idle kept-alive close was logged as a refusal"
+    );
+
+    let mut half_sent = TcpStream::connect(http).await.expect("connect");
+    half_sent
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: t\r\n")
+        .await
+        .expect("part of a header block");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        half_sent.read_to_end(&mut rest),
+    )
+    .await
+    .expect("the half-sent request is closed at the deadline")
+    .expect("read");
+
+    let logged = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while refusals() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    daemon.kill().expect("stop e6ircd");
+    daemon.wait().expect("reap e6ircd");
+    reader.join().expect("stderr reader");
+    assert!(
+        logged.is_ok(),
+        "the half-sent request was not logged as a refusal"
+    );
+    assert_eq!(refusals(), 1, "exactly the half-sent request is a refusal");
+    std::fs::remove_dir_all(&directory).expect("remove config directory");
+}
+
 /// One address holding every request slot it may have — each one a request
 /// whose body never finishes — is refused further work, while the probes an
 /// orchestrator restarts the process on keep answering: they are not queued

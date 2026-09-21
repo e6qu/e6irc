@@ -1338,7 +1338,10 @@ service, not one per route, and a request abandoned at the deadline answers a
 `408` problem document. Connections are served with a timer: a request's
 headers must arrive within 10 s, and the same bound closes an idle kept-alive
 connection (axum's default server has no timer, which silently drops hyper's
-header timeout). One address may hold 128 connections (trusted proxies
+header timeout). Only a connection that never completed a request is logged as
+a refused peer; an idle kept-alive connection closed at the bound is ordinary,
+and a reverse proxy's idle upstream connections used to log a "refused" line
+every ten seconds. One address may hold 128 connections (trusted proxies
 exempt) and 32 requests in flight (429 beyond); `/healthz` and `/readyz`
 bypass the admission bounds, so one client cannot starve the health check. A connection test dials a host the caller chose from
 the address every tenant shares, so it has its own admission: one running test
@@ -2861,7 +2864,13 @@ Layers, bottom to top:
 7. **e2e (API & network)**: REST `/api/v1` exercised over HTTP against a
    running `e6ircd` + Postgres (docker-composed in CI); IRC flows exercised
    over real sockets, including TLS.
-8. **UI tests**: Playwright drives real OIDC and local-password authentication
+8. **Released settings rows**: `tests/fixtures/server_settings/` holds the
+   managed configuration each release stored, captured by that release's own
+   code and named `<its last migration>-<release>.json`; a PostgreSQL test
+   loads every one through today's migrations. A change to the stored shape
+   adds the previous release's fixture. The deploy of `c51261725b5d`
+   crash-looped on a `null` that no fresh-row test could hold (migration 0067).
+9. **UI tests**: Playwright drives real OIDC and local-password authentication
    through Chromium, Firefox, and WebKit; exact Shauth qualification uses
    Chromium. Firefox runs with `browser.tabs.remote.useCrossOriginOpenerPolicy`
    off: pages send `Cross-Origin-Opener-Policy: same-origin`, and the context
@@ -2875,7 +2884,7 @@ Layers, bottom to top:
    operations data, visits every administrator directory, mutates and audits a
    server ban, verifies queue monitoring in HTML and JSON, then gracefully
    restarts the daemon and proves session/network/backlog recovery.
-9. **Load**: `e6irc-load` and `tools/load/sweep.sh` measure connection rate,
+10. **Load**: `e6irc-load` and `tools/load/sweep.sh` measure connection rate,
    duplicate-proof exact fan-out sequence delivery, and latency percentiles;
    any client, socket, malformed sequence, missing/duplicate delivery, or
    supplied-threshold failure is a nonzero process exit. CI exercises 64

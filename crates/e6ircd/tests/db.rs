@@ -8696,6 +8696,67 @@ async fn the_read_marker_cap_is_enforced_by_the_database() {
 
 // ---- corrective and backfilling migrations ---------------------------------
 
+/// Every settings row a released e6irc wrote must still load after today's
+/// migrations. Each fixture in `tests/fixtures/server_settings/` is the managed
+/// configuration a release stored, captured by that release's own code, named
+/// `<its last migration>-<release>.json`. When a change alters the stored shape
+/// (a field made required, renamed or retyped), add the previous release's
+/// fixture; the deploy of c51261725b5d crash-looped because no test held an
+/// old row.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn settings_rows_written_by_released_versions_load_after_migrating() {
+    let directory =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/server_settings");
+    let mut fixtures: Vec<_> = std::fs::read_dir(&directory)
+        .expect("settings fixtures")
+        .map(|entry| entry.expect("fixture entry").path())
+        .collect();
+    fixtures.sort();
+    assert!(
+        !fixtures.is_empty(),
+        "no settings fixtures in {directory:?}"
+    );
+    for fixture in fixtures {
+        let name = fixture
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("fixture name")
+            .to_owned();
+        let level: i64 = name
+            .split_once('-')
+            .and_then(|(level, _)| level.parse().ok())
+            .unwrap_or_else(|| panic!("{name}: fixtures are named <migration>-<release>.json"));
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture).expect("read fixture"))
+                .expect("fixture JSON");
+        let pool =
+            sqlx::PgPool::connect(&support::test_db(&format!("settings_fixture_{name}")).await)
+                .await
+                .expect("connect");
+        MIGRATIONS
+            .run_to(level, &pool)
+            .await
+            .unwrap_or_else(|error| panic!("{name}: migrate to {level}: {error}"));
+        sqlx::query(
+            "INSERT INTO server_settings (singleton, revision, settings, updated_by)
+             VALUES (TRUE, 1, $1, 'fixture')",
+        )
+        .bind(&settings)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("{name}: store the release's row: {error}"));
+        MIGRATIONS
+            .run(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("{name}: migrate to latest: {error}"));
+        db::load_managed_config(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("{name}: the release's row no longer loads: {error}"));
+        pool.close().await;
+    }
+}
+
 /// A settings row saved while `limits.command_burst` was optional stores it as
 /// `null`, which the required field cannot read: the daemon refused to start on
 /// the deployed row. 0067 turns that `null` into the documented default.
