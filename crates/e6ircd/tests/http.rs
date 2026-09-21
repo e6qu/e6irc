@@ -415,6 +415,15 @@ async fn an_idle_kept_alive_connection_is_not_logged_as_a_refusal() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    // Accepting is not ready: an instrumented build answers before its health
+    // check passes.
+    while request(http, &get("/healthz")).await.0 != 200 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "e6ircd never became healthy"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     let mut idle = TcpStream::connect(http).await.expect("connect");
     idle.write_all(b"GET /healthz HTTP/1.1\r\nHost: t\r\n\r\n")
@@ -422,7 +431,8 @@ async fn an_idle_kept_alive_connection_is_not_logged_as_a_refusal() {
         .expect("a keep-alive request");
     let mut response = [0u8; 1024];
     let read = idle.read(&mut response).await.expect("response");
-    assert!(String::from_utf8_lossy(&response[..read]).starts_with("HTTP/1.1 200"));
+    let answer = String::from_utf8_lossy(&response[..read]);
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
     let mut rest = Vec::new();
     tokio::time::timeout(
         std::time::Duration::from_secs(20),
