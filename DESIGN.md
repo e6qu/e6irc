@@ -2671,7 +2671,10 @@ but the CLI, TUI, and BNC must surface the rejection.
   `Cache-Control: no-store`; pages add `Cross-Origin-Opener-Policy:
   same-origin`; JSON, problem documents and `/api/` responses add
   `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`. Each is
-  added by one baseline layer only where the handler set none. The console's
+  added by one baseline layer only where the handler set none. The one
+  frameable answer is OpenID Connect front-channel logout, which the provider
+  loads in an iframe: it sets `frame-ancestors` to that issuer's origin alone
+  (`tools/test-shauth-sso.mjs` proves the provider's iframes reach it). The console's
   CSP admits no inline style (`style-src 'self'`, stylesheet at
   `/console.css`).
 - A client address is canonicalised once (`ClientIp`): IPv4-mapped IPv6
