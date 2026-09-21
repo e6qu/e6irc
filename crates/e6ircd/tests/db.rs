@@ -8696,6 +8696,47 @@ async fn the_read_marker_cap_is_enforced_by_the_database() {
 
 // ---- corrective and backfilling migrations ---------------------------------
 
+/// A settings row saved while `limits.command_burst` was optional stores it as
+/// `null`, which the required field cannot read: the daemon refused to start on
+/// the deployed row. 0067 turns that `null` into the documented default.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_settings_row_with_a_null_command_burst_loads_after_0067() {
+    let pool = sqlx::PgPool::connect(
+        &support::test_db("a_settings_row_with_a_null_command_burst_loads").await,
+    )
+    .await
+    .expect("connect");
+    MIGRATIONS.run_to(66, &pool).await.expect("through 0066");
+    let bootstrap =
+        e6ircd::config::ManagedConfig::from_config(&Config::default(), None).expect("bootstrap");
+    db::load_or_initialize_managed_config(&pool, &bootstrap)
+        .await
+        .expect("initialize");
+    sqlx::query(
+        "UPDATE server_settings
+         SET settings = jsonb_set(settings, '{limits,command_burst}', 'null'::jsonb)",
+    )
+    .execute(&pool)
+    .await
+    .expect("store the old shape");
+    assert!(
+        matches!(
+            db::load_managed_config(&pool).await,
+            Err(db::DbError::InvalidServerSettings(_))
+        ),
+        "the old shape must be what failed"
+    );
+    MIGRATIONS.run(&pool).await.expect("migrate to latest");
+    let loaded = db::load_managed_config(&pool)
+        .await
+        .expect("loads after 0067");
+    assert_eq!(
+        loaded.settings.limits.command_burst,
+        e6ircd::config::DEFAULT_COMMAND_BURST
+    );
+}
+
 /// 0066 folds the targets 0059 wrote under display names, so a mixed-case
 /// account sees its own revocations.
 #[tokio::test]
