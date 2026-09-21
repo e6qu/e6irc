@@ -691,8 +691,24 @@ strip = "symbols"
   through a **bounded** per-connection queue of `Bytes` (SendQ). Queue-full →
   the classic ircd answer: kill the slow client with a "SendQ exceeded" quit.
   No unbounded buffering, no silent drops.
-- RecvQ/flood control: token-bucket per connection (configurable burst/rate),
-  plus per-IP connection throttle and registration throttle.
+- RecvQ/flood control: a token bucket per connection, on by default with
+  Solanum's shape (`limits.command_burst = 40` tokens, `limits.command_rate =
+  20` per second; a registered non-oper session spends one per command, PING
+  and PONG exempt, and is closed with Excess Flood when the bucket is empty),
+  plus per-IP connection throttle and registration throttle. It used to be off
+  by default with a fixed one-token-per-second refill, which left every
+  output-amplifying command class — repeated JOIN/NAMES targets, repeated list
+  modes — unbounded for anyone who never turned it on, and made any burst that
+  was turned on flood-kill an ordinary autojoin storm.
+- JOIN, PART and NAMES target lists are casefold-deduplicated and bounded by
+  the advertised `TARGMAX` (`JOIN:250`, `PART:250` — the channel limit — and
+  `NAMES:1`, as on Libera); the first target past the bound is refused with
+  ERR_TOOMANYTARGETS. A JOIN of a channel already joined is a no-op (no echo,
+  TOPIC or NAMES; a comma list naming a 10k-member channel a hundred times used
+  to clone its member list a hundred times). A list mode named more than once
+  in one MODE is dumped once. `TOPIC <channel>` with one parameter is a query
+  however it is framed (`TOPIC :#c` used to clear the topic). Every echo of
+  client text, PONG included, is fitted to the 512-byte wire limit.
 - Registration pipeline: `CAP LS 302` → (SASL) → NICK/USER → welcome burst
   (001–005 with ISUPPORT, LUSERS, MOTD). SASL-required mode configurable
   globally and per-IP-range.
@@ -863,9 +879,17 @@ that is abandoned or fails validation delivers *nothing* — a truncated version
 of what the sender wrote would be worse than silence, and the sender is told why
 with `FAIL BATCH`. A batch may not mix PRIVMSG and NOTICE (it is one message,
 and NOTICE's "never auto-reply" meaning cannot be applied to half of it), and
-TAGMSG may not join one at all. If the opening BATCH was labeled, the failure
-carries that label: the batch was the response owed to that command, so without
-it a client tracking labels would wait forever.
+TAGMSG may not join one at all. A line inside a batch must address the batch's
+target (`FAIL BATCH MULTILINE_INVALID_TARGET`), the concat tag may not open a
+batch, and a `@batch` tag with no reference — or naming a batch this connection
+never opened — is refused, never delivered as a plain message; a batch
+reference is non-empty by construction. If the opening BATCH was labeled, the
+failure carries that label: the batch was the response owed to that command,
+so without it a client tracking labels would wait forever. Whether a captured
+labeled response is already one batch (CHATHISTORY) is decided by parsing its
+first and last lines as `BATCH +ref` / `BATCH -ref` commands, never by
+searching message text, so an echo whose body reads `BATCH +z` cannot escape
+its labeled batch.
 
 Recipients that negotiated the capability receive the batch as sent, blank lines
 and `draft/multiline-concat` tags intact, because those are what the sender
@@ -1021,7 +1045,10 @@ Principal tables (columns abridged):
   make the bounded buffer retain an unbounded entry.
   Retention is per (owner, network): the persistence task counts its own
   appends and trims to the newest `BNC_BUFFER_CAP` at every
-  `BNC_TRIM_INTERVAL`. The count belongs to that task, not to the table's `id`
+  `BNC_TRIM_INTERVAL`, and rows older than `storage.history_retention_days`
+  are deleted by storage maintenance in bounded batches (index
+  `bnc_buffer_created_at_idx`, migration 0060) — "history retention" means
+  bouncer history, direct messages included, not only the server's own. The count belongs to that task, not to the table's `id`
   sequence — one sequence is shared by every network, so triggering off it
   makes retention depend on the interleaving between them
 - `bnc_read_markers` (BIGINT account_id, network, target, timestamp) —
@@ -1029,7 +1056,13 @@ Principal tables (columns abridged):
   `draft/read-marker` on the attach listener. Distinct from `read_markers`
   below, which tracks the core's local-server targets. Writes lock the durable
   account row in their transaction, increase monotonically, and admit at most
-  256 targets per account even under concurrent inserts. The committed value
+  256 targets per account even under concurrent inserts; the core keeps a
+  per-account count of distinct marker targets (confirmed or with a write in
+  flight), maintained at every write to the marker maps — which are private to
+  the state module for exactly that reason — so the cap costs a lookup per
+  MARKREAD rather than a scan of every account's markers, and sibling-connection
+  sync uses an account → connections index kept at login, logout and close. The
+  committed value
   is acknowledged and fanned out only to other read-marker-capable attachments
   of the same account. Deleting a BNC network deletes its markers, so
   recreating the same name cannot inherit stale read state.
@@ -1106,7 +1139,11 @@ on the host, where the configuration and the database already are: `e6ircd
 recover-administrator --account NAME [<configuration>]`. In one transaction it
 gives one *existing, active* account a new 32-random-byte password printed
 once, durable administrator authority, and no remaining browser sessions, and
-writes an `ADMINISTRATOR_RECOVERY` audit row whose actor is
+writes an `ADMINISTRATOR_RECOVERY` audit row (every creation path writes
+`ACCOUNT_CREATE` too — IRC self-registration with the account as actor, OpenID
+Connect provisioning with `oidc:<issuer>`; `NETWORK_CREATE`/`NETWORK_UPDATE`
+details name the fields present or changed, `CONFIG` detail ends with the
+changed dotted field names, and values never appear) whose actor is
 `host:recover-administrator`. An unknown or suspended account is refused and
 nothing is changed. It needs no restart: the running daemon honours the
 granted authority and the revoked credentials on its next request, and the
@@ -1268,6 +1305,13 @@ service, not one per route, and a request abandoned at the deadline answers a
 the address every tenant shares, so it has its own admission: one running test
 per account, six started per account per minute, and eight running in the
 process; a refusal is a `429` with `Retry-After` and costs the account nothing.
+The test registers and says `QUIT :connection test complete`; it joins no
+channel (registration is the qualification, and a join would be visible
+noise on the owner's public channels), so its answer names the confirmed nick
+and the timings only. While the network being tested is running, the test is
+refused with a `409` ("network is running; disable it to test its settings"):
+the running driver holds the nick, so the test could only answer
+`nickname_in_use`, and the server never probes under an invented nick.
 The verb lives at `/api/v1/me/network-preflight`, outside the positions a
 network name occupies — the contract check refuses any two route patterns one
 URL could satisfy, so no resource name is unreachable.
@@ -1403,7 +1447,10 @@ back to the browser. A bridge is configured on the Integrations page, so the
 IRC edit form refuses non-IRC kinds. The manager is available to any
 authenticated user for their own networks. The create form defaults to a
 Libera Chat preset and offers a small, provenance-dated catalog of published
-TLS endpoints (Libera, OFTC, EFnet, Snoonet) plus Custom. A preset's human label
+TLS endpoints (Libera, OFTC, Snoonet — each verified as a TLS registration
+through the driver, with a certificate valid for the preset hostname; EFnet is
+absent because no member of its round robin presents one for `irc.efnet.org`)
+plus Custom. A preset's human label
 is never its client/URL identifier: `Libera Chat` maps to the safe stable id
 `libera`. Presets are applied server-side so they work without JavaScript;
 the script only mirrors their fields for editing. A preset is endpoint
@@ -1622,46 +1669,57 @@ upstream's.
   from upstream when available (Libera: yes). It deliberately does not
   request `echo-message`: the driver synthesizes self-echoes itself
   (§10.1), and requesting it would produce every echo twice.
-  Synthesized message echoes rebuild their prefixed traditional body within
-  the 512-byte wire allowance, preserving valid client-only tags and cutting
+  Synthesized message echoes carry the prefix the upstream shows for this
+  session — `nick!user@host`, with the configured user name (tilde included
+  when the upstream adds one) and the server's name until the first self-echo
+  or `396` reveals the real user and host — and rebuild their traditional body
+  within the 512-byte wire allowance, preserving valid client-only tags and cutting
   trailing UTF-8 only at a character boundary; malformed message commands do
   not manufacture an echo the upstream would never send. NickServ commands
   that can contain a password, email address, verification code, recovery
   token, or replacement credential synthesize only a redacted trailing field,
   while the exact command is still sent upstream.
 - Auto-reconnect has two schedules, because a lost packet and a refusal are
-  different events. A transient drop retries with exponential backoff + jitter
-  from 200ms to a 30s cap. A refusal is the upstream's policy answer and never
-  takes that schedule. **Rejected credentials park on the first rejection**:
-  a retry re-sends the same password, can only fail the same way, and every
-  failure counts against the owner's account on the upstream. **Any other
-  registration refusal** (a ghost on the nick, a connection throttle, a ban
-  that expires) retries after 30s, 1m, 2m, and 4m and parks on the fifth **of
-  one kind** in a row — a refusal of another kind starts the count over, so the
-  433 that follows a services outage (the driver's own ghost) is owed the whole
-  schedule, not an instant park — keeping the upstream's sanitized reason in the
-  runtime snapshot for the whole wait. The failure and the time of the next attempt are published as one
+  different events. A transient drop retries with exponential backoff from
+  200ms to a 30s cap, with jitter of 0–25% of the delay drawn per driver from
+  its seed; the same seed rotates the vetted address list and advances the
+  start per attempt, and stored networks started at boot stagger their first
+  dial over 0–5 s — so a daemon restart with many networks, or a network-wide
+  drop, does not have every driver re-dial the same server in the same
+  instant. A refusal is the upstream's answer and never takes that schedule.
+  `RegistrationRefusal::retry_policy` decides, per kind and in the client
+  crate so no caller can re-type it, one of three policies. **Park now**:
+  rejected credentials (a retry re-sends the same password, can only fail the
+  same way, and every failure counts against the owner's account) and a
+  welcome under another nickname (`WelcomedAsAnotherNickname`; the owner must
+  change the nick). **Schedule, then park**: a refusal the owner may be able
+  to outwait but that may also be a configuration fault — 433/436/437 on the
+  nick, 432, 468, 464, a SASL exchange that ended without a verdict — retries
+  after 30s, 1m, 2m, and 4m and parks on the fifth **of one kind** in a row; a
+  refusal of another kind starts the count over, so the 433 that follows a
+  services outage (the driver's own ghost) is owed the whole schedule. **Until
+  it clears, never park**: a capacity or policy answer from the network — a
+  pre-welcome `ERROR` (a connection throttle, "too many host connections", a
+  K-line, "SASL access only"), a 465 ban, `sasl_unavailable`, a 906 abort —
+  takes the same first steps and then stays at 4m for as long as it lasts,
+  with the upstream's sanitized reason in the runtime snapshot the whole time.
+  Parking waits for the owner to change something; a throttle, a services
+  outage and even a ban give them nothing to change, and a ban that is
+  retried every four minutes costs the network one refused dial while keeping
+  its reason visible, where a parked network costs the owner a re-save of every
+  network the moment a shared throttle lifts. The failure and the time of the next attempt are published as one
   transition (`FailureDisposition::Retry { next_attempt_in }`), so no observer
   can see a network waiting to retry with its reason but no next-attempt time
-  (the time is cleared again when the attempt begins). **A refusal that ends by
-  itself never parks**: parking waits for the owner to change something, and
-  `sasl_unavailable` — Solanum-family servers withdraw the `sasl` capability
-  for as long as services are down — gives them nothing to change. It
-  takes the same 30s, 1m and 2m steps and then stays at 4m for as long as it
-  lasts
-  (`RegistrationRefusal::clears_without_reconfiguration`). A pre-welcome
-  `ERROR` is deliberately not in that class although a throttle arrives that
-  way: it also carries bans and "SASL access only", only the server's prose
-  tells them apart, and retrying a permanent closure forever is the worse
-  mistake. Only a session that actually registered resets that count: a dial
+  (the time is cleared again when the attempt begins). Only a session that
+  actually registered resets that count: a dial
   that dies before registration neither counts as a refusal nor forgives the
   ones already counted, so a refusing upstream's own throttle cannot keep the
   driver from parking. The transient backoff likewise resets only after a
   session that reached `Connected` and stayed up for ten seconds: a tarpit that
   completes the handshake and says nothing until the registration deadline
-  keeps the schedule growing. A stopped driver (removed or replaced) says
-  `QUIT :reconfigured` within 2 s before its socket closes, so its successor
-  never meets its own ghost; every upstream write is bounded (10 s, then
+  keeps the schedule growing. A stopped driver — removed, replaced, or stopped
+  by process shutdown (§18) — says `QUIT :e6irc bouncer stopping` within 2 s
+  before its socket closes, so its successor never meets its own ghost; every upstream write is bounded (10 s, then
   `upstream_write_failed`), the auto-join burst is raced against the stop
   signal, and the registry waits at most 15 s for a stopped driver before a
   replace or remove proceeds, loudly. A server `ERROR` is classified by the one pre-welcome
@@ -1681,7 +1739,13 @@ upstream's.
   upstream does the substituting: a welcome addressed to any other nickname
   than the configured one (a server truncating to its NICKLEN, a services
   rename on connect) is a registration refusal that names both, not a
-  connection; a difference of case alone (RFC1459 folding) is not. The `USER`
+  connection: the driver says `QUIT` first and parks on the first occurrence,
+  because nothing but the configured nick can clear it; a difference of case
+  alone (RFC1459 folding) is not a refusal. A rename the upstream forces
+  *after* the welcome (Atheme's ENFORCE moving an unidentified nick to
+  `Guest12345`) is tracked, as it must be, and announced: `renamed_by_upstream`
+  in the runtime snapshot with the diagnostic "upstream renamed this session
+  from X to Y", and one `*bnc*` notice into the backlog. The `USER`
   name is configured, never derived. It used to be the first ten bytes of the
   nickname, so a legal nickname such as `_bot` registered as `USER _bot`, which
   Solanum-family servers answer by closing the link. `UpstreamUsername` admits
@@ -1701,9 +1765,10 @@ upstream's.
   is ever rewritten to fit. On reconnect the driver
   re-registers under the configured nick and re-joins the *configured*
   autojoin channels plus every channel the upstream confirmed membership in
-  before the drop (runtime JOIN/PART/KICK are tracked as they are
-  acknowledged upstream; a forced upstream NICK renames the tracked
-  identity). Tracked membership is bounded at 512 channels, per session and in
+  before the drop — comma-joined within the 510-byte line, so a heavy user's
+  hundred channels are a handful of lines rather than a burst Solanum's flood
+  limit answers with "Excess Flood" (runtime JOIN/PART/KICK are tracked as they
+  are acknowledged upstream). Tracked membership is bounded at 512 channels, per session and in
   the reconnect intent: the names come from the upstream, which a tenant may
   point at a server of their own, so an unbounded set was a memory and
   reconnect-flood lever on the shared daemon. Past the bound the session ends
@@ -1716,12 +1781,20 @@ upstream's.
   mechanism the server offers — is an authentication failure, which parks at
   once. A server that does not offer the mechanism or the capability
   (`sasl_unavailable`), or that ends the exchange without a verdict
-  (`sasl_failed`: nick locked, aborted, too long), is a registration refusal
-  carrying the server's own words, retried on the refusal schedule. Treating
-  those as "rejected credentials" parked a network instantly and left its owner
-  retyping a correct password. A server with no capability negotiation at all
-  registers plainly — unless SASL is configured, where registering
-  unauthenticated would be a silent downgrade, so it is refused. The idle
+  (`sasl_failed`: nick locked, too long; a 906 abort is `sasl_aborted` and is
+  retried until it clears), is a registration refusal carrying the server's own
+  words. Treating those as "rejected credentials" parked a network instantly
+  and left its owner retyping a correct password. A server with no capability
+  negotiation at all — a 421 or 451 to `CAP LS`, or five seconds of silence —
+  registers plainly (NICK/USER and then `CAP END`, harmless to a server that
+  merely answered slowly) — unless SASL is configured, where registering
+  unauthenticated would be a silent downgrade, so it is refused loudly. A
+  post-registration `ERROR :Closing Link …` from the upstream (a ping timeout,
+  a rolling restart, a services GHOST, an operator KILL) never reaches an
+  attached client or the backlog as `ERROR` — several clients treat that as
+  the end of *their* connection and reconnect themselves, which is exactly what
+  a bouncer exists to hide; it becomes `:*bnc* NOTICE * :upstream closed the
+  link: …` and the `connection_lost` diagnostic. The idle
   window that detects a half-open upstream is measured from the last line the
   upstream sent; downstream traffic does not restart it (it used to, so a dead
   link was never noticed while anyone was typing), and the Discord and Slack
@@ -1988,8 +2061,11 @@ Surface (initial):
   account suspension/reactivation; live/historical observability; Prometheus
   exposition. Personalized
   administrator JSON and metrics responses carry `Cache-Control: no-store`.
-- `healthz` (liveness; no auth)
-- `readyz` (core-heartbeat and configured-PostgreSQL readiness; no auth)
+- `healthz` (liveness; no auth): the process answers and every core shard's
+  heartbeat is within 45 s; database-free, so a database outage shows on
+  `readyz` and never restart-loops the container, while a stalled shard is a
+  503 the health check acts on. It used to be a constant.
+- `readyz` (the same core check plus configured-PostgreSQL readiness; no auth)
 
 The OpenAPI 3.1 document at `/api/v1/openapi.json` is hand-authored for
 request/response semantics and always served (no feature gate, no utoipa
@@ -2477,13 +2553,23 @@ command.
 
 When PostgreSQL is configured, a sampler stores the typed JSON snapshot in
 `observability_samples`. The UI-managed `[observability]` interval (5–300
-seconds), enable switch, and retention (1–2160 hours) apply live. Every insert
-deletes rows older than the configured retention in the same transaction, so
-the history is bounded by construction rather than a separate best-effort
-cleanup job. The independently supervised storage-maintenance worker also
-reports its database latency and failures through this telemetry even when
-historical sampling is disabled. `/healthz` remains a dependency-free
-liveness probe.
+seconds), enable switch, and retention (1–2160 hours) apply live. Expired
+samples are pruned by the storage-maintenance worker under
+`observability.retention_hours` whether or not sampling is on (pruning on
+insert left the table frozen the moment sampling was switched off). That
+worker runs every five minutes in bounded batches; a tick whose batch fills
+runs up to 21 batches 250 ms apart and logs once with totals, so a large
+backlog — or a retention cut from a year to a month — drains instead of
+saturating forever. It also reports its database latency and failures through
+this telemetry even when historical sampling is disabled. `/healthz` remains a
+dependency-free liveness probe. HTTP observation (`x-request-id`, HSTS,
+request count and latency) is the outermost layer, outside the body limit,
+the concurrency semaphore and the request deadline, so a `408` or a permit
+wait is counted and timed like any other request. Per-peer connection
+refusals (per-IP limit, connection-id exhaustion, socket setup, TLS handshake
+failure or timeout) are summarised by `PeerRefusalLog`: the first occurrence
+at once, then one line per 60 s window carrying the suppressed count, bounded
+to 4,096 (peer, class) entries; the counters are unaffected.
 
 Logging continues to use loud stderr lines; metrics do not depend on a
 third-party metrics stack.
@@ -2569,6 +2655,13 @@ Layers, bottom to top:
 
 ## 18. Configuration & operations
 
+- Startup retries the first PostgreSQL connection for
+  `[database] startup_wait_seconds` (default 300; 1 s doubling to 30 s; one
+  stderr line per attempt; connection errors only — a migration error is
+  immediate) and then exits non-zero, so a host whose database comes up later
+  than the daemon is a loud wait rather than a crash loop; the first probe is
+  one plain connection, so the reason (refused, authentication, "starting up")
+  is reported instead of the pool's "timed out".
 - A minimal `e6irc.toml`/environment bootstrap supplies the PostgreSQL URL,
   secrets-key source, HTTP bind, immutable release revision, and either
   existing administrator authority or a one-time first-administrator token.
@@ -2607,8 +2700,11 @@ Layers, bottom to top:
   binds the replacement socket, swaps only after success, and retains the
   working listener on failure. Disabling the attach socket does not stop
   always-on networks or the web client.
-- Graceful shutdown: stop accepting, notify clients, stop drivers, and flush
-  the bounded PostgreSQL write paths within the shutdown budget. Stopping the
+- Graceful shutdown is four bounded steps in this order: the listeners stop
+  accepting; every bouncer driver is stopped concurrently and says goodbye to
+  its upstream (`QUIT`, or the Matrix logout; at most 15 s for all of them, a
+  laggard is logged and the stop stands), so a restart never meets its own
+  ghost; the core drains; the bounded PostgreSQL write paths flush. Stopping the
   core is a drain: a shard that has seen the shutdown stops taking outside
   input but keeps serving the other shards until every shard has seen it and
   nothing is passing between them. Every shard is then joined; a shard that
@@ -2653,7 +2749,12 @@ Layers, bottom to top:
   a container that has no file to point at.
   The systemd stop budget mechanically exceeds the daemon's bounded shutdown
   — the core drain followed by the PostgreSQL flush; the guard sums both
-  constants.
+  constants. The unit sets `StartLimitIntervalSec=0` (asserted by the same
+  guard): a refused first database connection fails the daemon in
+  milliseconds, and systemd's default limit of five starts in ten seconds
+  would otherwise leave the unit permanently failed after a reboot where
+  PostgreSQL comes up later than e6irc; restarts stay `RestartSec` apart and
+  each attempt is a journal line, loud rather than final.
   A version tag equal to `v` plus the workspace version publishes deterministic
   archives containing `e6ircd`, `e6irc`, and `e6irc-tui` for Linux, macOS, and
   Windows on x86-64 and ARM64. Each archive has a GitHub build-provenance

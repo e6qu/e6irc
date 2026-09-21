@@ -36,6 +36,13 @@ const MAX_DATABASE_MILLIS: u64 = 1 << 53;
 #[derive(Debug)]
 pub enum DbError {
     Connect(sqlx::Error),
+    /// Startup kept retrying the initial connection for its whole wait and
+    /// PostgreSQL never accepted one; `last` is the final attempt's error.
+    StartupWaitExhausted {
+        attempts: u32,
+        waited: std::time::Duration,
+        last: Box<DbError>,
+    },
     Migrate(sqlx::migrate::MigrateError),
     Query(sqlx::Error),
     Hash(argon2::password_hash::Error),
@@ -92,6 +99,16 @@ impl std::fmt::Display for DbError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Connect(e) => write!(f, "database connect failed: {e}"),
+            Self::StartupWaitExhausted {
+                attempts,
+                waited,
+                last,
+            } => write!(
+                f,
+                "database did not accept a connection in {attempts} attempts over {}s; last \
+                 error: {last}",
+                waited.as_secs()
+            ),
             Self::Migrate(e) => write!(f, "database migration failed: {e}"),
             Self::Query(e) => write!(f, "database query failed: {e}"),
             Self::Hash(e) => write!(f, "password hash operation failed: {e}"),
@@ -184,6 +201,27 @@ fn seconds_for_database(value: u64, column: &str) -> Result<f64, DbError> {
 }
 
 pub async fn connect_and_migrate(url: &str) -> Result<PgPool, DbError> {
+    // One plain connection first. The pool's own `connect` retries inside its
+    // acquire timeout and then reports only "pool timed out", which hides the
+    // reason — refused, wrong password, "the database system is starting up" —
+    // that the operator (and the startup retry) must see. The probe fails at
+    // once with that reason, bounded by the same timeout so an unroutable
+    // address cannot hang startup on the operating system's connect timeout.
+    let probe = tokio::time::timeout(
+        DATABASE_ACQUIRE_TIMEOUT,
+        <sqlx::PgConnection as sqlx::Connection>::connect(url),
+    )
+    .await
+    .map_err(|_| {
+        DbError::Connect(sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("no answer within {}s", DATABASE_ACQUIRE_TIMEOUT.as_secs()),
+        )))
+    })?
+    .map_err(DbError::Connect)?;
+    <sqlx::PgConnection as sqlx::Connection>::close(probe)
+        .await
+        .map_err(DbError::Connect)?;
     // Every caller shares this pool, including HTTP handlers and the database
     // worker. A dependency interruption must therefore produce a bounded,
     // typed query failure instead of parking unrelated requests on SQLx's
@@ -210,33 +248,178 @@ pub async fn connect_and_migrate(url: &str) -> Result<PgPool, DbError> {
     Ok(pool)
 }
 
+/// How long startup keeps retrying the first database connection before the
+/// process gives up and exits non-zero. Constructed only through
+/// [`StartupDatabaseWait::from_seconds`], so the bound the configuration
+/// documents ([`StartupDatabaseWait::MAX_SECONDS`]) cannot be exceeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartupDatabaseWait(std::time::Duration);
+
+impl StartupDatabaseWait {
+    /// One hour: past that a supervisor's own restart policy is the right tool.
+    pub const MAX_SECONDS: u64 = 3_600;
+    /// The longest pause between two attempts; the backoff doubles up to it.
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+    const FIRST_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// `0` means a single attempt and no waiting.
+    pub fn from_seconds(seconds: u64) -> Result<Self, String> {
+        if seconds > Self::MAX_SECONDS {
+            return Err(format!(
+                "database.startup_wait_seconds must be at most {} (got {seconds})",
+                Self::MAX_SECONDS
+            ));
+        }
+        Ok(Self(std::time::Duration::from_secs(seconds)))
+    }
+
+    pub const fn duration(self) -> std::time::Duration {
+        self.0
+    }
+}
+
+/// One failed startup connection attempt, handed to the caller's reporter so
+/// every attempt is a visible line wherever the process logs.
+#[derive(Debug)]
+pub struct StartupDatabaseAttempt<'a> {
+    /// 1-based.
+    pub attempt: u32,
+    pub error: &'a DbError,
+    /// Time already spent waiting, including this attempt.
+    pub waited: std::time::Duration,
+    /// The pause before the next attempt; `None` means this was the last one.
+    pub retry_in: Option<std::time::Duration>,
+}
+
+/// [`connect_and_migrate`] for process startup: a refused or not-yet-listening
+/// PostgreSQL (a container that starts a few seconds after this one, a
+/// restarting server) is retried with a doubling, capped backoff until `wait`
+/// is spent, and every failed attempt is reported. Only connection failures
+/// are retried: a migration failure is a fact about the schema that waiting
+/// cannot change, and is returned at once.
+pub async fn connect_and_migrate_with_retry(
+    url: &str,
+    wait: StartupDatabaseWait,
+    mut report: impl FnMut(StartupDatabaseAttempt<'_>),
+) -> Result<PgPool, DbError> {
+    let started = std::time::Instant::now();
+    let mut backoff = StartupDatabaseWait::FIRST_BACKOFF;
+    let mut attempts: u32 = 0;
+    loop {
+        attempts = attempts.saturating_add(1);
+        let error = match connect_and_migrate(url).await {
+            Ok(pool) => return Ok(pool),
+            Err(error @ DbError::Connect(_)) => error,
+            Err(error) => return Err(error),
+        };
+        let waited = started.elapsed();
+        let retry_in = wait
+            .duration()
+            .checked_sub(waited)
+            .filter(|remaining| !remaining.is_zero())
+            .map(|remaining| backoff.min(remaining));
+        report(StartupDatabaseAttempt {
+            attempt: attempts,
+            error: &error,
+            waited,
+            retry_in,
+        });
+        let Some(pause) = retry_in else {
+            return Err(DbError::StartupWaitExhausted {
+                attempts,
+                waited,
+                last: Box::new(error),
+            });
+        };
+        tokio::time::sleep(pause).await;
+        backoff = (backoff * 2).min(StartupDatabaseWait::MAX_BACKOFF);
+    }
+}
+
 const STORAGE_MAINTENANCE_BATCH: u64 = 10_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StorageMaintenanceReport {
     pub messages: u64,
+    /// Bouncer history (`bnc_buffer`, every network's external lines, direct
+    /// messages included) under the same history retention as `messages`.
+    pub bnc_buffer: u64,
     pub audit_events: u64,
     pub web_sessions: u64,
     pub api_tokens: u64,
     pub device_grants: u64,
     pub logout_tokens: u64,
     pub account_invitations: u64,
+    /// Historical monitoring samples past `observability.retention_hours`,
+    /// pruned here whether or not sampling is currently on.
+    pub observability_samples: u64,
     /// At least one collection filled its bounded batch and may have more
-    /// expired rows. The supervised worker emits this explicitly and retries
-    /// on its next fixed maintenance tick.
+    /// expired rows. [`drain_storage_maintenance`] keeps going while this is
+    /// set, up to its batch budget.
     pub saturated: bool,
+}
+
+impl StorageMaintenanceReport {
+    fn add(&mut self, other: &Self) {
+        self.messages += other.messages;
+        self.bnc_buffer += other.bnc_buffer;
+        self.audit_events += other.audit_events;
+        self.web_sessions += other.web_sessions;
+        self.api_tokens += other.api_tokens;
+        self.device_grants += other.device_grants;
+        self.logout_tokens += other.logout_tokens;
+        self.account_invitations += other.account_invitations;
+        self.observability_samples += other.observability_samples;
+        self.saturated = other.saturated;
+    }
+}
+
+/// The time bounds maintenance applies, taken from the managed configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageRetention {
+    /// `messages` and `bnc_buffer` rows older than this are deleted.
+    pub history_days: u64,
+    pub audit_days: u64,
+    /// `observability_samples` older than this are deleted.
+    pub observability_hours: u64,
+}
+
+/// How far one maintenance tick may go when a batch fills: `batches` in total
+/// (the first included), `pause` between two of them so a large backlog is
+/// drained in bounded steps rather than one long lock-holding sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceDrainPlan {
+    pub batches: std::num::NonZeroUsize,
+    pub pause: std::time::Duration,
+}
+
+/// What one tick of [`drain_storage_maintenance`] did in total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageMaintenanceDrain {
+    /// Rows deleted across every batch; `saturated` is the last batch's.
+    pub totals: StorageMaintenanceReport,
+    pub batches_run: usize,
+}
+
+/// The per-statement retention bound, bound before the batch limit.
+#[derive(Debug, Clone, Copy)]
+enum RetentionBound {
+    Days(i32),
+    Millis(i64),
+    None,
 }
 
 async fn execute_maintenance_delete(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     statement: &'static str,
-    retention_days: Option<i32>,
+    bound: RetentionBound,
     limit: i64,
 ) -> Result<u64, DbError> {
     let query = sqlx::query(statement);
-    let query = match retention_days {
-        Some(days) => query.bind(days).bind(limit),
-        None => query.bind(limit),
+    let query = match bound {
+        RetentionBound::Days(days) => query.bind(days).bind(limit),
+        RetentionBound::Millis(millis) => query.bind(millis).bind(limit),
+        RetentionBound::None => query.bind(limit),
     };
     query
         .execute(&mut **transaction)
@@ -245,19 +428,52 @@ async fn execute_maintenance_delete(
         .map_err(DbError::Query)
 }
 
+/// Run [`run_storage_maintenance`] until a batch comes back unsaturated or
+/// the plan's batch budget is spent. A saturated single batch every five
+/// minutes could never catch up with a large backlog (a retention lowered by
+/// months, say) and would log the same warning forever; this drains it in the
+/// same tick, bounded.
+pub async fn drain_storage_maintenance(
+    pool: &PgPool,
+    retention: StorageRetention,
+    plan: MaintenanceDrainPlan,
+) -> Result<StorageMaintenanceDrain, DbError> {
+    let mut totals = StorageMaintenanceReport::default();
+    let mut batches_run = 0;
+    loop {
+        let report = run_storage_maintenance(pool, retention).await?;
+        totals.add(&report);
+        batches_run += 1;
+        if !report.saturated || batches_run >= plan.batches.get() {
+            return Ok(StorageMaintenanceDrain {
+                totals,
+                batches_run,
+            });
+        }
+        tokio::time::sleep(plan.pause).await;
+    }
+}
+
 /// Delete one bounded batch from every time-retained/expiring collection.
 /// Each statement uses an indexed or time-ordered candidate set and every
 /// pooled statement still has the global PostgreSQL deadline, so maintenance
 /// cannot monopolize the database or grow one unbounded transaction.
 pub async fn run_storage_maintenance(
     pool: &PgPool,
-    history_retention_days: u64,
-    audit_retention_days: u64,
+    retention: StorageRetention,
 ) -> Result<StorageMaintenanceReport, DbError> {
-    let history_days = i32::try_from(history_retention_days)
+    let history_days = i32::try_from(retention.history_days)
         .map_err(|_| DbError::InvalidServerSettings("history retention exceeds INT".into()))?;
-    let audit_days = i32::try_from(audit_retention_days)
+    let audit_days = i32::try_from(retention.audit_days)
         .map_err(|_| DbError::InvalidServerSettings("audit retention exceeds INT".into()))?;
+    let observability_cutoff_ms = i64::try_from(
+        crate::observability::epoch_millis().saturating_sub(
+            retention
+                .observability_hours
+                .saturating_mul(60 * 60 * 1_000),
+        ),
+    )
+    .map_err(|_| DbError::InvalidServerSettings("sample retention cutoff exceeds BIGINT".into()))?;
     let limit = STORAGE_MAINTENANCE_BATCH as i64;
     let mut transaction = pool.begin().await.map_err(DbError::Query)?;
     let messages = execute_maintenance_delete(
@@ -269,7 +485,23 @@ pub async fn run_storage_maintenance(
              LIMIT $2
          )
          DELETE FROM messages m USING expired e WHERE m.id = e.id",
-        Some(history_days),
+        RetentionBound::Days(history_days),
+        limit,
+    )
+    .await?;
+    // Storage age (`created_at`), not the upstream's `sent_at`, which a peer
+    // controls and may omit: the bound is on what this server keeps, and the
+    // index from migration 0060 is on that column.
+    let bnc_buffer = execute_maintenance_delete(
+        &mut transaction,
+        "WITH expired AS (
+             SELECT id FROM bnc_buffer
+             WHERE created_at < now() - make_interval(days => $1)
+             ORDER BY created_at, id
+             LIMIT $2
+         )
+         DELETE FROM bnc_buffer b USING expired e WHERE b.id = e.id",
+        RetentionBound::Days(history_days),
         limit,
     )
     .await?;
@@ -282,7 +514,7 @@ pub async fn run_storage_maintenance(
              LIMIT $2
          )
          DELETE FROM audit_log a USING expired e WHERE a.id = e.id",
-        Some(audit_days),
+        RetentionBound::Days(audit_days),
         limit,
     )
     .await?;
@@ -295,7 +527,7 @@ pub async fn run_storage_maintenance(
              ORDER BY expires_at
              LIMIT $1
          )",
-        None,
+        RetentionBound::None,
         limit,
     )
     .await?;
@@ -308,7 +540,7 @@ pub async fn run_storage_maintenance(
              ORDER BY expires_at
              LIMIT $1
          )",
-        None,
+        RetentionBound::None,
         limit,
     )
     .await?;
@@ -321,7 +553,7 @@ pub async fn run_storage_maintenance(
              ORDER BY expires_at, id
              LIMIT $1
          )",
-        None,
+        RetentionBound::None,
         limit,
     )
     .await?;
@@ -334,7 +566,7 @@ pub async fn run_storage_maintenance(
              ORDER BY expires_at, issuer, jti
              LIMIT $1
          )",
-        None,
+        RetentionBound::None,
         limit,
     )
     .await?;
@@ -347,51 +579,63 @@ pub async fn run_storage_maintenance(
              ORDER BY COALESCE(consumed_at, expires_at), id
              LIMIT $1
          )",
-        None,
+        RetentionBound::None,
+        limit,
+    )
+    .await?;
+    let observability_samples = execute_maintenance_delete(
+        &mut transaction,
+        "DELETE FROM observability_samples
+         WHERE sampled_at_ms IN (
+             SELECT sampled_at_ms FROM observability_samples
+             WHERE sampled_at_ms < $1
+             ORDER BY sampled_at_ms
+             LIMIT $2
+         )",
+        RetentionBound::Millis(observability_cutoff_ms),
         limit,
     )
     .await?;
     transaction.commit().await.map_err(DbError::Query)?;
     let saturated = [
         messages,
+        bnc_buffer,
         audit_events,
         web_sessions,
         api_tokens,
         device_grants,
         logout_tokens,
         account_invitations,
+        observability_samples,
     ]
     .into_iter()
     .any(|deleted| deleted == STORAGE_MAINTENANCE_BATCH);
     Ok(StorageMaintenanceReport {
         messages,
+        bnc_buffer,
         audit_events,
         web_sessions,
         api_tokens,
         device_grants,
         logout_tokens,
         account_invitations,
+        observability_samples,
         saturated,
     })
 }
 
+/// Persist one monitoring sample. Expired samples are pruned by storage
+/// maintenance (whether or not sampling is on), not here: a prune that only
+/// ran while sampling was enabled left the table frozen at whatever it held
+/// when sampling was turned off.
 pub(crate) async fn store_observability_sample(
     pool: &PgPool,
     snapshot: &crate::observability::Snapshot,
-    retention_hours: u64,
 ) -> Result<(), DbError> {
     let value = serde_json::to_value(snapshot)
         .map_err(|error| DbError::InvalidServerSettings(error.to_string()))?;
-    let retention_ms = retention_hours
-        .saturating_mul(60)
-        .saturating_mul(60)
-        .saturating_mul(1_000);
-    let cutoff = snapshot.sampled_at_ms.saturating_sub(retention_ms);
     let sampled_at = i64::try_from(snapshot.sampled_at_ms)
         .map_err(|_| DbError::InvalidServerSettings("sample timestamp exceeds BIGINT".into()))?;
-    let cutoff = i64::try_from(cutoff)
-        .map_err(|_| DbError::InvalidServerSettings("retention cutoff exceeds BIGINT".into()))?;
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
     sqlx::query(
         "INSERT INTO observability_samples (sampled_at_ms, snapshot)
          VALUES ($1, $2)
@@ -399,15 +643,9 @@ pub(crate) async fn store_observability_sample(
     )
     .bind(sampled_at)
     .bind(value)
-    .execute(&mut *transaction)
+    .execute(pool)
     .await
     .map_err(DbError::Query)?;
-    sqlx::query("DELETE FROM observability_samples WHERE sampled_at_ms < $1")
-        .bind(cutoff)
-        .execute(&mut *transaction)
-        .await
-        .map_err(DbError::Query)?;
-    transaction.commit().await.map_err(DbError::Query)?;
     Ok(())
 }
 
@@ -644,6 +882,16 @@ pub async fn create_account_with_contact(
     .map_err(DbError::Query)?
     .ok_or_else(|| DbError::DuplicateAccount(name.to_string()))?;
     insert_primary_password(&mut tx, id, &hash).await?;
+    // Self-service creation is audited like every other way an account comes
+    // to exist (administrator, invitation, bootstrap); the actor is the account.
+    insert_audit_log_with(
+        &mut *tx,
+        &folded,
+        "ACCOUNT_CREATE",
+        &folded,
+        "self-registered over IRC",
+    )
+    .await?;
     tx.commit().await.map_err(DbError::Query)?;
     Ok(id)
 }
@@ -6143,6 +6391,14 @@ pub async fn find_or_create_oidc_account(
         .map_err(DbError::Query)?;
         return Ok(winner);
     }
+    insert_audit_log_with(
+        &mut *tx,
+        &format!("oidc:{issuer}"),
+        "ACCOUNT_CREATE",
+        &folded,
+        "provisioned from OpenID Connect",
+    )
+    .await?;
     tx.commit().await.map_err(DbError::Query)?;
     Ok(name)
 }

@@ -691,7 +691,8 @@ fn operations() -> serde_json::Value {
         "additionalProperties": false,
         "properties": {
             "max_connections_per_ip": { "type": ["integer", "null"], "minimum": 1 },
-            "command_burst": { "type": ["integer", "null"], "minimum": 1 },
+            "command_burst": { "type": "integer", "minimum": 1, "maximum": 10000 },
+            "command_rate": { "type": "integer", "minimum": 1, "maximum": 10000 },
             "trusted_proxies": { "type": "array", "items": { "type": "string" } },
             "auth_rate_burst": { "type": ["integer", "null"], "minimum": 1 },
             "api_rate_burst": { "type": "integer", "minimum": 1 },
@@ -1579,23 +1580,23 @@ fn operations() -> serde_json::Value {
                             } } } } },
                     "responses": {
                         "200": {
-                            "description": "DNS, transport, registration timings, and confirmed channel joins",
+                            "description": "DNS, transport, and registration timings; the test joins no channels",
                             "content": { "application/json": { "schema": {
                                 "type": "object",
                                 "additionalProperties": false,
-                                "required": ["ok", "resolved_addresses", "dns_ms", "connect_ms", "registration_ms", "confirmed_nick", "joined_channels"],
+                                "required": ["ok", "resolved_addresses", "dns_ms", "connect_ms", "registration_ms", "confirmed_nick"],
                                 "properties": {
                                     "ok": { "const": true },
                                     "resolved_addresses": { "type": "integer", "minimum": 1 },
                                     "dns_ms": { "type": "integer", "format": "int64", "minimum": 0 },
                                     "connect_ms": { "type": "integer", "format": "int64", "minimum": 0 },
                                     "registration_ms": { "type": "integer", "format": "int64", "minimum": 0 },
-                                    "confirmed_nick": { "type": "string", "minLength": 1, "maxLength": 64 },
-                                    "joined_channels": { "type": "array", "items": { "type": "string" } }
+                                    "confirmed_nick": { "type": "string", "minLength": 1, "maxLength": 64 }
                                 }
                             } } }
                         },
                         "400": { "description": "invalid address, identity, or incomplete credentials" },
+                        "409": { "description": "the account's network with this upstream and nickname is running and holds the nickname; disable it to test its settings" },
                         "429": { "description": "this account already has a connection test running, has started six in the last minute, or the server is running as many as it allows at once; Retry-After gives the seconds to wait" },
                         "502": { "description": "typed upstream DNS, transport, TLS, authentication, or registration failure" }
                     }

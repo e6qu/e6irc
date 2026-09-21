@@ -35,7 +35,9 @@ mod upstream_identity;
 pub use discord::{DiscordConfig, DiscordDriver};
 pub(crate) use irc_driver::KEEPALIVE_IDLE;
 pub(crate) use irc_driver::validate_irc_upstream_addr;
-pub use irc_driver::{IrcNetwork, IrcPreflight, IrcPreflightFailure, NetworkConfig, preflight_irc};
+pub use irc_driver::{
+    FirstDial, IrcNetwork, IrcPreflight, IrcPreflightFailure, NetworkConfig, preflight_irc,
+};
 pub use local_driver::{CoreHandles, LocalDriver};
 #[cfg(feature = "matrix")]
 pub use matrix::{MatrixConfig, MatrixDevice, MatrixDriver};
@@ -216,6 +218,10 @@ pub struct DriverSpec {
     pub sasl_password: Option<String>,
     /// The server's policy on upstreams inside its own network.
     pub internal_upstreams: crate::egress::InternalUpstreams,
+    /// Whether the driver dials at once or holds its first dial back as one of
+    /// a boot's many (see [`FirstDial`]). Bridges dial their own APIs and
+    /// ignore it.
+    pub first_dial: FirstDial,
 }
 
 /// error (never a silent fall-through to IRC), and `local` is not creatable as a
@@ -237,6 +243,7 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
         sasl_account,
         sasl_password,
         internal_upstreams,
+        first_dial,
     } = spec;
     let required_field = |value: String, field: &str, maximum: usize| {
         validate_network_credential(&value, maximum)
@@ -293,6 +300,7 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
                 keepalive_idle: KEEPALIVE_IDLE,
                 rejection_retry_floor: REJECTION_RETRY_FLOOR,
                 internal_upstreams,
+                first_dial,
             })))
         }
         NetworkKind::Local => {
@@ -395,6 +403,7 @@ pub fn driver_from_row(
     key: Option<&crate::secret::SecretKeyring>,
     owner: &str,
     internal_upstreams: crate::egress::InternalUpstreams,
+    first_dial: FirstDial,
 ) -> Result<Box<dyn NetworkDriver>, String> {
     if row.kind.is_bridge() && row.realname.is_some() {
         return Err(format!(
@@ -440,6 +449,7 @@ pub fn driver_from_row(
         sasl_account: account,
         sasl_password: password,
         internal_upstreams,
+        first_dial,
     })
 }
 
@@ -449,29 +459,59 @@ use tokio::sync::mpsc;
 /// their reconnect timing stays identical in one place. Starts at 200ms,
 /// doubles per drop, caps at 30s, and resets once a session lasted long enough
 /// (≥10s) to have clearly connected — otherwise a flapping-but-reachable
-/// upstream would ratchet toward the cap forever. Jitter is a coarse
-/// deterministic function of the delay *and* a per-driver seed (no RNG), so it
-/// spreads reconnects both across retry rounds and across concurrent drivers.
+/// upstream would ratchet toward the cap forever. Jitter is a fixed fraction
+/// of the delay, drawn per driver from its seed (no RNG), so concurrent
+/// drivers that drop together spread out, and spread out *more* as the delay
+/// grows — a fixed sub-100 ms spread on a four-minute refusal step put every
+/// driver of one restart back on the throttled server within the same second.
 pub(crate) struct Backoff {
     current: std::time::Duration,
-    /// Per-driver jitter offset, so drivers that drop together from one shared
-    /// upstream outage do not recompute an *identical* delay and reconnect in
-    /// lockstep. Without a per-driver term the jitter is a pure function of
-    /// `current`, which every driver advances through the same sequence — so it
-    /// spread reconnects across retry *rounds* but not across the drivers within
-    /// a round, which is the one thing jitter exists to do.
-    jitter_offset: u64,
+    /// This driver's share of the jitter window, in thousandths of the base
+    /// delay: 0 to [`Self::JITTER_PERMILLE_SPAN`]. Fixed for the driver's
+    /// lifetime, so its whole schedule is shifted rather than shuffled.
+    jitter_permille: u64,
 }
 
 impl Backoff {
+    /// Jitter is 0–25% of the base delay.
+    const JITTER_PERMILLE_SPAN: u64 = 250;
+
+    /// The widest spread of first dials after a process start.
+    pub(crate) const FIRST_DIAL_STAGGER: std::time::Duration = std::time::Duration::from_secs(5);
+
     pub(crate) fn new(seed: u64) -> Self {
         Self {
             current: std::time::Duration::from_millis(200),
-            // Fibonacci-hash the stable per-driver seed into the jitter window so
-            // sequential driver ids spread across the [0,97) range rather than
-            // clustering. RNG-free: the offset is fixed for a driver's lifetime.
-            jitter_offset: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) % 97,
+            jitter_permille: Self::spread(seed) % (Self::JITTER_PERMILLE_SPAN + 1),
         }
+    }
+
+    /// Fibonacci-hash the stable per-driver seed so sequential driver ids land
+    /// far apart in whatever window a caller reduces this into.
+    const fn spread(seed: u64) -> u64 {
+        seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32
+    }
+
+    /// The jitter this driver adds to `base`.
+    pub(crate) fn jitter(&self, base: std::time::Duration) -> std::time::Duration {
+        base.mul_f64(self.jitter_permille as f64 / 1000.0)
+    }
+
+    /// How long a driver started at boot waits before its first dial: a point
+    /// in `[0, FIRST_DIAL_STAGGER)` fixed by the seed, so a restart with many
+    /// networks on one round robin does not dial them all in one burst.
+    pub(crate) fn first_dial_stagger(seed: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            Self::spread(seed) % Self::FIRST_DIAL_STAGGER.as_millis() as u64,
+        )
+    }
+
+    /// Where in the vetted address list `attempt` starts (0-based), so
+    /// concurrent drivers spread across a round robin and one driver's retries
+    /// walk it instead of re-dialling the address that just refused. Every
+    /// address is still tried; only the order rotates.
+    pub(crate) fn address_rotation(seed: u64, attempt: u64) -> u64 {
+        Self::spread(seed).wrapping_add(attempt)
     }
 
     /// The delay the next [`Backoff::wait`] will sleep, computed exactly as
@@ -483,9 +523,7 @@ impl Backoff {
         } else {
             self.current
         };
-        let jitter =
-            std::time::Duration::from_millis((base.as_millis() as u64 + self.jitter_offset) % 97);
-        base + jitter
+        base + self.jitter(base)
     }
 
     /// Sleep before the next reconnect attempt, then grow the delay for the
@@ -496,12 +534,7 @@ impl Backoff {
         if session_held {
             self.current = std::time::Duration::from_millis(200);
         }
-        // Combine the per-round delay term with the per-driver offset so both the
-        // round and the driver vary; still bounded to a coarse <97ms spread.
-        let jitter = std::time::Duration::from_millis(
-            (self.current.as_millis() as u64 + self.jitter_offset) % 97,
-        );
-        tokio::time::sleep(self.current + jitter).await;
+        tokio::time::sleep(self.current + self.jitter(self.current)).await;
         self.current = (self.current * 2).min(std::time::Duration::from_secs(30));
     }
 
@@ -527,13 +560,29 @@ impl Backoff {
         floor: std::time::Duration,
         consecutive_rejections: u32,
     ) -> std::time::Duration {
-        // The schedule ends where parking used to end it (30s, 1m, 2m, 4m). A
-        // refusal that is retried past that point stays at the last step.
+        // The schedule ends where parking ends it (30s, 1m, 2m, 4m). A refusal
+        // that is retried past that point stays at the last step.
         let doublings = consecutive_rejections
             .saturating_sub(1)
             .min(MAX_CONSECUTIVE_REGISTRATION_REJECTIONS - 2);
-        floor.saturating_mul(1 << doublings) + std::time::Duration::from_millis(self.jitter_offset)
+        let base = floor.saturating_mul(1 << doublings);
+        base + self.jitter(base)
     }
+}
+
+/// `addresses`, started `rotation` places in (wrapping), so callers dialling
+/// the same round robin at once begin at different members and one caller's
+/// consecutive attempts begin at different members too. The relative order,
+/// and with it the family alternation of [`interleave_address_families`], is
+/// kept.
+pub(crate) fn rotate_addresses(
+    mut addresses: Vec<std::net::SocketAddr>,
+    rotation: u64,
+) -> Vec<std::net::SocketAddr> {
+    if let Some(len) = std::num::NonZeroU64::new(addresses.len() as u64) {
+        addresses.rotate_left((rotation % len) as usize);
+    }
+    addresses
 }
 
 /// Outcome of one driver session attempt, for the always-on drivers'
@@ -550,6 +599,10 @@ pub(crate) enum SessionOutcome {
     /// unrepresentable: every driver must tell monitoring why the attempt
     /// ended before the shared runner can schedule another one.
     Dropped(NetworkFailure),
+    /// A registered session the upstream ended with a stated reason (an IRC
+    /// `ERROR :Closing Link …`). Retried like [`Self::Dropped`] with
+    /// [`NetworkFailure::ConnectionLost`]; the reason is what the owner reads.
+    ClosedByUpstream(LinkClosed),
     /// The upstream rejected the credentials. A retry re-sends the same
     /// password and can only fail the same way, while every failure counts
     /// against the account on the upstream, so [`run_with_backoff`] parks on
@@ -557,10 +610,11 @@ pub(crate) enum SessionOutcome {
     /// words ride along; a bridge, whose rejection is an HTTP status or a close
     /// code, has none.
     AuthRejected(Option<e6irc_client::SaslRejection>),
-    /// The upstream refused registration for a reason that may clear by itself
-    /// (a ghost holding the nick, a connection throttle, a ban that expires).
-    /// [`run_with_backoff`] retries these on the slow rejection schedule and
-    /// parks after [`MAX_CONSECUTIVE_REGISTRATION_REJECTIONS`] in a row.
+    /// The upstream refused registration. What [`run_with_backoff`] does about
+    /// it is the refusal's [`e6irc_client::RegistrationRefusal::retry_policy`]:
+    /// the slow rejection schedule for as long as a passing refusal lasts, that
+    /// schedule and then a park after [`MAX_CONSECUTIVE_REGISTRATION_REJECTIONS`]
+    /// of one kind, or a park at once for one only reconfiguration can end.
     RegistrationRejected(e6irc_client::RegistrationRejection),
     /// A bridge's upstream refused something this network's *configuration*
     /// asks for — a room it may not join, a channel that cannot be mapped.
@@ -595,8 +649,27 @@ impl ConfigurationRefusal {
     }
 }
 
-/// A refusal the shared runner retries slowly and then parks on, whichever kind
-/// of upstream gave it.
+/// The upstream's stated reason for ending a registered session, bounded and
+/// control-free like every other upstream text the owner reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkClosed {
+    diagnostic: String,
+}
+
+impl LinkClosed {
+    pub fn new(reason: &str) -> Self {
+        Self {
+            diagnostic: e6irc_client::bounded_diagnostic(reason),
+        }
+    }
+
+    pub fn diagnostic(&self) -> &str {
+        &self.diagnostic
+    }
+}
+
+/// A refusal the shared runner retries slowly, and parks on when its policy
+/// says so, whichever kind of upstream gave it.
 enum Refusal {
     Registration(e6irc_client::RegistrationRejection),
     #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
@@ -620,14 +693,17 @@ impl Refusal {
         }
     }
 
-    /// Parking waits for the owner to change something. A refusal that ends by
-    /// itself gives them nothing to change, so it is retried at the schedule's
-    /// last step for as long as it lasts.
-    fn parks(&self) -> bool {
+    /// What the runner may do about this refusal. Parking waits for the owner
+    /// to change something: a refusal that ends by itself gives them nothing to
+    /// change and is retried at the schedule's last step for as long as it
+    /// lasts; one that only a change can end is parked on at once. A bridge's
+    /// configuration refusal takes the schedule and then parks, as it always
+    /// has: its upstream may be catching up on a room it was just invited to.
+    fn retry(&self) -> e6irc_client::RefusalRetry {
         match self {
-            Self::Registration(rejection) => !rejection.refusal().clears_without_reconfiguration(),
+            Self::Registration(rejection) => rejection.refusal().retry_policy(),
             #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-            Self::Configuration(_) => true,
+            Self::Configuration(_) => e6irc_client::RefusalRetry::ScheduleThenPark,
         }
     }
 
@@ -649,18 +725,19 @@ impl Refusal {
 }
 
 /// Consecutive upstream registration rejections *of one kind* before a driver
-/// stops re-dialing and parks until the network is reconfigured. A refusal of
-/// another kind starts the count over: a services outage is a long run of
-/// refusals that never park, and the 433 that follows it (the driver's own
-/// ghost, still holding the nick) is the first of its kind, owed the whole
-/// schedule rather than an instant park. Rejected *credentials* never reach
-/// this count: they park on the first rejection.
+/// on the schedule-then-park policy stops re-dialing and parks until the
+/// network is reconfigured. A refusal of another kind starts the count over: a
+/// services outage or a connection throttle is a long run of refusals that
+/// never park, and the 433 that follows it (the driver's own ghost, still
+/// holding the nick) is the first of its kind, owed the whole schedule rather
+/// than an instant park. Rejected *credentials* and a welcome under another
+/// nickname never reach this count: they park on the first rejection.
 pub(crate) const MAX_CONSECUTIVE_REGISTRATION_REJECTIONS: u32 = 5;
 
 /// First delay after an upstream refuses registration, doubled per consecutive
-/// refusal (30s, 1m, 2m, 4m, then park). Long enough to outlast a connection
-/// throttle and most of a ghost session's ping timeout; tests shrink it through
-/// [`DriverEnds::set_rejection_retry_floor`].
+/// refusal (30s, 1m, 2m, 4m, then park or stay at 4m). Long enough to outlast a
+/// connection throttle and most of a ghost session's ping timeout; tests shrink
+/// it through [`DriverEnds::set_rejection_retry_floor`].
 pub(crate) const REJECTION_RETRY_FLOOR: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long the registry waits for a stopped driver to release its upstream
@@ -765,14 +842,17 @@ pub(crate) type DriverSession<C> =
     ) -> std::pin::Pin<Box<dyn Future<Output = SessionOutcome> + Send + 'a>>;
 
 /// Announce why the attempt ended, publish when the next one fires, and sleep
-/// until then. Returns `false` when the network was stopped while waiting.
+/// until then. `upstream_reason` is the upstream's own text for an event that
+/// does not carry one (a registered session it closed with a stated reason).
+/// Returns `false` when the network was stopped while waiting.
 async fn wait_for_reconnect(
     ends: &mut DriverEnds,
     event: ConnectionEvent,
+    upstream_reason: Option<&str>,
     delay: std::time::Duration,
     sleep: impl Future<Output = ()>,
 ) -> bool {
-    ends.publish(event, Some(delay));
+    ends.publish(event, Some(delay), upstream_reason);
     tokio::select! {
         biased;
         _ = ends.shutdown_signalled() => false,
@@ -799,6 +879,16 @@ pub(crate) async fn run_with_backoff<C>(
     session: DriverSession<C>,
 ) {
     let mut backoff = Backoff::new(ends.reconnect_seed);
+    // A driver started at boot holds its first dial back so a restart's worth
+    // of drivers reach one round robin spread out, not in a burst.
+    let first_dial_delay = ends.first_dial_delay;
+    if !first_dial_delay.is_zero() {
+        tokio::select! {
+            biased;
+            _ = ends.shutdown_signalled() => return,
+            _ = tokio::time::sleep(first_dial_delay) => {}
+        }
+    }
     // How many refusals of `last_refusal`'s kind in a row.
     let mut consecutive_rejections: u32 = 0;
     let mut last_refusal: Option<RefusalKind> = None;
@@ -811,49 +901,120 @@ pub(crate) async fn run_with_backoff<C>(
         }
         ends.begin_attempt();
         let started = tokio::time::Instant::now();
-        let refusal = match session(&config, ends).await {
+        let (failure, upstream_reason) = match session(&config, ends).await {
             SessionOutcome::Stopped => return,
             SessionOutcome::AuthRejected(rejection) => {
                 park(ends, ConnectionEvent::AuthenticationFailed(rejection)).await;
                 return;
             }
-            SessionOutcome::RegistrationRejected(rejection) => Refusal::Registration(rejection),
-            #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-            SessionOutcome::ConfigurationRejected(refusal) => Refusal::Configuration(refusal),
-            SessionOutcome::Dropped(failure) => {
-                // Only a session that actually registered proves the upstream
-                // accepts this configuration. A drop *before* that (a throttled
-                // dial between two refusals, say) neither counts as a refusal
-                // nor forgives the ones already counted — otherwise a refusing
-                // upstream's own throttle would keep the driver from ever
-                // parking.
-                let connected = ends.connected_this_attempt();
-                if connected {
-                    consecutive_rejections = 0;
-                    last_refusal = None;
-                }
-                let session_held = Backoff::session_held(connected, started.elapsed());
-                let delay = backoff.next_delay(session_held);
-                let reconnecting = ConnectionEvent::Reconnecting(failure);
-                if !wait_for_reconnect(ends, reconnecting, delay, backoff.wait(session_held)).await
+            SessionOutcome::RegistrationRejected(rejection) => {
+                let refusal = Refusal::Registration(rejection);
+                match retry_refusal(
+                    ends,
+                    &backoff,
+                    refusal,
+                    &mut consecutive_rejections,
+                    &mut last_refusal,
+                )
+                .await
                 {
-                    return;
+                    RefusalHandled::Retrying => continue,
+                    RefusalHandled::Ended => return,
                 }
-                continue;
+            }
+            #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+            SessionOutcome::ConfigurationRejected(refusal) => {
+                let refusal = Refusal::Configuration(refusal);
+                match retry_refusal(
+                    ends,
+                    &backoff,
+                    refusal,
+                    &mut consecutive_rejections,
+                    &mut last_refusal,
+                )
+                .await
+                {
+                    RefusalHandled::Retrying => continue,
+                    RefusalHandled::Ended => return,
+                }
+            }
+            SessionOutcome::Dropped(failure) => (failure, None),
+            SessionOutcome::ClosedByUpstream(closed) => {
+                (NetworkFailure::ConnectionLost, Some(closed))
             }
         };
-        if last_refusal.replace(refusal.kind()) != Some(refusal.kind()) {
+        // Only a session that actually registered proves the upstream accepts
+        // this configuration. A drop *before* that (a throttled dial between
+        // two refusals, say) neither counts as a refusal nor forgives the ones
+        // already counted — otherwise a refusing upstream's own throttle would
+        // keep the driver from ever parking.
+        let connected = ends.connected_this_attempt();
+        if connected {
             consecutive_rejections = 0;
+            last_refusal = None;
         }
-        consecutive_rejections = consecutive_rejections.saturating_add(1);
-        if consecutive_rejections >= MAX_CONSECUTIVE_REGISTRATION_REJECTIONS && refusal.parks() {
-            park(ends, refusal.parked()).await;
+        let session_held = Backoff::session_held(connected, started.elapsed());
+        let delay = backoff.next_delay(session_held);
+        let reconnecting = ConnectionEvent::Reconnecting(failure);
+        let reason = upstream_reason.as_ref().map(LinkClosed::diagnostic);
+        if !wait_for_reconnect(
+            ends,
+            reconnecting,
+            reason,
+            delay,
+            backoff.wait(session_held),
+        )
+        .await
+        {
             return;
         }
-        let delay = backoff.rejection_delay(ends.rejection_retry_floor, consecutive_rejections);
-        if !wait_for_reconnect(ends, refusal.retrying(), delay, tokio::time::sleep(delay)).await {
-            return;
+    }
+}
+
+enum RefusalHandled {
+    /// The wait for the next attempt ended; dial again.
+    Retrying,
+    /// The driver parked, or was stopped while waiting.
+    Ended,
+}
+
+/// Count `refusal` against the run of its kind and act on its retry policy.
+async fn retry_refusal(
+    ends: &mut DriverEnds,
+    backoff: &Backoff,
+    refusal: Refusal,
+    consecutive_rejections: &mut u32,
+    last_refusal: &mut Option<RefusalKind>,
+) -> RefusalHandled {
+    use e6irc_client::RefusalRetry;
+    if last_refusal.replace(refusal.kind()) != Some(refusal.kind()) {
+        *consecutive_rejections = 0;
+    }
+    *consecutive_rejections = consecutive_rejections.saturating_add(1);
+    let parks = match refusal.retry() {
+        RefusalRetry::ParkNow => true,
+        RefusalRetry::ScheduleThenPark => {
+            *consecutive_rejections >= MAX_CONSECUTIVE_REGISTRATION_REJECTIONS
         }
+        RefusalRetry::UntilItClears => false,
+    };
+    if parks {
+        park(ends, refusal.parked()).await;
+        return RefusalHandled::Ended;
+    }
+    let delay = backoff.rejection_delay(ends.rejection_retry_floor, *consecutive_rejections);
+    if wait_for_reconnect(
+        ends,
+        refusal.retrying(),
+        None,
+        delay,
+        tokio::time::sleep(delay),
+    )
+    .await
+    {
+        RefusalHandled::Retrying
+    } else {
+        RefusalHandled::Ended
     }
 }
 
@@ -1783,6 +1944,11 @@ pub struct ChannelLimitExceeded;
 pub struct SessionChange {
     /// Our new nickname, when the line renamed us.
     pub nick: Option<String>,
+    /// The `user@host` the upstream shows for this session, when the line
+    /// revealed it: the source of our own `JOIN`, `PART` or `NICK` echo, or a
+    /// `396 RPL_VISIBLEHOST` (host only). The user part is verbatim, tilde
+    /// included, since the upstream decides whether identd answered.
+    pub shown_identity: Option<ShownIdentity>,
     /// Channels that were not tracked before this line.
     pub joined: Vec<upstream_identity::ConfirmedChannel>,
     /// RFC1459-folded names of channels this line took us out of. A `QUIT`
@@ -1792,6 +1958,15 @@ pub struct SessionChange {
     /// server could mean it, each cut to [`UNTRACKED_NAME_SHOWN`] bytes. They
     /// are not tracked, so they are not rejoined after a reconnect.
     pub untracked: Vec<String>,
+}
+
+/// The identity the upstream shows other users for this session, as far as one
+/// line revealed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShownIdentity {
+    /// The user (ident) part, when the line carried a full prefix.
+    pub user: Option<String>,
+    pub host: String,
 }
 
 /// Bytes of an untrackable channel name repeated back in its notice.
@@ -1843,11 +2018,30 @@ impl IrcSessionState {
                 .map(|value| value.split(',').filter(|item| !item.is_empty()).collect())
                 .unwrap_or_default()
         };
+        // Our own echoes carry the prefix the upstream shows for us.
+        if is_us(source_nick)
+            && let Some(source) = &message.source
+            && let Some(host) = source.host
+        {
+            change.shown_identity = Some(ShownIdentity {
+                user: source.user.map(str::to_string),
+                host: host.to_string(),
+            });
+        }
         match message.command.to_ascii_uppercase().as_str() {
             "NICK" if is_us(source_nick) => {
                 if let Some(nick) = message.params.first() {
                     self.nick = Some((*nick).to_string());
                     change.nick = self.nick.clone();
+                }
+            }
+            // RPL_VISIBLEHOST: `396 <nick> <host> :is now your visible host`.
+            "396" if is_us(message.params.first().copied()) => {
+                if let Some(host) = message.params.get(1).filter(|host| !host.is_empty()) {
+                    change.shown_identity = Some(ShownIdentity {
+                        user: None,
+                        host: host.to_string(),
+                    });
                 }
             }
             "JOIN" if is_us(source_nick) => {
@@ -2131,6 +2325,11 @@ pub enum NetworkFailure {
     AutojoinFailed,
     ConnectionLost,
     KeepaliveTimedOut,
+    /// The upstream renamed a registered session (a services enforcer moving
+    /// an unidentified nickname to `Guest12345`). The session goes on under
+    /// the new name, tracked; the owner is told, because it is a name they
+    /// did not choose.
+    RenamedByUpstream,
     ChannelLimitExceeded,
     UpstreamWriteFailed,
     UpstreamRequestFailed,
@@ -2165,6 +2364,7 @@ impl NetworkFailure {
             Self::AutojoinFailed => "autojoin_failed",
             Self::ConnectionLost => "connection_lost",
             Self::KeepaliveTimedOut => "keepalive_timed_out",
+            Self::RenamedByUpstream => "renamed_by_upstream",
             Self::ChannelLimitExceeded => "channel_limit_exceeded",
             Self::UpstreamWriteFailed => "upstream_write_failed",
             Self::UpstreamRequestFailed => "upstream_request_failed",
@@ -2193,7 +2393,9 @@ impl NetworkFailure {
             Self::InvalidNickname => "The upstream rejected the configured nickname.",
             Self::InvalidUsername => "The upstream rejected the IRC username.",
             Self::NicknameInUse => "The configured nickname is already in use.",
-            Self::ServerPasswordRejected => "The upstream rejected the configured server password.",
+            Self::ServerPasswordRejected => {
+                "The network requires a server password, which this network configuration does not supply."
+            }
             Self::NetworkBanned => "The upstream network banned this connection.",
             Self::AuthenticationRejected => "The upstream rejected the configured credentials.",
             Self::SaslUnavailable => {
@@ -2203,6 +2405,9 @@ impl NetworkFailure {
             Self::AutojoinFailed => "A configured JOIN could not be sent during startup.",
             Self::ConnectionLost => "The established upstream connection was lost.",
             Self::KeepaliveTimedOut => "The upstream stopped responding to keepalive checks.",
+            Self::RenamedByUpstream => {
+                "The upstream renamed this session to a nickname the owner did not choose."
+            }
             Self::ChannelLimitExceeded => {
                 "The upstream confirmed more than 512 channels; the session was ended."
             }
@@ -2514,6 +2719,20 @@ impl NetworkRuntime {
         let now = epoch_millis();
         let mut state = self.state.lock().expect("network runtime poisoned");
         Self::set_error(&mut state, now, failure, None);
+    }
+
+    fn operational_error_with_diagnostic(&self, failure: NetworkFailure, diagnostic: &str) {
+        let now = epoch_millis();
+        let mut state = self.state.lock().expect("network runtime poisoned");
+        Self::set_error(&mut state, now, failure, Some(diagnostic));
+    }
+
+    /// Attempts begun so far, the current one included.
+    fn connection_attempts(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("network runtime poisoned")
+            .connection_attempts
     }
 
     fn set_error(
@@ -3123,6 +3342,7 @@ impl NetworkHandle {
             telemetry,
             reconnect_seed,
             rejection_retry_floor: REJECTION_RETRY_FLOOR,
+            first_dial_delay: std::time::Duration::ZERO,
             buffered_status: std::sync::Mutex::new(None),
         };
         (handle, ends)
@@ -3268,6 +3488,9 @@ pub struct DriverEnds {
     /// First delay after the upstream refuses registration; see
     /// [`REJECTION_RETRY_FLOOR`].
     rejection_retry_floor: std::time::Duration,
+    /// How long the first dial is held back; zero unless the driver was
+    /// started at boot (see [`Backoff::first_dial_stagger`]).
+    first_dial_delay: std::time::Duration,
     /// The connection state whose notice last entered the backlog.
     buffered_status: std::sync::Mutex<Option<DriverConnectionStatus>>,
 }
@@ -3406,13 +3629,20 @@ impl DriverEnds {
     /// ([`DriverEnds::emit_line`]) because they need sanitizing and buffering;
     /// see [`ConnectionEvent`].
     pub fn emit(&self, event: ConnectionEvent) {
-        self.publish(event, None);
+        self.publish(event, None, None);
     }
 
     /// [`DriverEnds::emit`], with when the next attempt fires for an event that
     /// announces a retry (visible in the runtime snapshot as `next_retry_at`
-    /// until the attempt begins). One step, so the two cannot be seen apart.
-    fn publish(&self, event: ConnectionEvent, next_attempt_in: Option<std::time::Duration>) {
+    /// until the attempt begins), and the upstream's own bounded text for a
+    /// [`ConnectionEvent::Reconnecting`] that has one (the other events carry
+    /// theirs). One step, so none of the three can be seen apart.
+    fn publish(
+        &self,
+        event: ConnectionEvent,
+        next_attempt_in: Option<std::time::Duration>,
+        upstream_reason: Option<&str>,
+    ) {
         let (status, revision, notice) = match event {
             ConnectionEvent::Connected => {
                 let revision = self.runtime.connected();
@@ -3432,7 +3662,7 @@ impl DriverEnds {
                         DriverConnectionStatus::Reconnecting(failure),
                         FailureDisposition::Retry { next_attempt_in },
                         failure,
-                        None,
+                        upstream_reason,
                     ),
                     ConnectionEvent::RegistrationRetrying(ref rejection) => {
                         let failure = registration_failure(rejection.refusal());
@@ -3548,6 +3778,40 @@ impl DriverEnds {
         self.rejection_retry_floor = floor;
     }
 
+    /// Hold the first dial back by this driver's share of
+    /// [`Backoff::FIRST_DIAL_STAGGER`]. A driver started at boot applies it
+    /// before its run loop; one started on demand dials at once.
+    pub fn stagger_first_dial(&mut self) {
+        self.first_dial_delay = Backoff::first_dial_stagger(self.reconnect_seed);
+    }
+
+    /// Where in the vetted address list this attempt starts; see
+    /// [`Backoff::address_rotation`].
+    pub fn dial_rotation(&self) -> u64 {
+        Backoff::address_rotation(self.reconnect_seed, self.runtime.connection_attempts())
+    }
+
+    /// Record a failure that does not end the session, with the upstream's
+    /// own bounded text: counted and shown in the runtime snapshot like a
+    /// lifecycle failure, and said once to attached clients and the backlog.
+    pub fn record_error_with_upstream_detail(&self, failure: NetworkFailure, diagnostic: &str) {
+        let diagnostic = e6irc_client::bounded_diagnostic(diagnostic);
+        self.runtime
+            .operational_error_with_diagnostic(failure, &diagnostic);
+        if let Some(telemetry) = self
+            .telemetry
+            .lock()
+            .expect("telemetry hook poisoned")
+            .as_ref()
+        {
+            telemetry.record_error(crate::observability::ErrorKind::Bouncer);
+        }
+        self.emit_line(format!(
+            "{}; upstream: {diagnostic}",
+            failure_notice(failure)
+        ));
+    }
+
     /// Await the next downstream command; `None` when every handle is dropped
     /// **or** the network is shut down. Every driver's session loop selects on
     /// this, so an authoritative stop from the registry reaches all of them
@@ -3609,7 +3873,10 @@ fn lifecycle_notice(state: &str, failure: NetworkFailure, diagnostic: Option<&st
 
 const fn registration_failure(refusal: e6irc_client::RegistrationRefusal) -> NetworkFailure {
     match refusal {
-        e6irc_client::RegistrationRefusal::InvalidNickname => NetworkFailure::InvalidNickname,
+        e6irc_client::RegistrationRefusal::InvalidNickname
+        | e6irc_client::RegistrationRefusal::WelcomedAsAnotherNickname => {
+            NetworkFailure::InvalidNickname
+        }
         e6irc_client::RegistrationRefusal::InvalidUsername => NetworkFailure::InvalidUsername,
         e6irc_client::RegistrationRefusal::NicknameInUse => NetworkFailure::NicknameInUse,
         e6irc_client::RegistrationRefusal::ServerPasswordRejected => {
@@ -3618,7 +3885,8 @@ const fn registration_failure(refusal: e6irc_client::RegistrationRefusal) -> Net
         e6irc_client::RegistrationRefusal::NetworkBanned => NetworkFailure::NetworkBanned,
         e6irc_client::RegistrationRefusal::NotRegistered => NetworkFailure::RegistrationRejected,
         e6irc_client::RegistrationRefusal::SaslUnavailable => NetworkFailure::SaslUnavailable,
-        e6irc_client::RegistrationRefusal::SaslFailed => NetworkFailure::SaslFailed,
+        e6irc_client::RegistrationRefusal::SaslAborted
+        | e6irc_client::RegistrationRefusal::SaslFailed => NetworkFailure::SaslFailed,
     }
 }
 
@@ -4309,6 +4577,7 @@ mod tests {
             sasl_account: account.map(str::to_string),
             sasl_password: password.map(str::to_string),
             internal_upstreams: crate::egress::InternalUpstreams::Refuse,
+            first_dial: FirstDial::Immediate,
         })
         .err()
         .expect("invalid driver configuration should be rejected")
@@ -4401,6 +4670,7 @@ mod tests {
             None,
             "owner",
             crate::egress::InternalUpstreams::Refuse,
+            FirstDial::Immediate,
         )
         .err()
         .expect("noncanonical stored bridge should be rejected");
@@ -4427,6 +4697,7 @@ mod tests {
             None,
             "owner",
             crate::egress::InternalUpstreams::Refuse,
+            FirstDial::Immediate,
         )
         .err()
         .expect("stored IRC network without realname should fail");
@@ -4486,6 +4757,7 @@ mod tests {
         ends.publish(
             ConnectionEvent::AuthenticationFailed(None),
             Some(std::time::Duration::from_secs(1)),
+            None,
         );
         let failed = handle.runtime_snapshot();
         assert_eq!(failed.lifecycle, NetworkLifecycle::AuthenticationFailed);
@@ -5172,6 +5444,82 @@ mod tests {
         );
     }
 
+    /// Concurrent drivers of one restart must not all begin a round robin at
+    /// its first member, nor re-dial the member that just refused: the start
+    /// rotates by seed and advances per attempt, and every member stays in.
+    #[test]
+    fn dial_order_rotates_by_seed_and_by_attempt() {
+        let addresses: Vec<std::net::SocketAddr> = (1..=4)
+            .map(|index| format!("192.0.2.{index}:6697").parse().unwrap())
+            .collect();
+        let first = |seed: u64, attempt: u64| {
+            rotate_addresses(addresses.clone(), Backoff::address_rotation(seed, attempt))
+        };
+        assert_ne!(
+            first(0, 1)[0],
+            first(1, 1)[0],
+            "two seeds, one first address"
+        );
+        assert_ne!(
+            first(0, 1)[0],
+            first(0, 2)[0],
+            "two attempts, one first address"
+        );
+        for seed in 0..8 {
+            let rotated = first(seed, 1);
+            let start = addresses
+                .iter()
+                .position(|address| *address == rotated[0])
+                .expect("a rotation begins with a member");
+            let expected: Vec<_> = addresses
+                .iter()
+                .cycle()
+                .skip(start)
+                .take(4)
+                .copied()
+                .collect();
+            assert_eq!(rotated, expected, "a rotation keeps the order");
+        }
+        assert!(rotate_addresses(Vec::new(), 7).is_empty());
+    }
+
+    /// Jitter is a share of the delay it is added to, so the spread between
+    /// drivers grows with the delay: a fixed sub-100 ms spread on a
+    /// four-minute step is no spread at all.
+    #[test]
+    fn jitter_spread_grows_with_the_base_delay() {
+        let second = std::time::Duration::from_secs(1);
+        let step = std::time::Duration::from_secs(240);
+        let mut spreads = std::collections::BTreeSet::new();
+        for seed in 0..16 {
+            let backoff = Backoff::new(seed);
+            assert!(backoff.jitter(second) <= second / 4, "seed {seed}");
+            assert_eq!(
+                backoff.jitter(step),
+                backoff.jitter(second) * 240,
+                "seed {seed}: jitter is proportional"
+            );
+            spreads.insert(backoff.jitter(step));
+        }
+        assert!(
+            spreads.len() > 8,
+            "seeds collapse onto few jitters: {spreads:?}"
+        );
+        assert!(
+            spreads
+                .iter()
+                .any(|jitter| *jitter > std::time::Duration::from_secs(30)),
+            "a four-minute step spreads drivers over tens of seconds: {spreads:?}"
+        );
+        let boot: std::collections::BTreeSet<_> =
+            (0..16).map(Backoff::first_dial_stagger).collect();
+        assert!(boot.len() > 8, "boot dials collapse: {boot:?}");
+        assert!(
+            boot.iter()
+                .all(|delay| *delay < Backoff::FIRST_DIAL_STAGGER)
+        );
+    }
+
     /// A tarpit completes the handshake and says nothing until the registration
     /// deadline. Read as "the session lasted long enough", that reset the
     /// schedule and had the driver re-dial it every 200 ms; only a session that
@@ -5195,7 +5543,8 @@ mod tests {
                 .collect()
         }
         let tarpit = waits_between(&[false, false, false]).await;
-        // 200 ms, 400 ms, 800 ms: each attempt waits longer, jitter under 97 ms.
+        // 200 ms, 400 ms, 800 ms: each attempt waits longer, jitter at most a
+        // quarter of each.
         assert!(
             tarpit[0] < std::time::Duration::from_millis(300),
             "{tarpit:?}"
@@ -5571,6 +5920,7 @@ mod tests {
             let waited = wait_for_reconnect(
                 &mut ends,
                 ConnectionEvent::Reconnecting(NetworkFailure::ConnectionLost),
+                None,
                 std::time::Duration::from_secs(30),
                 std::future::ready(()),
             )
@@ -5632,10 +5982,17 @@ mod tests {
             ends.emit_session_line(format!(":alice!u@h JOIN #flood{index}"))
                 .expect("within the channel limit");
         }
-        // A membership that is already tracked is not a new one.
+        // A membership that is already tracked is not a new one; our own echo
+        // still shows the identity the upstream gives us.
         assert_eq!(
             ends.emit_session_line(":alice!u@h JOIN #REAL".to_string()),
-            Ok(SessionChange::default())
+            Ok(SessionChange {
+                shown_identity: Some(ShownIdentity {
+                    user: Some("u".into()),
+                    host: "h".into(),
+                }),
+                ..SessionChange::default()
+            })
         );
 
         let lines_before = handle.buffer_snapshot();
@@ -5672,8 +6029,8 @@ mod tests {
             .emit_session_line(":alice!u@h QUIT :bye".to_string())
             .expect("a QUIT cannot exceed the limit");
         assert_eq!(
-            change,
-            SessionChange::default(),
+            (change.nick, change.joined, change.left, change.untracked),
+            (None, Vec::new(), Vec::new(), Vec::new()),
             "a QUIT ends live membership without touching the reconnect intent"
         );
         assert!(

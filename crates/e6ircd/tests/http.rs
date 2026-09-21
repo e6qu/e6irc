@@ -204,11 +204,21 @@ fn temporary_path(label: &str) -> std::path::PathBuf {
 
 #[tokio::test]
 async fn healthz_is_public_and_ok() {
+    // Liveness is the process plus every core shard's heartbeat, so it turns
+    // 200 once each shard has finished its first event (its first tick).
     let running = net::start(test_config()).await.expect("start");
     let http = running.http_addr.expect("http bound");
-    let (status, _, body) = request(http, &get("/healthz")).await;
-    assert_eq!(status, 200);
-    assert_eq!(body, "ok");
+    let mut last = (0, String::new());
+    for _ in 0..200 {
+        let (status, _, body) = request(http, &get("/healthz")).await;
+        last = (status, body);
+        if last.0 == 200 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(last.0, 200, "{}", last.1);
+    assert_eq!(last.1, "ok");
 }
 
 #[tokio::test]
@@ -281,7 +291,10 @@ async fn browser_bootstrap_creates_the_only_first_admin_and_closes_itself() {
     let database_url =
         support::test_db("browser_bootstrap_creates_the_only_first_admin_and_closes_itself").await;
     let mut config = test_config();
-    config.database = Some(DatabaseConfig { url: database_url });
+    config.database = Some(DatabaseConfig {
+        url: database_url,
+        startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+    });
     config.bootstrap = Some(BootstrapConfig {
         token: "0123456789abcdef0123456789abcdef".into(),
     });
@@ -604,7 +617,10 @@ async fn internal_upstreams_are_refused_unless_the_operator_allows_them() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
@@ -715,7 +731,10 @@ async fn bnc_network_management_lifecycle() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
@@ -753,8 +772,8 @@ async fn bnc_network_management_lifecycle() {
     .await;
     assert_eq!(status, 400, "discord creation must reject IRC fields");
 
-    // Qualification uses the production resolver, transport, registration, and
-    // channel-join path without persisting or starting a driver.
+    // Qualification uses the production resolver, transport, and registration
+    // path without persisting or starting a driver, and joins nothing.
     let (status, body) = post_json(
         http,
         "/api/v1/me/network-preflight",
@@ -766,10 +785,9 @@ async fn bnc_network_management_lifecycle() {
     let qualified: serde_json::Value = serde_json::from_str(&body).expect("preflight json");
     assert_eq!(qualified["ok"], true, "{body}");
     assert_eq!(qualified["confirmed_nick"], "probe", "{body}");
-    assert_eq!(
-        qualified["joined_channels"],
-        serde_json::json!(["#preflight"]),
-        "{body}"
+    assert!(
+        qualified.get("joined_channels").is_none(),
+        "the connection test joins nothing and says nothing about channels: {body}"
     );
     assert_eq!(qualified["resolved_addresses"], 1, "{body}");
     for stage in ["dns_ms", "connect_ms", "registration_ms"] {
@@ -945,6 +963,29 @@ async fn bnc_network_management_lifecycle() {
     );
     let (status, _, body) = request(http, &update_req).await;
     assert_eq!(status, 204, "update: {body}");
+    // The audit row names the fields the edit changed (by name only) and the
+    // kind; `addr` and `tls` were resubmitted unchanged and are not listed.
+    let audit_pool = sqlx::PgPool::connect(&url).await.expect("audit pool");
+    let (target, detail): (String, String) = sqlx::query_as(
+        "SELECT target, detail FROM audit_log WHERE action = 'NETWORK_UPDATE' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&audit_pool)
+    .await
+    .expect("NETWORK_UPDATE audit row");
+    assert_eq!(target, "alice/work");
+    assert_eq!(detail, "irc; changed: nick, username, autojoin");
+    let (_, create_detail): (String, String) = sqlx::query_as(
+        "SELECT target, detail FROM audit_log WHERE action = 'NETWORK_CREATE' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&audit_pool)
+    .await
+    .expect("NETWORK_CREATE audit row");
+    assert!(
+        create_detail.starts_with("irc; fields: addr, tls, nick"),
+        "{create_detail}"
+    );
+    assert!(!create_detail.contains(&up.to_string()), "{create_detail}");
+    audit_pool.close().await;
     let (status, _, detail) = request(http, &detail_req).await;
     assert_eq!(status, 200, "{detail}");
     let detail: serde_json::Value = serde_json::from_str(&detail).expect("updated detail json");
@@ -1079,7 +1120,10 @@ async fn bnc_network_upstream_secret_requires_master_key() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
@@ -1395,6 +1439,7 @@ async fn openapi_spec_is_served() {
     for field in [
         "max_connections_per_ip",
         "command_burst",
+        "command_rate",
         "auth_rate_burst",
         "api_rate_burst",
         "administrator_api_rate_burst",
@@ -1740,7 +1785,10 @@ async fn local_login_is_browser_bound_and_accepts_only_the_primary_password() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let http = net::start(config)
@@ -1860,7 +1908,10 @@ async fn account_url_redirects_to_the_complete_account_console() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -1980,7 +2031,10 @@ async fn console_networks_page_lists_the_callers_networks() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let http = net::start(config)
@@ -2137,7 +2191,10 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
             secure_cookies: false,
             admin_accounts: vec!["alice".into()],
         }),
-        database: Some(DatabaseConfig { url: url.clone() }),
+        database: Some(DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -2358,13 +2415,39 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
         stored_history,
         "live sampler did not persist an observability sample"
     );
-    let expired_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM observability_samples WHERE sampled_at_ms = $1")
-            .bind(i64::try_from(old_sampled_at).unwrap())
-            .fetch_one(&verification_pool)
-            .await
-            .expect("expired sample count");
-    assert_eq!(expired_count, 0, "sampler did not prune expired history");
+    // Pruning belongs to storage maintenance, not the sampler, so it happens
+    // whether or not sampling is on: the sampler left the expired row alone,
+    // and one maintenance batch under the configured hour of retention drops it.
+    let expired_sample_count = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM observability_samples WHERE sampled_at_ms = $1",
+        )
+        .bind(i64::try_from(old_sampled_at).unwrap())
+        .fetch_one(&verification_pool)
+        .await
+        .expect("expired sample count")
+    };
+    assert_eq!(
+        expired_sample_count().await,
+        1,
+        "the sampler is not the pruner"
+    );
+    let report = e6ircd::db::run_storage_maintenance(
+        &verification_pool,
+        e6ircd::db::StorageRetention {
+            history_days: 30,
+            audit_days: 365,
+            observability_hours: 1,
+        },
+    )
+    .await
+    .expect("maintenance");
+    assert!(report.observability_samples >= 1, "{report:?}");
+    assert_eq!(
+        expired_sample_count().await,
+        0,
+        "maintenance did not prune expired history"
+    );
 
     let (status, _, body) = request(http, &observability).await;
     assert_eq!(status, 200, "{body}");
@@ -2453,7 +2536,10 @@ async fn console_configuration_manages_every_credential_collection() {
             secure_cookies: false,
             admin_accounts: vec!["alice".into()],
         }),
-        database: Some(e6ircd::config::DatabaseConfig { url: url.clone() }),
+        database: Some(e6ircd::config::DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         secrets: Some(SecretsConfig {
             key_file: key_path,
             previous_key_files: Vec::new(),
@@ -2886,7 +2972,10 @@ async fn owned_channel_api_covers_configuration_access_transfer_and_drop() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -3132,7 +3221,10 @@ async fn owned_channel_api_and_console_shell_are_scoped_and_csrf_protected() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -3382,7 +3474,10 @@ async fn admin_accounts_endpoint_is_gated() {
             secure_cookies: false,
             admin_accounts: vec!["alice".into()],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let http = net::start(config)
@@ -3565,7 +3660,10 @@ async fn admin_console_page_is_api_hydrated_and_admin_only() {
             secure_cookies: false,
             admin_accounts: vec!["alice".into()],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let http = net::start(config)
@@ -3676,7 +3774,10 @@ async fn account_directory_filters_pages_counts_and_escapes_for_admins_only() {
             secure_cookies: false,
             admin_accounts: vec!["alice".into()],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let http = net::start(config)
@@ -3854,7 +3955,10 @@ async fn durable_admin_can_suspend_and_reactivate_an_account_end_to_end() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url: url.clone() }),
+        database: Some(DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let http = net::start(config)
@@ -4046,7 +4150,10 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url: url.clone() }),
+        database: Some(DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
@@ -4371,7 +4478,10 @@ async fn policy_directories_filter_page_and_escape_for_admins_only() {
             secure_cookies: false,
             admin_accounts: vec!["alice".into()],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let http = net::start(config)
@@ -4588,7 +4698,10 @@ async fn audit_explorer_filters_pages_and_escapes_for_admins_only() {
             secure_cookies: false,
             admin_accounts: vec!["alice".into()],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let http = net::start(config)
@@ -4729,7 +4842,10 @@ async fn admin_console_ban_and_channel_actions() {
             secure_cookies: false,
             admin_accounts: vec!["alice".into()],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let http = net::start(config)
@@ -4898,7 +5014,10 @@ async fn admin_connection_directory_and_disconnect_controls() {
             secure_cookies: false,
             admin_accounts: vec!["alice".into()],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         core_workers: 3,
         ..Config::default()
     };
@@ -5130,7 +5249,10 @@ async fn my_sessions_are_scoped_to_the_caller() {
             secure_cookies: false,
             admin_accounts: vec![], // alice is NOT an admin: this is self-service
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -5325,7 +5447,10 @@ async fn browser_sessions_are_visible_and_owner_scoped_across_api_and_console() 
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let http = net::start(config)
@@ -5511,7 +5636,10 @@ async fn console_integrations_page_lists_platforms_for_admins_only() {
             secure_cookies: false,
             admin_accounts: vec!["alice".into()],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let http = net::start(config)
@@ -5622,7 +5750,10 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
             secure_cookies: false,
             admin_accounts: vec!["alice".into()],
         }),
-        database: Some(DatabaseConfig { url: url.clone() }),
+        database: Some(DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
@@ -5800,7 +5931,10 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
             secure_cookies: false,
             admin_accounts: vec!["alice".into()],
         }),
-        database: Some(DatabaseConfig { url: url.clone() }),
+        database: Some(DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
@@ -6054,7 +6188,10 @@ async fn account_console_manages_credentials_tokens_and_identities() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
@@ -6376,7 +6513,10 @@ async fn device_authorization_grant_flow() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url: url.clone() }),
+        database: Some(DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let http = net::start(config)
@@ -6676,7 +6816,10 @@ async fn me_tokens_list_and_revoke() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let http = net::start(config)
@@ -6797,7 +6940,10 @@ async fn personal_access_token_scopes_gate_reads_writes_admin_and_irc() {
             secure_cookies: false,
             admin_accounts: vec!["alice".into()],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let http = net::start(config)
@@ -6886,7 +7032,10 @@ async fn authenticated_api_limit_is_per_account_shared_across_bearers_and_bounde
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         limits: e6ircd::config::LimitsConfig {
             api_rate_burst: 2,
             ..Default::default()
@@ -6983,7 +7132,10 @@ async fn network_buffer_read() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
@@ -7094,7 +7246,10 @@ async fn me_read_markers_list() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let http = net::start(config)
@@ -7181,7 +7336,10 @@ async fn rp_initiated_logout_redirects_to_provider() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         oidc_providers: vec![OidcProviderConfig {
             name: "shauth".into(),
             issuer_url: "https://auth.example".into(),
@@ -7413,7 +7571,10 @@ async fn application_entry_starts_shauth_when_configured() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         oidc_providers: vec![OidcProviderConfig {
             name: "shauth".into(),
             issuer_url: "https://auth.example".into(),
@@ -7509,7 +7670,10 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         oidc_providers: vec![OidcProviderConfig {
             name: "corp".into(),
             issuer_url: "https://auth.example".into(),
@@ -7608,7 +7772,10 @@ async fn admin_networks_fleet_view_and_toggle() {
             secure_cookies: false,
             admin_accounts: vec!["alice".into()],
         }),
-        database: Some(DatabaseConfig { url: url.clone() }),
+        database: Some(DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
@@ -7681,7 +7848,10 @@ async fn admin_networks_fleet_view_and_toggle() {
 /// A database-backed server with the HTTP listener and nothing else.
 async fn start_with_database(url: &str, administrators: &[&str]) -> net::Running {
     let config = Config {
-        database: Some(DatabaseConfig { url: url.into() }),
+        database: Some(DatabaseConfig {
+            url: url.into(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             public_url: None,
@@ -8054,7 +8224,10 @@ async fn oidc_callback_query_is_closed_and_admits_session_state() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         oidc_providers: vec![e6ircd::config::OidcProviderConfig {
             name: "corp".into(),
             issuer_url: "https://auth.example".into(),
@@ -8565,4 +8738,71 @@ async fn a_provider_without_a_token_endpoint_is_a_bad_gateway() {
         "{headers}"
     );
     assert!(body.contains("OIDC provider unavailable"), "{body}");
+}
+
+/// A running network's driver holds the configured nickname, so a connection
+/// test of the same upstream and nickname could only end `nickname_in_use`,
+/// which says nothing about the settings. It is refused with the way out; once
+/// the network is disabled the same test runs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_connection_test_of_a_running_network_is_refused() {
+    let url = support::test_db("a_connection_test_of_a_running_network_is_refused").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "alice", "pw", None)
+        .await
+        .expect("account");
+    let token = issue_api_token(&pool, "alice", "automation")
+        .await
+        .expect("token");
+    let up = upstream_server().await.addrs[0];
+    let running = start_with_database(&url, &[]).await;
+    let http = running.http_addr.expect("http");
+    wait_http_ready(http).await;
+
+    let (status, body) = post_json(
+        http,
+        "/api/v1/me/networks",
+        &token,
+        &format!(r#"{{"kind":"irc","name":"lan","addr":"{up}","tls":false,"nick":"probe","username":"probe","realname":"Probe","autojoin":[]}}"#),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+
+    let test_body = format!(
+        r#"{{"addr":"{up}","tls":false,"nick":"Probe","username":"probe","realname":"Probe","autojoin":[]}}"#
+    );
+    let (status, body) = post_json(http, "/api/v1/me/network-preflight", &token, &test_body).await;
+    assert_eq!(status, 409, "{body}");
+    let problem: serde_json::Value = serde_json::from_str(&body).expect("problem json");
+    assert_eq!(problem["title"], "Network is running", "{body}");
+    assert_eq!(
+        problem["detail"], "network 'lan' is running; disable it to test its settings",
+        "{body}"
+    );
+    assert!(problem.get("field").is_none(), "{body}");
+
+    // Another nickname on the same upstream is not held by that driver.
+    let other = format!(
+        r#"{{"addr":"{up}","tls":false,"nick":"probe2","username":"probe","realname":"Probe","autojoin":[]}}"#
+    );
+    let (status, body) = post_json(http, "/api/v1/me/network-preflight", &token, &other).await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = patch_json(
+        http,
+        "/api/v1/me/networks/lan",
+        &token,
+        r#"{"enabled":false}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post_json(http, "/api/v1/me/network-preflight", &token, &test_body).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        running.shutdown.run().await,
+        e6ircd::net::ShutdownOutcome::Flushed
+    );
 }

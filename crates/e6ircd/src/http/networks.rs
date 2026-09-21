@@ -116,15 +116,22 @@ pub(super) struct IrcNetworkPreset {
     pub(super) tls: bool,
 }
 
-/// Public connection endpoints from the networks' own documentation, verified
-/// 2026-07-29:
+/// Public connection endpoints from the networks' own documentation, each
+/// verified by a TLS registration through this driver on 2026-09-21 (the
+/// certificate the round robin's members present is valid for the preset's
+/// hostname, and the registration is welcomed):
 /// - <https://libera.chat/guides/connect>
 /// - <https://www.oftc.net/>
-/// - <https://www.efnet.org/>
 /// - <https://snoonet.org/help/>
 ///
+/// EFnet is not offered: `irc.efnet.org` is a round robin of independently
+/// run servers whose certificates name themselves (`efnet.tngnet.nl`,
+/// `irc.colosolutions.net`, …), none valid for `irc.efnet.org`, so a preset
+/// for it fails `secure_connection_failed` on every address, forever.
+///
 /// Keep this catalog small and authoritative: a stale preset is worse than
-/// making a custom endpoint explicit.
+/// making a custom endpoint explicit, and a network that cannot connect must
+/// not be offered.
 pub(super) const IRC_NETWORK_PRESETS: &[IrcNetworkPreset] = &[
     IrcNetworkPreset {
         id: "libera",
@@ -138,13 +145,6 @@ pub(super) const IRC_NETWORK_PRESETS: &[IrcNetworkPreset] = &[
         label: "OFTC",
         name: "oftc",
         addr: "irc.oftc.net:6697",
-        tls: true,
-    },
-    IrcNetworkPreset {
-        id: "efnet",
-        label: "EFnet",
-        name: "efnet",
-        addr: "irc.efnet.org:6697",
         tls: true,
     },
     IrcNetworkPreset {
@@ -691,12 +691,57 @@ pub(super) async fn create_network(
 /// driver survives the response.
 pub(super) async fn preflight_network(
     State(state): State<Arc<AppState>>,
-    _permit: PreflightPermit,
+    permit: PreflightPermit,
     JsonBody(req): JsonBody<PreflightNetwork>,
 ) -> Response {
+    if let Err(refused) = refuse_test_of_a_running_network(&state, permit.account(), &req).await {
+        return refused.into_response();
+    }
     match preflight_network_core(req, state.internal_upstreams).await {
         Ok(result) => axum::Json(PreflightNetworkResponse { ok: true, result }).into_response(),
         Err(error) => error.into_response(),
+    }
+}
+
+/// A connection test registers the requested identity itself. While the
+/// account's network with that upstream and nickname is running, its driver
+/// holds the nickname, so the test can only end `nickname_in_use` — which says
+/// nothing about the settings. Refused with the way out.
+async fn refuse_test_of_a_running_network(
+    state: &AppState,
+    account: &str,
+    req: &PreflightNetwork,
+) -> Result<(), NetworkMutationError> {
+    let Some(registry) = state.bnc_registry.as_ref() else {
+        return Ok(());
+    };
+    let rows = crate::db::list_bnc_networks(pool_of(state), account)
+        .await
+        .map_err(|error| {
+            eprintln!("http: connection test network lookup: {error}");
+            network_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            )
+        })?;
+    let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
+    let running = rows.iter().find(|row| {
+        row.kind == crate::config::NetworkKind::Irc
+            && row.addr.eq_ignore_ascii_case(&req.addr)
+            && casemap.eq(&row.nick, &req.nick)
+            && registry.get_owned(account, &row.name).is_some()
+    });
+    match running {
+        Some(row) => Err(network_error(
+            StatusCode::CONFLICT,
+            "Network is running",
+            Some(&format!(
+                "network '{}' is running; disable it to test its settings",
+                row.name
+            )),
+        )),
+        None => Ok(()),
     }
 }
 
@@ -744,6 +789,7 @@ pub(super) async fn preflight_network_core(
         keepalive_idle: crate::bouncer::KEEPALIVE_IDLE,
         rejection_retry_floor: crate::bouncer::REJECTION_RETRY_FLOOR,
         internal_upstreams,
+        first_dial: crate::bouncer::FirstDial::Immediate,
     };
     // Below the request deadline, so the test's own typed timeout is what the
     // caller reads rather than a generic "request timed out".
@@ -870,7 +916,7 @@ pub(super) async fn network_account_command(
             audit_network_mutation(
                 &state,
                 &account,
-                "network_account_command",
+                "NETWORK_ACCOUNT_COMMAND",
                 &account,
                 &network.name,
                 kind,
@@ -1334,6 +1380,7 @@ fn stored_network_driver(
         state.secret_key.as_deref(),
         account,
         state.internal_upstreams,
+        crate::bouncer::FirstDial::Immediate,
     )
     .map_err(|error| network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error)))
 }
@@ -1421,6 +1468,7 @@ pub(super) async fn update_network_core(
     let lane = ActiveOwnerLane::enter(state, registry, account).await?;
     let pool = pool_of(state);
     let mut row = editable_network(state, account, name, "update").await?;
+    let before = row.clone();
     if row.kind == crate::config::NetworkKind::Irc && realname.is_none() {
         return Err(network_error(
             StatusCode::BAD_REQUEST,
@@ -1475,10 +1523,129 @@ pub(super) async fn update_network_core(
         "NETWORK_UPDATE",
         account,
         &row.name,
-        row.kind.as_db_str(),
+        &network_audit_detail(row.kind, "changed", &changed_network_fields(&before, &row)),
     )
     .await;
     Ok(())
+}
+
+/// The network fields whose stored value differs between `before` and
+/// `after`, by name. Named here in one place so the audit detail can list what
+/// an edit touched without ever copying a value (the address, the nick, and
+/// the sealed password are all values an audit reader must not see).
+fn changed_network_fields(
+    before: &crate::db::BncNetworkRow,
+    after: &crate::db::BncNetworkRow,
+) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    let mut note = |name: &'static str, differs: bool| {
+        if differs {
+            changed.push(name);
+        }
+    };
+    note("addr", before.addr != after.addr);
+    note("tls", before.tls != after.tls);
+    note("nick", before.nick != after.nick);
+    note("username", before.username != after.username);
+    note("realname", before.realname != after.realname);
+    note("autojoin", before.autojoin != after.autojoin);
+    note("sasl_account", before.sasl_account != after.sasl_account);
+    note(
+        "sasl_password",
+        before.sasl_password_sealed != after.sasl_password_sealed,
+    );
+    note("enabled", before.enabled != after.enabled);
+    changed
+}
+
+/// The fields a new network row carries a value for, by name.
+fn present_network_fields(row: &crate::db::BncNetworkRow) -> Vec<&'static str> {
+    let mut present = vec!["addr", "tls", "nick"];
+    if row.username.is_some() {
+        present.push("username");
+    }
+    if row.realname.is_some() {
+        present.push("realname");
+    }
+    if !row.autojoin.is_empty() {
+        present.push("autojoin");
+    }
+    if row.sasl_account.is_some() {
+        present.push("sasl_account");
+    }
+    if row.sasl_password_sealed.is_some() {
+        present.push("sasl_password");
+    }
+    present
+}
+
+/// `NETWORK_CREATE`/`NETWORK_UPDATE` detail: the kind and the field names.
+fn network_audit_detail(
+    kind: crate::config::NetworkKind,
+    relation: &str,
+    fields: &[&'static str],
+) -> String {
+    format!(
+        "{}; {relation}: {}",
+        kind.as_db_str(),
+        if fields.is_empty() {
+            "nothing".to_string()
+        } else {
+            fields.join(", ")
+        }
+    )
+}
+
+#[cfg(test)]
+mod audit_detail_tests {
+    use super::{changed_network_fields, network_audit_detail, present_network_fields};
+
+    fn row() -> crate::db::BncNetworkRow {
+        crate::db::BncNetworkRow {
+            kind: crate::config::NetworkKind::Irc,
+            name: "work".into(),
+            addr: "irc.example:6697".into(),
+            tls: true,
+            nick: "alice".into(),
+            username: Some("alice".into()),
+            realname: Some("Alice".into()),
+            autojoin: vec!["#work".into()],
+            sasl_account: None,
+            sasl_password_sealed: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn an_edit_of_addr_is_audited_by_name_only() {
+        let before = row();
+        let mut after = row();
+        after.addr = "irc.elsewhere.example:6697".into();
+        let changed = changed_network_fields(&before, &after);
+        assert_eq!(changed, ["addr"]);
+        let detail = network_audit_detail(after.kind, "changed", &changed);
+        assert_eq!(detail, "irc; changed: addr");
+        assert!(!detail.contains("elsewhere"), "{detail}");
+        assert_eq!(
+            network_audit_detail(
+                after.kind,
+                "changed",
+                &changed_network_fields(&before, &before)
+            ),
+            "irc; changed: nothing"
+        );
+    }
+
+    #[test]
+    fn a_created_row_lists_the_fields_it_carries() {
+        let mut created = row();
+        created.sasl_account = Some("alice".into());
+        created.sasl_password_sealed = Some("sealed".into());
+        assert_eq!(
+            network_audit_detail(created.kind, "fields", &present_network_fields(&created)),
+            "irc; fields: addr, tls, nick, username, realname, autojoin, sasl_account, sasl_password"
+        );
+    }
 }
 
 async fn create_network_core(
@@ -1614,6 +1781,7 @@ async fn create_network_core(
         sasl_account: req.sasl_account.clone(),
         sasl_password: req.sasl_password.clone(),
         internal_upstreams: state.internal_upstreams,
+        first_dial: crate::bouncer::FirstDial::Immediate,
     })
     .map_err(|error| network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error)))?;
 
@@ -1670,7 +1838,7 @@ async fn create_network_core(
         "NETWORK_CREATE",
         account,
         &req.name,
-        kind.as_db_str(),
+        &network_audit_detail(kind, "fields", &present_network_fields(&row)),
     )
     .await;
     Ok(())
@@ -2078,6 +2246,12 @@ mod tests {
                 .iter()
                 .any(|preset| preset.id == "libera"),
             "Libera is the primary interop target"
+        );
+        assert!(
+            IRC_NETWORK_PRESETS
+                .iter()
+                .all(|preset| !preset.addr.contains("efnet")),
+            "irc.efnet.org's members present certificates that are not valid for it"
         );
         for preset in IRC_NETWORK_PRESETS {
             assert_eq!(preset.id, preset.name);

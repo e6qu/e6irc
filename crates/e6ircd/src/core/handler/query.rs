@@ -543,7 +543,12 @@ pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
             "MSGREFTYPES=msgid,timestamp",
             &format!("MAXLIST=bqeI:{MAXLIST}"),
             &format!("CHANLIMIT=#:{MAX_CHANNELS_PER_SESSION}"),
-            &format!("TARGMAX=PRIVMSG:{TARGMAX},NOTICE:{TARGMAX},KICK:{TARGMAX}"),
+            // Every command that bounds its target list, at the bound it keeps
+            // (the test pins this list against the enforcing constants).
+            &format!(
+                "TARGMAX=PRIVMSG:{TARGMAX},NOTICE:{TARGMAX},TAGMSG:{TARGMAX},KICK:{TARGMAX},\
+                 JOIN:{JOIN_TARGMAX},PART:{PART_TARGMAX},NAMES:{NAMES_TARGMAX}"
+            ),
         ],
         Some("are supported by this server"),
     );

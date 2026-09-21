@@ -18,8 +18,52 @@ pub(super) const MAXLIST: usize = 100;
 /// Advertised as `CHANLIMIT` (matches Libera's `#:250`).
 pub(super) const MAX_CHANNELS_PER_SESSION: usize = 250;
 
-/// Max targets accepted in one PRIVMSG/NOTICE. Advertised as `TARGMAX`.
+/// Max targets accepted in one PRIVMSG/NOTICE/TAGMSG/KICK. Advertised as
+/// `TARGMAX` (Libera's value for PRIVMSG/NOTICE).
 pub(super) const TARGMAX: usize = 4;
+
+/// Max channels one JOIN or PART may name, advertised as `TARGMAX` `JOIN:` /
+/// `PART:`. Solanum bounds these lists only through its channel limit, and so
+/// does this: a session can never need to name more channels than it may hold.
+/// The target list is casefold-deduplicated first (`JOIN #c,#C` is one
+/// channel), so the per-command work is bounded by *distinct* channels, and
+/// the first target past the cap is refused loudly (ERR_TOOMANYTARGETS).
+pub(super) const JOIN_TARGMAX: usize = MAX_CHANNELS_PER_SESSION;
+pub(super) const PART_TARGMAX: usize = MAX_CHANNELS_PER_SESSION;
+
+/// NAMES serves one channel per command, advertised as `TARGMAX` `NAMES:1`
+/// (Solanum / Libera). NAMES is the one channel-list command that costs a
+/// member list without membership, so an unbounded list over large channels
+/// multiplied output by its length; the second target on is refused loudly.
+pub(super) const NAMES_TARGMAX: usize = 1;
+
+/// The channels a JOIN/PART/NAMES target list names — each once, casefolded,
+/// with its raw comma position (JOIN keys align to that) — bounded by `cap`.
+/// The first target past the cap is answered with ERR_TOOMANYTARGETS and the
+/// rest are dropped: never served silently N times, never silently truncated.
+/// The one path every channel-list command takes, so none can forget either
+/// the fold-dedup or the bound.
+fn capped_channel_targets(
+    state: &mut ServerState,
+    conn: ConnId,
+    targets: &str,
+    cap: usize,
+) -> Vec<(usize, String)> {
+    let mut kept = Vec::new();
+    for (index, target) in unique_targets_indexed(targets, state.casemap) {
+        if kept.len() >= cap {
+            state.numeric(
+                conn,
+                ERR_TOOMANYTARGETS,
+                &[clip_echo(target)],
+                Some("Too many targets"),
+            );
+            break;
+        }
+        kept.push((index, target.to_string()));
+    }
+    kept
+}
 
 /// Cap on stored read markers per account. Markers persist across parts, so
 /// without a cap a client could seed the marker map without bound.
@@ -161,10 +205,8 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // target slot still consumes its key slot: `JOIN #a,,#c k1,k2` gives `#a`
     // k1 and `#c` no key (k2 belonged to the empty slot), never `#c`←k2.
     let actor = state.channel_actor(conn);
-    for (i, target) in targets.split(',').enumerate() {
-        if target.is_empty() {
-            continue;
-        }
+    for (i, target) in capped_channel_targets(state, conn, targets, JOIN_TARGMAX) {
+        let target = target.as_str();
         let key = state.chan_key(target);
         // The session owner alone owns this index, so it enforces the bound
         // before either a local or remote channel-owner request. A JOIN sent
@@ -242,18 +284,10 @@ pub(super) fn join_on_owner(
         )
     });
     if chan.is_member(conn) {
-        return ChannelJoinResult::Joined(ChannelJoinSuccess {
-            key,
-            display: chan.name.clone(),
-            topic: chan.topic.clone(),
-            secret: chan.modes.secret,
-            members: chan
-                .member_identities()
-                .map(|(_, modes, identity)| (modes.clone(), identity.clone()))
-                .collect(),
-            own_join: String::new(),
-            own_mode: None,
-        });
+        // Joining a channel already joined is a no-op (Solanum / Modern): no
+        // JOIN echo, no TOPIC, no NAMES. Replaying the member list here made a
+        // repeated JOIN of a large channel an output multiplier.
+        return ChannelJoinResult::AlreadyMember;
     }
     // Admission checks, Solanum order. The invite lives on the channel, so it
     // can only ever admit into the incarnation whose op granted it.
@@ -412,6 +446,9 @@ pub(super) fn emit_join_result(
 
 fn emit_join_response(state: &mut ServerState, conn: ConnId, result: ChannelJoinResult) {
     match result {
+        // Already a member: nothing changed, so nothing is said (the pending
+        // reservation was released by the caller either way).
+        ChannelJoinResult::AlreadyMember => {}
         ChannelJoinResult::Rejected(ChannelJoinFailure::NoSuchChannel { name }) => {
             state.err_nosuchchannel(conn, &name);
         }
@@ -525,20 +562,14 @@ pub(super) fn cmd_part(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     }
     let reason = p.get(1).map(|r| r.to_string());
     let actor = state.channel_actor(conn);
-    for target in targets.split(',').filter(|t| !t.is_empty()) {
-        let owner = state.channel_owner(target);
+    for (_, target) in capped_channel_targets(state, conn, targets, PART_TARGMAX) {
+        let owner = state.channel_owner(&target);
         if !state.owns_channel(&owner) {
             let label = state.defer_channel_reply(conn);
-            state.route_part(
-                owner,
-                actor.clone(),
-                target.to_string(),
-                reason.clone(),
-                label,
-            );
+            state.route_part(owner, actor.clone(), target, reason.clone(), label);
             continue;
         }
-        let result = part_on_owner(state, actor.clone(), target, reason.as_deref());
+        let result = part_on_owner(state, actor.clone(), &target, reason.as_deref());
         emit_part_response(state, conn, result);
     }
 }
@@ -703,17 +734,17 @@ pub(super) fn cmd_names(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .is_some_and(|t| t.split(',').any(|s| !s.is_empty()));
     match p.first().filter(|_| has_target) {
         Some(&targets) => {
-            for target in targets.split(',').filter(|t| !t.is_empty()) {
-                let owner = state.channel_owner(target);
+            for (_, target) in capped_channel_targets(state, conn, targets, NAMES_TARGMAX) {
+                let owner = state.channel_owner(&target);
                 if state.owns_channel(&owner) {
-                    let key = state.chan_key(target);
-                    send_names(state, conn, &key, target);
+                    let key = state.chan_key(&target);
+                    send_names(state, conn, &key, &target);
                 } else {
                     let label = state.channel_reply_label(conn, &owner);
                     state.route_channel_command(crate::core::state::ChannelCommand::new(
                         owner,
                         state.channel_actor(conn),
-                        target.to_string(),
+                        target,
                         crate::core::state::ChannelCommandOperation::Names,
                         label,
                     ));
@@ -871,15 +902,17 @@ fn require_channel<'a>(
     }
 }
 
-pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p: &[&str]) {
+pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let Some(&target) = p.first() else {
         state.err_needmoreparams(conn, "TOPIC");
         return;
     };
-    let operation = if p.len() == 1 && !msg.has_trailing {
-        crate::core::state::ChannelTopicOperation::Query
-    } else {
-        crate::core::state::ChannelTopicOperation::Set(p.get(1).copied().unwrap_or("").to_string())
+    // One parameter is a query however it was framed: `TOPIC :#c` names the
+    // channel as a trailing parameter, it does not set an empty topic. Only a
+    // second parameter sets (and `TOPIC #c :` clears).
+    let operation = match p.get(1) {
+        None => crate::core::state::ChannelTopicOperation::Query,
+        Some(&text) => crate::core::state::ChannelTopicOperation::Set(text.to_string()),
     };
     let owner = state.channel_owner(target);
     let local = state.owns_channel(&owner);
@@ -1342,11 +1375,27 @@ fn mode_list_query_modes(rest: &[&str]) -> Option<String> {
         return None;
     };
     let modes = token.strip_prefix('+').unwrap_or(token);
-    (!modes.is_empty()
-        && modes
+    if modes.is_empty()
+        || !modes
             .chars()
-            .all(|mode| matches!(mode, 'b' | 'q' | 'e' | 'I')))
-    .then(|| modes.to_string())
+            .all(|mode| matches!(mode, 'b' | 'q' | 'e' | 'I'))
+    {
+        return None;
+    }
+    // Each list once, however many times its letter was written: `MODE #c
+    // bbb` is one ban-list query, not a request to dump it three times.
+    Some(unique_mode_chars(modes))
+}
+
+/// The distinct characters of a mode string, first occurrence order.
+fn unique_mode_chars(modes: &str) -> String {
+    let mut unique = String::new();
+    for mode in modes.chars() {
+        if !unique.contains(mode) {
+            unique.push(mode);
+        }
+    }
+    unique
 }
 
 fn route_mode_query(
@@ -1889,6 +1938,9 @@ fn channel_mode_with_prefix(
     // lines as the 512-byte wire limit needs — a single line of many bans is
     // discarded whole by a recipient's framing, hiding bans that are in force.
     let mut changes: Vec<(bool, char, Option<String>)> = Vec::new();
+    // List modes already dumped by this command: a letter repeated without a
+    // mask (`MODE #c b+b`) is one query, not one dump per repetition.
+    let mut listed = String::new();
 
     for c in rest[0].chars() {
         match c {
@@ -2030,7 +2082,10 @@ fn channel_mode_with_prefix(
                     // No mask: a list *query* for this mode (e.g. `MODE #c be`
                     // views bans and exceptions), not a silent no-op. Op context
                     // here (the apply loop is op-gated), so `e`/`I` are viewable.
-                    emit_channel_list(state, conn, &key, &display, c, true);
+                    if !listed.contains(c) {
+                        listed.push(c);
+                        emit_channel_list(state, conn, &key, &display, c, true);
+                    }
                     continue;
                 };
                 // One constructor canonicalizes to nick!user@host (so a bare

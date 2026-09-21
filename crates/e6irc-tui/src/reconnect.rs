@@ -84,7 +84,9 @@ fn permanent_refusal(error: &io::Error) -> Option<String> {
         | RegistrationRefusal::InvalidUsername
         | RegistrationRefusal::NicknameInUse
         | RegistrationRefusal::NotRegistered
+        | RegistrationRefusal::WelcomedAsAnotherNickname
         | RegistrationRefusal::SaslUnavailable
+        | RegistrationRefusal::SaslAborted
         | RegistrationRefusal::SaslFailed => return None,
     };
     Some(format!("{what} ({})", rejection.diagnostic()))

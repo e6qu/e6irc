@@ -32,10 +32,22 @@ pub(super) fn unique_targets(
     targets: &str,
     casemap: e6irc_proto::casemap::CaseMapping,
 ) -> impl Iterator<Item = &str> {
+    unique_targets_indexed(targets, casemap).map(|(_, target)| target)
+}
+
+/// [`unique_targets`] with each kept target's *raw* comma position. JOIN keys
+/// align to raw positions (`JOIN #a,,#c k1,k2` gives `#c` no key), so a caller
+/// that pairs targets with a parallel list needs the position the fold-dedup
+/// would otherwise hide.
+pub(super) fn unique_targets_indexed(
+    targets: &str,
+    casemap: e6irc_proto::casemap::CaseMapping,
+) -> impl Iterator<Item = (usize, &str)> {
     let mut seen = std::collections::HashSet::new();
     targets
         .split(',')
-        .filter(move |t| !t.is_empty() && seen.insert(casemap.casefold(t)))
+        .enumerate()
+        .filter(move |(_, t)| !t.is_empty() && seen.insert(casemap.casefold(t)))
 }
 
 pub(super) fn cmd_message(
@@ -866,6 +878,19 @@ pub(super) fn cmd_batch(state: &mut ServerState, conn: ConnId, msg: &Message, p:
     let reference = chars.as_str();
     match sign {
         Some('+') => {
+            // The reference is what every later `@batch=<reference>` line is
+            // matched against; an empty one would be matched by a valueless
+            // `@batch` tag, so it is refused at the one place a batch opens.
+            if reference.is_empty() {
+                multiline_fail(
+                    state,
+                    conn,
+                    "MULTILINE_INVALID",
+                    &[],
+                    "Syntax: BATCH +<reference> draft/multiline <target>",
+                );
+                return;
+            }
             if !state.sessions[&conn].caps.multiline {
                 multiline_fail(
                     state,
@@ -1580,14 +1605,15 @@ pub(super) fn multiline_collect(
     p: &[&str],
     kind: crate::core::MessageKind,
 ) -> bool {
-    let Some(reference) = msg
-        .tags
-        .iter()
-        .find(|t| t.key == "batch")
-        .and_then(|t| t.value.clone())
-    else {
+    let Some(tag) = msg.tags.iter().find(|t| t.key == "batch") else {
         return false;
     };
+    // A valueless `@batch` names no batch. It is a batch claim all the same,
+    // so it is judged as one — an unknown reference, refused — rather than
+    // quietly delivered as an ordinary message the sender did not send.
+    // (An open batch always has a non-empty reference; `cmd_batch` refuses
+    // `BATCH +`, so the empty string can never match one.)
+    let reference = tag.value.as_deref().unwrap_or("");
     let matches = state.sessions[&conn]
         .multiline
         .as_ref()
@@ -1604,8 +1630,44 @@ pub(super) fn multiline_collect(
         );
         return true;
     }
+    // Every line of a batch is part of one message to one target. A line
+    // addressed elsewhere is the spec's MULTILINE_INVALID_TARGET, and the
+    // batch is abandoned: the message it was building cannot be completed.
+    let batch_target = state.sessions[&conn]
+        .multiline
+        .as_ref()
+        .map(|b| b.target.clone())
+        .expect("matched above");
+    let line_target = p.first().copied().unwrap_or("");
+    if state.casemap.casefold(line_target) != state.casemap.casefold(&batch_target) {
+        multiline_fail(
+            state,
+            conn,
+            "MULTILINE_INVALID_TARGET",
+            &[clip_echo(&batch_target), clip_echo(line_target)],
+            "Multiline batch target does not match message target",
+        );
+        return true;
+    }
     let text = p.get(1).copied().unwrap_or("");
     let concat = msg.tags.iter().any(|t| t.key == MULTILINE_CONCAT_TAG);
+    let first_line = state.sessions[&conn]
+        .multiline
+        .as_ref()
+        .is_some_and(|b| b.lines.is_empty());
+    if concat && first_line {
+        // There is no previous line to concatenate onto (the spec forbids the
+        // tag on a batch's first message), and dropping the tag would change
+        // what the sender wrote.
+        multiline_fail(
+            state,
+            conn,
+            "MULTILINE_INVALID",
+            &[],
+            "The concat tag cannot be used on the first message of a batch",
+        );
+        return true;
+    }
     if concat && text.is_empty() {
         // Concatenating onto nothing is meaningless, and silently dropping the
         // tag would change what the sender wrote.

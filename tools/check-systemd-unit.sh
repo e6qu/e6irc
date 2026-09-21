@@ -22,19 +22,29 @@ systemd-analyze \
   --man=no \
   verify e6ircd.service
 
-# The daemon's clean shutdown is sequential: the core shards drain for up to
+# A refused first database connection exits in milliseconds; without this the
+# default start limit (5 in 10 s) turns a PostgreSQL that comes up later than
+# e6ircd into a unit that stays failed until a human resets it.
+grep -qx 'StartLimitIntervalSec=0' "$unit" || {
+  echo "$unit must set StartLimitIntervalSec=0 so a slow database cannot leave the unit permanently failed" >&2
+  exit 1
+}
+
+# The daemon's clean shutdown is sequential: the bouncer drivers say goodbye
+# for up to SHUTDOWN_DRIVER_STOP_TIMEOUT, THEN the core shards drain for up to
 # SHUTDOWN_CORE_STOP_TIMEOUT, THEN the database flushes for up to
 # SHUTDOWN_DB_FLUSH_TIMEOUT. The unit's stop budget must exceed the sum, or
 # systemd can kill a shutdown that was still clean.
 stop_seconds="$(sed -n 's/^TimeoutStopSec=\([0-9][0-9]*\)s$/\1/p' "$unit")"
 flush_seconds="$(sed -n 's/.*const SHUTDOWN_DB_FLUSH_TIMEOUT.*from_secs(\([0-9][0-9]*\)).*/\1/p' crates/e6ircd/src/net.rs | head -n1)"
 drain_seconds="$(sed -n 's/.*const SHUTDOWN_CORE_STOP_TIMEOUT.*from_secs(\([0-9][0-9]*\)).*/\1/p' crates/e6ircd/src/net.rs | head -n1)"
-if [ -z "$stop_seconds" ] || [ -z "$flush_seconds" ] || [ -z "$drain_seconds" ]; then
-  echo "could not resolve the systemd stop budget or the daemon's drain/flush budgets" >&2
+driver_seconds="$(sed -n 's/.*const SHUTDOWN_DRIVER_STOP_TIMEOUT.*from_secs(\([0-9][0-9]*\)).*/\1/p' crates/e6ircd/src/net.rs | head -n1)"
+if [ -z "$stop_seconds" ] || [ -z "$flush_seconds" ] || [ -z "$drain_seconds" ] || [ -z "$driver_seconds" ]; then
+  echo "could not resolve the systemd stop budget or the daemon's driver-stop/drain/flush budgets" >&2
   exit 1
 fi
-budget=$((drain_seconds + flush_seconds))
+budget=$((driver_seconds + drain_seconds + flush_seconds))
 if [ "$stop_seconds" -le "$budget" ]; then
-  echo "TimeoutStopSec=${stop_seconds}s must exceed the daemon's ${drain_seconds}s core drain plus ${flush_seconds}s database flush (${budget}s)" >&2
+  echo "TimeoutStopSec=${stop_seconds}s must exceed the daemon's ${driver_seconds}s driver stop plus ${drain_seconds}s core drain plus ${flush_seconds}s database flush (${budget}s)" >&2
   exit 1
 fi

@@ -43,7 +43,7 @@ including credentials.
 **Evidence.** Proven by configuration validation/runtime-listener unit tests
 and `console_configuration_enables_and_persists_bnc_listener`.
 
-## Add Libera Chat, OFTC, EFnet, Snoonet, or a custom IRC network
+## Add Libera Chat, OFTC, Snoonet, or a custom IRC network
 
 **Actor and goal.** An account holder wants an always-on upstream configured
 from the chat client or **Your networks** in the console.
@@ -61,7 +61,7 @@ the same words.
 
 1. In the chat client choose **+** beside **Networks**, or **Add a network** on
    an empty account. The dialog opens in place.
-2. **Network** defaults to Libera Chat and also offers OFTC, EFnet, Snoonet,
+2. **Network** defaults to Libera Chat and also offers OFTC, Snoonet,
    and **Another network…**. **Nickname** defaults to the account name.
 3. Optionally enter the **NickServ account** and **NickServ password** of an
    account already held on that network, and **Channels to join**. Signing in to

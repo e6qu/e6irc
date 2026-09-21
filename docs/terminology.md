@@ -276,7 +276,7 @@ platform for real-time events.
 protocol over a WebSocket, so a web client speaks IRC without a raw TCP port.
 
 **Preset** — one entry of the curated catalog of public IRC networks
-(`IRC_NETWORK_PRESETS`: Libera Chat, OFTC, EFnet, Snoonet), served at
+(`IRC_NETWORK_PRESETS`: Libera Chat, OFTC, Snoonet), served at
 `GET /api/v1/network-presets`. Every preset is a TLS endpoint on port 6697. A
 preset only fills the add-network form; the request carries the resulting
 fields, never a preset identifier.

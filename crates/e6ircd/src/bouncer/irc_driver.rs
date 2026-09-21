@@ -39,6 +39,20 @@ pub struct NetworkConfig {
     /// Whether the upstream may resolve to an address inside this host's own
     /// network (§egress). Every resolved address is judged against it at dial.
     pub internal_upstreams: crate::egress::InternalUpstreams,
+    /// Whether the first dial is held back as one of a boot's many.
+    pub first_dial: FirstDial,
+}
+
+/// When a started driver first dials. A daemon restart starts every stored
+/// network within milliseconds; dialled at once they reach one network's round
+/// robin as a burst that its connection throttle answers with `ERROR`, so those
+/// are spread over [`super::Backoff::FIRST_DIAL_STAGGER`] by each driver's
+/// seed. A network the owner just created or enabled is one dial, made at
+/// once, so they see its outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstDial {
+    Immediate,
+    Staggered,
 }
 
 impl Default for NetworkConfig {
@@ -57,6 +71,7 @@ impl Default for NetworkConfig {
             keepalive_idle: KEEPALIVE_IDLE,
             rejection_retry_floor: super::REJECTION_RETRY_FLOOR,
             internal_upstreams: crate::egress::InternalUpstreams::Refuse,
+            first_dial: FirstDial::Immediate,
         }
     }
 }
@@ -108,10 +123,13 @@ impl IrcNetwork {
     }
 }
 
-/// A successful, side-effect-free IRC upstream qualification. The connection
-/// is closed after registration and no channels are joined. Timings are split
-/// at the same boundaries operators must diagnose: name resolution, transport
-/// establishment (including TLS), and IRC registration (including SASL).
+/// A successful, side-effect-free IRC upstream qualification. Registration
+/// under the configured identity is the qualification: the connection says
+/// `QUIT` as soon as it is welcomed and joins nothing, so a test of a network
+/// whose channels are public shows those channels no JOIN/QUIT pair. Timings
+/// are split at the same boundaries operators must diagnose: name resolution,
+/// transport establishment (including TLS), and IRC registration (including
+/// SASL).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct IrcPreflight {
     pub resolved_addresses: usize,
@@ -119,7 +137,6 @@ pub struct IrcPreflight {
     pub connect_ms: u64,
     pub registration_ms: u64,
     pub confirmed_nick: String,
-    pub joined_channels: Vec<String>,
 }
 
 /// Closed failure taxonomy for an IRC preflight. Raw resolver, TLS, and server
@@ -146,8 +163,6 @@ pub enum IrcPreflightFailure {
     SaslFailed(e6irc_client::RegistrationRejection),
     RegistrationFailed,
     RegistrationTimedOut,
-    ChannelJoinFailed,
-    ChannelJoinTimedOut,
 }
 
 impl IrcPreflightFailure {
@@ -170,8 +185,6 @@ impl IrcPreflightFailure {
             Self::SaslFailed(_) => "sasl_failed",
             Self::RegistrationFailed => "registration_failed",
             Self::RegistrationTimedOut => "registration_timed_out",
-            Self::ChannelJoinFailed => "channel_join_failed",
-            Self::ChannelJoinTimedOut => "channel_join_timed_out",
         }
     }
 
@@ -193,17 +206,13 @@ impl IrcPreflightFailure {
             Self::InvalidUsername(_) => "The upstream rejected the IRC username.",
             Self::NicknameInUse(_) => "The configured nickname is already in use.",
             Self::ServerPasswordRejected(_) => {
-                "The upstream rejected the configured server password."
+                super::NetworkFailure::ServerPasswordRejected.summary()
             }
             Self::NetworkBanned(_) => "The upstream network banned this connection.",
             Self::SaslUnavailable(_) => super::NetworkFailure::SaslUnavailable.summary(),
             Self::SaslFailed(_) => super::NetworkFailure::SaslFailed.summary(),
             Self::RegistrationFailed => "IRC registration failed before a welcome was received.",
             Self::RegistrationTimedOut => "IRC registration timed out.",
-            Self::ChannelJoinFailed => "The upstream rejected a configured channel join.",
-            Self::ChannelJoinTimedOut => {
-                "The upstream did not confirm a configured channel join in time."
-            }
         }
     }
 
@@ -229,11 +238,11 @@ impl IrcPreflightFailure {
 /// Resolve, connect, and register exactly as the always-on IRC driver does,
 /// without persisting configuration or starting a reconnect loop.
 ///
-/// `budget` bounds the whole test. The stages used to carry 10 + 30 + 30 + 30
-/// seconds per channel of their own, so the caller's own deadline always fired
-/// first: its typed timeouts could never be reported, and the dropped future
-/// skipped the goodbye below. Whichever stage is running when the budget ends
-/// reports its own timeout, and every exit after the socket opens says `QUIT`.
+/// `budget` bounds the whole test. The stages used to carry 10 + 30 + 30
+/// seconds of their own, so the caller's own deadline always fired first: its
+/// typed timeouts could never be reported, and the dropped future skipped the
+/// goodbye below. Whichever stage is running when the budget ends reports its
+/// own timeout, and every exit after the socket opens says `QUIT`.
 pub async fn preflight_irc(
     config: &NetworkConfig,
     budget: Duration,
@@ -262,6 +271,8 @@ pub async fn preflight_irc(
     let resolved_addresses = addresses.len();
 
     let connect_started = Instant::now();
+    // One test, one dial: nothing to spread it against.
+    let addresses = super::rotate_addresses(addresses, 0);
     let mut connection = tokio::time::timeout_at(deadline, connect_resolved(config, addresses))
         .await
         .map_err(|_| IrcPreflightFailure::ConnectionTimedOut)?
@@ -276,61 +287,35 @@ pub async fn preflight_irc(
     let connect_ms = elapsed_millis(connect_started.elapsed());
 
     // Everything from here talks on an open socket, so it runs as one unit
-    // whose every outcome -- a refusal, a rejected join, the deadline -- is
-    // followed by the goodbye below.
+    // whose every outcome -- a refusal, a welcome, the deadline -- is followed
+    // by the goodbye below.
     let registration_started = Instant::now();
-    let outcome = async {
-        let registration = register(config, &mut connection);
-        let confirmed_nick = match tokio::time::timeout_at(deadline, registration).await {
-            Ok(Ok(welcomed)) => configured_nick_was_granted(config.nick.as_str(), welcomed)
-                .map_err(|rejection| preflight_refusal(Some(rejection)))?,
-            Ok(Err(error)) => {
-                return Err(match RegistrationError::classify(error) {
-                    RegistrationError::CredentialsRejected(rejection) => {
-                        IrcPreflightFailure::AuthenticationRejected(Some(rejection))
-                    }
-                    RegistrationError::Refused(rejection) => preflight_refusal(Some(rejection)),
-                    RegistrationError::Failed(error) => {
-                        eprintln!("irc preflight: registration failed: {error}");
-                        IrcPreflightFailure::RegistrationFailed
-                    }
-                });
+    let registration = register(config, &mut connection);
+    let outcome = match tokio::time::timeout_at(deadline, registration).await {
+        Ok(Ok(welcomed)) => configured_nick_was_granted(config.nick.as_str(), welcomed)
+            .map_err(|rejection| preflight_refusal(Some(rejection))),
+        Ok(Err(error)) => Err(match RegistrationError::classify(error) {
+            RegistrationError::CredentialsRejected(rejection) => {
+                IrcPreflightFailure::AuthenticationRejected(Some(rejection))
             }
-            Err(_) => return Err(IrcPreflightFailure::RegistrationTimedOut),
-        };
-
-        let registration_ms = elapsed_millis(registration_started.elapsed());
-
-        let mut joined_channels = Vec::with_capacity(config.autojoin.len());
-        for channel in &config.autojoin {
-            match tokio::time::timeout_at(
-                deadline,
-                connection.join_with_latest_history(channel.as_str(), 0),
-            )
-            .await
-            {
-                Ok(Ok(_)) => joined_channels.push(channel.to_string()),
-                Ok(Err(error)) => {
-                    eprintln!("irc preflight: channel join failed: {error}");
-                    return Err(IrcPreflightFailure::ChannelJoinFailed);
-                }
-                Err(_) => return Err(IrcPreflightFailure::ChannelJoinTimedOut),
+            RegistrationError::Refused(rejection) => preflight_refusal(Some(rejection)),
+            RegistrationError::Failed(error) => {
+                eprintln!("irc preflight: registration failed: {error}");
+                IrcPreflightFailure::RegistrationFailed
             }
-        }
-        Ok((confirmed_nick, registration_ms, joined_channels))
-    }
-    .await;
+        }),
+        Err(_) => Err(IrcPreflightFailure::RegistrationTimedOut),
+    };
+    let registration_ms = elapsed_millis(registration_started.elapsed());
 
     say_goodbye(&mut connection, "connection test complete", "irc preflight").await;
 
-    let (confirmed_nick, registration_ms, joined_channels) = outcome?;
     Ok(IrcPreflight {
         resolved_addresses,
         dns_ms,
         connect_ms,
         registration_ms,
-        confirmed_nick,
-        joined_channels,
+        confirmed_nick: outcome?,
     })
 }
 
@@ -363,10 +348,15 @@ async fn say_goodbye(connection: &mut Connection, reason: &str, who: &str) {
 
 /// What a stopped driver says on its way out, whether the network was removed
 /// or replaced by its reconfigured successor.
-const STOPPED_GOODBYE: &str = "reconfigured";
+// Neutral on purpose: the driver cannot tell a replace from a removal or a
+// process shutdown, and the upstream needs only to know the session ended.
+const STOPPED_GOODBYE: &str = "e6irc bouncer stopping";
 
 async fn run(config: NetworkConfig, mut ends: DriverEnds) {
     ends.set_rejection_retry_floor(config.rejection_retry_floor);
+    if config.first_dial == FirstDial::Staggered {
+        ends.stagger_first_dial();
+    }
     // Clean stop: the command channel closed (handle dropped).
     let shared = SharedDriver {
         config,
@@ -480,7 +470,8 @@ fn preflight_refusal(
         return IrcPreflightFailure::RegistrationRejected(None);
     };
     match rejection.refusal() {
-        e6irc_client::RegistrationRefusal::InvalidNickname => {
+        e6irc_client::RegistrationRefusal::InvalidNickname
+        | e6irc_client::RegistrationRefusal::WelcomedAsAnotherNickname => {
             IrcPreflightFailure::InvalidNickname(Some(rejection))
         }
         e6irc_client::RegistrationRefusal::InvalidUsername => {
@@ -501,7 +492,10 @@ fn preflight_refusal(
         e6irc_client::RegistrationRefusal::SaslUnavailable => {
             IrcPreflightFailure::SaslUnavailable(rejection)
         }
-        e6irc_client::RegistrationRefusal::SaslFailed => IrcPreflightFailure::SaslFailed(rejection),
+        e6irc_client::RegistrationRefusal::SaslAborted
+        | e6irc_client::RegistrationRefusal::SaslFailed => {
+            IrcPreflightFailure::SaslFailed(rejection)
+        }
     }
 }
 
@@ -511,7 +505,7 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     // but never sends 001 (firewall dropping data, half-open peer) must not
     // wedge the driver forever — that would starve the reconnect loop, the
     // same failure the Matrix driver's timeout guards against.
-    let connect_fut = connect(config);
+    let connect_fut = connect(config, ends.dial_rotation());
     let connected = tokio::select! {
         _ = ends.shutdown_signalled() => return super::SessionOutcome::Stopped,
         result = tokio::time::timeout(Duration::from_secs(30), connect_fut) => result,
@@ -538,13 +532,32 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
         say_goodbye(&mut conn, STOPPED_GOODBYE, "irc driver").await;
         return super::SessionOutcome::Stopped;
     };
-    let granted = registration_outcome(registration).and_then(|welcomed| {
-        configured_nick_was_granted(config.nick.as_str(), welcomed)
-            .map_err(super::SessionOutcome::RegistrationRejected)
-    });
-    let mut current_nick = match granted {
-        Ok(nick) => nick,
+    let welcomed = match registration_outcome(registration) {
+        Ok(welcomed) => welcomed,
         Err(outcome) => return outcome,
+    };
+    let current_nick = match configured_nick_was_granted(config.nick.as_str(), welcomed) {
+        Ok(nick) => nick,
+        Err(rejection) => {
+            // Registered, under a name nobody chose: leave as a client would,
+            // or the upstream keeps that session until its ping timeout.
+            say_goodbye(
+                &mut conn,
+                "registered under an unconfigured nickname",
+                "irc driver",
+            )
+            .await;
+            return super::SessionOutcome::RegistrationRejected(rejection);
+        }
+    };
+    let mut identity = SelfIdentity {
+        nick: current_nick,
+        // `~` because no identd answered; replaced by whatever the upstream
+        // shows once one of our own echoes reveals it.
+        user: format!("~{}", config.username.as_str()),
+        host: upstream_host(&config.addr)
+            .expect("IRC driver starts only from a validated upstream address")
+            .to_string(),
     };
     // Join the configured autojoin plus every channel the upstream confirmed
     // us in before the drop (runtime joins are tracked in `shared.joined`).
@@ -569,15 +582,14 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
         list.extend(extras);
         list
     };
-    // Up to `MAX_TRACKED_CHANNELS` writes, each bounded; the whole burst is
-    // still raced against the stop signal so a removal or replacement is not
-    // held behind a slow upstream's worth of them.
+    // As few lines as the wire allows, each bounded; the whole burst is still
+    // raced against the stop signal so a removal or replacement is not held
+    // behind a slow upstream's worth of them.
     let rejoined = tokio::select! {
         _ = ends.shutdown_signalled() => None,
         result = async {
-            for chan in &rejoin {
-                write_bounded(&mut conn, &format!("JOIN {chan}"), super::UPSTREAM_WRITE_DEADLINE)
-                    .await?;
+            for line in join_lines(&rejoin) {
+                write_bounded(&mut conn, &line, super::UPSTREAM_WRITE_DEADLINE).await?;
             }
             Ok::<(), std::io::Error>(())
         } => Some(result),
@@ -590,7 +602,7 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
         Some(Err(_)) => return dropped(super::NetworkFailure::AutojoinFailed),
         Some(Ok(())) => {}
     }
-    ends.begin_irc_session(current_nick.clone());
+    ends.begin_irc_session(identity.nick.clone());
     ends.emit(ConnectionEvent::Connected);
 
     // Keepalive: `connect_once` bounds connect + registration, but the
@@ -607,10 +619,6 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     // and must not make a silent upstream look alive while someone types.
     let mut awaiting_keepalive = false;
     let mut silence = super::SilenceDeadline::new(config.keepalive_idle);
-    // The host half of synthesized self-echo prefixes.
-    let upstream = upstream_host(&config.addr)
-        .expect("IRC driver starts only from a validated upstream address")
-        .to_string();
     loop {
         tokio::select! {
             // Upstream -> buffer + event.
@@ -627,7 +635,7 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                         // driver's job, not the attached client's).
                         if m.command == "PING" {
                             let token = m.params.first().cloned().unwrap_or_default();
-                            if write_bounded(&mut conn, &format!("PONG :{token}"), super::UPSTREAM_WRITE_DEADLINE)
+                            if write_bounded(&mut conn, &pong_line(&token), super::UPSTREAM_WRITE_DEADLINE)
                                 .await
                                 .is_err()
                             {
@@ -654,6 +662,21 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                         if m.command == "CAP" {
                             continue;
                         }
+                        // The upstream is closing the link and says why. To an
+                        // attached client `ERROR` means *its* connection is
+                        // over, and replayed from the backlog days later it
+                        // would mean it again; the reason is kept as this
+                        // drop's diagnostic and said as a notice instead.
+                        if m.command == "ERROR" {
+                            let closed = super::LinkClosed::new(
+                                m.params.last().map(String::as_str).unwrap_or("no reason given"),
+                            );
+                            ends.emit_line(format!(
+                                ":*bnc* NOTICE * :upstream closed the link: {}",
+                                closed.diagnostic()
+                            ));
+                            return super::SessionOutcome::ClosedByUpstream(closed);
+                        }
                     }
                     // The upstream's own line: attached clients and the detached
                     // buffer get what the network sent, tags and all. `attach`
@@ -668,8 +691,24 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                     // numeric cannot erase channels still awaiting confirmation
                     // on this new session.
                     let tracked = ends.emit_session_line(raw).and_then(|mut change| {
+                        if let Some(shown) = change.shown_identity.take() {
+                            if let Some(user) = shown.user {
+                                identity.user = user;
+                            }
+                            identity.host = shown.host;
+                        }
                         if let Some(nick) = change.nick.take() {
-                            current_nick = nick;
+                            // Tracked, so the session goes on under it — and
+                            // announced, because it is a name the owner did
+                            // not choose (a services enforcer, typically).
+                            ends.record_error_with_upstream_detail(
+                                super::NetworkFailure::RenamedByUpstream,
+                                &format!(
+                                    "upstream renamed this session from {} to {nick}",
+                                    identity.nick
+                                ),
+                            );
+                            identity.nick = nick;
                         }
                         shared.joined.apply(change)
                     });
@@ -722,7 +761,7 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                     // account's other sessions must see both sides of the
                     // conversation, and the originator sees it exactly when it
                     // negotiated echo-message on attach.
-                    if let Some(echo) = self_echo(&cmd.line, &current_nick, config.nick.as_str(), &upstream) {
+                    if let Some(echo) = self_echo(&cmd.line, &identity) {
                         ends.emit_echo(echo, cmd.origin);
                     }
                 }
@@ -741,15 +780,59 @@ fn dropped(failure: super::NetworkFailure) -> super::SessionOutcome {
     super::SessionOutcome::Dropped(failure)
 }
 
+/// The prefix the upstream shows other users for this session, as far as the
+/// driver has seen it: the nick it registered (or was renamed to), and the
+/// user and host from its own echoes. Until an echo reveals them, the user is
+/// the configured one behind a `~` and the host is the server's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SelfIdentity {
+    pub(super) nick: String,
+    /// Verbatim, tilde included.
+    pub(super) user: String,
+    pub(super) host: String,
+}
+
+/// The widest `JOIN` line the wire allows: 512 bytes less the CRLF.
+/// The answer to an upstream `PING`, fitted to the wire like every other
+/// trailing parameter: a token the upstream padded to the line limit (or
+/// past it, on a peer a tenant points at) would otherwise leave here as an
+/// over-long line the upstream's framing discards whole, and then reaps the
+/// link as unanswered.
+fn pong_line(token: &str) -> String {
+    let head = "PONG :";
+    format!("{head}{}", crate::core::fit_trailing(head, token))
+}
+
+const JOIN_LINE_BUDGET: usize = 510;
+
+/// `channels` as the fewest `JOIN` lines that fit the wire, names comma-joined
+/// in order. One line per channel exceeded Solanum's flood allowance on a
+/// reconnect with many channels, which it answers by closing the link ("Excess
+/// Flood"); a comma list is one command to the flood counter.
+pub(super) fn join_lines(channels: &[String]) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for channel in channels {
+        match lines.last_mut() {
+            Some(line) if line.len() + 1 + channel.len() <= JOIN_LINE_BUDGET => {
+                line.push(',');
+                line.push_str(channel);
+            }
+            _ => lines.push(format!("JOIN {channel}")),
+        }
+    }
+    lines
+}
+
 /// Build the self-echo line for a client command, or `None` when the command
 /// is not a message an upstream would echo. The prefix is our current
-/// upstream identity (`nick!~ident@host`; `~` because no identd answered),
-/// valid client-only tags ride along exactly as a real echo-message would
-/// return them, and a fresh authoritative `time=` tag stamps when the bouncer
-/// accepted the line so backlog playback orders it against upstream traffic.
-pub(super) fn self_echo(line: &str, nick: &str, ident: &str, host: &str) -> Option<String> {
+/// upstream identity (`nick!user@host` as the upstream shows it, see
+/// [`SelfIdentity`]), valid client-only tags ride along exactly as a real
+/// echo-message would return them, and a fresh authoritative `time=` tag stamps
+/// when the bouncer accepted the line so backlog playback orders it against
+/// upstream traffic.
+pub(super) fn self_echo(line: &str, identity: &SelfIdentity) -> Option<String> {
     let parsed = e6irc_proto::message::Message::parse(line).ok()?;
-    let prefix = format!(":{nick}!~{ident}@{host}");
+    let prefix = format!(":{}!{}@{}", identity.nick, identity.user, identity.host);
     let body = match parsed.command.to_ascii_uppercase().as_str() {
         command @ ("PRIVMSG" | "NOTICE") => {
             let [target, text] = parsed.params.as_slice() else {
@@ -831,7 +914,9 @@ fn matches_ignore_ascii_case(candidate: &str, expected: &[&str]) -> bool {
 /// `2 × KEEPALIVE_IDLE`.
 pub(crate) const KEEPALIVE_IDLE: Duration = Duration::from_secs(120);
 
-async fn connect(config: &NetworkConfig) -> std::io::Result<Connection> {
+/// `rotation` is where in the vetted list this attempt starts; see
+/// [`super::rotate_addresses`].
+async fn connect(config: &NetworkConfig, rotation: u64) -> std::io::Result<Connection> {
     // SSRF control: resolve the upstream address ourselves and dial a *vetted*
     // resolved IP directly, rather than handing the hostname to the OS resolver
     // inside `TcpStream::connect`. The creation-time literal check
@@ -848,7 +933,7 @@ async fn connect(config: &NetworkConfig) -> std::io::Result<Connection> {
              (internal or never an upstream)",
         ));
     }
-    connect_resolved(config, vetted).await
+    connect_resolved(config, super::rotate_addresses(vetted, rotation)).await
 }
 
 /// One write to the upstream, bounded by `deadline`; the timeout is an
@@ -873,11 +958,12 @@ async fn connect_resolved(
     config: &NetworkConfig,
     vetted: Vec<std::net::SocketAddr>,
 ) -> std::io::Result<Connection> {
-    // Try every vetted result. Public round robins commonly return both IPv6
-    // and IPv4; selecting only the first made a host without working IPv6 retry
-    // the same unreachable address forever instead of reaching the IPv4 peer.
-    // Each concrete dial is bounded so one black-holed address cannot consume
-    // the entire outer connection deadline.
+    // Try every vetted result, from wherever the caller rotated the list to.
+    // Public round robins commonly return both IPv6 and IPv4; selecting only
+    // the first made a host without working IPv6 retry the same unreachable
+    // address forever instead of reaching the IPv4 peer. Each concrete dial is
+    // bounded so one black-holed address cannot consume the entire outer
+    // connection deadline.
     let server_name = upstream_host(&config.addr)?;
     let mut last_error = std::io::Error::new(
         std::io::ErrorKind::NotFound,
@@ -974,6 +1060,20 @@ pub(crate) fn validate_irc_upstream_addr(addr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_upstream_ping_token_is_answered_within_the_line_limit() {
+        assert_eq!(pong_line("irc.example"), "PONG :irc.example");
+        let padded = "a".repeat(600);
+        let pong = pong_line(&padded);
+        assert_eq!(pong.len(), 510, "PONG + CRLF must fit 512 bytes");
+        assert!(pong.starts_with("PONG :aaaa"));
+        // Cut on a character boundary, never inside a multi-byte sequence.
+        let wide = "é".repeat(400);
+        let pong = pong_line(&wide);
+        assert!(pong.len() <= 510);
+        assert!(std::str::from_utf8(pong.as_bytes()).is_ok());
+    }
 
     /// A hostname is judged where it resolves. `localhost` resolves to loopback
     /// only, which the default policy refuses and the operator's allowance
@@ -1193,13 +1293,20 @@ mod tests {
         ));
     }
 
+    /// The identity every echo test speaks as, before any echo revealed more.
+    fn alice() -> SelfIdentity {
+        SelfIdentity {
+            nick: "alice".into(),
+            user: "~alice".into(),
+            host: "irc.example".into(),
+        }
+    }
+
     #[test]
     fn self_echo_mints_provenance_and_keeps_only_valid_client_tags() {
         let echo = self_echo(
             "@time=forged;msgid=forged;+typing=old;+typing=active;+bad.foo=x PRIVMSG #room :hello",
-            "alice",
-            "alice",
-            "irc.example",
+            &alice(),
         )
         .expect("message has an echo");
         let parsed = e6irc_proto::message::Message::parse(&echo).expect("valid echo");
@@ -1224,8 +1331,7 @@ mod tests {
     fn self_echo_adds_a_prefix_without_exceeding_the_wire_budget() {
         let line = format!("privmsg #room :{}é", "x".repeat(490));
         assert!(e6irc_proto::message::client_frame_fits(line.as_bytes()));
-        let echo = self_echo(&line, "alice", "alice", "irc.example")
-            .expect("a valid message has a bounded echo");
+        let echo = self_echo(&line, &alice()).expect("a valid message has a bounded echo");
         assert!(e6irc_proto::message::server_frame_fits(echo.as_bytes()));
         assert!(echo.contains(" PRIVMSG #room :"));
         assert!(
@@ -1243,7 +1349,7 @@ mod tests {
             "NOTICE NS :VERIFY REGISTER alice mail-token",
             "PRIVMSG NickServ :SET PASSWORD replacement-secret",
         ] {
-            let echo = self_echo(line, "alice", "alice", "irc.example")
+            let echo = self_echo(line, &alice())
                 .expect("service message still has a visible redacted echo");
             assert!(
                 echo.contains("[sensitive NickServ command redacted]"),
@@ -1258,22 +1364,17 @@ mod tests {
                 assert!(!echo.contains(secret), "{echo}");
             }
         }
-        let help = self_echo(
-            "PRIVMSG NickServ :HELP REGISTER",
-            "alice",
-            "alice",
-            "irc.example",
-        )
-        .expect("non-sensitive help is echoed");
+        let help = self_echo("PRIVMSG NickServ :HELP REGISTER", &alice())
+            .expect("non-sensitive help is echoed");
         assert!(help.ends_with("PRIVMSG NickServ :HELP REGISTER"), "{help}");
     }
 
     #[test]
     fn self_echo_rejects_commands_the_upstream_would_not_echo() {
-        assert!(self_echo("PRIVMSG #room", "a", "a", "irc.example").is_none());
-        assert!(self_echo("PRIVMSG #room :", "a", "a", "irc.example").is_none());
-        assert!(self_echo("TAGMSG", "a", "a", "irc.example").is_none());
-        assert!(self_echo("PING :token", "a", "a", "irc.example").is_none());
+        assert!(self_echo("PRIVMSG #room", &alice()).is_none());
+        assert!(self_echo("PRIVMSG #room :", &alice()).is_none());
+        assert!(self_echo("TAGMSG", &alice()).is_none());
+        assert!(self_echo("PING :token", &alice()).is_none());
     }
 
     async fn assert_live_driver(network: &str, addr: &str, autojoin: &[&str]) {

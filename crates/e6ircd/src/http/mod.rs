@@ -165,13 +165,9 @@ pub struct AppState {
     /// The per-IP connection cap, shared with the TCP listeners so IRC sessions
     /// opened over `/ws/irc` count against the same budget as raw-socket ones.
     pub(crate) conn_limiter: crate::net::ConnLimiter,
-    /// Random per-process prefix plus a monotonic suffix generate opaque,
-    /// bounded correlation identifiers without accepting an untrusted request
-    /// header into logs or responses.
-    pub(crate) request_id_prefix: u64,
-    pub(crate) request_id_counter: AtomicU64,
-    /// HSTS is safe only when the configured public origin is HTTPS.
-    pub(crate) hsts_enabled: bool,
+    /// Request identifiers, HSTS, and the request counter/latency, applied as
+    /// the outermost layer of the service (see [`RequestObservation`]).
+    pub(crate) observation: Arc<RequestObservation>,
     /// Digest of the deployment-supplied one-time bootstrap secret. Plaintext
     /// is dropped with startup configuration before requests are accepted.
     pub(crate) bootstrap_token_digest: Option<[u8; 32]>,
@@ -212,6 +208,43 @@ pub(crate) fn monitoring_token_digest_from_env() -> Result<Option<[u8; 32]>, Str
     monitoring_token_digest(&token).map(Some)
 }
 
+/// What every response carries and every request is counted by, independent
+/// of what happened inside the service: the correlation identifier, HSTS, and
+/// the request counter and latency histogram. It is the outermost layer, so a
+/// request answered by a bound (the deadline, the concurrency permit, the
+/// body limit) is observed like any other; inside the bounds it would be
+/// invisible exactly when the service is overloaded.
+pub(crate) struct RequestObservation {
+    telemetry: Arc<crate::observability::Telemetry>,
+    /// Random per-process prefix plus a monotonic suffix generate opaque,
+    /// bounded correlation identifiers without accepting an untrusted request
+    /// header into logs or responses.
+    request_id_prefix: u64,
+    request_id_counter: AtomicU64,
+    /// HSTS is safe only when the configured public origin is HTTPS.
+    hsts_enabled: bool,
+}
+
+impl RequestObservation {
+    pub(crate) fn new(
+        telemetry: Arc<crate::observability::Telemetry>,
+        request_id_prefix: u64,
+        hsts_enabled: bool,
+    ) -> Self {
+        Self {
+            telemetry,
+            request_id_prefix,
+            request_id_counter: AtomicU64::new(0),
+            hsts_enabled,
+        }
+    }
+
+    fn next_request_id(&self) -> String {
+        let suffix = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
+        format!("{:016x}{suffix:016x}", self.request_id_prefix)
+    }
+}
+
 impl AppState {
     pub fn no_pending_auth() -> Mutex<HashMap<String, PendingAuth>> {
         Mutex::new(HashMap::new())
@@ -233,11 +266,6 @@ impl AppState {
                 token.as_bytes(),
             )
             .is_ok()
-    }
-
-    fn next_request_id(&self) -> String {
-        let suffix = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
-        format!("{:016x}{suffix:016x}", self.request_id_prefix)
     }
 }
 
@@ -560,6 +588,7 @@ pub(super) async fn mutate_account_suspension(
                 state.secret_key.as_deref(),
                 &target_name,
                 state.internal_upstreams,
+                crate::bouncer::FirstDial::Immediate,
             )
             .map_err(|error| {
                 (
@@ -939,18 +968,18 @@ pub(crate) fn bnc_counts(state: &AppState) -> (u64, u64) {
 }
 
 async fn observe_http(
-    State(state): State<Arc<AppState>>,
+    State(observation): State<Arc<RequestObservation>>,
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     let started = Instant::now();
-    let request_id = state.next_request_id();
+    let request_id = observation.next_request_id();
     let mut response = next.run(request).await;
     response.headers_mut().insert(
         "x-request-id",
         request_id.parse().expect("generated request identifier"),
     );
-    if state.hsts_enabled {
+    if observation.hsts_enabled {
         response.headers_mut().insert(
             header::STRICT_TRANSPORT_SECURITY,
             "max-age=31536000; includeSubDomains"
@@ -958,7 +987,7 @@ async fn observe_http(
                 .expect("static HSTS header"),
         );
     }
-    state
+    observation
         .telemetry
         .record_http_request(started.elapsed(), response.status().is_server_error());
     response
@@ -984,8 +1013,32 @@ async fn database_is_ready(pool: &sqlx::PgPool) -> bool {
     )
 }
 
+/// A core shard that has not finished an event (a client line, a database
+/// reply, or its own periodic tick) in this long is wedged, and every
+/// connection and channel it owns is dead with it.
+const CORE_HEARTBEAT_FRESHNESS: Duration = Duration::from_secs(45);
+
+/// Liveness: the process answers and every core shard has been heard within
+/// `maximum_age`. No database: a database outage must show on `/readyz`, not
+/// restart-loop the container. The bound is a parameter so the stale case is
+/// testable without waiting it out.
+fn liveness(telemetry: &crate::observability::Telemetry, maximum_age: Duration) -> Response {
+    if telemetry.core_is_fresh(maximum_age) {
+        (StatusCode::OK, "ok").into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "core stalled: a core shard has not finished an event in {}s",
+                maximum_age.as_secs()
+            ),
+        )
+            .into_response()
+    }
+}
+
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
-    let core_ready = state.telemetry.core_is_fresh(Duration::from_secs(45));
+    let core_ready = state.telemetry.core_is_fresh(CORE_HEARTBEAT_FRESHNESS);
     let database_ready = match &state.pool {
         Some(pool) => {
             let started = Instant::now();
@@ -1121,8 +1174,8 @@ async fn admin_metrics(State(state): State<Arc<AppState>>, _admin: AdminAccount)
     response
 }
 
-async fn health() -> &'static str {
-    "ok"
+async fn health(State(state): State<Arc<AppState>>) -> Response {
+    liveness(&state.telemetry, CORE_HEARTBEAT_FRESHNESS)
 }
 
 // Define every OpenAPI-documented HTTP operation once. This expands to both
@@ -1322,18 +1375,32 @@ pub fn router(state: Arc<AppState>) -> Router {
                     .or_insert(header::HeaderValue::from_static("nosniff"));
                 resp
             },
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            observe_http,
         ));
-    bound_requests(router, MAX_CONCURRENT_REQUESTS).with_state(state)
+    observed(
+        bound_requests(router, MAX_CONCURRENT_REQUESTS, REQUEST_DEADLINE),
+        state.observation.clone(),
+    )
+    .with_state(state)
 }
 
 /// Requests the whole HTTP service works on at once.
 const MAX_CONCURRENT_REQUESTS: usize = 1024;
 /// How long the service works on one request before answering `408`.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+
+/// [`observe_http`] as the outermost layer: added after the bounds, so it
+/// wraps them. A request the deadline answers, or one that waited for a
+/// concurrency permit, is counted, timed from arrival, and stamped with its
+/// `x-request-id` like every other.
+fn observed<S>(router: Router<S>, observation: Arc<RequestObservation>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.layer(axum::middleware::from_fn_with_state(
+        observation,
+        observe_http,
+    ))
+}
 
 /// The resource bounds every request passes before work can consume unbounded
 /// process resources: body size, aggregate concurrency, and a deadline.
@@ -1342,7 +1409,7 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 /// builds its layer once per route and method, and an ordinary
 /// `ConcurrencyLimitLayer` makes a new semaphore each time it is built, which
 /// turned "1,024 requests" into 1,024 per endpoint.
-fn bound_requests<S>(router: Router<S>, concurrent_requests: usize) -> Router<S>
+fn bound_requests<S>(router: Router<S>, concurrent_requests: usize, deadline: Duration) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -1351,18 +1418,27 @@ where
         .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
             concurrent_requests,
         ))
-        .layer(axum::middleware::from_fn(request_deadline))
+        .layer(axum::middleware::from_fn(move |request, next| {
+            request_deadline(deadline, request, next)
+        }))
 }
 
 /// Abandon a request at the deadline with the same problem document every
 /// other refusal uses, so a client can tell a timeout from a dropped connection.
-async fn request_deadline(request: Request<axum::body::Body>, next: Next) -> Response {
-    match tokio::time::timeout(REQUEST_DEADLINE, next.run(request)).await {
+async fn request_deadline(
+    deadline: Duration,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    match tokio::time::timeout(deadline, next.run(request)).await {
         Ok(response) => response,
         Err(_) => problem(
             StatusCode::REQUEST_TIMEOUT,
             "Request timed out",
-            Some("The server stopped working on this request at its 30-second deadline."),
+            Some(&format!(
+                "The server stopped working on this request at its {}-second deadline.",
+                deadline.as_secs()
+            )),
         ),
     }
 }
@@ -3785,9 +3861,76 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
 
 #[cfg(test)]
 mod request_bound_tests {
-    use super::{Request, Router, StatusCode, bound_requests, get};
+    use super::{
+        Duration, Request, RequestObservation, Router, StatusCode, bound_requests, get, liveness,
+        observed,
+    };
+    use crate::observability::Telemetry;
     use std::sync::Arc;
     use tower::Service;
+
+    #[tokio::test]
+    async fn a_request_the_deadline_answers_is_still_observed() {
+        let telemetry = Arc::new(Telemetry::new());
+        let observation = Arc::new(RequestObservation::new(telemetry.clone(), 0x5eed, false));
+        let mut router = observed(
+            bound_requests(
+                Router::new().route(
+                    "/slow",
+                    get(|| async {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        StatusCode::NO_CONTENT
+                    }),
+                ),
+                1,
+                Duration::from_millis(50),
+            ),
+            observation,
+        );
+        let request = Request::builder()
+            .uri("/slow")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let response = router.call(request).await.expect("infallible");
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .expect("a timed-out request still carries its correlation identifier")
+            .to_str()
+            .expect("hex");
+        assert!(request_id.starts_with("0000000000005eed"), "{request_id}");
+        let snapshot = telemetry.snapshot(0, 0);
+        assert_eq!(snapshot.http_requests_total, 1, "the 408 was not counted");
+        assert_eq!(snapshot.http_latency.count, 1, "the 408 was not timed");
+        assert!(
+            snapshot.http_latency.max_us >= 50_000,
+            "latency must span the deadline, not the handler: {}us",
+            snapshot.http_latency.max_us
+        );
+    }
+
+    #[tokio::test]
+    async fn liveness_reports_a_stalled_or_unheard_core_shard() {
+        let telemetry = Telemetry::new();
+        telemetry.expect_core_shards(1);
+        assert_eq!(
+            liveness(&telemetry, Duration::from_secs(45)).status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a shard that never finished an event is not alive"
+        );
+        telemetry.adjust_core_gauges(0, (0, 0, 0), (0, 0, 0));
+        assert_eq!(
+            liveness(&telemetry, Duration::from_secs(45)).status(),
+            StatusCode::OK
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            liveness(&telemetry, Duration::ZERO).status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a heartbeat older than the bound is a stalled shard"
+        );
+    }
 
     /// A route that reports having started work and then holds its permit until
     /// the test lets go.
@@ -3822,6 +3965,7 @@ mod request_bound_tests {
                 )
                 .route("/second", held_route(entered, release.clone(), "second")),
             1,
+            Duration::from_secs(30),
         );
         let call = |path: &'static str| {
             let mut router = router.clone();

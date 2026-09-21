@@ -286,7 +286,10 @@ async fn cli_sasl_login() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(e6ircd::config::DatabaseConfig { url }),
+        database: Some(e6ircd::config::DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..e6ircd::config::Config::default()
     };
     let running = e6ircd::net::start(config).await.expect("start");

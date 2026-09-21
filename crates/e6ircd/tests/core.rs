@@ -11,7 +11,7 @@ use e6irc_queue::{Config, Policy, Receiver, queue};
 fn test_mono() -> MonoMillis {
     MonoMillis::from_millis(1_000_000_000)
 }
-use e6ircd::core::{ConnId, Core, CoreConfig, Input, Output};
+use e6ircd::core::{CommandFlood, ConnId, Core, CoreConfig, Input, Output};
 
 struct TestServer {
     core: Core,
@@ -91,7 +91,7 @@ impl TestServer {
                     opers: vec![("god".into(), "letmein".into())],
                     clock,
                     mono_clock: test_mono,
-                    command_burst: None,
+                    command_flood: None,
                     registration_burst: None,
                 },
                 db_tx,
@@ -5819,7 +5819,7 @@ fn fresh_session_flood_bucket_starts_full_regardless_of_uptime() {
     // The monotonic clock's epoch is process start, so a session opened a few
     // seconds into uptime must STILL start with the full command burst — not
     // `min(uptime_seconds, burst)`. Regression for a fresh bucket under-filled
-    // during the first `command_burst` seconds after a restart, which would
+    // during the first burst-many seconds after a restart, which would
     // wrongly Excess-Flood-kill a client pipelining a legitimate burst — the
     // worst case being a post-restart reconnect storm. A fixed clock only 3s
     // into "uptime" reproduces it (the usual 1e9-ms test clock masks it, since
@@ -5847,7 +5847,7 @@ fn fresh_session_flood_bucket_starts_full_regardless_of_uptime() {
             max_hot_channels: 8,
             clock: || Millis::from_millis(1_000_000_000),
             mono_clock: early_mono,
-            command_burst: Some(10),
+            command_flood: Some(CommandFlood::new(10, 1).expect("valid bucket")),
             registration_burst: None,
         },
         db_tx,
@@ -5872,7 +5872,7 @@ fn fresh_session_flood_bucket_starts_full_regardless_of_uptime() {
     }
     while rx.try_pop().is_some() {}
 
-    // Send exactly `command_burst` floodable commands in the same tick. With a
+    // Send exactly one burst of floodable commands in the same tick. With a
     // full fresh bucket all ten are credited; with the old uptime-seeded bucket
     // (3 tokens) the fourth would be dropped with Excess Flood.
     for _ in 0..10 {
@@ -5893,6 +5893,146 @@ fn fresh_session_flood_bucket_starts_full_regardless_of_uptime() {
     assert!(
         !out.iter().any(|l| l.contains("Excess Flood")),
         "a fresh session must start with the full burst, not min(uptime, burst): {out:#?}"
+    );
+}
+
+#[test]
+fn default_flood_bucket_admits_a_burst_of_forty_then_kills_and_exempts_keepalive() {
+    // The shipped default is Solanum's shape: 40 tokens, 20 per second. In one
+    // clock instant a registered session may pipeline exactly 40 floodable
+    // commands; the 41st closes the link with Excess Flood. PING and PONG never
+    // spend a token, so a keepalive-heavy client is never killed for it, and
+    // 50 ms later (one token at 20/s) one more command is admitted.
+    static NOW_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_000_000_000);
+    fn ticking_mono() -> MonoMillis {
+        MonoMillis::from_millis(NOW_MS.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    let flood = CommandFlood::new(
+        e6ircd::config::DEFAULT_COMMAND_BURST,
+        e6ircd::config::DEFAULT_COMMAND_RATE,
+    )
+    .expect("the shipped defaults are a valid bucket");
+    let open_session = |conn: ConnId| {
+        let (db_tx, _db_rx) = queue(Config {
+            name: "d",
+            capacity: 8,
+            policy: Policy::Fifo,
+        });
+        let mut core = Core::new(
+            CoreConfig {
+                server_name: "irc.test.example".into(),
+                network_name: "T".into(),
+                description: "test server".into(),
+                registration_before_connect: false,
+                registration_require_email: false,
+                sendq: 1024,
+                motd: vec![],
+                nicklen: 16,
+                sasl_enabled: false,
+                opers: vec![],
+                max_hot_channels: 8,
+                clock: || Millis::from_millis(1_000_000_000),
+                mono_clock: ticking_mono,
+                command_flood: Some(flood),
+                registration_burst: None,
+            },
+            db_tx,
+        );
+        let (tx, mut rx) = queue(Config {
+            name: "s",
+            capacity: 4096,
+            policy: Policy::Fifo,
+        });
+        core.handle(Input::Open {
+            conn,
+            tx,
+            host: "h".into(),
+            transport: e6ircd::core::ConnectionTransport::Tcp,
+        });
+        for line in ["NICK alice", "USER a 0 * :A"] {
+            core.handle(Input::Line {
+                conn,
+                line: line.as_bytes().to_vec(),
+            });
+        }
+        while rx.try_pop().is_some() {}
+        (core, rx)
+    };
+    let drain = |rx: &mut e6irc_queue::Receiver<Output>| -> Vec<String> {
+        std::iter::from_fn(|| {
+            rx.try_pop().map(|e| {
+                String::from_utf8(e.payload.0.to_vec())
+                    .unwrap()
+                    .trim_end()
+                    .to_string()
+            })
+        })
+        .collect()
+    };
+
+    let conn = ConnId(1);
+    let (mut core, mut rx) = open_session(conn);
+    // Keepalive first, and plenty of it: none of these may cost a token.
+    for _ in 0..100 {
+        core.handle(Input::Line {
+            conn,
+            line: b"PING :keepalive".to_vec(),
+        });
+        core.handle(Input::Line {
+            conn,
+            line: b"PONG :keepalive".to_vec(),
+        });
+    }
+    for _ in 0..40 {
+        core.handle(Input::Line {
+            conn,
+            line: b"AWAY :busy".to_vec(),
+        });
+    }
+    let out = drain(&mut rx);
+    assert!(
+        !out.iter().any(|l| l.contains("Excess Flood")),
+        "40 commands plus any amount of keepalive fit the default burst: {out:#?}"
+    );
+    core.handle(Input::Line {
+        conn,
+        line: b"AWAY :busy".to_vec(),
+    });
+    let out = drain(&mut rx);
+    assert!(
+        out.iter()
+            .any(|l| l.starts_with("ERROR :Closing Link:") && l.contains("Excess Flood")),
+        "the 41st command in one instant must close the link with Excess Flood: {out:#?}"
+    );
+
+    // A fresh session that spent its burst regains one token 50 ms later.
+    let conn = ConnId(2);
+    let (mut core, mut rx) = open_session(conn);
+    for _ in 0..40 {
+        core.handle(Input::Line {
+            conn,
+            line: b"AWAY :busy".to_vec(),
+        });
+    }
+    drain(&mut rx);
+    NOW_MS.fetch_add(50, std::sync::atomic::Ordering::Relaxed);
+    core.handle(Input::Line {
+        conn,
+        line: b"AWAY :busy".to_vec(),
+    });
+    let out = drain(&mut rx);
+    assert!(
+        !out.iter().any(|l| l.contains("Excess Flood")),
+        "50 ms at 20 tokens/s refills exactly one token: {out:#?}"
+    );
+    core.handle(Input::Line {
+        conn,
+        line: b"AWAY :busy".to_vec(),
+    });
+    let out = drain(&mut rx);
+    assert!(
+        out.iter().any(|l| l.contains("Excess Flood")),
+        "the refilled token was the only one: {out:#?}"
     );
 }
 
@@ -5922,7 +6062,7 @@ fn account_creation_is_rate_limited_per_ip() {
             max_hot_channels: 8,
             clock: || Millis::from_millis(1_000_000_000),
             mono_clock: test_mono,
-            command_burst: None,
+            command_flood: None,
             registration_burst: Some(1),
         },
         db_tx,
@@ -5996,7 +6136,7 @@ fn hot_history_ring_is_lru_evicted() {
             max_hot_channels: 2,
             clock: || Millis::from_millis(1_000_000_000),
             mono_clock: test_mono,
-            command_burst: None,
+            command_flood: None,
             registration_burst: None,
         },
         db_tx,
@@ -7998,7 +8138,7 @@ fn history_logmessage_gated_on_database() {
                 max_hot_channels: 8,
                 clock: || Millis::from_millis(1_000_000_000),
                 mono_clock: test_mono,
-                command_burst: None,
+                command_flood: None,
                 registration_burst: None,
             },
             db_tx,
@@ -10111,7 +10251,7 @@ fn isupport_advertises_whox_and_length_limits() {
         // KICK became multi-user in an earlier sweep but the advertisement stayed
         // at the old `KICK:1`, telling a state-tracking client a limit the server
         // does not keep. It now matches PRIVMSG/NOTICE.
-        "TARGMAX=PRIVMSG:4,NOTICE:4,KICK:4",
+        "TARGMAX=PRIVMSG:4,NOTICE:4,TAGMSG:4,KICK:4,JOIN:250,PART:250,NAMES:1",
         // KNOCK is implemented (cmd_knock), so it must be advertised — a client
         // that gates its /knock UI on this token was otherwise misled.
         "KNOCK",
@@ -11673,4 +11813,338 @@ fn renaming_away_from_a_nick_frees_its_unauthenticated_conversations() {
         "the nick's previous holder's conversation was served: {out:#?}"
     );
     let _ = alice;
+}
+
+// ---- post-#335 sweep: output amplification, PONG fitting, TOPIC query,
+// ---- labeled framing, multiline deviations --------------------------------
+
+fn count_numeric(lines: &[String], code: &str) -> usize {
+    lines
+        .iter()
+        .filter(|l| l.split(' ').nth(1) == Some(code))
+        .count()
+}
+
+/// A JOIN naming a channel the session is already in is a no-op (Solanum /
+/// Modern): no JOIN echo, no TOPIC, no NAMES — and a casefolded duplicate in
+/// the target list is the same channel, so `JOIN #c,#C,#c` replays nothing at
+/// all instead of dumping the member list three times.
+#[test]
+fn rejoin_and_duplicate_join_targets_replay_nothing() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #c");
+    }
+    for c in [alice, bob] {
+        s.drain(c);
+    }
+    s.line(alice, "JOIN #c,#C,#c");
+    let out = s.drain(alice);
+    assert_eq!(
+        count_numeric(&out, "353") + count_numeric(&out, "366"),
+        0,
+        "a JOIN of a channel already joined must not replay NAMES: {out:#?}"
+    );
+    assert!(
+        !out.iter().any(|l| l.contains(" JOIN ")),
+        "no JOIN echo for an existing member: {out:#?}"
+    );
+    assert!(out.is_empty(), "nothing at all: {out:#?}");
+    assert!(s.drain(bob).is_empty(), "peers must not see a phantom JOIN");
+}
+
+/// `NAMES #c,#C,#c` is one NAMES of one channel: one 353 burst and one 366.
+/// Beyond `TARGMAX` NAMES:1 the excess is refused loudly (407), never served
+/// silently N times.
+#[test]
+fn names_dedups_targets_and_caps_loudly() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #c");
+        s.line(c, "JOIN #d");
+    }
+    for c in [alice, bob] {
+        s.drain(c);
+    }
+    s.line(alice, "NAMES #c,#C,#c");
+    let out = s.drain(alice);
+    assert_eq!(count_numeric(&out, "353"), 1, "{out:#?}");
+    assert_eq!(count_numeric(&out, "366"), 1, "{out:#?}");
+    assert_eq!(count_numeric(&out, "407"), 0, "{out:#?}");
+
+    s.line(alice, "NAMES #c,#d");
+    let out = s.drain(alice);
+    assert_eq!(
+        count_numeric(&out, "353"),
+        1,
+        "only the first target: {out:#?}"
+    );
+    assert_eq!(count_numeric(&out, "366"), 1, "{out:#?}");
+    let over = out
+        .iter()
+        .find(|l| l.split(' ').nth(1) == Some("407"))
+        .expect("the second target is over TARGMAX and refused loudly");
+    assert!(over.contains(" #d "), "{over}");
+}
+
+/// A list mode named several times in one MODE (`MODE #c bbb`, `MODE #c b+b`)
+/// is dumped once, not once per letter.
+#[test]
+fn repeated_list_mode_letters_dump_the_list_once() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #c");
+    s.line(alice, "MODE #c +bbb a!*@* b!*@* c!*@*");
+    s.drain(alice);
+    for query in ["MODE #c bbb", "MODE #c b+b", "MODE #c +b+b"] {
+        s.line(alice, query);
+        let out = s.drain(alice);
+        assert_eq!(count_numeric(&out, "367"), 3, "{query}: {out:#?}");
+        assert_eq!(count_numeric(&out, "368"), 1, "{query}: {out:#?}");
+    }
+    // Two different lists are still two dumps.
+    s.line(alice, "MODE #c bq");
+    let out = s.drain(alice);
+    assert_eq!(count_numeric(&out, "367"), 3, "{out:#?}");
+    assert_eq!(count_numeric(&out, "368"), 1, "{out:#?}");
+    assert_eq!(count_numeric(&out, "729"), 1, "{out:#?}");
+}
+
+#[test]
+fn isupport_advertises_every_enforced_targmax() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "NICK alice");
+    s.line(c, "USER alice 0 * :Alice");
+    let burst = s.drain(c);
+    let isupport: String = burst
+        .iter()
+        .filter(|l| l.split(' ').nth(1) == Some("005"))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let targmax = isupport
+        .split(' ')
+        .find_map(|token| token.strip_prefix("TARGMAX="))
+        .expect("TARGMAX advertised");
+    for entry in [
+        "PRIVMSG:4",
+        "NOTICE:4",
+        "TAGMSG:4",
+        "KICK:4",
+        "JOIN:250",
+        "PART:250",
+        "NAMES:1",
+    ] {
+        assert!(
+            targmax.split(',').any(|e| e == entry),
+            "TARGMAX must list {entry}: {targmax}"
+        );
+    }
+}
+
+/// A PONG echoes the client's token behind a server-sized head; a maximal
+/// token must be fitted, not pushed past the 512-byte wire limit (which
+/// panics the shared core worker in debug builds).
+#[test]
+fn pong_to_a_maximal_ping_token_fits_the_wire() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let token = "a".repeat(505);
+    // `PING ` plus 505 bytes fills the 510-byte input frame exactly.
+    s.line(alice, &format!("PING {token}"));
+    let out = s.drain(alice);
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].len() + 2 <= 512, "{} bytes", out[0].len() + 2);
+    let parsed = e6irc_proto::message::Message::parse(&out[0]).expect("parses");
+    assert_eq!(parsed.command, "PONG");
+    assert!(
+        parsed
+            .params
+            .last()
+            .is_some_and(|t| token.starts_with(t) && !t.is_empty()),
+        "the token is a prefix of what was sent: {out:#?}"
+    );
+}
+
+/// The 257th distinct target of an account is refused before anything is
+/// queued — synchronously, from the per-account slot count, not by scanning
+/// every account's markers.
+#[test]
+fn markread_refuses_a_new_target_past_the_account_cap() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/read-marker");
+    identify(&mut s, alice, "alice");
+    s.core.preload_read_markers(
+        (0..256)
+            .map(|i| {
+                (
+                    "alice".to_string(),
+                    format!("#room{i}"),
+                    Millis::from_millis(i),
+                )
+            })
+            .collect(),
+    );
+    s.line(
+        alice,
+        "MARKREAD #overflow timestamp=2026-07-18T12:00:00.000Z",
+    );
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("FAIL MARKREAD INVALID_PARAMS #overflow")),
+        "{out:#?}"
+    );
+    assert!(s.db_requests().is_empty(), "nothing was queued");
+    // An existing target is still updatable: the cap is on distinct targets.
+    s.line(alice, "MARKREAD #room3 timestamp=2026-07-18T12:00:00.000Z");
+    assert!(s.drain(alice).is_empty(), "the write is pending");
+    let pending = take_read_marker_request(&mut s);
+    assert_eq!(pending.target, "#room3");
+}
+
+/// `TOPIC :#c` is `TOPIC #c`: one parameter is a query however it was framed.
+/// It must not clear the topic, broadcast, or write anything.
+#[test]
+fn topic_with_a_trailing_channel_is_a_query_not_a_clear() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #c");
+    }
+    for c in [alice, bob] {
+        s.drain(c);
+    }
+    s.line(alice, "TOPIC #c :the topic");
+    s.drain(alice);
+    s.drain(bob);
+
+    s.line(alice, "TOPIC :#c");
+    let out = s.drain(alice);
+    assert_eq!(count_numeric(&out, "332"), 1, "{out:#?}");
+    assert!(
+        out[0].ends_with("#c :the topic"),
+        "the topic is unchanged: {out:#?}"
+    );
+    assert!(
+        !out.iter().any(|l| l.contains(" TOPIC ")),
+        "no TOPIC broadcast: {out:#?}"
+    );
+    assert!(s.drain(bob).is_empty(), "peers see nothing");
+    assert!(s.db_requests().is_empty(), "no persistence write");
+
+    // The same on a registered channel, where a set would queue a DB write.
+    s.core.preload_founders(vec![("#c".into(), "alice".into())]);
+    s.line(alice, "TOPIC :#c");
+    let out = s.drain(alice);
+    assert_eq!(count_numeric(&out, "332"), 1, "{out:#?}");
+    assert!(s.db_requests().is_empty(), "no persistence write");
+    s.line(alice, "TOPIC #c");
+    assert!(s.drain(alice)[0].ends_with("#c :the topic"));
+}
+
+/// The labeled-response framer decides "already one batch" by parsing the
+/// captured lines, not by finding `BATCH +` somewhere in a message body: a
+/// multi-target echo whose *text* is `BATCH +z BATCH -z` is two PRIVMSG lines
+/// and gets the labeled batch like any other multi-line response.
+#[test]
+fn labeled_multi_target_echo_is_not_mistaken_for_a_batch() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "labeled-response batch echo-message");
+    let bob = s.register(2, "bob");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #a");
+        s.line(c, "JOIN #b");
+    }
+    for c in [alice, bob] {
+        s.drain(c);
+    }
+    s.drain(alice);
+    s.line(alice, "@label=L PRIVMSG #a,#b :BATCH +z BATCH -z");
+    let out = s.drain(alice);
+    assert_eq!(out.len(), 4, "{out:#?}");
+    let open = e6irc_proto::message::Message::parse(&out[0]).expect("parses");
+    assert_eq!(open.command, "BATCH");
+    assert_eq!(open.params.get(1).copied(), Some("labeled-response"));
+    assert!(out[0].starts_with("@label=L "), "{}", out[0]);
+    let batch_ref = open.params[0].strip_prefix('+').expect("opens").to_string();
+    for echo in &out[1..3] {
+        assert!(
+            echo.contains(&format!("batch={batch_ref}")) && echo.contains(" PRIVMSG #"),
+            "{echo}"
+        );
+    }
+    assert_eq!(out[3], format!(":irc.test.example BATCH -{batch_ref}"));
+}
+
+fn multiline_pair(s: &mut TestServer) -> (ConnId, ConnId) {
+    let caps = "batch draft/multiline message-tags";
+    let alice = register_with_caps(s, 1, "alice", caps);
+    let bob = register_with_caps(s, 2, "bob", caps);
+    for c in [alice, bob] {
+        s.line(c, "JOIN #m");
+        s.line(c, "JOIN #other");
+    }
+    for c in [alice, bob] {
+        s.drain(c);
+    }
+    (alice, bob)
+}
+
+fn assert_multiline_fail_delivers_nothing(
+    s: &mut TestServer,
+    alice: ConnId,
+    bob: ConnId,
+    code: &str,
+) {
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.contains(&format!("FAIL BATCH {code} "))),
+        "expected FAIL BATCH {code}: {out:#?}"
+    );
+    s.line(alice, "BATCH -7");
+    s.drain(alice);
+    let delivered = s.drain(bob);
+    assert!(
+        delivered.is_empty(),
+        "nothing may be delivered: {delivered:#?}"
+    );
+}
+
+#[test]
+fn multiline_line_to_another_target_is_invalid_target() {
+    let mut s = TestServer::new_no_persistence();
+    let (alice, bob) = multiline_pair(&mut s);
+    s.line(alice, "BATCH +7 draft/multiline #m");
+    s.line(alice, "@batch=7 PRIVMSG #m :first");
+    s.line(alice, "@batch=7 PRIVMSG #other :astray");
+    assert_multiline_fail_delivers_nothing(&mut s, alice, bob, "MULTILINE_INVALID_TARGET");
+}
+
+#[test]
+fn multiline_concat_on_the_first_line_is_invalid() {
+    let mut s = TestServer::new_no_persistence();
+    let (alice, bob) = multiline_pair(&mut s);
+    s.line(alice, "BATCH +7 draft/multiline #m");
+    s.line(
+        alice,
+        "@batch=7;draft/multiline-concat PRIVMSG #m :nothing before me",
+    );
+    assert_multiline_fail_delivers_nothing(&mut s, alice, bob, "MULTILINE_INVALID");
+}
+
+#[test]
+fn multiline_valueless_batch_tag_is_an_unknown_batch() {
+    let mut s = TestServer::new_no_persistence();
+    let (alice, bob) = multiline_pair(&mut s);
+    s.line(alice, "BATCH +7 draft/multiline #m");
+    s.line(alice, "@batch PRIVMSG #m :where do I belong");
+    assert_multiline_fail_delivers_nothing(&mut s, alice, bob, "MULTILINE_INVALID");
 }

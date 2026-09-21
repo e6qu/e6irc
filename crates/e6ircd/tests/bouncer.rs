@@ -21,6 +21,13 @@ async fn upstream() -> std::net::SocketAddr {
             tls: None,
             websocket: false,
         }],
+        // Tests pipeline hundreds of lines at this stand-in upstream in one
+        // instant; its default command-flood bucket is not what they measure.
+        limits: e6ircd::config::LimitsConfig {
+            command_burst: 10_000,
+            command_rate: 10_000,
+            ..e6ircd::config::LimitsConfig::default()
+        },
         ..Config::default()
     };
     net::start(config).await.expect("start").addrs[0]
@@ -399,7 +406,10 @@ fn bnc_config(up: std::net::SocketAddr, url: String) -> Config {
             tls: None,
             websocket: false,
         }],
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         networks: vec![
             NetworkEntry {
                 kind: NetworkKind::Irc,
@@ -722,7 +732,10 @@ async fn driver_authenticates_to_sasl_upstream() {
             tls: None,
             websocket: false,
         }],
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let up = net::start(up_config).await.expect("start").addrs[0];
@@ -839,7 +852,10 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
             tls: None,
             websocket: false,
         }],
-        database: Some(DatabaseConfig { url: url.clone() }),
+        database: Some(DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         networks: vec![NetworkEntry {
             kind: NetworkKind::Irc,
             name: "up".into(),
@@ -921,7 +937,10 @@ async fn local_driver_presents_the_in_process_network() {
             tls: None,
             websocket: false,
         }],
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         networks: vec![NetworkEntry {
             name: "home".into(),
             kind: NetworkKind::Local,
@@ -1339,12 +1358,14 @@ async fn the_configured_username_is_what_the_upstream_is_sent() {
     drop(handle);
 }
 
-/// A refused channel fails the test, and the test still leaves politely.
+/// Registration is the qualification. The test joins none of the configured
+/// channels -- their members would otherwise see a JOIN/QUIT pair from every
+/// test -- and still leaves politely.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_connection_test_with_a_refused_channel_still_quits() {
+async fn a_connection_test_joins_nothing_and_still_quits() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel(4);
+    let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel(64);
     tokio::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("preflight").await;
@@ -1353,33 +1374,51 @@ async fn a_connection_test_with_a_refused_channel_still_quits() {
             if line.is_empty() {
                 break;
             }
-            if line.starts_with("JOIN ") {
-                session
-                    .send(":up 473 preflight #closed :Cannot join channel (+i)")
-                    .await;
-            }
-            if line.starts_with("QUIT") {
-                heard_tx.send(line).await.unwrap();
+            let goodbye = line.starts_with("QUIT");
+            heard_tx.send(line).await.unwrap();
+            if goodbye {
+                break;
             }
         }
     });
-    let failure = preflight_irc(
+    let result = preflight_irc(
         &NetworkConfig {
             addr: addr.to_string(),
             nick: "preflight".parse().expect("test nickname"),
-            autojoin: vec!["#closed".parse().expect("test channel")],
+            autojoin: vec![
+                "#lobby".parse().expect("test channel"),
+                "#dev".parse().expect("test channel"),
+            ],
             internal_upstreams: InternalUpstreams::Allow,
             ..NetworkConfig::default()
         },
         std::time::Duration::from_secs(10),
     )
     .await
-    .expect_err("an invite-only channel cannot be joined");
-    assert_eq!(failure.code(), "channel_join_failed");
-    tokio::time::timeout(std::time::Duration::from_secs(5), heard_rx.recv())
-        .await
-        .expect("the upstream never heard a goodbye")
-        .expect("upstream script ended");
+    .expect("registration qualifies the upstream");
+    assert_eq!(result.confirmed_nick, "preflight");
+    let mut heard = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let line = heard_rx.recv().await.expect("upstream script ended");
+            let goodbye = line.starts_with("QUIT");
+            heard.push(line);
+            if goodbye {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the upstream never heard a goodbye");
+    assert!(
+        heard.iter().all(|line| !line.starts_with("JOIN")),
+        "the connection test joined a channel: {heard:?}"
+    );
+    assert_eq!(
+        heard.last().map(String::as_str),
+        Some("QUIT :connection test complete"),
+        "{heard:?}"
+    );
 }
 
 /// A taken nickname is reported, never worked around. The driver does not
@@ -1472,7 +1511,9 @@ async fn a_taken_nickname_is_reported_and_never_replaced() {
 }
 
 /// A forced upstream NICK changes the driver's identity; later self-echoes
-/// use the new nick.
+/// use the new nick, and the owner is told -- in the runtime snapshot and as a
+/// notice in the backlog -- that the session now runs under a name they did
+/// not choose.
 #[tokio::test(flavor = "multi_thread")]
 async fn driver_tracks_forced_upstream_nick_change() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1514,6 +1555,43 @@ async fn driver_tracks_forced_upstream_nick_change() {
     })
     .await
     .expect("nick line never relayed");
+    let renamed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let snapshot = handle.runtime_snapshot();
+            if snapshot.last_error.is_some() {
+                return snapshot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the rename was never recorded");
+    assert_eq!(
+        renamed.lifecycle,
+        NetworkLifecycle::Connected,
+        "{renamed:?}"
+    );
+    assert_eq!(
+        renamed.last_error,
+        Some(e6ircd::bouncer::NetworkFailure::RenamedByUpstream),
+        "{renamed:?}"
+    );
+    assert_eq!(
+        renamed.last_error_diagnostic.as_deref(),
+        Some("upstream renamed this session from bncbot to renamed"),
+        "{renamed:?}"
+    );
+    let notices: Vec<String> = handle
+        .buffer_snapshot()
+        .into_iter()
+        .filter(|line| line.contains("renamed this session"))
+        .collect();
+    assert_eq!(notices.len(), 1, "one notice per rename: {notices:?}");
+    assert!(
+        notices[0].starts_with(":*bnc* NOTICE * :")
+            && notices[0].contains("(renamed_by_upstream); upstream: upstream renamed this session from bncbot to renamed"),
+        "{notices:?}"
+    );
     assert_eq!(
         handle.send("PRIVMSG #room :after rename"),
         SendOutcome::Sent
@@ -1532,7 +1610,8 @@ async fn driver_tracks_forced_upstream_nick_change() {
     })
     .await
     .expect("no echo");
-    assert!(echo.contains(":renamed!~bncbot@"), "{echo}");
+    // The NICK echo also revealed the user and host the upstream shows.
+    assert!(echo.contains(":renamed!~bncbot@up PRIVMSG"), "{echo}");
 }
 
 /// Channels joined at runtime (not in the configured autojoin) are rejoined
@@ -1559,14 +1638,17 @@ async fn runtime_joined_channels_are_rejoined_after_reconnect() {
         }
         drop_rx.recv().await;
         drop(first);
-        // Second session: report every JOIN the driver sends.
+        // Second session: report every channel the driver's JOIN lines name
+        // (a rejoin comma-joins them).
         let mut second = fake_accept(&listener).await;
         second.complete_registration("bncbot").await;
         loop {
             let line = second.read_line().await;
-            if let Some(chan) = line.strip_prefix("JOIN ") {
-                join_tx.send(chan.to_string()).await.unwrap();
-                if chan == "#dynamic" {
+            if let Some(chans) = line.strip_prefix("JOIN ") {
+                for chan in chans.split(',') {
+                    join_tx.send(chan.to_string()).await.unwrap();
+                }
+                if chans.contains("#dynamic") {
                     return;
                 }
             }
@@ -1682,21 +1764,34 @@ async fn silent_upstream_trips_keepalive_and_reconnects() {
 /// A server that truncates to its NICKLEN welcomes the connection under a
 /// nickname the owner never chose. The driver does not run under it: the
 /// identity on an upstream is the configured one or none.
+///
+/// The session was registered, so it leaves with `QUIT` rather than a dropped
+/// socket; and since no retry can shorten the nickname, the driver parks on
+/// the first such welcome instead of registering, and quitting, five times.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_welcome_under_a_different_nickname_is_a_refusal_not_an_identity() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel(8);
     tokio::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("averyveryverylon").await;
-        // Hold later dials open so the driver stays in its retry wait.
-        let _held = fake_accept(&listener).await;
+        loop {
+            let line = session.read_line().await;
+            if line.is_empty() || line.starts_with("QUIT") {
+                heard_tx.send(line).await.unwrap();
+                break;
+            }
+        }
+        // Any later dial would be the driver retrying what cannot change.
+        let _second = fake_accept(&listener).await;
+        heard_tx.send("a second dial".to_string()).await.unwrap();
         std::future::pending::<()>().await;
     });
     let handle = IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
         nick: "averyveryverylongnick".parse().expect("test nickname"),
-        rejection_retry_floor: std::time::Duration::from_secs(30),
+        rejection_retry_floor: std::time::Duration::from_millis(20),
         internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
@@ -1708,7 +1803,7 @@ async fn a_welcome_under_a_different_nickname_is_a_refusal_not_an_identity() {
                 NetworkLifecycle::Connected,
                 "the driver ran under a nickname nobody configured"
             );
-            if snapshot.last_error.is_some() {
+            if snapshot.lifecycle == NetworkLifecycle::RegistrationFailed {
                 return snapshot;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1726,7 +1821,22 @@ async fn a_welcome_under_a_different_nickname_is_a_refusal_not_an_identity() {
         Some("requested averyveryverylongnick, but the server welcomed averyveryverylon"),
         "{snapshot:?}"
     );
+    assert_eq!(
+        snapshot.connection_attempts, 1,
+        "a welcome under another nickname parks on the first occurrence: {snapshot:?}"
+    );
     assert!(handle.irc_session_snapshot().is_none());
+    let goodbye = tokio::time::timeout(std::time::Duration::from_secs(5), heard_rx.recv())
+        .await
+        .expect("the upstream heard neither a goodbye nor a close")
+        .expect("upstream script ended");
+    assert!(
+        goodbye.starts_with("QUIT :"),
+        "a registered session leaves with QUIT, not a dropped socket: {goodbye:?}"
+    );
+    // Parked: the upstream sees no second dial within the refusal schedule.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(heard_rx.try_recv().is_err(), "the driver dialled again");
 }
 
 /// Capabilities are negotiated hop by hop. An attached client negotiated with
@@ -1902,7 +2012,7 @@ async fn a_stopped_driver_says_quit_to_its_upstream() {
     handle.shutdown_and_wait().await;
     assert_eq!(
         upstream.await.expect("scripted upstream"),
-        "QUIT :reconfigured"
+        "QUIT :e6irc bouncer stopping"
     );
 }
 
@@ -2081,7 +2191,10 @@ async fn an_upstream_without_the_sasl_mechanism_is_not_a_credential_rejection() 
 
 /// A refusing upstream's own connection throttle shows up as dials that die
 /// before registration. Such a drop must not forgive the refusals already
-/// counted, or the driver would never park and would re-dial forever.
+/// counted, or the driver would never park and would re-dial forever. A taken
+/// nickname is the refusal that parks after its schedule: the holder is
+/// usually a ghost of the driver's own last session, and one that outlasts
+/// four minutes of retries is not.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_dial_between_refusals_does_not_reset_the_park_count() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2102,7 +2215,7 @@ async fn a_dropped_dial_between_refusals_does_not_reset_the_park_count() {
                 }
             }
             session
-                .send(":up 465 bncbot :You are banned from this server")
+                .send(":up 433 * bncbot :Nickname is already in use")
                 .await;
         }
     });
@@ -2118,8 +2231,13 @@ async fn a_dropped_dial_between_refusals_does_not_reset_the_park_count() {
     // Five refusals plus the one dropped dial between them.
     assert_eq!(snapshot.connection_attempts, 6, "{snapshot:?}");
     assert_eq!(
+        snapshot.last_error,
+        Some(e6ircd::bouncer::NetworkFailure::NicknameInUse),
+        "{snapshot:?}"
+    );
+    assert_eq!(
         snapshot.last_error_diagnostic.as_deref(),
-        Some("You are banned from this server"),
+        Some("Nickname is already in use"),
         "{snapshot:?}"
     );
 }
@@ -2290,8 +2408,8 @@ async fn self_echo_is_persisted_to_the_backlog() {
     .await
     .expect("the echo was never persisted");
     assert!(
-        line.contains(":bncnick!~bncnick@"),
-        "persisted echo carries the upstream identity: {line}"
+        line.contains(":bncnick!tester@127.0.0.1 PRIVMSG"),
+        "persisted echo carries the identity the upstream shows for the session: {line}"
     );
     drop(running);
 }
@@ -2598,4 +2716,438 @@ async fn bnc_listener_serves_chathistory_and_markread() {
         "targets carry a resume timestamp: {target_line:?}"
     );
     drop(running);
+}
+
+/// The network's capacity and policy answers, given before the welcome. They
+/// end by themselves, so the driver never parks on them however many arrive in
+/// a row: it retries on the slow schedule, keeping the reason visible, and
+/// connects once the network lets it.
+enum PreWelcomeAnswer {
+    /// A pre-welcome `ERROR`: Solanum's "Reconnecting too fast, throttled",
+    /// "Too many host connections", a K-line.
+    ThrottleError,
+    /// A 465.
+    Banned,
+}
+
+/// Six refusals of one kind -- more than the schedule-then-park policy
+/// tolerates -- then a welcome. The driver reaches `Connected`, never
+/// `RegistrationFailed`, and the reason was visible while it waited.
+async fn outlasted_never_parked(answer: PreWelcomeAnswer) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (expected_failure, expected_text) = match answer {
+        PreWelcomeAnswer::ThrottleError => (
+            e6ircd::bouncer::NetworkFailure::RegistrationRejected,
+            "Closing Link: 127.0.0.1 (Reconnecting too fast, throttled)",
+        ),
+        PreWelcomeAnswer::Banned => (
+            e6ircd::bouncer::NetworkFailure::NetworkBanned,
+            "You are banned from this server",
+        ),
+    };
+    tokio::spawn(async move {
+        for _ in 1..=6 {
+            let mut session = fake_accept(&listener).await;
+            match answer {
+                PreWelcomeAnswer::ThrottleError => {
+                    session
+                        .send("ERROR :Closing Link: 127.0.0.1 (Reconnecting too fast, throttled)")
+                        .await;
+                }
+                PreWelcomeAnswer::Banned => {
+                    session.negotiate_capabilities().await;
+                    loop {
+                        if session.read_line().await.starts_with("USER ") {
+                            break;
+                        }
+                    }
+                    session
+                        .send(":up 465 bncbot :You are banned from this server")
+                        .await;
+                }
+            }
+            drop(session);
+        }
+        let mut session = fake_accept(&listener).await;
+        session.complete_registration("bncbot").await;
+        while !session.read_line().await.is_empty() {}
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        rejection_retry_floor: std::time::Duration::from_millis(20),
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    });
+    let mut reason_seen = false;
+    let connected = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let snapshot = handle.runtime_snapshot();
+            assert_ne!(
+                snapshot.lifecycle,
+                NetworkLifecycle::RegistrationFailed,
+                "a capacity or policy answer parked the driver: {snapshot:?}"
+            );
+            if snapshot.lifecycle == NetworkLifecycle::Reconnecting
+                && snapshot.last_error == Some(expected_failure)
+            {
+                assert_eq!(
+                    snapshot.last_error_diagnostic.as_deref(),
+                    Some(expected_text),
+                    "{snapshot:?}"
+                );
+                reason_seen = true;
+            }
+            if snapshot.lifecycle == NetworkLifecycle::Connected {
+                return snapshot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the driver never connected");
+    assert_eq!(connected.connection_attempts, 7, "{connected:?}");
+    assert!(reason_seen, "the upstream's reason was never visible");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_throttle_is_outlasted_never_parked() {
+    outlasted_never_parked(PreWelcomeAnswer::ThrottleError).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ban_is_outlasted_never_parked() {
+    outlasted_never_parked(PreWelcomeAnswer::Banned).await;
+}
+
+/// A registered session the upstream closes with `ERROR` is reported as the
+/// reason it was lost. The `ERROR` line itself never reaches an attached
+/// client -- to a client it means *its* connection is over, and replayed from
+/// the backlog it would mean it again -- and never enters the backlog.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_error_after_registration_is_a_notice_not_an_error() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (drop_tx, mut drop_rx) = tokio::sync::mpsc::channel::<()>(1);
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.complete_registration("bncbot").await;
+        drop_rx.recv().await;
+        session
+            .send("ERROR :Closing Link: 127.0.0.1 (Excess Flood)")
+            .await;
+        drop(session);
+        // Hold later dials open so the driver stays in its reconnect wait.
+        let _held = fake_accept(&listener).await;
+        std::future::pending::<()>().await;
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    });
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    drop_tx.send(()).await.unwrap();
+    // What an attached client reads, up to and including the notice.
+    let mut read = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line, .. }))
+                | Ok(DriverEvent::Notice(e6ircd::bouncer::BufferedLine { line, .. })) => {
+                    let notice = line.contains("upstream closed the link");
+                    read.push(line);
+                    if notice {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => panic!("event stream ended: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no notice about the closed link: {read:?}"));
+    assert_eq!(
+        read.last().map(String::as_str),
+        Some(":*bnc* NOTICE * :upstream closed the link: Closing Link: 127.0.0.1 (Excess Flood)"),
+        "{read:?}"
+    );
+    let is_error_command = |line: &str| {
+        line.strip_prefix(':')
+            .and_then(|rest| rest.split_once(' '))
+            .map_or(line.starts_with("ERROR"), |(_, rest)| {
+                rest.starts_with("ERROR")
+            })
+    };
+    assert!(
+        !read.iter().any(|line| is_error_command(line)),
+        "an ERROR command reached the attached client: {read:?}"
+    );
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let snapshot = handle.runtime_snapshot();
+            if snapshot.lifecycle == NetworkLifecycle::Reconnecting {
+                return snapshot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the drop was never reported");
+    assert_eq!(
+        snapshot.last_error,
+        Some(e6ircd::bouncer::NetworkFailure::ConnectionLost),
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.last_error_diagnostic.as_deref(),
+        Some("Closing Link: 127.0.0.1 (Excess Flood)"),
+        "{snapshot:?}"
+    );
+    let backlog = handle.buffer_snapshot();
+    assert!(
+        !backlog.iter().any(|line| is_error_command(line)),
+        "an ERROR command entered the backlog: {backlog:?}"
+    );
+    assert!(
+        backlog
+            .iter()
+            .any(|line| line.contains("upstream closed the link: Closing Link")),
+        "{backlog:?}"
+    );
+}
+
+/// 437 (the nick delay after a recent holder) is a refusal like 433: it is
+/// reported with the upstream's text at once, not after the 30 s registration
+/// timeout as an anonymous `registration_timed_out`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_nick_delay_is_a_typed_refusal_within_milliseconds() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.negotiate_capabilities().await;
+        loop {
+            if session.read_line().await.starts_with("USER ") {
+                break;
+            }
+        }
+        session
+            .send(":up 437 * bncbot :Nick/channel is temporarily unavailable")
+            .await;
+        // Hold later dials open so the driver stays in its retry wait.
+        let _held = fake_accept(&listener).await;
+        std::future::pending::<()>().await;
+    });
+    let started = std::time::Instant::now();
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        rejection_retry_floor: std::time::Duration::from_secs(30),
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    });
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let snapshot = handle.runtime_snapshot();
+            if snapshot.last_error.is_some() {
+                return snapshot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the 437 was not read as a refusal before the registration timeout");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(
+        snapshot.lifecycle,
+        NetworkLifecycle::Reconnecting,
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.last_error,
+        Some(e6ircd::bouncer::NetworkFailure::NicknameInUse),
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.last_error_diagnostic.as_deref(),
+        Some("Nick/channel is temporarily unavailable"),
+        "{snapshot:?}"
+    );
+}
+
+/// A rejoin names its channels in as few `JOIN` lines as the wire allows. One
+/// line per channel was a burst Solanum's flood allowance answers by closing
+/// the link ("Excess Flood") on any network with more than a few dozen.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejoin_of_many_channels_takes_few_join_lines() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let channels: Vec<String> = (0..100).map(|index| format!("#room{index:02}")).collect();
+    let expected = channels.clone();
+    let (lines_tx, mut lines_rx) = tokio::sync::mpsc::channel(16);
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.complete_registration("bncbot").await;
+        let mut named = std::collections::HashSet::new();
+        while named.len() < expected.len() {
+            let line = session.read_line().await;
+            if let Some(chans) = line.strip_prefix("JOIN ") {
+                for chan in chans.split(',') {
+                    named.insert(chan.to_string());
+                }
+                lines_tx.send(line.clone()).await.unwrap();
+            }
+        }
+        while !session.read_line().await.is_empty() {}
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        autojoin: channels
+            .iter()
+            .map(|channel| channel.parse().expect("test channel"))
+            .collect(),
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    });
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    let mut lines = Vec::new();
+    let mut named: Vec<String> = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while named.len() < channels.len() {
+            let line = lines_rx.recv().await.expect("upstream script ended");
+            named.extend(line["JOIN ".len()..].split(',').map(str::to_string));
+            lines.push(line);
+        }
+    })
+    .await
+    .expect("not every channel was joined");
+    assert!(lines.len() <= 5, "{} JOIN lines: {lines:?}", lines.len());
+    assert!(
+        lines.iter().all(|line| line.len() <= 510),
+        "a JOIN line exceeds the wire budget: {lines:?}"
+    );
+    let mut sorted = named.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        named.len(),
+        channels.len(),
+        "a channel was named twice: {lines:?}"
+    );
+    assert_eq!(sorted, channels, "{lines:?}");
+}
+
+/// The synthesized echo of an own message carries the identity the upstream
+/// shows: the configured user name behind a `~` and the server's name until
+/// one of our own echoes reveals the real user and host, and those afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn self_echoes_carry_the_identity_the_upstream_shows() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::channel::<()>(1);
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.complete_registration("bncbot").await;
+        loop {
+            if session.read_line().await.starts_with("JOIN ") {
+                break;
+            }
+        }
+        confirm_rx.recv().await;
+        session.send(":bncbot!~e6e2e@82.77.225.81 JOIN #room").await;
+        loop {
+            let _ = session.read_line().await;
+        }
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        username: "e6e2e".parse().expect("test user name"),
+        autojoin: vec!["#room".parse().expect("test channel")],
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    });
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    async fn next_echo(events: &mut tokio::sync::broadcast::Receiver<DriverEvent>) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(DriverEvent::Echo {
+                    line: e6ircd::bouncer::BufferedLine { line, .. },
+                    ..
+                }) = events.recv().await
+                {
+                    return line;
+                }
+            }
+        })
+        .await
+        .expect("no echo")
+    }
+    assert_eq!(handle.send("PRIVMSG #room :before"), SendOutcome::Sent);
+    let before = next_echo(&mut events).await;
+    assert!(
+        before.contains(":bncbot!~e6e2e@127.0.0.1 PRIVMSG #room :before"),
+        "the configured user name and the server name, until better is known: {before}"
+    );
+    confirm_tx.send(()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line, .. })) =
+                events.recv().await
+                && line.contains("JOIN #room")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("join confirmation never relayed");
+    assert_eq!(handle.send("PRIVMSG #room :after"), SendOutcome::Sent);
+    let after = next_echo(&mut events).await;
+    assert!(
+        after.contains(":bncbot!~e6e2e@82.77.225.81 PRIVMSG #room :after"),
+        "the host the upstream showed in our own JOIN: {after}"
+    );
+}
+
+/// A server without capability negotiation may answer `CAP LS` with 451
+/// ("you have not registered"). That is not a refusal to register: the driver
+/// registers plainly and connects on the first attempt.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_answering_451_to_capability_discovery_connects_at_once() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        assert_eq!(session.read_line().await, "CAP LS 302");
+        session.send(":up 451 * :You have not registered").await;
+        loop {
+            let line = session.read_line().await;
+            assert!(!line.starts_with("CAP"), "{line}");
+            if line.starts_with("USER ") {
+                session.send(":up 001 bncbot :welcome").await;
+                break;
+            }
+        }
+        while !session.read_line().await.is_empty() {}
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    });
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    let snapshot = handle.runtime_snapshot();
+    assert_eq!(snapshot.connection_attempts, 1, "{snapshot:?}");
+    assert_eq!(snapshot.last_error, None, "{snapshot:?}");
 }

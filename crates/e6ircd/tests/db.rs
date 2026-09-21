@@ -324,7 +324,10 @@ async fn sasl_over_real_socket() {
             tls: None,
             websocket: false,
         }],
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -384,7 +387,10 @@ async fn sasl_oauthbearer_with_api_token() {
             tls: None,
             websocket: false,
         }],
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let addr = net::start(config).await.expect("start").addrs[0];
@@ -471,7 +477,10 @@ async fn app_password_issued_over_http_works_for_sasl() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -565,7 +574,10 @@ async fn auth_endpoint_rate_limit_returns_429_after_burst() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         limits: LimitsConfig {
             // Two requests per client IP, then the bucket is empty.
             auth_rate_burst: Some(2),
@@ -616,7 +628,10 @@ async fn channel_messages_are_persisted() {
             tls: None,
             websocket: false,
         }],
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -849,7 +864,10 @@ async fn credential_list_and_revoke() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -1439,7 +1457,10 @@ async fn read_marker_persists() {
             tls: None,
             websocket: false,
         }],
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -1556,7 +1577,10 @@ async fn history_rest_endpoint() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -1793,7 +1817,18 @@ async fn chathistory_pages_from_postgres_past_the_ring() {
             tls: None,
             websocket: false,
         }],
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
+        // This client pipelines 600 messages in one instant to overflow the
+        // ring, which the default command-flood bucket (40 then 20/s) would
+        // rightly answer with Excess Flood; the bucket is not what is under test.
+        limits: e6ircd::config::LimitsConfig {
+            command_burst: 10_000,
+            command_rate: 10_000,
+            ..e6ircd::config::LimitsConfig::default()
+        },
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -1931,7 +1966,10 @@ async fn chathistory_recreated_channel_serves_persisted_history_with_label() {
             tls: None,
             websocket: false,
         }],
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -2034,7 +2072,10 @@ async fn read_marker_preloaded_after_restart() {
             tls: None,
             websocket: false,
         }],
-        database: Some(DatabaseConfig { url: url.clone() }),
+        database: Some(DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
 
@@ -2106,7 +2147,10 @@ async fn sasl_registration_fails_loudly_on_nick_in_use() {
             tls: None,
             websocket: false,
         }],
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let addr = net::start(config).await.expect("start").addrs[0];
@@ -2165,7 +2209,10 @@ async fn labeled_chathistory_targets_carries_label_on_db_path() {
             tls: None,
             websocket: false,
         }],
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -2240,7 +2287,10 @@ async fn chathistory_targets_db_path_shows_dm_correspondent_as_a_nick() {
             tls: None,
             websocket: false,
         }],
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -2309,7 +2359,10 @@ async fn a_stranger_taking_a_nick_gets_none_of_its_previous_conversations() {
             tls: None,
             websocket: false,
         }],
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -5172,11 +5225,14 @@ async fn unreadable_secret_rolls_back_the_entire_rotation() {
         after.settings.opers[0].password, initial.settings.opers[0].password,
         "the earlier settings update escaped the failed transaction"
     );
+    // Alice's own ACCOUNT_CREATE row from her self-registration is the only
+    // audit entry: the rotation's success row was rolled back with it.
     assert!(
         list_audit_log(&pool, audit_page_size(10))
             .await
             .expect("audit")
-            .is_empty(),
+            .iter()
+            .all(|entry| entry.action == "ACCOUNT_CREATE"),
         "a rolled-back rotation left an audit success"
     );
 }
@@ -6746,35 +6802,380 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     .await
     .expect("account invitations");
 
-    let report = db::run_storage_maintenance(&pool, 30, 365)
+    // Bouncer history is under the same retention as `messages`: an old line
+    // of an always-on network (a direct message included) expires by storage
+    // age, while the recent line and the newest-N ring it belongs to stay.
+    sqlx::query(
+        "INSERT INTO bnc_buffer (owner, network, line, created_at)
+         VALUES
+           ('alice', 'libera', ':x!u@h PRIVMSG alice :old dm', now() - interval '31 days'),
+           ('alice', 'libera', ':x!u@h PRIVMSG alice :new dm', now())",
+    )
+    .execute(&pool)
+    .await
+    .expect("bnc_buffer");
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO observability_samples (sampled_at_ms, snapshot)
+         VALUES ($1, '{}'::jsonb), ($2, '{}'::jsonb)",
+    )
+    .bind(now_ms - 2 * 60 * 60 * 1_000)
+    .bind(now_ms)
+    .execute(&pool)
+    .await
+    .expect("observability samples");
+
+    let retention = db::StorageRetention {
+        history_days: 30,
+        audit_days: 365,
+        observability_hours: 1,
+    };
+    let report = db::run_storage_maintenance(&pool, retention)
         .await
         .expect("maintenance");
     assert_eq!(report.messages, 1);
+    assert_eq!(report.bnc_buffer, 1);
     assert_eq!(report.audit_events, 1);
     assert_eq!(report.web_sessions, 1);
     assert_eq!(report.api_tokens, 1);
     assert_eq!(report.device_grants, 1);
     assert_eq!(report.logout_tokens, 1);
     assert_eq!(report.account_invitations, 1);
+    assert_eq!(report.observability_samples, 1);
     assert!(!report.saturated);
-    let counts: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+    let counts: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
            (SELECT count(*) FROM messages),
+           (SELECT count(*) FROM bnc_buffer),
            (SELECT count(*) FROM audit_log),
            (SELECT count(*) FROM web_sessions),
            (SELECT count(*) FROM api_tokens),
            (SELECT count(*) FROM device_grants),
            (SELECT count(*) FROM oidc_logout_tokens),
-           (SELECT count(*) FROM account_invitations)",
+           (SELECT count(*) FROM account_invitations),
+           (SELECT count(*) FROM observability_samples)",
     )
     .fetch_one(&pool)
     .await
     .expect("retained row counts");
+    // Two audit rows remain: the recent seeded one and Alice's own
+    // ACCOUNT_CREATE, written by her self-registration above.
     assert_eq!(
         counts,
-        (1, 1, 1, 1, 1, 1, 0),
+        (1, 1, 2, 1, 1, 1, 1, 0, 1),
         "every collection retained only its live/recent row"
     );
+    let remaining: String = sqlx::query_scalar("SELECT line FROM bnc_buffer")
+        .fetch_one(&pool)
+        .await
+        .expect("remaining bouncer line");
+    assert!(remaining.ends_with("new dm"), "{remaining}");
+}
+
+/// A saturated batch every five minutes never catches up with a backlog of
+/// hundreds of thousands of rows (a retention lowered by months); one tick must
+/// drain what it can in bounded steps.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn storage_maintenance_drains_a_backlog_in_one_tick() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("storage_maintenance_drains_a_backlog_in_one_tick").await,
+    )
+    .await
+    .expect("connect");
+    sqlx::query(
+        "INSERT INTO messages (msgid, target, sender_prefix, kind, body, ts)
+         SELECT 'expired-' || n, '#test', 'Alice!u@h', 'privmsg', 'old',
+                now() - interval '31 days' - (n || ' seconds')::interval
+         FROM generate_series(1, 25000) AS n",
+    )
+    .execute(&pool)
+    .await
+    .expect("25k expired messages");
+    let retention = db::StorageRetention {
+        history_days: 30,
+        audit_days: 365,
+        observability_hours: 1,
+    };
+    let single = db::run_storage_maintenance(&pool, retention)
+        .await
+        .expect("one batch");
+    assert_eq!(single.messages, 10_000);
+    assert!(single.saturated, "one batch cannot drain 25k rows");
+    let drain = db::drain_storage_maintenance(
+        &pool,
+        retention,
+        db::MaintenanceDrainPlan {
+            batches: std::num::NonZeroUsize::new(21).unwrap(),
+            pause: std::time::Duration::ZERO,
+        },
+    )
+    .await
+    .expect("drain");
+    assert_eq!(drain.totals.messages, 15_000, "{drain:?}");
+    assert_eq!(
+        drain.batches_run, 2,
+        "10k, then the 5k remainder: {drain:?}"
+    );
+    assert!(!drain.totals.saturated, "{drain:?}");
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM messages")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(remaining, 0);
+    // A bounded plan stops at its budget and says the backlog remains.
+    sqlx::query(
+        "INSERT INTO messages (msgid, target, sender_prefix, kind, body, ts)
+         SELECT 'again-' || n, '#test', 'Alice!u@h', 'privmsg', 'old', now() - interval '31 days'
+         FROM generate_series(1, 20001) AS n",
+    )
+    .execute(&pool)
+    .await
+    .expect("expired messages again");
+    let capped = db::drain_storage_maintenance(
+        &pool,
+        retention,
+        db::MaintenanceDrainPlan {
+            batches: std::num::NonZeroUsize::new(2).unwrap(),
+            pause: std::time::Duration::ZERO,
+        },
+    )
+    .await
+    .expect("capped drain");
+    assert_eq!(capped.batches_run, 2);
+    assert_eq!(capped.totals.messages, 20_000);
+    assert!(
+        capped.totals.saturated,
+        "the last batch filled, so the plan must report the backlog: {capped:?}"
+    );
+}
+
+/// Every way an account comes to exist is audited. Self-registration over IRC
+/// and first-login provisioning from an identity provider used to leave no
+/// row, unlike administrator creation, invitation and bootstrap.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn self_registration_and_oidc_provisioning_are_audited() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("self_registration_and_oidc_provisioning_are_audited").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account_with_contact(&pool, "Alice", "password", None)
+        .await
+        .expect("self-registered account");
+    let created = db::find_or_create_oidc_account(&pool, "https://idp.example", "sub-1", "Bob")
+        .await
+        .expect("provisioned account");
+    assert_eq!(created, "Bob");
+    let again = db::find_or_create_oidc_account(&pool, "https://idp.example", "sub-1", "Bob")
+        .await
+        .expect("existing account");
+    assert_eq!(again, "Bob");
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT actor, action, target, detail FROM audit_log
+         WHERE action = 'ACCOUNT_CREATE' ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("audit rows");
+    assert_eq!(
+        rows,
+        [
+            (
+                "alice".to_string(),
+                "ACCOUNT_CREATE".to_string(),
+                "alice".to_string(),
+                "self-registered over IRC".to_string()
+            ),
+            (
+                "oidc:https://idp.example".to_string(),
+                "ACCOUNT_CREATE".to_string(),
+                "bob".to_string(),
+                "provisioned from OpenID Connect".to_string()
+            ),
+        ],
+        "one row per creation, none for a returning identity"
+    );
+}
+
+/// A port nobody listens on: bound, read, and released, so a connection to it
+/// is refused rather than black-holed.
+fn refusing_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.local_addr().expect("addr").port()
+}
+
+/// Startup keeps trying a refused database, one reported attempt at a time,
+/// and gives up with a typed error once its wait is spent.
+#[tokio::test]
+async fn startup_database_wait_retries_a_refused_port_then_gives_up() {
+    let url = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/x",
+        refusing_port()
+    );
+    let wait = db::StartupDatabaseWait::from_seconds(2).expect("bounded");
+    let mut reported: Vec<(u32, Option<std::time::Duration>)> = Vec::new();
+    let started = std::time::Instant::now();
+    let error = db::connect_and_migrate_with_retry(&url, wait, |attempt| {
+        assert!(
+            matches!(attempt.error, db::DbError::Connect(_)),
+            "{}",
+            attempt.error
+        );
+        reported.push((attempt.attempt, attempt.retry_in));
+    })
+    .await
+    .expect_err("nothing listens there");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_secs(2)
+            && elapsed < std::time::Duration::from_secs(10),
+        "the wait is the budget: {elapsed:?}"
+    );
+    let db::DbError::StartupWaitExhausted { attempts, last, .. } = error else {
+        panic!("expected the exhausted-wait error, got {error}");
+    };
+    assert!(
+        attempts >= 2,
+        "at least the first attempt and one retry: {attempts}"
+    );
+    assert!(matches!(*last, db::DbError::Connect(_)), "{last}");
+    assert_eq!(reported.len() as u32, attempts, "every attempt is reported");
+    assert!(
+        reported[..reported.len() - 1]
+            .iter()
+            .all(|(_, retry_in)| retry_in.is_some()),
+        "every attempt but the last announces its retry: {reported:?}"
+    );
+    assert_eq!(
+        reported.last().unwrap().1,
+        None,
+        "the last one says it gives up"
+    );
+    assert_eq!(reported[0].1, Some(std::time::Duration::from_secs(1)));
+}
+
+/// `startup_wait_seconds = 0` is exactly one attempt.
+#[tokio::test]
+async fn startup_database_wait_of_zero_is_a_single_attempt() {
+    let url = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/x",
+        refusing_port()
+    );
+    let wait = db::StartupDatabaseWait::from_seconds(0).expect("bounded");
+    let mut attempts = 0;
+    let error = db::connect_and_migrate_with_retry(&url, wait, |_| attempts += 1)
+        .await
+        .expect_err("refused");
+    assert_eq!(attempts, 1);
+    assert!(matches!(
+        error,
+        db::DbError::StartupWaitExhausted { attempts: 1, .. }
+    ));
+}
+
+/// The daemon itself: a refused database is retried with one line per attempt
+/// on stderr, then the process exits non-zero.
+#[test]
+fn daemon_exits_non_zero_after_its_startup_database_wait() {
+    let directory = std::env::temp_dir().join(format!(
+        "e6irc-startup-wait-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).expect("temp dir");
+    let config = directory.join("e6ircd.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "server_name = \"irc.wait.test\"\nnetwork_name = \"WaitNet\"\n\
+             [[listeners]]\naddr = \"127.0.0.1:0\"\n\
+             [database]\nurl = \"postgres://postgres:postgres@127.0.0.1:{}/x\"\n\
+             startup_wait_seconds = 1\n",
+            refusing_port()
+        ),
+    )
+    .expect("config");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_e6ircd"))
+        .arg("--config")
+        .arg(&config)
+        .output()
+        .expect("run e6ircd");
+    let _ = std::fs::remove_dir_all(&directory);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("database connection attempt 1 failed")
+            && stderr.contains("Connection refused")
+            && stderr.contains("retrying in"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("database connection attempt 2 failed"),
+        "at least one retry within the one-second wait: {stderr}"
+    );
+    assert!(stderr.contains("giving up"), "{stderr}");
+    assert!(
+        stderr.contains("did not accept a connection in"),
+        "the final error names the exhausted wait: {stderr}"
+    );
+}
+
+/// A database that starts listening during the wait is used: the retry is for
+/// the container that comes up after this one.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn startup_database_wait_uses_a_database_that_appears_in_the_window() {
+    let real = support::test_db("startup_database_wait_uses_a_database_that_appears").await;
+    // `postgres://user:pass@host:port/name?...` -> the host:port to proxy to.
+    let authority = real
+        .split_once('@')
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(authority, _)| authority.to_string())
+        .expect("database URL has an authority");
+    let port = refusing_port();
+    let proxied = real.replacen(&authority, &format!("127.0.0.1:{port}"), 1);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("proxy bind");
+        loop {
+            let (mut downstream, _) = listener.accept().await.expect("proxy accept");
+            let upstream = authority.clone();
+            tokio::spawn(async move {
+                let mut upstream = tokio::net::TcpStream::connect(upstream)
+                    .await
+                    .expect("proxy dial");
+                let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+            });
+        }
+    });
+    let mut attempts = 0;
+    let pool = db::connect_and_migrate_with_retry(
+        &proxied,
+        db::StartupDatabaseWait::from_seconds(20).expect("bounded"),
+        |_| attempts += 1,
+    )
+    .await
+    .expect("the database appeared inside the wait");
+    assert!(attempts >= 1, "the first attempt was refused");
+    let one: i32 = sqlx::query_scalar("SELECT 1")
+        .fetch_one(&pool)
+        .await
+        .expect("query through the late database");
+    assert_eq!(one, 1);
 }
 
 /// Two administrators demoting each other at the same moment must not both

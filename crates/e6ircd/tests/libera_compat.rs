@@ -25,9 +25,10 @@ fn reference() -> String {
 /// need a reason in the comment.
 const WHITELIST: &[&str] = &[
     // TARGMAX is enforcement-specific: we advertise limits only for the
-    // commands we actually bound (PRIVMSG/NOTICE at 4, matching Libera's
-    // values for those), whereas Libera also lists NAMES/LIST/KICK/WHOIS/
-    // ACCEPT/MONITOR. Advertising limits we do not enforce would be a false
+    // commands we actually bound (PRIVMSG/NOTICE/TAGMSG/KICK at 4, NAMES at 1
+    // matching Libera's values for PRIVMSG/NOTICE/NAMES, JOIN/PART at the
+    // channel limit), whereas Libera also lists LIST/WHOIS/ACCEPT/MONITOR and
+    // keeps KICK at 1. Advertising limits we do not enforce would be a false
     // claim, so the token legitimately differs.
     "TARGMAX",
     // Libera advertises additional modes. Unsupported modes return 472.
@@ -77,7 +78,7 @@ fn our_isupport() -> HashMap<String, String> {
             max_hot_channels: 8192,
             clock: || e6irc_proto::time::Millis::from_millis(0),
             mono_clock: || e6irc_proto::time::MonoMillis::from_millis(0),
-            command_burst: None,
+            command_flood: None,
             registration_burst: None,
         },
         db_tx,

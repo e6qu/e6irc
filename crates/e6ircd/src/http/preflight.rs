@@ -114,6 +114,13 @@ pub(crate) struct PreflightPermit {
     _process: tokio::sync::OwnedSemaphorePermit,
 }
 
+impl PreflightPermit {
+    /// The account the test runs for.
+    pub(crate) fn account(&self) -> &str {
+        &self.account
+    }
+}
+
 impl Drop for PreflightPermit {
     fn drop(&mut self) {
         self.limiter

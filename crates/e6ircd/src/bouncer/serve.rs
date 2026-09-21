@@ -189,6 +189,7 @@ impl Registry {
                     keepalive_idle: super::KEEPALIVE_IDLE,
                     rejection_retry_floor: super::REJECTION_RETRY_FLOOR,
                     internal_upstreams,
+                    first_dial: super::FirstDial::Immediate,
                 };
                 Box::new(super::LocalDriver::new(core.clone(), config))
             } else {
@@ -206,6 +207,7 @@ impl Registry {
                     sasl_account: e.sasl_account.clone(),
                     sasl_password: e.sasl_password.clone(),
                     internal_upstreams,
+                    first_dial: super::FirstDial::Immediate,
                 })
                 .map_err(|msg| format!("network '{}': {msg}", e.name))?
             };
@@ -336,6 +338,39 @@ impl Registry {
             }
             None => false,
         }
+    }
+
+    /// Stop every driver, all at once, for a process shutdown: each says its
+    /// goodbye (`QUIT`) and releases its upstream, so the restarted daemon does
+    /// not meet its own ghosts. Waits at most `deadline` for the slowest;
+    /// returns how many had released their upstream by then, out of how many
+    /// were running. The registry is empty afterwards either way.
+    pub async fn stop_all_within(&self, deadline: std::time::Duration) -> (usize, usize) {
+        let slots: Vec<Slot> = self
+            .networks
+            .lock()
+            .expect("registry poisoned")
+            .drain()
+            .map(|(_, slot)| slot)
+            .collect();
+        let running = slots.len();
+        let mut stops = tokio::task::JoinSet::new();
+        for slot in slots {
+            stops.spawn(async move {
+                let released = slot.handle.shutdown_and_wait_within(deadline).await;
+                if let Some(task) = slot.persistence {
+                    task.abort();
+                }
+                released
+            });
+        }
+        let mut released = 0;
+        while let Some(outcome) = stops.join_next().await {
+            if outcome.expect("a driver stop does not panic") {
+                released += 1;
+            }
+        }
+        (released, running)
     }
 
     /// Stop every active upstream owned by one account while preserving its
@@ -894,6 +929,10 @@ where
                 }
                 "PING" => {
                     if let Some(token) = msg.params.first() {
+                        // `PONG :` is one byte longer than the `PING ` that
+                        // carried a maximal token, so the echo is fitted like
+                        // every other relay of client text.
+                        let token = crate::core::fit_trailing("PONG :", token);
                         write
                             .write_all(format!("PONG :{token}\r\n").as_bytes())
                             .await?;
@@ -1441,9 +1480,15 @@ mod handshake_tests {
         let task = tokio::spawn(async move {
             handshake(&mut server_read, &mut server_write, &pool, "bnc.example").await
         });
+        // The last PING carries a maximal token: `PING ` plus 505 bytes fills
+        // the 510-byte input frame, and the `PONG :` echo is one byte longer.
+        let long_token = "a".repeat(505);
         client_write
             .write_all(
-                b"NICK alice/libera\r\nUSER only-one-param\r\nWAT value\r\nBAD\0LINE\r\nCAP SURPRISE\r\nPING :token\r\nQUIT :done\r\n",
+                format!(
+                    "NICK alice/libera\r\nUSER only-one-param\r\nWAT value\r\nBAD\0LINE\r\nCAP SURPRISE\r\nPING :token\r\nPING {long_token}\r\nQUIT :done\r\n"
+                )
+                .as_bytes(),
             )
             .await
             .expect("write handshake");
@@ -1458,6 +1503,15 @@ mod handshake_tests {
         assert!(replies.contains(" FAIL * INVALID_MESSAGE :Malformed line\r\n"));
         assert!(replies.contains(" 410 * SURPRISE :Invalid CAP subcommand\r\n"));
         assert!(replies.contains("PONG :token\r\n"));
+        let long_pong = replies
+            .split("\r\n")
+            .find(|line| line.starts_with("PONG :aaaa"))
+            .expect("the maximal PING is answered");
+        assert!(
+            long_pong.len() + 2 <= 512,
+            "PONG must fit the wire: {} bytes",
+            long_pong.len() + 2
+        );
         assert!(matches!(
             task.await
                 .expect("handshake task")
