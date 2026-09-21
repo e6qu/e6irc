@@ -225,6 +225,19 @@ test("a refusal quotes the network's own reason, while retrying as well as once 
   );
 });
 
+// A 464 is a setting to change, and which one depends on whether a server
+// password was configured at all.
+test("a missing or rejected server password points at the setting that repairs it", () => {
+  assert.match(
+    networkStateHelp({ state: "reconnecting", failureCode: "server_password_required", failureDetail: "Password required" }),
+    /requires a server password.*Server password under Advanced.*The network said: “Password required”$/,
+  );
+  assert.match(
+    networkStateHelp({ state: "registration_failed", failureCode: "server_password_rejected", failureDetail: null }),
+    /rejected the server password.*Server password under Advanced/,
+  );
+});
+
 test("a refusal with no specific repair still quotes the network", () => {
   assert.equal(
     networkStateHelp({ state: "reconnecting", failureCode: "network_banned", failureDetail: "Trying to reconnect too fast." }),

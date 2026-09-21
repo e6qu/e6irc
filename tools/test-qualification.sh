@@ -6,7 +6,7 @@ bin="$root/target/debug/e6irc-qualification"
 temporary="$(mktemp -d)"
 trap 'rm -rf "$temporary"' EXIT
 
-cargo build -p e6irc-qualification
+cargo build --locked -p e6irc-qualification
 
 probe() {
   local name="$1" report="$2"

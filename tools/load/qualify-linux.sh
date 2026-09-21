@@ -71,10 +71,10 @@ qualification_bin="$root/target/release/e6irc-qualification"
   exit 2
 }
 if [[ ! -x "$load_bin" ]]; then
-  (cd "$root" && cargo build --release -p e6irc-load >&2)
+  (cd "$root" && cargo build --locked --release -p e6irc-load >&2)
 fi
 if [[ ! -x "$qualification_bin" ]]; then
-  (cd "$root" && cargo build --release -p e6irc-qualification >&2)
+  (cd "$root" && cargo build --locked --release -p e6irc-qualification >&2)
 fi
 
 [[ ! -e "$output_dir" ]] || { echo "OUTPUT_DIR must not already exist: $output_dir" >&2; exit 2; }

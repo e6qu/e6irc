@@ -5073,6 +5073,45 @@ fn markread_store_failure_is_loud_labeled_and_non_mutating() {
     );
 }
 
+/// The database's cap — counted across every core shard — refuses a new
+/// target the shard's own mirror would still have admitted, as the same
+/// `FAIL MARKREAD INVALID_PARAMS` the in-memory cap gives, and the refusal
+/// leaves no marker behind.
+#[test]
+fn markread_refused_by_the_database_cap_is_invalid_params() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(
+        &mut s,
+        1,
+        "alice",
+        "batch draft/read-marker labeled-response",
+    );
+    identify(&mut s, alice, "alice");
+    s.line(
+        alice,
+        "@label=cap1 MARKREAD #room timestamp=2026-07-18T12:00:00.000Z",
+    );
+    let request = take_read_marker_request(&mut s);
+    s.core.handle(Input::DbReply {
+        conn: request.conn,
+        reply: e6ircd::core::DbReply::ReadMarkerLimitReached {
+            account: request.account.clone(),
+            target: request.target.clone(),
+            display: request.display.clone(),
+            label: request.label.clone(),
+        },
+    });
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|line| line.starts_with("@label=cap1 ")
+            && line.contains("FAIL MARKREAD INVALID_PARAMS #room")
+            && line.contains("Too many read markers")),
+        "{out:#?}"
+    );
+    s.line(alice, "MARKREAD #room");
+    assert_eq!(s.drain(alice), vec![":irc.test.example MARKREAD #room *"]);
+}
+
 #[test]
 fn markread_query_behind_pending_update_never_replies_with_a_stale_value() {
     let mut s = TestServer::new();
@@ -9498,6 +9537,91 @@ fn self_kill_audit_row_names_the_actor() {
         })
         .expect("KILL not audited");
     assert_eq!(actor, "god", "self-KILL audit row lost its actor");
+}
+
+fn audit_rows(s: &mut TestServer) -> Vec<(String, String, String)> {
+    s.db_requests()
+        .into_iter()
+        .filter_map(|request| match request {
+            e6ircd::core::DbRequest::AuditLog {
+                actor,
+                action,
+                target,
+                ..
+            } => Some((actor, action, target)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An operator's privileged actions are recorded under the operator name it
+/// authenticated as, not the nick it happens to hold.
+#[test]
+fn oper_actions_are_recorded_under_the_operator_name() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "Alice");
+    let bob = s.register(2, "bob");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    s.line(op, "SETHOST bob cloaked.example");
+    s.line(op, "KILL bob :bye");
+    s.drain(op);
+    s.drain(bob);
+    assert_eq!(
+        audit_rows(&mut s),
+        [
+            ("god".to_string(), "OPER".to_string(), "god".to_string()),
+            ("god".to_string(), "SETHOST".to_string(), "bob".to_string()),
+            ("god".to_string(), "KILL".to_string(), "bob".to_string()),
+        ]
+    );
+}
+
+/// An operator action the audit trail cannot record — its row does not fit
+/// the database queue — is refused loudly, not performed unrecorded.
+#[test]
+fn oper_actions_the_audit_trail_cannot_record_are_refused() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    s.line(op, "JOIN #flood");
+    s.drain(op);
+    let fill = |s: &mut TestServer| {
+        for i in 0..80 {
+            s.line(op, &format!("PRIVMSG #flood :m{i}"));
+            s.drain(op);
+        }
+    };
+    s.db_requests();
+    fill(&mut s);
+    s.line(op, "OPER god letmein");
+    let out = s.drain(op);
+    assert!(!has_numeric(&out, "381"), "{out:#?}");
+    assert!(
+        out.iter().any(|l| l.contains("OPER not granted")),
+        "{out:#?}"
+    );
+
+    s.db_requests();
+    s.line(op, "OPER god letmein");
+    assert!(has_numeric(&s.drain(op), "381"));
+    s.db_requests();
+    fill(&mut s);
+    s.line(op, "SETHOST bob cloaked.example");
+    s.line(op, "KILL bob :bye");
+    let out = s.drain(op);
+    assert!(
+        out.iter().any(|l| l.contains("SETHOST not performed"))
+            && out.iter().any(|l| l.contains("KILL not performed")),
+        "{out:#?}"
+    );
+    let bob_out = s.drain(bob);
+    assert!(
+        !bob_out
+            .iter()
+            .any(|l| l.starts_with("ERROR") || l.contains(" 396 ")),
+        "an unrecorded KILL or SETHOST reached its target: {bob_out:#?}"
+    );
 }
 
 /// A QUIT sent inside a labeled command tears the session down from within the

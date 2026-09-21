@@ -1540,8 +1540,13 @@ pub(super) fn client_ip(
     peer: std::net::IpAddr,
     headers: &axum::http::HeaderMap,
     trusted: &[ipnet::IpNet],
-) -> std::net::IpAddr {
-    if !trusted.iter().any(|net| net.contains(&peer)) {
+) -> crate::net::ClientIp {
+    // Every address is judged in its canonical spelling: a dual-stack listener
+    // presents an IPv4 proxy mapped, and a proxy may forward a mapped client.
+    let peer = crate::net::ClientIp::new(peer);
+    let is_trusted =
+        |address: crate::net::ClientIp| trusted.iter().any(|net| net.contains(&address.ip()));
+    if !is_trusted(peer) {
         return peer;
     }
     // Concatenate *every* X-Forwarded-For header in header order before scanning
@@ -1559,7 +1564,7 @@ pub(super) fn client_ip(
         .join(",");
     for part in joined.rsplit(',') {
         if let Some(ip) = parse_forwarded_ip(part)
-            && !trusted.iter().any(|net| net.contains(&ip))
+            && !is_trusted(ip)
         {
             return ip;
         }
@@ -1574,18 +1579,19 @@ pub(super) fn client_ip(
 /// to a spoofable left-hand entry or the proxy's own IP — collapsing per-IP
 /// rate limits and bans onto one key. Returns `None` only for a truly malformed
 /// entry.
-fn parse_forwarded_ip(entry: &str) -> Option<std::net::IpAddr> {
+fn parse_forwarded_ip(entry: &str) -> Option<crate::net::ClientIp> {
     let s = entry.trim();
-    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
-        return Some(ip); // bare IPv4 or unbracketed IPv6
-    }
-    if let Ok(sock) = s.parse::<std::net::SocketAddr>() {
-        return Some(sock.ip()); // ip:port or [ip]:port
-    }
-    // `[ip]` with no port.
-    s.strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .and_then(|inner| inner.parse::<std::net::IpAddr>().ok())
+    let address = if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+        Some(ip) // bare IPv4 or unbracketed IPv6
+    } else if let Ok(sock) = s.parse::<std::net::SocketAddr>() {
+        Some(sock.ip()) // ip:port or [ip]:port
+    } else {
+        // `[ip]` with no port.
+        s.strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .and_then(|inner| inner.parse::<std::net::IpAddr>().ok())
+    };
+    address.map(crate::net::ClientIp::new)
 }
 
 /// Hard ceiling on the auth-rate bucket map. The age-based retain below only
@@ -1599,7 +1605,7 @@ const MAX_AUTH_BUCKETS: usize = 4096;
 /// bucket refills to full over 60s; fully-refilled entries are pruned, and the
 /// map is hard-capped at `MAX_AUTH_BUCKETS` so it can't grow without bound even
 /// under a distinct-IP flood.
-pub(super) fn auth_rate_ok(state: &AppState, ip: std::net::IpAddr) -> bool {
+pub(super) fn auth_rate_ok(state: &AppState, ip: crate::net::ClientIp) -> bool {
     let Some(burst) = state.auth_rate_burst else {
         return true;
     };
@@ -1725,10 +1731,7 @@ pub(super) fn login_state_cookie_name(secure: bool) -> &'static str {
 }
 
 pub(super) fn random_browser_token() -> String {
-    use argon2::password_hash::rand_core::RngCore;
-    let mut bytes = [0u8; 32];
-    argon2::password_hash::rand_core::OsRng.fill_bytes(&mut bytes);
-    e6irc_proto::base64::encode(&bytes).replace(['+', '/'], "-")
+    crate::secret::random_url_safe_token()
 }
 
 pub(super) fn session_cookie(token: &str, secure: bool) -> String {

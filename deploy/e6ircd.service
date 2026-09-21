@@ -20,6 +20,10 @@ RestartSec=2s
 KillSignal=SIGTERM
 TimeoutStopSec=55s
 LimitNOFILE=262144
+# No core files: one would be a copy of memory holding the master key, opened
+# upstream credentials, and session tokens (the daemon also marks itself
+# non-dumpable at start).
+LimitCORE=0
 UMask=0077
 
 # The daemon persists through PostgreSQL and needs no writable host filesystem.

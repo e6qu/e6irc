@@ -772,6 +772,7 @@ async fn client(
             nick: &format!("load{id}"),
             username: "load",
             realname: "load",
+            server_password: None,
         })
         .await?;
         conn.send_line(&format!("JOIN {channel}")).await?;

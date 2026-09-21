@@ -649,6 +649,7 @@ try {
   assert.equal(await networkForm.locator('[name="realname"]').isVisible(), true);
   assert.equal(await networkForm.locator('[name="sasl_account"]').isVisible(), false);
   assert.equal(await networkForm.locator('[name="sasl_password"]').isVisible(), false);
+  assert.equal(await networkForm.locator('[name="server_password"]').isVisible(), false);
   await networkDriver.selectOption("irc");
   assert.equal(await networkForm.locator('[name="addr"]').getAttribute("required"), "");
   assert.equal(await networkForm.locator('[name="nick"]').getAttribute("required"), "");
@@ -660,7 +661,7 @@ try {
   assert.deepEqual(
     await networkForm.locator("label:not([hidden]) > span:first-child").allInnerTexts(),
     ["Name", "Owner blank for shared", "Type", "Server", "Nickname", "Username", "Real name", "Channels to join",
-      "Buffer capacity", "NickServ account", "NickServ password"],
+      "Buffer capacity", "NickServ account", "NickServ password", "Server password"],
   );
   await networkForm.locator('[name="name"]').fill("shared-browser");
   await networkForm.locator('[name="addr"]').fill(upstream.address);
@@ -976,7 +977,9 @@ try {
   );
   assert.equal(observability.status(), 200);
   const observabilityBody = await observability.json();
-  assert.equal(observabilityBody.current.schema_version, 3);
+  assert.equal(observabilityBody.current.schema_version, 4);
+  const pool = observabilityBody.current.database_pool;
+  assert.ok(pool.max >= 2 && pool.size <= pool.max && pool.idle <= pool.size, JSON.stringify(pool));
   // Queue allocation is restart-required. Telemetry must describe the
   // capacity actually enforcing backpressure now, not the next-start value.
   assert.equal(observabilityBody.current.queues["core-0"].capacity, 65_536);
@@ -1519,6 +1522,7 @@ try {
             sasl_account: null,
             has_sasl_account: false,
             has_sasl_password: false,
+            has_server_password: false,
             enabled: true,
             connected: false,
             runtime: {

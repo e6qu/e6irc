@@ -383,6 +383,56 @@ change fixes:
   The stop budget now covers the drivers' goodbye; a restore into an empty
   database is proven by the recovery script.
 
+A 2026-09-21 fourth review (native clients, the database layer with EXPLAIN,
+the bridges against the providers' current contracts, transport security and
+supply chain) found, and this change fixes:
+
+- **The server password.** A private network that requires `PASS` could not be
+  configured; it can now, end to end (client library, CLI/TUI, sealed storage
+  in migration 0061, an explicit keep/set/remove action on replace, both
+  browser forms), and a 464 tells a missing password from a rejected one.
+  e6ircd answered a client's `PASS` with 451, which stalled clients; the
+  replace endpoint silently dropped a password typed beside `keep`.
+- **The bridges.** An IRC user could page a whole Discord guild or Slack
+  workspace; remote text could deliver a CTCP request to every attached IRC
+  client; Discord sat "connected" and deaf after an invalid session and
+  re-identified on every drop; Matrix joined encrypted rooms and relayed
+  nothing, dropped every msgtype but text, and lost an outage's messages;
+  Slack treated routine refreshes as failures and relayed retried envelopes
+  twice; no driver honoured a rate limit; bridge REST bases accepted `http://`.
+- **The native clients.** The terminal client marked unloaded messages read on
+  every device; `e6irc send` and `raw` exited 0 on refusals; a cached API
+  token went to any IRC server; the cleartext check trusted a `*.localhost`
+  name and `HTTP_PROXY`; `tail` never gave up on a silent server; quitting
+  dropped queued lines and never sent QUIT; long lines were clipped, pastes
+  sent line by line, and `/raw` replies shown nowhere.
+- **Transport and supply chain.** The bouncer's attach listener took account
+  passwords in cleartext; the HTTP listener had no header or idle timeout and
+  no per-address limit, so one client could starve every page and the health
+  check; the bouncer sent upstream SASL and server passwords over plaintext
+  networks; IPv4-mapped peers escaped bans and trusted-proxy matching; the TLS
+  certificate was never reloaded; the attested SBOM named no Rust crate and no
+  build was `--locked`; core dumps could carry keys; responses lacked a header
+  baseline and the console needed inline styles; HSTS forced
+  `includeSubDomains`; browser tokens used a non-injective alphabet; SASL
+  passwords were silently trimmed. The bouncer now relays the upstream's own
+  echo, so a refused line is never echoed as sent.
+- **The database.** A suspended, demoted or recovered administrator's
+  invitations still opened accounts; deleting a busy network or account left
+  backlog written behind the deletion (migration 0062 ties each line to its
+  network); a slow migration was cancelled by the pool's statement timeout;
+  account deletion and export scanned `messages` whole (0063; export now
+  streams from a snapshot); password changes ran Argon2 under a row lock;
+  one refused maintenance delete rolled back the others; a restart could leave a
+  backlog over its 5,000-line cap, and attach history loaded every row of a
+  target; CHATHISTORY TARGETS and maintenance deletes scanned tables; audit
+  rows were written outside the change they record, and OPER/KILL/SETHOST not
+  at all under the operator's name; the pool was a fixed 10 connections; the
+  read-marker cap was per core shard; the replay of a quiet buffer walked every
+  other buffer's lines. Unused indexes were dropped (0064), device grants
+  reference accounts by id (0065), and `cargo` now rebuilds when a migration is
+  added.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

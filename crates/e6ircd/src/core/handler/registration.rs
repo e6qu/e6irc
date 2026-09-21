@@ -101,6 +101,27 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     }
 }
 
+/// `PASS` names a connection password. e6ircd has none — who a client is
+/// comes from SASL — so before registration a `PASS` is taken without a reply,
+/// as RFC 2812 servers with no password configured take it. Answering it with
+/// 451 would be worse than silence: a client that sends `PASS` and then
+/// `CAP LS` reads that 451 as the server declining capability negotiation.
+/// After registration it is 462, like `USER`.
+pub(super) fn cmd_pass(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    if state.sessions[&conn].is_registered() {
+        state.numeric(
+            conn,
+            ERR_ALREADYREGISTERED,
+            &[],
+            Some("You may not reregister"),
+        );
+        return;
+    }
+    if p.first().is_none_or(|password| password.is_empty()) {
+        state.err_needmoreparams(conn, "PASS");
+    }
+}
+
 pub(super) fn cmd_user(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     if state.sessions[&conn].is_registered() {
         state.numeric(

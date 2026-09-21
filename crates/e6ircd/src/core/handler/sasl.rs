@@ -344,6 +344,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             reply,
             crate::core::DbReply::ReadMarkerStored { .. }
                 | crate::core::DbReply::ReadMarkerUnavailable { .. }
+                | crate::core::DbReply::ReadMarkerLimitReached { .. }
         )
     {
         return; // client vanished while the DB worked; nothing to do
@@ -545,7 +546,37 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             display,
             label,
         } => {
-            read_marker_unavailable(state, conn, account, target, display, label);
+            read_marker_refused(
+                state,
+                conn,
+                ReadMarkerRefusal {
+                    account,
+                    target,
+                    display,
+                    label,
+                },
+                "TEMPORARILY_UNAVAILABLE",
+                "Read marker could not be persisted",
+            );
+        }
+        crate::core::DbReply::ReadMarkerLimitReached {
+            account,
+            target,
+            display,
+            label,
+        } => {
+            read_marker_refused(
+                state,
+                conn,
+                ReadMarkerRefusal {
+                    account,
+                    target,
+                    display,
+                    label,
+                },
+                "INVALID_PARAMS",
+                "Too many read markers",
+            );
         }
     }
     // A connect-time SASL verify that resolved may have been the last thing

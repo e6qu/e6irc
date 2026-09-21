@@ -120,7 +120,7 @@ pub(crate) fn apply_account_suspension(
         .collect();
     let mut disconnected = 0usize;
     for connection in connections {
-        if super::oper::kill_connection(state, connection, reason, actor) {
+        if super::oper::disconnect_suspended(state, connection, reason, actor) {
             disconnected += 1;
         }
     }
@@ -470,7 +470,10 @@ fn live_connection_matches(
     {
         return false;
     }
-    if filter.oper.is_some_and(|oper| session.oper != oper) {
+    if filter
+        .oper
+        .is_some_and(|oper| session.oper.is_some() != oper)
+    {
         return false;
     }
     true
@@ -565,7 +568,7 @@ pub(crate) fn connection_list_entries(
                 user: session.user().unwrap_or("*").to_string(),
                 host: session.host.clone(),
                 account: session.account().map(str::to_owned),
-                oper: session.oper,
+                oper: session.oper.is_some(),
                 transport: session.transport,
                 connected_at: session.signon,
                 idle_seconds: now.saturating_sub(session.last_active.get()).as_secs(),
@@ -634,13 +637,13 @@ fn disconnect_connection(
         .get(&connection)
         .and_then(|session| session.nick())
         .map(str::to_owned);
-    if super::oper::kill_connection(state, connection, comment, actor) {
-        AdminReply::Ok(format!(
+    match super::oper::kill_connection(state, connection, comment, actor) {
+        super::oper::KillOutcome::Killed => AdminReply::Ok(format!(
             "Disconnected {}",
             nick.as_deref().unwrap_or("connection")
-        ))
-    } else {
-        AdminReply::ConnectionMissing
+        )),
+        super::oper::KillOutcome::Missing => AdminReply::ConnectionMissing,
+        super::oper::KillOutcome::AuditUnavailable => AdminReply::AuditUnavailable,
     }
 }
 
@@ -665,10 +668,10 @@ fn disconnect_own_connection(
     } else {
         comment
     };
-    if super::oper::kill_connection(state, connection, comment, account) {
-        AdminReply::Ok(format!("Disconnected {nick}"))
-    } else {
-        AdminReply::ConnectionMissing
+    match super::oper::kill_connection(state, connection, comment, account) {
+        super::oper::KillOutcome::Killed => AdminReply::Ok(format!("Disconnected {nick}")),
+        super::oper::KillOutcome::Missing => AdminReply::ConnectionMissing,
+        super::oper::KillOutcome::AuditUnavailable => AdminReply::AuditUnavailable,
     }
 }
 

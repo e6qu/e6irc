@@ -104,6 +104,9 @@ pub struct AppState {
     pub public_url: Option<String>,
     /// Bootstrap HTTP bind; shown with provenance in the configuration console.
     pub http_bind: Option<std::net::SocketAddr>,
+    /// Bootstrap `[http].hsts_include_subdomains`, against which a managed
+    /// public origin is judged.
+    pub hsts_include_subdomains: bool,
     pub secure_cookies: bool,
     /// The server's policy on upstreams inside its own network (`crate::egress`).
     pub internal_upstreams: crate::egress::InternalUpstreams,
@@ -151,7 +154,7 @@ pub struct AppState {
     /// auth rate limiting. The bucket refills to full over 60 seconds.
     pub auth_rate_burst: Option<usize>,
     /// Per-client-IP auth token buckets: `(tokens, last_refill)`.
-    pub auth_buckets: Mutex<HashMap<std::net::IpAddr, (f64, std::time::Instant)>>,
+    pub(crate) auth_buckets: Mutex<HashMap<crate::net::ClientIp, (f64, std::time::Instant)>>,
     /// Per-account ordinary/administrator API token buckets. The boolean key
     /// distinguishes the smaller administrator budget.
     pub api_rate_burst: usize,
@@ -165,6 +168,8 @@ pub struct AppState {
     /// The per-IP connection cap, shared with the TCP listeners so IRC sessions
     /// opened over `/ws/irc` count against the same budget as raw-socket ones.
     pub(crate) conn_limiter: crate::net::ConnLimiter,
+    /// The per-address in-flight request bound ([`RequestAdmission`]).
+    pub(crate) request_admission: Arc<RequestAdmission>,
     /// Request identifiers, HSTS, and the request counter/latency, applied as
     /// the outermost layer of the service (see [`RequestObservation`]).
     pub(crate) observation: Arc<RequestObservation>,
@@ -221,21 +226,44 @@ pub(crate) struct RequestObservation {
     /// header into logs or responses.
     request_id_prefix: u64,
     request_id_counter: AtomicU64,
-    /// HSTS is safe only when the configured public origin is HTTPS.
-    hsts_enabled: bool,
+    /// What HSTS header responses carry, if any.
+    hsts: Hsts,
+}
+
+/// The `Strict-Transport-Security` policy. Sent only when the configured
+/// public origin is HTTPS; `includeSubDomains` only when the operator states
+/// every subdomain is HTTPS too; never `preload`, which no configuration can
+/// take back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Hsts {
+    Off,
+    ThisOrigin,
+    WithSubdomains,
+}
+
+impl Hsts {
+    fn header(self) -> Option<header::HeaderValue> {
+        match self {
+            Self::Off => None,
+            Self::ThisOrigin => Some(header::HeaderValue::from_static("max-age=31536000")),
+            Self::WithSubdomains => Some(header::HeaderValue::from_static(
+                "max-age=31536000; includeSubDomains",
+            )),
+        }
+    }
 }
 
 impl RequestObservation {
     pub(crate) fn new(
         telemetry: Arc<crate::observability::Telemetry>,
         request_id_prefix: u64,
-        hsts_enabled: bool,
+        hsts: Hsts,
     ) -> Self {
         Self {
             telemetry,
             request_id_prefix,
             request_id_counter: AtomicU64::new(0),
-            hsts_enabled,
+            hsts,
         }
     }
 
@@ -246,6 +274,15 @@ impl RequestObservation {
 }
 
 impl AppState {
+    /// The bootstrap values a managed-settings revision is judged against.
+    pub(crate) fn bootstrap_context(&self) -> crate::config::BootstrapContext {
+        crate::config::BootstrapContext {
+            http_listener: self.http_bind,
+            hsts_include_subdomains: self.hsts_include_subdomains,
+            internal_upstreams: self.internal_upstreams,
+        }
+    }
+
     pub fn no_pending_auth() -> Mutex<HashMap<String, PendingAuth>> {
         Mutex::new(HashMap::new())
     }
@@ -504,6 +541,9 @@ async fn core_action(state: &AppState, req: crate::core::AdminRequest) -> Result
             Err("unexpected live-connection reply for a mutation".into())
         }
         crate::core::AdminReply::ConnectionMissing => Err("no such live connection".into()),
+        crate::core::AdminReply::AuditUnavailable => {
+            Err("the action could not be recorded in the audit trail, so it was not taken".into())
+        }
     }
 }
 
@@ -806,6 +846,13 @@ pub(super) async fn delete_account_lifecycle(
         )
     })?;
 
+    // The owner's drivers stop before any row goes — each persistence task
+    // finishing the line it is writing — so no late backlog line can land
+    // after the deletion (and one that tried would fail the foreign key its
+    // network's row no longer satisfies). Drivers for the running networks are
+    // built first, so a deletion the database refuses restarts exactly them.
+    let restart = owner_network_restart(state, pool, registry, &target).await;
+    let stopped_networks = registry.remove_owner(&target.folded).await;
     let deleted = match crate::db::delete_account_permanently(
         pool,
         account_id,
@@ -815,20 +862,69 @@ pub(super) async fn delete_account_lifecycle(
     .await
     {
         Ok(Some(deleted)) => deleted,
+        // The account is already gone: nothing of it may run again.
         Ok(None) => {
             undo_account_deletion_gate(state, &target.folded, actor).await?;
             return Err((StatusCode::NOT_FOUND, "No such account".into()));
         }
         Err(error) => {
+            for (name, driver) in restart {
+                registry
+                    .ensure_running(Some(&target.folded), &name, driver)
+                    .await;
+            }
             undo_account_deletion_gate(state, &target.folded, actor).await?;
             return Err(account_deletion_error(error));
         }
     };
-    let stopped_networks = registry.remove_owner(&deleted.folded).await;
     Ok(format!(
         "Permanently deleted {} and stopped {stopped_networks} owned network(s). The account name is retired.",
         deleted.name
     ))
+}
+
+/// Drivers for every network of `target` that is running now, built from the
+/// stored rows so they can be restarted if its deletion is refused. A network
+/// whose row no longer builds is named on stderr: a refused deletion leaves it
+/// stopped.
+async fn owner_network_restart(
+    state: &AppState,
+    pool: &sqlx::PgPool,
+    registry: &crate::bouncer::Registry,
+    target: &crate::db::AccountDeletionTarget,
+) -> Vec<(String, Box<dyn crate::bouncer::NetworkDriver>)> {
+    let rows = match crate::db::list_bnc_networks(pool, &target.name).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            eprintln!(
+                "account deletion: networks of {} could not be listed for a restart ({error}); \
+                 a refused deletion leaves them stopped",
+                target.name
+            );
+            return Vec::new();
+        }
+    };
+    let mut restart = Vec::new();
+    for row in rows {
+        if registry.get_owned(&target.folded, &row.name).is_none() {
+            continue;
+        }
+        match crate::bouncer::driver_from_row(
+            &row,
+            state.secret_key.as_deref(),
+            &target.name,
+            state.internal_upstreams,
+            crate::bouncer::FirstDial::Immediate,
+        ) {
+            Ok(driver) => restart.push((row.name, driver)),
+            Err(error) => eprintln!(
+                "account deletion: network {}/{} cannot be rebuilt ({error}); a refused \
+                 deletion leaves it stopped",
+                target.name, row.name
+            ),
+        }
+    }
+    restart
 }
 
 fn account_deletion_error(error: crate::db::DbError) -> (StatusCode, String) {
@@ -979,13 +1075,10 @@ async fn observe_http(
         "x-request-id",
         request_id.parse().expect("generated request identifier"),
     );
-    if observation.hsts_enabled {
-        response.headers_mut().insert(
-            header::STRICT_TRANSPORT_SECURITY,
-            "max-age=31536000; includeSubDomains"
-                .parse()
-                .expect("static HSTS header"),
-        );
+    if let Some(hsts) = observation.hsts.header() {
+        response
+            .headers_mut()
+            .insert(header::STRICT_TRANSPORT_SECURITY, hsts);
     }
     observation
         .telemetry
@@ -1182,11 +1275,29 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
 // the axum routes and the method/path inventory validated by `openapi.rs`, so a
 // handler cannot be added to the public REST surface without becoming an
 // explicit specification obligation in the same edit.
+//
+// The probes are a group of their own: they are added after the admission
+// bounds (the service-wide concurrency permit, the per-address in-flight cap),
+// so an orchestrator's liveness and readiness checks are never queued behind —
+// or refused by — the work they exist to watch.
 macro_rules! documented_routes {
-    ($( $path:literal => { $( $method:ident : $handler:expr ),+ $(,)? } ),+ $(,)?) => {
+    (
+        probes: { $( $probe_path:literal => { $( $probe_method:ident : $probe_handler:expr ),+ $(,)? } ),+ $(,)? }
+        routes: { $( $path:literal => { $( $method:ident : $handler:expr ),+ $(,)? } ),+ $(,)? }
+    ) => {
         pub(super) const DOCUMENTED_ROUTE_OPERATIONS: &[(&str, &str)] = &[
+            $( $(($probe_path, stringify!($probe_method))),+ ),+ ,
             $( $(($path, stringify!($method))),+ ),+
         ];
+
+        fn add_probe_routes(router: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
+            router$(
+                .route(
+                    $probe_path,
+                    axum::routing::MethodRouter::new()$(.$probe_method($probe_handler))+
+                )
+            )+
+        }
 
         fn add_documented_routes(router: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
             router$(
@@ -1200,8 +1311,11 @@ macro_rules! documented_routes {
 }
 
 documented_routes! {
+    probes: {
     "/healthz" => { get: health },
     "/readyz" => { get: readiness },
+    }
+    routes: {
     "/api/v1/server" => { get: server_info },
     "/api/v1/network-presets" => { get: network_presets },
     "/api/v1/monitoring/observation" => { get: application_observation },
@@ -1289,6 +1403,7 @@ documented_routes! {
     "/api/v1/admin/observability" => { get: admin_observability },
     "/api/v1/admin/logs" => { get: pages::admin_logs },
     "/api/v1/admin/metrics" => { get: admin_metrics },
+    }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -1306,6 +1421,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/auth/validation", get(pages::validation))
         .route("/auth/shauth/logout/complete", get(shauth_logout_complete))
         .route("/auth.css", get(pages::auth_styles))
+        .route("/console.css", get(pages::console_styles))
         .route("/console-contract.js", get(pages::console_contract_script))
         .route("/console-settings.js", get(pages::console_settings_script))
         .route("/console.js", get(pages::console_script))
@@ -1363,30 +1479,172 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(web::index))
         .route("/favicon.ico", get(web::favicon))
         .route("/assets/{*path}", get(web::asset));
-    let router = router
-        .fallback(async || problem(StatusCode::NOT_FOUND, "Not Found", None))
-        // Defense-in-depth: every response (including the JSON/problem+json API
-        // paths, which don't go through security_headers) carries nosniff, so a
-        // response body can never be sniffed into an executable type.
-        .layer(axum::middleware::map_response(
-            |mut resp: Response| async move {
-                resp.headers_mut()
-                    .entry(header::X_CONTENT_TYPE_OPTIONS)
-                    .or_insert(header::HeaderValue::from_static("nosniff"));
-                resp
-            },
-        ));
+    let router = router.fallback(async || problem(StatusCode::NOT_FOUND, "Not Found", None));
+    let router = admit_requests(
+        router,
+        state.request_admission.clone(),
+        MAX_CONCURRENT_REQUESTS,
+    );
+    // Added after the admission bounds, so they bypass them.
+    let router = add_probe_routes(router);
     observed(
-        bound_requests(router, MAX_CONCURRENT_REQUESTS, REQUEST_DEADLINE),
+        bound_request(router, REQUEST_DEADLINE).layer(axum::middleware::from_fn(baseline_headers)),
         state.observation.clone(),
     )
     .with_state(state)
+}
+
+/// Browser features no e6irc page uses, denied to every document the server
+/// sends and to anything it might embed.
+const PERMISSIONS_POLICY: &str = "accelerometer=(), camera=(), display-capture=(), \
+    geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), \
+    publickey-credentials-get=(), screen-wake-lock=(), usb=(), xr-spatial-tracking=()";
+
+/// The one policy for a JSON body: it is data, never a document, so nothing in
+/// it may load, run, or be framed if a browser is ever made to render it.
+const JSON_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; frame-ancestors 'none'";
+
+/// The header baseline every response carries, by route class, each header
+/// added only when the handler did not set its own (a hashed asset keeps its
+/// long cache lifetime; a page keeps its narrower CSP):
+///
+/// - every response: `nosniff` (a body is never sniffed into an executable
+///   type), the [`PERMISSIONS_POLICY`], `Cross-Origin-Resource-Policy:
+///   same-origin` (no other site may embed a resource), and `Cache-Control:
+///   no-store` — the default for anything that did not say it is cacheable,
+///   because the service's responses are personal unless stated otherwise;
+/// - a page (`text/html`): `Cross-Origin-Opener-Policy: same-origin`, so no
+///   other window keeps a reference into it;
+/// - JSON and problem documents, and anything under `/api/`: the
+///   [`JSON_CONTENT_SECURITY_POLICY`].
+async fn baseline_headers(request: Request<axum::body::Body>, next: Next) -> Response {
+    let api = request.uri().path().starts_with("/api/");
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let page = content_type.starts_with("text/html");
+    let json = content_type.starts_with("application/json")
+        || content_type.starts_with("application/problem+json");
+    let mut default = |name: header::HeaderName, value: &'static str| {
+        headers
+            .entry(name)
+            .or_insert(header::HeaderValue::from_static(value));
+    };
+    default(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    default(
+        header::HeaderName::from_static("permissions-policy"),
+        PERMISSIONS_POLICY,
+    );
+    default(
+        header::HeaderName::from_static("cross-origin-resource-policy"),
+        "same-origin",
+    );
+    default(header::CACHE_CONTROL, "no-store");
+    if page {
+        default(
+            header::HeaderName::from_static("cross-origin-opener-policy"),
+            "same-origin",
+        );
+    }
+    if json || api {
+        default(
+            header::CONTENT_SECURITY_POLICY,
+            JSON_CONTENT_SECURITY_POLICY,
+        );
+    }
+    response
 }
 
 /// Requests the whole HTTP service works on at once.
 const MAX_CONCURRENT_REQUESTS: usize = 1024;
 /// How long the service works on one request before answering `408`.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The per-address in-flight request count, keyed by the client address the
+/// request resolves to ([`client_ip`]: the socket peer, or the forwarded client
+/// behind a trusted proxy).
+pub(crate) struct RequestAdmission {
+    trusted_proxies: Vec<ipnet::IpNet>,
+    limit: usize,
+    in_flight: Mutex<HashMap<crate::net::ClientIp, usize>>,
+}
+
+impl RequestAdmission {
+    pub(crate) fn new(trusted_proxies: Vec<ipnet::IpNet>, limit: usize) -> Self {
+        Self {
+            trusted_proxies,
+            limit,
+            in_flight: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn admit(self: &Arc<Self>, client: crate::net::ClientIp) -> Option<InFlightRequest> {
+        let mut in_flight = self.in_flight.lock().expect("request admission lock");
+        let count = in_flight.entry(client).or_insert(0);
+        if *count >= self.limit {
+            return None;
+        }
+        *count += 1;
+        Some(InFlightRequest {
+            admission: self.clone(),
+            client,
+        })
+    }
+}
+
+/// One admitted request; its slot is released when the response is returned.
+struct InFlightRequest {
+    admission: Arc<RequestAdmission>,
+    client: crate::net::ClientIp,
+}
+
+impl Drop for InFlightRequest {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .admission
+            .in_flight
+            .lock()
+            .expect("request admission lock");
+        if let Some(count) = in_flight.get_mut(&self.client) {
+            *count -= 1;
+            if *count == 0 {
+                in_flight.remove(&self.client);
+            }
+        }
+    }
+}
+
+/// Refuse a request past its address's in-flight bound with `429`, at once,
+/// rather than let it wait for — and hold — a service-wide permit.
+async fn admit_client_request(
+    State(admission): State<Arc<RequestAdmission>>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    // The server installs `ConnectInfo`; a request without one is keyed as the
+    // unspecified address, so the bound still applies (fail closed).
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map_or(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            |info| info.0.ip(),
+        );
+    let client = client_ip(peer, request.headers(), &admission.trusted_proxies);
+    let Some(_slot) = admission.admit(client) else {
+        return retry_later(
+            "Too many requests in flight",
+            "This address already has as many requests in progress as it may; retry once \
+             one has finished.",
+            1,
+        );
+    };
+    next.run(request).await
+}
 
 /// [`observe_http`] as the outermost layer: added after the bounds, so it
 /// wraps them. A request the deadline answers, or one that waited for a
@@ -1402,22 +1660,40 @@ where
     ))
 }
 
-/// The resource bounds every request passes before work can consume unbounded
-/// process resources: body size, aggregate concurrency, and a deadline.
+/// The admission bounds a request passes before it may do work: the
+/// per-address in-flight cap (refused at once), then one service-wide
+/// concurrency permit (waited for, within the request deadline).
 ///
 /// The concurrency bound is one semaphore for the service. `Router::layer`
 /// builds its layer once per route and method, and an ordinary
 /// `ConcurrencyLimitLayer` makes a new semaphore each time it is built, which
 /// turned "1,024 requests" into 1,024 per endpoint.
-fn bound_requests<S>(router: Router<S>, concurrent_requests: usize, deadline: Duration) -> Router<S>
+fn admit_requests<S>(
+    router: Router<S>,
+    admission: Arc<RequestAdmission>,
+    concurrent_requests: usize,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router
+        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+            concurrent_requests,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            admission,
+            admit_client_request,
+        ))
+}
+
+/// The bounds every request carries, probes included: a body size limit and a
+/// deadline (which also covers the wait for an admission permit).
+fn bound_request<S>(router: Router<S>, deadline: Duration) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     router
         .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024))
-        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
-            concurrent_requests,
-        ))
         .layer(axum::middleware::from_fn(move |request, next| {
             request_deadline(deadline, request, next)
         }))
@@ -1453,6 +1729,7 @@ pub fn ws_irc_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(ws_irc))
         .fallback(async || problem(StatusCode::NOT_FOUND, "Not Found", None))
+        .layer(axum::middleware::from_fn(baseline_headers))
         .with_state(state)
 }
 
@@ -1989,7 +2266,7 @@ mod pages {
             && token.starts_with("e6i_")
             && token[4..]
                 .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'='))
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'='))
     }
 
     fn invitation_response(
@@ -2113,7 +2390,15 @@ mod pages {
                 StatusCode::BAD_REQUEST,
             );
         }
-        let account = match crate::db::accept_account_invitation(pool, &token, &form.password).await
+        let configured_administrators: Vec<String> =
+            state.configured_admin_accounts.iter().cloned().collect();
+        let account = match crate::db::accept_account_invitation(
+            pool,
+            &token,
+            &form.password,
+            &configured_administrators,
+        )
+        .await
         {
             Ok(account) => account,
             Err(crate::db::DbError::InvitationUnavailable) => {
@@ -2323,6 +2608,18 @@ mod pages {
                 (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             ],
             include_str!("../../assets/auth.css"),
+        )
+            .into_response()
+    }
+
+    pub async fn console_styles() -> Response {
+        (
+            [
+                (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+                (header::CACHE_CONTROL, "public, max-age=3600"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            include_str!("../../assets/console.css"),
         )
             .into_response()
     }
@@ -2808,6 +3105,8 @@ mod pages {
     struct ConsoleNetworks {
         shell: ConsoleShell,
         attach_addr: Option<std::net::SocketAddr>,
+        /// Whether the attach listener is TLS (else loopback plaintext).
+        attach_tls: bool,
         presets: &'static [IrcNetworkPreset],
         form: NetworkFormView,
         can_store_secrets: bool,
@@ -3007,14 +3306,15 @@ mod pages {
             Ok(actor) => actor,
             Err(response) => return response.into(),
         };
-        let attach_addr = match &state.bnc_listener {
-            Some(listener) => listener.status().await.map(|(_, bound)| bound),
+        let attach = match &state.bnc_listener {
+            Some(listener) => listener.status().await,
             None => None,
         };
         let form = NetworkFormView::libera(&actor.account);
         render_private(ConsoleNetworks {
             shell: console_shell(actor, "networks"),
-            attach_addr,
+            attach_addr: attach.as_ref().map(|(_, bound)| *bound),
+            attach_tls: attach.is_some_and(|(requested, _)| requested.tls.is_some()),
             presets: IRC_NETWORK_PRESETS,
             form,
             can_store_secrets: state.secret_key.is_some(),
@@ -3278,13 +3578,15 @@ mod pages {
     }
 
     /// Like [`render`], plus private-page caching and script policy. The console
-    /// has one same-origin runtime (`/console.js`) and no inline JavaScript, so
-    /// every personalized page can carry a useful CSP in every build. Inline
-    /// styles remain necessary for the server-rendered traffic bars.
+    /// has one same-origin runtime (`/console.js`), one same-origin stylesheet
+    /// (`/console.css`), and neither inline script nor inline style — the
+    /// traffic bars are sized through the CSS object model, which a style
+    /// policy does not govern — so every personalized page carries a CSP that
+    /// admits no inline code of either kind.
     fn render_private<T: Template>(template: T) -> Response {
         render_with_security_headers(
             template,
-            "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
         )
     }
 
@@ -3329,6 +3631,33 @@ mod pages {
     #[cfg(test)]
     mod bootstrap_helper_tests {
         use super::*;
+
+        /// Tokens are spelled in the URL-safe alphabet, which has two distinct
+        /// symbols (`-`, `_`) where standard base64 has `+` and `/`; the
+        /// invitation link's own validator must admit both.
+        #[test]
+        fn invitation_tokens_use_the_url_safe_alphabet() {
+            let token = format!("e6i_{}", e6irc_proto::base64::encode_url_safe(&[0xfb; 32]));
+            assert!(token.contains('-') || token.contains('_'), "{token}");
+            assert!(valid_invitation_token(&format!("e6i_{}_=", "A".repeat(42))));
+            assert!(valid_invitation_token(&format!("e6i_{}-=", "A".repeat(42))));
+            assert!(!valid_invitation_token(&format!(
+                "e6i_{}/=",
+                "A".repeat(42)
+            )));
+            assert!(!valid_invitation_token(&format!(
+                "e6i_{}+=",
+                "A".repeat(42)
+            )));
+            let issued = crate::secret::random_url_safe_token();
+            assert!(valid_invitation_token(&format!("e6i_{issued}")), "{issued}");
+            assert!(
+                issued
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'=')),
+                "{issued}"
+            );
+        }
 
         #[test]
         fn browser_state_cookie_is_exact_constant_time_input() {
@@ -3505,6 +3834,7 @@ mod invitation_url_tests {
 #[cfg(test)]
 mod client_ip_tests {
     use super::client_ip;
+    use crate::net::ClientIp;
 
     fn xff(value: &str) -> axum::http::HeaderMap {
         let mut h = axum::http::HeaderMap::new();
@@ -3513,6 +3843,9 @@ mod client_ip_tests {
     }
     fn ip(s: &str) -> std::net::IpAddr {
         s.parse().unwrap()
+    }
+    fn client(s: &str) -> ClientIp {
+        ClientIp::new(ip(s))
     }
     fn net(s: &str) -> ipnet::IpNet {
         s.parse().unwrap()
@@ -3524,7 +3857,7 @@ mod client_ip_tests {
         // the real socket peer, never the header, or rate limits are bypassed.
         let trusted = [net("10.0.0.0/8")];
         let got = client_ip(ip("203.0.113.7"), &xff("1.2.3.4"), &trusted);
-        assert_eq!(got, ip("203.0.113.7"));
+        assert_eq!(got, client("203.0.113.7"));
     }
 
     #[test]
@@ -3538,21 +3871,21 @@ mod client_ip_tests {
             &xff("9.9.9.9, 203.0.113.7, 10.0.0.2"),
             &trusted,
         );
-        assert_eq!(got, ip("203.0.113.7"));
+        assert_eq!(got, client("203.0.113.7"));
     }
 
     #[test]
     fn trusted_proxy_without_header_falls_back_to_peer() {
         let trusted = [net("10.0.0.0/8")];
         let got = client_ip(ip("10.0.0.1"), &axum::http::HeaderMap::new(), &trusted);
-        assert_eq!(got, ip("10.0.0.1"));
+        assert_eq!(got, client("10.0.0.1"));
     }
 
     #[test]
     fn all_forwarded_entries_trusted_falls_back_to_peer() {
         let trusted = [net("10.0.0.0/8")];
         let got = client_ip(ip("10.0.0.1"), &xff("10.0.0.9, 10.0.0.8"), &trusted);
-        assert_eq!(got, ip("10.0.0.1"));
+        assert_eq!(got, client("10.0.0.1"));
     }
 
     #[test]
@@ -3565,7 +3898,10 @@ mod client_ip_tests {
         let mut h = axum::http::HeaderMap::new();
         h.append("x-forwarded-for", "6.6.6.6".parse().unwrap());
         h.append("x-forwarded-for", "203.0.113.7, 10.0.0.2".parse().unwrap());
-        assert_eq!(client_ip(ip("10.0.0.1"), &h, &trusted), ip("203.0.113.7"));
+        assert_eq!(
+            client_ip(ip("10.0.0.1"), &h, &trusted),
+            client("203.0.113.7")
+        );
     }
 
     #[test]
@@ -3581,7 +3917,7 @@ mod client_ip_tests {
                 &xff("1.2.3.4, 203.0.113.7:52833, 10.0.0.2"),
                 &trusted
             ),
-            ip("203.0.113.7"),
+            client("203.0.113.7"),
         );
         // Bracketed IPv6 with a port.
         assert_eq!(
@@ -3590,19 +3926,47 @@ mod client_ip_tests {
                 &xff("[2001:db8::5]:443, 10.0.0.2"),
                 &trusted
             ),
-            ip("2001:db8::5"),
+            client("2001:db8::5"),
         );
         // Bracketed IPv6 with no port.
         assert_eq!(
             client_ip(ip("10.0.0.1"), &xff("[2001:db8::9]"), &trusted),
-            ip("2001:db8::9"),
+            client("2001:db8::9"),
         );
         // A port-annotated *trusted* hop is still recognized as trusted (parsed,
         // then matched), so it's skipped rather than mis-returned as the client.
         assert_eq!(
             client_ip(ip("10.0.0.1"), &xff("203.0.113.7, 10.0.0.2:9000"), &trusted),
+            client("203.0.113.7"),
+        );
+    }
+
+    /// A dual-stack listener presents an IPv4 proxy or client in its mapped
+    /// IPv6 spelling. The trusted-proxy match, each forwarded entry, and the
+    /// resolved key are all judged in the canonical IPv4 form, or a mapped
+    /// proxy is not recognised as trusted and every client behind it collapses
+    /// onto the proxy's address.
+    #[test]
+    fn mapped_ipv4_peers_and_entries_are_canonical() {
+        let trusted = [net("10.0.0.0/8")];
+        let got = client_ip(ip("::ffff:10.0.0.1"), &xff("203.0.113.7"), &trusted);
+        assert_eq!(got, client("203.0.113.7"));
+        assert_eq!(got.ip(), ip("203.0.113.7"));
+        assert_eq!(
+            client_ip(
+                ip("::ffff:10.0.0.1"),
+                &xff("::ffff:203.0.113.7, ::ffff:10.0.0.2"),
+                &trusted
+            )
+            .ip(),
             ip("203.0.113.7"),
         );
+        assert_eq!(
+            client_ip(ip("::ffff:198.51.100.4"), &xff("1.2.3.4"), &trusted).ip(),
+            ip("198.51.100.4"),
+            "an untrusted mapped peer is its own IPv4 address"
+        );
+        assert_eq!(client("::ffff:192.0.2.1").to_string(), "192.0.2.1");
     }
 }
 
@@ -3862,8 +4226,8 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
 #[cfg(test)]
 mod request_bound_tests {
     use super::{
-        Duration, Request, RequestObservation, Router, StatusCode, bound_requests, get, liveness,
-        observed,
+        Duration, Request, RequestAdmission, RequestObservation, Router, StatusCode,
+        admit_requests, bound_request, get, liveness, observed,
     };
     use crate::observability::Telemetry;
     use std::sync::Arc;
@@ -3872,17 +4236,24 @@ mod request_bound_tests {
     #[tokio::test]
     async fn a_request_the_deadline_answers_is_still_observed() {
         let telemetry = Arc::new(Telemetry::new());
-        let observation = Arc::new(RequestObservation::new(telemetry.clone(), 0x5eed, false));
+        let observation = Arc::new(RequestObservation::new(
+            telemetry.clone(),
+            0x5eed,
+            super::Hsts::Off,
+        ));
         let mut router = observed(
-            bound_requests(
-                Router::new().route(
-                    "/slow",
-                    get(|| async {
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        StatusCode::NO_CONTENT
-                    }),
+            bound_request(
+                admit_requests(
+                    Router::new().route(
+                        "/slow",
+                        get(|| async {
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            StatusCode::NO_CONTENT
+                        }),
+                    ),
+                    Arc::new(RequestAdmission::new(Vec::new(), 8)),
+                    1,
                 ),
-                1,
                 Duration::from_millis(50),
             ),
             observation,
@@ -3957,14 +4328,17 @@ mod request_bound_tests {
     async fn the_concurrency_bound_is_shared_across_routes() {
         let (entered, mut started) = tokio::sync::mpsc::unbounded_channel();
         let release = Arc::new(tokio::sync::Semaphore::new(0));
-        let router = bound_requests(
-            Router::new()
-                .route(
-                    "/first",
-                    held_route(entered.clone(), release.clone(), "first"),
-                )
-                .route("/second", held_route(entered, release.clone(), "second")),
-            1,
+        let router = bound_request(
+            admit_requests(
+                Router::new()
+                    .route(
+                        "/first",
+                        held_route(entered.clone(), release.clone(), "first"),
+                    )
+                    .route("/second", held_route(entered, release.clone(), "second")),
+                Arc::new(RequestAdmission::new(Vec::new(), 8)),
+                1,
+            ),
             Duration::from_secs(30),
         );
         let call = |path: &'static str| {

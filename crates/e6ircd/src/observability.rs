@@ -11,7 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+/// 4: `database_pool` (the shared PostgreSQL pool) joined the snapshot.
+pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
 
 const LATENCY_BUCKETS_US: [u64; 15] = [
     100,
@@ -273,11 +274,26 @@ pub(crate) struct Snapshot {
     pub bnc_connected: u64,
     #[serde(default)]
     pub queues: BTreeMap<String, QueueSnapshot>,
+    /// The shared PostgreSQL pool; absent on a server without a database.
+    #[serde(default)]
+    pub database_pool: Option<DatabasePoolSnapshot>,
     pub errors: BTreeMap<String, u64>,
     pub error_last_seen_ms: BTreeMap<String, u64>,
     pub core_latency: LatencySnapshot,
     pub database_latency: LatencySnapshot,
     pub http_latency: LatencySnapshot,
+}
+
+/// The shared PostgreSQL pool at one instant.
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct DatabasePoolSnapshot {
+    /// Connections open now, idle or in use.
+    pub size: u64,
+    pub idle: u64,
+    /// `database.max_connections` (or its default).
+    pub max: u64,
+    /// Acquires that waited the whole acquire timeout and failed.
+    pub acquire_timeouts_total: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -337,6 +353,7 @@ pub(crate) struct Telemetry {
     error_last_seen_ms: [AtomicU64; ErrorKind::COUNT],
     latency: [LatencyHistogram; LatencyKind::COUNT],
     operational_log: OperationalLog,
+    database_pool: std::sync::OnceLock<(sqlx::PgPool, crate::db::DatabasePoolSize)>,
 }
 
 pub(crate) struct BncClientConnection {
@@ -382,7 +399,31 @@ impl Telemetry {
             error_last_seen_ms: std::array::from_fn(|_| AtomicU64::new(0)),
             latency: std::array::from_fn(|_| LatencyHistogram::new()),
             operational_log: OperationalLog::new(),
+            database_pool: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Report the shared pool in every snapshot from now on. Called once, when
+    /// the pool exists.
+    pub(crate) fn observe_database_pool(
+        &self,
+        pool: sqlx::PgPool,
+        size: crate::db::DatabasePoolSize,
+    ) {
+        if self.database_pool.set((pool, size)).is_err() {
+            eprintln!("observability: the database pool was already being observed");
+        }
+    }
+
+    fn database_pool_snapshot(&self) -> Option<DatabasePoolSnapshot> {
+        self.database_pool
+            .get()
+            .map(|(pool, size)| DatabasePoolSnapshot {
+                size: u64::from(pool.size()),
+                idle: pool.num_idle() as u64,
+                max: u64::from(size.get()),
+                acquire_timeouts_total: crate::db::pool_acquire_timeouts(),
+            })
     }
 
     pub(crate) fn observing_queues(
@@ -610,6 +651,7 @@ impl Telemetry {
             bnc_networks,
             bnc_connected,
             queues,
+            database_pool: self.database_pool_snapshot(),
             errors,
             error_last_seen_ms,
             core_latency: self.latency[LatencyKind::Core.index()].snapshot(),
@@ -756,6 +798,9 @@ impl Telemetry {
             snapshot.bnc_client_connections,
         );
         render_queues(&mut out, &snapshot.queues);
+        if let Some(pool) = snapshot.database_pool {
+            render_database_pool(&mut out, pool);
+        }
         out.push_str("# HELP e6irc_errors_total Operational errors by fixed subsystem.\n");
         out.push_str("# TYPE e6irc_errors_total counter\n");
         for kind in ErrorKind::ALL {
@@ -782,6 +827,32 @@ fn adjust_gauge(gauge: &AtomicU64, previous: usize, current: usize) {
     } else {
         gauge.fetch_sub((previous - current) as u64, Ordering::Relaxed);
     }
+}
+
+fn render_database_pool(out: &mut String, pool: DatabasePoolSnapshot) {
+    state_gauge(
+        out,
+        "e6irc_database_pool_connections",
+        "Open PostgreSQL pool connections by state.",
+        &[
+            ("idle", pool.idle),
+            ("in_use", pool.size.saturating_sub(pool.idle)),
+        ],
+    );
+    one_metric(
+        out,
+        "e6irc_database_pool_max_connections",
+        "Most connections the PostgreSQL pool opens (database.max_connections).",
+        "gauge",
+        pool.max,
+    );
+    one_metric(
+        out,
+        "e6irc_database_pool_acquire_timeouts_total",
+        "Pool acquires that waited the whole acquire timeout for a connection and failed.",
+        "counter",
+        pool.acquire_timeouts_total,
+    );
 }
 
 fn render_queues(out: &mut String, queues: &BTreeMap<String, QueueSnapshot>) {
@@ -879,8 +950,22 @@ pub(crate) async fn run_storage_maintenance(
         batches: std::num::NonZeroUsize::new(MAINTENANCE_DRAIN_BATCHES).expect("non-zero literal"),
         pause: MAINTENANCE_DRAIN_PAUSE,
     };
+    let mut cap_sweep = crate::db::BncCapSweep::default();
     loop {
         ticker.tick().await;
+        let started = Instant::now();
+        match crate::db::trim_bnc_buffers_over_cap(&pool, &mut cap_sweep).await {
+            Ok(0) => {}
+            Ok(trimmed) => eprintln!(
+                "storage maintenance trimmed {trimmed} bouncer backlog line(s) beyond the \
+                 per-network cap"
+            ),
+            Err(error) => {
+                telemetry.record_error(ErrorKind::Database);
+                eprintln!("storage maintenance backlog-cap sweep failed: {error}");
+            }
+        }
+        telemetry.record_database_request(started.elapsed());
         let retention = {
             let snapshot = settings.read().await;
             crate::db::StorageRetention {
@@ -1017,6 +1102,33 @@ mod tests {
         assert_eq!(entries[0].component, ErrorKind::Read);
         assert_eq!(entries[0].severity, OperationalSeverity::Error);
         assert_eq!(entries[0].message, "An operational error was recorded.");
+    }
+
+    #[tokio::test]
+    async fn the_database_pool_is_reported_when_there_is_one() {
+        let telemetry = Telemetry::new();
+        assert_eq!(telemetry.snapshot(0, 0).database_pool, None);
+        assert!(!telemetry.prometheus(0, 0).contains("e6irc_database_pool"));
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://observer@localhost/unreached")
+            .expect("a lazy pool opens nothing");
+        telemetry
+            .observe_database_pool(pool, crate::db::DatabasePoolSize::new(24).expect("bounded"));
+        let reported = telemetry.snapshot(0, 0).database_pool.expect("observed");
+        assert_eq!((reported.size, reported.idle, reported.max), (0, 0, 24));
+        let text = telemetry.prometheus(0, 0);
+        assert!(
+            text.contains("e6irc_database_pool_max_connections 24\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("e6irc_database_pool_connections{state=\"in_use\"} 0\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("e6irc_database_pool_acquire_timeouts_total "),
+            "{text}"
+        );
     }
 
     #[test]

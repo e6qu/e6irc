@@ -27,7 +27,9 @@ upstream credentials will be stored.
 Managed network creation accepts one exact shape per driver. IRC and local
 networks require nickname and real name. Matrix requires a homeserver URL,
 user, and password. Discord requires a bot token. Slack requires bot and
-app-level tokens. The form hides incompatible fields.
+app-level tokens. Only an IRC network may carry a server password
+(`server_password`), sealed like the others; every other kind refuses the field
+by name. The form hides incompatible fields.
 
 **Visible failures and recovery.** Without PostgreSQL, the registry is
 unavailable and network creation is disabled visibly. Without a master key,
@@ -70,6 +72,12 @@ the same words.
    **Real name** — sits under **Advanced**. Choosing **Another network…** opens
    it, because the name and server are then the person's to supply; so does any
    field the browser reports invalid. A blank real name sends the nickname.
+   A private server that requires a connection password gets it here too:
+   **Server password** (optional; only for private servers that require one),
+   masked with a **Show** switch, sent as `PASS` before anything else, sealed
+   like any other password, and omitted from the request when blank. On edit
+   an empty box keeps the stored one, and **Remove the stored server password**
+   clears and disables the box.
 5. **Save** sends the request with the session's `X-E6IRC-CSRF` value and opens
    the new network. Creation names one driver and its complete fields; absent
    kind, TLS, or IRC identity is rejected. The server validates sizes and
@@ -113,6 +121,12 @@ joins every configured channel, and says `QUIT` when it is done. It never gates
   (or during a reconnect) on the network's own row and in live operations, and
   leave the network configured for edit. A stored row is not misreported as
   connected.
+- A server password the network requires but that is not configured
+  (`server_password_required`), and one it rejects
+  (`server_password_rejected`), are told apart, both from **Test connection**
+  and on the row, which points at **Server password** under **Advanced**. Both
+  are configuration faults: they wait on the refusal schedule and park, never
+  hammering the network.
 - Rejected credentials park the driver on the first rejection: a retry would
   re-send the same password and count against the account on the upstream.
   Saving corrected or removed credentials restarts it.
@@ -150,7 +164,16 @@ defaults, its Advanced disclosure, the exact request body, and the session
 token on the request. Real-socket driver tests prove that rejected credentials
 dial exactly once, that a dropped dial between refusals does not reset the park
 count, and that a refusal keeps its reason while retrying; the client crate
-proves a server `ERROR` during SASL is a typed refusal.
+proves a server `ERROR` during SASL is a typed refusal. The client crate proves
+`PASS` is the first line on every registration path and a value no `PASS` line
+can carry is refused before sending
+(`a_server_password_is_the_first_line_on_every_registration_path`,
+`a_server_password_is_bounded_and_delimiter_free_before_it_is_sent`,
+`a_464_names_a_missing_password_or_a_rejected_one`);
+`a_server_password_is_sent_first_and_its_refusals_are_told_apart` proves the
+driver and the connection test against a scripted private server, and
+`a_server_password_is_sealed_write_only_and_replaced_only_by_an_action` the
+API against PostgreSQL.
 The production IRC-driver preflight has a real local registration oracle.
 `console_networks_page_lists_the_callers_networks` proves the rendered
 **Your networks** page against PostgreSQL. In `tools/test-oidc-browser.mjs`
@@ -382,7 +405,9 @@ are ready, and a master key exists for any credential replacement.
 
 - **Edit** validates a complete replacement and swaps the live driver only
   after storage/runtime checks. Blank password retains the sealed secret;
-  **Remove the stored account and password** is explicit.
+  **Remove the stored account and password** is explicit. The server password
+  has its own required action (`keep`, `set`, or `remove`), never an omitted
+  field.
 - **Disable** stores disabled state and stops the driver while retaining
   configuration/backlog.
 - **Enable** starts a fresh driver from the stored configuration. Enabling a

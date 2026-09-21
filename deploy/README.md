@@ -27,13 +27,22 @@ software-bill-of-materials referrers.
 
 Each architecture digest carries signed GitHub build provenance and an SPDX
 software bill of materials as Open Container Initiative referrers; the assembled commit-SHA manifest
-carries signed assembly provenance. Verify them after authenticating `gh` for
-the repository:
+carries signed assembly provenance. The daemon is built with `cargo auditable`,
+so the software bill of materials names every Rust crate compiled into it and a
+RUSTSEC scan of the image (or of the extracted binary) sees them. Verify the
+attestations after authenticating `gh` for the repository. Name the signing
+workflow and the ref it ran on, not only the repository: any workflow in the
+repository can sign for it, and only `release.yml` running on `main` publishes
+images.
 
 ```sh
-gh attestation verify oci://ghcr.io/e6qu/e6irc:<short-sha> -R e6qu/e6irc
-gh attestation verify oci://ghcr.io/e6qu/e6irc:<short-sha>-amd64 \
-  -R e6qu/e6irc --predicate-type https://spdx.dev/Document/v2.3
+gh attestation verify oci://ghcr.io/e6qu/e6irc:<short-sha> -R e6qu/e6irc \
+  --signer-workflow e6qu/e6irc/.github/workflows/release.yml \
+  --source-ref refs/heads/main --deny-self-hosted-runners
+gh attestation verify oci://ghcr.io/e6qu/e6irc:<short-sha>-amd64 -R e6qu/e6irc \
+  --signer-workflow e6qu/e6irc/.github/workflows/release.yml \
+  --source-ref refs/heads/main --deny-self-hosted-runners \
+  --predicate-type https://spdx.dev/Document/v2.3
 ```
 
 ## Native archives
@@ -43,14 +52,20 @@ successful CI run on `main`, publishes deterministic
 archives for Linux, macOS, and Windows on x86-64 and ARM64. Every archive
 contains the daemon, CLI, TUI, README, license, and systemd unit. Download the
 archive for the host together with `SHA256SUMS`, then verify both transport
-integrity and GitHub build provenance:
+integrity and GitHub build provenance — signed by `release.yml` running on
+that exact tag:
 
 ```sh
 grep 'e6irc-0.1.0-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS \
   | sha256sum --check
 gh attestation verify e6irc-0.1.0-x86_64-unknown-linux-gnu.tar.gz \
-  -R e6qu/e6irc
+  -R e6qu/e6irc \
+  --signer-workflow e6qu/e6irc/.github/workflows/release.yml \
+  --source-ref refs/tags/v0.1.0 --deny-self-hosted-runners
 ```
+
+The native binaries are built with `cargo auditable` too, by the Rust release
+the image's build stage carries, from a clean build directory.
 
 The archives use the target's normal dynamic runtime; they are not musl/static
 packages. On Linux, extract the archive and use its systemd unit as below.
@@ -85,7 +100,35 @@ to the process, gives it private pseudo-devices and only its own `/proc`
 entries, forbids new namespaces, and restricts it to native-architecture system
 calls in systemd's `@system-service` set (a call outside it fails with `EPERM`
 rather than killing the daemon); listeners on privileged ports therefore need a
-reverse proxy or an explicit, reviewed service override.
+reverse proxy or an explicit, reviewed service override. It sets `LimitCORE=0`,
+and the daemon also marks itself non-dumpable at start
+(`prctl(PR_SET_DUMPABLE, 0)`, with a warning line if that fails): its memory
+holds the master key, opened upstream credentials, and session tokens, and
+neither a core file nor a same-user debugger may read them.
+
+### TLS certificates
+
+A `[[listeners]]` entry with `tls` and the BNC attach listener's certificate
+(`[bnc].tls`, or the console's BNC TLS paths) are read from their PEM files at
+start and again whenever they change: the daemon compares the files'
+modification times every 60 seconds, and reloads at once on `SIGHUP`
+(`systemctl kill -s HUP e6ircd`). A renewal hook therefore needs no restart.
+A reload that fails — a half-written file, a key that does not belong to the
+certificate — keeps the certificate already being served and logs
+`ERROR: TLS certificate … could not be reloaded` with the reason; fix the
+files and send `SIGHUP` (or wait for the next check). Each successful reload is
+a log line naming the files.
+
+### BNC attach listener
+
+Clients attaching to their always-on networks authenticate with their account
+password (SASL PLAIN). The listener therefore refuses to be configured on any
+address but loopback without a certificate — in the configuration file
+(`[bnc] addr = …` needs `tls = { cert_path = …, key_path = … }` unless the
+address is `127.0.0.1`/`::1`) and in the console alike, each refusal naming the
+setting. A loopback listener without TLS is for clients on the same machine
+(or behind a TLS-terminating proxy that runs there). The TLS handshake has the
+same 30-second bound as the IRC listeners'.
 
 ## Bootstrap configuration (environment)
 
@@ -156,6 +199,7 @@ configured, the next start seals and imports them atomically.
 | `E6IRC_SECURE_COOKIES` | no (`true`) | Mark session cookies `Secure`; exactly `true` or `false` |
 | `E6IRC_ADMIN_ACCOUNTS` | no | Comma-separated admin account names; empty fields are ignored |
 | `E6IRC_BOOTSTRAP_TOKEN` | no (secret; 32–512 bytes) | One-time browser token for creating the first durable administrator on an empty account store |
+| `E6IRC_DATABASE_MAX_CONNECTIONS` | no (sized to the host) | Most connections the shared PostgreSQL pool opens, 2–200 (`[database] max_connections` in a configuration file). The default is 1 (the serial database worker) + 4 (concurrent Argon2 verifications) + 2 × the host's CPU threads; size the PostgreSQL server's `max_connections` for every replica's pool plus your own sessions. The pool's size, idle count and acquire timeouts are on `/metrics` (`e6irc_database_pool_*`) |
 | `E6IRC_OIDC_ISSUER` | no | Shauth issuer, e.g. `https://auth.dev.e6qu.dev` (enables SSO) |
 | `E6IRC_OIDC_CLIENT_ID` | with issuer | Shauth OIDC client id, e.g. `e6irc-dev` |
 | `E6IRC_OIDC_CLIENT_SECRET` | with issuer (secret) | Shauth OIDC client secret |
@@ -232,7 +276,11 @@ Any host that runs an OCI image can run e6irc. It has to provide:
   started after this container), the daemon retries the first connection for
   five minutes — doubling backoff capped at 30 s, one stderr line per attempt
   (`[database] startup_wait_seconds` in a configuration file) — and then
-  exits non-zero. Back it up with `tools/backup-postgres.sh`.
+  exits non-zero. Migrations run on a connection of their own with no
+  statement timeout, so a long one (an index on a table that has grown for
+  months) completes; one that waits more than 10 s for a lock — another
+  replica migrating, a long transaction — is abandoned and retried, up to six
+  attempts, one stderr line each. Back it up with `tools/backup-postgres.sh`.
 - **The master key**, `E6IRC_SECRET_KEY`, kept outside the database and backed
   up separately. Without it the daemon cannot store upstream or managed
   credentials, and a database restored without it holds ciphertext nothing can
@@ -251,12 +299,18 @@ Any host that runs an OCI image can run e6irc. It has to provide:
   healthcheck [--ready] [--addr ip:port]` reads the same `E6IRC_HTTP_ADDR` the
   server binds (no configuration file needed), exits 0 only on HTTP 200,
   and finishes within three seconds. A host that prefers its own probe can
-  still use the two endpoints directly.
+  still use the two endpoints directly. The probes bypass the service's
+  admission bounds, so they answer while it is saturated: one client address
+  may hold 128 connections (a trusted proxy is exempt; its clients are
+  counted by forwarded address instead) and 32 requests in flight (more are
+  answered `429`), a request's headers must arrive within 10 seconds, and a
+  kept-alive connection idle for 10 seconds is closed.
 - **No published IRC port.** The raw IRC listener defaults to loopback
   (`127.0.0.1:6667`) and is not meant to be exposed from this image, which
   renders no TLS listener; IRC clients reach the server over `/ws/irc`. The
-  optional BNC listener an administrator can enable in the console is a raw
-  TCP port of its own and needs a host that can publish one.
+  optional BNC listener an administrator can enable in the console is a TCP
+  port of its own, needs a host that can publish one, and off loopback needs a
+  certificate the container can read ([BNC attach listener](#bnc-attach-listener)).
 - **A stop timeout of at least 55 seconds** ([Stop timeout](#stop-timeout)).
 - **Outbound network access** to PostgreSQL, to the OpenID Connect issuer, and
   — for always-on networks and bridges — to the IRC networks (TCP 6697 for the

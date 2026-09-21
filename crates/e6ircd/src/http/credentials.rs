@@ -146,24 +146,61 @@ pub(super) async fn export_me(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
 ) -> Response {
-    match crate::db::export_account_json(pool_of(&state), &account).await {
-        Ok(Some(export)) => {
-            let mut response = (
-                [
-                    (header::CONTENT_TYPE, "application/json; charset=utf-8"),
-                    (
-                        header::CONTENT_DISPOSITION,
-                        "attachment; filename=\"e6irc-account-export.json\"",
-                    ),
-                ],
-                export,
-            )
-                .into_response();
-            no_store(response.headers_mut());
-            response
+    let mut export = match crate::db::begin_account_export(pool_of(&state), &account).await {
+        Ok(Some(export)) => export,
+        Ok(None) => return problem(StatusCode::NOT_FOUND, "No such account", None),
+        Err(error) => return database_unavailable("account export", error),
+    };
+    // The document is produced a page at a time while the client reads it; a
+    // failure part-way ends the body with an error, so the client sees a
+    // broken download rather than a document that looks complete.
+    let (chunks, body) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        loop {
+            let next = match export.next_chunk().await {
+                Ok(Some(chunk)) => Ok(bytes::Bytes::from(chunk)),
+                Ok(None) => return,
+                Err(error) => {
+                    eprintln!("http: account export failed part-way: {error}");
+                    Err(std::io::Error::other("account export failed part-way"))
+                }
+            };
+            let failed = next.is_err();
+            if chunks.send(next).await.is_err() || failed {
+                return;
+            }
         }
-        Ok(None) => problem(StatusCode::NOT_FOUND, "No such account", None),
-        Err(error) => database_unavailable("account export", error),
+    });
+    let mut response = (
+        [
+            (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"e6irc-account-export.json\"",
+            ),
+        ],
+        axum::body::Body::new(ChannelBody(body)),
+    )
+        .into_response();
+    no_store(response.headers_mut());
+    response
+}
+
+/// A response body read from a channel of chunks: each `Err` ends the body
+/// with that error.
+struct ChannelBody(tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>);
+
+impl http_body::Body for ChannelBody {
+    type Data = bytes::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        self.0
+            .poll_recv(context)
+            .map(|chunk| chunk.map(|chunk| chunk.map(http_body::Frame::data)))
     }
 }
 

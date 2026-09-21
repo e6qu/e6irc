@@ -279,6 +279,56 @@ async fn tls_client_full_flow() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// e6ircd has no connection password of its own, so a `PASS` before
+/// registration is accepted and ignored, as RFC 2812 servers without one do —
+/// a 451 in answer to it would be read by a client as the answer to the
+/// `CAP LS` it sends next. After registration it is 462, like `USER`.
+#[tokio::test]
+async fn a_server_password_is_accepted_before_registration_and_refused_after() {
+    let config = Config {
+        server_name: "irc.pass.example".into(),
+        network_name: "PassNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        ..Config::default()
+    };
+    let addr = net::start(config).await.expect("start").addrs[0];
+    let password = e6irc_client::ServerPassword::parse("unused".into()).expect("valid");
+    let mut c = e6irc_client::Connection::connect(&addr.to_string())
+        .await
+        .unwrap();
+    let nick = timeout(
+        Duration::from_secs(5),
+        c.register(&e6irc_client::Identity {
+            nick: "passer",
+            username: "passer",
+            realname: "p",
+            server_password: Some(&password),
+        }),
+    )
+    .await
+    .expect("registration after PASS neither finished nor failed")
+    .expect("register after PASS");
+    assert_eq!(nick, "passer");
+    c.send_line("PASS :again").await.unwrap();
+    let reply = timeout(Duration::from_secs(5), async {
+        loop {
+            let message = c.next_message().await.unwrap().expect("open");
+            // The welcome burst (a 422 for the absent MOTD among it) comes
+            // first; the answer to PASS is one of these.
+            if matches!(message.command.as_str(), "421" | "451" | "461" | "462") {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("PASS after registration is answered");
+    assert_eq!(reply.command, "462", "{reply:?}");
+}
+
 #[tokio::test]
 async fn per_ip_connection_limit_refuses_excess() {
     use e6ircd::config::LimitsConfig;
@@ -309,6 +359,7 @@ async fn per_ip_connection_limit_refuses_excess() {
             nick: &format!("keep{i}"),
             username: "tester",
             realname: "k",
+            server_password: None,
         })
         .await
         .expect("register");
@@ -324,7 +375,8 @@ async fn per_ip_connection_limit_refuses_excess() {
             .register(&e6irc_client::Identity {
                 nick: "third",
                 username: "third",
-                realname: "t"
+                realname: "t",
+                server_password: None,
             })
             .await
             .is_err(),
@@ -343,6 +395,7 @@ async fn per_ip_connection_limit_refuses_excess() {
             nick: "again",
             username: "again",
             realname: "a",
+            server_password: None,
         })
         .await
         .expect("a freed slot should admit a new connection");
@@ -377,6 +430,7 @@ async fn command_flood_throttle_closes_excess() {
         nick: "flooder",
         username: "flooder",
         realname: "f",
+        server_password: None,
     })
     .await
     .expect("register");

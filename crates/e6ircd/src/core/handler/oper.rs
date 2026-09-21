@@ -40,12 +40,24 @@ pub(super) fn cmd_oper(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(conn, ERR_PASSWDMISMATCH, &[], Some("Password incorrect"));
         return;
     }
-    state.sessions.get_mut(&conn).expect("registered").oper = true;
     let nick = state.sessions[&conn]
         .nick()
         .map(String::from)
         .expect("registered");
-    record_audit(state, conn, "OPER", name, "");
+    // The grant is recorded before it takes effect; one that cannot be
+    // recorded does not happen.
+    if queue_audit(state, name, "OPER", name, &format!("nick {nick}")).is_err() {
+        let server = state.config.server_name.clone();
+        state.send(
+            conn,
+            &format!(
+                ":{server} NOTICE {nick} :Services are temporarily unavailable; OPER not granted \
+                 (the audit trail cannot record it)"
+            ),
+        );
+        return;
+    }
+    state.sessions.get_mut(&conn).expect("registered").oper = Some(name.to_string());
     state.numeric(
         conn,
         RPL_YOUREOPER,
@@ -71,7 +83,7 @@ pub(super) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Gate an oper-only command: reply `ERR_NOPRIVILEGES` and report `false`
 /// when the connection is not an IRC operator.
 fn require_oper(state: &mut ServerState, conn: ConnId) -> bool {
-    if state.sessions[&conn].oper {
+    if state.sessions[&conn].oper.is_some() {
         return true;
     }
     state.numeric(
@@ -110,13 +122,43 @@ pub(super) fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .nick()
         .map(String::from)
         .expect("registered");
+    let operator = operator_name(state, conn);
+    let comment = p.get(1).copied().unwrap_or("Killed").to_string();
+    // Recorded here, where the operator is, before the kill is carried out on
+    // whichever shard holds the victim; a kill that cannot be recorded is not
+    // carried out.
+    if queue_audit(state, &operator, "KILL", &victim.nick, &comment).is_err() {
+        refuse_unaudited(state, conn, "KILL");
+        return;
+    }
     session_action(
         state,
         victim.conn(),
-        crate::core::state::SessionAction::Kill {
-            comment: p.get(1).copied().unwrap_or("Killed").to_string(),
-            killer,
-        },
+        crate::core::state::SessionAction::Kill { comment, killer },
+    );
+}
+
+/// The configured operator name `conn` authenticated as with OPER — the actor
+/// its privileged actions are recorded under. Callers have passed
+/// [`require_oper`].
+fn operator_name(state: &ServerState, conn: ConnId) -> String {
+    state.sessions[&conn]
+        .oper
+        .clone()
+        .expect("require_oper admitted an operator")
+}
+
+/// Tell an operator their command did nothing because its audit row could not
+/// be queued.
+fn refuse_unaudited(state: &mut ServerState, conn: ConnId, command: &str) {
+    let server = state.config.server_name.clone();
+    let nick = state.sessions[&conn].nick().unwrap_or("*").to_string();
+    state.send(
+        conn,
+        &format!(
+            ":{server} NOTICE {nick} :Services are temporarily unavailable; {command} not \
+             performed (the audit trail cannot record it)"
+        ),
     );
 }
 
@@ -134,8 +176,9 @@ pub(crate) fn session_action(
         return;
     }
     match action {
+        // Audited by the shard that decided it (see `cmd_kill`).
         crate::core::state::SessionAction::Kill { comment, killer } => {
-            kill_connection(state, conn, &comment, &killer);
+            close_killed(state, conn, &comment, &killer);
         }
         crate::core::state::SessionAction::Ghost { by } => {
             let server = state.config.server_name.clone();
@@ -151,31 +194,71 @@ pub(crate) fn session_action(
     }
 }
 
-/// Disconnect one exact registered connection. HTTP control-plane rows carry
-/// this immutable id, so a delayed form or API request cannot follow a released
-/// nick onto a different client. IRC KILL resolves its nick once and then uses
-/// this same close/audit path.
+/// What became of a disconnect the control plane asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KillOutcome {
+    Killed,
+    /// No registered connection has that id.
+    Missing,
+    /// The audit row could not be queued, so the connection was left alone.
+    AuditUnavailable,
+}
+
+/// Disconnect one exact registered connection, recording `actor` as the
+/// killer. HTTP control-plane rows carry this immutable id, so a delayed form
+/// or API request cannot follow a released nick onto a different client. The
+/// KILL row is queued before the close — a self-kill removes the actor's own
+/// session — and a kill whose row cannot be queued is not carried out.
 pub(crate) fn kill_connection(
     state: &mut ServerState,
     victim: ConnId,
     comment: &str,
-    killer: &str,
+    actor: &str,
+) -> KillOutcome {
+    let Some(target) = registered_nick(state, victim) else {
+        return KillOutcome::Missing;
+    };
+    if queue_audit(state, actor, "KILL", &target, comment).is_err() {
+        return KillOutcome::AuditUnavailable;
+    }
+    close_killed(state, victim, comment, actor);
+    KillOutcome::Killed
+}
+
+/// Disconnect every connection an account suspension ends. The suspension's
+/// own durable record (`ACCOUNT_SUSPEND`, committed with the flag) covers
+/// these closes, so none waits on — or is refused for — a KILL row of its
+/// own: a suspension that could not disconnect would leave the account in.
+pub(crate) fn disconnect_suspended(
+    state: &mut ServerState,
+    victim: ConnId,
+    reason: &str,
+    actor: &str,
 ) -> bool {
-    let Some(target) = state
+    if registered_nick(state, victim).is_none() {
+        return false;
+    }
+    close_killed(state, victim, reason, actor);
+    true
+}
+
+fn registered_nick(state: &ServerState, conn: ConnId) -> Option<String> {
+    state
         .sessions
-        .get(&victim)
+        .get(&conn)
         .filter(|session| session.is_registered())
         .and_then(|session| session.nick())
         .map(str::to_owned)
-    else {
-        return false;
+}
+
+/// Close a killed connection on the shard that holds it: tell the other
+/// operators, then the victim. The caller has already recorded the kill.
+fn close_killed(state: &mut ServerState, victim: ConnId, comment: &str, killer: &str) {
+    let Some(target) = registered_nick(state, victim) else {
+        return;
     };
     let reason = format!("Killed ({killer} ({comment}))");
     let server = state.config.server_name.clone();
-    // Audit before the close: a self-kill removes the actor's own session, and
-    // recording afterwards would resolve the actor to an empty string — an
-    // unattributed row in the log whose whole purpose is attribution.
-    record_audit_by(state, killer, "KILL", &target, comment);
     // Snotice every other oper (the victim, if an oper, is about to be closed).
     notify_opers(
         state,
@@ -191,48 +274,37 @@ pub(crate) fn kill_connection(
     let fitted = fit_trailing(&format!("{head})"), &reason);
     state.send(victim, &format!("{head}{fitted})"));
     state.close(victim, &reason);
-    true
 }
 
-/// Record a privileged oper action in the audit log (best-effort; only
-/// when a database is configured to hold it).
-pub(super) fn record_audit(
-    state: &mut ServerState,
-    conn: ConnId,
-    action: &str,
-    target: &str,
-    detail: &str,
-) {
-    let actor = state
-        .sessions
-        .get(&conn)
-        .and_then(|s| s.nick().map(String::from))
-        .unwrap_or_default();
-    record_audit_by(state, &actor, action, target, detail);
-}
+/// The database queue would not take an audit row.
+#[derive(Debug)]
+pub(crate) struct AuditUnavailable;
 
-/// Record an audit-log row for an actor named directly (rather than resolved
-/// from a connection) — used by the HTTP admin console, which has no IRC
-/// session. Same fire-and-forget persistence as [`record_audit`].
-pub(crate) fn record_audit_by(
+/// Queue one audit row for a privileged action, recording `actor` (folded, as
+/// every audit row names an account or operator). The caller performs the
+/// action only when this succeeds: an action the audit trail cannot record is
+/// refused, never done silently. A server without a database has no audit
+/// trail to write, so there is nothing to refuse for.
+pub(crate) fn queue_audit(
     state: &mut ServerState,
     actor: &str,
     action: &str,
     target: &str,
     detail: &str,
-) {
+) -> Result<(), AuditUnavailable> {
     if !state.config.sasl_enabled {
-        return;
+        return Ok(());
     }
     let request = crate::core::DbRequest::AuditLog {
-        actor: actor.to_string(),
+        actor: state.casemap.casefold(actor),
         action: action.to_string(),
         target: target.to_string(),
         detail: detail.to_string(),
     };
-    if state.db_tx.try_push(request).is_err() {
-        eprintln!("audit: db queue full or closed; {action} action not recorded");
-    }
+    state.db_tx.try_push(request).map(|_| ()).map_err(|_| {
+        eprintln!("audit: database queue full or closed; {action} refused");
+        AuditUnavailable
+    })
 }
 
 /// Broadcast an operator server-notice (snotice) to every registered operator,
@@ -894,7 +966,11 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.err_nosuchnick(conn, clip_echo(nick));
         return;
     };
-    record_audit(state, conn, "SETHOST", nick, newhost);
+    let operator = operator_name(state, conn);
+    if queue_audit(state, &operator, "SETHOST", nick, newhost).is_err() {
+        refuse_unaudited(state, conn, "SETHOST");
+        return;
+    }
     let oper = state.session_shard(conn);
     session_action(
         state,

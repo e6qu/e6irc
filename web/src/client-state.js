@@ -66,8 +66,8 @@ export function networkStateHelp(network) {
   // Without them the advice points at the Server log, where they would be.
   const said = network.failureDetail ? `The network said: “${network.failureDetail}”` : null;
   const repair = stateRepair(network, said ? "" : " Open Server log for its reason.");
-  // A refusal with no specific repair (a throttle, a ban, a rejected server
-  // password) still has the network's own words, and they are the whole point.
+  // A refusal with no specific repair (a throttle, a ban) still has the
+  // network's own words, and they are the whole point.
   if (repair === null) return said;
   return said ? `${repair} ${said}` : repair;
 }
@@ -78,6 +78,10 @@ function stateRepair(network, whereToLook) {
       return "The network rejected the NickServ account or password. Open settings to correct them.";
     case "nickname_in_use":
       return "The nickname is in use on this network. Choose another in settings, or wait for the old session to time out.";
+    case "server_password_required":
+      return "The network requires a server password. Enter it in settings, as Server password under Advanced.";
+    case "server_password_rejected":
+      return "The network rejected the server password. Correct it in settings, as Server password under Advanced.";
     case "registration_rejected":
       return `The network refused registration.${whereToLook} If verified SASL is required, add your NickServ account and password in settings.`;
   }

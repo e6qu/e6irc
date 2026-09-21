@@ -18,7 +18,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-use crate::config::{Config, TlsConfig};
+use crate::certificate::CertificateReloads;
+use crate::config::{BncConfig, Config};
 use crate::core::{
     ConnId, ConnectionIdAllocator, Core, CoreConfig, CoreIngress, CoreShardId, CoreWorker, Input,
     Output, TimerWheel,
@@ -62,6 +63,25 @@ fn random_connection_id_start() -> io::Result<NonZeroU64> {
 /// A real handshake completes in well under a second; 30s matches the
 /// registration budget a plaintext peer already gets.
 const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
+
+/// How long a client may take to send one request's complete header block.
+/// hyper starts the same timer the moment a kept-alive connection goes idle
+/// (waiting for the next request's headers), so this is also the idle
+/// keep-alive timeout: a connection that sends nothing for this long is closed.
+const HTTP_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// HTTP connections one address may hold open at once. A browser opens a
+/// handful per origin; this leaves room for many behind one address. A
+/// trusted reverse proxy is exempt — every client behind it shares its
+/// address — and its clients are bounded per request, by forwarded address.
+const MAX_HTTP_CONNECTIONS_PER_IP: usize = 128;
+
+/// Requests one client address may have in the HTTP service at once (see
+/// `http::RequestAdmission`). A browser opens a handful of connections per
+/// origin; this leaves room for several behind one address while keeping any
+/// one address from holding the service-wide permits with requests it never
+/// finishes.
+pub const MAX_HTTP_REQUESTS_IN_FLIGHT_PER_IP: usize = 32;
 
 /// How long graceful shutdown waits for the DB worker to drain and flush its
 /// buffered history before giving up. A healthy flush is a single batched
@@ -322,7 +342,7 @@ fn supervise_listener(
 
 #[derive(Debug)]
 struct BncListenerState {
-    requested: SocketAddr,
+    requested: BncConfig,
     bound: SocketAddr,
     task: tokio::task::JoinHandle<()>,
 }
@@ -341,6 +361,7 @@ pub struct BncListenerController {
     server_name: String,
     limiter: ConnLimiter,
     telemetry: Arc<Telemetry>,
+    certificates: CertificateReloads,
 }
 
 impl BncListenerController {
@@ -350,6 +371,7 @@ impl BncListenerController {
         server_name: String,
         limiter: ConnLimiter,
         telemetry: Arc<Telemetry>,
+        certificates: CertificateReloads,
     ) -> Self {
         Self {
             state: tokio::sync::Mutex::new(None),
@@ -358,29 +380,40 @@ impl BncListenerController {
             server_name,
             limiter,
             telemetry,
+            certificates,
         }
     }
 
-    /// The configured and effective listener addresses, when enabled.
-    pub async fn status(&self) -> Option<(SocketAddr, SocketAddr)> {
+    /// The configured listener and its effective address, when enabled.
+    pub async fn status(&self) -> Option<(BncConfig, SocketAddr)> {
         self.state
             .lock()
             .await
             .as_ref()
-            .map(|state| (state.requested, state.bound))
+            .map(|state| (state.requested.clone(), state.bound))
     }
 
     /// Enable or atomically replace the listener. The old listener remains
-    /// active when the new address cannot be bound.
-    pub async fn enable(&self, requested: SocketAddr) -> io::Result<SocketAddr> {
-        let listener = TcpListener::bind(requested).await.inspect_err(|_error| {
-            self.telemetry.record_error(ErrorKind::Bouncer);
-        })?;
+    /// active when the new address cannot be bound or its certificate cannot
+    /// be read.
+    pub async fn enable(&self, requested: &BncConfig) -> io::Result<SocketAddr> {
+        let acceptor = match &requested.tls {
+            Some(tls) => Some(self.certificates.acceptor(tls).inspect_err(|_error| {
+                self.telemetry.record_error(ErrorKind::TlsHandshake);
+            })?),
+            None => None,
+        };
+        let listener = TcpListener::bind(requested.addr)
+            .await
+            .inspect_err(|_error| {
+                self.telemetry.record_error(ErrorKind::Bouncer);
+            })?;
         let bound = listener.local_addr().inspect_err(|_error| {
             self.telemetry.record_error(ErrorKind::ConnectionSetup);
         })?;
         let task = spawn_bnc_listener(
             listener,
+            acceptor,
             self.registry.clone(),
             self.pool.clone(),
             self.server_name.clone(),
@@ -388,7 +421,7 @@ impl BncListenerController {
             self.telemetry.clone(),
         );
         let replacement = BncListenerState {
-            requested,
+            requested: requested.clone(),
             bound,
             task,
         };
@@ -411,6 +444,7 @@ impl BncListenerController {
 
 fn spawn_bnc_listener(
     listener: TcpListener,
+    tls: Option<TlsAcceptor>,
     registry: Arc<crate::bouncer::Registry>,
     pool: sqlx::PgPool,
     server_name: String,
@@ -421,11 +455,12 @@ fn spawn_bnc_listener(
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
-                    let Some(guard) = limiter.try_acquire(peer.ip()) else {
+                    let client = ClientIp::new(peer.ip());
+                    let Some(guard) = limiter.try_acquire(client) else {
                         telemetry.record_connection_rejected();
                         limiter
                             .refusals()
-                            .note(peer.ip(), PeerRefusal::PerIpLimit, None);
+                            .note(client, PeerRefusal::PerIpLimit, None);
                         continue;
                     };
                     let registry = registry.clone();
@@ -433,16 +468,60 @@ fn spawn_bnc_listener(
                     let pool = pool.clone();
                     let telemetry = telemetry.clone();
                     let refusals = limiter.refusals().clone();
+                    let tls = tls.clone();
                     tokio::spawn(async move {
                         let _guard = guard;
                         if let Err(e) = stream.set_nodelay(true) {
                             telemetry.record_error(ErrorKind::ConnectionSetup);
-                            refusals.note(peer.ip(), PeerRefusal::SocketSetup, Some(&e));
+                            refusals.note(client, PeerRefusal::SocketSetup, Some(&e));
                             return;
                         }
-                        if let Err(e) =
-                            crate::bouncer::bnc_serve(stream, registry, &pool, &server_name).await
-                        {
+                        let served = match tls {
+                            // Attaching clients authenticate with their account
+                            // password; off loopback that only ever travels
+                            // inside TLS (config refuses anything else).
+                            Some(acceptor) => {
+                                let handshake = tokio::time::timeout(
+                                    std::time::Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
+                                    acceptor.accept(stream),
+                                )
+                                .await;
+                                match handshake {
+                                    Ok(Ok(stream)) => {
+                                        crate::bouncer::bnc_serve(
+                                            stream,
+                                            registry,
+                                            &pool,
+                                            &server_name,
+                                        )
+                                        .await
+                                    }
+                                    Ok(Err(e)) => {
+                                        telemetry.record_error(ErrorKind::TlsHandshake);
+                                        refusals.note(
+                                            client,
+                                            PeerRefusal::TlsHandshakeFailed,
+                                            Some(&e),
+                                        );
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        telemetry.record_error(ErrorKind::TlsHandshake);
+                                        refusals.note(
+                                            client,
+                                            PeerRefusal::TlsHandshakeTimedOut,
+                                            None,
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                            None => {
+                                crate::bouncer::bnc_serve(stream, registry, &pool, &server_name)
+                                    .await
+                            }
+                        };
+                        if let Err(e) = served {
                             telemetry.record_error(ErrorKind::Bouncer);
                             eprintln!("bnc connection from {peer} failed: {e}");
                         }
@@ -513,13 +592,20 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     let (pool, managed_config) = match config
         .database
         .as_ref()
-        .map(|db| (db.url.clone(), db.startup_wait_seconds))
+        .map(|db| (db.url.clone(), db.startup_wait_seconds, db.pool_size()))
     {
-        Some((database_url, startup_wait_seconds)) => {
+        Some((database_url, startup_wait_seconds, pool_size)) => {
             let wait = crate::db::StartupDatabaseWait::from_seconds(startup_wait_seconds)
                 .map_err(io::Error::other)?;
-            let pool = crate::db::connect_and_migrate_with_retry(&database_url, wait, |attempt| {
-                match attempt.retry_in {
+            eprintln!(
+                "e6ircd: database pool holds at most {} connections",
+                pool_size.get()
+            );
+            let pool = crate::db::connect_and_migrate_with_retry(
+                &database_url,
+                wait,
+                pool_size,
+                |attempt| match attempt.retry_in {
                     Some(pause) => eprintln!(
                         "e6ircd: database connection attempt {} failed after {:.1}s: {}; retrying \
                          in {:.1}s (giving up after {}s)",
@@ -535,8 +621,8 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                         attempt.waited.as_secs_f64(),
                         attempt.error,
                     ),
-                }
-            })
+                },
+            )
             .await
             .map_err(io::Error::other)?;
             let imported =
@@ -604,6 +690,9 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         core_tx.monitors(),
         db_tx.monitor(),
     ));
+    if let (Some(pool), Some(database)) = (&pool, &config.database) {
+        telemetry.observe_database_pool(pool.clone(), database.pool_size());
+    }
     let (critical_tx, critical_rx) = tokio::sync::mpsc::unbounded_channel();
     let managed_config =
         managed_config.map(|snapshot| Arc::new(tokio::sync::RwLock::new(snapshot)));
@@ -671,7 +760,12 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                         // A configuration-file network may already hold this
                         // key. The operator's own entry wins; say so rather
                         // than abort the boot or run two upstream sessions.
-                        if let Err(error) = reg.add(Some(&owner), &row.name, driver) {
+                        if let Err(error) = reg.add(
+                            Some(&owner),
+                            &row.name,
+                            crate::db::BncNetworkDefinition::Stored,
+                            driver,
+                        ) {
                             telemetry.record_error(ErrorKind::Bouncer);
                             eprintln!("bnc: skipping stored network: {error}");
                         }
@@ -700,6 +794,14 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     // capabilities. The registry exists as soon as persistence does; the
     // listener can then be enabled or rebound from the console without
     // reconstructing every always-on upstream.
+    // Every TLS certificate the process serves, reloaded on SIGHUP and when
+    // its files change.
+    let certificates = CertificateReloads::default();
+    listeners.push(supervise_listener(
+        "TLS certificate reloader",
+        tokio::spawn(certificates.clone().run()),
+        critical_tx.clone(),
+    ));
     let bnc_listener = match (&pool, &bnc_registry) {
         (Some(pool), Some(registry)) => Some(Arc::new(BncListenerController::new(
             registry.clone(),
@@ -707,6 +809,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             config.server_name.clone(),
             limiter.clone(),
             telemetry.clone(),
+            certificates.clone(),
         ))),
         _ => None,
     };
@@ -715,7 +818,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         let controller = bnc_listener
             .as_ref()
             .expect("config validation guarantees [database] when [bnc] is set");
-        bnc_addr = Some(controller.enable(bnc.addr).await?);
+        bnc_addr = Some(controller.enable(bnc).await?);
     }
     if let (Some(pool), Some(settings)) = (&pool, &managed_config) {
         let sampler = tokio::spawn(crate::observability::run_sampler(
@@ -788,6 +891,10 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             pool: pool.clone(),
             public_url,
             http_bind: config.http.as_ref().map(|http| http.addr),
+            hsts_include_subdomains: config
+                .http
+                .as_ref()
+                .is_some_and(|http| http.hsts_include_subdomains),
             secure_cookies,
             internal_upstreams: config.internal_upstreams,
             oidc_providers: config.oidc_providers.clone(),
@@ -811,7 +918,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                     .expect("system RNG for CSRF key");
                 k
             },
-            trusted_proxies,
+            trusted_proxies: trusted_proxies.clone(),
             auth_rate_burst: config.limits.auth_rate_burst,
             auth_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
             api_rate_burst: config.limits.api_rate_burst,
@@ -820,6 +927,10 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             preflight_limiter: crate::http::PreflightLimiter::new(),
             ui_sockets: crate::http::UiSocketLimiter::new(),
             conn_limiter: limiter.clone(),
+            request_admission: Arc::new(crate::http::RequestAdmission::new(
+                trusted_proxies.clone(),
+                MAX_HTTP_REQUESTS_IN_FLIGHT_PER_IP,
+            )),
             observation: Arc::new(crate::http::RequestObservation::new(
                 telemetry.clone(),
                 {
@@ -830,11 +941,21 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                         .map_err(|_| io::Error::other("system RNG for HTTP request identifiers"))?;
                     u64::from_le_bytes(bytes)
                 },
-                config
-                    .http
-                    .as_ref()
-                    .and_then(|http| http.public_url.as_deref())
-                    .is_some_and(|url| url.starts_with("https://")),
+                match &config.http {
+                    Some(http)
+                        if http
+                            .public_url
+                            .as_deref()
+                            .is_some_and(|url| url.starts_with("https://")) =>
+                    {
+                        if http.hsts_include_subdomains {
+                            crate::http::Hsts::WithSubdomains
+                        } else {
+                            crate::http::Hsts::ThisOrigin
+                        }
+                    }
+                    _ => crate::http::Hsts::Off,
+                },
             )),
             bootstrap_token_digest: config
                 .bootstrap
@@ -853,15 +974,12 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             let state = app_state
                 .clone()
                 .expect("app_state is built whenever [http] is set");
-            let http_task = tokio::spawn(async move {
-                // `ConnectInfo<SocketAddr>` so handlers can see the socket peer
-                // (for rate limiting / X-Forwarded-For client-IP resolution).
-                let service = crate::http::router(state)
-                    .into_make_service_with_connect_info::<std::net::SocketAddr>();
-                if let Err(e) = axum::serve(listener, service).await {
-                    eprintln!("http server exited: {e}");
-                }
-            });
+            let http_task = tokio::spawn(serve_http(
+                listener,
+                crate::http::router(state.clone()),
+                HttpAdmission::for_state(&state),
+                telemetry.clone(),
+            ));
             listeners.push(supervise_listener(
                 "HTTP listener",
                 http_task,
@@ -1013,13 +1131,12 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             let state = app_state
                 .clone()
                 .expect("app_state is built whenever a websocket listener is set");
-            let ws_task = tokio::spawn(async move {
-                let service = crate::http::ws_irc_router(state)
-                    .into_make_service_with_connect_info::<std::net::SocketAddr>();
-                if let Err(e) = axum::serve(listener, service).await {
-                    eprintln!("ws-irc listener exited: {e}");
-                }
-            });
+            let ws_task = tokio::spawn(serve_http(
+                listener,
+                crate::http::ws_irc_router(state.clone()),
+                HttpAdmission::for_state(&state),
+                telemetry.clone(),
+            ));
             listeners.push(supervise_listener(
                 "WebSocket IRC listener",
                 ws_task,
@@ -1028,7 +1145,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             continue;
         }
         let acceptor = match &listener_config.tls {
-            Some(tls) => Some(tls_acceptor(tls)?),
+            Some(tls) => Some(certificates.acceptor(tls)?),
             None => None,
         };
         let accept_task = tokio::spawn(accept_loop(
@@ -1063,22 +1180,123 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     })
 }
 
-fn tls_acceptor(tls: &TlsConfig) -> io::Result<TlsAcceptor> {
-    use rustls_pki_types::pem::PemObject;
-    let certs: Vec<_> = rustls_pki_types::CertificateDer::pem_file_iter(&tls.cert_path)
-        .map_err(pem_err)?
-        .collect::<Result<_, _>>()
-        .map_err(pem_err)?;
-    let key = rustls_pki_types::PrivateKeyDer::from_pem_file(&tls.key_path).map_err(pem_err)?;
-    let server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    Ok(TlsAcceptor::from(Arc::new(server_config)))
+/// Who may open an HTTP connection: at most [`MAX_HTTP_CONNECTIONS_PER_IP`]
+/// from one address, except a trusted reverse proxy. One instance per
+/// listener — an HTTP connection is not an IRC session, and must not spend the
+/// IRC listeners' per-address budget.
+struct HttpAdmission {
+    connections: ConnLimiter,
+    trusted_proxies: Vec<ipnet::IpNet>,
 }
 
-fn pem_err(e: rustls_pki_types::pem::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, format!("TLS PEM: {e}"))
+impl HttpAdmission {
+    fn for_state(state: &crate::http::AppState) -> Self {
+        Self {
+            connections: ConnLimiter::new(Some(MAX_HTTP_CONNECTIONS_PER_IP)),
+            trusted_proxies: state.trusted_proxies.clone(),
+        }
+    }
+}
+
+/// Serve HTTP/1.1 (with WebSocket upgrades) on `listener`.
+///
+/// Written out rather than `axum::serve`, which builds its connection builder
+/// without a timer: hyper then silently drops its header-read timeout, and a
+/// peer that sends half a header block — or holds a kept-alive connection idle
+/// — keeps its socket and task forever. Here every connection has a timer and
+/// [`HTTP_HEADER_READ_TIMEOUT`], and the per-address connection cap is applied
+/// at accept, before any work is spent on the peer.
+async fn serve_http(
+    listener: TcpListener,
+    router: axum::Router,
+    admission: HttpAdmission,
+    telemetry: Arc<Telemetry>,
+) {
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                // Transient accept errors (EMFILE etc.) must not kill the
+                // listener; retrying is the correct handling.
+                telemetry.record_error(ErrorKind::Accept);
+                eprintln!("http accept error: {error}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let client = ClientIp::new(peer.ip());
+        let guard = if admission
+            .trusted_proxies
+            .iter()
+            .any(|net| net.contains(&client.ip()))
+        {
+            None
+        } else {
+            match admission.connections.try_acquire(client) {
+                Some(guard) => Some(guard),
+                None => {
+                    telemetry.record_connection_rejected();
+                    admission
+                        .connections
+                        .refusals()
+                        .note(client, PeerRefusal::PerIpLimit, None);
+                    continue;
+                }
+            }
+        };
+        let refusals = admission.connections.refusals().clone();
+        tokio::spawn(serve_http_connection(
+            stream,
+            peer,
+            router.clone(),
+            guard,
+            refusals,
+            telemetry.clone(),
+        ));
+    }
+}
+
+async fn serve_http_connection(
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    router: axum::Router,
+    _guard: Option<ConnGuard>,
+    refusals: Arc<PeerRefusalLog>,
+    telemetry: Arc<Telemetry>,
+) {
+    use tower::ServiceExt;
+    let client = ClientIp::new(peer.ip());
+    if let Err(error) = stream.set_nodelay(true) {
+        telemetry.record_error(ErrorKind::ConnectionSetup);
+        refusals.note(client, PeerRefusal::SocketSetup, Some(&error));
+        return;
+    }
+    // `ConnectInfo` so handlers see the socket peer (rate limiting, and the
+    // forwarded-address resolution behind a trusted proxy).
+    let service = router.map_request(move |mut request: axum::http::Request<_>| {
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        request
+    });
+    let served = hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HTTP_HEADER_READ_TIMEOUT)
+        .serve_connection(
+            hyper_util::rt::TokioIo::new(stream),
+            hyper_util::service::TowerToHyperService::new(service),
+        )
+        .with_upgrades()
+        .await;
+    match served {
+        Ok(()) => {}
+        Err(error) if error.is_timeout() => {
+            refusals.note(client, PeerRefusal::HttpHeaderTimedOut, None);
+        }
+        // A peer that resets or abandons its connection mid-request: counted,
+        // not logged per occurrence.
+        Err(_) => telemetry.record_error(ErrorKind::Http),
+    }
 }
 
 async fn core_worker(
@@ -1098,6 +1316,32 @@ async fn core_worker(
     }
 }
 
+/// A client's address as every per-client decision keys it: a limiter slot, a
+/// refusal summary, a rate bucket, a trusted-proxy match, a session's host
+/// (what WHOIS shows and a DLINE or KLINE matches). A dual-stack (`[::]`)
+/// listener presents every IPv4 client as IPv4-mapped IPv6
+/// (`::ffff:a.b.c.d`); the constructor canonicalizes that to the IPv4 form, so
+/// one address can never be split between two spellings — two limiter
+/// budgets, a ban written in natural IPv4 notation that silently misses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ClientIp(std::net::IpAddr);
+
+impl ClientIp {
+    pub(crate) fn new(address: std::net::IpAddr) -> Self {
+        Self(address.to_canonical())
+    }
+
+    pub(crate) fn ip(self) -> std::net::IpAddr {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ClientIp {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 /// Per-IP concurrent-connection cap. When `max_per_ip` is `None` the
 /// limiter is a no-op; otherwise it refuses connections beyond the cap
 /// and releases the slot when the connection's guard drops.
@@ -1111,11 +1355,13 @@ pub(crate) enum PeerRefusal {
     SocketSetup,
     TlsHandshakeFailed,
     TlsHandshakeTimedOut,
+    HttpHeaderTimedOut,
 }
 
 impl PeerRefusal {
     const fn label(self) -> &'static str {
         match self {
+            Self::HttpHeaderTimedOut => "HTTP request headers not received in time",
             Self::PerIpLimit => "per-IP connection limit reached",
             Self::ConnectionIdExhausted => "no connection identifier available",
             Self::SocketSetup => "socket setup failed",
@@ -1141,9 +1387,8 @@ const PEER_REFUSAL_LOG_CAPACITY: usize = 4_096;
 /// export are unchanged (they are incremented by the caller, not here).
 pub(crate) struct PeerRefusalLog {
     window: std::time::Duration,
-    entries: std::sync::Mutex<
-        std::collections::HashMap<(std::net::IpAddr, PeerRefusal), PeerRefusalWindow>,
-    >,
+    entries:
+        std::sync::Mutex<std::collections::HashMap<(ClientIp, PeerRefusal), PeerRefusalWindow>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1164,7 +1409,7 @@ impl PeerRefusalLog {
     /// Log one occurrence now, if it is this window's line.
     pub(crate) fn note(
         &self,
-        peer: std::net::IpAddr,
+        peer: ClientIp,
         refusal: PeerRefusal,
         detail: Option<&dyn std::fmt::Display>,
     ) {
@@ -1178,7 +1423,7 @@ impl PeerRefusalLog {
     pub(crate) fn line_at(
         &self,
         now: std::time::Instant,
-        peer: std::net::IpAddr,
+        peer: ClientIp,
         refusal: PeerRefusal,
         detail: Option<&dyn std::fmt::Display>,
     ) -> Option<String> {
@@ -1227,7 +1472,7 @@ impl PeerRefusalLog {
 
 #[derive(Clone)]
 pub(crate) struct ConnLimiter {
-    counts: Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+    counts: Arc<std::sync::Mutex<std::collections::HashMap<ClientIp, usize>>>,
     max_per_ip: Option<usize>,
     /// Per-peer admission failures are summarised here rather than logged one
     /// line per attempt; it travels with the limiter because every listener
@@ -1250,7 +1495,7 @@ impl ConnLimiter {
     }
 
     /// Reserve a slot for `ip`, or `None` if it is already at the cap.
-    pub(crate) fn try_acquire(&self, ip: std::net::IpAddr) -> Option<ConnGuard> {
+    pub(crate) fn try_acquire(&self, ip: ClientIp) -> Option<ConnGuard> {
         let Some(max) = self.max_per_ip else {
             return Some(ConnGuard { limiter: None, ip });
         };
@@ -1266,7 +1511,7 @@ impl ConnLimiter {
         })
     }
 
-    fn release(&self, ip: std::net::IpAddr) {
+    fn release(&self, ip: ClientIp) {
         let mut counts = self.counts.lock().expect("conn limiter poisoned");
         if let Some(c) = counts.get_mut(&ip) {
             *c -= 1;
@@ -1280,7 +1525,7 @@ impl ConnLimiter {
 /// Releases its per-IP slot when the connection ends (on drop).
 pub(crate) struct ConnGuard {
     limiter: Option<ConnLimiter>,
-    ip: std::net::IpAddr,
+    ip: ClientIp,
 }
 
 impl Drop for ConnGuard {
@@ -1352,15 +1597,16 @@ struct AcceptContext<'a> {
 
 fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &AcceptContext<'_>) {
     let refusals = context.limiter.refusals().clone();
-    let Some(guard) = context.limiter.try_acquire(peer.ip()) else {
-        refusals.note(peer.ip(), PeerRefusal::PerIpLimit, None);
+    let client = ClientIp::new(peer.ip());
+    let Some(guard) = context.limiter.try_acquire(client) else {
+        refusals.note(client, PeerRefusal::PerIpLimit, None);
         context.telemetry.record_connection_rejected();
         return;
     };
     let conn = match context.next_conn.allocate() {
         Ok(conn) => conn,
         Err(error) => {
-            refusals.note(peer.ip(), PeerRefusal::ConnectionIdExhausted, Some(&error));
+            refusals.note(client, PeerRefusal::ConnectionIdExhausted, Some(&error));
             context.telemetry.record_error(ErrorKind::ConnectionSetup);
             return;
         }
@@ -1372,7 +1618,7 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
     tokio::spawn(async move {
         let _guard = guard;
         if let Err(e) = stream.set_nodelay(true) {
-            refusals.note(peer.ip(), PeerRefusal::SocketSetup, Some(&e));
+            refusals.note(client, PeerRefusal::SocketSetup, Some(&e));
             telemetry.record_error(ErrorKind::ConnectionSetup);
             return;
         }
@@ -1398,11 +1644,11 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
                     }
                     Ok(Err(e)) => {
                         telemetry.record_error(ErrorKind::TlsHandshake);
-                        refusals.note(peer.ip(), PeerRefusal::TlsHandshakeFailed, Some(&e));
+                        refusals.note(client, PeerRefusal::TlsHandshakeFailed, Some(&e));
                     }
                     Err(_) => {
                         telemetry.record_error(ErrorKind::TlsHandshake);
-                        refusals.note(peer.ip(), PeerRefusal::TlsHandshakeTimedOut, None);
+                        refusals.note(client, PeerRefusal::TlsHandshakeTimedOut, None);
                     }
                 }
             }
@@ -1443,14 +1689,9 @@ async fn serve_conn<S>(
         .push(Input::Open {
             conn,
             tx: out_tx,
-            // Canonicalize an IPv4-mapped IPv6 peer (`::ffff:1.2.3.4`) to its IPv4
-            // form at this single ingress point. A dual-stack (`[::]`) listener
-            // presents every IPv4 client mapped, so without this a `DLINE
-            // 1.2.3.4` (or `KLINE *@1.2.3.4`) an operator writes in natural IPv4
-            // notation would not match the `::ffff:1.2.3.4` subject `ban_match`
-            // tests — a silent ban evasion — and WHOIS would show the mapped
-            // spelling. Mirrors the outbound SSRF canonicalization in `networks`.
-            host: peer.ip().to_canonical().to_string(),
+            // The canonical IPv4 spelling of a mapped peer (`ClientIp`): the
+            // subject `ban_match` tests and WHOIS shows.
+            host: ClientIp::new(peer.ip()).to_string(),
             transport,
         })
         .await
@@ -1608,6 +1849,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::certificate::ReloadingCertificate;
+    use crate::config::TlsConfig;
     use crate::core::Input;
     use e6irc_queue::Sender;
     use std::pin::Pin;
@@ -1616,8 +1859,8 @@ mod tests {
     fn peer_refusals_log_once_per_window_with_the_suppressed_count() {
         use std::time::{Duration, Instant};
         let log = PeerRefusalLog::new(Duration::from_secs(60));
-        let peer: std::net::IpAddr = "203.0.113.9".parse().unwrap();
-        let other: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+        let peer = ClientIp::new("203.0.113.9".parse().unwrap());
+        let other = ClientIp::new("203.0.113.10".parse().unwrap());
         let start = Instant::now();
         let first = log
             .line_at(start, peer, PeerRefusal::PerIpLimit, None)
@@ -1681,7 +1924,9 @@ mod tests {
         let log = PeerRefusalLog::new(Duration::from_secs(60));
         let start = Instant::now();
         for i in 0..PEER_REFUSAL_LOG_CAPACITY as u32 {
-            let peer = std::net::IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000 + i));
+            let peer = ClientIp::new(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                0x0A00_0000 + i,
+            )));
             assert!(
                 log.line_at(start, peer, PeerRefusal::PerIpLimit, None)
                     .is_some()
@@ -1689,7 +1934,7 @@ mod tests {
         }
         // Full, and every entry's window is still open: the newcomer is logged
         // (not remembered), and logged again on its next attempt.
-        let newcomer: std::net::IpAddr = "198.51.100.1".parse().unwrap();
+        let newcomer = ClientIp::new("198.51.100.1".parse().unwrap());
         assert!(
             log.line_at(start, newcomer, PeerRefusal::PerIpLimit, None)
                 .is_some()
@@ -1764,6 +2009,105 @@ mod tests {
         fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    /// A self-signed certificate for `localhost` written to `dir`, and its DER
+    /// form for a client to trust.
+    fn write_certificate(
+        dir: &std::path::Path,
+    ) -> (TlsConfig, rustls_pki_types::CertificateDer<'static>) {
+        let generated =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("certificate");
+        let files = TlsConfig {
+            cert_path: dir.join("cert.pem"),
+            key_path: dir.join("key.pem"),
+        };
+        std::fs::write(&files.cert_path, generated.cert.pem()).expect("write certificate");
+        std::fs::write(&files.key_path, generated.signing_key.serialize_pem()).expect("write key");
+        (files, generated.cert.der().clone())
+    }
+
+    /// The certificate a TLS client is shown by `acceptor`.
+    async fn presented_certificate(
+        acceptor: &TlsAcceptor,
+        trusted: &rustls_pki_types::CertificateDer<'static>,
+    ) -> Result<rustls_pki_types::CertificateDer<'static>, std::io::Error> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let acceptor = acceptor.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            drop(acceptor.accept(stream).await);
+        });
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(trusted.clone()).expect("root");
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ));
+        let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let tls = connector
+            .connect("localhost".try_into().expect("name"), stream)
+            .await?;
+        let presented = tls
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|chain| chain.first())
+            .expect("a certificate")
+            .clone()
+            .into_owned();
+        drop(tls);
+        drop(server.await);
+        Ok(presented)
+    }
+
+    /// A renewed certificate is served without a restart: after the files are
+    /// rewritten and a reload runs, the next handshake presents the new one.
+    /// A file that does not parse keeps the certificate being served.
+    #[tokio::test]
+    async fn a_reloaded_certificate_is_presented_to_the_next_handshake() {
+        install_crypto_provider();
+        let dir = std::env::temp_dir().join(format!(
+            "e6irc-certificate-reload-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("directory");
+        let (files, first) = write_certificate(&dir);
+        let certificate = Arc::new(ReloadingCertificate::load(&files).expect("load"));
+        let acceptor = TlsAcceptor::from(Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(certificate.clone()),
+        ));
+        assert_eq!(
+            presented_certificate(&acceptor, &first)
+                .await
+                .expect("handshake"),
+            first
+        );
+
+        let (_, second) = write_certificate(&dir);
+        assert_ne!(first, second);
+        certificate.reload().expect("the renewed files parse");
+        assert_eq!(
+            presented_certificate(&acceptor, &second)
+                .await
+                .expect("handshake with the renewed certificate"),
+            second
+        );
+
+        std::fs::write(&files.cert_path, "not a certificate").expect("corrupt the file");
+        assert!(certificate.reload().is_err(), "a broken file is refused");
+        assert_eq!(
+            presented_certificate(&acceptor, &second)
+                .await
+                .expect("the last good certificate is still served"),
+            second
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -2046,6 +2390,7 @@ mod tests {
                     buffer_cap: 16,
                     sasl_account: None,
                     sasl_password: None,
+                    server_password: None,
                 }],
                 None,
                 crate::bouncer::CoreHandles {

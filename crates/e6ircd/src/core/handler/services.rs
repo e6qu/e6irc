@@ -470,6 +470,7 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                     session: state.channel_actor(conn).session_owner(),
                     display: channel.to_string(),
                     label,
+                    actor: account,
                 },
             };
             queue_service_verdict(state, conn, request);
@@ -602,7 +603,7 @@ pub(super) fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str
         );
         return;
     };
-    let Some((key, _account)) = chanserv_founder_gate(
+    let Some((key, account)) = chanserv_founder_gate(
         state,
         channel,
         conn,
@@ -670,6 +671,7 @@ pub(super) fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str
         display: channel.to_string(),
         account: target.to_string(),
         flags: (!new_flags.is_empty()).then_some(new_flags),
+        actor: account,
         label: state
             .capture
             .as_ref()
@@ -822,7 +824,7 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
         state.service_notice(conn, "ChanServ", "Syntax: SET <#channel> <option> <value>");
         return;
     };
-    let Some((key, _account)) = chanserv_founder_gate(
+    let Some((key, account)) = chanserv_founder_gate(
         state,
         channel,
         conn,
@@ -841,6 +843,7 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
                 session: state.channel_actor(conn).session_owner(),
                 channel: channel.to_string(),
                 new_founder: state.casemap.casefold(new),
+                actor: account,
                 label: state
                     .capture
                     .as_ref()
@@ -879,6 +882,7 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
                 keeptopic: on,
                 topic,
                 label,
+                actor: account,
             };
             queue_service_verdict(state, conn, request);
         }
@@ -894,6 +898,7 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
                     display: channel.to_string(),
                     mlock: None,
                     label,
+                    actor: account,
                 };
                 queue_service_verdict(state, conn, request);
                 return;
@@ -922,6 +927,7 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
                 display: channel.to_string(),
                 mlock: Some(canonical.clone()),
                 label,
+                actor: account,
             };
             queue_service_verdict(state, conn, request);
         }
@@ -985,6 +991,7 @@ pub(crate) fn channel_drop_result(
             session,
             display,
             label,
+            actor: _,
         } => {
             state.route_input(crate::core::Input::ChannelDropReply {
                 session,

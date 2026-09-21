@@ -55,6 +55,19 @@ async fn add_server_ban(
     .map(|_| ())
 }
 
+/// An account's whole export document, read page by page as the HTTP handler
+/// streams it.
+async fn export_account(pool: &sqlx::PgPool, account: &str) -> Option<String> {
+    let mut export = db::begin_account_export(pool, account)
+        .await
+        .expect("begin export")?;
+    let mut document = String::new();
+    while let Some(chunk) = export.next_chunk().await.expect("export page") {
+        document.push_str(&chunk);
+    }
+    Some(document)
+}
+
 /// The newest audit entries, unfiltered, through the query the console uses.
 async fn list_audit_log(
     pool: &sqlx::PgPool,
@@ -327,6 +340,7 @@ async fn sasl_over_real_socket() {
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         ..Config::default()
     };
@@ -390,6 +404,7 @@ async fn sasl_oauthbearer_with_api_token() {
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         ..Config::default()
     };
@@ -405,6 +420,7 @@ async fn sasl_oauthbearer_with_api_token() {
                 nick: "toknick",
                 username: "toknick",
                 realname: "T",
+                server_password: None,
             },
             &token,
         )
@@ -440,7 +456,8 @@ async fn sasl_oauthbearer_with_api_token() {
             &e6irc_client::Identity {
                 nick: "bad",
                 username: "bad",
-                realname: "B"
+                realname: "B",
+                server_password: None,
             },
             "not-a-real-token"
         )
@@ -476,10 +493,12 @@ async fn app_password_issued_over_http_works_for_sasl() {
             public_url: None,
             secure_cookies: false,
             admin_accounts: vec![],
+            hsts_include_subdomains: false,
         }),
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         ..Config::default()
     };
@@ -573,10 +592,12 @@ async fn auth_endpoint_rate_limit_returns_429_after_burst() {
             public_url: None,
             secure_cookies: false,
             admin_accounts: vec![],
+            hsts_include_subdomains: false,
         }),
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         limits: LimitsConfig {
             // Two requests per client IP, then the bucket is empty.
@@ -631,6 +652,7 @@ async fn channel_messages_are_persisted() {
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         ..Config::default()
     };
@@ -863,10 +885,12 @@ async fn credential_list_and_revoke() {
             public_url: None,
             secure_cookies: false,
             admin_accounts: vec![],
+            hsts_include_subdomains: false,
         }),
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         ..Config::default()
     };
@@ -1371,16 +1395,34 @@ async fn bnc_networks_are_capped_per_account() {
         sasl_account: None,
         sasl_password_sealed: None,
         enabled: true,
+        server_password_sealed: None,
     };
     // Mint the maximum (32); each succeeds.
     for i in 0..32 {
-        db::create_bnc_network(&pool, "ncap", &row(i))
-            .await
-            .unwrap_or_else(|e| panic!("network {i} should succeed: {e}"));
+        db::create_bnc_network(
+            &pool,
+            "ncap",
+            &row(i),
+            e6ircd::db::NetworkAudit {
+                actor: "ncap",
+                detail: "",
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("network {i} should succeed: {e}"));
     }
     // The 33rd is refused with the dedicated error, enforced atomically — each
     // network spawns an always-on driver, so an overshoot is real amplification.
-    let over = db::create_bnc_network(&pool, "ncap", &row(99)).await;
+    let over = db::create_bnc_network(
+        &pool,
+        "ncap",
+        &row(99),
+        e6ircd::db::NetworkAudit {
+            actor: "ncap",
+            detail: "",
+        },
+    )
+    .await;
     assert!(
         matches!(over, Err(db::DbError::TooManyNetworks)),
         "the 33rd network must be refused: {over:?}"
@@ -1416,7 +1458,7 @@ async fn channel_access_is_capped_per_channel() {
             .execute(&pool)
             .await
             .expect("target account");
-        db::set_channel_access(&pool, "#c", &name, Some("v".into()))
+        db::set_channel_access(&pool, "#c", &name, Some("v".into()), "founder")
             .await
             .unwrap_or_else(|e| panic!("grant {i} should succeed: {e}"));
     }
@@ -1426,14 +1468,14 @@ async fn channel_access_is_capped_per_channel() {
         .execute(&pool)
         .await
         .expect("target account");
-    let over = db::set_channel_access(&pool, "#c", "t256", Some("v".into())).await;
+    let over = db::set_channel_access(&pool, "#c", "t256", Some("v".into()), "founder").await;
     assert!(
         matches!(over, Err(db::DbError::TooManyAccessEntries)),
         "the 257th access entry must be refused: {over:?}"
     );
 
     // Re-flagging an EXISTING entry is still allowed — it replaces, not grows.
-    let reflag = db::set_channel_access(&pool, "#c", "t0", Some("o".into())).await;
+    let reflag = db::set_channel_access(&pool, "#c", "t0", Some("o".into()), "founder").await;
     assert!(
         matches!(reflag, Ok(true)),
         "re-flagging an existing entry stays allowed at the cap: {reflag:?}"
@@ -1460,6 +1502,7 @@ async fn read_marker_persists() {
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         ..Config::default()
     };
@@ -1576,10 +1619,12 @@ async fn history_rest_endpoint() {
             public_url: None,
             secure_cookies: false,
             admin_accounts: vec![],
+            hsts_include_subdomains: false,
         }),
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         ..Config::default()
     };
@@ -1820,6 +1865,7 @@ async fn chathistory_pages_from_postgres_past_the_ring() {
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         // This client pipelines 600 messages in one instant to overflow the
         // ring, which the default command-flood bucket (40 then 20/s) would
@@ -1969,6 +2015,7 @@ async fn chathistory_recreated_channel_serves_persisted_history_with_label() {
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         ..Config::default()
     };
@@ -2075,6 +2122,7 @@ async fn read_marker_preloaded_after_restart() {
         database: Some(DatabaseConfig {
             url: url.clone(),
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         ..Config::default()
     };
@@ -2150,6 +2198,7 @@ async fn sasl_registration_fails_loudly_on_nick_in_use() {
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         ..Config::default()
     };
@@ -2163,6 +2212,7 @@ async fn sasl_registration_fails_loudly_on_nick_in_use() {
         nick: "dup",
         username: "dup",
         realname: "First",
+        server_password: None,
     })
     .await
     .expect("register");
@@ -2180,6 +2230,7 @@ async fn sasl_registration_fails_loudly_on_nick_in_use() {
                 nick: "dup",
                 username: "dup",
                 realname: "Second",
+                server_password: None,
             },
             "dupacct",
             "pw",
@@ -2212,6 +2263,7 @@ async fn labeled_chathistory_targets_carries_label_on_db_path() {
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         ..Config::default()
     };
@@ -2290,6 +2342,7 @@ async fn chathistory_targets_db_path_shows_dm_correspondent_as_a_nick() {
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         ..Config::default()
     };
@@ -2362,6 +2415,7 @@ async fn a_stranger_taking_a_nick_gets_none_of_its_previous_conversations() {
         database: Some(DatabaseConfig {
             url,
             startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         }),
         ..Config::default()
     };
@@ -2518,25 +2572,60 @@ async fn bnc_networks_crud() {
         sasl_account: Some("alice".into()),
         sasl_password_sealed: Some("enc:v1:abc".into()),
         enabled: true,
+        server_password_sealed: None,
     };
-    db::create_bnc_network(&pool, "alice", &libera)
-        .await
-        .expect("create");
+    db::create_bnc_network(
+        &pool,
+        "alice",
+        &libera,
+        e6ircd::db::NetworkAudit {
+            actor: "alice",
+            detail: "",
+        },
+    )
+    .await
+    .expect("create");
 
     // duplicate (owner, name) is rejected loudly
-    let dup = db::create_bnc_network(&pool, "alice", &libera).await;
+    let dup = db::create_bnc_network(
+        &pool,
+        "alice",
+        &libera,
+        e6ircd::db::NetworkAudit {
+            actor: "alice",
+            detail: "",
+        },
+    )
+    .await;
     assert!(
         matches!(dup, Err(db::DbError::DuplicateNetwork(_))),
         "{dup:?}"
     );
 
     // bob may reuse the same network name (distinct owner)
-    db::create_bnc_network(&pool, "bob", &libera)
-        .await
-        .expect("bob create");
+    db::create_bnc_network(
+        &pool,
+        "bob",
+        &libera,
+        e6ircd::db::NetworkAudit {
+            actor: "bob",
+            detail: "",
+        },
+    )
+    .await
+    .expect("bob create");
 
     // unknown account is rejected
-    let bad = db::create_bnc_network(&pool, "nobody", &libera).await;
+    let bad = db::create_bnc_network(
+        &pool,
+        "nobody",
+        &libera,
+        e6ircd::db::NetworkAudit {
+            actor: "nobody",
+            detail: "",
+        },
+    )
+    .await;
     assert!(matches!(bad, Err(db::DbError::BadCredentials)), "{bad:?}");
 
     // list scopes to the owner and preserves fields
@@ -2558,9 +2647,18 @@ async fn bnc_networks_crud() {
     updated.sasl_account = Some("alice-login".into());
     updated.sasl_password_sealed = Some("enc:v2:replacement".into());
     assert!(
-        db::update_bnc_network(&pool, "alice", "LIBERA", &updated)
-            .await
-            .expect("update")
+        db::update_bnc_network(
+            &pool,
+            "alice",
+            "LIBERA",
+            &updated,
+            e6ircd::db::NetworkAudit {
+                actor: "alice",
+                detail: ""
+            }
+        )
+        .await
+        .expect("update")
     );
     let stored = db::get_bnc_network(&pool, "alice", "libera")
         .await
@@ -2594,19 +2692,37 @@ async fn bnc_networks_crud() {
         sasl_account: None,
         sasl_password_sealed: Some("enc:v2:sealed".into()),
         enabled: true,
+        server_password_sealed: None,
     };
-    db::create_bnc_network(&pool, "alice", &matrix)
-        .await
-        .expect("matrix");
+    db::create_bnc_network(
+        &pool,
+        "alice",
+        &matrix,
+        e6ircd::db::NetworkAudit {
+            actor: "alice",
+            detail: "",
+        },
+    )
+    .await
+    .expect("matrix");
     let hq = db::get_bnc_network(&pool, "alice", "hq")
         .await
         .expect("get")
         .expect("present");
     assert_eq!(hq.kind, e6ircd::config::NetworkKind::Matrix);
     assert_eq!(hq.addr, "https://matrix.example");
-    db::set_bnc_network_enabled(&pool, "alice", "hq", false)
-        .await
-        .expect("disable matrix");
+    db::set_bnc_network_enabled(
+        &pool,
+        "alice",
+        "hq",
+        false,
+        e6ircd::db::NetworkAudit {
+            actor: "alice",
+            detail: "",
+        },
+    )
+    .await
+    .expect("disable matrix");
     let inventory = db::list_bnc_network_inventory(&pool)
         .await
         .expect("admin inventory");
@@ -2616,9 +2732,17 @@ async fn bnc_networks_crud() {
             row.owner == "alice" && row.network.name == "hq" && !row.network.enabled
         })
     );
-    db::delete_bnc_network(&pool, "alice", "hq")
-        .await
-        .expect("cleanup");
+    db::delete_bnc_network(
+        &pool,
+        "alice",
+        "hq",
+        e6ircd::db::NetworkAudit {
+            actor: "alice",
+            detail: "",
+        },
+    )
+    .await
+    .expect("cleanup");
 
     // list_all pairs each network with its owner (two rows: alice+bob)
     let all = db::list_startable_bnc_networks(&pool).await.expect("all");
@@ -2660,14 +2784,30 @@ async fn bnc_networks_crud() {
 
     // delete is owner-scoped
     assert!(
-        db::delete_bnc_network(&pool, "alice", "libera")
-            .await
-            .unwrap()
+        db::delete_bnc_network(
+            &pool,
+            "alice",
+            "libera",
+            e6ircd::db::NetworkAudit {
+                actor: "alice",
+                detail: ""
+            }
+        )
+        .await
+        .unwrap()
     );
     assert!(
-        !db::delete_bnc_network(&pool, "alice", "libera")
-            .await
-            .unwrap()
+        !db::delete_bnc_network(
+            &pool,
+            "alice",
+            "libera",
+            e6ircd::db::NetworkAudit {
+                actor: "alice",
+                detail: ""
+            }
+        )
+        .await
+        .unwrap()
     );
     assert_eq!(
         db::list_bnc_networks(&pool, "alice").await.unwrap().len(),
@@ -2704,15 +2844,33 @@ async fn bnc_network_name_selection_is_case_insensitive() {
         sasl_account: None,
         sasl_password_sealed: None,
         enabled: true,
+        server_password_sealed: None,
     };
-    db::create_bnc_network(&pool, "alice", &libera)
-        .await
-        .expect("create");
+    db::create_bnc_network(
+        &pool,
+        "alice",
+        &libera,
+        e6ircd::db::NetworkAudit {
+            actor: "alice",
+            detail: "",
+        },
+    )
+    .await
+    .expect("create");
 
     // A case-variant of an existing name is the *same* network, not a new one.
     let mut variant = libera.clone();
     variant.name = "Libera".into();
-    let dup = db::create_bnc_network(&pool, "alice", &variant).await;
+    let dup = db::create_bnc_network(
+        &pool,
+        "alice",
+        &variant,
+        e6ircd::db::NetworkAudit {
+            actor: "alice",
+            detail: "",
+        },
+    )
+    .await;
     assert!(
         matches!(dup, Err(db::DbError::DuplicateNetwork(_))),
         "case-variant create must collide with the existing network: {dup:?}"
@@ -2729,9 +2887,21 @@ async fn bnc_network_name_selection_is_case_insensitive() {
     }
     // Buffer APIs share that same composite-key fold. A producer using display
     // casing and a reader using a different selector spelling must still meet.
-    db::persist_bnc_line(&pool, "ALICE", "LiBeRa", None, ":s NOTICE * :backlog")
+    db::persist_bnc_line(
+        &pool,
+        &e6ircd::db::open_bnc_buffer(
+            &pool,
+            Some("ALICE"),
+            "LiBeRa",
+            e6ircd::db::BncNetworkDefinition::Configured,
+        )
         .await
-        .expect("persist case variant");
+        .expect("open buffer"),
+        None,
+        ":s NOTICE * :backlog",
+    )
+    .await
+    .expect("persist case variant");
     assert_eq!(
         db::recent_bnc_lines(&pool, "alice", "LIBERA", 10)
             .await
@@ -2745,15 +2915,32 @@ async fn bnc_network_name_selection_is_case_insensitive() {
     assert!(summary.oldest_at.is_some());
     assert!(summary.newest_at.is_some());
     assert!(
-        db::set_bnc_network_enabled(&pool, "alice", "LIBERA", false)
-            .await
-            .expect("disable"),
+        db::set_bnc_network_enabled(
+            &pool,
+            "alice",
+            "LIBERA",
+            false,
+            e6ircd::db::NetworkAudit {
+                actor: "alice",
+                detail: ""
+            }
+        )
+        .await
+        .expect("disable"),
         "disable by a different casing must match the stored network"
     );
     assert!(
-        db::delete_bnc_network(&pool, "alice", "LiBeRa")
-            .await
-            .expect("delete"),
+        db::delete_bnc_network(
+            &pool,
+            "alice",
+            "LiBeRa",
+            e6ircd::db::NetworkAudit {
+                actor: "alice",
+                detail: ""
+            }
+        )
+        .await
+        .expect("delete"),
         "delete by a different casing must match the stored network"
     );
     assert_eq!(
@@ -2811,17 +2998,32 @@ async fn deleting_a_bnc_network_purges_its_casefolded_buffer() {
         sasl_account: None,
         sasl_password_sealed: None,
         enabled: true,
+        server_password_sealed: None,
     };
-    db::create_bnc_network(&pool, "MixedCase", &net)
-        .await
-        .expect("create");
+    db::create_bnc_network(
+        &pool,
+        "MixedCase",
+        &net,
+        e6ircd::db::NetworkAudit {
+            actor: "MixedCase",
+            detail: "",
+        },
+    )
+    .await
+    .expect("create");
     // The live persistence path writes under the folded owner.
     let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold("MixedCase");
     for i in 0..3 {
         db::persist_bnc_line(
             &pool,
-            &folded,
-            "libera",
+            &e6ircd::db::open_bnc_buffer(
+                &pool,
+                Some(&folded),
+                "libera",
+                e6ircd::db::BncNetworkDefinition::Configured,
+            )
+            .await
+            .expect("open buffer"),
             Some("mc"),
             &format!(":s PRIVMSG #x :m{i}"),
         )
@@ -2839,9 +3041,17 @@ async fn deleting_a_bnc_network_purges_its_casefolded_buffer() {
     .expect("persist read marker");
     // Delete by the raw (display-cased) account name, as the HTTP handler does.
     assert!(
-        db::delete_bnc_network(&pool, "MixedCase", "libera")
-            .await
-            .expect("delete")
+        db::delete_bnc_network(
+            &pool,
+            "MixedCase",
+            "libera",
+            e6ircd::db::NetworkAudit {
+                actor: "MixedCase",
+                detail: ""
+            }
+        )
+        .await
+        .expect("delete")
     );
     let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM bnc_buffer")
         .fetch_one(&pool)
@@ -2915,6 +3125,25 @@ async fn concurrent_bnc_read_markers_cannot_exceed_the_account_cap() {
     assert_eq!(count, db::BNC_READ_MARKER_LIMIT);
 }
 
+/// Every retained line of one alice/libera target, oldest first.
+async fn history_latest(
+    pool: &sqlx::PgPool,
+    target: &str,
+) -> Result<Vec<db::BncHistoryLine>, db::DbError> {
+    Ok(db::bnc_history_window(
+        pool,
+        "alice",
+        "libera",
+        target,
+        db::BncHistoryPaging::Latest,
+        &db::BncHistorySelector::Star,
+        &db::BncHistorySelector::Star,
+        500,
+    )
+    .await?
+    .expect("LATEST * has no msgid to miss"))
+}
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn bnc_history_queries_are_target_scoped_and_merge_direct_messages() {
@@ -2924,8 +3153,14 @@ async fn bnc_history_queries_are_target_scoped_and_merge_direct_messages() {
             .expect("connect");
     db::persist_bnc_line(
         &pool,
-        "alice",
-        "libera",
+        &e6ircd::db::open_bnc_buffer(
+            &pool,
+            Some("alice"),
+            "libera",
+            e6ircd::db::BncNetworkDefinition::Configured,
+        )
+        .await
+        .expect("open buffer"),
         Some("alice"),
         "@msgid=shared :a!u@h PRIVMSG #one :first",
     )
@@ -2933,25 +3168,31 @@ async fn bnc_history_queries_are_target_scoped_and_merge_direct_messages() {
     .expect("persist first target");
     db::persist_bnc_line(
         &pool,
-        "alice",
-        "libera",
+        &e6ircd::db::open_bnc_buffer(
+            &pool,
+            Some("alice"),
+            "libera",
+            e6ircd::db::BncNetworkDefinition::Configured,
+        )
+        .await
+        .expect("open buffer"),
         Some("alice"),
         "@msgid=shared :a!u@h PRIVMSG #two :second",
     )
     .await
     .expect("persist second target");
 
-    let one = db::bnc_history_lines(&pool, "alice", "libera", "#ONE")
+    let one = history_latest(&pool, "#ONE")
         .await
         .expect("first target history");
-    let two = db::bnc_history_lines(&pool, "alice", "libera", "#two")
+    let two = history_latest(&pool, "#two")
         .await
         .expect("second target history");
     assert_eq!(one.len(), 1);
     assert_eq!(two.len(), 1);
     assert_ne!(one[0].id, two[0].id, "each target resolves its own row");
     assert!(
-        db::bnc_history_lines(&pool, "alice", "libera", "#three")
+        history_latest(&pool, "#three")
             .await
             .expect("missing target history")
             .is_empty(),
@@ -2962,11 +3203,23 @@ async fn bnc_history_queries_are_target_scoped_and_merge_direct_messages() {
         "@msgid=out :alice!u@h PRIVMSG Bob :outbound",
         "@msgid=in :Bob!u@h PRIVMSG alice :inbound",
     ] {
-        db::persist_bnc_line(&pool, "alice", "libera", Some("alice"), line)
+        db::persist_bnc_line(
+            &pool,
+            &e6ircd::db::open_bnc_buffer(
+                &pool,
+                Some("alice"),
+                "libera",
+                e6ircd::db::BncNetworkDefinition::Configured,
+            )
             .await
-            .expect("persist direct message");
+            .expect("open buffer"),
+            Some("alice"),
+            line,
+        )
+        .await
+        .expect("persist direct message");
     }
-    let direct = db::bnc_history_lines(&pool, "alice", "libera", "bOB")
+    let direct = history_latest(&pool, "bOB")
         .await
         .expect("direct-message history");
     assert_eq!(
@@ -3617,7 +3870,7 @@ async fn channel_keeptopic_persist_and_load() {
     // Turn it off → it appears in the off-list and clears all retained-topic
     // columns in the same UPDATE.
     assert!(
-        db::set_channel_keeptopic(&pool, "#c", false, None)
+        db::set_channel_keeptopic(&pool, "#c", false, None, "founder")
             .await
             .expect("off")
     );
@@ -3640,6 +3893,7 @@ async fn channel_keeptopic_persist_and_load() {
             "#c",
             true,
             Some(("current".into(), "boss!b@h".into(), 2000)),
+            "founder"
         )
         .await
         .expect("on")
@@ -3660,7 +3914,7 @@ async fn channel_keeptopic_persist_and_load() {
         )]
     );
     assert!(
-        !db::set_channel_keeptopic(&pool, "#missing", true, None)
+        !db::set_channel_keeptopic(&pool, "#missing", true, None, "founder")
             .await
             .expect("missing option row")
     );
@@ -3700,13 +3954,13 @@ async fn channel_mlock_persist_and_load() {
     // The database boundary rejects a semantically valid but non-canonical
     // spelling; every shipped writer canonicalizes before it reaches storage.
     assert!(
-        db::set_channel_mlock(&pool, "#c", Some("+tn-i".into()))
+        db::set_channel_mlock(&pool, "#c", Some("+tn-i".into()), "founder")
             .await
             .is_err()
     );
     for noncanonical in ["+-i", "+i-i"] {
         assert!(
-            db::set_channel_mlock(&pool, "#c", Some(noncanonical.into()))
+            db::set_channel_mlock(&pool, "#c", Some(noncanonical.into()), "founder")
                 .await
                 .is_err(),
             "database accepted non-canonical MLOCK {noncanonical}"
@@ -3715,7 +3969,7 @@ async fn channel_mlock_persist_and_load() {
 
     // Canonical set → loads back with the same spec.
     assert!(
-        db::set_channel_mlock(&pool, "#c", Some("+nt-i".into()))
+        db::set_channel_mlock(&pool, "#c", Some("+nt-i".into()), "founder")
             .await
             .expect("set")
     );
@@ -3726,7 +3980,7 @@ async fn channel_mlock_persist_and_load() {
 
     // Clear → it no longer loads.
     assert!(
-        db::set_channel_mlock(&pool, "#c", None)
+        db::set_channel_mlock(&pool, "#c", None, "founder")
             .await
             .expect("clear")
     );
@@ -3737,7 +3991,7 @@ async fn channel_mlock_persist_and_load() {
             .is_empty()
     );
     assert!(
-        !db::set_channel_mlock(&pool, "#missing", Some("+m".into()))
+        !db::set_channel_mlock(&pool, "#missing", Some("+m".into()), "founder")
             .await
             .expect("missing row")
     );
@@ -3902,6 +4156,157 @@ async fn managed_config_migration_backfills_legacy_oidc_claims() {
 /// old derivation (the first ten bytes of the nick), repaired only where the
 /// grammar no longer admits it. A network that worked keeps its identity; new
 /// configuration still gets no default.
+/// Migration 0061 adds the server password as a nullable sealed column: every
+/// network that existed keeps working without one, and only an IRC network
+/// can ever hold one.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn server_password_migration_adds_a_sealed_column_only_irc_may_fill() {
+    let pool = sqlx::PgPool::connect(
+        &support::test_db("server_password_migration_adds_a_sealed_column").await,
+    )
+    .await
+    .expect("connect");
+    MIGRATIONS
+        .run_to(60, &pool)
+        .await
+        .expect("migrate through 0060");
+    let account: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (name, name_folded) VALUES ('owner', 'owner') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("account");
+    sqlx::query(
+        "INSERT INTO bnc_networks (account_id, name, addr, nick, username, kind)
+         VALUES ($1, 'private', 'irc.example:6697', 'alice', 'alice', 'irc'),
+                ($1, 'bridge', '', '', NULL, 'discord')",
+    )
+    .bind(account)
+    .execute(&pool)
+    .await
+    .expect("networks before 0061");
+    MIGRATIONS.run(&pool).await.expect("migrate to latest");
+
+    let stored: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT server_password_sealed FROM bnc_networks ORDER BY name")
+            .fetch_all(&pool)
+            .await
+            .expect("read column");
+    assert_eq!(stored, [None, None], "nothing is backfilled");
+    sqlx::query(
+        "UPDATE bnc_networks SET server_password_sealed = 'enc:v2:x' WHERE name = 'private'",
+    )
+    .execute(&pool)
+    .await
+    .expect("an IRC network may hold one");
+    let bridge = sqlx::query(
+        "UPDATE bnc_networks SET server_password_sealed = 'enc:v2:x' WHERE name = 'bridge'",
+    )
+    .execute(&pool)
+    .await;
+    assert!(bridge.is_err(), "a bridge sends no PASS: {bridge:?}");
+}
+
+/// The server password is stored sealed under the owner's context, read back
+/// by every network query, and resealed by key rotation's reader like the
+/// SASL password.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_sealed_server_password_round_trips_through_every_network_query() {
+    let pool =
+        db::connect_and_migrate(&support::test_db("sealed_server_password_round_trip").await)
+            .await
+            .expect("connect");
+    db::create_account_with_contact(&pool, "alice", "pw", None)
+        .await
+        .expect("acct");
+    let keyring = e6ircd::secret::SecretKeyring::single(e6ircd::secret::SecretKey::generate());
+    let sealed = keyring.seal("open sesame", &e6ircd::bouncer::bnc_secret_context("alice"));
+    assert!(!sealed.contains("open sesame"));
+    let network = db::BncNetworkRow {
+        kind: NetworkKind::Irc,
+        name: "private".into(),
+        addr: "irc.example:6697".into(),
+        tls: true,
+        nick: "alice".into(),
+        username: Some("alice".into()),
+        realname: Some("Alice".into()),
+        autojoin: vec![],
+        sasl_account: None,
+        sasl_password_sealed: None,
+        server_password_sealed: Some(sealed.clone()),
+        enabled: true,
+    };
+    db::create_bnc_network(
+        &pool,
+        "alice",
+        &network,
+        e6ircd::db::NetworkAudit {
+            actor: "alice",
+            detail: "",
+        },
+    )
+    .await
+    .expect("create");
+    let listed = db::list_bnc_networks(&pool, "alice").await.expect("list");
+    let got = db::get_bnc_network(&pool, "alice", "private")
+        .await
+        .expect("get")
+        .expect("network");
+    let inventory = db::list_bnc_network_inventory(&pool)
+        .await
+        .expect("inventory");
+    let startable = db::list_startable_bnc_networks(&pool)
+        .await
+        .expect("startable");
+    for (query, value) in [
+        ("list", &listed[0].server_password_sealed),
+        ("get", &got.server_password_sealed),
+        ("inventory", &inventory[0].network.server_password_sealed),
+        ("startable", &startable[0].1.server_password_sealed),
+    ] {
+        assert_eq!(value.as_deref(), Some(sealed.as_str()), "{query}");
+    }
+    assert_eq!(
+        keyring
+            .open(&sealed, &e6ircd::bouncer::bnc_secret_context("alice"))
+            .expect("opens under the owner's context"),
+        "open sesame"
+    );
+    assert!(
+        keyring
+            .open(&sealed, &e6ircd::bouncer::bnc_secret_context("mallory"))
+            .is_err(),
+        "a blob cannot be opened for another account"
+    );
+
+    let mut removed = network.clone();
+    removed.server_password_sealed = None;
+    assert!(
+        db::update_bnc_network(
+            &pool,
+            "alice",
+            "private",
+            &removed,
+            e6ircd::db::NetworkAudit {
+                actor: "alice",
+                detail: ""
+            }
+        )
+        .await
+        .expect("update")
+    );
+    assert_eq!(
+        db::get_bnc_network(&pool, "alice", "private")
+            .await
+            .expect("get")
+            .expect("network")
+            .server_password_sealed,
+        None
+    );
+}
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn username_migration_backfills_what_each_network_was_already_sending() {
@@ -4128,7 +4533,7 @@ async fn channel_access_persist_and_load() {
     .await
     .expect("channel");
 
-    let applied = db::set_channel_access(&pool, "#c", "alice", Some("ov".into()))
+    let applied = db::set_channel_access(&pool, "#c", "alice", Some("ov".into()), "founder")
         .await
         .expect("set");
     assert!(applied, "granting a registered account must apply");
@@ -4139,7 +4544,7 @@ async fn channel_access_persist_and_load() {
 
     // Granting to an account that isn't registered writes no row and reports
     // that nothing applied — the caller must not create a hot entry for it.
-    let phantom = db::set_channel_access(&pool, "#c", "ghost", Some("o".into()))
+    let phantom = db::set_channel_access(&pool, "#c", "ghost", Some("o".into()), "founder")
         .await
         .expect("phantom grant");
     assert!(!phantom, "granting an unregistered account must not apply");
@@ -4149,7 +4554,7 @@ async fn channel_access_persist_and_load() {
         "phantom grant leaked a row"
     );
 
-    let cleared = db::set_channel_access(&pool, "#c", "alice", None)
+    let cleared = db::set_channel_access(&pool, "#c", "alice", None, "founder")
         .await
         .expect("clear");
     assert!(cleared, "clearing access always applies");
@@ -4331,7 +4736,7 @@ async fn channel_founder_transfer() {
 
     // Transfer to an existing account succeeds and moves ownership.
     assert!(
-        db::set_channel_founder(&pool, "#c", "alice")
+        db::set_channel_founder(&pool, "#c", "alice", "founder")
             .await
             .expect("transfer")
     );
@@ -4342,7 +4747,7 @@ async fn channel_founder_transfer() {
 
     // Transfer to a nonexistent account fails and leaves ownership intact.
     assert!(
-        !db::set_channel_founder(&pool, "#c", "nobody")
+        !db::set_channel_founder(&pool, "#c", "nobody", "founder")
             .await
             .expect("transfer")
     );
@@ -5089,6 +5494,22 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
         buffer_cap: 100,
         sasl_account: Some(old.seal("xoxb-old", CONFIG_CONTEXT)),
         sasl_password: Some(old.seal("xapp-old", CONFIG_CONTEXT)),
+        server_password: None,
+    });
+    managed.networks.push(NetworkEntry {
+        name: "private-shared".into(),
+        kind: NetworkKind::Irc,
+        owner: None,
+        addr: "irc.example:6697".into(),
+        tls: true,
+        nick: "shared".into(),
+        username: Some("shared".into()),
+        realname: Some("Shared".into()),
+        autojoin: vec![],
+        buffer_cap: 100,
+        sasl_account: None,
+        sasl_password: None,
+        server_password: Some(old.seal("managed-pass", CONFIG_CONTEXT)),
     });
     db::load_or_initialize_managed_config(&pool, &managed)
         .await
@@ -5107,10 +5528,44 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
         sasl_account: Some(old.seal("xoxb-account", &owner_context)),
         sasl_password_sealed: Some(old.seal("xapp-account", &owner_context)),
         enabled: false,
+        server_password_sealed: None,
     };
-    db::create_bnc_network(&pool, "alice", &account_network)
-        .await
-        .expect("account network");
+    db::create_bnc_network(
+        &pool,
+        "alice",
+        &account_network,
+        e6ircd::db::NetworkAudit {
+            actor: "alice",
+            detail: "",
+        },
+    )
+    .await
+    .expect("account network");
+    let private_network = db::BncNetworkRow {
+        kind: NetworkKind::Irc,
+        name: "private".into(),
+        addr: "irc.example:6697".into(),
+        tls: true,
+        nick: "alice".into(),
+        username: Some("alice".into()),
+        realname: Some("Alice".into()),
+        autojoin: vec![],
+        sasl_account: None,
+        sasl_password_sealed: None,
+        server_password_sealed: Some(old.seal("account-pass", &owner_context)),
+        enabled: false,
+    };
+    db::create_bnc_network(
+        &pool,
+        "alice",
+        &private_network,
+        e6ircd::db::NetworkAudit {
+            actor: "alice",
+            detail: "",
+        },
+    )
+    .await
+    .expect("private account network");
 
     let new = SecretKey::generate();
     let new_base64 = new.to_base64();
@@ -5121,8 +5576,8 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
     assert_eq!(
         report,
         db::SecretRotationReport {
-            managed_config_secrets: 4,
-            account_network_secrets: 2,
+            managed_config_secrets: 5,
+            account_network_secrets: 3,
         }
     );
 
@@ -5140,6 +5595,29 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
             .open(&rotated.settings.opers[0].password, CONFIG_CONTEXT)
             .is_err(),
         "old key still opened a rotated managed secret"
+    );
+    let rotated_private = db::get_bnc_network(&pool, "alice", "private")
+        .await
+        .expect("network query")
+        .expect("network");
+    assert_eq!(
+        new_verifier
+            .open(
+                rotated_private.server_password_sealed.as_deref().unwrap(),
+                &owner_context,
+            )
+            .unwrap(),
+        "account-pass",
+        "an account network's server password is resealed"
+    );
+    let managed_pass = rotated.settings.networks[1]
+        .server_password
+        .as_deref()
+        .unwrap();
+    assert_eq!(
+        new_verifier.open(managed_pass, CONFIG_CONTEXT).unwrap(),
+        "managed-pass",
+        "a managed network's server password is resealed"
     );
     let rotated_network = db::get_bnc_network(&pool, "alice", "team")
         .await
@@ -5208,6 +5686,11 @@ async fn unreadable_secret_rolls_back_the_entire_rotation() {
             sasl_account: Some("alice".into()),
             sasl_password_sealed: Some("enc:v2:not-base64".into()),
             enabled: false,
+            server_password_sealed: None,
+        },
+        e6ircd::db::NetworkAudit {
+            actor: "alice",
+            detail: "",
         },
     )
     .await
@@ -5225,14 +5708,14 @@ async fn unreadable_secret_rolls_back_the_entire_rotation() {
         after.settings.opers[0].password, initial.settings.opers[0].password,
         "the earlier settings update escaped the failed transaction"
     );
-    // Alice's own ACCOUNT_CREATE row from her self-registration is the only
-    // audit entry: the rotation's success row was rolled back with it.
+    // Alice's self-registration and her network's creation are the only
+    // audit entries: the rotation's success row was rolled back with it.
     assert!(
         list_audit_log(&pool, audit_page_size(10))
             .await
             .expect("audit")
             .iter()
-            .all(|entry| entry.action == "ACCOUNT_CREATE"),
+            .all(|entry| matches!(entry.action.as_str(), "ACCOUNT_CREATE" | "NETWORK_CREATE")),
         "a rolled-back rotation left an audit success"
     );
 }
@@ -5624,7 +6107,7 @@ async fn history_read_authorization_is_scoped() {
             .unwrap()
     );
     // Granting access lets them read.
-    db::set_channel_access(&pool, "#chan", "bob", Some("v".into()))
+    db::set_channel_access(&pool, "#chan", "bob", Some("v".into()), "founder")
         .await
         .expect("grant");
     assert!(
@@ -5847,14 +6330,32 @@ async fn bnc_buffer_trim_is_scoped_to_one_network() {
 
     for i in 0..6_000 {
         for network in ["alpha", "beta"] {
-            db::persist_bnc_line(&pool, "owner", network, None, &format!("line {i}"))
+            db::persist_bnc_line(
+                &pool,
+                &e6ircd::db::open_bnc_buffer(
+                    &pool,
+                    Some("owner"),
+                    network,
+                    e6ircd::db::BncNetworkDefinition::Configured,
+                )
                 .await
-                .expect("persist");
+                .expect("open buffer"),
+                None,
+                &format!("line {i}"),
+            )
+            .await
+            .expect("persist");
         }
     }
-    db::trim_bnc_buffer(&pool, "owner", "alpha")
-        .await
-        .expect("trim");
+    let alpha = db::open_bnc_buffer(
+        &pool,
+        Some("owner"),
+        "alpha",
+        db::BncNetworkDefinition::Configured,
+    )
+    .await
+    .expect("open buffer");
+    db::trim_bnc_buffer(&pool, &alpha).await.expect("trim");
 
     assert_eq!(count("alpha").await, 5_000, "alpha trimmed to the cap");
     assert_eq!(count("beta").await, 6_000, "beta untouched");
@@ -6398,7 +6899,7 @@ async fn account_invitations_are_single_use_expiring_and_digest_only() {
             .is_none()
     );
 
-    let account = db::accept_account_invitation(&pool, &token, "invited password")
+    let account = db::accept_account_invitation(&pool, &token, "invited password", &[])
         .await
         .expect("accept");
     assert_eq!(account, "Bob");
@@ -6416,7 +6917,7 @@ async fn account_invitations_are_single_use_expiring_and_digest_only() {
             .is_admin()
     );
     assert!(matches!(
-        db::accept_account_invitation(&pool, &token, "other password").await,
+        db::accept_account_invitation(&pool, &token, "other password", &[]).await,
         Err(db::DbError::InvitationUnavailable)
     ));
     assert!(
@@ -6487,7 +6988,7 @@ async fn permanent_account_deletion_requires_succession_purges_and_retires() {
         Err(db::DbError::AccountOwnsChannels(1))
     ));
     assert!(
-        db::set_channel_founder(&pool, "#bob", "alice")
+        db::set_channel_founder(&pool, "#bob", "alice", "founder")
             .await
             .expect("transfer")
     );
@@ -6566,7 +7067,8 @@ async fn permanent_account_deletion_requires_succession_purges_and_retires() {
             (SELECT count(*) FROM bnc_buffer WHERE owner = 'bob'),
             (SELECT count(*) FROM messages
              WHERE sender_account IN ('Bob', 'bob') OR dm_peers @> ARRAY['bob']),
-            (SELECT count(*) FROM device_grants WHERE account = 'Bob'),
+            (SELECT count(*) FROM device_grants g JOIN accounts a ON a.id = g.account_id
+              WHERE a.name = 'Bob'),
             (SELECT count(*) FROM bnc_read_markers WHERE account_id = $1)",
     )
     .bind(bob_id)
@@ -6640,9 +7142,10 @@ async fn account_export_and_security_activity_are_owner_scoped_and_secret_free()
         .expect("token");
     sqlx::query(
         "INSERT INTO bnc_networks
-            (account_id, name, addr, tls, nick, username, sasl_account, sasl_password_sealed)
+            (account_id, name, addr, tls, nick, username, sasl_account, sasl_password_sealed,
+             server_password_sealed)
          VALUES ($1, 'libera', 'irc.libera.chat:6697', true, 'Alice', 'alice',
-                 'alice', 'enc:v1:must-not-export')",
+                 'alice', 'enc:v1:must-not-export', 'enc:v2:server-password-must-not-export')",
     )
     .bind(alice_id)
     .execute(&pool)
@@ -6671,15 +7174,14 @@ async fn account_export_and_security_activity_are_owner_scoped_and_secret_free()
         .await
         .expect("other event");
 
-    let export = db::export_account_json(&pool, "ALICE")
-        .await
-        .expect("export")
-        .expect("Alice");
+    let export = export_account(&pool, "ALICE").await.expect("Alice");
     let value: serde_json::Value = serde_json::from_str(&export).expect("valid JSON");
     assert_eq!(value["schema_version"], 1);
     assert_eq!(value["account"]["name"], "Alice");
     assert_eq!(value["account"]["contact_email"], "Alice@example.com");
     assert_eq!(value["networks"][0]["has_sasl_password"], true);
+    assert_eq!(value["networks"][0]["has_server_password"], true);
+    assert!(!export.contains("server-password-must-not-export"));
     assert_eq!(
         value["messages"][0]["message_id"], "alice-sent",
         "a channel message is stored under the display name and is still the account's"
@@ -7026,14 +7528,19 @@ async fn startup_database_wait_retries_a_refused_port_then_gives_up() {
     let wait = db::StartupDatabaseWait::from_seconds(8).expect("bounded");
     let mut reported: Vec<(u32, Option<std::time::Duration>)> = Vec::new();
     let started = std::time::Instant::now();
-    let error = db::connect_and_migrate_with_retry(&url, wait, |attempt| {
-        assert!(
-            matches!(attempt.error, db::DbError::Connect(_)),
-            "{}",
-            attempt.error
-        );
-        reported.push((attempt.attempt, attempt.retry_in));
-    })
+    let error = db::connect_and_migrate_with_retry(
+        &url,
+        wait,
+        db::DatabasePoolSize::for_this_host(),
+        |attempt| {
+            assert!(
+                matches!(attempt.error, db::DbError::Connect(_)),
+                "{}",
+                attempt.error
+            );
+            reported.push((attempt.attempt, attempt.retry_in));
+        },
+    )
     .await
     .expect_err("nothing listens there");
     let elapsed = started.elapsed();
@@ -7074,9 +7581,14 @@ async fn startup_database_wait_of_zero_is_a_single_attempt() {
     );
     let wait = db::StartupDatabaseWait::from_seconds(0).expect("bounded");
     let mut attempts = 0;
-    let error = db::connect_and_migrate_with_retry(&url, wait, |_| attempts += 1)
-        .await
-        .expect_err("refused");
+    let error = db::connect_and_migrate_with_retry(
+        &url,
+        wait,
+        db::DatabasePoolSize::for_this_host(),
+        |_| attempts += 1,
+    )
+    .await
+    .expect_err("refused");
     assert_eq!(attempts, 1);
     assert!(matches!(
         error,
@@ -7171,6 +7683,7 @@ async fn startup_database_wait_uses_a_database_that_appears_in_the_window() {
     let pool = db::connect_and_migrate_with_retry(
         &proxied,
         db::StartupDatabaseWait::from_seconds(20).expect("bounded"),
+        db::DatabasePoolSize::for_this_host(),
         |_| attempts += 1,
     )
     .await
@@ -7366,11 +7879,13 @@ async fn administrator_recovery_restores_one_named_account_and_is_audited() {
             .expect("token inventory")
             .is_empty()
     );
-    let device_grants: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM device_grants WHERE account = 'Alice'")
-            .fetch_one(&pool)
-            .await
-            .expect("device grant count");
+    let device_grants: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM device_grants g JOIN accounts a ON a.id = g.account_id
+             WHERE a.name = 'Alice'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("device grant count");
     assert_eq!(device_grants, 0, "the approved device grant is revoked");
     assert_eq!(
         recovered.account, "Alice",
@@ -7666,5 +8181,1062 @@ async fn app_passwords_are_found_by_lookup_and_none_can_exist_without_one() {
     assert!(
         !primary_has_lookup,
         "a chosen password is never stored under a fast hash"
+    );
+}
+
+// ---- privilege persistence across suspension, demotion and recovery -------
+
+/// An administrator account and the pending invitations it issued: one that
+/// grants durable administrator authority, one that does not.
+async fn administrator_with_pending_invitations(pool: &sqlx::PgPool) -> (i64, String, String) {
+    db::bootstrap_first_admin(pool, "Alice", "administrator password")
+        .await
+        .expect("Alice");
+    let mallory = db::create_account_by_administrator(
+        pool,
+        "Mallory",
+        "mallory password",
+        None,
+        true,
+        "Alice",
+    )
+    .await
+    .expect("Mallory");
+    let lifetime = e6ircd::identity::AccountInvitationLifetimeDays::new(7).expect("lifetime");
+    let administrator = db::issue_account_invitation(pool, "Eve", None, true, lifetime, "Mallory")
+        .await
+        .expect("administrator invitation");
+    let ordinary = db::issue_account_invitation(pool, "Frank", None, false, lifetime, "Mallory")
+        .await
+        .expect("ordinary invitation");
+    (mallory, administrator, ordinary)
+}
+
+async fn invitation_revocations(pool: &sqlx::PgPool) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT actor, target FROM audit_log
+         WHERE action = 'ACCOUNT_INVITATION_REVOKE' ORDER BY target",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("revocation audit")
+}
+
+/// Suspending an account ends every invitation it issued, in the suspension's
+/// own transaction: an intruder who minted administrator invitations with a
+/// stolen administrator session cannot come back through them afterwards.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn suspension_revokes_the_suspended_accounts_pending_invitations() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("suspension_revokes_the_suspended_accounts_invitations").await,
+    )
+    .await
+    .expect("connect");
+    let (mallory, administrator, ordinary) = administrator_with_pending_invitations(&pool).await;
+    db::set_account_suspended(&pool, mallory, true, "Alice", &[])
+        .await
+        .expect("suspend")
+        .expect("Mallory");
+    for token in [&administrator, &ordinary] {
+        let accepted = db::accept_account_invitation(&pool, token, "invited password", &[]).await;
+        assert!(
+            matches!(accepted, Err(db::DbError::InvitationUnavailable)),
+            "a suspended issuer's invitation must not open an account: {accepted:?}"
+        );
+    }
+    assert_eq!(
+        invitation_revocations(&pool).await,
+        [
+            ("alice".to_string(), "eve".to_string()),
+            ("alice".to_string(), "frank".to_string())
+        ]
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn demotion_revokes_the_demoted_accounts_pending_invitations() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("demotion_revokes_the_demoted_accounts_invitations").await,
+    )
+    .await
+    .expect("connect");
+    let (mallory, administrator, ordinary) = administrator_with_pending_invitations(&pool).await;
+    db::set_account_administrator(&pool, mallory, false, "Alice", &[])
+        .await
+        .expect("demote")
+        .expect("Mallory");
+    for token in [&administrator, &ordinary] {
+        let accepted = db::accept_account_invitation(&pool, token, "invited password", &[]).await;
+        assert!(
+            matches!(accepted, Err(db::DbError::InvitationUnavailable)),
+            "a demoted issuer's invitation must not open an account: {accepted:?}"
+        );
+    }
+    assert_eq!(invitation_revocations(&pool).await.len(), 2);
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn administrator_recovery_revokes_the_recovered_accounts_invitations() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("administrator_recovery_revokes_the_recovered_invitations").await,
+    )
+    .await
+    .expect("connect");
+    let (_mallory, administrator, ordinary) = administrator_with_pending_invitations(&pool).await;
+    db::recover_administrator(&pool, "MALLORY")
+        .await
+        .expect("recover");
+    for token in [&administrator, &ordinary] {
+        let accepted = db::accept_account_invitation(&pool, token, "invited password", &[]).await;
+        assert!(
+            matches!(accepted, Err(db::DbError::InvitationUnavailable)),
+            "an invitation minted with lost credentials must not survive recovery: {accepted:?}"
+        );
+    }
+    assert_eq!(
+        invitation_revocations(&pool).await,
+        [
+            ("host:recover-administrator".to_string(), "eve".to_string()),
+            (
+                "host:recover-administrator".to_string(),
+                "frank".to_string()
+            )
+        ]
+    );
+}
+
+/// Acceptance re-checks the issuer: an administrator invitation opens an
+/// administrator account only while its issuer still holds that authority —
+/// durably or by configuration — and is active.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn administrator_invitation_requires_an_issuer_who_is_still_an_active_administrator() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("administrator_invitation_requires_active_issuer").await,
+    )
+    .await
+    .expect("connect");
+    let (_mallory, administrator, ordinary) = administrator_with_pending_invitations(&pool).await;
+    // Authority removed by a path that knows nothing of invitations.
+    sqlx::query("UPDATE accounts SET flags = 0 WHERE name_folded = 'mallory'")
+        .execute(&pool)
+        .await
+        .expect("strip authority");
+    let accepted =
+        db::accept_account_invitation(&pool, &administrator, "invited password", &[]).await;
+    assert!(
+        matches!(accepted, Err(db::DbError::InvitationUnavailable)),
+        "{accepted:?}"
+    );
+    // A configured grant is authority too.
+    let configured = ["mallory".to_string()];
+    assert_eq!(
+        db::accept_account_invitation(&pool, &administrator, "invited password", &configured)
+            .await
+            .expect("configured issuer"),
+        "Eve"
+    );
+    // An ordinary invitation carries no authority to re-check.
+    assert_eq!(
+        db::accept_account_invitation(&pool, &ordinary, "invited password", &[])
+            .await
+            .expect("ordinary"),
+        "Frank"
+    );
+    // A suspended configured administrator's invitation is refused.
+    let lifetime = e6ircd::identity::AccountInvitationLifetimeDays::new(7).expect("lifetime");
+    let later = db::issue_account_invitation(&pool, "Grace", None, true, lifetime, "Mallory")
+        .await
+        .expect("issue");
+    sqlx::query("UPDATE accounts SET flags = 2 WHERE name_folded = 'mallory'")
+        .execute(&pool)
+        .await
+        .expect("suspend by flag");
+    let accepted =
+        db::accept_account_invitation(&pool, &later, "invited password", &configured).await;
+    assert!(
+        matches!(accepted, Err(db::DbError::InvitationUnavailable)),
+        "{accepted:?}"
+    );
+}
+
+/// Expired invitations no longer count against the issuer's pending cap.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn expired_invitations_do_not_count_against_the_pending_cap() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("expired_invitations_do_not_count_against_the_cap").await,
+    )
+    .await
+    .expect("connect");
+    db::bootstrap_first_admin(&pool, "Alice", "administrator password")
+        .await
+        .expect("Alice");
+    sqlx::query(
+        "INSERT INTO account_invitations
+            (token_hash, account_name, name_folded, created_by, created_at, expires_at)
+         SELECT sha256(convert_to('t' || n, 'UTF8')), 'x' || n, 'x' || n, 'alice',
+                now() - interval '10 days', now() - interval '1 day'
+         FROM generate_series(1, $1) n",
+    )
+    .bind(db::MAX_PENDING_ACCOUNT_INVITATIONS_PER_ADMINISTRATOR as i32)
+    .execute(&pool)
+    .await
+    .expect("expired invitations");
+    db::issue_account_invitation(
+        &pool,
+        "Bob",
+        None,
+        false,
+        e6ircd::identity::AccountInvitationLifetimeDays::new(1).expect("lifetime"),
+        "Alice",
+    )
+    .await
+    .expect("expired invitations are not pending");
+}
+
+// ---- migrations outside the pool's statement timeout ----------------------
+
+/// A migration that runs longer than the pool's statement timeout still
+/// completes: the migrator runs on its own connection with no statement
+/// timeout, so a large deployment does not crash-loop on upgrade.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_migration_longer_than_the_statement_timeout_completes() {
+    let url = support::test_db("a_migration_longer_than_the_statement_timeout").await;
+    let directory = std::env::temp_dir().join(format!(
+        "e6irc-slow-migration-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).expect("migration directory");
+    std::fs::write(
+        directory.join("0001_slow.sql"),
+        "SELECT pg_sleep(16);\nCREATE TABLE slow_migration_done (id INT);\n",
+    )
+    .expect("slow migration");
+    let migrator = sqlx::migrate::Migrator::new(directory.as_path())
+        .await
+        .expect("migrator");
+    db::run_migrations(&url, &migrator)
+        .await
+        .expect("a slow migration completes");
+    std::fs::remove_dir_all(&directory).expect("clean up");
+    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    let done: bool = sqlx::query_scalar("SELECT to_regclass('slow_migration_done') IS NOT NULL")
+        .fetch_one(&pool)
+        .await
+        .expect("check");
+    assert!(done);
+}
+
+// ---- account purge is indexed ---------------------------------------------
+
+/// Both halves of the account-message predicate that deletion and export use
+/// are index-served: with sequential scans disabled, the plan still contains
+/// none (a predicate half with no index would force one regardless).
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn the_account_message_predicate_is_index_served() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("the_account_message_predicate_is_index_served").await,
+    )
+    .await
+    .expect("connect");
+    let mut connection = pool.acquire().await.expect("connection");
+    sqlx::query("SET enable_seqscan = off")
+        .execute(&mut *connection)
+        .await
+        .expect("disable seqscan");
+    let sql = format!(
+        "EXPLAIN (FORMAT TEXT) SELECT id FROM messages WHERE {}",
+        db::ACCOUNT_MESSAGES_PREDICATE
+    );
+    let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind("alice")
+        .bind("Alice")
+        .fetch_all(&mut *connection)
+        .await
+        .expect("explain");
+    let plan = plan.join("\n");
+    assert!(!plan.contains("Seq Scan"), "{plan}");
+    assert!(plan.contains("messages_sender_account_idx"), "{plan}");
+    assert!(plan.contains("messages_dm_peers_idx"), "{plan}");
+}
+
+// ---- Argon2 outside row locks ----------------------------------------------
+
+/// A password change waits for an Argon2 permit without holding the account
+/// row: while every permit is busy, a read-marker write for the same account
+/// (whose foreign-key check needs a share lock on that row) is not blocked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_password_change_waiting_for_argon2_does_not_block_the_account_row() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("a_password_change_waiting_for_argon2_does_not_block").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account_with_contact(&pool, "alice", "current password", None)
+        .await
+        .expect("alice");
+    let session = db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("session");
+
+    // Keep every Argon2 permit busy for the whole test.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut flood = tokio::task::JoinSet::new();
+    for _ in 0..12 {
+        let pool = pool.clone();
+        let stop = stop.clone();
+        flood.spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = db::verify_credentials(&pool, "nobody", "guess").await;
+            }
+        });
+    }
+
+    let (req_tx, req_rx) = queue::<DbRequest>(QueueConfig {
+        name: "t-db",
+        capacity: 8,
+        policy: Policy::Fifo,
+    });
+    let (core_tx, mut core_rx) = queue::<Input>(QueueConfig {
+        name: "t-core",
+        capacity: 8,
+        policy: Policy::Fifo,
+    });
+    tokio::spawn(db::run_worker(
+        pool.clone(),
+        req_rx,
+        CoreIngress::single(core_tx),
+    ));
+
+    let change = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            db::change_local_password(
+                &pool,
+                "alice",
+                "current password",
+                "a brand new password",
+                &session,
+            )
+            .await
+        }
+    });
+    let mut slowest = std::time::Duration::ZERO;
+    let mut probes = 0u64;
+    while !change.is_finished() {
+        let started = std::time::Instant::now();
+        req_tx
+            .push(DbRequest::SetReadMarker {
+                conn: e6ircd::core::ConnId(1),
+                account: "alice".into(),
+                target: format!("#probe{probes}"),
+                display: format!("#probe{probes}"),
+                marker_ms: e6irc_proto::time::Millis::from_millis(1_000),
+                label: None,
+            })
+            .await
+            .expect("push");
+        let reply = core_rx.pop().await.expect("worker reply");
+        slowest = slowest.max(started.elapsed());
+        assert!(
+            matches!(
+                reply.payload,
+                Input::DbReply {
+                    reply: DbReply::ReadMarkerStored { .. },
+                    ..
+                }
+            ),
+            "{:?}",
+            reply.payload
+        );
+        probes += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    change.await.expect("join").expect("password changed");
+    while flood.join_next().await.is_some() {}
+    assert!(probes > 0, "the change finished before any probe ran");
+    assert!(
+        slowest < std::time::Duration::from_secs(1),
+        "a read-marker write waited {slowest:?} behind a password change"
+    );
+}
+
+// ---- storage maintenance collections are independent -----------------------
+
+/// Each maintenance collection commits on its own: one table failing to delete
+/// (here, a trigger that refuses) is reported, and does not roll back the
+/// expired history the other collections removed.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn one_failing_maintenance_collection_does_not_roll_back_the_others() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("one_failing_maintenance_collection_does_not_roll_back").await,
+    )
+    .await
+    .expect("connect");
+    let account = db::create_account_with_contact(&pool, "alice", "password", None)
+        .await
+        .expect("alice");
+    sqlx::query(
+        "INSERT INTO messages (msgid, target, sender_prefix, kind, body, ts)
+         VALUES ('old', '#test', 'a!u@h', 'privmsg', 'old', now() - interval '31 days')",
+    )
+    .execute(&pool)
+    .await
+    .expect("old message");
+    sqlx::query(
+        "INSERT INTO web_sessions (token_hash, account_id, expires_at)
+         VALUES ('\\x00'::bytea, $1, now() - interval '1 day')",
+    )
+    .bind(account)
+    .execute(&pool)
+    .await
+    .expect("expired session");
+    sqlx::raw_sql(
+        "CREATE FUNCTION refuse_delete() RETURNS trigger LANGUAGE plpgsql AS
+             $$ BEGIN RAISE EXCEPTION 'refused by test'; END $$;
+         CREATE TRIGGER refuse_session_delete BEFORE DELETE ON web_sessions
+             FOR EACH ROW EXECUTE FUNCTION refuse_delete();",
+    )
+    .execute(&pool)
+    .await
+    .expect("trigger");
+    let outcome = db::run_storage_maintenance(
+        &pool,
+        db::StorageRetention {
+            history_days: 30,
+            audit_days: 365,
+            observability_hours: 24,
+        },
+    )
+    .await;
+    let error = outcome.expect_err("a failing collection is reported");
+    assert!(error.to_string().contains("web_sessions"), "{error}");
+    let messages: i64 = sqlx::query_scalar("SELECT count(*) FROM messages")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(messages, 0, "expired history was still collected");
+}
+
+// ---- durable read-marker cap -----------------------------------------------
+
+/// The per-account read-marker cap holds in the database, where every core
+/// shard's writes meet: the 257th target is refused, re-writing a held target
+/// is not.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn the_read_marker_cap_is_enforced_by_the_database() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("the_read_marker_cap_is_enforced_by_the_database").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account_with_contact(&pool, "alice", "password", None)
+        .await
+        .expect("alice");
+    let (req_tx, req_rx) = queue::<DbRequest>(QueueConfig {
+        name: "t-db",
+        capacity: 8,
+        policy: Policy::Fifo,
+    });
+    let (core_tx, mut core_rx) = queue::<Input>(QueueConfig {
+        name: "t-core",
+        capacity: 8,
+        policy: Policy::Fifo,
+    });
+    tokio::spawn(db::run_worker(pool, req_rx, CoreIngress::single(core_tx)));
+    let mut write = async |target: String| {
+        req_tx
+            .push(DbRequest::SetReadMarker {
+                conn: e6ircd::core::ConnId(1),
+                account: "Alice".into(),
+                target: target.clone(),
+                display: target,
+                marker_ms: e6irc_proto::time::Millis::from_millis(1_000),
+                label: None,
+            })
+            .await
+            .expect("push");
+        match core_rx.pop().await.expect("reply").payload {
+            Input::DbReply { reply, .. } => reply,
+            other => panic!("unexpected {other:?}"),
+        }
+    };
+    for index in 0..256 {
+        let reply = write(format!("#t{index}")).await;
+        assert!(
+            matches!(reply, DbReply::ReadMarkerStored { .. }),
+            "{index}: {reply:?}"
+        );
+    }
+    let refused = write("#one-too-many".into()).await;
+    assert!(
+        matches!(refused, DbReply::ReadMarkerLimitReached { .. }),
+        "{refused:?}"
+    );
+    let again = write("#t7".into()).await;
+    assert!(
+        matches!(again, DbReply::ReadMarkerStored { .. }),
+        "{again:?}"
+    );
+}
+
+// ---- corrective and backfilling migrations ---------------------------------
+
+/// 0066 folds the targets 0059 wrote under display names, so a mixed-case
+/// account sees its own revocations.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn app_password_revocations_from_0059_become_visible_to_their_account() {
+    let pool = sqlx::PgPool::connect(
+        &support::test_db("app_password_revocations_from_0059_become_visible").await,
+    )
+    .await
+    .expect("connect");
+    MIGRATIONS.run_to(58, &pool).await.expect("through 0058");
+    let account: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (name, name_folded) VALUES ('Mixed[Case]', 'mixed{case}')
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("account");
+    sqlx::query(
+        "INSERT INTO account_credentials (account_id, kind, argon2_hash, label)
+         VALUES ($1, 'app_password', 'hash', 'phone')",
+    )
+    .bind(account)
+    .execute(&pool)
+    .await
+    .expect("app password");
+    MIGRATIONS.run(&pool).await.expect("migrate to latest");
+    let page = db::query_account_security_activity(&pool, "MIXED[CASE]", None, audit_page_size(10))
+        .await
+        .expect("activity");
+    assert!(
+        page.entries
+            .iter()
+            .any(|entry| entry.action == "ACCOUNT_APP_PASSWORD_REVOKE"
+                && entry.target == "mixed{case}"),
+        "{:?}",
+        page.entries
+    );
+}
+
+/// 0062 backfills each database network's backlog with its row id, leaves
+/// configuration networks' rows without one, and the key cascades.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn bouncer_backlog_is_backfilled_with_its_network_and_cascades() {
+    let pool = sqlx::PgPool::connect(
+        &support::test_db("bouncer_backlog_is_backfilled_with_its_network").await,
+    )
+    .await
+    .expect("connect");
+    MIGRATIONS.run_to(61, &pool).await.expect("through 0061");
+    let account: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (name, name_folded) VALUES ('Alice', 'alice') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("account");
+    let network: i64 = sqlx::query_scalar(
+        "INSERT INTO bnc_networks (account_id, name, addr, nick, username, kind)
+         VALUES ($1, 'Libera', 'irc.libera.chat:6697', 'alice', 'alice', 'irc') RETURNING id",
+    )
+    .bind(account)
+    .fetch_one(&pool)
+    .await
+    .expect("network");
+    sqlx::query(
+        "INSERT INTO bnc_buffer (owner, network, line) VALUES
+           ('alice', 'libera', 'owned'),
+           ('alice', 'configured', 'configured'),
+           ('*', 'shared', 'shared')",
+    )
+    .execute(&pool)
+    .await
+    .expect("lines");
+    MIGRATIONS.run(&pool).await.expect("migrate to latest");
+    let rows: Vec<(String, Option<i64>)> =
+        sqlx::query_as("SELECT line, network_id FROM bnc_buffer ORDER BY line")
+            .fetch_all(&pool)
+            .await
+            .expect("rows");
+    assert_eq!(
+        rows,
+        [
+            ("configured".to_string(), None),
+            ("owned".to_string(), Some(network)),
+            ("shared".to_string(), None)
+        ]
+    );
+    let refused = sqlx::query(
+        "INSERT INTO bnc_buffer (owner, network, line, network_id) VALUES ('*', 'shared', 'x', $1)",
+    )
+    .bind(network)
+    .execute(&pool)
+    .await;
+    assert!(refused.is_err(), "a server-level line never names a row");
+    sqlx::query("DELETE FROM bnc_networks WHERE id = $1")
+        .bind(network)
+        .execute(&pool)
+        .await
+        .expect("delete network");
+    let late = sqlx::query(
+        "INSERT INTO bnc_buffer (owner, network, line, network_id)
+         VALUES ('alice', 'libera', 'late', $1)",
+    )
+    .bind(network)
+    .execute(&pool)
+    .await;
+    assert!(late.is_err(), "a line for a deleted network fails loudly");
+    let left: Vec<String> = sqlx::query_scalar("SELECT line FROM bnc_buffer ORDER BY line")
+        .fetch_all(&pool)
+        .await
+        .expect("left");
+    assert_eq!(left, ["configured", "shared"]);
+}
+
+/// 0065 moves an approved device grant from a display-name string to the
+/// account's id, which cascades.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn device_grants_name_their_account_by_id() {
+    let pool =
+        sqlx::PgPool::connect(&support::test_db("device_grants_name_their_account_by_id").await)
+            .await
+            .expect("connect");
+    MIGRATIONS.run_to(64, &pool).await.expect("through 0064");
+    let account: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (name, name_folded) VALUES ('Alice', 'alice') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("account");
+    sqlx::query(
+        "INSERT INTO device_grants (device_code, user_code, account, expires_at) VALUES
+           ('d1', 'U1', 'Alice', now() + interval '5 minutes'),
+           ('d2', 'U2', 'Gone', now() + interval '5 minutes'),
+           ('d3', 'U3', NULL, now() + interval '5 minutes')",
+    )
+    .execute(&pool)
+    .await
+    .expect("grants");
+    MIGRATIONS.run(&pool).await.expect("migrate to latest");
+    let rows: Vec<(String, Option<i64>)> =
+        sqlx::query_as("SELECT device_code, account_id FROM device_grants ORDER BY device_code")
+            .fetch_all(&pool)
+            .await
+            .expect("rows");
+    assert_eq!(
+        rows,
+        [("d1".to_string(), Some(account)), ("d3".to_string(), None)]
+    );
+    sqlx::query("DELETE FROM accounts WHERE id = $1")
+        .bind(account)
+        .execute(&pool)
+        .await
+        .expect("delete account");
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM device_grants")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(left, 1, "the account's approved grant went with it");
+}
+
+// ---- audit rows commit with their mutations --------------------------------
+
+fn audit_test_network(name: &str) -> db::BncNetworkRow {
+    db::BncNetworkRow {
+        kind: NetworkKind::Irc,
+        name: name.into(),
+        addr: "irc.example:6697".into(),
+        tls: true,
+        nick: "alice".into(),
+        username: Some("alice".into()),
+        realname: Some("Alice".into()),
+        autojoin: vec![],
+        sasl_account: None,
+        sasl_password_sealed: None,
+        enabled: true,
+        server_password_sealed: None,
+    }
+}
+
+/// A network change and its audit row are one transaction: when the audit row
+/// cannot be written, the change does not happen; when it happens, the row
+/// names the folded actor and the stored network.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn network_mutations_commit_only_with_their_audit_rows() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("network_mutations_commit_only_with_their_audit").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account_with_contact(&pool, "Alice", "password", None)
+        .await
+        .expect("alice");
+    let audit = db::NetworkAudit {
+        actor: "Alice",
+        detail: "irc; fields: addr",
+    };
+    db::create_bnc_network(&pool, "alice", &audit_test_network("Work"), audit)
+        .await
+        .expect("create");
+    let recorded: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT actor, action, target FROM audit_log WHERE action LIKE 'NETWORK_%'")
+            .fetch_all(&pool)
+            .await
+            .expect("audit");
+    assert_eq!(
+        recorded,
+        [(
+            "alice".to_string(),
+            "NETWORK_CREATE".to_string(),
+            "alice/Work".to_string()
+        )]
+    );
+
+    sqlx::raw_sql(
+        "CREATE FUNCTION refuse_network_audit() RETURNS trigger LANGUAGE plpgsql AS
+             $$ BEGIN
+                 IF NEW.action LIKE 'NETWORK_%' THEN RAISE EXCEPTION 'audit refused'; END IF;
+                 RETURN NEW;
+             END $$;
+         CREATE TRIGGER refuse_network_audit BEFORE INSERT ON audit_log
+             FOR EACH ROW EXECUTE FUNCTION refuse_network_audit();",
+    )
+    .execute(&pool)
+    .await
+    .expect("trigger");
+    assert!(
+        db::create_bnc_network(&pool, "alice", &audit_test_network("Play"), audit)
+            .await
+            .is_err()
+    );
+    assert!(
+        db::set_bnc_network_enabled(&pool, "alice", "work", false, audit)
+            .await
+            .is_err()
+    );
+    assert!(
+        db::delete_bnc_network(&pool, "alice", "work", audit)
+            .await
+            .is_err()
+    );
+    let networks = db::list_bnc_networks(&pool, "alice").await.expect("list");
+    assert_eq!(
+        networks.len(),
+        1,
+        "no unaudited network was created or deleted"
+    );
+    assert!(networks[0].enabled, "no unaudited toggle committed");
+}
+
+/// ChanServ's founder changes are audited like the owner console's, inside
+/// their own transactions, with the founder's folded account as the actor.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn chanserv_changes_are_audited_with_the_founder_as_actor() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("chanserv_changes_are_audited_with_the_founder").await,
+    )
+    .await
+    .expect("connect");
+    for name in ["Founder", "bob"] {
+        db::create_account_with_contact(&pool, name, "password", None)
+            .await
+            .expect("account");
+    }
+    db::persist_channel_registration(&pool, "#Room", "Founder", &None)
+        .await
+        .expect("register");
+    assert!(
+        db::set_channel_access(&pool, "#room", "Bob", Some("v".into()), "Founder")
+            .await
+            .expect("access")
+    );
+    assert!(
+        db::set_channel_keeptopic(&pool, "#room", false, None, "Founder")
+            .await
+            .expect("keeptopic")
+    );
+    assert!(
+        db::set_channel_mlock(&pool, "#room", Some("+nt".into()), "Founder")
+            .await
+            .expect("mlock")
+    );
+    assert!(
+        db::set_channel_founder(&pool, "#room", "bob", "Founder")
+            .await
+            .expect("founder")
+    );
+
+    assert!(
+        db::drop_channel(&pool, "#room", db::ChannelDropper::Founder("BOB"))
+            .await
+            .expect("drop")
+    );
+
+    let recorded: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT actor, action, target, detail FROM audit_log
+         WHERE action LIKE 'CHANNEL_%' AND action <> 'CHANNEL_REGISTER' ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("audit");
+    let row = |actor: &str, action: &str, detail: &str| {
+        (
+            actor.to_string(),
+            action.to_string(),
+            "#room".to_string(),
+            detail.to_string(),
+        )
+    };
+    assert_eq!(
+        recorded,
+        [
+            row("founder", "CHANNEL_ACCESS", "account=bob flags=v"),
+            row("founder", "CHANNEL_KEEPTOPIC", "off"),
+            row("founder", "CHANNEL_MLOCK", "+nt"),
+            row("founder", "CHANNEL_FOUNDER", "bob"),
+            row("bob", "CHANNEL_DROP", ""),
+        ]
+    );
+}
+
+/// Every CHATHISTORY window on the attach listener has the specified boundary
+/// and direction, resolved in PostgreSQL.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn every_bouncer_history_window_has_the_specified_boundary_and_direction() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("every_bouncer_history_window_has_the_boundary").await,
+    )
+    .await
+    .expect("connect");
+    let buffer = db::open_bnc_buffer(
+        &pool,
+        Some("alice"),
+        "libera",
+        db::BncNetworkDefinition::Configured,
+    )
+    .await
+    .expect("buffer");
+    for id in 1..=6 {
+        db::persist_bnc_line(
+            &pool,
+            &buffer,
+            Some("alice"),
+            &format!("@msgid=m{id};time=2026-01-01T00:00:0{id}.000Z :n!u@h PRIVMSG #room :{id}"),
+        )
+        .await
+        .expect("persist");
+    }
+    let window =
+        async |paging, first: db::BncHistorySelector, second: db::BncHistorySelector, limit| {
+            db::bnc_history_window(
+                &pool, "alice", "libera", "#ROOM", paging, &first, &second, limit,
+            )
+            .await
+            .expect("query")
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| row.msgid.expect("msgid"))
+                    .collect::<Vec<_>>()
+            })
+        };
+    let ids = |ids: &[u8]| -> Result<Vec<String>, db::UnknownBncMsgid> {
+        Ok(ids.iter().map(|id| format!("m{id}")).collect())
+    };
+    let star = db::BncHistorySelector::Star;
+    let msgid = |id: u8| db::BncHistorySelector::Msgid(format!("m{id}"));
+    use db::BncHistoryPaging::{After, Around, Before, Between, Latest};
+    assert_eq!(
+        window(Latest, star.clone(), star.clone(), 2).await,
+        ids(&[5, 6])
+    );
+    assert_eq!(
+        window(Latest, msgid(2).clone(), star.clone(), 2).await,
+        ids(&[5, 6]),
+        "bounded LATEST keeps the newest messages after its pivot"
+    );
+    assert_eq!(
+        window(Before, msgid(5).clone(), star.clone(), 2).await,
+        ids(&[3, 4])
+    );
+    assert_eq!(
+        window(After, msgid(2).clone(), star.clone(), 2).await,
+        ids(&[3, 4])
+    );
+    assert_eq!(
+        window(Around, msgid(4).clone(), star.clone(), 4).await,
+        ids(&[2, 3, 4, 5])
+    );
+    assert_eq!(
+        window(Between, msgid(2).clone(), msgid(6).clone(), 2).await,
+        ids(&[3, 4])
+    );
+    assert_eq!(
+        window(Between, msgid(6).clone(), msgid(2).clone(), 2).await,
+        ids(&[4, 5]),
+        "a reverse BETWEEN window limits from its first, newer endpoint"
+    );
+    let at =
+        |second: u8| db::BncHistorySelector::Timestamp(format!("2026-01-01T00:00:0{second}.000Z"));
+    assert_eq!(
+        window(After, at(3).clone(), star.clone(), 10).await,
+        ids(&[4, 5, 6]),
+        "AFTER a timestamp excludes the message at it"
+    );
+    assert_eq!(
+        window(Before, at(3).clone(), star.clone(), 10).await,
+        ids(&[1, 2]),
+        "BEFORE a timestamp excludes the message at it"
+    );
+    assert_eq!(
+        window(Around, at(3).clone(), star.clone(), 2).await,
+        ids(&[2, 3]),
+        "AROUND a timestamp includes the message at it in its newer half"
+    );
+    for paging in [Latest, Before, After, Around] {
+        assert_eq!(
+            window(paging, msgid(9).clone(), star.clone(), 2).await,
+            Err(db::UnknownBncMsgid)
+        );
+    }
+    for (first, second) in [(msgid(9), msgid(2)), (msgid(2), msgid(9))] {
+        assert_eq!(
+            window(Between, first.clone(), second.clone(), 2).await,
+            Err(db::UnknownBncMsgid)
+        );
+    }
+    let late = db::BncHistorySelector::Timestamp("2027-01-01T00:00:00.000Z".into());
+    assert_eq!(window(After, late.clone(), star.clone(), 2).await, ids(&[]));
+
+    // Each window is an index range scan under its LIMIT, never a load of the
+    // whole target.
+    let mut connection = pool.acquire().await.expect("connection");
+    sqlx::query("SET enable_seqscan = off")
+        .execute(&mut *connection)
+        .await
+        .expect("disable seqscan");
+    let plan: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN SELECT id, line, msgid, sent_at FROM bnc_buffer
+         WHERE owner = 'alice' AND network = 'libera' AND target = '#room'
+           AND (sent_at, id) > ('2026-01-01T00:00:02.000Z', 2)
+         ORDER BY sent_at ASC, id ASC LIMIT 2",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .expect("explain");
+    let plan = plan.join("\n");
+    assert!(plan.contains("Limit"), "{plan}");
+    assert!(plan.contains("bnc_buffer_sent_at_idx"), "{plan}");
+}
+
+/// The export's growing sections are read a page at a time and still form one
+/// JSON document holding every row, in order.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn the_account_export_pages_its_history_into_one_document() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("the_account_export_pages_its_history_into_one").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account_with_contact(&pool, "Alice", "password", None)
+        .await
+        .expect("alice");
+    sqlx::query(
+        "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts)
+         SELECT 'm' || n, '#room', 'Alice!u@h', 'Alice', 'privmsg', 'line ' || n,
+                now() - make_interval(secs => 2000 - n)
+         FROM generate_series(1, 1234) n",
+    )
+    .execute(&pool)
+    .await
+    .expect("messages");
+    sqlx::query(
+        "INSERT INTO bnc_buffer (owner, network, line)
+         SELECT 'alice', 'configured', 'backlog ' || n FROM generate_series(1, 777) n",
+    )
+    .execute(&pool)
+    .await
+    .expect("backlog");
+    let export = export_account(&pool, "alice").await.expect("Alice");
+    let value: serde_json::Value = serde_json::from_str(&export).expect("one JSON document");
+    let messages = value["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 1234);
+    assert_eq!(messages[0]["message_id"], "m1");
+    assert_eq!(messages[1233]["message_id"], "m1234");
+    let backlog = value["bouncer_buffer"].as_array().expect("backlog");
+    assert_eq!(backlog.len(), 777);
+    assert_eq!(backlog[776]["line"], "backlog 777");
+    assert_eq!(value["account"]["name"], "Alice");
+    assert!(export_account(&pool, "nobody").await.is_none());
+}
+
+/// Maintenance trims whatever buffer is over the per-network cap, a bounded
+/// batch at a time, walking every buffer in turn.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn maintenance_trims_buffers_over_the_backlog_cap() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("maintenance_trims_buffers_over_the_backlog_cap").await,
+    )
+    .await
+    .expect("connect");
+    sqlx::query(
+        "INSERT INTO bnc_buffer (owner, network, line)
+         SELECT 'alice', 'over', 'over ' || n FROM generate_series(1, 5200) n
+         UNION ALL
+         SELECT 'bob', 'under', 'under ' || n FROM generate_series(1, 300) n",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+    let mut sweep = db::BncCapSweep::default();
+    assert_eq!(
+        db::trim_bnc_buffers_over_cap(&pool, &mut sweep)
+            .await
+            .expect("sweep"),
+        200
+    );
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT owner, count(*) FROM bnc_buffer GROUP BY owner ORDER BY owner")
+            .fetch_all(&pool)
+            .await
+            .expect("count");
+    assert_eq!(
+        rows,
+        [("alice".to_string(), 5_000), ("bob".to_string(), 300)]
+    );
+    let oldest: String =
+        sqlx::query_scalar("SELECT line FROM bnc_buffer WHERE owner = 'alice' ORDER BY id LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("oldest");
+    assert_eq!(oldest, "over 201", "the oldest lines go, the newest stay");
+    assert_eq!(
+        db::trim_bnc_buffers_over_cap(&pool, &mut sweep)
+            .await
+            .expect("second sweep"),
+        0
     );
 }

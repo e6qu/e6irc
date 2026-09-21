@@ -273,7 +273,8 @@ async fn control_response(
         Ok(
             crate::core::AdminReply::BanErr { .. }
             | crate::core::AdminReply::Connections(_)
-            | crate::core::AdminReply::ConnectionMissing,
+            | crate::core::AdminReply::ConnectionMissing
+            | crate::core::AdminReply::AuditUnavailable,
         ) => problem(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Unexpected core response",

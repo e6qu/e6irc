@@ -31,8 +31,17 @@ const TAG_LEN: usize = 16;
 /// classes of secret can't be substituted for one another.
 pub const CONFIG_CONTEXT: &[u8] = b"config";
 
-/// A 256-bit key that seals and opens config secrets.
+/// A 256-bit key that seals and opens config secrets. Its bytes are wiped when
+/// it is dropped, so a later memory disclosure (a core file, a swapped page)
+/// does not carry a key the process has let go of.
 pub struct SecretKey([u8; KEY_LEN]);
+
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.zeroize();
+    }
+}
 
 /// An ordered key set used during rotation. New values are always sealed with
 /// `primary`; reads try it first and then the explicitly configured previous
@@ -82,12 +91,12 @@ impl SecretKeyring {
     /// material instead of silently making an operator's fallback list
     /// ambiguous.
     pub fn new(primary: SecretKey, previous: Vec<SecretKey>) -> Result<Self, SecretError> {
-        let mut seen = vec![primary.0];
-        for key in &previous {
-            if seen.contains(&key.0) {
+        // Compared in place: a list of copies would leave key bytes behind
+        // that no `Drop` wipes.
+        for (index, key) in previous.iter().enumerate() {
+            if key.0 == primary.0 || previous[..index].iter().any(|earlier| earlier.0 == key.0) {
                 return Err(SecretError::DuplicateKey);
             }
-            seen.push(key.0);
         }
         Ok(Self { primary, previous })
     }
@@ -132,15 +141,53 @@ pub fn is_sealed(value: &str) -> bool {
     value.starts_with(V1_PREFIX) || value.starts_with(V2_PREFIX)
 }
 
+/// Mark this process non-dumpable (`prctl(PR_SET_DUMPABLE, 0)`): the kernel
+/// then writes no core file for it and refuses `ptrace` attachment and
+/// `/proc/<pid>/mem` reads from other processes of the same user. Memory here
+/// holds the master key, opened upstream credentials, and session tokens.
+#[cfg(target_os = "linux")]
+pub fn mark_process_non_dumpable() -> std::io::Result<()> {
+    // SAFETY: PR_SET_DUMPABLE takes one integer argument and touches no
+    // memory of ours; the unused arguments are passed as zero, as documented.
+    let result = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// A fresh 256-bit bearer secret (a session, an API token, an invitation, a
+/// browser state value) spelled in the URL-safe base64 alphabet: 44
+/// characters, every symbol distinct, none needing escaping in a link, a query
+/// or a cookie. The one generator, so no call site can spell it lossily.
+pub fn random_url_safe_token() -> String {
+    let mut bytes = [0u8; 32];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .expect("system RNG must produce token bytes");
+    e6irc_proto::base64::encode_url_safe(&bytes)
+}
+
 impl SecretKey {
     /// Parse a base64-encoded 32-byte key (surrounding whitespace ok).
     pub fn from_base64(s: &str) -> Result<Self, SecretError> {
-        let bytes = e6irc_proto::base64::decode(s.trim()).ok_or(SecretError::BadKey)?;
-        let arr: [u8; KEY_LEN] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| SecretError::BadKey)?;
-        Ok(Self(arr))
+        use zeroize::Zeroize;
+        let mut bytes = e6irc_proto::base64::decode(s.trim()).ok_or(SecretError::BadKey)?;
+        let key = <[u8; KEY_LEN]>::try_from(bytes.as_slice())
+            .map(Self)
+            .map_err(|_| SecretError::BadKey);
+        bytes.zeroize();
+        key
+    }
+
+    /// Parse key text read from a file, wiping the text once it is parsed so
+    /// the key's base64 spelling does not outlive it in freed memory.
+    pub fn from_base64_text(mut text: String) -> Result<Self, SecretError> {
+        use zeroize::Zeroize;
+        let key = Self::from_base64(&text);
+        text.zeroize();
+        key
     }
 
     /// Generate a fresh key from the system RNG.
@@ -219,6 +266,40 @@ mod tests {
     use super::*;
 
     const CTX: &[u8] = b"test-context";
+
+    /// The master key is wiped when its holder lets go of it, so a later
+    /// memory disclosure (a core file, a swapped page) does not carry it.
+    #[test]
+    fn a_dropped_key_leaves_zeroes_behind() {
+        let mut key = std::mem::ManuallyDrop::new(SecretKey::generate());
+        assert!(key.0.iter().any(|byte| *byte != 0));
+        // SAFETY: the value is dropped exactly once and never used as a key
+        // again; only its plain bytes, which stay allocated inside the
+        // `ManuallyDrop`, are read afterwards.
+        unsafe { std::mem::ManuallyDrop::drop(&mut key) };
+        assert_eq!(key.0, [0u8; KEY_LEN]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_process_can_be_marked_non_dumpable() {
+        mark_process_non_dumpable().expect("PR_SET_DUMPABLE");
+        // SAFETY: PR_GET_DUMPABLE reads one process attribute.
+        assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }, 0);
+    }
+
+    #[test]
+    fn random_url_safe_tokens_carry_256_bits_in_the_url_safe_alphabet() {
+        let token = random_url_safe_token();
+        assert_eq!(token.len(), 44, "{token}");
+        assert!(
+            token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'=')),
+            "{token}"
+        );
+        assert_ne!(token, random_url_safe_token());
+    }
 
     #[test]
     fn seal_open_round_trips() {

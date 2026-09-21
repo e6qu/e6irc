@@ -1733,6 +1733,7 @@ const NETWORK_FIELD_INPUTS = Object.freeze({
   autojoin: "nf-autojoin",
   sasl_account: "nf-sasl-account",
   sasl_password: "nf-sasl-password",
+  server_password: "nf-server-password",
 });
 
 function clearFieldMarks() {
@@ -1795,8 +1796,13 @@ function hideRevealedSecrets() {
     field.type = "password";
     button.textContent = "Show";
     button.setAttribute("aria-pressed", "false");
-    button.setAttribute("aria-label", "Show password");
+    button.setAttribute("aria-label", `Show ${revealName(button)}`);
   }
+}
+
+/** What a reveal button shows, for its accessible name. */
+function revealName(button) {
+  return button.dataset.revealName ?? "password";
 }
 // A typed secret does not outlive the dialog it was typed into.
 networkDialog?.addEventListener("close", () => {
@@ -1827,6 +1833,15 @@ el("nf-clear")?.addEventListener("change", () => {
   password.disabled = clearing;
 });
 
+// The server password's Remove works the same way: ticked, its box is cleared
+// and disabled, since a value typed there would not be saved.
+el("nf-clear-server-password")?.addEventListener("change", () => {
+  const clearing = el("nf-clear-server-password").checked;
+  const password = el("nf-server-password");
+  if (clearing) password.value = "";
+  password.disabled = clearing;
+});
+
 // Editing shows what is configured but never a stored password: the API does
 // not return one, and this deliberately does not ask it to. Leaving the field
 // empty keeps whatever is already sealed, which is why the note changes.
@@ -1853,10 +1868,14 @@ async function openNetworkDialog(name = null) {
     : "A short label for this connection.";
   el("nf-preset-row").hidden = editing;
   el("nf-clear-row").hidden = !editing;
+  el("nf-clear-server-password-row").hidden = !editing;
   el("nf-advanced").open = false;
   el("nf-sasl-password-note").textContent = editing
     ? "Leave blank to keep the stored password. Stored encrypted; never shown again."
     : "Stored encrypted; never shown again once saved.";
+  el("nf-server-password-note").textContent = editing
+    ? "Only for private servers that require one. Leave blank to keep the stored one; stored encrypted, never shown again."
+    : "Only for private servers that require one. Stored encrypted; never shown again once saved.";
   el("nf-tls").checked = true;
   // The suggested nickname needs nothing from the server, so it goes in before
   // anything is awaited: set after the catalog arrived, it replaced whatever
@@ -1959,6 +1978,8 @@ if (networkForm) {
       password,
       clearing: editing ? el("nf-clear").checked : false,
       storedAccount: networkForm.dataset.storedAccount ?? "",
+      serverPassword: el("nf-server-password").value,
+      clearingServerPassword: editing ? el("nf-clear-server-password").checked : false,
     };
 
     // network-request.js owns both shapes and is tested on the difference.
@@ -2013,7 +2034,7 @@ for (const button of document.querySelectorAll("[data-reveal]")) {
     field.type = shown ? "password" : "text";
     button.textContent = shown ? "Show" : "Hide";
     button.setAttribute("aria-pressed", String(!shown));
-    button.setAttribute("aria-label", shown ? "Show password" : "Hide password");
+    button.setAttribute("aria-label", `${shown ? "Show" : "Hide"} ${revealName(button)}`);
     field.focus();
   });
 }

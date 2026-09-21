@@ -9,6 +9,7 @@
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::{AttachCaps, NetworkHandle, NetworkHistory};
+use crate::db::{BncHistoryPaging as Paging, BncHistorySelector as HistorySelector};
 
 /// The largest page a client may ask for in one CHATHISTORY reply. Bounded so
 /// a hostile client cannot demand the whole 5000-line backlog in one write.
@@ -153,16 +154,6 @@ async fn require_history(
     }
 }
 
-/// Which paging direction a CHATHISTORY subcommand asks for.
-#[derive(Clone, Copy)]
-enum Paging {
-    Latest,
-    Before,
-    After,
-    Around,
-    Between,
-}
-
 /// `CHATHISTORY (LATEST|BEFORE|AFTER) <target> <selector> <limit>`.
 async fn paged(
     handle: &NetworkHandle,
@@ -219,31 +210,33 @@ async fn paged(
     let Some(history) = require_history(handle, write).await? else {
         return Ok(());
     };
-    let rows =
-        match crate::db::bnc_history_lines(&history.pool, &history.owner, &history.network, target)
-            .await
-        {
-            Ok(rows) => rows,
-            Err(e) => return db_error(write, e).await,
-        };
-    match resolve_window(&rows, paging, &selector, &selector2, limit as usize) {
-        Ok(selected) => reply_lines(write, caps, target, &selected).await,
-        Err(UnknownMsgid) => {
+    match crate::db::bnc_history_window(
+        &history.pool,
+        &history.owner,
+        &history.network,
+        target,
+        paging,
+        &selector,
+        &selector2,
+        limit,
+    )
+    .await
+    {
+        Ok(Ok(rows)) => reply_lines(write, caps, target, &rows).await,
+        // A `msgid=` selector that names no message in the buffer being paged
+        // is not an empty page: a client resuming from the last message it saw
+        // would read an empty page as "nothing new" when the truth is "that
+        // position is gone". (A timestamp always names a position, so one that
+        // matches nothing is a genuinely empty page.)
+        Ok(Err(crate::db::UnknownBncMsgid)) => {
             write
                 .write_all(unknown_msgid_reply(params[0], target).as_bytes())
                 .await?;
             write.flush().await
         }
+        Err(e) => db_error(write, e).await,
     }
 }
-
-/// A `msgid=` selector that names no message in the buffer being paged. It is
-/// not an empty page: a client resuming from the last message it saw would read
-/// an empty page as "nothing new" when the truth is "that position is gone".
-/// (A timestamp always names a position, so one that matches nothing is a
-/// genuinely empty page.)
-#[derive(Debug, PartialEq, Eq)]
-struct UnknownMsgid;
 
 /// The spec's `MESSAGE_ERROR the_given_command the_given_target`. `target` has
 /// passed [`valid_target`], so it is one bounded parameter.
@@ -254,14 +247,9 @@ fn unknown_msgid_reply(subcommand: &str, target: &str) -> String {
     )
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum HistorySelector {
-    Star,
-    Msgid(String),
-    Timestamp(String),
-}
-
 impl HistorySelector {
+    /// Parse a client's selector into a validated position: a well-formed
+    /// message id, or a timestamp canonicalized to the stored representation.
     fn parse(raw: &str) -> Result<Self, &'static str> {
         if raw == "*" {
             return Ok(Self::Star);
@@ -279,68 +267,6 @@ impl HistorySelector {
         }
         Err("selector must be *, msgid=..., or timestamp=...")
     }
-}
-
-fn resolve_window<'a>(
-    rows: &'a [crate::db::BncHistoryLine],
-    paging: Paging,
-    selector: &HistorySelector,
-    selector2: &HistorySelector,
-    limit: usize,
-) -> Result<Vec<&'a crate::db::BncHistoryLine>, UnknownMsgid> {
-    let n = rows.len();
-    // Where a selector sits in `rows`: the index of the message it names, and
-    // whether it names one (a timestamp names the gap before `index`). `*` is
-    // refused for everything but an unbounded LATEST before this is reached.
-    let position = |selector: &HistorySelector, inclusive: bool| match selector {
-        HistorySelector::Msgid(msgid) => rows
-            .iter()
-            .position(|row| row.msgid.as_deref() == Some(msgid))
-            .map(|position| position + usize::from(inclusive))
-            .ok_or(UnknownMsgid),
-        HistorySelector::Timestamp(timestamp) => Ok(rows.partition_point(|row| {
-            if inclusive {
-                row.sent_at.as_str() <= timestamp.as_str()
-            } else {
-                row.sent_at.as_str() < timestamp.as_str()
-            }
-        })),
-        HistorySelector::Star => Ok(if inclusive { 0 } else { n }),
-    };
-    let lower_start = |selector: &HistorySelector| position(selector, true);
-    let upper_end = |selector: &HistorySelector| position(selector, false);
-    let newest = |start: usize, end: usize| {
-        let end = end.min(n);
-        let start = end.saturating_sub(limit).max(start.min(end));
-        rows[start..end].iter().collect()
-    };
-    let oldest = |start: usize, end: usize| {
-        let end = end.min(n);
-        let start = start.min(end);
-        rows[start..(start + limit).min(end)].iter().collect()
-    };
-    Ok(match paging {
-        Paging::Latest => newest(lower_start(selector)?, n),
-        Paging::Before => newest(0, upper_end(selector)?),
-        Paging::After => oldest(lower_start(selector)?, n),
-        Paging::Around => {
-            let pivot = upper_end(selector)?;
-            let before = limit / 2;
-            let start = pivot.saturating_sub(before);
-            let end = (pivot + (limit - before)).min(n);
-            rows[start..end].iter().collect()
-        }
-        Paging::Between => {
-            let (first, second) = (upper_end(selector)?, upper_end(selector2)?);
-            let older = if first <= second { selector } else { selector2 };
-            let start = lower_start(older)?;
-            if first > second {
-                newest(start, first.max(second))
-            } else {
-                oldest(start, first.max(second))
-            }
-        }
-    })
 }
 
 /// `CHATHISTORY TARGETS <timestamp> <timestamp> <target-count>`: list the
@@ -458,7 +384,7 @@ async fn reply_lines(
     write: &mut (impl AsyncWrite + Unpin),
     caps: AttachCaps,
     target: &str,
-    rows: &[&crate::db::BncHistoryLine],
+    rows: &[crate::db::BncHistoryLine],
 ) -> std::io::Result<()> {
     let inner: Vec<String> = rows
         .iter()
@@ -646,79 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn every_history_window_has_the_specified_boundary_and_direction() {
-        fn row(id: i64) -> crate::db::BncHistoryLine {
-            crate::db::BncHistoryLine {
-                id,
-                line: format!(":n PRIVMSG #room :{id}"),
-                msgid: Some(format!("m{id}")),
-                sent_at: format!("2026-01-01T00:00:0{id}.000Z"),
-            }
-        }
-        let rows: Vec<_> = (1..=6).map(row).collect();
-        let ids = |selected: Vec<&crate::db::BncHistoryLine>| {
-            selected.into_iter().map(|row| row.id).collect::<Vec<_>>()
-        };
-        let window = |rows, paging, first: &HistorySelector, second: &HistorySelector, limit| {
-            resolve_window(rows, paging, first, second, limit).expect("known selectors")
-        };
-        let star = HistorySelector::Star;
-        let msgid = |id| HistorySelector::Msgid(format!("m{id}"));
-        assert_eq!(
-            ids(window(&rows, Paging::Latest, &star, &star, 2)),
-            vec![5, 6]
-        );
-        assert_eq!(
-            ids(window(&rows, Paging::Latest, &msgid(2), &star, 2)),
-            vec![5, 6],
-            "bounded LATEST keeps the newest messages after its pivot"
-        );
-        assert_eq!(
-            ids(window(&rows, Paging::Before, &msgid(5), &star, 2)),
-            vec![3, 4]
-        );
-        assert_eq!(
-            ids(window(&rows, Paging::After, &msgid(2), &star, 2)),
-            vec![3, 4]
-        );
-        assert_eq!(
-            ids(window(&rows, Paging::Around, &msgid(4), &star, 4)),
-            vec![2, 3, 4, 5]
-        );
-        assert_eq!(
-            ids(window(&rows, Paging::Between, &msgid(2), &msgid(6), 2)),
-            vec![3, 4]
-        );
-        assert_eq!(
-            ids(window(&rows, Paging::Between, &msgid(6), &msgid(2), 2)),
-            vec![4, 5],
-            "a reverse BETWEEN window limits from its first, newer endpoint"
-        );
-        // A msgid this buffer does not hold names no position. An empty page
-        // would tell a resuming client "nothing new"; it is an error instead.
-        for paging in [
-            Paging::Latest,
-            Paging::Before,
-            Paging::After,
-            Paging::Around,
-        ] {
-            assert_eq!(
-                resolve_window(&rows, paging, &msgid(99), &star, 2).map(ids),
-                Err(UnknownMsgid)
-            );
-        }
-        for (first, second) in [(msgid(99), msgid(2)), (msgid(2), msgid(99))] {
-            assert_eq!(
-                resolve_window(&rows, Paging::Between, &first, &second, 2).map(ids),
-                Err(UnknownMsgid)
-            );
-        }
-        // A timestamp that matches nothing is a position with nothing after it.
-        let late = HistorySelector::Timestamp("2027-01-01T00:00:00.000Z".into());
-        assert_eq!(
-            resolve_window(&rows, Paging::After, &late, &star, 2).map(ids),
-            Ok(vec![])
-        );
+    fn unknown_msgid_is_the_specified_error_reply() {
         assert_eq!(
             unknown_msgid_reply("AFTER", "#room"),
             ":*bnc* FAIL CHATHISTORY MESSAGE_ERROR AFTER #room :unknown msgid\r\n"

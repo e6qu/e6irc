@@ -1,9 +1,25 @@
 //! Standard base64 (RFC 4648, with padding) for SASL AUTHENTICATE
-//! payloads. ~50 lines in-repo; a dependency is not warranted.
+//! payloads, and its URL- and filename-safe spelling for tokens that travel in
+//! links and cookies. ~50 lines in-repo; a dependency is not warranted.
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+/// RFC 4648 §5: `-` and `_` in place of `+` and `/`.
+const URL_SAFE_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
+/// Standard base64 with padding.
 pub fn encode(data: &[u8]) -> String {
+    encode_with(ALPHABET, data)
+}
+
+/// URL- and filename-safe base64 (RFC 4648 §5) with padding: every symbol is
+/// distinct, so the encoding keeps all of the input's entropy, and none needs
+/// escaping in a path segment, a query, or a cookie value.
+pub fn encode_url_safe(data: &[u8]) -> String {
+    encode_with(URL_SAFE_ALPHABET, data)
+}
+
+fn encode_with(alphabet: &[u8; 64], data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b = [
@@ -13,10 +29,10 @@ pub fn encode(data: &[u8]) -> String {
         ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         let chars = [
-            ALPHABET[(n >> 18) as usize & 63],
-            ALPHABET[(n >> 12) as usize & 63],
-            ALPHABET[(n >> 6) as usize & 63],
-            ALPHABET[n as usize & 63],
+            alphabet[(n >> 18) as usize & 63],
+            alphabet[(n >> 12) as usize & 63],
+            alphabet[(n >> 6) as usize & 63],
+            alphabet[n as usize & 63],
         ];
         let keep = chunk.len() + 1;
         for (i, c) in chars.into_iter().enumerate() {
@@ -92,6 +108,16 @@ mod tests {
             let enc = encode(case);
             assert_eq!(decode(&enc).as_deref(), Some(case), "{enc}");
         }
+    }
+
+    /// RFC 4648 §5: the URL- and filename-safe alphabet spells 62 and 63 as
+    /// `-` and `_`, two distinct symbols, so no entropy is lost and the text
+    /// needs no escaping in a path, query, or cookie.
+    #[test]
+    fn url_safe_alphabet_spells_62_and_63_distinctly() {
+        assert_eq!(encode(&[0xfb, 0xff]), "+/8=");
+        assert_eq!(encode_url_safe(&[0xfb, 0xff]), "-_8=");
+        assert_eq!(encode_url_safe(b"foobar"), "Zm9vYmFy");
     }
 
     #[test]

@@ -603,7 +603,7 @@ fn flood_ok(state: &mut ServerState, conn: ConnId) -> bool {
     };
     {
         let s = &state.sessions[&conn];
-        if !s.is_registered() || s.oper {
+        if !s.is_registered() || s.oper.is_some() {
             return true;
         }
     }
@@ -672,6 +672,7 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
         "AUTHENTICATE" => return cmd_authenticate(state, conn, p),
         "NICK" => return cmd_nick(state, conn, p),
         "USER" => return cmd_user(state, conn, p),
+        "PASS" => return cmd_pass(state, conn, p),
         "PING" => return cmd_ping(state, conn, p),
         "PONG" => {
             // Liveness marker (no protocol reply); clears any outstanding

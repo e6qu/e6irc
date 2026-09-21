@@ -20,6 +20,7 @@ fn config() -> Config {
             public_url: None,
             secure_cookies: false,
             admin_accounts: vec![],
+            hsts_include_subdomains: false,
         }),
         ..Config::default()
     }
@@ -78,6 +79,7 @@ async fn ws_client_registers_and_messages_a_tcp_client() {
         nick: "tcpclient",
         username: "tcpclient",
         realname: "tcp",
+        server_password: None,
     })
     .await
     .expect("register");
@@ -107,6 +109,33 @@ async fn ws_client_registers_and_messages_a_tcp_client() {
     .expect("timeout");
     assert!(got.contains("hello over websocket"), "{got}");
     assert!(got.starts_with(":tcpclient!"), "{got}");
+}
+
+/// A dual-stack (`[::]`) HTTP listener presents an IPv4 client in its
+/// IPv4-mapped IPv6 spelling. The session's host — what WHOIS shows and what a
+/// DLINE or KLINE is matched against — must be the IPv4 address, or a ban an
+/// operator writes in natural IPv4 notation silently misses `/ws/irc` users.
+#[tokio::test]
+async fn a_mapped_ipv4_websocket_peer_gets_an_ipv4_host() {
+    let mut config = config();
+    config.http.as_mut().expect("http").addr = "[::]:0".parse().unwrap();
+    let running = net::start(config).await.expect("start");
+    let port = running.http_addr.expect("http").port();
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws/irc"))
+        .await
+        .expect("ws connect over IPv4 to the dual-stack listener");
+    ws.send(Tung::text("NICK mapped")).await.unwrap();
+    ws.send(Tung::text("USER mapped 0 * :Mapped"))
+        .await
+        .unwrap();
+    read_until(&mut ws, " 001 ").await;
+    ws.send(Tung::text("WHOIS mapped")).await.unwrap();
+    let whois = read_until(&mut ws, " 311 ").await;
+    assert!(
+        whois.contains(" 127.0.0.1 "),
+        "the host must be the IPv4 spelling: {whois}"
+    );
+    assert!(!whois.contains("::ffff:"), "{whois}");
 }
 
 /// Read text frames until one contains `needle`; panics on close/timeout.

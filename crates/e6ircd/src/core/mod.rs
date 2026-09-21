@@ -1084,6 +1084,9 @@ pub enum AdminReply {
     Connections(LiveConnectionPage),
     /// An exact connection-id mutation found no eligible live connection.
     ConnectionMissing,
+    /// The action's audit row could not be queued, so the action was not
+    /// taken.
+    AuditUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1108,6 +1111,8 @@ pub enum ChannelDropRequester {
         session: SessionOwner,
         display: String,
         label: Option<String>,
+        /// The founder's account, recorded as the drop's actor.
+        actor: String,
     },
     Admin {
         request_id: u64,
@@ -1372,6 +1377,8 @@ pub enum DbRequest {
         /// New founder account, casefolded.
         new_founder: String,
         label: Option<String>,
+        /// The founder's account, recorded as the transfer's actor.
+        actor: String,
     },
     /// Page history from PostgreSQL when the request reaches past the
     /// in-memory ring. Answered with [`Input::HistoryPage`].
@@ -1417,7 +1424,8 @@ pub enum DbRequest {
         /// the originating command was labeled.
         label: Option<String>,
     },
-    /// Persist a read marker. Answered with [`DbReply::ReadMarkerStored`] or
+    /// Persist a read marker. Answered with [`DbReply::ReadMarkerStored`],
+    /// [`DbReply::ReadMarkerLimitReached`] or
     /// [`DbReply::ReadMarkerUnavailable`]; the core updates its hot mirror and
     /// acknowledges the command only after that verdict.
     SetReadMarker {
@@ -1460,6 +1468,8 @@ pub enum DbRequest {
         /// Current live topic when enabling; ignored when disabling.
         topic: Option<(String, String, u64)>,
         label: Option<String>,
+        /// The founder's account, recorded as the change's actor.
+        actor: String,
     },
     /// Persist a registered channel's mode lock. `mlock` is the canonical spec
     /// string; `None` clears the lock.
@@ -1472,6 +1482,8 @@ pub enum DbRequest {
         display: String,
         mlock: Option<String>,
         label: Option<String>,
+        /// The founder's account, recorded as the change's actor.
+        actor: String,
     },
     /// Persist one channel access entry, then answer with `ChannelAccessSet` so
     /// the hot map is updated only on a confirmed write (a grant to an
@@ -1486,6 +1498,8 @@ pub enum DbRequest {
         account: String,
         flags: Option<String>,
         label: Option<String>,
+        /// The founder's account, recorded as the change's actor.
+        actor: String,
     },
     /// Persist a founder-owned HTTP control-plane mutation. The numeric request
     /// id maps the verdict back to a core-owned oneshot sender without putting
@@ -1819,6 +1833,15 @@ pub enum DbReply {
     /// core can release its pending-target reservation even if the requesting
     /// connection vanished during the database round trip.
     ReadMarkerUnavailable {
+        account: String,
+        target: String,
+        display: String,
+        label: Option<String>,
+    },
+    /// The write named a new target and the account already holds the
+    /// database's read-marker cap — counted across every shard, which the
+    /// per-shard hot mirror cannot see. Refused like the in-memory cap.
+    ReadMarkerLimitReached {
         account: String,
         target: String,
         display: String,

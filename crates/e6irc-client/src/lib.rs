@@ -8,6 +8,7 @@
 #![deny(clippy::let_underscore_must_use)]
 
 pub mod credentials;
+pub mod liveness;
 pub mod token_cache;
 
 use std::io;
@@ -38,8 +39,10 @@ const MAX_ADVERTISED_CAPABILITIES: usize = 256;
 /// The wire parser rejects only CR/LF/NUL, so every other control byte (the rest
 /// of C0, DEL, and C1 — which includes the one-byte CSI `0x9B`) arrives verbatim
 /// and could retitle the window, clear the screen, or spoof output. This newtype
-/// is constructible only via [`TerminalSafe::from_untrusted`], which replaces
-/// each control character with a visible `U+FFFD`; a field or display path typed
+/// is constructible only via [`TerminalSafe::from_untrusted`] (or
+/// [`TerminalSafe::from_irc_text`], which first removes IRC formatting codes),
+/// which replaces each control character — and each invisible Unicode format
+/// character that reorders or hides text — with a visible `U+FFFD`; a field or display path typed
 /// as `TerminalSafe` therefore cannot hold raw server text with a live escape
 /// sequence. Shared by the CLI and the TUI so the sanitizer has one definition
 /// rather than a per-crate copy (the TUI previously leaned on ratatui's internal
@@ -53,14 +56,107 @@ impl TerminalSafe {
     pub fn from_untrusted(s: &str) -> Self {
         Self(
             s.chars()
-                .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+                .map(|c| {
+                    if c.is_control() || is_invisible_formatting(c) {
+                        '\u{FFFD}'
+                    } else {
+                        c
+                    }
+                })
                 .collect(),
         )
+    }
+
+    /// Message text for a person to read: the mIRC formatting codes (bold,
+    /// colour, italics, …) are removed first, because a terminal client that
+    /// does not render them would otherwise show each as a replacement
+    /// character, then the rest is neutralised as by
+    /// [`TerminalSafe::from_untrusted`].
+    pub fn from_irc_text(s: &str) -> Self {
+        Self::from_untrusted(&strip_formatting(s))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// `text` without mIRC formatting codes: bold (`^B`), colour (`^C` with up to
+/// two digits of foreground and an optional comma and two digits of
+/// background), hex colour (`^D` with six hex digits and an optional comma and
+/// six more), reset (`^O`), monospace (`^Q`), reverse (`^V`), italics (`^]`),
+/// strikethrough (`^^`) and underline (`^_`). A colour code's digits belong to
+/// the code, so `^C4hello` is `hello`; a comma not followed by a colour is
+/// text and stays.
+pub fn strip_formatting(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    // Consume up to `limit` characters that satisfy `accept`.
+    fn take(
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+        limit: usize,
+        accept: fn(&char) -> bool,
+    ) -> usize {
+        let mut taken = 0;
+        while taken < limit && chars.next_if(accept).is_some() {
+            taken += 1;
+        }
+        taken
+    }
+    while let Some(c) = chars.next() {
+        match c {
+            '\x02' | '\x0f' | '\x11' | '\x16' | '\x1d' | '\x1e' | '\x1f' => {}
+            '\x03' | '\x04' => {
+                let (limit, accept): (usize, fn(&char) -> bool) = if c == '\x03' {
+                    (2, char::is_ascii_digit)
+                } else {
+                    (6, char::is_ascii_hexdigit)
+                };
+                if take(&mut chars, limit, accept) > 0 {
+                    // A background only when a comma is followed by a colour.
+                    let mut lookahead = chars.clone();
+                    if lookahead.next() == Some(',') && lookahead.peek().is_some_and(accept) {
+                        chars.next();
+                        take(&mut chars, limit, accept);
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Whether `message` is a server's refusal of something this client asked
+/// for: an error reply (a three-digit numeric from 400 to 599) or an IRCv3
+/// `FAIL`. The one predicate every native client uses to decide that a line
+/// it sent did not do what it asked — a delivery, a join, a raw command.
+pub fn is_refusal(message: &OwnedMessage) -> bool {
+    message.command == "FAIL" || is_error_numeric(&message.command)
+}
+
+/// Whether `command` is an IRC error reply (400–599).
+fn is_error_numeric(command: &str) -> bool {
+    command.len() == 3
+        && command.bytes().all(|byte| byte.is_ascii_digit())
+        && command
+            .parse::<u16>()
+            .is_ok_and(|numeric| (400..600).contains(&numeric))
+}
+
+/// The Unicode format characters that change what a terminal *shows* without
+/// being control bytes: the Arabic letter mark, the zero-width space, joiners
+/// and direction marks (U+200B–200F), the bidirectional embeddings and
+/// overrides (U+202A–202E), the word joiner, invisible operators and isolates
+/// (U+2060–2069), and the byte-order mark used as a zero-width no-break space.
+/// A right-to-left override in a nickname or message can make the rest of a
+/// line read backwards, and a zero-width character can hide text or make two
+/// names look identical, so each is neutralised like a control byte.
+fn is_invisible_formatting(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'
+    )
 }
 
 impl std::fmt::Display for TerminalSafe {
@@ -93,6 +189,66 @@ pub struct Connection {
     /// What the server said it offers, recorded during capability discovery so
     /// registration asks only for what exists and can name what is missing.
     advertised: AdvertisedCapabilities,
+    /// Whether this connection sent a `PASS`, which decides what a `464`
+    /// means.
+    server_password_sent: ServerPasswordSent,
+    /// Whether a credential may be written to this connection, decided by how
+    /// it was built ([`Transport`]).
+    transport: Transport,
+    /// Capabilities to ask for during registration when the server offers
+    /// them, each in a request of its own ([`Connection::request_when_offered`]).
+    requested_when_offered: Vec<&'static str>,
+    /// Those of `requested_when_offered` the server acknowledged.
+    enabled_when_offered: Vec<&'static str>,
+}
+
+/// Whether what is written to a connection can be read on the path — decided
+/// by how the connection was built, never by a flag a caller passes. A
+/// credential (a SASL password, a bearer token, a server password) is written
+/// only to a [`Transport::Tls`] or [`Transport::Loopback`] connection, or to a
+/// cleartext one whose user explicitly consented
+/// ([`Connection::consent_to_cleartext_credentials`]). No other value can be
+/// constructed outside this crate, so no caller — the bouncer's driver
+/// included — can send one in cleartext to another machine by forgetting to
+/// check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    /// TLS, the server's certificate verified.
+    Tls,
+    /// Plaintext to a peer whose address is loopback: the bytes never leave
+    /// this machine.
+    Loopback,
+    /// Plaintext to another machine.
+    Cleartext,
+    /// Plaintext to another machine, and the user said to send credentials
+    /// anyway.
+    CleartextConsented,
+}
+
+impl Transport {
+    /// A plaintext connection's transport, from the address it is connected
+    /// to — the address actually dialled, so a resolver cannot change it.
+    fn of_plaintext_peer(peer: std::net::SocketAddr) -> Self {
+        if peer.ip().to_canonical().is_loopback() {
+            Self::Loopback
+        } else {
+            Self::Cleartext
+        }
+    }
+
+    /// Refuse `credential` on a transport that could be overheard.
+    fn admit(self, credential: &str) -> io::Result<()> {
+        match self {
+            Self::Tls | Self::Loopback | Self::CleartextConsented => Ok(()),
+            Self::Cleartext => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to send {credential} in cleartext to a server that is not this \
+                     machine; connect with TLS"
+                ),
+            )),
+        }
+    }
 }
 
 /// The capability set a server advertised in `CAP LS`, with each capability's
@@ -277,6 +433,21 @@ pub enum ClientEvent {
     Rejected(RejectedLine),
 }
 
+/// An interactive client acts on a line's syntax, so a line that relays but
+/// does not parse is a rejection for it.
+impl From<RelayEvent> for ClientEvent {
+    fn from(event: RelayEvent) -> Self {
+        match event {
+            RelayEvent::Line {
+                message: Some(message),
+                ..
+            } => Self::Message(message),
+            RelayEvent::Line { message: None, .. } => Self::Rejected(RejectedLine::Unparseable),
+            RelayEvent::Rejected(rejected) => Self::Rejected(rejected),
+        }
+    }
+}
+
 impl OwnedMessage {
     /// Look up one IRCv3 tag without exposing representation details to every
     /// client state machine.
@@ -328,10 +499,112 @@ pub struct ConnectionOptions {
     /// while saying nothing relevant would otherwise hang a scripted client
     /// forever, and only the caller knows how long its user will wait.
     pub response_deadline: std::time::Duration,
-    /// Whether SASL credentials may cross a plaintext connection to a server
-    /// that is not this machine. Required, so that sending a password in the
-    /// clear is something a caller's user asked for, never a default.
+    /// Whether SASL credentials, or a server password, may cross a plaintext
+    /// connection to a server that is not this machine. Required, so that
+    /// sending a password in the clear is something a caller's user asked
+    /// for, never a default.
     pub cleartext_credentials: CleartextCredentials,
+    /// The network's connection password, sent as `PASS` before anything
+    /// else. Distinct from SASL: it identifies the connection to a private
+    /// server, not the user to an account.
+    pub server_password: Option<ServerPassword>,
+}
+
+/// A network's connection password: the argument of the `PASS` a server that
+/// requires one wants before `CAP LS`, `NICK` and `USER`, and answers with
+/// `464` when it is wrong or missing.
+///
+/// Built only by [`ServerPassword::parse`], so a value that exists fits the
+/// one line it travels on and cannot forge a second command inside it. Its
+/// `Debug` form is redacted: an [`Identity`] or [`ConnectionOptions`] printed
+/// into a log must not print the password with it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ServerPassword(String);
+
+/// Why a value cannot be a [`ServerPassword`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerPasswordError {
+    Empty,
+    /// Longer than [`ServerPassword::MAX_LEN`] bytes.
+    TooLong,
+    /// Contains CR, LF or NUL: the bytes that end or corrupt an IRC line.
+    Delimiter,
+}
+
+impl std::fmt::Display for ServerPasswordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("a server password cannot be empty"),
+            Self::TooLong => write!(
+                f,
+                "a server password cannot exceed {} bytes",
+                ServerPassword::MAX_LEN
+            ),
+            Self::Delimiter => {
+                f.write_str("a server password cannot contain a line break or a NUL byte")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ServerPasswordError {}
+
+impl From<ServerPasswordError> for io::Error {
+    fn from(error: ServerPasswordError) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
+    }
+}
+
+impl ServerPassword {
+    /// The command and the trailing-parameter marker that share the password's
+    /// line. The trailing form is used so a password with spaces stays whole.
+    const LINE_PREFIX: &'static str = "PASS :";
+
+    /// The longest password that fits one traditional IRC line with its
+    /// command and CRLF: the wire budget, not a number chosen here.
+    pub const MAX_LEN: usize = e6irc_proto::message::MAX_LINE_LEN - 2 - Self::LINE_PREFIX.len();
+
+    pub fn parse(password: String) -> Result<Self, ServerPasswordError> {
+        if password.is_empty() {
+            return Err(ServerPasswordError::Empty);
+        }
+        if password.len() > Self::MAX_LEN {
+            return Err(ServerPasswordError::TooLong);
+        }
+        if password
+            .bytes()
+            .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0'))
+        {
+            return Err(ServerPasswordError::Delimiter);
+        }
+        Ok(Self(password))
+    }
+
+    /// The password itself, for the one place that must store it (sealed) or
+    /// send it. Never for a log line.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn line(&self) -> String {
+        format!("{}{}", Self::LINE_PREFIX, self.0)
+    }
+}
+
+impl std::fmt::Debug for ServerPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ServerPassword(<redacted>)")
+    }
+}
+
+/// Whether a `PASS` went before registration. A `464` means two different
+/// things depending on it — the network wants a password this connection has
+/// none of, or it rejected the one sent — and only the client that did or did
+/// not send one can tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerPasswordSent {
+    No,
+    Yes,
 }
 
 /// See [`ConnectionOptions::cleartext_credentials`].
@@ -350,6 +623,9 @@ pub struct Identity<'a> {
     /// [`ConnectionOptions::username`].
     pub username: &'a str,
     pub realname: &'a str,
+    /// The network's connection password, sent as the first line. See
+    /// [`ConnectionOptions::server_password`].
+    pub server_password: Option<&'a ServerPassword>,
 }
 
 /// A connection the server has welcomed, with the nickname it confirmed —
@@ -368,27 +644,56 @@ impl ConnectionOptions {
         within(
             Some(self.response_deadline),
             "connecting and registering",
-            self.connect_and_register(),
+            self.connect_and_register(system_resolve),
         )
         .await
     }
 
-    async fn connect_and_register(&self) -> io::Result<Registered> {
+    /// As [`ConnectionOptions::connect_registered`], with `resolve` turning
+    /// `host:port` into addresses wherever this connection must decide by
+    /// address — injectable so a test can stand in for DNS.
+    async fn connect_and_register<Resolved>(
+        &self,
+        resolve: impl FnOnce(String) -> Resolved,
+    ) -> io::Result<Registered>
+    where
+        Resolved: Future<Output = io::Result<Vec<std::net::SocketAddr>>>,
+    {
         // SASL PLAIN is the password in base64 and OAUTHBEARER is the token
         // itself, so without TLS both are readable by everything on the path.
         // Decided before dialing: nothing leaves the machine first.
-        if !self.tls
-            && !matches!(self.authentication, Authentication::None)
-            && self.cleartext_credentials == CleartextCredentials::Refuse
-            && !is_loopback_host(tls_server_name(&self.address)?)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "refusing to send SASL credentials in cleartext to a server that is not this \
-                 machine; connect with --tls, or pass --allow-cleartext-credentials to send \
-                 them unprotected",
-            ));
-        }
+        // A server password travels as itself in `PASS`.
+        let credentials = match (&self.authentication, &self.server_password) {
+            (Authentication::None, None) => None,
+            (Authentication::None, Some(_)) => Some("a server password"),
+            (_, None) => Some("SASL credentials"),
+            (_, Some(_)) => Some("SASL credentials and a server password"),
+        };
+        let plaintext_to = match credentials {
+            Some(credentials)
+                if !self.tls && self.cleartext_credentials == CleartextCredentials::Refuse =>
+            {
+                // "This machine" is decided by address, never by name: a name
+                // under `.localhost` is whatever a resolver says it is. Every
+                // address the name resolves to must be loopback, and exactly
+                // those addresses are dialed, so nothing can re-resolve it to
+                // somewhere else between the decision and the connection.
+                match loopback_only(&self.address, resolve).await? {
+                    Some(addresses) => Some(addresses),
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "refusing to send {credentials} in cleartext to a server that \
+                                 is not this machine; connect with --tls, or pass \
+                                 --allow-cleartext-credentials to send them unprotected"
+                            ),
+                        ));
+                    }
+                }
+            }
+            _ => None,
+        };
         let mut connection = if self.tls {
             let name = match self.tls_server_name.as_deref() {
                 Some(name) if !name.trim().is_empty() => name,
@@ -401,13 +706,19 @@ impl ConnectionOptions {
                 None => tls_server_name(&self.address)?,
             };
             Connection::connect_tls(&self.address, name, webpki_root_store()).await?
+        } else if let Some(addresses) = plaintext_to {
+            Connection::from_tcp(connect_first(&addresses).await?)?
         } else {
             Connection::connect(&self.address).await?
         };
+        if self.cleartext_credentials == CleartextCredentials::Allow {
+            connection.consent_to_cleartext_credentials();
+        }
         let identity = Identity {
             nick: &self.nick,
             username: &self.username,
             realname: &self.realname,
+            server_password: self.server_password.as_ref(),
         };
         let nick = match &self.authentication {
             Authentication::None => connection.register(&identity).await?,
@@ -446,17 +757,49 @@ async fn within<T>(
         })
 }
 
-/// Whether `host` is this machine: `localhost`, a name under `.localhost`
-/// (RFC 6761), or a loopback address, bracketed or not. The one rule for "a
-/// plaintext connection that cannot be overheard"; the qualification harness
-/// applies the same rule to plaintext HTTP.
-pub fn is_loopback_host(host: &str) -> bool {
-    host == "localhost"
-        || host.ends_with(".localhost")
-        || host
-            .trim_matches(['[', ']'])
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
+/// The addresses `address` (`host:port`) resolves to when every one of them is
+/// loopback, else `None`: the one rule for "a plaintext connection that cannot
+/// be overheard". The caller dials (or pins its HTTP client to) exactly these
+/// addresses, so the name cannot be resolved again, differently, afterwards.
+pub async fn loopback_addresses(address: &str) -> io::Result<Option<Vec<std::net::SocketAddr>>> {
+    loopback_only(address, system_resolve).await
+}
+
+async fn loopback_only<Resolved>(
+    address: &str,
+    resolve: impl FnOnce(String) -> Resolved,
+) -> io::Result<Option<Vec<std::net::SocketAddr>>>
+where
+    Resolved: Future<Output = io::Result<Vec<std::net::SocketAddr>>>,
+{
+    let resolved = resolve(address.to_owned()).await.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot resolve {address} to decide whether it is this machine: {error}"),
+        )
+    })?;
+    let loopback = !resolved.is_empty()
+        && resolved
+            .iter()
+            .all(|resolved| resolved.ip().to_canonical().is_loopback());
+    Ok(loopback.then_some(resolved))
+}
+
+async fn system_resolve(address: String) -> io::Result<Vec<std::net::SocketAddr>> {
+    Ok(tokio::net::lookup_host(address).await?.collect())
+}
+
+/// Connect to the first of `addresses` that accepts, in order; the error of
+/// the last one when none does.
+async fn connect_first(addresses: &[std::net::SocketAddr]) -> io::Result<TcpStream> {
+    let mut last_error = io::Error::new(io::ErrorKind::InvalidInput, "no address to connect to");
+    for address in addresses {
+        match TcpStream::connect(address).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }
 
 /// Whether `word` is a `USER` name every server accepts: 1–10 bytes, an ASCII
@@ -571,8 +914,22 @@ impl Connection {
     /// this entry point without re-resolving the hostname after validation.
     pub fn from_tcp(stream: TcpStream) -> io::Result<Self> {
         stream.set_nodelay(true)?;
+        let transport = Transport::of_plaintext_peer(stream.peer_addr()?);
         let (reader, writer) = stream.into_split();
-        Ok(Self::from_halves(Box::new(reader), Box::new(writer)))
+        Ok(Self::from_halves(
+            Box::new(reader),
+            Box::new(writer),
+            transport,
+        ))
+    }
+
+    /// Let credentials cross this plaintext connection to another machine:
+    /// the user's explicit override (`--allow-cleartext-credentials`), and
+    /// nothing else. No effect on a connection that already may carry them.
+    pub fn consent_to_cleartext_credentials(&mut self) {
+        if self.transport == Transport::Cleartext {
+            self.transport = Transport::CleartextConsented;
+        }
     }
 
     /// Connect over TLS to `host:port`, validating the server
@@ -605,11 +962,18 @@ impl Connection {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid server name"))?;
         let tls = connector.connect(domain, stream).await?;
         let (reader, writer) = tokio::io::split(tls);
-        Ok(Self::from_halves(Box::new(reader), Box::new(writer)))
+        Ok(Self::from_halves(
+            Box::new(reader),
+            Box::new(writer),
+            Transport::Tls,
+        ))
     }
 
-    fn from_halves(reader: BoxRead, writer: BoxWrite) -> Self {
+    fn from_halves(reader: BoxRead, writer: BoxWrite, transport: Transport) -> Self {
         Self {
+            transport,
+            requested_when_offered: Vec::new(),
+            enabled_when_offered: Vec::new(),
             reader,
             writer,
             framing: LineBuffer::new(e6irc_proto::message::MAX_SERVER_FRAME_LEN),
@@ -617,6 +981,7 @@ impl Connection {
             read_buf: vec![0u8; 8192],
             response_deadline: None,
             advertised: AdvertisedCapabilities::default(),
+            server_password_sent: ServerPasswordSent::No,
         }
     }
 
@@ -775,17 +1140,7 @@ impl Connection {
     /// [`Connection::next_message`], whose strict handshake contract rejects
     /// malformed input as an I/O error.
     pub async fn next_event_lossy(&mut self) -> io::Result<Option<ClientEvent>> {
-        match self.next_line_relayable().await? {
-            None => Ok(None),
-            Some(RelayEvent::Line {
-                message: Some(message),
-                ..
-            }) => Ok(Some(ClientEvent::Message(message))),
-            Some(RelayEvent::Line { message: None, .. }) => {
-                Ok(Some(ClientEvent::Rejected(RejectedLine::Unparseable)))
-            }
-            Some(RelayEvent::Rejected(rejected)) => Ok(Some(ClientEvent::Rejected(rejected))),
-        }
+        Ok(self.next_line_relayable().await?.map(ClientEvent::from))
     }
 
     /// Receive the next message, or fail loudly if the peer closed the socket
@@ -833,12 +1188,24 @@ impl Connection {
                     Err(_) => return Ok(CapabilityNegotiation::Unanswered),
                 }
             };
-            if let Some(err) = registration_refused(&msg) {
+            if let Some(err) = self.registration_refused(&msg) {
                 return Err(err);
             }
+            // A 451 that names `PASS` answers the server password, not `CAP LS`:
+            // negotiation is still open, and its answer is still to come.
+            if msg.command == "451"
+                && self.server_password_sent == ServerPasswordSent::Yes
+                && msg
+                    .params
+                    .iter()
+                    .any(|parameter| parameter.eq_ignore_ascii_case("PASS"))
+            {
+                continue;
+            }
             // 421 names the command it did not know; 451 does not reliably
-            // (`451 * :You have not registered`), and nothing but `CAP LS` has
-            // been sent, so any 451 here is the answer to it.
+            // (`451 * :You have not registered`), and nothing but `CAP LS` (and
+            // perhaps `PASS`, handled above) has been sent, so any other 451
+            // here is the answer to it.
             if msg.command == "451"
                 || (msg.command == "421"
                     && msg
@@ -900,12 +1267,40 @@ impl Connection {
             .into_iter()
             .filter(|capability| self.advertised.offers(capability))
             .collect();
-        if wanted.is_empty() {
-            return Ok(());
+        if !wanted.is_empty() {
+            match self.request_capabilities(&wanted).await? {
+                CapabilityVerdict::Acknowledged | CapabilityVerdict::Refused(_) => {}
+            }
         }
-        match self.request_capabilities(&wanted).await? {
-            CapabilityVerdict::Acknowledged | CapabilityVerdict::Refused(_) => Ok(()),
+        // Each in a request of its own: a server that refuses one must not
+        // take the others, or the metadata above, down with it.
+        let optional: Vec<&'static str> = self
+            .requested_when_offered
+            .iter()
+            .copied()
+            .filter(|capability| self.advertised.offers(capability))
+            .collect();
+        for capability in optional {
+            if self.request_capabilities(&[capability]).await? == CapabilityVerdict::Acknowledged {
+                self.enabled_when_offered.push(capability);
+            }
         }
+        Ok(())
+    }
+
+    /// Ask for `capability` during registration when the server offers it,
+    /// in a request of its own (a refusal costs only that capability).
+    /// [`Connection::enabled`] says afterwards whether it was acknowledged.
+    pub fn request_when_offered(&mut self, capability: &'static str) {
+        if !self.requested_when_offered.contains(&capability) {
+            self.requested_when_offered.push(capability);
+        }
+    }
+
+    /// Whether a capability asked for with [`Connection::request_when_offered`]
+    /// was acknowledged during registration.
+    pub fn enabled(&self, capability: &str) -> bool {
+        self.enabled_when_offered.contains(&capability)
     }
 
     /// Request `capabilities` atomically and consume exactly their verdict.
@@ -917,7 +1312,7 @@ impl Connection {
             .await?;
         loop {
             let msg = self.recv("closed during capability negotiation").await?;
-            if let Some(err) = registration_refused(&msg) {
+            if let Some(err) = self.registration_refused(&msg) {
                 return Err(err);
             }
             if let Some(verdict) = capability_verdict(&msg, capabilities)? {
@@ -965,7 +1360,7 @@ impl Connection {
         msg: &OwnedMessage,
         mechanism: &str,
     ) -> io::Result<Option<io::Error>> {
-        if let Some(err) = registration_refused(msg) {
+        if let Some(err) = self.registration_refused(msg) {
             return Ok(Some(err));
         }
         let failure = match msg.command.as_str() {
@@ -1021,7 +1416,7 @@ impl Connection {
     async fn await_welcome(&mut self, nick: &str) -> io::Result<String> {
         loop {
             let msg = self.recv("closed before welcome").await?;
-            if let Some(err) = registration_refused(&msg) {
+            if let Some(err) = self.registration_refused(&msg) {
                 return Err(err);
             }
             match msg.command.as_str() {
@@ -1047,6 +1442,8 @@ impl Connection {
         account: &str,
         password: &str,
     ) -> io::Result<String> {
+        self.transport.admit("SASL credentials")?;
+        self.send_server_password(identity).await?;
         self.begin_sasl("PLAIN").await?;
         let payload = {
             let mut bytes = vec![0u8];
@@ -1109,6 +1506,8 @@ impl Connection {
         identity: &Identity<'_>,
         token: &str,
     ) -> io::Result<String> {
+        self.transport.admit("a bearer token")?;
+        self.send_server_password(identity).await?;
         self.begin_sasl("OAUTHBEARER").await?;
         // RFC 7628 client response: gs2 header, then the bearer credential.
         let payload =
@@ -1120,6 +1519,7 @@ impl Connection {
     /// Register with a nick and realname, answering PINGs, until the
     /// welcome (001) arrives. Returns the confirmed nick.
     pub async fn register(&mut self, identity: &Identity<'_>) -> io::Result<String> {
+        self.send_server_password(identity).await?;
         match self.begin_cap().await? {
             CapabilityNegotiation::Open => {
                 self.request_metadata_capabilities().await?;
@@ -1142,6 +1542,31 @@ impl Connection {
         self.await_welcome(identity.nick).await
     }
 
+    /// Send the network's connection password, when one is configured, as the
+    /// first line: a server that requires one reads it before `CAP LS`,
+    /// `NICK` and `USER`. The line is never logged; it goes straight to the
+    /// socket.
+    async fn send_server_password(&mut self, identity: &Identity<'_>) -> io::Result<()> {
+        let Some(password) = identity.server_password else {
+            return Ok(());
+        };
+        self.transport.admit("a server password")?;
+        self.send_line(&password.line()).await?;
+        self.server_password_sent = ServerPasswordSent::Yes;
+        Ok(())
+    }
+
+    /// The one refusal predicate for every pre-welcome wait loop (capability
+    /// discovery, capability requests, SASL, and the welcome itself). `ERROR`
+    /// is the server closing the link with its reason — a connection throttle,
+    /// a ban, "SASL access only" — and it can arrive at any of those stages,
+    /// so it is classified here rather than by whichever loop happens to be
+    /// running.
+    fn registration_refused(&self, message: &OwnedMessage) -> Option<io::Error> {
+        RegistrationRejection::from_reply(message, self.server_password_sent)
+            .map(RegistrationRejection::into_error)
+    }
+
     async fn send_registration_identity(&mut self, identity: &Identity<'_>) -> io::Result<()> {
         // `NICK` and the first `USER` parameter are single words on the wire;
         // an empty one, or one with a space in it, silently becomes a different
@@ -1159,6 +1584,73 @@ impl Connection {
             "USER {} 0 * :{}",
             identity.username, identity.realname
         ))
+        .await
+    }
+
+    /// Whether the server advertised `capability` during registration.
+    pub fn offers(&self, capability: &str) -> bool {
+        self.advertised.offers(capability)
+    }
+
+    /// Wait until the server has processed everything sent so far: a `PING`
+    /// with a token of this client's own, answered by the matching `PONG`,
+    /// which a server sends only after every earlier line. Every other line
+    /// read on the way is handed to `each` (a server `PING` is answered and
+    /// not handed on). Bounded by the response deadline.
+    pub async fn round_trip(
+        &mut self,
+        mut each: impl FnMut(RelayEvent) -> io::Result<()>,
+    ) -> io::Result<()> {
+        const TOKEN: &str = "e6irc-round-trip";
+        within(self.response_deadline, "answering a PING", async {
+            self.send_line(&format!("PING :{TOKEN}")).await?;
+            loop {
+                let event = self.next_line_relayable().await?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the server closed the connection before answering a PING",
+                    )
+                })?;
+                if let RelayEvent::Line {
+                    message: Some(message),
+                    ..
+                } = &event
+                {
+                    if message.command == "PONG"
+                        && message.params.last().map(String::as_str) == Some(TOKEN)
+                    {
+                        return Ok(());
+                    }
+                    if self.answer_ping(message).await? {
+                        continue;
+                    }
+                }
+                each(event)?;
+            }
+        })
+        .await
+    }
+
+    /// Send `QUIT` and read until the server closes the connection, handing
+    /// each line read on the way to `each`. Bounded by the response deadline:
+    /// a server that keeps the socket open after `QUIT` ends the wait with
+    /// [`io::ErrorKind::TimedOut`] instead of holding the caller forever.
+    pub async fn quit_and_drain(
+        &mut self,
+        reason: &str,
+        mut each: impl FnMut(RelayEvent) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.send_line(&format!("QUIT :{reason}")).await?;
+        within(
+            self.response_deadline,
+            "closing the connection after QUIT",
+            async {
+                while let Some(event) = self.next_line_relayable().await? {
+                    each(event)?;
+                }
+                Ok(())
+            },
+        )
         .await
     }
 
@@ -1187,15 +1679,27 @@ impl Connection {
         }
     }
 
-    /// Join one channel, wait for confirmation, and load its latest
-    /// CHATHISTORY batch. Messages observed during JOIN and playback are
-    /// returned in wire order so a UI can build state before its first draw.
+    /// Join one channel, wait for confirmation, and load what its user has not
+    /// read: the history after the channel's shared read marker, paged forward
+    /// `page_lines` at a time until a page comes back short, for at most
+    /// [`MAX_HISTORY_PAGES`] pages and `max_lines` lines. Without a marker it
+    /// is the latest `page_lines` lines. Messages observed during JOIN and
+    /// playback are returned in wire order so a UI can build state before its
+    /// first draw, with whether unread lines remain beyond what was loaded.
     pub async fn join_with_history(
         &mut self,
         target: &str,
-        history_count: usize,
-    ) -> io::Result<Vec<ClientEvent>> {
-        self.join_history(target, history_count, true).await
+        page_lines: usize,
+        max_lines: usize,
+    ) -> io::Result<JoinedHistory> {
+        self.join_history(
+            target,
+            HistoryRequest::Unread {
+                page_lines,
+                max_lines,
+            },
+        )
+        .await
     }
 
     /// Join one channel and load the latest bounded history window regardless
@@ -1207,19 +1711,21 @@ impl Connection {
         target: &str,
         history_count: usize,
     ) -> io::Result<Vec<ClientEvent>> {
-        self.join_history(target, history_count, false).await
+        Ok(self
+            .join_history(target, HistoryRequest::Latest(history_count))
+            .await?
+            .events)
     }
 
     async fn join_history(
         &mut self,
         target: &str,
-        history_count: usize,
-        resume_after_marker: bool,
-    ) -> io::Result<Vec<ClientEvent>> {
+        request: HistoryRequest,
+    ) -> io::Result<JoinedHistory> {
         within(
             self.response_deadline,
             "confirming a JOIN and its history",
-            self.join_and_replay(target, history_count, resume_after_marker),
+            self.join_and_replay(target, request),
         )
         .await
     }
@@ -1256,9 +1762,8 @@ impl Connection {
     async fn join_and_replay(
         &mut self,
         target: &str,
-        history_count: usize,
-        resume_after_marker: bool,
-    ) -> io::Result<Vec<ClientEvent>> {
+        request: HistoryRequest,
+    ) -> io::Result<JoinedHistory> {
         let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
         self.send_line(&format!("JOIN {target}")).await?;
         let mut events = Vec::new();
@@ -1297,25 +1802,111 @@ impl Connection {
                 break;
             }
         }
-        if history_count == 0 {
-            return Ok(events);
-        }
 
-        let request = match read_marker.filter(|_| resume_after_marker) {
-            Some(marker) => {
-                format!("CHATHISTORY AFTER {target} timestamp={marker} {history_count}")
+        let (page_lines, max_lines, marker) = match request {
+            HistoryRequest::Latest(0) | HistoryRequest::Unread { page_lines: 0, .. } => {
+                return Ok(JoinedHistory {
+                    events,
+                    coverage: HistoryCoverage::NoHistory,
+                });
             }
-            None => format!("CHATHISTORY LATEST {target} * {history_count}"),
+            HistoryRequest::Latest(count) => {
+                self.history_page(
+                    &format!("CHATHISTORY LATEST {target} * {count}"),
+                    count,
+                    &mut events,
+                )
+                .await?;
+                return Ok(JoinedHistory {
+                    events,
+                    coverage: HistoryCoverage::Latest,
+                });
+            }
+            HistoryRequest::Unread {
+                page_lines,
+                max_lines,
+            } => match read_marker {
+                Some(marker) => (page_lines, max_lines, marker),
+                None => {
+                    self.history_page(
+                        &format!("CHATHISTORY LATEST {target} * {page_lines}"),
+                        page_lines,
+                        &mut events,
+                    )
+                    .await?;
+                    return Ok(JoinedHistory {
+                        events,
+                        coverage: HistoryCoverage::Latest,
+                    });
+                }
+            },
         };
-        self.send_line(&request).await?;
+
+        // `AFTER <marker> N` returns the *oldest* N unread lines. Stopping at
+        // one page would leave the rest unloaded, and the next live line would
+        // then advance the marker over them on every device.
+        let mut anchor = format!("timestamp={marker}");
+        let mut loaded = 0usize;
+        let mut pages = 0usize;
+        loop {
+            let wanted = page_lines.min(max_lines.saturating_sub(loaded));
+            if wanted == 0 || pages == MAX_HISTORY_PAGES {
+                // The last page was full and no more may be loaded.
+                return Ok(JoinedHistory {
+                    events,
+                    coverage: HistoryCoverage::UnreadBeyondLoaded,
+                });
+            }
+            let page = self
+                .history_page(
+                    &format!("CHATHISTORY AFTER {target} {anchor} {wanted}"),
+                    wanted,
+                    &mut events,
+                )
+                .await?;
+            pages += 1;
+            loaded += page.lines;
+            if page.lines < wanted {
+                return Ok(JoinedHistory {
+                    events,
+                    coverage: HistoryCoverage::AllUnread,
+                });
+            }
+            match page.last_anchor {
+                Some(next) => anchor = next,
+                // A full page whose last line carries neither a msgid nor a
+                // time cannot be continued from.
+                None => {
+                    return Ok(JoinedHistory {
+                        events,
+                        coverage: HistoryCoverage::UnreadBeyondLoaded,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Send one CHATHISTORY `request` for at most `count` lines and read its
+    /// batch into `events`.
+    async fn history_page(
+        &mut self,
+        request: &str,
+        count: usize,
+        events: &mut Vec<ClientEvent>,
+    ) -> io::Result<HistoryPage> {
+        self.send_line(request).await?;
         let limit = events
             .len()
-            .saturating_add(history_count)
+            .saturating_add(count)
             .saturating_add(MAX_JOIN_BURST_LINES);
-        let mut history_batch = None;
+        let mut history_batch: Option<String> = None;
+        let mut page = HistoryPage {
+            lines: 0,
+            last_anchor: None,
+        };
         loop {
             let Some(msg) = self
-                .next_join_event(&mut events, limit, "closed during CHATHISTORY playback")
+                .next_join_event(events, limit, "closed during CHATHISTORY playback")
                 .await?
             else {
                 continue;
@@ -1343,13 +1934,66 @@ impl Connection {
                 if let Some(closed) = reference.strip_prefix('-')
                     && history_batch.as_deref() == Some(closed)
                 {
-                    break;
+                    return Ok(page);
+                }
+            }
+            if history_batch.is_some() && msg.tag("batch") == history_batch.as_deref() {
+                page.lines += 1;
+                if let Some(msgid) = msg.tag("msgid") {
+                    page.last_anchor = Some(format!("msgid={msgid}"));
+                } else if let Some(time) = msg.tag("time") {
+                    page.last_anchor = Some(format!("timestamp={time}"));
                 }
             }
             events.push(ClientEvent::Message(msg));
         }
-        Ok(events)
     }
+}
+
+/// The most CHATHISTORY pages one join loads while catching up on unread
+/// lines. Past it the client says that more remain rather than paging on.
+pub const MAX_HISTORY_PAGES: usize = 10;
+
+/// What a join asks the history for.
+enum HistoryRequest {
+    /// The latest `n` lines, whatever the read marker says.
+    Latest(usize),
+    /// The unread lines after the read marker, paged forward.
+    Unread { page_lines: usize, max_lines: usize },
+}
+
+/// One CHATHISTORY batch as read.
+struct HistoryPage {
+    /// Lines inside the batch.
+    lines: usize,
+    /// The selector naming the page's last line, to continue after it.
+    last_anchor: Option<String>,
+}
+
+/// A confirmed join with its history.
+#[derive(Debug)]
+pub struct JoinedHistory {
+    /// The join burst and the history, in wire order.
+    pub events: Vec<ClientEvent>,
+    /// How much of the channel's history the events hold.
+    pub coverage: HistoryCoverage,
+}
+
+/// How much history a join loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryCoverage {
+    /// None was asked for.
+    NoHistory,
+    /// The latest lines, with no read marker to resume from (or none asked
+    /// about): older unread lines may exist before them.
+    Latest,
+    /// Every line after the read marker: nothing unread is missing.
+    AllUnread,
+    /// Unread lines remain after the last one loaded: paging stopped at its
+    /// bound on a full page. A client must not advance the read marker past
+    /// the last loaded line while this holds, or the unloaded lines would be
+    /// marked read on every device.
+    UnreadBeyondLoaded,
 }
 
 /// Lines a server may send between a `JOIN` and its end-of-names, or around a
@@ -1443,8 +2087,12 @@ pub enum RegistrationRefusal {
     /// 433, 436 or 437: the nickname is held, collided, or delayed after a
     /// recent holder; it becomes free without anything changing here.
     NicknameInUse,
-    /// 464: the server wants a server password this connection did not send.
+    /// 464 after a `PASS`: the network rejected the configured server
+    /// password.
     ServerPasswordRejected,
+    /// 464 with no `PASS` sent: the network requires a server password and
+    /// none is configured.
+    ServerPasswordRequired,
     /// 465: the server refuses this connection by policy (a ban, a limit).
     NetworkBanned,
     /// A pre-welcome `ERROR`: the server closed the link with its reason (a
@@ -1527,7 +2175,11 @@ impl RegistrationRejection {
     /// registration — `CAP LS` on a server without capability negotiation,
     /// which [`Connection::register`] reads as such — and a client that ended
     /// on it registered nowhere it could have.
-    pub fn from_reply(message: &OwnedMessage) -> Option<Self> {
+    ///
+    /// `server_password` says whether a `PASS` preceded registration, which
+    /// is the only thing that tells a missing server password from a rejected
+    /// one.
+    pub fn from_reply(message: &OwnedMessage, server_password: ServerPasswordSent) -> Option<Self> {
         let refusal = match message.command.as_str() {
             "ERROR" => RegistrationRefusal::NotRegistered,
             "432" => RegistrationRefusal::InvalidNickname,
@@ -1535,7 +2187,10 @@ impl RegistrationRejection {
             // 433 is held; 436 is a collision the server is resolving; 437 is
             // the nick delay after a recent holder. Each ends by itself.
             "433" | "436" | "437" => RegistrationRefusal::NicknameInUse,
-            "464" => RegistrationRefusal::ServerPasswordRejected,
+            "464" => match server_password {
+                ServerPasswordSent::Yes => RegistrationRefusal::ServerPasswordRejected,
+                ServerPasswordSent::No => RegistrationRefusal::ServerPasswordRequired,
+            },
             "465" => RegistrationRefusal::NetworkBanned,
             _ => return None,
         };
@@ -1601,7 +2256,8 @@ impl RegistrationRefusal {
     /// A taken nickname is retried on the slow schedule, which outlasts the
     /// usual holder — a ghost of the client's own previous session — and
     /// parks when the holder stays. A nickname or user name the server will
-    /// not take, and a server password it wants, take the same schedule. A
+    /// not take, and a server password it wants or rejects, take the same
+    /// schedule. A
     /// welcome under another nickname parks at once: it cannot end without a
     /// shorter, or different, configured nickname.
     pub const fn retry_policy(self) -> RefusalRetry {
@@ -1614,6 +2270,7 @@ impl RegistrationRefusal {
             | Self::InvalidNickname
             | Self::InvalidUsername
             | Self::ServerPasswordRejected
+            | Self::ServerPasswordRequired
             | Self::SaslFailed => RefusalRetry::ScheduleThenPark,
             Self::WelcomedAsAnotherNickname => RefusalRetry::ParkNow,
         }
@@ -1628,7 +2285,9 @@ impl RegistrationRefusal {
             Self::NicknameInUse => io::ErrorKind::AlreadyExists,
             Self::InvalidNickname | Self::WelcomedAsAnotherNickname => io::ErrorKind::InvalidInput,
             Self::InvalidUsername => io::ErrorKind::InvalidInput,
-            Self::ServerPasswordRejected => io::ErrorKind::PermissionDenied,
+            Self::ServerPasswordRejected | Self::ServerPasswordRequired => {
+                io::ErrorKind::PermissionDenied
+            }
             Self::NetworkBanned => io::ErrorKind::ConnectionAborted,
             Self::NotRegistered | Self::SaslFailed | Self::SaslAborted => io::ErrorKind::Other,
             Self::SaslUnavailable => io::ErrorKind::Unsupported,
@@ -1636,21 +2295,16 @@ impl RegistrationRefusal {
     }
 }
 
-/// The one refusal predicate for every pre-welcome wait loop (capability
-/// discovery, capability requests, SASL, and the welcome itself). `ERROR` is
-/// the server closing the link with its reason — a connection throttle, a ban,
-/// "SASL access only" — and it can arrive at any of those stages, so it is
-/// classified here rather than by whichever loop happens to be running.
-fn registration_refused(message: &OwnedMessage) -> Option<io::Error> {
-    RegistrationRejection::from_reply(message).map(|rejection| {
+impl RegistrationRejection {
+    fn into_error(self) -> io::Error {
         io::Error::new(
-            rejection.refusal.error_kind(),
+            self.refusal.error_kind(),
             RegistrationRefusalError {
-                refusal: rejection.refusal,
-                diagnostic: rejection.diagnostic,
+                refusal: self.refusal,
+                diagnostic: self.diagnostic,
             },
         )
-    })
+    }
 }
 
 fn registration_diagnostic(message: &OwnedMessage) -> String {
@@ -1787,8 +2441,10 @@ impl std::fmt::Display for SaslRejection {
 
 impl std::error::Error for SaslRejection {}
 
-/// Install aws-lc-rs as the process rustls provider, once.
-fn install_crypto_provider() {
+/// Install aws-lc-rs as the process rustls provider, once. Public so a binary
+/// whose other TLS users (an HTTP client) take the process default gets this
+/// one stack rather than a second.
+pub fn install_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         // Another library in the process may already have installed rustls's
@@ -1816,13 +2472,14 @@ mod tests {
             ("433", RegistrationRefusal::NicknameInUse),
             ("436", RegistrationRefusal::NicknameInUse),
             ("437", RegistrationRefusal::NicknameInUse),
-            ("464", RegistrationRefusal::ServerPasswordRejected),
             ("465", RegistrationRefusal::NetworkBanned),
         ] {
             let message = OwnedMessage::from(
                 &Message::parse(&format!(":srv {numeric} nick :refused")).expect("numeric"),
             );
-            let error = registration_refused(&message).expect("known refusal numeric");
+            let error = RegistrationRejection::from_reply(&message, ServerPasswordSent::No)
+                .expect("known refusal numeric")
+                .into_error();
             assert_eq!(RegistrationRefusal::from_error(&error), Some(expected));
             let rejection = RegistrationRejection::from_error(&error).expect("typed rejection");
             assert_eq!(rejection.refusal(), expected);
@@ -1832,7 +2489,9 @@ mod tests {
         let not_registered = OwnedMessage::from(
             &Message::parse(":srv 451 * :You have not registered").expect("numeric"),
         );
-        assert!(registration_refused(&not_registered).is_none());
+        assert!(
+            RegistrationRejection::from_reply(&not_registered, ServerPasswordSent::No).is_none()
+        );
     }
 
     #[test]
@@ -1871,6 +2530,54 @@ mod tests {
             TerminalSafe::from_untrusted("plain #chan").as_str(),
             "plain #chan"
         );
+        // Bidirectional overrides and isolates reorder what follows them, and
+        // zero-width characters hide text: either lets a server line pose as
+        // something else on the screen. Each is neutralised like a control.
+        for invisible in [
+            '\u{061c}', '\u{200b}', '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}', '\u{202a}',
+            '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2060}', '\u{2061}', '\u{2062}',
+            '\u{2063}', '\u{2064}', '\u{2065}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+            '\u{feff}',
+        ] {
+            let shown = TerminalSafe::from_untrusted(&format!("a{invisible}b"));
+            assert_eq!(
+                shown.as_str(),
+                "a\u{fffd}b",
+                "U+{:04X}",
+                u32::from(invisible)
+            );
+        }
+    }
+
+    /// After a `PASS`, a server may answer it with 451 before capability
+    /// discovery has been answered at all. That 451 is about `PASS`, not
+    /// `CAP`: registration must keep negotiating, not conclude that the server
+    /// has no capability negotiation.
+    #[tokio::test]
+    async fn a_451_about_pass_does_not_end_capability_negotiation() {
+        let password = ServerPassword::parse("open sesame".to_owned()).expect("a valid password");
+        let identity = Identity {
+            server_password: Some(&password),
+            ..TEST_IDENTITY
+        };
+        let mut steps = vec![
+            Expect("PASS :open sesame"),
+            Expect("CAP LS 302"),
+            Send(":srv 451 * PASS :You have not registered"),
+            Send(":srv CAP * LS :"),
+        ];
+        steps.extend(IDENTITY_THEN_WELCOME);
+        let (mut connection, server) = scripted(steps);
+        let welcomed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connection.register(&identity),
+        )
+        .await
+        .expect("registration neither finished nor failed")
+        .expect("welcomed");
+        assert_eq!(welcomed, "nick");
+        drop(connection);
+        assert_eq!(server.await.unwrap(), Vec::<String>::new());
     }
 
     #[test]
@@ -2322,15 +3029,236 @@ mod tests {
         nick: "nick",
         username: "ident",
         realname: "real",
+        server_password: None,
     };
 
+    /// A `PASS` goes out before anything else — before `CAP LS`, on every
+    /// registration path — and its trailing-parameter form keeps a password
+    /// with spaces in it whole.
+    #[tokio::test]
+    async fn a_server_password_is_the_first_line_on_every_registration_path() {
+        let password = ServerPassword::parse("open sesame".to_owned()).expect("a valid password");
+        let identity = Identity {
+            server_password: Some(&password),
+            ..TEST_IDENTITY
+        };
+        let plain = {
+            let mut steps = vec![Expect("PASS :open sesame"), Expect("CAP LS 302")];
+            steps.push(Send(":srv CAP * LS :"));
+            steps.extend(IDENTITY_THEN_WELCOME);
+            steps
+        };
+        let (mut connection, server) = scripted(plain);
+        assert_eq!(
+            connection.register(&identity).await.expect("welcomed"),
+            "nick"
+        );
+        drop(connection);
+        assert_eq!(server.await.unwrap(), Vec::<String>::new());
+
+        // The SASL paths: the scripted server refuses `sasl` once asked, which
+        // ends each registration right after the lines that matter here.
+        for mechanism in ["PLAIN", "OAUTHBEARER"] {
+            let (mut connection, server) = scripted(vec![
+                Expect("PASS :open sesame"),
+                Expect("CAP LS 302"),
+                Send(":srv CAP * LS :sasl"),
+                Expect("CAP REQ :sasl"),
+                Send(":srv CAP * NAK :sasl"),
+            ]);
+            let registration = async {
+                if mechanism == "PLAIN" {
+                    connection.register_sasl(&identity, "acct", "pw").await
+                } else {
+                    connection.register_oauthbearer(&identity, "token").await
+                }
+            };
+            let error = tokio::time::timeout(std::time::Duration::from_secs(5), registration)
+                .await
+                .expect("registration neither finished nor failed")
+                .expect_err("the scripted server refuses sasl");
+            assert_eq!(
+                SaslRejection::from_error(&error).map(|rejection| rejection.failure()),
+                Some(SaslFailure::CapabilityNotOffered),
+                "{mechanism}: {error:?}"
+            );
+            drop(connection);
+            assert_eq!(server.await.unwrap(), Vec::<String>::new());
+        }
+    }
+
+    /// The bound is decided before a byte leaves: an over-long password would
+    /// otherwise be cut by the wire budget, and a delimiter would forge a
+    /// second command inside the one line the server trusts most.
+    #[test]
+    fn a_server_password_is_bounded_and_delimiter_free_before_it_is_sent() {
+        assert_eq!(ServerPassword::MAX_LEN, 504);
+        assert!(ServerPassword::parse("x".repeat(ServerPassword::MAX_LEN)).is_ok());
+        for (value, cause) in [
+            (String::new(), ServerPasswordError::Empty),
+            (
+                "x".repeat(ServerPassword::MAX_LEN + 1),
+                ServerPasswordError::TooLong,
+            ),
+            ("a\r\nQUIT".to_owned(), ServerPasswordError::Delimiter),
+            ("a\nb".to_owned(), ServerPasswordError::Delimiter),
+            ("a\0b".to_owned(), ServerPasswordError::Delimiter),
+        ] {
+            assert_eq!(ServerPassword::parse(value).expect_err("refused"), cause);
+        }
+        let password = ServerPassword::parse("hunter2".to_owned()).expect("valid");
+        assert_eq!(password.as_str(), "hunter2");
+        assert!(!format!("{password:?}").contains("hunter2"));
+        assert!(
+            !format!(
+                "{:?}",
+                Identity {
+                    server_password: Some(&password),
+                    ..TEST_IDENTITY
+                }
+            )
+            .contains("hunter2")
+        );
+    }
+
+    /// A 464 means one of two things, and only the client knows which: with no
+    /// `PASS` sent the network wants one; after a `PASS` it rejected the one
+    /// sent. Each is a different repair, so each is a different refusal.
+    #[tokio::test]
+    async fn a_464_names_a_missing_password_or_a_rejected_one() {
+        let refused = ":srv 464 nick :Password incorrect";
+        let (mut connection, server) = scripted(vec![Expect("CAP LS 302"), Send(refused)]);
+        let error = connection
+            .register(&TEST_IDENTITY)
+            .await
+            .expect_err("464 refuses registration");
+        assert_eq!(
+            RegistrationRefusal::from_error(&error),
+            Some(RegistrationRefusal::ServerPasswordRequired)
+        );
+        drop(connection);
+        assert_eq!(server.await.unwrap(), Vec::<String>::new());
+
+        let password = ServerPassword::parse("wrong".to_owned()).expect("valid");
+        let (mut connection, server) = scripted(vec![
+            Expect("PASS :wrong"),
+            Expect("CAP LS 302"),
+            Send(refused),
+        ]);
+        let error = connection
+            .register(&Identity {
+                server_password: Some(&password),
+                ..TEST_IDENTITY
+            })
+            .await
+            .expect_err("464 refuses registration");
+        assert_eq!(
+            RegistrationRefusal::from_error(&error),
+            Some(RegistrationRefusal::ServerPasswordRejected)
+        );
+        assert!(!error.to_string().contains("wrong"), "{error}");
+        drop(connection);
+        assert_eq!(server.await.unwrap(), Vec::<String>::new());
+        assert_eq!(
+            RegistrationRefusal::ServerPasswordRequired.retry_policy(),
+            RegistrationRefusal::ServerPasswordRejected.retry_policy()
+        );
+    }
+
     fn duplex_connection(capacity: usize) -> (Connection, tokio::io::DuplexStream) {
+        duplex_connection_over(capacity, Transport::Loopback)
+    }
+
+    fn duplex_connection_over(
+        capacity: usize,
+        transport: Transport,
+    ) -> (Connection, tokio::io::DuplexStream) {
         let (client_io, server_io) = tokio::io::duplex(capacity);
         let (reader, writer) = tokio::io::split(client_io);
         (
-            Connection::from_halves(Box::new(reader), Box::new(writer)),
+            Connection::from_halves(Box::new(reader), Box::new(writer), transport),
             server_io,
         )
+    }
+
+    /// A credential — a SASL password, a bearer token, a server password — is
+    /// written only to a connection whose transport cannot be overheard: TLS,
+    /// or a plaintext socket whose peer is this machine's loopback address.
+    /// The connection decides from how it was built; no caller can talk it
+    /// into sending one in cleartext to another machine, and it refuses
+    /// before a single byte is written.
+    #[tokio::test]
+    async fn credentials_are_written_only_to_a_transport_that_cannot_be_overheard() {
+        let password = ServerPassword::parse("open sesame".into()).expect("valid");
+        let identity = Identity {
+            nick: "alice",
+            username: "alice",
+            realname: "Alice",
+            server_password: None,
+        };
+        let with_password = Identity {
+            server_password: Some(&password),
+            ..identity
+        };
+        for attempt in 0..3 {
+            let (mut connection, mut server) = duplex_connection_over(4096, Transport::Cleartext);
+            let refused = match attempt {
+                0 => connection.register_sasl(&identity, "alice", "secret").await,
+                1 => connection.register_oauthbearer(&identity, "token").await,
+                _ => connection.register(&with_password).await,
+            }
+            .expect_err("a cleartext transport to another machine carries no credential");
+            assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "{refused}");
+            assert!(refused.to_string().contains("cleartext"), "{refused}");
+            drop(connection);
+            let mut written = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut server, &mut written)
+                .await
+                .expect("read what was written");
+            assert!(
+                written.is_empty(),
+                "{:?}",
+                String::from_utf8_lossy(&written)
+            );
+        }
+        // With the user's explicit consent (`--allow-cleartext-credentials`)
+        // the password is sent.
+        let (mut connection, mut server) = duplex_connection_over(4096, Transport::Cleartext);
+        connection.consent_to_cleartext_credentials();
+        drop(connection.send_server_password(&with_password).await);
+        drop(connection);
+        let mut written = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut server, &mut written)
+            .await
+            .expect("read");
+        assert_eq!(written, b"PASS :open sesame\r\n");
+    }
+
+    #[test]
+    fn a_plaintext_peer_is_loopback_by_its_address() {
+        for peer in [
+            "127.0.0.1:6667",
+            "127.8.8.8:6667",
+            "[::1]:6667",
+            "[::ffff:127.0.0.1]:6667",
+        ] {
+            assert_eq!(
+                Transport::of_plaintext_peer(peer.parse().unwrap()),
+                Transport::Loopback,
+                "{peer}"
+            );
+        }
+        for peer in [
+            "192.0.2.1:6667",
+            "[2001:db8::1]:6667",
+            "[::ffff:192.0.2.1]:6667",
+        ] {
+            assert_eq!(
+                Transport::of_plaintext_peer(peer.parse().unwrap()),
+                Transport::Cleartext,
+                "{peer}"
+            );
+        }
     }
 
     /// `USER  0 * :real` names the user "0", and `USER al ice 0 * :real` shifts
@@ -2348,6 +3276,7 @@ mod tests {
                 nick,
                 username,
                 realname: "real",
+                server_password: None,
             };
             let error = connection
                 .send_registration_identity(&identity)
@@ -2701,6 +3630,7 @@ mod tests {
             authentication: Authentication::None,
             response_deadline,
             cleartext_credentials: CleartextCredentials::Refuse,
+            server_password: None,
         }
     }
 
@@ -2723,6 +3653,13 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
             assert!(error.to_string().contains("cleartext"), "{error}");
         }
+        // A server password is a credential too, even with no SASL.
+        let mut options = anonymous("192.0.2.1:6667".into(), std::time::Duration::from_secs(2));
+        options.server_password = Some(ServerPassword::parse("secret".into()).expect("valid"));
+        let error = must_give_up(options.connect_registered()).await;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        assert!(error.to_string().contains("server password"), "{error}");
+        assert!(!error.to_string().contains("secret"), "{error}");
 
         // Loopback never leaves the machine; anonymous has nothing to protect;
         // and the caller's user may insist. None of these is refused up front
@@ -2770,23 +3707,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn loopback_hosts_are_recognised_by_name_and_by_address() {
-        for host in [
-            "localhost",
-            "irc.localhost",
-            "127.0.0.1",
-            "127.8.8.8",
-            "::1",
-            "[::1]",
-        ] {
-            assert!(is_loopback_host(host), "{host}");
-        }
-        for host in ["localhost.example", "192.0.2.1", "::2", "irc.example", ""] {
-            assert!(!is_loopback_host(host), "{host}");
-        }
-    }
-
     #[tokio::test]
     async fn registration_gives_up_at_the_response_deadline() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2809,7 +3729,7 @@ mod tests {
             let (_reader, writer) = tokio::io::split(server_io);
             let peer = tokio::spawn(chatter(writer));
             let error = if join {
-                must_give_up(connection.join_with_history("#room", 0)).await
+                must_give_up(connection.join_with_history("#room", 0, 0)).await
             } else {
                 must_give_up(connection.require_capabilities(&["batch"])).await
             };
@@ -2956,7 +3876,13 @@ mod tests {
         .await
         .unwrap();
         let messages = if resume_after_marker {
-            conn.join_with_history("#Room", 50).await.unwrap()
+            let joined = conn.join_with_history("#Room", 50, 500).await.unwrap();
+            assert_eq!(
+                joined.coverage,
+                HistoryCoverage::AllUnread,
+                "a short page is the end"
+            );
+            joined.events
         } else {
             conn.join_with_latest_history("#Room", 50).await.unwrap()
         };
@@ -2967,6 +3893,206 @@ mod tests {
                 && message.params.get(1).is_some_and(|text| text == "unread")
         }));
         server.await.unwrap();
+    }
+
+    /// `AFTER <marker> N` answers with the *oldest* N unread lines. A full
+    /// page means more may follow, so the client pages forward from the last
+    /// line it received until a page comes back short.
+    #[tokio::test]
+    async fn unread_history_pages_forward_until_a_short_page() {
+        let joined = |steps: &mut Vec<Step>| {
+            steps.extend([
+                Expect("JOIN #r"),
+                Send(":me!u@h JOIN #r"),
+                Send(":srv MARKREAD #r timestamp=2026-07-30T12:00:00.000Z"),
+                Send(":srv 366 me #r :End of NAMES"),
+            ]);
+        };
+        let page = |steps: &mut Vec<Step>, request: &'static str, lines: &[&'static str]| {
+            steps.push(Expect(request));
+            steps.push(Send(":srv BATCH +h chathistory #r"));
+            steps.extend(lines.iter().map(|line| Send(line)));
+            steps.push(Send(":srv BATCH -h"));
+        };
+        let mut steps = Vec::new();
+        joined(&mut steps);
+        page(
+            &mut steps,
+            "CHATHISTORY AFTER #r timestamp=2026-07-30T12:00:00.000Z 2",
+            &[
+                "@batch=h;msgid=a;time=2026-07-30T12:00:01.000Z :x!u@h PRIVMSG #r :1",
+                "@batch=h;msgid=b;time=2026-07-30T12:00:02.000Z :x!u@h PRIVMSG #r :2",
+            ],
+        );
+        page(
+            &mut steps,
+            "CHATHISTORY AFTER #r msgid=b 2",
+            &[
+                "@batch=h;msgid=c;time=2026-07-30T12:00:03.000Z :x!u@h PRIVMSG #r :3",
+                "@batch=h;time=2026-07-30T12:00:04.000Z :x!u@h PRIVMSG #r :4",
+            ],
+        );
+        page(
+            &mut steps,
+            "CHATHISTORY AFTER #r timestamp=2026-07-30T12:00:04.000Z 2",
+            &["@batch=h;msgid=e;time=2026-07-30T12:00:05.000Z :x!u@h PRIVMSG #r :5"],
+        );
+        let (mut connection, server) = scripted(steps);
+        let history = connection
+            .join_with_history("#r", 2, 100)
+            .await
+            .expect("history");
+        assert_eq!(history.coverage, HistoryCoverage::AllUnread);
+        let texts: Vec<&str> = messages_of(&history.events)
+            .into_iter()
+            .filter(|message| message.command == "PRIVMSG")
+            .map(|message| message.params[1].as_str())
+            .collect();
+        assert_eq!(texts, ["1", "2", "3", "4", "5"]);
+        drop(connection);
+        assert_eq!(server.await.unwrap(), Vec::<String>::new());
+
+        // Paging is bounded: a page that is still full when the bound is
+        // reached says that unread lines remain beyond what was loaded.
+        let mut steps = Vec::new();
+        joined(&mut steps);
+        page(
+            &mut steps,
+            "CHATHISTORY AFTER #r timestamp=2026-07-30T12:00:00.000Z 2",
+            &[
+                "@batch=h;msgid=a :x!u@h PRIVMSG #r :1",
+                "@batch=h;msgid=b :x!u@h PRIVMSG #r :2",
+            ],
+        );
+        page(
+            &mut steps,
+            "CHATHISTORY AFTER #r msgid=b 1",
+            &["@batch=h;msgid=c :x!u@h PRIVMSG #r :3"],
+        );
+        let (mut connection, server) = scripted(steps);
+        let history = connection
+            .join_with_history("#r", 2, 3)
+            .await
+            .expect("history");
+        assert_eq!(history.coverage, HistoryCoverage::UnreadBeyondLoaded);
+        drop(connection);
+        assert_eq!(server.await.unwrap(), Vec::<String>::new());
+    }
+
+    /// A name under `.localhost` is whatever a resolver answers. Credentials
+    /// cross in cleartext only when every resolved address is loopback, and
+    /// then exactly those addresses are dialed.
+    #[tokio::test]
+    async fn a_localhost_name_is_trusted_only_for_what_it_resolves_to() {
+        let mut options = anonymous(
+            "irc.localhost:6667".into(),
+            std::time::Duration::from_secs(2),
+        );
+        options.authentication = Authentication::Plain {
+            account: "account".into(),
+            password: "secret".into(),
+        };
+        for resolved in [
+            vec!["192.0.2.1:6667"],
+            vec!["127.0.0.1:6667", "192.0.2.1:6667"],
+            vec!["[::ffff:192.0.2.1]:6667"],
+            vec![],
+        ] {
+            let addresses: Vec<std::net::SocketAddr> =
+                resolved.iter().map(|a| a.parse().unwrap()).collect();
+            let error =
+                must_give_up(options.connect_and_register(|_| async move { Ok(addresses) })).await;
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "{resolved:?}: {error}"
+            );
+            assert!(error.to_string().contains("cleartext"), "{error}");
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let loopback = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut lines = tokio::io::BufReader::new(socket).lines();
+            lines.next_line().await.unwrap()
+        });
+        let error = must_give_up(options.connect_and_register(|requested| async move {
+            assert_eq!(requested, "irc.localhost:6667");
+            Ok(vec![loopback])
+        }))
+        .await;
+        assert_ne!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        assert_eq!(
+            accepted.await.unwrap().as_deref(),
+            Some("CAP LS 302"),
+            "the resolved loopback address is the one dialed"
+        );
+    }
+
+    #[test]
+    fn refusals_are_error_numerics_and_fail() {
+        let parsed = |line: &str| OwnedMessage::from(&Message::parse(line).unwrap());
+        for refusal in [
+            ":srv 404 me #c :Cannot send to channel",
+            ":srv 486 me bob :You must log in to message this user",
+            ":srv 473 me #c :Cannot join channel (+i)",
+            ":srv 599 me :x",
+            ":srv FAIL PRIVMSG CANNOT_SEND #c :no",
+        ] {
+            assert!(is_refusal(&parsed(refusal)), "{refusal}");
+        }
+        for other in [
+            ":srv 311 me bob u h * :Bob",
+            ":srv 366 me #c :End",
+            ":srv 600 me :x",
+            ":srv WARN X Y :z",
+            ":bob!u@h PRIVMSG #c :400",
+        ] {
+            assert!(!is_refusal(&parsed(other)), "{other}");
+        }
+    }
+
+    #[test]
+    fn irc_formatting_is_stripped_before_text_is_shown() {
+        for (formatted, plain) in [
+            ("\x02bold\x02 text", "bold text"),
+            ("\x034red\x03 \x0304,12both\x03", "red both"),
+            ("\x03,5comma\x03", ",5comma"),
+            ("\x0312,x", ",x"),
+            ("\x04ff0000hex\x04ff0000,00ff00bg", "hexbg"),
+            (
+                "\x1ditalic\x1f under\x1estrike\x11mono\x16rev\x0f",
+                "italic understrikemonorev",
+            ),
+            ("\x03999", "9"),
+        ] {
+            assert_eq!(strip_formatting(formatted), plain, "{formatted:?}");
+        }
+        assert_eq!(
+            TerminalSafe::from_irc_text("\x02hi\x02\x1b[2J").as_str(),
+            "hi\u{fffd}[2J"
+        );
+    }
+
+    /// Every wait after `QUIT` is bounded: a server that keeps the socket open
+    /// ends it with a timeout rather than holding the caller forever.
+    #[tokio::test]
+    async fn the_wait_after_quit_is_bounded() {
+        let (mut connection, server_io) = duplex_connection(16 * 1024);
+        connection.response_deadline = Some(std::time::Duration::from_millis(150));
+        let (_reader, writer) = tokio::io::split(server_io);
+        let peer = tokio::spawn(chatter(writer));
+        let mut seen = 0;
+        let error = must_give_up(connection.quit_and_drain("done", |_| {
+            seen += 1;
+            Ok(())
+        }))
+        .await;
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(seen > 0, "lines read on the way are handed on");
+        peer.abort();
     }
 
     #[tokio::test]

@@ -288,6 +288,16 @@ channels, reports each stage's timing, sends `QUIT`, and stores nothing: no
 network is created and no driver is started. Saving a network never depends
 on it.
 
+**Server password (PASS)** — a network's connection password: the argument of
+the `PASS` line a private IRC server requires before `CAP LS`, `NICK` and
+`USER`, answered with `464` when it is wrong or missing. It admits the
+connection, not a user — distinct from the SASL or NickServ password, which
+identifies an account. e6irc sends it first when one is configured, stores it
+sealed like the SASL password, reports only whether one is stored
+(`has_server_password`), and tells a missing one (`server_password_required`)
+from a rejected one (`server_password_rejected`); both wait on the refusal
+schedule. IRC networks only; a bridge has no such line.
+
 **Refusal schedule** — the delays before a driver re-dials an upstream that
 refused its registration: 30 seconds, then 1, 2, and 4 minutes, long enough for
 a ghost of the driver's own session to time out upstream. An ordinary

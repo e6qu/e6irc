@@ -71,6 +71,7 @@ const apiContract = {
             realname: { type: "string" },
             autojoin: { type: "array", items: { type: "string" } },
             sasl_account: { type: "string" }, sasl_password: { type: "string" },
+            server_password: { type: ["string", "null"], minLength: 1, maxLength: 504, writeOnly: true },
           },
         } } } },
         responses: { 201: response({
@@ -138,9 +139,10 @@ async function consoleTemplate(name, values = {}) {
     .replace(/\{\{\s*([\w.]+)\s*\}\}/g, (_, key) => values[key] ?? "");
 }
 
+// The console's one stylesheet (served at /console.css; the pages allow no
+// inline style).
 async function consoleStyles() {
-  const template = await readFile(new URL("../../crates/e6ircd/templates/console_base.html", import.meta.url), "utf8");
-  return template.match(/<style>([\s\S]+)<\/style>/)[1];
+  return readFile(new URL("../../crates/e6ircd/assets/console.css", import.meta.url), "utf8");
 }
 
 async function mountConsoleRuntime(page, body, styles = "", apiResponses = {}) {
@@ -192,8 +194,7 @@ test("identity entry uses the shared relay-desk system", async ({ page }) => {
 test("console shell keeps operations dense and legible", async ({ page }) => {
   await page.emulateMedia({ colorScheme: "light", reducedMotion: "reduce" });
   await page.setViewportSize({ width: 1280, height: 800 });
-  const template = await readFile(new URL("../../crates/e6ircd/templates/console_base.html", import.meta.url), "utf8");
-  const styles = template.match(/<style>([\s\S]+)<\/style>/)?.[1];
+  const styles = await consoleStyles();
   expect(styles).toBeTruthy();
   await setStyledFixture(page, "console-overview.html", styles);
 
@@ -348,7 +349,9 @@ test("console adds a known network from a nickname alone, with no forced test", 
   expect(await page.locator("form[data-api-owner-network-create] label > span:first-of-type").allTextContents()).toEqual([
     "IRC network", "Nickname", "NickServ account optional", "NickServ password optional", "Channels to join optional",
     "Name", "Server", "Use TLSRecommended for public IRC networks.", "Username optional", "Real name optional",
+    "Server password optional",
   ]);
+  await expect(page.locator('input[name="server_password"]')).toHaveAttribute("autocomplete", "new-password");
   await expectAccessible(page);
 
   await add.click();
@@ -386,7 +389,7 @@ test("console network editor sends the nickname for a blank real name and restor
   const editor = await consoleTemplate("console_network_edit.html", { name: "libera", "shell.csrf": "test-csrf" });
   const network = {
     kind: "irc", name: "libera", addr: "irc.libera.chat:6697", tls: true, nick: "alice", username: "alice", realname: null,
-    autojoin: ["#e6irc"], sasl_account: "alice", has_sasl_account: true, has_sasl_password: true, enabled: true,
+    autojoin: ["#e6irc"], sasl_account: "alice", has_sasl_account: true, has_sasl_password: true, has_server_password: true, enabled: true,
   };
   await mountConsoleRuntime(page, `<main>${editor}</main>`, await consoleStyles(), { "/api/v1/me/networks/libera": network });
 
@@ -408,6 +411,7 @@ test("console network editor sends the nickname for a blank real name and restor
       // The contract declares every credential field a string: a blank
       // password is omitted (the sealed one is kept), never sent as null.
       credentials: { action: "set", account: "alice" },
+      server_password: { action: "keep" },
     },
   }]);
 
@@ -418,13 +422,29 @@ test("console network editor sends the nickname for a blank real name and restor
   await expect(page.getByRole("status")).toContainText("alice is still stored");
   await expect(page.getByLabel("NickServ account")).toBeFocused();
   expect(await page.evaluate(() => window.consoleApiMutations.length)).toBe(1);
+  await page.getByLabel("NickServ account").fill("alice");
+
+  // The server password: typed is a set, Remove clears and disables the box
+  // and is a remove.
+  await page.getByText("Advanced").click();
+  const serverPassword = page.getByLabel("New server password");
+  await serverPassword.fill("rotated");
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => window.consoleApiMutations.at(-1).json.server_password)).toEqual({ action: "set", password: "rotated" });
+  await serverPassword.fill("typed");
+  await page.getByLabel("Remove the stored server password").check();
+  await expect(serverPassword).toBeDisabled();
+  await expect(serverPassword).toHaveValue("");
+  await expectAccessible(page);
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => window.consoleApiMutations.at(-1).json.server_password)).toEqual({ action: "remove" });
 });
 
 test("console bridge editor sends only the fields the contract declares for a bridge", async ({ page }) => {
   const editor = await consoleTemplate("console_bridge_edit.html", { name: "team", "shell.csrf": "test-csrf" });
   const network = {
     kind: "slack", name: "team", addr: "https://slack.com/api", tls: true, nick: "", username: null, realname: null,
-    autojoin: ["C123"], sasl_account: null, has_sasl_account: true, has_sasl_password: true, enabled: true,
+    autojoin: ["C123"], sasl_account: null, has_sasl_account: true, has_sasl_password: true, has_server_password: false, enabled: true,
   };
   await mountConsoleRuntime(page, `<main>${editor}</main>`, await consoleStyles(), { "/api/v1/me/networks/team": network });
   await expect(page.getByRole("button", { name: "Save bridge", exact: true })).toBeVisible();
@@ -434,6 +454,7 @@ test("console bridge editor sends only the fields the contract declares for a br
   await expect.poll(() => page.evaluate(() => window.consoleApiMutations)).toEqual([{
     method: "PUT", url: "/api/v1/me/networks/team", json: {
       addr: "https://slack.com/api", tls: true, nick: "", autojoin: ["C123"], credentials: { action: "keep" },
+      server_password: { action: "keep" },
     },
   }]);
   await page.locator('[name="sasl_password"]').fill("xapp-new");
@@ -445,7 +466,7 @@ test("the console network page's save control says when it also enables the netw
   const detail = await consoleTemplate("console_network_detail.html", { name: "libera", "shell.csrf": "test-csrf" });
   const network = {
     kind: "irc", name: "libera", addr: "irc.libera.chat:6697", tls: true, nick: "alice", username: "alice", realname: null,
-    autojoin: [], sasl_account: null, has_sasl_account: false, has_sasl_password: false, enabled: false,
+    autojoin: [], sasl_account: null, has_sasl_account: false, has_sasl_password: false, has_server_password: false, enabled: false,
   };
   const operations = { enabled: false, runtime: null, storage: { lines: 0, oldest_at: null, newest_at: null }, recent_lines: [] };
   await mountConsoleRuntime(page, `<main>${detail}</main>`, await consoleStyles(), {
@@ -461,7 +482,7 @@ test("the console network page's save control says when it also enables the netw
   await save.getByLabel("NickServ password").fill("secret");
   await button.click();
   await expect.poll(() => page.evaluate(() => window.consoleApiMutations.map(({ method, url, json }) => `${method} ${url} ${JSON.stringify(json)}`))).toEqual([
-    'PUT /api/v1/me/networks/libera {"addr":"irc.libera.chat:6697","tls":true,"nick":"alice","username":"alice","realname":null,"autojoin":[],"credentials":{"action":"set","account":"alice","password":"secret"}}',
+    'PUT /api/v1/me/networks/libera {"addr":"irc.libera.chat:6697","tls":true,"nick":"alice","username":"alice","realname":null,"autojoin":[],"credentials":{"action":"set","account":"alice","password":"secret"},"server_password":{"action":"keep"}}',
     'PATCH /api/v1/me/networks/libera {"enabled":true}',
   ]);
   await expect(page.getByRole("status")).toContainText("saved and the network enabled");
@@ -485,7 +506,7 @@ test("console network page shows the NickServ account first and registration on 
   const detail = await consoleTemplate("console_network_detail.html", { name: "libera", "shell.csrf": "test-csrf" });
   const network = {
     kind: "irc", name: "libera", addr: "irc.libera.chat:6697", tls: true, nick: "alice", username: "alice", realname: null,
-    autojoin: [], sasl_account: null, has_sasl_account: false, has_sasl_password: false, enabled: true,
+    autojoin: [], sasl_account: null, has_sasl_account: false, has_sasl_password: false, has_server_password: false, enabled: true,
   };
   const operations = { enabled: true, runtime: null, storage: { lines: 0, oldest_at: null, newest_at: null }, recent_lines: [] };
   await mountConsoleRuntime(page, `<main>${detail}</main>`, await consoleStyles(), {
@@ -493,6 +514,7 @@ test("console network page shows the NickServ account first and registration on 
     "/api/v1/me/networks/libera": network,
   });
 
+  await expect(page.locator('[data-network-field="server-password"]')).toHaveText("Not set");
   const save = page.locator("[data-api-network-account-save]");
   await expect(save.getByLabel("NickServ account")).toHaveValue("alice");
   await expect(save.getByLabel("NickServ password")).toBeVisible();
@@ -598,7 +620,7 @@ test("a background refresh never pulls the rows out from under a pending confirm
   await mountConsoleRuntime(page, `<main>${form}</main>${confirmDialog}`, await consoleStyles(), {
     "/api/v1/me/networks": { networks: [{
       name: "libera", kind: "irc", addr: "irc.libera.chat:6697", tls: true, nick: "alice", username: "alice", realname: "Alice", autojoin: [],
-      sasl_account: null, has_sasl_account: false, has_sasl_password: false, enabled: true, connected: true,
+      sasl_account: null, has_sasl_account: false, has_sasl_password: false, has_server_password: false, enabled: true, connected: true,
       runtime: { state: "connected", attached_clients: 0, errors: 0, last_error: null },
     }] },
   });
@@ -642,6 +664,19 @@ test("console server-network form masks a token and forgets credentials when the
   await expect(token).toHaveAttribute("type", "text");
   await expect(token).toHaveValue("");
   await expect(form.locator('[name="sasl_password"]')).toHaveValue("");
+
+  // A server password is IRC's alone: offered, masked, and forgotten when the
+  // type changes to one that sends no PASS.
+  const serverPassword = form.locator('[name="server_password"]');
+  await expect(serverPassword).toBeVisible();
+  await expect(serverPassword).toHaveAttribute("type", "password");
+  await expect(serverPassword).toHaveAttribute("autocomplete", "new-password");
+  await serverPassword.fill("open sesame");
+  await kind.selectOption("slack");
+  await expect(serverPassword).toBeHidden();
+  await expect(serverPassword).toBeDisabled();
+  await kind.selectOption("irc");
+  await expect(serverPassword).toHaveValue("");
 });
 
 test("network picker renders the empty account state", async ({ page }) => {
@@ -832,19 +867,40 @@ const ircNetwork = (name, extra = {}) => ({
 });
 const networkDetail = (name, addr) => ({
   name, kind: "irc", addr, tls: true, nick: `${name}-nick`, username: "viewer", realname: "Viewer", autojoin: ["#kept"],
-  sasl_account: null, has_sasl_account: false, has_sasl_password: false, enabled: true,
+  sasl_account: null, has_sasl_account: false, has_sasl_password: false, has_server_password: false, enabled: true,
 });
 const detailContract = {
   get: { responses: { 200: response({
     type: "object", additionalProperties: false,
-    required: ["name", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "sasl_account", "has_sasl_account", "has_sasl_password", "enabled"],
+    required: ["name", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "sasl_account", "has_sasl_account", "has_sasl_password", "has_server_password", "enabled"],
     properties: {
       name: { type: "string" }, kind: { type: "string" }, addr: { type: "string" }, tls: { type: "boolean" },
       nick: { type: "string" }, username: { type: ["string", "null"] }, realname: { type: ["string", "null"] },
       autojoin: { type: "array", items: { type: "string" } }, sasl_account: { type: ["string", "null"] },
-      has_sasl_account: { type: "boolean" }, has_sasl_password: { type: "boolean" }, enabled: { type: "boolean" },
+      has_sasl_account: { type: "boolean" }, has_sasl_password: { type: "boolean" },
+      has_server_password: { type: "boolean" }, enabled: { type: "boolean" },
     },
   }) } },
+};
+
+// The replace request as the server documents it: both write-only secrets are
+// changed only by an explicit action.
+const secretAction = (set) => ({ oneOf: [
+  { type: "object", additionalProperties: false, required: ["action"], properties: { action: { const: "keep" } } },
+  { type: "object", additionalProperties: false, required: ["action"], properties: { action: { const: "remove" } } },
+  { type: "object", additionalProperties: false, required: ["action", ...set.required], properties: { action: { const: "set" }, ...set.properties } },
+] });
+const replaceContract = {
+  requestBody: { required: true, content: { "application/json": { schema: {
+    type: "object", additionalProperties: false, required: ["addr", "tls", "nick", "credentials", "server_password"],
+    properties: {
+      addr: { type: "string" }, tls: { type: "boolean" }, nick: { type: "string" },
+      username: { type: "string" }, realname: { type: "string" }, autojoin: { type: "array", items: { type: "string" } },
+      credentials: secretAction({ required: [], properties: { account: { type: "string" }, password: { type: "string" } } }),
+      server_password: secretAction({ required: ["password"], properties: { password: { type: "string", minLength: 1, maxLength: 504 } } }),
+    },
+  } } } },
+  responses: { 204: { description: "updated" } },
 };
 
 async function mockNetworkDetails(page, respond) {
@@ -853,6 +909,10 @@ async function mockNetworkDetails(page, respond) {
     body: JSON.stringify({ paths: { ...apiContract.paths, "/api/v1/me/networks/{name}": {
       get: {
         ...detailContract.get,
+        parameters: [{ name: "name", in: "path", required: true, schema: { type: "string" } }],
+      },
+      put: {
+        ...replaceContract,
         parameters: [{ name: "name", in: "path", required: true, schema: { type: "string" } }],
       },
     } } }),
@@ -1553,6 +1613,86 @@ test("Remove clears and disables the credential boxes in the settings dialog", a
   await expect(dialog.getByRole("alert")).toContainText("ada is still stored");
   await expect(dialog.locator("#nf-sasl-account")).toBeFocused();
   await expect(dialog.locator("#nf-sasl-account")).toHaveAttribute("aria-invalid", "true");
+});
+
+test("the server password sits under Advanced, is revealed on request, and is omitted on create when blank", async ({ page }) => {
+  await mockSession(page, []);
+  const bodies = [];
+  await page.route(/\/api\/v1\/me\/networks$/, async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    bodies.push(route.request().postDataJSON());
+    return route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify({ name: "libera", attach: "visual-test/libera" }) });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Add a network", exact: true }).last().click();
+  const dialog = page.getByRole("dialog", { name: "Add a network" });
+  // Addressed by id: the label also carries its reveal button's text.
+  const box = dialog.locator("#nf-server-password");
+  await expect(box).toBeHidden();
+  await dialog.getByText("Advanced").click();
+  await expect(box).toBeVisible();
+  await expect(box).toHaveAttribute("autocomplete", "new-password");
+  await expect(dialog.getByText("Only for private servers that require one.")).toBeVisible();
+  await expect(dialog.getByText("Remove the stored server password")).toBeHidden();
+  await box.fill("open sesame");
+  await dialog.getByRole("button", { name: "Show server password" }).click();
+  await expect(box).toHaveAttribute("type", "text");
+  await expect(dialog.getByRole("button", { name: "Hide server password" })).toHaveAttribute("aria-pressed", "true");
+  await expectAccessible(page);
+  await box.fill("");
+  await dialog.locator("#nf-username").fill("visual");
+  await dialog.getByRole("button", { name: "Save" }).click();
+  await expect(page).toHaveURL(/\?network=libera$/);
+  expect(bodies).toHaveLength(1);
+  expect("server_password" in bodies[0]).toBe(false);
+});
+
+test("the settings dialog keeps, sets, or removes the server password only as asked", async ({ page }) => {
+  await mockLiveSocket(page);
+  await mockSession(page, [ircNetwork("Libera")]);
+  const replaced = [];
+  await mockNetworkDetails(page, (route) => {
+    if (route.request().method() === "PUT") {
+      replaced.push(route.request().postDataJSON().server_password);
+      return route.fulfill({ status: 204 });
+    }
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ ...networkDetail("Libera", "irc.libera.example:6697"), has_server_password: true }),
+    });
+  });
+  await page.goto("/?network=Libera");
+  const open = async () => {
+    await page.getByRole("button", { name: "Settings for Libera" }).click();
+    const dialog = page.getByRole("dialog", { name: "Settings — Libera" });
+    await expect(dialog.locator("#nf-nick")).toHaveValue("Libera-nick");
+    await dialog.getByText("Advanced").click();
+    return dialog;
+  };
+  const save = async (dialog, count) => {
+    await dialog.getByRole("button", { name: "Save" }).click();
+    await expect.poll(() => replaced.length).toBe(count);
+    await expect(dialog).toBeHidden();
+  };
+
+  let dialog = await open();
+  await expect(dialog.getByText("Leave blank to keep the stored one", { exact: false })).toBeVisible();
+  await save(dialog, 1);
+  expect(replaced[0]).toEqual({ action: "keep" });
+
+  dialog = await open();
+  await dialog.locator("#nf-server-password").fill("rotated");
+  await save(dialog, 2);
+  expect(replaced[1]).toEqual({ action: "set", password: "rotated" });
+
+  dialog = await open();
+  await dialog.locator("#nf-server-password").fill("typed");
+  await dialog.getByText("Remove the stored server password").click();
+  await expect(dialog.locator("#nf-server-password")).toBeDisabled();
+  await expect(dialog.locator("#nf-server-password")).toHaveValue("");
+  await expectAccessible(page);
+  await save(dialog, 3);
+  expect(replaced[2]).toEqual({ action: "remove" });
 });
 
 test("on a phone the member list opens from the buffer header", async ({ page }) => {

@@ -191,10 +191,27 @@ impl CampaignTarget {
     }
 }
 
+/// Whether `host` can be a public DNS name: a domain, not an address literal
+/// (which proves no identity to qualify), and not a special-use name reserved
+/// for this machine (`localhost` and names under it, RFC 6761 §6.3). This is a
+/// statement about the name's spelling for the evidence a campaign records;
+/// whether a plaintext connection may go somewhere is decided by address when
+/// it is dialled (`native::endpoint_scope`).
+fn is_public_dns_name(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    !host.is_empty()
+        && host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_err()
+        && host != "localhost"
+        && !host.ends_with(".localhost")
+}
+
 fn validate_external_oidc_issuer(value: &str) -> Result<(), String> {
     let url = Url::parse(value).map_err(|_| "OIDC target must be an HTTPS issuer URL")?;
     if url.scheme() != "https"
-        || !url.host_str().is_some_and(native::is_external_host)
+        || !url.host_str().is_some_and(is_public_dns_name)
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()

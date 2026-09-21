@@ -21,46 +21,89 @@ pub struct LogLine {
 }
 
 impl LogLine {
-    /// Neutralize control bytes in the (untrusted) sender and text.
+    /// Neutralize control bytes in the (untrusted) sender and text, and drop
+    /// the text's IRC formatting codes, which this client does not render.
     fn new(from: &str, text: &str) -> Self {
         Self {
             from: TerminalSafe::from_untrusted(from),
-            text: TerminalSafe::from_untrusted(text),
+            text: TerminalSafe::from_irc_text(text),
+        }
+    }
+
+    /// A message body as the sender meant it to be shown: a CTCP `ACTION`
+    /// (`/me waves`) is `* nick waves`, any other CTCP request is named as
+    /// one rather than shown with its delimiters, and ordinary text is itself.
+    fn message(sender: &str, text: &str) -> Self {
+        let Some(ctcp) = text.strip_prefix('\x01') else {
+            return Self::new(sender, text);
+        };
+        let ctcp = ctcp.strip_suffix('\x01').unwrap_or(ctcp);
+        match ctcp.split_once(' ') {
+            Some((verb, action)) if verb.eq_ignore_ascii_case("ACTION") => {
+                Self::new(&format!("* {sender}"), action)
+            }
+            _ if ctcp.eq_ignore_ascii_case("ACTION") => Self::new(&format!("* {sender}"), ""),
+            _ => Self::new(sender, &format!("[CTCP {ctcp}]")),
         }
     }
 }
 
-/// Whether `command` is an IRC error reply (400–599).
-fn is_error_numeric(command: &str) -> bool {
-    command.len() == 3
-        && command
-            .parse::<u16>()
-            .is_ok_and(|numeric| (400..600).contains(&numeric))
+/// What a buffer holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferKind {
+    /// A channel or a query: text typed here is sent to it.
+    Conversation,
+    /// The server's own lines — the welcome burst, replies to `/raw`, modes
+    /// and notices that belong to no conversation. Nothing is sent to it.
+    Server,
 }
+
+/// How far a buffer's read marker may advance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReadHold {
+    /// To the latest line shown.
+    Free,
+    /// No further than this time: the last line loaded before a gap.
+    At(String),
+    /// Not at all: a gap follows lines whose times are unknown.
+    Nowhere,
+}
+
+/// The server buffer's name: not a legal channel or nickname, so no
+/// conversation can share it.
+pub const SERVER_BUFFER: &str = "*server*";
 
 /// One conversation: a channel or a query (PM) with its own scrollback.
 #[derive(Debug, Clone)]
 pub struct Buffer {
     pub name: String,
+    pub kind: BufferKind,
     pub log: Vec<LogLine>,
     seen_msgids: std::collections::HashSet<String>,
     msgid_order: std::collections::VecDeque<String>,
     latest_time: Option<String>,
     read_marker: Option<String>,
+    /// How far the read marker may advance. Held at the last line loaded
+    /// contiguously from history when unread lines remain beyond it: the lines
+    /// between it and the live stream were never shown, and marking them read
+    /// would do so on every device.
+    read_hold: ReadHold,
     unread: usize,
     /// Scrollback offset in lines from the bottom (0 = following live).
     scroll: usize,
 }
 
 impl Buffer {
-    fn new(name: String) -> Self {
+    fn new(name: String, kind: BufferKind) -> Self {
         Self {
             name,
+            kind,
             log: Vec::new(),
             seen_msgids: std::collections::HashSet::new(),
             msgid_order: std::collections::VecDeque::new(),
             latest_time: None,
             read_marker: None,
+            read_hold: ReadHold::Free,
             unread: 0,
             scroll: 0,
         }
@@ -122,16 +165,30 @@ impl Buffer {
         self.unread
     }
 
-    /// The window of lines to render for a pane `height` rows tall.
+    /// The window of lines to render for a pane `height` rows tall, when
+    /// each line takes one row.
     pub fn visible(&self, height: usize) -> &[LogLine] {
+        self.visible_rows(height, |_| 1)
+    }
+
+    /// The window of lines to render for a pane `height` rows tall, when a
+    /// line takes `rows(line)` rows (a long line wraps): the lines ending at
+    /// the scroll position whose rows fill the pane. The first may be taller
+    /// than what is left of the pane; the renderer shows its end.
+    pub fn visible_rows(&self, height: usize, rows: impl Fn(&LogLine) -> usize) -> &[LogLine] {
         let end = self.log.len().saturating_sub(self.scroll);
-        let start = end.saturating_sub(height);
+        let mut start = end;
+        let mut filled = 0;
+        while start > 0 && filled < height {
+            start -= 1;
+            filled += rows(&self.log[start]).max(1);
+        }
         &self.log[start..end]
     }
 }
 
 /// Lines of scrollback kept per buffer. Older lines are dropped.
-const SCROLLBACK_LINES: usize = 5_000;
+pub const SCROLLBACK_LINES: usize = 5_000;
 
 /// Buffers a client will open. Names arrive from the server, so this bounds
 /// what a remote party can make the client allocate.
@@ -195,7 +252,7 @@ impl App {
     pub fn new(channel: String, nick: String) -> Self {
         Self {
             nick,
-            buffers: vec![Buffer::new(channel)],
+            buffers: vec![Buffer::new(channel, BufferKind::Conversation)],
             current: 0,
             input: String::new(),
             input_cursor: 0,
@@ -280,8 +337,82 @@ impl App {
         if self.buffers.len() >= MAX_BUFFERS {
             return None;
         }
-        self.buffers.push(Buffer::new(name));
+        self.buffers
+            .push(Buffer::new(name, BufferKind::Conversation));
         Some(self.buffers.len() - 1)
+    }
+
+    /// The server buffer, opened the first time the server says something
+    /// that belongs to no conversation. At the buffer cap its lines go where
+    /// the user is looking — never nowhere.
+    fn server_buffer(&mut self) -> usize {
+        if let Some(index) = self
+            .buffers
+            .iter()
+            .position(|buffer| buffer.kind == BufferKind::Server)
+        {
+            return index;
+        }
+        if self.buffers.len() >= MAX_BUFFERS {
+            self.note_buffer_limit();
+            return self.current;
+        }
+        self.buffers
+            .push(Buffer::new(SERVER_BUFFER.to_owned(), BufferKind::Server));
+        self.buffers.len() - 1
+    }
+
+    /// Say `text` in the server buffer.
+    fn note_server(&mut self, text: &str) {
+        let index = self.server_buffer();
+        self.buffers[index].push(LogLine::new("*", text));
+    }
+
+    /// Say `text` in the conversation named `name` when one is open, else in
+    /// the server buffer: a reply about something this client is showing
+    /// belongs beside it.
+    fn note_about(&mut self, name: &str, text: &str) {
+        match self.conversation_index(name) {
+            Some(index) => self.buffers[index].push(LogLine::new("*", text)),
+            None => self.note_server(text),
+        }
+    }
+
+    /// Index of the open conversation (not the server buffer) named `name`.
+    fn conversation_index(&self, name: &str) -> Option<usize> {
+        self.buffer_index(name)
+            .filter(|index| self.buffers[*index].kind == BufferKind::Conversation)
+    }
+
+    /// Let the read marker of `channel` advance freely again: its history
+    /// loaded every unread line, so no gap remains.
+    pub fn release_read_marker(&mut self, channel: &str) {
+        if let Some(index) = self.conversation_index(channel) {
+            self.buffers[index].read_hold = ReadHold::Free;
+        }
+    }
+
+    /// Hold the read marker of `channel` at its last loaded line: history
+    /// stopped paging with unread lines still beyond it, and those lines were
+    /// never shown.
+    pub fn hold_read_marker(&mut self, channel: &str) {
+        let Some(index) = self.conversation_index(channel) else {
+            return;
+        };
+        let buffer = &mut self.buffers[index];
+        buffer.read_hold = match buffer
+            .latest_time
+            .clone()
+            .or_else(|| buffer.read_marker.clone())
+        {
+            Some(time) => ReadHold::At(time),
+            None => ReadHold::Nowhere,
+        };
+        buffer.push(LogLine::new(
+            "*",
+            "more unread lines were not loaded; the read marker stays at the last line \
+             loaded here",
+        ));
     }
 
     pub fn next_buffer(&mut self) {
@@ -329,12 +460,25 @@ impl App {
                     return;
                 };
                 let text = msg.params.get(1).cloned().unwrap_or_default();
+                let from_a_user = msg
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source.contains('!'));
                 // A channel message lands in that channel's buffer; a PM to
-                // us opens/uses a query buffer named after the sender.
-                let buffer = if casemap.eq(&target, &self.nick) {
-                    sender.clone()
-                } else {
+                // us opens/uses a query buffer named after the sender. What a
+                // server says to us, or to no one in particular (`NOTICE *`,
+                // a bouncer's status), belongs to no conversation.
+                let buffer = if e6irc_client::is_channel_target(&target) {
                     target
+                } else if casemap.eq(&target, &self.nick) && from_a_user {
+                    sender.clone()
+                } else if casemap.eq(&sender, &self.nick) {
+                    // Our own message, sent from another client attached to
+                    // the same bouncer network: it belongs to its recipient.
+                    target
+                } else {
+                    self.note_server(&format!("{sender}: {text}"));
+                    return;
                 };
                 let Some(idx) = self.open_buffer(buffer) else {
                     self.note_buffer_limit();
@@ -343,7 +487,7 @@ impl App {
                 if !self.buffers[idx].accept_msgid(msg.tag("msgid")) {
                     return;
                 }
-                self.buffers[idx].push(LogLine::new(&sender, &text));
+                self.buffers[idx].push(LogLine::message(&sender, &text));
                 if let Some(raw_time) = msg.tag("time") {
                     if let Some(millis) = e6irc_proto::time::parse_server_time_millis(raw_time) {
                         self.buffers[idx].latest_time =
@@ -404,6 +548,31 @@ impl App {
                 };
                 self.note_in(channel, &format!("{who} kicked by {sender}: {reason}"));
             }
+            "TOPIC" => {
+                let (Some(channel), Some(topic)) = (msg.params.first(), msg.params.get(1)) else {
+                    return;
+                };
+                self.note_about(channel, &format!("{sender} set the topic: {topic}"));
+            }
+            "MODE" => {
+                let Some(target) = msg.params.first() else {
+                    return;
+                };
+                let change = msg.params.get(1..).unwrap_or_default().join(" ");
+                self.note_about(target, &format!("{sender} sets mode {change} on {target}"));
+            }
+            "INVITE" => {
+                let (Some(invited), Some(channel)) = (msg.params.first(), msg.params.get(1)) else {
+                    return;
+                };
+                if casemap.eq(invited, &self.nick) {
+                    self.status(format!(
+                        "{sender} invited you to {channel} — /join {channel} to accept"
+                    ));
+                } else {
+                    self.note_about(channel, &format!("{sender} invited {invited} to {channel}"));
+                }
+            }
             "MARKREAD" => {
                 let Some(target) = msg.params.first() else {
                     return;
@@ -428,6 +597,9 @@ impl App {
                     self.buffers[index].unread = 0;
                 }
             }
+            // Liveness traffic: the network task answers the server's PING,
+            // and a PONG answers a PING of this client's own.
+            "PING" | "PONG" => {}
             // The server closing the link, or answering a command with a
             // standard reply, is the only account the user gets of it.
             "ERROR" => self.status(format!("server error: {}", msg.params.join(" "))),
@@ -438,14 +610,26 @@ impl App {
             // sent the moment it is queued, so a refusal that is not shown
             // leaves the user believing it was delivered. `params[0]` is our
             // own nick; what follows names the subject, then says why.
-            numeric if is_error_numeric(numeric) => {
+            numeric if e6irc_client::is_refusal(msg) => {
                 let subject = msg.params.get(1).map(String::as_str).unwrap_or("");
                 let detail = msg.params.get(1..).unwrap_or_default().join(" ");
                 self.note_in(subject, &format!("{detail} ({numeric})"));
             }
-            // Everything else (the welcome burst, NAMES, MODE, …) is state this
-            // client does not model, not an outcome the user is waiting on.
-            _ => {}
+            // Every other numeric — the welcome burst, a WHOIS answer to
+            // `/raw`, NAMES, a topic on join — is shown beside the
+            // conversation it names, else in the server buffer. `params[0]` is
+            // our own nick.
+            numeric if numeric.len() == 3 && numeric.bytes().all(|byte| byte.is_ascii_digit()) => {
+                let subject = msg.params.get(1).map(String::as_str).unwrap_or("");
+                let detail = msg.params.get(1..).unwrap_or_default().join(" ");
+                self.note_about(subject, &detail);
+            }
+            // A command this client does not model (AWAY, ACCOUNT, CHGHOST,
+            // WALLOPS, CAP NEW, …) is still something the server said.
+            command => {
+                let detail = msg.params.join(" ");
+                self.note_server(&format!("{sender} {command} {detail}"));
+            }
         }
     }
 
@@ -481,7 +665,19 @@ impl App {
         let Some(latest) = buffer.latest_time.clone() else {
             return;
         };
-        if buffer.read_marker.as_deref() == Some(latest.as_str()) {
+        // Times are the server's fixed-width UTC form, so they order as text.
+        let latest = match &buffer.read_hold {
+            ReadHold::Free => latest,
+            ReadHold::At(ceiling) => latest.min(ceiling.clone()),
+            ReadHold::Nowhere => return,
+        };
+        // Read positions only move forward: a marker at or past this one (set
+        // here, or by another device) needs no update.
+        if buffer
+            .read_marker
+            .as_deref()
+            .is_some_and(|marker| marker >= latest.as_str())
+        {
             return;
         }
         self.pending_read_marker = Some(format!("MARKREAD {} timestamp={latest}", buffer.name));
@@ -568,6 +764,26 @@ impl App {
         }
         self.input.insert(self.input_cursor, c);
         self.input_cursor += c.len_utf8();
+    }
+
+    /// Insert pasted text at the cursor. A paste holding a line break is
+    /// refused whole: typed into the composer it would be one message with
+    /// the breaks lost, and sent line by line it would be several messages
+    /// the user never saw separately.
+    pub fn on_paste(&mut self, text: &str) {
+        if text.contains(['\r', '\n']) {
+            let lines = text
+                .split(['\r', '\n'])
+                .filter(|line| !line.is_empty())
+                .count();
+            self.status(format!(
+                "a paste of {lines} lines was not inserted: paste one line at a time"
+            ));
+            return;
+        }
+        for character in text.chars() {
+            self.on_char(character);
+        }
     }
 
     pub fn on_backspace(&mut self) {
@@ -775,6 +991,12 @@ impl App {
     }
 
     fn message_outbound(&mut self, input: String, text: String) -> Action {
+        if self.current().kind == BufferKind::Server {
+            return self.refuse_command(
+                input,
+                "the server buffer is not a conversation — /msg nick text, /join #channel, or /raw LINE",
+            );
+        }
         if !self.connected {
             return self.refuse_command(input, "not connected — message not sent");
         }
@@ -1388,5 +1610,146 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// A line this client does not model is still something the server said:
+    /// shown beside the conversation it names, else in the server buffer.
+    #[test]
+    fn unmodelled_replies_and_commands_are_shown_not_dropped() {
+        let mut app = App::new("#home".into(), "me".into());
+        app.on_message(&msg(":srv 001 me :Welcome to the network"));
+        app.on_message(&msg(":srv 311 me alice ~a host.example * :Alice Liddell"));
+        let server = app.buffer_index(SERVER_BUFFER).expect("a server buffer");
+        assert_eq!(app.buffers[server].kind, BufferKind::Server);
+        assert_eq!(
+            last_line(&app, SERVER_BUFFER),
+            "alice ~a host.example * Alice Liddell"
+        );
+        assert!(
+            app.buffers[server]
+                .log
+                .iter()
+                .any(|line| line.text.as_str() == "Welcome to the network")
+        );
+        // A reply about an open conversation is shown beside it.
+        app.on_message(&msg(":alice!u@h PRIVMSG me :hi"));
+        app.on_message(&msg(":srv 301 me alice :gone fishing"));
+        assert_eq!(last_line(&app, "alice"), "alice gone fishing");
+
+        app.on_message(&msg(":bob!u@h INVITE me #secret"));
+        assert_eq!(
+            last_line(&app, "#home"),
+            "bob invited you to #secret — /join #secret to accept"
+        );
+        app.on_message(&msg(":op!u@h TOPIC #home :new topic"));
+        assert_eq!(last_line(&app, "#home"), "op set the topic: new topic");
+        app.on_message(&msg(":op!u@h MODE #home +o me"));
+        assert_eq!(last_line(&app, "#home"), "op sets mode +o me on #home");
+        app.on_message(&msg(":srv NOTICE * :*** Looking up your hostname"));
+        assert_eq!(
+            last_line(&app, SERVER_BUFFER),
+            "srv: *** Looking up your hostname"
+        );
+        app.on_message(&msg(":alice!u@h AWAY :lunch"));
+        assert_eq!(last_line(&app, SERVER_BUFFER), "alice AWAY lunch");
+        // Keepalive traffic is not.
+        let before = app.buffers[server].log.len();
+        app.on_message(&msg("PING :x"));
+        app.on_message(&msg(":srv PONG srv :x"));
+        assert_eq!(app.buffers[server].log.len(), before);
+
+        // The server buffer is not a conversation to type into.
+        app.input = "/win *server*".into();
+        app.on_enter();
+        assert_eq!(app.current().kind, BufferKind::Server);
+        app.input = "hello".into();
+        assert_eq!(app.on_enter(), Action::None);
+        assert_eq!(app.input, "hello");
+    }
+
+    #[test]
+    fn actions_and_formatting_render_as_meant() {
+        let mut app = App::new("#home".into(), "me".into());
+        app.on_message(&msg(":alice!u@h PRIVMSG #home :\x01ACTION waves\x01"));
+        let line = app.current().log.last().expect("a line").clone();
+        assert_eq!(line.from, "* alice");
+        assert_eq!(line.text, "waves");
+        app.on_message(&msg(
+            ":alice!u@h PRIVMSG #home :\x02bold\x02 and \x0304,01red\x03 \x1ditalic\x1d",
+        ));
+        assert_eq!(last_line(&app, "#home"), "bold and red italic");
+        app.on_message(&msg(":alice!u@h PRIVMSG me :\x01VERSION\x01"));
+        assert_eq!(last_line(&app, "alice"), "[CTCP VERSION]");
+    }
+
+    /// Unread history that did not all load leaves a gap between the last
+    /// loaded line and the live stream. A live line must not move the read
+    /// marker over it — that would mark the unloaded lines read everywhere.
+    #[test]
+    fn the_read_marker_never_passes_the_last_contiguously_loaded_line() {
+        let mut app = App::new("#a".into(), "me".into());
+        app.on_message(&msg(":srv MARKREAD #a timestamp=2026-07-30T12:00:00.000Z"));
+        app.on_message(&msg(
+            "@batch=h;time=2026-07-30T12:00:01.000Z :alice!u@h PRIVMSG #a :oldest unread",
+        ));
+        app.on_message(&msg(
+            "@batch=h;time=2026-07-30T12:00:02.000Z :alice!u@h PRIVMSG #a :last loaded",
+        ));
+        app.hold_read_marker("#a");
+        assert!(
+            app.current()
+                .log
+                .last()
+                .is_some_and(|line| line.text.as_str().contains("more unread lines"))
+        );
+        assert_eq!(
+            app.take_read_marker_command().as_deref(),
+            Some("MARKREAD #a timestamp=2026-07-30T12:00:02.000Z")
+        );
+        app.on_message(&msg(":srv MARKREAD #a timestamp=2026-07-30T12:00:02.000Z"));
+        app.on_message(&msg(
+            "@time=2026-07-30T13:00:00.000Z :alice!u@h PRIVMSG #a :live, after the gap",
+        ));
+        assert_eq!(app.take_read_marker_command(), None);
+
+        // A later session that loads every unread line closes the gap.
+        app.release_read_marker("#a");
+        assert_eq!(
+            app.take_read_marker_command().as_deref(),
+            None,
+            "releasing queues nothing by itself"
+        );
+        app.on_message(&msg(
+            "@time=2026-07-30T13:00:01.000Z :alice!u@h PRIVMSG #a :caught up",
+        ));
+        assert_eq!(
+            app.take_read_marker_command().as_deref(),
+            Some("MARKREAD #a timestamp=2026-07-30T13:00:01.000Z")
+        );
+
+        // With no time known at all, the marker does not move.
+        let mut app = App::new("#b".into(), "me".into());
+        app.hold_read_marker("#b");
+        app.on_message(&msg(
+            "@time=2026-07-30T13:00:00.000Z :alice!u@h PRIVMSG #b :live",
+        ));
+        assert_eq!(app.take_read_marker_command(), None);
+    }
+
+    #[test]
+    fn a_multi_line_paste_is_refused_and_a_single_line_is_inserted() {
+        let mut app = App::new("#c".into(), "me".into());
+        app.on_paste("a\rb");
+        assert_eq!(app.input(), "");
+        assert!(
+            app.current()
+                .log
+                .last()
+                .is_some_and(|line| line.text.as_str().contains("paste of 2 lines"))
+        );
+        app.on_char('x');
+        app.on_paste(" pasted");
+        assert_eq!(app.input(), "x pasted");
+        assert_eq!(app.input_cursor(), app.input().len());
     }
 }

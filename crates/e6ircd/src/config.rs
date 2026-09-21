@@ -322,6 +322,10 @@ pub struct ManagedConfig {
     #[serde(default)]
     pub storage: StorageConfig,
     pub bnc_addr: Option<SocketAddr>,
+    /// The attach listener's certificate (`[bnc].tls`); required unless
+    /// `bnc_addr` is a loopback address.
+    #[serde(default)]
+    pub bnc_tls: Option<TlsConfig>,
     pub public_url: Option<String>,
     pub secure_cookies: bool,
     pub admin_accounts: Vec<String>,
@@ -389,6 +393,7 @@ impl ManagedConfig {
     pub fn requires_restart_to_reach(&self, next: &Self) -> bool {
         let mut reached_live = self.clone();
         reached_live.bnc_addr = next.bnc_addr;
+        reached_live.bnc_tls = next.bnc_tls.clone();
         reached_live.observability = next.observability.clone();
         reached_live.storage = next.storage.clone();
         reached_live != *next
@@ -400,6 +405,7 @@ impl ManagedConfig {
     ) -> Result<Self, ConfigError> {
         let network_has_secret = config.networks.iter().any(|network| {
             network.sasl_password.is_some()
+                || network.server_password.is_some()
                 || (network.kind.account_is_secret() && network.sasl_account.is_some())
         });
         let credentials_from_bootstrap = key.is_none()
@@ -424,6 +430,9 @@ impl ManagedConfig {
             if let Some(password) = &network.sasl_password {
                 network.sasl_password = Some(seal(password));
             }
+            if let Some(password) = &network.server_password {
+                network.server_password = Some(seal(password));
+            }
             if network.kind.account_is_secret()
                 && let Some(account) = &network.sasl_account
             {
@@ -446,6 +455,7 @@ impl ManagedConfig {
             observability: config.observability.clone(),
             storage: config.storage.clone(),
             bnc_addr: config.bnc.as_ref().map(|bnc| bnc.addr),
+            bnc_tls: config.bnc.as_ref().and_then(|bnc| bnc.tls.clone()),
             public_url: config
                 .http
                 .as_ref()
@@ -460,6 +470,14 @@ impl ManagedConfig {
             opers,
             networks,
             credentials_from_bootstrap,
+        })
+    }
+
+    /// The attach listener these settings describe, when enabled.
+    pub fn bnc(&self) -> Option<BncConfig> {
+        self.bnc_addr.map(|addr| BncConfig {
+            addr,
+            tls: self.bnc_tls.clone(),
         })
     }
 
@@ -478,7 +496,7 @@ impl ManagedConfig {
         config.limits = self.limits.clone();
         config.observability = self.observability.clone();
         config.storage = self.storage.clone();
-        config.bnc = self.bnc_addr.map(|addr| BncConfig { addr });
+        config.bnc = self.bnc();
         if let Some(http) = &mut config.http {
             http.public_url.clone_from(&self.public_url);
             http.secure_cookies = self.secure_cookies;
@@ -494,31 +512,48 @@ impl ManagedConfig {
     /// Validate through the startup parser's one configuration choke point.
     /// Bootstrap prerequisites are supplied with inert, valid values solely so
     /// this operational subset can be checked without reimplementing its
-    /// invariants in an HTTP handler.
-    ///
-    /// `http_listener` is the address the running HTTP listener was configured
-    /// with — it comes from the file, not from these settings — so a listener
-    /// or bouncer address edited here is checked against it too. `None` means
-    /// there is no HTTP listener for anything to collide with.
-    pub fn validate(&self, http_listener: Option<std::net::SocketAddr>) -> Result<(), ConfigError> {
+    /// invariants in an HTTP handler; the bootstrap values these settings are
+    /// judged against are the running process's own ([`BootstrapContext`]).
+    pub fn validate(&self, bootstrap: BootstrapContext) -> Result<(), ConfigError> {
         let mut config = Config {
             database: Some(DatabaseConfig {
                 url: "postgresql://control-plane-validation".into(),
                 startup_wait_seconds: DEFAULT_STARTUP_WAIT_SECONDS,
+                max_connections: None,
             }),
             http: Some(HttpConfig {
-                addr: http_listener
+                addr: bootstrap
+                    .http_listener
                     .unwrap_or_else(|| "127.0.0.1:0".parse().expect("literal socket address")),
                 public_url: None,
                 secure_cookies: false,
                 admin_accounts: Vec::new(),
+                hsts_include_subdomains: bootstrap.hsts_include_subdomains,
             }),
+            internal_upstreams: bootstrap.internal_upstreams,
             application_release_revision: Some("0123456789ab".into()),
             ..Config::default()
         };
         self.apply_to(&mut config);
         config.validate()
     }
+}
+
+/// The bootstrap values a managed-settings revision is judged against. They
+/// come from the file or environment the process started with — the console
+/// cannot change them — yet a managed value is valid only together with them.
+#[derive(Debug, Clone, Copy)]
+pub struct BootstrapContext {
+    /// The address the running HTTP listener was configured with, so a
+    /// listener or bouncer address edited in the console is checked against
+    /// it. `None`: there is no HTTP listener for anything to collide with.
+    pub http_listener: Option<std::net::SocketAddr>,
+    /// `[http].hsts_include_subdomains`, which needs an `https://` public
+    /// origin — and the public origin is a managed setting.
+    pub hsts_include_subdomains: bool,
+    /// The policy that decides whether a network may name an upstream inside
+    /// this host's own network.
+    pub internal_upstreams: crate::egress::InternalUpstreams,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -612,6 +647,10 @@ pub struct NetworkEntry {
     /// app token.
     #[serde(default)]
     pub sasl_password: Option<String>,
+    /// The IRC server password sent as `PASS` before registration. `irc`
+    /// only; sealed at rest like `sasl_password`.
+    #[serde(default)]
+    pub server_password: Option<String>,
 }
 
 fn default_bnc_buffer() -> usize {
@@ -629,6 +668,7 @@ pub(crate) enum NetworkEntryWire {
         realname: String,
         sasl_account: Option<String>,
         sasl_password: Option<String>,
+        server_password: Option<String>,
     },
     Local {
         #[serde(flatten)]
@@ -679,8 +719,10 @@ impl From<NetworkEntryWire> for NetworkEntry {
                 realname,
                 sasl_account,
                 sasl_password,
+                server_password,
             } => NetworkEntry {
                 username: Some(username),
+                server_password,
                 ..common.into_entry(
                     NetworkKind::Irc,
                     nick,
@@ -750,6 +792,7 @@ impl NetworkEntryCommon {
             buffer_cap: self.buffer_cap,
             sasl_account,
             sasl_password,
+            server_password: None,
         }
     }
 }
@@ -783,10 +826,12 @@ impl NetworkEntry {
             .into_iter()
             .map(|channel| channel.trim().to_string())
             .collect();
-        self.sasl_account = self.sasl_account.map(|account| account.trim().to_string());
-        self.sasl_password = self
-            .sasl_password
-            .map(|password| password.trim().to_string());
+        // An IRC account name is public text and may be tidied; a secret — a
+        // SASL password, a Slack bot token carried in `sasl_account`, a server
+        // password — is kept verbatim: trimming would store another one.
+        if !self.kind.account_is_secret() {
+            self.sasl_account = self.sasl_account.map(|account| account.trim().to_string());
+        }
         self
     }
 
@@ -820,14 +865,13 @@ impl NetworkEntry {
         {
             return Err("autojoin entries must be non-blank".into());
         }
-        if let Some(account) = self.sasl_account.as_deref() {
-            crate::bouncer::validate_network_credential(account, 255)
-                .map_err(|error| format!("invalid sasl_account: {error}"))?;
+        if self.server_password.is_some() && self.kind != NetworkKind::Irc {
+            return Err(format!(
+                "kind={} does not accept server_password; it applies only to kind=irc",
+                self.kind.as_db_str()
+            ));
         }
-        if let Some(password) = self.sasl_password.as_deref() {
-            crate::bouncer::validate_network_credential(password, 512)
-                .map_err(|error| format!("invalid sasl_password: {error}"))?;
-        }
+        self.validate_credential_contents()?;
         match self.kind {
             NetworkKind::Irc => {
                 if self.sasl_account.is_some() != self.sasl_password.is_some() {
@@ -924,6 +968,31 @@ impl NetworkEntry {
 }
 
 impl NetworkEntry {
+    /// What the credential fields contain, each named by its field and never
+    /// quoted. A sealed value is skipped here — its ciphertext says nothing
+    /// about the secret — and judged once it is opened, when
+    /// [`Config::validate_secrets`] runs this again with nothing left sealed.
+    fn validate_credential_contents(&self) -> Result<(), String> {
+        fn opened(value: &Option<String>) -> Option<&str> {
+            value
+                .as_deref()
+                .filter(|value| !crate::secret::is_sealed(value))
+        }
+        if let Some(account) = opened(&self.sasl_account) {
+            crate::bouncer::validate_network_credential(account, 255)
+                .map_err(|error| format!("invalid sasl_account: {error}"))?;
+        }
+        if let Some(password) = opened(&self.sasl_password) {
+            crate::bouncer::validate_network_credential(password, 512)
+                .map_err(|error| format!("invalid sasl_password: {error}"))?;
+        }
+        if let Some(password) = opened(&self.server_password) {
+            e6irc_client::ServerPassword::parse(password.to_string())
+                .map_err(|error| format!("invalid server_password: {error}"))?;
+        }
+        Ok(())
+    }
+
     /// An `irc` or `local` network states its `USER` name, in the one grammar
     /// the driver will accept ([`crate::bouncer::UpstreamUsername`]).
     fn require_username(&self) -> Result<(), String> {
@@ -1031,10 +1100,15 @@ impl NetworkKind {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BncConfig {
     pub addr: SocketAddr,
+    /// The certificate the attach listener serves. Attaching clients send
+    /// their account password (SASL PLAIN), so a listener on any address but
+    /// loopback must set this ([`Config::validate`] refuses it otherwise).
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1060,6 +1134,12 @@ pub struct HttpConfig {
     /// (default) means no one — admin is opt-in and explicit.
     #[serde(default)]
     pub admin_accounts: Vec<String>,
+    /// Add `includeSubDomains` to the HSTS header an `https://` public origin
+    /// is served with. Off by default: it commits every subdomain of the host
+    /// to HTTPS for a year, which only the operator knows to be true. The
+    /// header never asks for preloading, which no configuration can revoke.
+    #[serde(default)]
+    pub hsts_include_subdomains: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1137,6 +1217,23 @@ pub struct DatabaseConfig {
     /// its ceiling is [`crate::db::StartupDatabaseWait::MAX_SECONDS`].
     #[serde(default = "default_startup_wait_seconds")]
     pub startup_wait_seconds: u64,
+    /// The most connections the server's shared pool opens, between
+    /// [`crate::db::DatabasePoolSize::MIN`] and
+    /// [`crate::db::DatabasePoolSize::MAX`] (refused outside them when the
+    /// file is read). Absent, the pool is sized to this host by
+    /// [`crate::db::DatabasePoolSize::for_this_host`]: one for the serial
+    /// database worker, one per concurrent Argon2 computation, and two per
+    /// runtime worker thread.
+    #[serde(default)]
+    pub max_connections: Option<crate::db::DatabasePoolSize>,
+}
+
+impl DatabaseConfig {
+    /// The pool size the server opens: the configured one, else the default.
+    pub fn pool_size(&self) -> crate::db::DatabasePoolSize {
+        self.max_connections
+            .unwrap_or_else(crate::db::DatabasePoolSize::for_this_host)
+    }
 }
 
 pub const DEFAULT_STARTUP_WAIT_SECONDS: u64 = 300;
@@ -1290,7 +1387,7 @@ impl Config {
                     s.key_file.display()
                 ))
             })?;
-            let primary = SecretKey::from_base64(&raw)
+            let primary = SecretKey::from_base64_text(raw)
                 .map_err(|e| ConfigError::Invalid(format!("secrets key_file: {e}")))?;
             let mut previous = Vec::with_capacity(s.previous_key_files.len());
             for path in &s.previous_key_files {
@@ -1300,7 +1397,7 @@ impl Config {
                         path.display()
                     ))
                 })?;
-                previous.push(SecretKey::from_base64(&raw).map_err(|e| {
+                previous.push(SecretKey::from_base64_text(raw).map_err(|e| {
                     ConfigError::Invalid(format!(
                         "secrets previous_key_file {}: {e}",
                         path.display()
@@ -1369,6 +1466,11 @@ impl Config {
                 )));
             }
         }
+        for network in &self.networks {
+            network.validate_credential_contents().map_err(|error| {
+                ConfigError::Invalid(format!("network '{}': {error}", network.name))
+            })?;
+        }
         // An empty oper password would let `OPER <name> ""` succeed.
         for oper in &self.opers {
             if oper.password.is_empty() {
@@ -1404,6 +1506,9 @@ impl Config {
             // name passes through `open_secret` unchanged.
             if let Some(account) = net.sasl_account.take() {
                 net.sasl_account = Some(open_secret(&account, key)?);
+            }
+            if let Some(password) = net.server_password.take() {
+                net.server_password = Some(open_secret(&password, key)?);
             }
         }
         for oper in &mut self.opers {
@@ -1768,13 +1873,24 @@ impl Config {
                 }
             }
         }
-        if self.bnc.is_some() {
+        if let Some(bnc) = &self.bnc {
             // Config [[network]]s are optional now — accounts add their
             // own networks at runtime — but authentication needs accounts.
             if self.database.is_none() {
                 return Err(ConfigError::Invalid(
                     "[bnc] requires [database] to authenticate attaching clients".into(),
                 ));
+            }
+            // An attaching client sends its account password. Off loopback
+            // that is readable by everything on the path unless the listener
+            // is TLS.
+            if bnc.tls.is_none() && !bnc.addr.ip().to_canonical().is_loopback() {
+                return Err(ConfigError::Invalid(format!(
+                    "[bnc].addr {} (the console's bnc_addr) is not a loopback address, so \
+                     [bnc].tls (the console's bnc_tls) is required: attaching clients send \
+                     their account password, which must not cross the network in cleartext",
+                    bnc.addr
+                )));
             }
         }
         // `[registration]` policy only means anything with an account store; set
@@ -1846,6 +1962,21 @@ impl Config {
                 ));
             }
         }
+        // HSTS is sent only for an `https://` public origin; asking to widen a
+        // header that is never sent would be a setting that does nothing.
+        if let Some(h) = &self.http
+            && h.hsts_include_subdomains
+            && !h
+                .public_url
+                .as_deref()
+                .is_some_and(|value| value.starts_with("https://"))
+        {
+            return Err(ConfigError::Invalid(
+                "http.hsts_include_subdomains requires an https:// http.public_url (HSTS is \
+                 sent only for an HTTPS public origin)"
+                    .into(),
+            ));
+        }
         // A configured `public_url` seeds every browser-facing absolute URL.
         // Credentials leak into those links; queries and fragments corrupt an
         // appended path. Keep a valid scheme, host, and optional deployment path.
@@ -1905,6 +2036,20 @@ impl Config {
         for n in &self.networks {
             n.validate_connection_intent()
                 .map_err(|error| ConfigError::Invalid(format!("network '{}': {error}", n.name)))?;
+            if n.kind == NetworkKind::Irc
+                && let Some(credential) = self.internal_upstreams.cleartext_credential(
+                    &n.addr,
+                    n.tls,
+                    n.sasl_password.is_some(),
+                    n.server_password.is_some(),
+                )
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "network '{}': {}",
+                    n.name,
+                    credential.reason()
+                )));
+            }
         }
         // OPER blocks: an empty name is a dangerous silent default, and a
         // duplicate name is ambiguous (first-match wins with no warning). Reject
@@ -1974,17 +2119,20 @@ mod tests {
         config.database = Some(DatabaseConfig {
             url: "postgres://localhost/e6irc".into(),
             startup_wait_seconds: DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         });
         config.http = Some(HttpConfig {
             addr: "127.0.0.1:6667".parse().unwrap(),
             public_url: None,
             secure_cookies: false,
             admin_accounts: vec![],
+            hsts_include_subdomains: false,
         });
         assert!(refusal(&config).contains("[http]"));
         config.http.as_mut().unwrap().addr = "127.0.0.1:8080".parse().unwrap();
         config.bnc = Some(BncConfig {
             addr: "127.0.0.1:8080".parse().unwrap(),
+            tls: None,
         });
         let message = refusal(&config);
         assert!(
@@ -1996,6 +2144,7 @@ mod tests {
         // do different ports, or the same port on two distinct addresses.
         config.bnc = Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
         });
         config.http.as_mut().unwrap().addr = "127.0.0.1:0".parse().unwrap();
         config.listeners = vec![
@@ -2280,6 +2429,161 @@ mod tests {
         );
     }
 
+    /// A server password is the `PASS` of an IRC connection: accepted for
+    /// `kind=irc`, refused by name for every kind that sends no such line,
+    /// and a sealed one is opened and then held to the same one-line rule.
+    #[test]
+    fn a_static_server_password_is_irc_only_and_opened_before_use() {
+        let irc = "kind = 'irc'\nname = 'irc'\naddr = 'irc.example:6697'\ntls = true\nnick = 'alice'\nusername = 'alice'\nrealname = 'Alice'\nautojoin = []\nbuffer_cap = 1000";
+        let config = toml::from_str::<Config>(&config_with_static_network(&format!(
+            "{irc}\nserver_password = 'open sesame'"
+        )))
+        .expect("an irc network takes a server password");
+        assert_eq!(
+            config.networks[0].server_password.as_deref(),
+            Some("open sesame")
+        );
+        for network in [
+            "kind = 'local'\nname = 'local'\naddr = ''\ntls = false\nnick = 'alice'\nusername = 'alice'\nrealname = 'Alice'\nautojoin = []\nbuffer_cap = 1000\nserver_password = 'pass'",
+            "kind = 'matrix'\nname = 'matrix'\naddr = 'https://matrix.example.test'\ntls = true\nnick = '@alice:example.test'\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'password'\nserver_password = 'pass'",
+            "kind = 'discord'\nname = 'discord'\naddr = ''\ntls = true\nautojoin = []\nbuffer_cap = 1000\nsasl_password = 'token'\nserver_password = 'pass'",
+            "kind = 'slack'\nname = 'slack'\naddr = ''\ntls = true\nautojoin = []\nbuffer_cap = 1000\nsasl_account = 'xoxb-token'\nsasl_password = 'xapp-token'\nserver_password = 'pass'",
+        ] {
+            let error = toml::from_str::<Config>(&config_with_static_network(network))
+                .expect_err("only kind=irc sends PASS")
+                .to_string();
+            assert!(error.contains("server_password"), "{network}: {error}");
+        }
+        // Checked on the plaintext, and a managed entry that bypasses the wire
+        // form is refused by the same rule.
+        let over_long = format!(
+            "{irc}\nserver_password = '{}'",
+            "x".repeat(e6irc_client::ServerPassword::MAX_LEN + 1)
+        );
+        assert!(toml::from_str::<Config>(&config_with_static_network(&over_long)).is_err());
+        let mut local = net("local", None);
+        local.kind = NetworkKind::Local;
+        local.server_password = Some("pass".into());
+        assert!(
+            local
+                .validate_connection_intent()
+                .expect_err("local sends no PASS")
+                .contains("server_password")
+        );
+
+        // A sealed value is opened, then held to the same rule.
+        let keyring = crate::secret::SecretKeyring::single(crate::secret::SecretKey::generate());
+        let mut sealed = net("sealed", None);
+        sealed.server_password = Some(keyring.seal(
+            &"x".repeat(e6irc_client::ServerPassword::MAX_LEN),
+            crate::secret::CONFIG_CONTEXT,
+        ));
+        sealed
+            .validate_connection_intent()
+            .expect("a sealed value's length is its ciphertext's, not the password's");
+        let mut config = Config {
+            networks: vec![sealed],
+            ..Config::default()
+        };
+        config
+            .resolve_secrets_with_key(Some(&keyring))
+            .expect("opens");
+        assert_eq!(
+            config.networks[0].server_password.as_deref().map(str::len),
+            Some(e6irc_client::ServerPassword::MAX_LEN)
+        );
+        config.validate_secrets().expect("fits one PASS line");
+        config.networks[0].server_password =
+            Some("x".repeat(e6irc_client::ServerPassword::MAX_LEN + 1));
+        assert!(config.validate_secrets().is_err());
+    }
+
+    /// A SASL password (and a Slack bot token in `sasl_account`) is a secret:
+    /// judged on its opened text, never on the ciphertext, and never trimmed.
+    #[test]
+    fn sasl_secrets_are_judged_opened_and_kept_verbatim() {
+        let keyring = crate::secret::SecretKeyring::single(crate::secret::SecretKey::generate());
+        let mut sealed = net("sealed", None);
+        sealed.tls = true;
+        sealed.sasl_account = Some("alice".into());
+        sealed.sasl_password = Some(keyring.seal(&"x".repeat(512), crate::secret::CONFIG_CONTEXT));
+        sealed
+            .validate_connection_intent()
+            .expect("a sealed value's length is its ciphertext's, not the password's");
+        let mut config = Config {
+            networks: vec![sealed],
+            ..Config::default()
+        };
+        config
+            .resolve_secrets_with_key(Some(&keyring))
+            .expect("opens");
+        config.validate_secrets().expect("512 bytes fit");
+        config.networks[0].sasl_password = Some("x".repeat(513));
+        let error = config
+            .validate_secrets()
+            .expect_err("the bound holds on the opened text")
+            .to_string();
+        assert!(error.contains("sasl_password"), "{error}");
+
+        let mut padded = net("padded", None);
+        padded.sasl_account = Some(" alice ".into());
+        padded.sasl_password = Some("  spaced secret  ".into());
+        let normalized = padded.normalized_connection_intent();
+        assert_eq!(normalized.sasl_account.as_deref(), Some("alice"));
+        assert_eq!(
+            normalized.sasl_password.as_deref(),
+            Some("  spaced secret  "),
+            "a password is kept verbatim: trimming would store another one"
+        );
+        let mut slack = net("slack", None);
+        slack.kind = NetworkKind::Slack;
+        slack.sasl_account = Some(" xoxb-token ".into());
+        assert_eq!(
+            slack.normalized_connection_intent().sasl_account.as_deref(),
+            Some(" xoxb-token "),
+            "a Slack bot token in sasl_account is a secret, kept verbatim"
+        );
+    }
+
+    /// A configured network's SASL or server password never crosses a
+    /// plaintext connection to another machine; only the test harness's
+    /// loopback upstream, under `internal_upstreams = "allow"`, may take one.
+    #[test]
+    fn a_static_network_refuses_credentials_without_tls() {
+        let mut config = listening_config();
+        config.database = Some(DatabaseConfig {
+            url: "postgres://localhost/e6irc".into(),
+            startup_wait_seconds: DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
+        });
+        let mut plain = net("plain", None);
+        plain.sasl_account = Some("alice".into());
+        plain.sasl_password = Some("secret".into());
+        config.networks = vec![plain.clone()];
+        let message = refusal(&config);
+        assert!(
+            message.contains("sasl_password requires tls=true"),
+            "{message}"
+        );
+        plain.sasl_account = None;
+        plain.sasl_password = None;
+        plain.server_password = Some("open sesame".into());
+        config.networks = vec![plain.clone()];
+        assert!(refusal(&config).contains("server_password requires tls=true"));
+        plain.addr = "127.0.0.1:6667".into();
+        config.networks = vec![plain.clone()];
+        assert!(
+            refusal(&config).contains("server_password"),
+            "loopback is still refused under the default policy"
+        );
+        config.internal_upstreams = crate::egress::InternalUpstreams::Allow;
+        config.validate().expect("the harness's loopback upstream");
+        plain.tls = true;
+        plain.addr = "irc.example:6697".into();
+        config.networks = vec![plain];
+        config.validate().expect("over TLS");
+    }
+
     #[test]
     fn static_network_ingress_rejects_invalid_driver_fields() {
         for network in [
@@ -2458,6 +2762,7 @@ mod tests {
                 buffer_cap: 1000,
                 sasl_account: Some(sealed_account),
                 sasl_password: Some(sealed),
+                server_password: None,
             }],
             secrets: secrets_at(&path),
             ..Config::default()
@@ -2531,6 +2836,7 @@ mod tests {
             buffer_cap: 1000,
             sasl_account: None,
             sasl_password: None,
+            server_password: None,
         }
     }
 
@@ -2541,6 +2847,7 @@ mod tests {
     fn bnc() -> Option<BncConfig> {
         Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
         })
     }
 
@@ -2548,6 +2855,7 @@ mod tests {
         Some(DatabaseConfig {
             url: "postgres://localhost/x".into(),
             startup_wait_seconds: DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
         })
     }
 
@@ -2809,6 +3117,7 @@ mod tests {
             database: Some(DatabaseConfig {
                 url: "postgres://localhost/e6irc".into(),
                 startup_wait_seconds,
+                max_connections: None,
             }),
             ..Config::default()
         };
@@ -2891,6 +3200,7 @@ mod tests {
             public_url: None,
             secure_cookies: false,
             admin_accounts: vec![],
+            hsts_include_subdomains: false,
         });
         config.validate().expect("complete browser bootstrap");
         config.validate_secrets().expect("a strong bounded token");
@@ -2923,6 +3233,7 @@ mod tests {
                 public_url: None,
                 secure_cookies: false,
                 admin_accounts: vec![],
+                hsts_include_subdomains: false,
             }),
             bootstrap: Some(BootstrapConfig {
                 token: key.seal("short", crate::secret::CONFIG_CONTEXT),
@@ -3013,6 +3324,7 @@ mod tests {
                 public_url: None,
                 secure_cookies: false,
                 admin_accounts: vec!["alice".into(), "Bob_1".into()],
+                hsts_include_subdomains: false,
             }),
             ..Config::default()
         };
@@ -3116,10 +3428,12 @@ mod tests {
                 public_url: Some("https://chat.example".into()),
                 secure_cookies: true,
                 admin_accounts: vec![],
+                hsts_include_subdomains: false,
             }),
             database: Some(DatabaseConfig {
                 url: "postgres://db.example/e6irc".into(),
                 startup_wait_seconds: DEFAULT_STARTUP_WAIT_SECONDS,
+                max_connections: None,
             }),
             oidc_providers: vec![OidcProviderConfig {
                 name: name.into(),
@@ -3406,6 +3720,96 @@ account_claim = "preferred_username"
         assert_eq!(cfg.opers[0].password, "operpass");
         assert_eq!(cfg.oidc_providers[0].client_secret, "oidcsecret");
     }
+    /// Attaching clients send their account password. A listener off loopback
+    /// without TLS would carry it in cleartext; it is refused by the file and by
+    /// the console save alike, naming the setting to change.
+    #[test]
+    fn a_cleartext_attach_listener_is_refused_off_loopback() {
+        let mut config = listening_config();
+        config.database = Some(DatabaseConfig {
+            url: "postgres://localhost/e6irc".into(),
+            startup_wait_seconds: DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
+        });
+        for addr in [
+            "0.0.0.0:6697",
+            "192.0.2.10:6697",
+            "[::]:6697",
+            "[::ffff:192.0.2.10]:6697",
+        ] {
+            config.bnc = Some(BncConfig {
+                addr: addr.parse().unwrap(),
+                tls: None,
+            });
+            let message = refusal(&config);
+            assert!(
+                message.contains("[bnc].tls") && message.contains("bnc_tls"),
+                "{addr}: {message}"
+            );
+        }
+        for addr in ["127.0.0.1:6697", "[::1]:6697", "[::ffff:127.0.0.1]:6697"] {
+            config.bnc = Some(BncConfig {
+                addr: addr.parse().unwrap(),
+                tls: None,
+            });
+            config
+                .validate()
+                .expect("loopback plaintext stays on this machine");
+        }
+        config.bnc = Some(BncConfig {
+            addr: "0.0.0.0:6697".parse().unwrap(),
+            tls: Some(TlsConfig {
+                cert_path: "/etc/e6irc/cert.pem".into(),
+                key_path: "/etc/e6irc/key.pem".into(),
+            }),
+        });
+        config.validate().expect("a TLS listener may bind anywhere");
+
+        let mut managed = ManagedConfig::from_config(&listening_config(), None).expect("managed");
+        managed.bnc_addr = Some("0.0.0.0:6697".parse().unwrap());
+        let bootstrap = BootstrapContext {
+            http_listener: None,
+            hsts_include_subdomains: false,
+            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
+        };
+        let error = managed
+            .validate(bootstrap)
+            .expect_err("the console save is refused too")
+            .to_string();
+        assert!(error.contains("bnc_tls"), "{error}");
+        managed.bnc_tls = Some(TlsConfig {
+            cert_path: "/etc/e6irc/cert.pem".into(),
+            key_path: "/etc/e6irc/key.pem".into(),
+        });
+        managed.validate(bootstrap).expect("with a certificate");
+    }
+
+    /// Widening a header that is never sent would be a setting that does
+    /// nothing: HSTS goes out only for an `https://` public origin.
+    #[test]
+    fn hsts_subdomains_needs_an_https_public_origin() {
+        let mut config = listening_config();
+        config.database = Some(DatabaseConfig {
+            url: "postgres://localhost/e6irc".into(),
+            startup_wait_seconds: DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
+        });
+        config.http = Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: Some("http://irc.example".into()),
+            secure_cookies: false,
+            admin_accounts: vec![],
+            hsts_include_subdomains: true,
+        });
+        assert!(refusal(&config).contains("hsts_include_subdomains"));
+        let http = config.http.as_mut().unwrap();
+        http.public_url = Some("https://irc.example".into());
+        http.secure_cookies = true;
+        config
+            .validate()
+            .expect("an HTTPS origin may widen its HSTS");
+    }
+
     #[test]
     fn only_settings_the_process_re_reads_avoid_a_restart() {
         let current = ManagedConfig::from_config(&Config::default(), None).unwrap();

@@ -12,7 +12,7 @@ only the current closed schema, the required source and target, fresh
 non-secret metadata, valid phase applicability, and an outcome that matches
 the recorded phases.
 
-Build it with `cargo build --release -p e6irc-qualification`. Every command
+Build it with `cargo build --locked --release -p e6irc-qualification`. Every command
 needs a non-secret target identifier, source revision, host, executable, new
 output path, workload, and budget values:
 

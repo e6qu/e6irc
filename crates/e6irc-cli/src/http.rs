@@ -124,13 +124,28 @@ async fn bounded_body(mut response: Response, limit: usize) -> io::Result<Vec<u8
     Ok(body)
 }
 
-fn client() -> io::Result<Client> {
-    Client::builder()
+/// The HTTP client for one request to `base`. It talks to that origin and
+/// nothing else: no redirects, and no proxy from the environment
+/// (`HTTP_PROXY`, `ALL_PROXY`, …), which would otherwise see every request —
+/// bearer token included — without the cleartext rule ever being asked about
+/// it. When the plaintext decision was made by address, the origin's host is
+/// pinned to exactly the addresses that were vetted.
+fn client(pinned: Option<&Pinned>) -> io::Result<Client> {
+    let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(transport_error)
+        .no_proxy();
+    if let Some(pinned) = pinned {
+        builder = builder.resolve_to_addrs(&pinned.host, &pinned.addresses);
+    }
+    builder.build().map_err(transport_error)
+}
+
+/// A plaintext origin's host and the loopback addresses it was vetted to.
+struct Pinned {
+    host: String,
+    addresses: Vec<std::net::SocketAddr>,
 }
 
 pub async fn login(
@@ -140,8 +155,8 @@ pub async fn login(
 ) -> io::Result<()> {
     let base = normalized_base(base)?;
     // The whole exchange exists to obtain a token, so it is decided up front.
-    token_may_cross(&base, true, cleartext)?;
-    let client = client()?;
+    let pinned = token_may_cross(&base, true, cleartext).await?;
+    let client = client(pinned.as_ref())?;
     let start_response = client
         .post(endpoint(&base, "/api/v1/auth/device/start")?)
         .header(reqwest::header::ACCEPT, "application/json")
@@ -220,32 +235,42 @@ pub async fn login(
             return Ok(());
         }
 
-        let error: DeviceError = serde_json::from_slice(&body)
-            .map_err(|parse| io::Error::new(io::ErrorKind::InvalidData, parse))?;
-        match error.error.as_str() {
-            "authorization_pending" => {}
-            "slow_down" => {
-                interval = (interval + Duration::from_secs(5))
-                    .min(Duration::from_secs(MAX_DEVICE_INTERVAL_SECONDS));
-            }
-            "access_denied" => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "device authorization was denied",
-                ));
-            }
-            "expired_token" => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "device authorization expired",
-                ));
-            }
-            code => {
-                return Err(io::Error::other(format!(
-                    "device authorization failed: {code}"
-                )));
-            }
+        if device_poll_failure(status, &body)? == DevicePoll::SlowDown {
+            interval = (interval + Duration::from_secs(5))
+                .min(Duration::from_secs(MAX_DEVICE_INTERVAL_SECONDS));
         }
+    }
+}
+
+/// What a non-success answer to a device-token poll asks of the poller.
+#[derive(Debug, PartialEq, Eq)]
+enum DevicePoll {
+    Pending,
+    SlowDown,
+}
+
+/// Read a non-success device-token response. RFC 8628 errors are JSON with an
+/// `error` code; anything else (a proxy's HTML page, a 502) is reported with
+/// its HTTP status and body, not as a JSON parse error that hides both.
+fn device_poll_failure(status: StatusCode, body: &[u8]) -> io::Result<DevicePoll> {
+    let Ok(error) = serde_json::from_slice::<DeviceError>(body) else {
+        return Err(http_failure("device authorization", status, body));
+    };
+    match error.error.as_str() {
+        "authorization_pending" => Ok(DevicePoll::Pending),
+        "slow_down" => Ok(DevicePoll::SlowDown),
+        "access_denied" => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "device authorization was denied",
+        )),
+        "expired_token" => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "device authorization expired",
+        )),
+        code => Err(io::Error::other(format!(
+            "device authorization failed: {}",
+            TerminalSafe::from_untrusted(code)
+        ))),
     }
 }
 
@@ -301,9 +326,9 @@ pub async fn api(
         }
         (None, None) => None,
     };
-    token_may_cross(&base, token.is_some(), cleartext)?;
+    let pinned = token_may_cross(&base, token.is_some(), cleartext).await?;
     let method = Method::from_bytes(method.as_bytes()).map_err(invalid_input)?;
-    let mut request = client()?.request(method, endpoint(&base, path)?);
+    let mut request = client(pinned.as_ref())?.request(method, endpoint(&base, path)?);
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
@@ -318,9 +343,18 @@ pub async fn api(
     use std::io::{IsTerminal as _, Write as _};
     let mut stdout = io::stdout().lock();
     let shown = body_for_stdout(&response_body, stdout.is_terminal());
-    stdout.write_all(&shown)?;
-    if !shown.ends_with(b"\n") {
-        stdout.write_all(b"\n")?;
+    let written = stdout.write_all(&shown).and_then(|()| {
+        if shown.ends_with(b"\n") {
+            Ok(())
+        } else {
+            stdout.write_all(b"\n")
+        }
+    });
+    match written {
+        // A reader that went away (`… | head -1`) took what it wanted; the
+        // request's own outcome still decides the exit status.
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
+        other => other?,
     }
     if status.is_success() {
         Ok(())
@@ -332,43 +366,54 @@ pub async fn api(
     }
 }
 
-/// A response body as stdout should receive it. The body is whatever the
-/// server sent, so on a terminal its control characters are neutralized line by
-/// line (the line breaks of a formatted body are kept). Anywhere else the
-/// reader is a program — `e6irc api … | jq`, a file — and gets the exact bytes:
-/// a replacement character there would silently change the data.
 /// Whether a request to `base` may carry (or, for `login`, obtain) a bearer
-/// token. A token is a password with an expiry: over `http://` to another
+/// token, and the addresses to pin its host to when the answer was decided by
+/// address. A token is a password with an expiry: over `http://` to another
 /// machine it is readable by everything on the path. The rule, the override
 /// and the meaning of "this machine" are the IRC commands' own
-/// ([`CleartextCredentials`], `e6irc_client::is_loopback_host`), so one flag
-/// means one thing across the tool.
-fn token_may_cross(
+/// ([`CleartextCredentials`], [`e6irc_client::loopback_addresses`]): every
+/// address the host resolves to must be loopback, and the request then goes to
+/// exactly those addresses.
+async fn token_may_cross(
     base: &str,
     sends_token: bool,
     cleartext: CleartextCredentials,
-) -> io::Result<()> {
+) -> io::Result<Option<Pinned>> {
     let url = reqwest::Url::parse(base).map_err(invalid_input)?;
-    let exposed = sends_token
-        && url.scheme() == "http"
-        && cleartext == CleartextCredentials::Refuse
-        && !url.host_str().is_some_and(e6irc_client::is_loopback_host);
-    if exposed {
-        return Err(io::Error::new(
+    if !sends_token || url.scheme() != "http" || cleartext == CleartextCredentials::Allow {
+        return Ok(None);
+    }
+    let refusal = || {
+        io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
                 "refusing to send a bearer token in cleartext to {base}; use an https:// base, \
                  or pass --allow-cleartext-credentials to send it unprotected"
             ),
-        ));
+        )
+    };
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        return Err(refusal());
+    };
+    // `host_str` keeps an IPv6 address's brackets, so this is `host:port`.
+    match e6irc_client::loopback_addresses(&format!("{host}:{port}")).await? {
+        Some(addresses) => Ok(Some(Pinned {
+            host: host.to_owned(),
+            addresses,
+        })),
+        None => Err(refusal()),
     }
-    Ok(())
 }
 
 /// Environment variable consulted for the `api` bearer token, resolved by the
 /// same rules as the IRC secrets (flag, else file, else this).
 pub(crate) const API_TOKEN_ENVIRONMENT: &str = "E6IRC_API_TOKEN";
 
+/// A response body as stdout should receive it. The body is whatever the
+/// server sent, so on a terminal its control characters are neutralized line by
+/// line (the line breaks of a formatted body are kept). Anywhere else the
+/// reader is a program — `e6irc api … | jq`, a file — and gets the exact bytes:
+/// a replacement character there would silently change the data.
 pub(crate) fn body_for_stdout(body: &[u8], stdout_is_terminal: bool) -> std::borrow::Cow<'_, [u8]> {
     if !stdout_is_terminal {
         return std::borrow::Cow::Borrowed(body);
@@ -435,11 +480,49 @@ mod tests {
             ("http://192.0.2.1", true, Refuse, false),
         ] {
             assert_eq!(
-                token_may_cross(base, sends_token, cleartext).is_ok(),
+                token_may_cross(base, sends_token, cleartext).await.is_ok(),
                 allowed,
                 "{base} sends_token={sends_token} {cleartext:?}"
             );
         }
+        // Plaintext to this machine is pinned to the loopback addresses that
+        // were vetted, so the name is not resolved again afterwards.
+        let pinned = token_may_cross("http://localhost:8080", true, Refuse)
+            .await
+            .expect("loopback")
+            .expect("pinned");
+        assert_eq!(pinned.host, "localhost");
+        assert!(
+            pinned
+                .addresses
+                .iter()
+                .all(|address| address.ip().is_loopback())
+        );
+    }
+
+    /// A device-token poll answered by something that is not the RFC 8628
+    /// JSON (a proxy's error page, a 502) says what came back: the status and
+    /// the body, not a JSON parse error that hides both.
+    #[test]
+    fn a_non_json_device_poll_failure_reports_its_status_and_body() {
+        let error = device_poll_failure(StatusCode::BAD_GATEWAY, b"<html>upstream down</html>")
+            .expect_err("a 502 is a failure");
+        let shown = error.to_string();
+        assert!(shown.contains("HTTP 502"), "{shown}");
+        assert!(shown.contains("upstream down"), "{shown}");
+        assert_eq!(
+            device_poll_failure(
+                StatusCode::BAD_REQUEST,
+                br#"{"error":"authorization_pending"}"#
+            )
+            .expect("pending"),
+            DevicePoll::Pending
+        );
+        assert_eq!(
+            device_poll_failure(StatusCode::BAD_REQUEST, br#"{"error":"slow_down"}"#)
+                .expect("slow down"),
+            DevicePoll::SlowDown
+        );
     }
 
     #[test]

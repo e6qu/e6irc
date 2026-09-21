@@ -1,4 +1,4 @@
-//! Where a native client's SASL credentials come from.
+//! Where a native client's SASL credentials and server password come from.
 //!
 //! A secret typed on the command line is readable by every local user through
 //! the process list, and is kept by the shell's history. Each secret can
@@ -10,13 +10,15 @@
 use std::io;
 use std::path::PathBuf;
 
-use crate::Authentication;
 use crate::token_cache::{default_token_path, load_token, read_secret_file};
+use crate::{Authentication, ServerPassword};
 
 /// Environment variable consulted for the SASL PLAIN password.
 pub const PASSWORD_ENVIRONMENT: &str = "E6IRC_PASSWORD";
 /// Environment variable consulted for the SASL OAUTHBEARER token.
 pub const OAUTH_TOKEN_ENVIRONMENT: &str = "E6IRC_OAUTH_TOKEN";
+/// Environment variable consulted for the network's server password (`PASS`).
+pub const SERVER_PASSWORD_ENVIRONMENT: &str = "E6IRC_SERVER_PASSWORD";
 
 /// One secret's three possible sources. At most one of `argument` and `file`
 /// may be given; the environment is consulted only when neither is.
@@ -62,6 +64,11 @@ pub struct CredentialArguments {
     pub oauth_from_cache: bool,
     /// Token-cache path for `oauth_from_cache`; the platform default when absent.
     pub token_file: Option<PathBuf>,
+    /// Send a cached token to an IRC server whose host is not the host of the
+    /// API origin that issued it. Without this, that is refused: the token is
+    /// the account's API credential, and any IRC server it is sent to can use
+    /// it against the API.
+    pub allow_oauth_token_for_other_server: bool,
 }
 
 impl CredentialArguments {
@@ -69,8 +76,12 @@ impl CredentialArguments {
     /// What was said on the command line decides the mode; the environment only
     /// supplies a secret the chosen mode still lacks, so a variable exported in
     /// a shell profile never overrides an explicit flag.
+    ///
+    /// `irc_address` is the `host:port` the credentials are for: a cached
+    /// token is released only to the host of the origin that issued it.
     pub fn resolve(
         self,
+        irc_address: &str,
         environment: &impl Fn(&str) -> io::Result<Option<String>>,
     ) -> io::Result<Authentication> {
         let modes = [
@@ -107,6 +118,23 @@ impl CredentialArguments {
                     format!("no cached token at {}; run e6irc login", path.display()),
                 )
             })?;
+            let issuer = origin_host(cached.base_url()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "the cached token at {} names no origin host",
+                        path.display()
+                    ),
+                )
+            })?;
+            let server = normalized_host(crate::tls_server_name(irc_address)?);
+            if server != issuer && !self.allow_oauth_token_for_other_server {
+                return Err(invalid(format!(
+                    "the cached token was issued by {issuer}; refusing to send it to the IRC \
+                     server {server}, which could use it against that API. Connect to \
+                     {issuer}, or pass --allow-oauth-token-for-other-server"
+                )));
+            }
             return Ok(Authentication::OAuthBearer {
                 token: cached.access_token().to_owned(),
             });
@@ -121,6 +149,45 @@ impl CredentialArguments {
             },
         )
     }
+}
+
+/// The host of an `http(s)://host[:port]` origin, lowercased and without a
+/// trailing dot or IPv6 brackets; `None` when there is none.
+fn origin_host(origin: &str) -> Option<String> {
+    let (_, rest) = origin.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = match authority.strip_prefix('[') {
+        Some(bracketed) => bracketed.split_once(']')?.0,
+        None => authority.split(':').next()?,
+    };
+    (!host.is_empty()).then(|| normalized_host(host))
+}
+
+/// One spelling per host: DNS names are case-insensitive, and a trailing dot
+/// names the same host.
+fn normalized_host(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// The network's server password, from the command line, else the file, else
+/// [`SERVER_PASSWORD_ENVIRONMENT`] — or none. Independent of the SASL mode: a
+/// private server's connection password and an account's credentials are
+/// different things, and either may be given without the other. A value that
+/// cannot travel in one `PASS` line is refused here, before anything dials.
+pub fn resolve_server_password(
+    sources: SecretSources,
+    environment: &impl Fn(&str) -> io::Result<Option<String>>,
+) -> io::Result<Option<ServerPassword>> {
+    sources
+        .resolve(SERVER_PASSWORD_ENVIRONMENT, environment)?
+        .map(|password| {
+            ServerPassword::parse(password)
+                .map_err(|error| invalid(format!("the server password is not usable: {error}")))
+        })
+        .transpose()
 }
 
 /// The process environment as [`CredentialArguments::resolve`] reads it. A
@@ -162,7 +229,7 @@ mod tests {
     }
 
     fn resolved(arguments: CredentialArguments, pairs: &'static [(&str, &str)]) -> String {
-        match arguments.resolve(&environment(pairs)) {
+        match arguments.resolve("irc.example:6697", &environment(pairs)) {
             Ok(Authentication::None) => "anonymous".into(),
             Ok(Authentication::Plain { account, password }) => {
                 format!("plain {account} {password}")
@@ -268,5 +335,102 @@ mod tests {
             let outcome = resolved(arguments.clone(), pairs);
             assert!(outcome.starts_with("error: "), "{arguments:?} -> {outcome}");
         }
+    }
+
+    #[test]
+    fn a_server_password_comes_from_the_same_sources_under_the_same_rules() {
+        let resolved = |sources: SecretSources, pairs: &'static [(&str, &str)]| {
+            resolve_server_password(sources, &environment(pairs))
+                .map(|password| password.map(|password| password.as_str().to_owned()))
+                .map_err(|error| error.to_string())
+        };
+        assert_eq!(resolved(SecretSources::default(), &[]), Ok(None));
+        assert_eq!(
+            resolved(
+                SecretSources::default(),
+                &[(SERVER_PASSWORD_ENVIRONMENT, "from-env")]
+            ),
+            Ok(Some("from-env".to_owned()))
+        );
+        assert_eq!(
+            resolved(
+                argument("typed"),
+                &[(SERVER_PASSWORD_ENVIRONMENT, "from-env")]
+            ),
+            Ok(Some("typed".to_owned()))
+        );
+        for (sources, pairs) in [
+            (
+                SecretSources::default(),
+                &[(SERVER_PASSWORD_ENVIRONMENT, "")][..],
+            ),
+            (argument("a\r\nQUIT"), &[][..]),
+            (
+                SecretSources {
+                    argument: Some("typed".into()),
+                    file: Some("/nonexistent".into()),
+                },
+                &[][..],
+            ),
+        ] {
+            let outcome = resolved(sources.clone(), pairs);
+            assert!(outcome.is_err(), "{sources:?} -> {outcome:?}");
+            assert!(
+                !format!("{outcome:?}").contains("QUIT"),
+                "the refusal names the rule, not the value: {outcome:?}"
+            );
+        }
+    }
+
+    /// The cached token is the account's API credential. An IRC server it is
+    /// sent to can replay it against the API, so it goes only to the host of
+    /// the origin that issued it, unless the user says otherwise.
+    #[test]
+    #[cfg(unix)]
+    fn a_cached_token_is_sent_only_to_the_host_that_issued_it() {
+        let directory =
+            std::env::temp_dir().join(format!("e6irc-credentials-issuer-{}", std::process::id()));
+        let path = directory.join("token.json");
+        let cached =
+            crate::token_cache::CachedToken::new("https://IRC.Example:8443".into(), "t0k".into())
+                .unwrap();
+        crate::token_cache::store_token(&path, &cached).unwrap();
+        let from_cache = |allow: bool| CredentialArguments {
+            oauth_from_cache: true,
+            token_file: Some(path.clone()),
+            allow_oauth_token_for_other_server: allow,
+            ..Default::default()
+        };
+        let outcome = |arguments: CredentialArguments, server: &str| match arguments
+            .resolve(server, &environment(&[]))
+        {
+            Ok(Authentication::OAuthBearer { token }) => format!("bearer {token}"),
+            Ok(_) => "other".into(),
+            Err(error) => format!("error: {error}"),
+        };
+        assert_eq!(
+            outcome(from_cache(false), "irc.example.:6697"),
+            "bearer t0k"
+        );
+        let refused = outcome(from_cache(false), "irc.elsewhere:6697");
+        assert!(refused.starts_with("error: "), "{refused}");
+        assert!(refused.contains("irc.example"), "{refused}");
+        assert!(
+            refused.contains("--allow-oauth-token-for-other-server"),
+            "{refused}"
+        );
+        assert!(!refused.contains("t0k"), "{refused}");
+        assert_eq!(
+            outcome(from_cache(true), "irc.elsewhere:6697"),
+            "bearer t0k"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+
+        assert_eq!(origin_host("http://[::1]:8080/").as_deref(), Some("::1"));
+        assert_eq!(
+            origin_host("https://user@Host.example").as_deref(),
+            Some("host.example")
+        );
+        assert_eq!(origin_host("not a url"), None);
     }
 }

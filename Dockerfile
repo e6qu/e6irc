@@ -35,7 +35,13 @@ RUN test -n "$E6IRC_BUILD_REVISION" || { echo "E6IRC_BUILD_REVISION build argume
 ENV E6IRC_BUILD_REVISION=$E6IRC_BUILD_REVISION
 COPY . .
 COPY --from=web-build /src/web/dist ./web/dist
-RUN cargo build --release -p e6ircd --all-features
+# `cargo auditable` embeds the resolved crate list (name, version, source)
+# in the binary, so the image SBOM names every Rust crate and an operator can
+# scan the running binary for RUSTSEC advisories. `--locked` builds exactly
+# what Cargo.lock states; tools/check-locked-builds.sh holds every build to it.
+# cargo-auditable 0.7.6 (2026-09-13).
+RUN cargo install cargo-auditable --version 0.7.6 --locked
+RUN cargo auditable build --locked --release -p e6ircd --all-features
 
 # glibc, libgcc and CA certificates, and nothing else: the release binary is
 # dynamically linked against the same Debian 12 glibc the build stage has.

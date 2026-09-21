@@ -239,6 +239,35 @@
               <input id="nf-realname" name="realname" maxlength="128" />
               <small>Shown to others in /whois. Your nickname is used when this is blank.</small>
             </label>
+
+            <label class="field">
+              <span>Server password <em>optional</em></span>
+              <span class="secret-input">
+                <!-- new-password for the reason given on the NickServ password:
+                     the e6irc login must never be offered to another network. -->
+                <input
+                  id="nf-server-password"
+                  name="server_password"
+                  type="password"
+                  maxlength="504"
+                  autocomplete="new-password"
+                />
+                <button
+                  type="button"
+                  class="reveal"
+                  data-reveal="nf-server-password"
+                  data-reveal-name="server password"
+                  aria-pressed="false"
+                  aria-label="Show server password"
+                >Show</button>
+              </span>
+              <small id="nf-server-password-note">Only for private servers that require one. Stored encrypted; never shown again once saved.</small>
+            </label>
+
+            <label class="check" id="nf-clear-server-password-row" hidden>
+              <input id="nf-clear-server-password" name="clear_server_password" type="checkbox" />
+              <span><strong>Remove the stored server password</strong><small>The connection will stop sending one.</small></span>
+            </label>
           </details>
 
           <p id="nf-error" class="dialog-error" role="alert" hidden></p>
