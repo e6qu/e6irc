@@ -2038,6 +2038,11 @@ try {
     clientFrames.some((frame) => JSON.parse(frame).message === "/part #room"),
     "Leave did not send PART for the active channel",
   );
+  // Leave the mocked `demo` document before its doubles go. Left open, it saw
+  // the logout below and could reconnect its socket after Firefox stopped
+  // routing it, reaching the real daemon for a network that does not exist
+  // (about one run in forty).
+  await page.goto("about:blank");
   await page.unroute(historyURL);
   await page.unroute(networkURL);
 
