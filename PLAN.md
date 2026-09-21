@@ -334,6 +334,55 @@ and this change fixes:
   revision as "unknown"; the test matrix's 15-minute job timeout cancelled the
   merge commit's cold Intel build; CI service images were tag-pinned.
 
+A 2026-09-21 second review (an adversarial protocol reviewer, a real-networks
+bouncer reviewer, an operability reviewer) and a live run of the owner's story
+against Libera through the real browser and the real daemon found, and this
+change fixes:
+
+- **The bouncer against real networks.** A shared egress and any simultaneous
+  drop turned Libera's per-address throttle into a permanent park of every
+  network past the first few: all drivers re-dialled the same server in
+  lockstep (jitter under 0.1 s, no address rotation, no boot stagger) and a
+  pre-welcome `ERROR` parked after five. Capacity and policy answers from a
+  network never park now; jitter is proportional, addresses rotate by seed,
+  boot dials stagger. An upstream `ERROR :Closing Link` was forwarded to
+  attached clients (which reconnected themselves) and persisted; it is a
+  bouncer notice and a diagnostic. 437/436 were not refusals (30 s burned per
+  attempt); a welcome under a truncated nick dropped the session without QUIT
+  and re-registered five times; a hundred-channel rejoin was a hundred JOIN
+  lines; a forced rename to `Guest12345` was adopted silently; the connection
+  test joined every channel it said it did not join and could not test a
+  running network; 451 to `CAP LS` parked; 906 counted toward parking; the
+  synthesized self-echo carried the nickname as its user part; the EFnet preset
+  could never connect over TLS (no member of the round robin presents a
+  certificate for `irc.efnet.org`) and is gone; and SIGTERM never told the
+  drivers to stop, so every restart met its own ghost.
+- **The core, adversarially.** A comma list naming an already-joined 10k-member
+  channel a hundred times cloned its member list a hundred times and replayed
+  TOPIC and NAMES each time; a list mode named a hundred times dumped the list
+  a hundred times; flood control was off by default with a refill no real
+  client could live under when turned on. Target lists are deduplicated and
+  bounded by the advertised TARGMAX, a rejoin is a no-op, a list is dumped
+  once, and flood control is on by default with Solanum's shape. An over-long
+  PING token produced a 548-byte PONG that panicked debug builds; `TOPIC :#c`
+  cleared the topic; MARKREAD scanned every account's markers and every
+  session per command; a labeled echo whose body read `BATCH +z` escaped its
+  batch; three `draft/multiline` rules were unenforced.
+- **Operations.** The systemd unit could crash-loop into a permanently failed
+  unit when PostgreSQL came up later than e6irc, and the daemon gave up on its
+  first database connection in milliseconds (reporting the pool's "timed out"
+  instead of the refusal); it now retries for a bounded, loud window. `/healthz`
+  was a constant, so a stalled core shard stayed "healthy" behind the container
+  health check; it now requires every shard's heartbeat. HTTP requests that hit
+  the deadline or waited on the concurrency permit were neither counted nor
+  timed. Self-registration and OpenID Connect provisioning wrote no audit row,
+  and network/configuration audit details named no fields. Bouncer history had
+  no time-based retention, a saturated maintenance tick could never catch up,
+  samples were pruned only while sampling was on, a listener rollback failure
+  was swallowed, and refused connections logged one line each without bound.
+  The stop budget now covers the drivers' goodbye; a restore into an empty
+  database is proven by the recovery script.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

@@ -1029,7 +1029,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         },
         limits: {
           max_connections_per_ip: optionalPositiveInteger(fields, "max_connections_per_ip", "Connections per IP"),
-          command_burst: optionalPositiveInteger(fields, "command_burst", "Command burst"),
+          command_burst: positiveInteger(fields, "command_burst", "Command burst"),
+          command_rate: positiveInteger(fields, "command_rate", "Command rate"),
           trusted_proxies: String(fields.get("trusted_proxies") || "")
             .split("\n")
             .map((entry) => entry.trim())
@@ -1385,7 +1386,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     configurationChecked(form, "secure_cookies", settings.secure_cookies);
     configurationValue(form, "admin_accounts", apiCollection(settings, "admin_accounts", "configuration").join("\n"));
     for (const name of ["nicklen", "sendq", "core_queue", "core_workers", "max_hot_channels"]) configurationValue(form, name, settings[name]);
-    for (const name of ["max_connections_per_ip", "command_burst", "auth_rate_burst", "api_rate_burst", "administrator_api_rate_burst", "registration_burst"]) configurationValue(form, name, settings.limits[name]);
+    for (const name of ["max_connections_per_ip", "command_burst", "command_rate", "auth_rate_burst", "api_rate_burst", "administrator_api_rate_burst", "registration_burst"]) configurationValue(form, name, settings.limits[name]);
     configurationValue(form, "trusted_proxies", apiCollection(settings.limits, "trusted_proxies", "configuration").join("\n"));
     configurationChecked(form, "observability_enabled", settings.observability.enabled);
     configurationValue(form, "observability_sample_interval_seconds", settings.observability.sample_interval_seconds);
@@ -2529,7 +2530,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const result = await apiRequest(form, apiMutation(method, url), body);
       if (mode === ownerNetworkPreflight) {
         setOwnerNetworkResult(
-          `Registered as ${result.confirmed_nick}. Joined ${result.joined_channels.length} configured channel${result.joined_channels.length === 1 ? "" : "s"}. Resolved ${result.resolved_addresses} address${result.resolved_addresses === 1 ? "" : "es"}; DNS ${result.dns_ms}ms, connection ${result.connect_ms}ms, registration ${result.registration_ms}ms. No network was created.`,
+          `Registered as ${result.confirmed_nick}; no channels were joined. Resolved ${result.resolved_addresses} address${result.resolved_addresses === 1 ? "" : "es"}; DNS ${result.dns_ms}ms, connection ${result.connect_ms}ms, registration ${result.registration_ms}ms. No network was created.`,
           true,
         );
       } else {

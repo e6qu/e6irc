@@ -1241,15 +1241,11 @@ pub(super) async fn admin_patch_configuration(
         }
     }
     let restart_required = current.settings.requires_restart_to_reach(&settings);
-    let detail = format!(
-        "revision {}; BNC listener {}; restart {}",
+    let detail = configuration_audit_detail(
         current.revision + 1,
-        if bnc_changed { "changed" } else { "unchanged" },
-        if restart_required {
-            "required"
-        } else {
-            "not required"
-        }
+        bnc_changed,
+        restart_required,
+        &current.settings.changed_fields(&settings),
     );
     match crate::db::save_managed_config(
         pool_of(&state),
@@ -1271,13 +1267,102 @@ pub(super) async fn admin_patch_configuration(
             if bnc_changed && let Some(listener) = &state.bnc_listener {
                 match previous_bnc {
                     Some(address) => {
-                        let _ = listener.enable(address).await;
+                        if let Err(rollback) = listener.enable(address).await {
+                            eprintln!(
+                                "{}",
+                                bnc_listener_rollback_failure(
+                                    address,
+                                    settings.bnc_addr,
+                                    &rollback
+                                )
+                            );
+                        }
                     }
                     None => listener.stop().await,
                 }
             }
             admin_db_error("managed configuration", error)
         }
+    }
+}
+
+/// The `CONFIG` audit detail: the revision, what happened to the live BNC
+/// listener, whether a restart is needed, and the NAMES of the settings that
+/// changed — never their values, which include sealed secrets and operator
+/// text the audit log must not copy.
+fn configuration_audit_detail(
+    revision: i64,
+    bnc_changed: bool,
+    restart_required: bool,
+    changed_fields: &[String],
+) -> String {
+    format!(
+        "revision {revision}; BNC listener {}; restart {}; changed: {}",
+        if bnc_changed { "changed" } else { "unchanged" },
+        if restart_required {
+            "required"
+        } else {
+            "not required"
+        },
+        if changed_fields.is_empty() {
+            "nothing".to_string()
+        } else {
+            changed_fields.join(", ")
+        }
+    )
+}
+
+/// The line logged when the save failed AND the BNC listener could not be put
+/// back: the process is now serving an address no revision records, which the
+/// operator must know to repair (restart, or save the configuration again).
+fn bnc_listener_rollback_failure(
+    previous: std::net::SocketAddr,
+    unsaved: Option<std::net::SocketAddr>,
+    error: &std::io::Error,
+) -> String {
+    format!(
+        "http: managed configuration save failed and the BNC listener could not be restored to \
+         {previous}: {error}; it is {} — restart or save the configuration again to reconcile",
+        match unsaved {
+            Some(address) => format!("still bound to the unsaved {address}"),
+            None => "stopped, which no saved revision records".to_string(),
+        }
+    )
+}
+
+#[cfg(test)]
+mod audit_detail_tests {
+    use super::{bnc_listener_rollback_failure, configuration_audit_detail};
+
+    #[test]
+    fn config_detail_names_changed_fields_and_never_values() {
+        let detail = configuration_audit_detail(
+            7,
+            false,
+            true,
+            &["limits.command_burst".to_string(), "motd".to_string()],
+        );
+        assert_eq!(
+            detail,
+            "revision 7; BNC listener unchanged; restart required; changed: limits.command_burst, motd"
+        );
+        assert_eq!(
+            configuration_audit_detail(8, true, false, &[]),
+            "revision 8; BNC listener changed; restart not required; changed: nothing"
+        );
+    }
+
+    #[test]
+    fn rollback_failure_names_both_addresses_and_the_error() {
+        let previous: std::net::SocketAddr = "127.0.0.1:6667".parse().unwrap();
+        let unsaved: std::net::SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        let error = std::io::Error::new(std::io::ErrorKind::AddrInUse, "address in use");
+        let line = bnc_listener_rollback_failure(previous, Some(unsaved), &error);
+        assert!(line.contains("127.0.0.1:6667"), "{line}");
+        assert!(line.contains("127.0.0.1:7000"), "{line}");
+        assert!(line.contains("address in use"), "{line}");
+        let stopped = bnc_listener_rollback_failure(previous, None, &error);
+        assert!(stopped.contains("stopped"), "{stopped}");
     }
 }
 

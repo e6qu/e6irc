@@ -26,7 +26,10 @@ fn dex_login_config(db_url: String, dex_url: String, http_addr: std::net::Socket
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url: db_url }),
+        database: Some(DatabaseConfig {
+            url: db_url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         oidc_providers: vec![OidcProviderConfig {
             name: "dex".into(),
             issuer_url: dex_url,
@@ -227,7 +230,10 @@ async fn pat_bearer_auth_works() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url: db_url }),
+        database: Some(DatabaseConfig {
+            url: db_url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -323,7 +329,10 @@ async fn oidc_identity_link_flow_and_conflict() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url: db_url }),
+        database: Some(DatabaseConfig {
+            url: db_url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         oidc_providers: vec![OidcProviderConfig {
             name: "dex".into(),
             issuer_url: dex_url,
@@ -450,7 +459,10 @@ async fn oidc_silent_sso_reuses_provider_session() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url: db_url }),
+        database: Some(DatabaseConfig {
+            url: db_url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         oidc_providers: vec![OidcProviderConfig {
             name: "dex".into(),
             issuer_url: dex_url,

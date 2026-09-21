@@ -1,0 +1,7 @@
+NICK a
+USER a 0 * :A
+JOIN #c
+JOIN #c,#C,#c
+NAMES #c,#C,#c
+NAMES #c,#d
+PART #c,#C,#c

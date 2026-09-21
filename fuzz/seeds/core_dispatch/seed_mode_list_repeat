@@ -1,0 +1,8 @@
+NICK a
+USER a 0 * :A
+JOIN #c
+MODE #c +bbb a!*@* b!*@* c!*@*
+MODE #c bbb
+MODE #c b+b
+MODE #c +b+b
+MODE #c bqeIbqeI

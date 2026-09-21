@@ -73,10 +73,14 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now e6ircd
 ```
 
-The unit uses SIGTERM and a 40-second stop budget, exceeding the daemon’s
-bounded shutdown — up to 5 seconds draining the core shards, then up to 30
-seconds flushing PostgreSQL — so systemd cannot kill a still-clean shutdown
-first. It grants no capabilities, makes the host filesystem read-only
+The unit uses SIGTERM and a 55-second stop budget, exceeding the daemon’s
+bounded shutdown — up to 15 seconds telling every bouncer network's upstream
+goodbye, then up to 5 seconds draining the core shards, then up to 30 seconds
+flushing PostgreSQL — so systemd cannot kill a still-clean shutdown first. It sets `StartLimitIntervalSec=0`: a refused database connection fails the
+daemon in milliseconds, and systemd's default limit of five starts in ten
+seconds would otherwise leave the unit permanently failed after a reboot where
+PostgreSQL comes up later than e6irc; restarts stay two seconds apart and each
+attempt is a journal line. It grants no capabilities, makes the host filesystem read-only
 to the process, gives it private pseudo-devices and only its own `/proc`
 entries, forbids new namespaces, and restricts it to native-architecture system
 calls in systemd's `@system-service` set (a call outside it fails with `EPERM`
@@ -124,10 +128,14 @@ store, set `E6IRC_BOOTSTRAP_TOKEN`, open `/bootstrap`, and create the first
 durable administrator. The route closes permanently as soon as any account
 exists; remove the environment secret after successful initialization.
 The same page owns live history and audit retention (30 and 365 days by
-default). A supervised worker applies those limits in bounded batches and also
-removes expired browser sessions, personal access tokens, device grants, and
-consumed logout tokens; operators should alert on its fixed-category database
-errors rather than scheduling a second cleanup job.
+default). History retention bounds both the server's own channel history
+(`messages`) and every network's bouncer history (`bnc_buffer`, direct
+messages included). A supervised worker applies those limits in bounded
+batches every five minutes — up to 21 batches in one tick when a backlog has
+built up — and also removes expired browser sessions, personal access tokens,
+device grants, consumed logout tokens, and monitoring samples past their
+retention; operators should alert on its fixed-category database errors rather
+than scheduling a second cleanup job.
 
 Deployments that still carry plaintext OIDC/operator credentials need a master
 key before the console can own those secrets. Until then, bootstrap credentials
@@ -197,11 +205,13 @@ the password.
 
 ## Stop timeout
 
-On SIGTERM the daemon stops accepting work, drains its core shards for at most
-5 seconds, then flushes buffered writes to PostgreSQL for at most 30 seconds.
-Give the container at least 40 seconds before it is killed, as
-`e6ircd.service` does: `stopTimeout: 40` (or more) in the ECS container
-definition, `docker stop --time 40`, or `stop_grace_period: 40s` in Compose.
+On SIGTERM the daemon stops accepting work, tells every bouncer network's
+upstream goodbye (`QUIT`, at most 15 seconds for all of them together, so a
+restart never meets its own ghost), drains its core shards for at most 5
+seconds, then flushes buffered writes to PostgreSQL for at most 30 seconds.
+Give the container at least 55 seconds before it is killed, as
+`e6ircd.service` does: `stopTimeout: 55` (or more) in the ECS container
+definition, `docker stop --time 55`, or `stop_grace_period: 55s` in Compose.
 The Docker default of 10 seconds and the ECS default of 30 can both kill a
 shutdown that was still flushing cleanly.
 
@@ -218,7 +228,11 @@ Any host that runs an OCI image can run e6irc. It has to provide:
   thing — accounts, sessions, channel registrations, history, network
   definitions, sealed credentials, managed configuration, audit — lives there;
   the container itself keeps no state and needs no volume. Migrations run at
-  start. Back it up with `tools/backup-postgres.sh`.
+  start. If PostgreSQL is not accepting connections yet (still starting, or
+  started after this container), the daemon retries the first connection for
+  five minutes — doubling backoff capped at 30 s, one stderr line per attempt
+  (`[database] startup_wait_seconds` in a configuration file) — and then
+  exits non-zero. Back it up with `tools/backup-postgres.sh`.
 - **The master key**, `E6IRC_SECRET_KEY`, kept outside the database and backed
   up separately. Without it the daemon cannot store upstream or managed
   credentials, and a database restored without it holds ciphertext nothing can
@@ -228,8 +242,11 @@ Any host that runs an OCI image can run e6irc. It has to provide:
   for the chat client, `/ws/irc` for IRC over WebSocket). Put TLS in front of
   it, let WebSocket upgrades through, and set `E6IRC_PUBLIC_URL` to the
   external HTTPS origin; session cookies are `Secure` unless
-  `E6IRC_SECURE_COOKIES=false`. `GET /healthz` is the liveness probe and
-  `GET /readyz` reports core and database readiness. The image contains no
+  `E6IRC_SECURE_COOKIES=false`. `GET /healthz` is the liveness probe: 200
+  while the process answers and every core shard has finished an event
+  within 45 seconds, 503 when one is wedged, and never a database check, so a
+  database outage shows on `GET /readyz` (core and database readiness)
+  rather than restart-looping the container. The image contains no
   HTTP client, so its `HEALTHCHECK` is the daemon probing itself: `e6ircd
   healthcheck [--ready] [--addr ip:port]` reads the same `E6IRC_HTTP_ADDR` the
   server binds (no configuration file needed), exits 0 only on HTTP 200,
@@ -240,7 +257,7 @@ Any host that runs an OCI image can run e6irc. It has to provide:
   renders no TLS listener; IRC clients reach the server over `/ws/irc`. The
   optional BNC listener an administrator can enable in the console is a raw
   TCP port of its own and needs a host that can publish one.
-- **A stop timeout of at least 40 seconds** ([Stop timeout](#stop-timeout)).
+- **A stop timeout of at least 55 seconds** ([Stop timeout](#stop-timeout)).
 - **Outbound network access** to PostgreSQL, to the OpenID Connect issuer, and
   — for always-on networks and bridges — to the IRC networks (TCP 6697 for the
   curated ones), Matrix homeservers, Discord, and Slack. On an account's
@@ -278,7 +295,7 @@ routable IPv6 where the host offers it.
 - `GET /api/v1/auth/oidc/shauth/sso` — silent `prompt=none` session probe
 - `GET /api/v1/auth/oidc/shauth/callback` — registered authorization callback
 - `GET /api/v1/auth/logout` — RP-initiated logout (ends the Shauth session too)
-- `GET /healthz` — liveness (Shauth catalog health URL)
+- `GET /healthz` — liveness: process up and every core shard fresh (Shauth catalog health URL)
 
 The Shauth client registered `E6IRC_PUBLIC_URL` as its post-logout return and
 `${E6IRC_PUBLIC_URL}/api/v1/auth/oidc/shauth/callback` as its authorization

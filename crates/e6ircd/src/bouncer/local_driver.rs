@@ -218,8 +218,12 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
             return outcome;
         }
     };
-    for chan in &session.autojoin {
-        if !say(core, conn, format!("JOIN {chan}")).await {
+    // Comma-joined within the wire limit, as the IRC driver joins upstream:
+    // the in-process session is a registered non-oper client of the core, so
+    // one JOIN per channel would spend the command-flood burst on a long
+    // autojoin list and be closed with Excess Flood before it finished.
+    for line in super::irc_driver::join_lines(&session.autojoin) {
+        if !say(core, conn, line).await {
             return Stopped;
         }
     }
@@ -277,12 +281,15 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
             // Downstream command -> core.
             cmd = ends.next_command() => match cmd {
                 Some(cmd) => {
+                    // The in-process core shows every user as `~user@local`.
                     let echo = ends.irc_session_snapshot().and_then(|snapshot| {
                         super::irc_driver::self_echo(
                             &cmd.line,
-                            &snapshot.nick,
-                            &session.nick,
-                            LOCAL_NETWORK,
+                            &super::irc_driver::SelfIdentity {
+                                nick: snapshot.nick,
+                                user: format!("~{}", session.nick),
+                                host: LOCAL_NETWORK.to_string(),
+                            },
                         )
                     });
                     if session
@@ -399,7 +406,7 @@ mod tests {
             ),
             (
                 ":e6.example 001 Alicia :Welcome",
-                e6irc_client::RegistrationRefusal::InvalidNickname,
+                e6irc_client::RegistrationRefusal::WelcomedAsAnotherNickname,
             ),
         ] {
             let (core_tx, mut core_rx) = core_queue(8);
@@ -473,13 +480,37 @@ mod tests {
         (core_rx, handle, events, task, out_tx)
     }
 
+    /// The autojoin list reaches the core the way a real client sends it: one
+    /// comma-joined JOIN per wire line, never one command per channel, which a
+    /// long list would spend the core's command-flood burst on.
+    #[tokio::test]
+    async fn autojoin_is_sent_as_one_comma_joined_line() {
+        let (core_tx, mut core_rx) = core_queue(8);
+        let (_handle, _events, _task) = spawn_session(
+            core_tx,
+            vec!["#room".into(), "#other".into(), "#third".into()],
+        );
+        let out_tx = finish_registration(&mut core_rx).await;
+        core_says(&out_tx, ":e6.example 001 alice :Welcome").await;
+        let Input::Line { line, .. } = core_rx.pop().await.expect("join").payload else {
+            panic!("expected the autojoin line");
+        };
+        assert_eq!(String::from_utf8(line).unwrap(), "JOIN #room,#other,#third");
+    }
+
     #[tokio::test]
     async fn autojoin_failure_stops_before_connected() {
-        // Capacity one lets the first JOIN fill the queue and park the second.
+        // Two channel names too long to share one 510-byte JOIN line make two
+        // lines; capacity one lets the first fill the queue and park the second.
         // Closing the receiver then deterministically fails auto-join.
         let (core_tx, mut core_rx) = core_queue(1);
-        let (_handle, mut events, task) =
-            spawn_session(core_tx.clone(), vec!["#room".into(), "#other".into()]);
+        let (_handle, mut events, task) = spawn_session(
+            core_tx.clone(),
+            vec![
+                format!("#{}", "r".repeat(300)),
+                format!("#{}", "o".repeat(300)),
+            ],
+        );
         let out_tx = finish_registration(&mut core_rx).await;
         core_says(&out_tx, ":e6.example 001 alice :Welcome").await;
         while core_tx.depth() == 0 {

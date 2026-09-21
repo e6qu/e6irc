@@ -221,11 +221,17 @@ pub struct LimitsConfig {
     /// Excess connections are refused at accept (before registration).
     #[serde(default)]
     pub max_connections_per_ip: Option<usize>,
-    /// Per-session command-flood bucket size; `None` disables the
-    /// throttle. Registered non-oper sessions spend one token per command
-    /// (PING/PONG exempt) and refill one per second.
-    #[serde(default)]
-    pub command_burst: Option<usize>,
+    /// Per-session command-flood bucket size (Solanum's
+    /// `client_flood_burst_max` shape). A registered non-oper session spends
+    /// one token per command (PING/PONG exempt) and is closed with Excess
+    /// Flood when the bucket is empty. Always on: it is the bound on every
+    /// output-amplifying command class. Must be at least `command_rate`.
+    #[serde(default = "default_command_burst")]
+    pub command_burst: usize,
+    /// Tokens the command-flood bucket regains per second, up to
+    /// `command_burst` (Solanum's `client_flood_message_num`).
+    #[serde(default = "default_command_rate")]
+    pub command_rate: usize,
     /// CIDRs of trusted reverse proxies (e.g. the load balancer). When a
     /// request's socket peer matches one of these, its client IP is taken
     /// from `X-Forwarded-For`; otherwise the socket peer IP is used. Parsing
@@ -250,6 +256,20 @@ pub struct LimitsConfig {
     pub registration_burst: Option<usize>,
 }
 
+/// Solanum's defaults: a 40-command burst refilling at 20 per second.
+pub const DEFAULT_COMMAND_BURST: usize = 40;
+pub const DEFAULT_COMMAND_RATE: usize = 20;
+/// Upper bound on both flood knobs; the console offers the same range.
+pub const MAX_COMMAND_FLOOD_TOKENS: usize = 10_000;
+
+const fn default_command_burst() -> usize {
+    DEFAULT_COMMAND_BURST
+}
+
+const fn default_command_rate() -> usize {
+    DEFAULT_COMMAND_RATE
+}
+
 const fn default_api_rate_burst() -> usize {
     DEFAULT_API_RATE_BURST
 }
@@ -262,7 +282,8 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             max_connections_per_ip: None,
-            command_burst: None,
+            command_burst: DEFAULT_COMMAND_BURST,
+            command_rate: DEFAULT_COMMAND_RATE,
             trusted_proxies: Vec::new(),
             auth_rate_burst: None,
             api_rate_burst: DEFAULT_API_RATE_BURST,
@@ -324,6 +345,47 @@ impl ManagedConfig {
     /// storage maintenance each re-read their settings every cycle. Everything
     /// else is read once, at start. (Storage used to be missing here, so a
     /// retention-only change was reported as needing a restart it did not.)
+    /// The names (never values) of the settings that differ between this
+    /// revision and `next`, as dotted paths into the nested tables
+    /// (`limits.command_burst`); a list such as `motd` or `listeners` is one
+    /// name. Derived from the serialized form so a new field cannot be left
+    /// out of the audit detail.
+    pub fn changed_fields(&self, next: &Self) -> Vec<String> {
+        fn collect(
+            prefix: &str,
+            before: &serde_json::Value,
+            after: &serde_json::Value,
+            out: &mut Vec<String>,
+        ) {
+            match (before, after) {
+                (serde_json::Value::Object(before), serde_json::Value::Object(after)) => {
+                    let keys: std::collections::BTreeSet<&String> =
+                        before.keys().chain(after.keys()).collect();
+                    for key in keys {
+                        let path = if prefix.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{prefix}.{key}")
+                        };
+                        match (before.get(key), after.get(key)) {
+                            (Some(b), Some(a)) => collect(&path, b, a, out),
+                            _ => out.push(path),
+                        }
+                    }
+                }
+                _ if before != after => out.push(prefix.to_string()),
+                _ => {}
+            }
+        }
+        let mut changed = Vec::new();
+        let (before, after) = (
+            serde_json::to_value(self).expect("managed configuration serializes"),
+            serde_json::to_value(next).expect("managed configuration serializes"),
+        );
+        collect("", &before, &after, &mut changed);
+        changed
+    }
+
     pub fn requires_restart_to_reach(&self, next: &Self) -> bool {
         let mut reached_live = self.clone();
         reached_live.bnc_addr = next.bnc_addr;
@@ -442,6 +504,7 @@ impl ManagedConfig {
         let mut config = Config {
             database: Some(DatabaseConfig {
                 url: "postgresql://control-plane-validation".into(),
+                startup_wait_seconds: DEFAULT_STARTUP_WAIT_SECONDS,
             }),
             http: Some(HttpConfig {
                 addr: http_listener
@@ -1067,6 +1130,19 @@ pub enum TokenEndpointAuthMethod {
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     pub url: String,
+    /// How long startup keeps retrying the first connection (doubling backoff,
+    /// capped at 30 s, one line per attempt) before the process exits
+    /// non-zero. `0` makes one attempt. A database that comes up after this
+    /// process (a container ordering, a restart) is the case it exists for;
+    /// its ceiling is [`crate::db::StartupDatabaseWait::MAX_SECONDS`].
+    #[serde(default = "default_startup_wait_seconds")]
+    pub startup_wait_seconds: u64,
+}
+
+pub const DEFAULT_STARTUP_WAIT_SECONDS: u64 = 300;
+
+const fn default_startup_wait_seconds() -> u64 {
+    DEFAULT_STARTUP_WAIT_SECONDS
 }
 
 impl Default for Config {
@@ -1504,11 +1580,16 @@ impl Config {
                 "storage.audit_retention_days must be between 1 and 3650".into(),
             ));
         }
-        if self.limits.command_burst == Some(0) {
-            return Err(ConfigError::Invalid(
-                "limits.command_burst must be nonzero when set (0 flood-kills every command)"
-                    .into(),
-            ));
+        if let Err(error) =
+            crate::core::CommandFlood::new(self.limits.command_burst, self.limits.command_rate)
+        {
+            return Err(ConfigError::Invalid(error.to_string()));
+        }
+        if let Some(database) = &self.database
+            && let Err(error) =
+                crate::db::StartupDatabaseWait::from_seconds(database.startup_wait_seconds)
+        {
+            return Err(ConfigError::Invalid(error));
         }
         if self.limits.auth_rate_burst == Some(0) {
             return Err(ConfigError::Invalid(
@@ -1892,6 +1973,7 @@ mod tests {
         config.listeners = vec![listener_on("127.0.0.1:6667")];
         config.database = Some(DatabaseConfig {
             url: "postgres://localhost/e6irc".into(),
+            startup_wait_seconds: DEFAULT_STARTUP_WAIT_SECONDS,
         });
         config.http = Some(HttpConfig {
             addr: "127.0.0.1:6667".parse().unwrap(),
@@ -2465,6 +2547,7 @@ mod tests {
     fn db() -> Option<DatabaseConfig> {
         Some(DatabaseConfig {
             url: "postgres://localhost/x".into(),
+            startup_wait_seconds: DEFAULT_STARTUP_WAIT_SECONDS,
         })
     }
 
@@ -2693,19 +2776,85 @@ mod tests {
     }
 
     #[test]
-    fn zero_command_burst_is_rejected() {
-        let cfg = Config {
+    fn command_flood_defaults_to_solanum_shape_and_is_always_on() {
+        let limits = LimitsConfig::default();
+        assert_eq!(limits.command_burst, 40);
+        assert_eq!(limits.command_rate, 20);
+        // Omitting both keys yields the same defaults: the throttle has no
+        // "absent means off" spelling.
+        let parsed: LimitsConfig = toml::from_str("").expect("empty limits table");
+        assert_eq!(parsed, limits);
+    }
+
+    #[test]
+    fn managed_config_changed_fields_names_paths_never_values() {
+        let before = ManagedConfig::from_config(&Config::default(), None).expect("managed");
+        let mut after = before.clone();
+        assert!(before.changed_fields(&after).is_empty());
+        after.server_name = "irc.renamed.example".into();
+        after.limits.command_burst += 1;
+        after.motd.push("a very secret motd line".into());
+        let changed = before.changed_fields(&after);
+        assert_eq!(changed, ["limits.command_burst", "motd", "server_name"]);
+        assert!(
+            changed.iter().all(|name| !name.contains("secret")),
+            "values must never appear: {changed:?}"
+        );
+    }
+
+    #[test]
+    fn database_startup_wait_is_bounded() {
+        let with = |startup_wait_seconds: u64| Config {
+            listeners: vec![listener()],
+            database: Some(DatabaseConfig {
+                url: "postgres://localhost/e6irc".into(),
+                startup_wait_seconds,
+            }),
+            ..Config::default()
+        };
+        with(0).validate().expect("0 is one attempt");
+        with(3_600).validate().expect("an hour is the ceiling");
+        let error = with(3_601).validate().unwrap_err().to_string();
+        assert!(error.contains("database.startup_wait_seconds"), "{error}");
+        let parsed: DatabaseConfig =
+            toml::from_str("url = \"postgres://localhost/e6irc\"").expect("url alone");
+        assert_eq!(parsed.startup_wait_seconds, DEFAULT_STARTUP_WAIT_SECONDS);
+    }
+
+    #[test]
+    fn command_flood_rate_zero_and_burst_below_rate_are_rejected() {
+        let with = |command_burst: usize, command_rate: usize| Config {
             listeners: vec![listener()],
             limits: LimitsConfig {
-                command_burst: Some(0),
+                command_burst,
+                command_rate,
                 ..LimitsConfig::default()
             },
             ..Config::default()
         };
+        let error = with(40, 0).validate().unwrap_err().to_string();
         assert!(
-            cfg.validate().is_err(),
-            "command_burst=0 flood-kills every command and must be rejected"
+            error.contains("limits.command_rate"),
+            "command_rate=0 never refills and must be rejected: {error}"
         );
+        let error = with(0, 20).validate().unwrap_err().to_string();
+        assert!(
+            error.contains("limits.command_burst"),
+            "command_burst=0 flood-kills every command and must be rejected: {error}"
+        );
+        let error = with(10, 20).validate().unwrap_err().to_string();
+        assert!(
+            error.contains("at least limits.command_rate"),
+            "a burst below the rate is a bucket that can never hold one second: {error}"
+        );
+        let error = with(MAX_COMMAND_FLOOD_TOKENS + 1, 20)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at most"), "{error}");
+        with(20, 20)
+            .validate()
+            .expect("burst equal to rate is the floor");
     }
 
     #[test]
@@ -2970,6 +3119,7 @@ mod tests {
             }),
             database: Some(DatabaseConfig {
                 url: "postgres://db.example/e6irc".into(),
+                startup_wait_seconds: DEFAULT_STARTUP_WAIT_SECONDS,
             }),
             oidc_providers: vec![OidcProviderConfig {
                 name: name.into(),

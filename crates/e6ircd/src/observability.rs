@@ -845,9 +845,7 @@ pub(crate) async fn run_sampler(
             .unwrap_or_default();
         let snapshot = telemetry.snapshot(networks, connected);
         let started = Instant::now();
-        if let Err(error) =
-            crate::db::store_observability_sample(&pool, &snapshot, config.retention_hours).await
-        {
+        if let Err(error) = crate::db::store_observability_sample(&pool, &snapshot).await {
             telemetry.record_error(ErrorKind::Database);
             eprintln!("observability sample persistence failed: {error}");
         }
@@ -856,10 +854,16 @@ pub(crate) async fn run_sampler(
     }
 }
 
+/// Batches one maintenance tick may run when the first fills: the first plus
+/// twenty more, a quarter second apart, so a backlog of a few hundred thousand
+/// rows drains within a tick instead of never.
+const MAINTENANCE_DRAIN_BATCHES: usize = 21;
+const MAINTENANCE_DRAIN_PAUSE: Duration = Duration::from_millis(250);
+
 /// Supervised database hygiene independent of whether historical monitoring is
 /// enabled. A fixed cadence plus bounded per-table batches prevents both
-/// expired credentials and durable history/audit data from growing forever,
-/// while the next tick makes saturation self-draining without a tight loop.
+/// expired credentials and durable history/audit data from growing forever; a
+/// tick whose batch fills keeps draining, bounded, before the next tick.
 pub(crate) async fn run_storage_maintenance(
     pool: sqlx::PgPool,
     telemetry: std::sync::Arc<Telemetry>,
@@ -869,35 +873,50 @@ pub(crate) async fn run_storage_maintenance(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // `interval`'s first tick is immediate. Consume it so startup never races
     // migrations, listener binding, or the first operator request with a
-    // six-table maintenance transaction.
+    // multi-table maintenance transaction.
     ticker.tick().await;
+    let plan = crate::db::MaintenanceDrainPlan {
+        batches: std::num::NonZeroUsize::new(MAINTENANCE_DRAIN_BATCHES).expect("non-zero literal"),
+        pause: MAINTENANCE_DRAIN_PAUSE,
+    };
     loop {
         ticker.tick().await;
-        let storage = settings.read().await.settings.storage.clone();
+        let retention = {
+            let snapshot = settings.read().await;
+            crate::db::StorageRetention {
+                history_days: snapshot.settings.storage.history_retention_days,
+                audit_days: snapshot.settings.storage.audit_retention_days,
+                observability_hours: snapshot.settings.observability.retention_hours,
+            }
+        };
         let started = Instant::now();
-        match crate::db::run_storage_maintenance(
-            &pool,
-            storage.history_retention_days,
-            storage.audit_retention_days,
-        )
-        .await
-        {
-            Ok(report) if report.saturated => {
+        match crate::db::drain_storage_maintenance(&pool, retention, plan).await {
+            // One batch that did not fill is the quiet steady state.
+            Ok(drain) if drain.batches_run == 1 && !drain.totals.saturated => {}
+            Ok(drain) => {
+                let report = drain.totals;
                 eprintln!(
-                    "storage maintenance filled a bounded batch \
-                     (messages={}, audit_events={}, web_sessions={}, api_tokens={}, \
-                     device_grants={}, logout_tokens={}, account_invitations={}); expired rows remain eligible \
-                     for the next cycle",
+                    "storage maintenance ran {} bounded batches in one tick \
+                     (messages={}, bnc_buffer={}, audit_events={}, web_sessions={}, \
+                     api_tokens={}, device_grants={}, logout_tokens={}, \
+                     account_invitations={}, observability_samples={}); {}",
+                    drain.batches_run,
                     report.messages,
+                    report.bnc_buffer,
                     report.audit_events,
                     report.web_sessions,
                     report.api_tokens,
                     report.device_grants,
                     report.logout_tokens,
                     report.account_invitations,
+                    report.observability_samples,
+                    if report.saturated {
+                        "the last batch still filled; expired rows remain for the next tick"
+                    } else {
+                        "the backlog is drained"
+                    },
                 );
             }
-            Ok(_report) => {}
             Err(error) => {
                 telemetry.record_error(ErrorKind::Database);
                 eprintln!("storage maintenance failed: {error}");
@@ -913,7 +932,7 @@ impl Default for Telemetry {
     }
 }
 
-fn epoch_millis() -> u64 {
+pub(crate) fn epoch_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before Unix epoch")

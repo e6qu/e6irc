@@ -40,3 +40,8 @@ webpki-roots = { version = "1.0.9", default-features = false }
 windows-sys = { version = "0.61.2", default-features = false, features = [
     "Win32_Storage_FileSystem",
 ] }
+
+[dev-dependencies]
+# Paused time for the capability-discovery deadline tests: a scripted server
+# that never answers `CAP LS` must be waited out in virtual seconds.
+tokio = { version = "1.53.0", default-features = false, features = ["test-util"] }

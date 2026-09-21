@@ -1,0 +1,9 @@
+CAP LS 302
+CAP REQ :batch labeled-response echo-message
+NICK a
+USER a 0 * :A
+CAP END
+JOIN #a
+JOIN #b
+@label=L PRIVMSG #a,#b :BATCH +z BATCH -z
+@label=M PRIVMSG #a :BATCH -z

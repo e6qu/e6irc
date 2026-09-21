@@ -73,7 +73,10 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         networks: vec![NetworkEntry {
             kind: e6ircd::config::NetworkKind::Irc,
             name: "up".into(),
@@ -382,7 +385,10 @@ async fn ws_ui_resumes_after_a_cursor_and_says_when_it_cannot() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         networks: vec![NetworkEntry {
             kind: e6ircd::config::NetworkKind::Irc,
             name: "up".into(),
@@ -545,7 +551,10 @@ async fn ws_ui_requires_authentication() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
@@ -610,7 +619,10 @@ async fn ws_ui_detaches_when_its_network_is_removed() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),

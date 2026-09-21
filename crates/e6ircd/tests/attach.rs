@@ -343,6 +343,7 @@ async fn self_echo_excluded_for_originator_but_reaches_others_and_buffer() {
     let handle = std::sync::Arc::new(IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
         nick: "echobot".parse().expect("test nickname"),
+        username: "echoident".parse().expect("test user name"),
         autojoin: vec!["#echo".parse().expect("test channel")],
         internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
@@ -353,8 +354,11 @@ async fn self_echo_excluded_for_originator_but_reaches_others_and_buffer() {
     // echo — only the originator is ever excluded).
     let (mut a_reader, mut a_writer, _a) = attach_client(&handle, Default::default());
     let (mut b_reader, _b_writer, _b) = attach_client(&handle, Default::default());
-    // Attach status notices.
+    // Attach status notices, then the upstream's confirmation of the
+    // autojoin: our own JOIN echo, which shows the identity the upstream
+    // presents for us (this upstream adds no `~`).
     read_until(&mut a_reader, "upstream connected").await;
+    read_until(&mut a_reader, "JOIN #echo").await;
     read_until(&mut b_reader, "upstream connected").await;
 
     a_writer
@@ -362,11 +366,12 @@ async fn self_echo_excluded_for_originator_but_reaches_others_and_buffer() {
         .await
         .unwrap();
 
-    // The observer receives the synthesized echo, prefixed as the driver's
-    // upstream identity.
+    // The observer receives the synthesized echo, prefixed as the upstream
+    // shows the driver: the configured user name and the shown host, never
+    // the nickname as user.
     let echoed = read_until(&mut b_reader, "both sides now").await;
     assert!(
-        echoed.contains(":echobot!~echobot@"),
+        echoed.contains(":echobot!echoident@127.0.0.1 PRIVMSG"),
         "echo carries the upstream identity: {echoed}"
     );
     assert!(echoed.contains("PRIVMSG #echo"), "{echoed}");
@@ -397,7 +402,10 @@ async fn self_echo_excluded_for_originator_but_reaches_others_and_buffer() {
     })
     .await
     .expect("echo not buffered");
-    assert!(buffered.contains(":echobot!~echobot@"), "{buffered}");
+    assert!(
+        buffered.contains(":echobot!echoident@127.0.0.1 PRIVMSG"),
+        "{buffered}"
+    );
 }
 
 /// With echo-message negotiated on attach, the originator receives exactly
@@ -409,6 +417,7 @@ async fn self_echo_delivered_once_when_negotiated() {
     let handle = std::sync::Arc::new(IrcNetwork::start(NetworkConfig {
         addr: addr.to_string(),
         nick: "echobot".parse().expect("test nickname"),
+        username: "echoident".parse().expect("test user name"),
         autojoin: vec!["#echo".parse().expect("test channel")],
         internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
@@ -421,13 +430,17 @@ async fn self_echo_delivered_once_when_negotiated() {
     };
     let (mut reader, mut writer, _task) = attach_client(&handle, caps);
     read_until(&mut reader, "upstream connected").await;
+    read_until(&mut reader, "JOIN #echo").await;
 
     writer
         .write_all(b"PRIVMSG #echo :my own words\r\n")
         .await
         .unwrap();
     let first = read_until(&mut reader, "my own words").await;
-    assert!(first.contains(":echobot!~echobot@"), "{first}");
+    assert!(
+        first.contains(":echobot!echoident@127.0.0.1 PRIVMSG"),
+        "{first}"
+    );
     // No second copy follows.
     let second = tokio::time::timeout(std::time::Duration::from_millis(400), async {
         loop {

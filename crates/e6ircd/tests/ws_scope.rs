@@ -49,7 +49,10 @@ async fn bouncer(
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+        }),
         networks: vec![NetworkEntry {
             kind: e6ircd::config::NetworkKind::Irc,
             name: "up".into(),

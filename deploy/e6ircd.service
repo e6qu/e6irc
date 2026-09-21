@@ -3,6 +3,12 @@ Description=e6irc server, web application, and bouncer
 Documentation=https://github.com/e6qu/e6irc/tree/main/deploy
 Wants=network-online.target
 After=network-online.target
+# A refused database connection fails the daemon in milliseconds; five of
+# those inside systemd's default ten-second window would leave the unit
+# permanently failed (start-limit-hit) after a reboot where PostgreSQL comes up
+# later than e6ircd. Restarts stay bounded by RestartSec, and each attempt is a
+# journal line, so the failure is loud rather than final.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -12,7 +18,7 @@ ExecStart=/usr/local/bin/e6ircd --config /etc/e6irc/e6ircd.toml
 Restart=on-failure
 RestartSec=2s
 KillSignal=SIGTERM
-TimeoutStopSec=40s
+TimeoutStopSec=55s
 LimitNOFILE=262144
 UMask=0077
 

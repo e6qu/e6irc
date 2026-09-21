@@ -814,6 +814,7 @@ dependencies = [
  "tower",
  "tower-http",
  "url",
+ "zeroize",
 ]
 
 [[package]]

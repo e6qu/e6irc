@@ -766,6 +766,89 @@ pub(crate) struct CoreDirectories {
     pub(crate) channel_options: ChannelOptionsDirectory,
 }
 
+/// A validated command-flood bucket shape: `burst` tokens at most, refilling
+/// `rate` per second. Constructed only through [`CommandFlood::new`], so a
+/// bucket that never refills (`rate = 0`), that kills every command
+/// (`burst = 0`), or that cannot hold one second of its own rate
+/// (`burst < rate`) cannot reach the dispatcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandFlood {
+    burst: u32,
+    rate: u32,
+}
+
+/// Why a burst/rate pair is not a usable flood bucket; the message names the
+/// configuration keys because the configuration validator reports it verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandFloodError {
+    RateZero,
+    BurstZero,
+    BurstBelowRate { burst: usize, rate: usize },
+    AboveMaximum { maximum: usize },
+}
+
+impl std::fmt::Display for CommandFloodError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RateZero => {
+                write!(
+                    f,
+                    "limits.command_rate must be at least 1 (0 never refills the bucket)"
+                )
+            }
+            Self::BurstZero => write!(
+                f,
+                "limits.command_burst must be at least 1 (0 flood-kills every command)"
+            ),
+            Self::BurstBelowRate { burst, rate } => write!(
+                f,
+                "limits.command_burst ({burst}) must be at least limits.command_rate ({rate}): \
+                 the bucket must hold one second of its own refill"
+            ),
+            Self::AboveMaximum { maximum } => write!(
+                f,
+                "limits.command_burst and limits.command_rate must be at most {maximum}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CommandFloodError {}
+
+impl CommandFlood {
+    pub fn new(burst: usize, rate: usize) -> Result<Self, CommandFloodError> {
+        let maximum = crate::config::MAX_COMMAND_FLOOD_TOKENS;
+        if rate == 0 {
+            return Err(CommandFloodError::RateZero);
+        }
+        if burst == 0 {
+            return Err(CommandFloodError::BurstZero);
+        }
+        if burst < rate {
+            return Err(CommandFloodError::BurstBelowRate { burst, rate });
+        }
+        if burst > maximum || rate > maximum {
+            return Err(CommandFloodError::AboveMaximum { maximum });
+        }
+        let narrow =
+            |value: usize| u32::try_from(value).expect("bounded by MAX_COMMAND_FLOOD_TOKENS");
+        Ok(Self {
+            burst: narrow(burst),
+            rate: narrow(rate),
+        })
+    }
+
+    /// The bucket's capacity: the tokens a fresh session starts with.
+    pub const fn burst(self) -> u32 {
+        self.burst
+    }
+
+    /// Tokens regained per second of elapsed monotonic time.
+    pub const fn rate(self) -> u32 {
+        self.rate
+    }
+}
+
 #[derive(Clone)]
 pub struct CoreConfig {
     pub server_name: String,
@@ -811,10 +894,13 @@ pub struct CoreConfig {
     /// reaper). The wall clock stays the source only for real timestamps
     /// (`server-time`, msgids, signon).
     pub mono_clock: fn() -> e6irc_proto::time::MonoMillis,
-    /// Per-session command-flood bucket size; `None` disables the
-    /// throttle. Registered non-oper sessions spend one token per
-    /// command (PING/PONG exempt) and refill one token per second.
-    pub command_burst: Option<usize>,
+    /// Per-session command-flood bucket. Registered non-oper sessions spend
+    /// one token per command (PING/PONG exempt) and are closed with Excess
+    /// Flood when the bucket is empty. The server always sets it (see
+    /// `limits.command_burst`/`limits.command_rate`); `None` exists for the
+    /// in-process drivers of the test and fuzz harnesses, which pipeline
+    /// whole scripted sessions in one clock instant.
+    pub command_flood: Option<CommandFlood>,
     /// Per-client-IP account-creation bucket size; `None` disables the throttle.
     /// One token is spent per REGISTER/NickServ-REGISTER that reaches account
     /// creation; the bucket refills to full over an hour (account creation is
@@ -1009,10 +1095,10 @@ pub(crate) struct Session {
     /// would write a persisted marker the client never asked to associate with the
     /// account (same reason the DM-history identity key is not back-filled).
     pub anon_read_markers: HashMap<ChanKey, e6irc_proto::time::Millis>,
-    /// Command-flood token bucket (only used when `command_burst` is set):
-    /// tokens remaining, and the clock-millisecond through which refill has
-    /// already been credited (it advances by whole seconds only, so a
-    /// sub-second remainder carries forward instead of being discarded).
+    /// Command-flood token bucket: tokens remaining, and the clock-millisecond
+    /// through which refill has already been credited (it advances by whole
+    /// tokens' worth only, so a sub-token remainder carries forward instead of
+    /// being discarded).
     pub flood_tokens: u32,
     /// Monotonic — the flood refill is a timer, not a timestamp.
     pub flood_refilled_to_ms: e6irc_proto::time::MonoMillis,
@@ -1515,6 +1601,10 @@ impl ChannelActor {
 #[derive(Debug, Clone)]
 pub enum ChannelJoinResult {
     Joined(ChannelJoinSuccess),
+    /// The session was a member already: nothing changed, nothing is sent
+    /// (Solanum / Modern). Distinct from `Joined` so the no-op cannot be
+    /// answered with a JOIN echo and a NAMES replay.
+    AlreadyMember,
     Rejected(ChannelJoinFailure),
 }
 
@@ -3009,12 +3099,27 @@ pub(crate) struct ServerState {
     /// the recipients already told.
     user_events_in_progress: HashMap<(CoreShardId, u64), UserEventProgress>,
     /// Read markers: (account, target) → epoch millis. Mirrors the
-    /// PostgreSQL table; this is the hot copy the core serves.
-    pub read_markers: HashMap<(AccountKey, ChanKey), e6irc_proto::time::Millis>,
+    /// PostgreSQL table; this is the hot copy the core serves. Private, with
+    /// `pending_read_markers`: every write goes through the slot-counting
+    /// methods (`store_read_marker`, `reserve_read_marker`,
+    /// `release_read_marker`, `preload_read_markers`) so
+    /// `read_marker_slots` can never drift from the maps.
+    read_markers: HashMap<(AccountKey, ChanKey), e6irc_proto::time::Millis>,
     /// Number of database writes in flight for each account/target. A target
     /// is reserved here before its first durable write completes, so pipelined
     /// MARKREAD commands cannot evade the per-account distinct-target cap.
-    pub pending_read_markers: HashMap<(AccountKey, ChanKey), usize>,
+    pending_read_markers: HashMap<(AccountKey, ChanKey), usize>,
+    /// Distinct targets each account holds a marker for, confirmed or
+    /// pending — the operand of the per-account MARKREAD cap. Kept at every
+    /// write so a MARKREAD costs a lookup, not a scan of every account's
+    /// markers (the `pending_joins` pattern: count at the mutation site).
+    read_marker_slots: HashMap<AccountKey, usize>,
+    /// Connections logged in to each account, under the server casemapping.
+    /// Maintained by the three places a session's account changes
+    /// (`set_account`, `clear_account`, `close`), so a sibling sync
+    /// (MARKREAD, account-notify) is a lookup rather than a fold of every
+    /// session's account.
+    account_sessions: HashMap<AccountKey, HashSet<ConnId>>,
     /// Registered channels → founder account (both casefolded). The hot
     /// copy of the `channels` table's ownership, boot-loaded and updated
     /// on registration; a founder rejoining their channel is re-opped.
@@ -3107,6 +3212,10 @@ pub(crate) struct LabelGroup {
     pub(crate) outstanding: usize,
     pub(crate) lines: Vec<Bytes>,
 }
+
+/// A read-marker database reply arrived for a key with no write in flight.
+#[derive(Debug)]
+pub(crate) struct ReadMarkerNotReserved;
 
 /// Buffered direct responses to a labeled command.
 pub(crate) struct Capture {
@@ -3875,6 +3984,8 @@ impl ServerState {
             user_events_in_progress: HashMap::new(),
             read_markers: HashMap::new(),
             pending_read_markers: HashMap::new(),
+            read_marker_slots: HashMap::new(),
+            account_sessions: HashMap::new(),
             registered_founders: directories.founders,
             pending_channel_registrations: HashMap::new(),
             registered_topics: directories.topics,
@@ -4104,16 +4215,111 @@ impl ServerState {
     /// would silently fail to sync a sibling connection (e.g. MARKREAD) if any
     /// session ever held a non-canonical account label.
     pub fn account_connections(&self, account: &str) -> Vec<ConnId> {
-        let want = self.casemap.casefold(account);
-        self.sessions
-            .iter()
-            .filter(|(_, s)| {
-                s.account
-                    .as_deref()
-                    .is_some_and(|a| self.casemap.casefold(a) == want)
-            })
-            .map(|(c, _)| *c)
-            .collect()
+        self.account_sessions
+            .get(&self.account_key(account))
+            .map(|connections| connections.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// `conn` is no longer logged in to `account`: drop it from the index,
+    /// and the account's entry once it is empty.
+    fn forget_account_session(&mut self, account: &str, conn: ConnId) {
+        let key = self.account_key(account);
+        let std::collections::hash_map::Entry::Occupied(mut entry) =
+            self.account_sessions.entry(key)
+        else {
+            unreachable!("a session's account is always indexed while it is set");
+        };
+        let removed = entry.get_mut().remove(&conn);
+        debug_assert!(removed, "a session's account is indexed while it is set");
+        if entry.get().is_empty() {
+            entry.remove();
+        }
+    }
+
+    /// The confirmed read marker for `key`, if any.
+    pub(crate) fn read_marker(
+        &self,
+        key: &(AccountKey, ChanKey),
+    ) -> Option<e6irc_proto::time::Millis> {
+        self.read_markers.get(key).copied()
+    }
+
+    /// Whether a database write for `key` is in flight.
+    pub(crate) fn read_marker_pending(&self, key: &(AccountKey, ChanKey)) -> bool {
+        self.pending_read_markers.contains_key(key)
+    }
+
+    /// Whether `key` holds one of its account's marker slots: confirmed, or
+    /// reserved by a write in flight.
+    pub(crate) fn read_marker_slot_held(&self, key: &(AccountKey, ChanKey)) -> bool {
+        self.read_markers.contains_key(key) || self.pending_read_markers.contains_key(key)
+    }
+
+    /// How many distinct targets `account` holds a marker slot for.
+    pub(crate) fn read_marker_slots(&self, account: &AccountKey) -> usize {
+        self.read_marker_slots.get(account).copied().unwrap_or(0)
+    }
+
+    fn take_read_marker_slot(&mut self, account: &AccountKey) {
+        *self.read_marker_slots.entry(account.clone()).or_default() += 1;
+    }
+
+    fn free_read_marker_slot(&mut self, account: &AccountKey) {
+        let std::collections::hash_map::Entry::Occupied(mut entry) =
+            self.read_marker_slots.entry(account.clone())
+        else {
+            unreachable!("a held marker slot is counted");
+        };
+        *entry.get_mut() -= 1;
+        if *entry.get() == 0 {
+            entry.remove();
+        }
+    }
+
+    /// Record a confirmed marker, returning the value it replaced.
+    pub(crate) fn store_read_marker(
+        &mut self,
+        key: (AccountKey, ChanKey),
+        marker_ms: e6irc_proto::time::Millis,
+    ) -> Option<e6irc_proto::time::Millis> {
+        let held = self.read_marker_slot_held(&key);
+        let previous = self.read_markers.insert(key.clone(), marker_ms);
+        if !held {
+            self.take_read_marker_slot(&key.0);
+        }
+        previous
+    }
+
+    /// Reserve `key` for a database write now in flight.
+    pub(crate) fn reserve_read_marker(&mut self, key: (AccountKey, ChanKey)) {
+        let held = self.read_marker_slot_held(&key);
+        *self.pending_read_markers.entry(key.clone()).or_default() += 1;
+        if !held {
+            self.take_read_marker_slot(&key.0);
+        }
+    }
+
+    /// One database write for `key` has been answered. `Err` when none was
+    /// reserved — a reply without a request, which the caller reports.
+    pub(crate) fn release_read_marker(
+        &mut self,
+        key: &(AccountKey, ChanKey),
+    ) -> Result<(), ReadMarkerNotReserved> {
+        match self.pending_read_markers.entry(key.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) if *entry.get() > 1 => {
+                *entry.get_mut() -= 1;
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                entry.remove();
+                if !self.read_markers.contains_key(key) {
+                    self.free_read_marker_slot(&key.0);
+                }
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Vacant(_) => Err(ReadMarkerNotReserved),
+        }
     }
 
     /// Key a channel name for lookup/storage.
@@ -4263,9 +4469,20 @@ impl ServerState {
     /// was written from `ChanKey::as_str`), so it is wrapped directly.
     pub fn preload_read_markers(&mut self, rows: Vec<(String, String, e6irc_proto::time::Millis)>) {
         self.read_markers.clear();
+        // The slot count is rebuilt from what remains (writes still in flight)
+        // plus the rows, through the same counting store as a live write.
+        self.read_marker_slots.clear();
+        let pending: Vec<AccountKey> = self
+            .pending_read_markers
+            .keys()
+            .map(|(account, _)| account.clone())
+            .collect();
+        for account in &pending {
+            self.take_read_marker_slot(account);
+        }
         for (account, target, ms) in rows {
             let account = self.account_key(&account);
-            self.read_markers.insert((account, ChanKey(target)), ms);
+            self.store_read_marker((account, ChanKey(target)), ms);
         }
     }
 
@@ -4514,11 +4731,11 @@ impl ServerState {
                 // open time — NOT a zero `MonoMillis` sentinel. The monotonic
                 // clock's epoch is process start, so a zero watermark makes the
                 // first refill credit `now - 0 = uptime` seconds: within the
-                // first `command_burst` seconds of uptime the bucket would start
+                // first burst-many seconds of uptime the bucket would start
                 // at only `min(uptime, burst)` tokens and wrongly kill a client
                 // that pipelines a legitimate burst — worst exactly during a
                 // post-restart reconnect storm.
-                flood_tokens: self.config.command_burst.unwrap_or(0) as u32,
+                flood_tokens: self.config.command_flood.map_or(0, CommandFlood::burst),
                 flood_refilled_to_ms: opened_at,
                 // Every monotonic watermark is seeded from the open time, never a
                 // zero `MonoMillis` sentinel. A zero would be indistinguishable
@@ -5241,6 +5458,9 @@ impl ServerState {
             }
         }
         let session = self.sessions.remove(&conn).expect("checked above");
+        if let Some(account) = &session.account {
+            self.forget_account_session(account, conn);
+        }
         self.memberships.release(conn);
         for key in session.monitoring.keys() {
             self.monitors.unwatch(key, conn);
@@ -5274,13 +5494,18 @@ impl ServerState {
     /// read them. A session already logged in keeps nothing under `~nick`, so
     /// changing accounts releases nothing.
     pub(crate) fn set_account(&mut self, conn: ConnId, account: String) {
+        let key = self.account_key(&account);
         let session = self.sessions.get_mut(&conn).expect("session logging in");
         let released = session
             .account
             .is_none()
             .then(|| session.nick().map(str::to_owned))
             .flatten();
-        session.account = Some(account);
+        let previous = session.account.replace(account);
+        if let Some(previous) = previous {
+            self.forget_account_session(&previous, conn);
+        }
+        self.account_sessions.entry(key).or_default().insert(conn);
         if let Some(nick) = released {
             self.release_unauthenticated_identity(&nick);
         }
@@ -5288,10 +5513,15 @@ impl ServerState {
 
     /// Log `conn` out: it is `~nick` again from here on.
     pub(crate) fn clear_account(&mut self, conn: ConnId) {
-        self.sessions
+        let previous = self
+            .sessions
             .get_mut(&conn)
             .expect("session logging out")
-            .account = None;
+            .account
+            .take();
+        if let Some(previous) = previous {
+            self.forget_account_session(&previous, conn);
+        }
     }
 
     /// An unauthenticated session has let go of `nick` — by leaving, by
@@ -5533,7 +5763,7 @@ mod session_store_tests {
                 opers: Vec::new(),
                 clock: wall_clock,
                 mono_clock,
-                command_burst: None,
+                command_flood: None,
                 registration_burst: None,
             },
             db_tx,
@@ -5815,5 +6045,159 @@ mod session_store_tests {
         assert_ne!(old.generation, current.generation);
         assert!(state.sessions.get(&ConnId(1)).is_none());
         assert!(state.sessions.get(&ConnId(2)).is_some());
+    }
+
+    /// Every distinct (account, target) pair confirmed or in flight is one
+    /// slot: the count kept at the write sites equals a recount of the maps
+    /// after every kind of write, and never goes stale or negative.
+    #[test]
+    fn read_marker_slots_equal_a_recount_after_every_write() {
+        fn recount(state: &ServerState, account: &AccountKey) -> usize {
+            state
+                .read_markers
+                .keys()
+                .chain(state.pending_read_markers.keys())
+                .filter(|(a, _)| a == account)
+                .map(|(_, target)| target.clone())
+                .collect::<HashSet<_>>()
+                .len()
+        }
+        fn key(state: &ServerState, account: &str, target: &str) -> (AccountKey, ChanKey) {
+            (state.account_key(account), state.chan_key(target))
+        }
+        let ms = |n: u64| e6irc_proto::time::Millis::from_millis(n);
+        let mut state = state();
+        let alice = state.account_key("Alice");
+        let bob = state.account_key("bob");
+        let check = |state: &ServerState, expect_alice: usize, expect_bob: usize| {
+            assert_eq!(state.read_marker_slots(&alice), recount(state, &alice));
+            assert_eq!(state.read_marker_slots(&bob), recount(state, &bob));
+            assert_eq!(state.read_marker_slots(&alice), expect_alice);
+            assert_eq!(state.read_marker_slots(&bob), expect_bob);
+        };
+        check(&state, 0, 0);
+
+        // The live MARKREAD sequence: reserve (twice, pipelined), confirm, release.
+        state.reserve_read_marker(key(&state, "alice", "#a"));
+        state.reserve_read_marker(key(&state, "ALICE", "#A"));
+        check(&state, 1, 0);
+        state
+            .release_read_marker(&key(&state, "alice", "#a"))
+            .expect("reserved");
+        assert_eq!(
+            state.store_read_marker(key(&state, "alice", "#a"), ms(1)),
+            None
+        );
+        state
+            .release_read_marker(&key(&state, "alice", "#a"))
+            .expect("reserved");
+        check(&state, 1, 0);
+        // Confirmed then reserved again: still one slot, before and after.
+        state.reserve_read_marker(key(&state, "alice", "#a"));
+        check(&state, 1, 0);
+        state
+            .release_read_marker(&key(&state, "alice", "#a"))
+            .expect("reserved");
+        check(&state, 1, 0);
+        // A reservation that never confirms gives its slot back.
+        state.reserve_read_marker(key(&state, "alice", "#b"));
+        check(&state, 2, 0);
+        state
+            .release_read_marker(&key(&state, "alice", "#b"))
+            .expect("reserved");
+        check(&state, 1, 0);
+        // Accounts are counted apart; a forward move is not a new slot.
+        state.store_read_marker(key(&state, "bob", "#a"), ms(1));
+        assert_eq!(
+            state.store_read_marker(key(&state, "bob", "#a"), ms(2)),
+            Some(ms(1))
+        );
+        check(&state, 1, 1);
+        // A reply with no reservation is refused and changes nothing.
+        assert!(
+            state
+                .release_read_marker(&key(&state, "bob", "#never"))
+                .is_err()
+        );
+        check(&state, 1, 1);
+
+        // Preload replaces the confirmed markers and keeps in-flight
+        // reservations; casing variants of one account fold to one slot.
+        state.reserve_read_marker(key(&state, "alice", "#c"));
+        check(&state, 2, 1);
+        state.preload_read_markers(vec![
+            ("Alice".into(), "#x".into(), ms(5)),
+            ("alice".into(), "#x".into(), ms(6)),
+            ("alice".into(), "#y".into(), ms(7)),
+            ("bob".into(), "#z".into(), ms(8)),
+        ]);
+        check(&state, 3, 1);
+        assert_eq!(state.read_marker(&key(&state, "alice", "#a")), None);
+        assert_eq!(state.read_marker(&key(&state, "ALICE", "#x")), Some(ms(6)));
+        state
+            .release_read_marker(&key(&state, "alice", "#c"))
+            .expect("reserved across the preload");
+        check(&state, 2, 1);
+    }
+
+    /// The account → connections index equals a scan of every session after
+    /// each way a session's account changes, and holds no empty entries.
+    #[test]
+    fn account_index_equals_a_scan_after_login_logout_and_close() {
+        fn scan(state: &ServerState, account: &str) -> Vec<ConnId> {
+            let want = state.casemap.casefold(account);
+            let mut out: Vec<ConnId> = state
+                .sessions
+                .iter()
+                .filter(|(_, s)| {
+                    s.account()
+                        .is_some_and(|a| state.casemap.casefold(a) == want)
+                })
+                .map(|(c, _)| *c)
+                .collect();
+            out.sort_by_key(|c| c.0);
+            out
+        }
+        fn indexed(state: &ServerState, account: &str) -> Vec<ConnId> {
+            let mut out = state.account_connections(account);
+            out.sort_by_key(|c| c.0);
+            out
+        }
+        let check = |state: &ServerState| {
+            for account in ["alice", "ALICE", "Carol", "nobody"] {
+                assert_eq!(indexed(state, account), scan(state, account), "{account}");
+            }
+            assert!(
+                state.account_sessions.values().all(|s| !s.is_empty()),
+                "no empty index entries"
+            );
+        };
+        let mut state = state();
+        register(&mut state, ConnId(1), "alice");
+        register(&mut state, ConnId(2), "bob");
+        register(&mut state, ConnId(3), "carol");
+        check(&state);
+        state.set_account(ConnId(1), "Alice".into());
+        state.set_account(ConnId(2), "alice".into());
+        state.set_account(ConnId(3), "carol".into());
+        check(&state);
+        assert_eq!(indexed(&state, "ALICE"), vec![ConnId(1), ConnId(2)]);
+        // Changing account moves the connection between entries.
+        state.set_account(ConnId(2), "carol".into());
+        check(&state);
+        assert_eq!(indexed(&state, "carol"), vec![ConnId(2), ConnId(3)]);
+        // Re-setting the same account is idempotent.
+        state.set_account(ConnId(2), "Carol".into());
+        check(&state);
+        assert_eq!(indexed(&state, "carol"), vec![ConnId(2), ConnId(3)]);
+        state.clear_account(ConnId(1));
+        check(&state);
+        assert!(indexed(&state, "alice").is_empty());
+        state.close(ConnId(3), "bye");
+        check(&state);
+        assert_eq!(indexed(&state, "carol"), vec![ConnId(2)]);
+        state.close(ConnId(2), "bye");
+        check(&state);
+        assert!(state.account_sessions.is_empty());
     }
 }

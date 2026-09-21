@@ -1,0 +1,7 @@
+NICK a
+USER a 0 * :A
+JOIN #c
+TOPIC #c :the topic
+TOPIC :#c
+TOPIC #c
+TOPIC #c :

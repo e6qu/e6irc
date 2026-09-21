@@ -615,10 +615,18 @@ jobs:
         # rather than a hand-maintained list, so a newly-added target can never
         # silently go un-fuzzed — serialize_message did exactly that under the
         # old hardcoded list.
+        # `fuzz/seeds/<target>/` holds hand-written, tracked seeds (regression
+        # inputs the fuzzer would otherwise have to rediscover: repeated list
+        # targets, multiline BATCH deviations, an over-long PING). They are
+        # copied into the gitignored corpus so every run starts from them.
         run: |
           targets="$(cargo +nightly-2026-07-23 fuzz list)"
           test -n "$targets" || { echo "no fuzz targets found"; exit 1; }
           for target in $targets; do
+            if [ -d "seeds/$target" ]; then
+              mkdir -p "corpus/$target"
+              cp seeds/"$target"/* "corpus/$target/"
+            fi
             cargo +nightly-2026-07-23 fuzz run "$target" -- -max_total_time=30
           done
 

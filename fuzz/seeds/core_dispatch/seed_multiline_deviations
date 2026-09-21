@@ -1,0 +1,15 @@
+CAP LS 302
+CAP REQ :batch draft/multiline message-tags
+NICK a
+USER a 0 * :A
+CAP END
+JOIN #m
+JOIN #o
+BATCH + draft/multiline #m
+@batch PRIVMSG #m :valueless
+BATCH +7 draft/multiline #m
+@batch=7;draft/multiline-concat PRIVMSG #m :first
+BATCH +8 draft/multiline #m
+@batch=8 PRIVMSG #m :ok
+@batch=8 PRIVMSG #o :astray
+BATCH -8

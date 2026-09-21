@@ -75,6 +75,15 @@ const SHUTDOWN_DB_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// them — and normally takes milliseconds.
 const SHUTDOWN_CORE_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long graceful shutdown waits for every bouncer driver to say goodbye
+/// and release its upstream. The drivers stop concurrently, so this is the
+/// slowest one's budget, not a sum: a healthy IRC driver needs one bounded
+/// write (`QUIT`, 2 s at most); a Matrix driver logs its device out. Without
+/// this step a restart met its own ghost on every network (433, then the
+/// refusal schedule). `tools/check-systemd-unit.sh` sums it with the core and
+/// database budgets for the unit's stop timeout.
+const SHUTDOWN_DRIVER_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 fn core_queue_name(index: usize) -> &'static str {
     Box::leak(format!("core-{index}").into_boxed_str())
 }
@@ -133,6 +142,10 @@ pub struct ShutdownHandle {
     /// be replaced from the console, so shutdown must address the controller
     /// rather than only the task that happened to exist at startup.
     bnc_listener: Option<Arc<BncListenerController>>,
+    /// The bouncer drivers, stopped after the listeners so each says goodbye
+    /// to its upstream before the process exits. `None` when no network can
+    /// exist (no database and no configured network).
+    bnc_registry: Option<Arc<crate::bouncer::Registry>>,
 }
 
 /// How graceful shutdown ended, so `main` can pick an honest exit code.
@@ -176,14 +189,20 @@ impl ShutdownHandle {
     }
 
     /// Run the graceful-shutdown sequence (DESIGN §18): stop accepting new
-    /// connections, ask the core to notify clients and stop, then wait for the
-    /// DB worker to flush its buffered history. Returns once the worker has
-    /// drained or the bounded timeout elapses.
+    /// connections, stop every bouncer driver (each says `QUIT` upstream),
+    /// ask the core to notify clients and stop, then wait for the DB worker to
+    /// flush its buffered history. Returns once the worker has drained or the
+    /// bounded timeout elapses.
     pub async fn run(self) -> ShutdownOutcome {
-        self.run_within(SHUTDOWN_CORE_STOP_TIMEOUT).await
+        self.run_within(SHUTDOWN_CORE_STOP_TIMEOUT, SHUTDOWN_DRIVER_STOP_TIMEOUT)
+            .await
     }
 
-    async fn run_within(mut self, core_stop_timeout: std::time::Duration) -> ShutdownOutcome {
+    async fn run_within(
+        mut self,
+        core_stop_timeout: std::time::Duration,
+        driver_stop_timeout: std::time::Duration,
+    ) -> ShutdownOutcome {
         // 1. Stop accepting: abort every listener task up front so nothing new
         //    is admitted while we drain.
         for listener in &self.listeners {
@@ -192,7 +211,23 @@ impl ShutdownHandle {
         if let Some(listener) = &self.bnc_listener {
             listener.stop().await;
         }
-        // 2. Tell the core to notify clients (terminal ERROR) and stop. A push
+        // 2. Stop the bouncer drivers, all at once, before the core: an
+        //    attached client is told the network went away by its driver, and
+        //    the upstream hears a goodbye instead of a reset. The drivers'
+        //    own bounded writes make this finite; the deadline only bounds a
+        //    wedged one, and the stop stands either way.
+        if let Some(registry) = self.bnc_registry.take() {
+            let (released, running) = registry.stop_all_within(driver_stop_timeout).await;
+            if released < running {
+                eprintln!(
+                    "e6ircd: {} of {running} bouncer drivers did not release their upstream \
+                     within {}s of the stop; proceeding without them",
+                    running - released,
+                    driver_stop_timeout.as_secs()
+                );
+            }
+        }
+        // 3. Tell the core to notify clients (terminal ERROR) and stop. A push
         //    failure can only mean the core queue is already closed, i.e. the
         //    core is already gone — nothing more to ask of it.
         // Queue closure means the core already stopped, which is the requested
@@ -229,7 +264,7 @@ impl ShutdownHandle {
                 }
             }
         }
-        // 3. Wait for the DB worker to observe its now-dropped sender, drain,
+        // 4. Wait for the DB worker to observe its now-dropped sender, drain,
         //    and flush. Bounded so a wedged database can't hang the shutdown.
         let flush = match self.db_worker.take() {
             None => ShutdownOutcome::Flushed,
@@ -388,18 +423,21 @@ fn spawn_bnc_listener(
                 Ok((stream, peer)) => {
                     let Some(guard) = limiter.try_acquire(peer.ip()) else {
                         telemetry.record_connection_rejected();
-                        eprintln!("bnc refused {peer}: per-IP connection limit reached");
+                        limiter
+                            .refusals()
+                            .note(peer.ip(), PeerRefusal::PerIpLimit, None);
                         continue;
                     };
                     let registry = registry.clone();
                     let server_name = server_name.clone();
                     let pool = pool.clone();
                     let telemetry = telemetry.clone();
+                    let refusals = limiter.refusals().clone();
                     tokio::spawn(async move {
                         let _guard = guard;
                         if let Err(e) = stream.set_nodelay(true) {
                             telemetry.record_error(ErrorKind::ConnectionSetup);
-                            eprintln!("bnc socket setup failed for {peer}: {e}");
+                            refusals.note(peer.ip(), PeerRefusal::SocketSetup, Some(&e));
                             return;
                         }
                         if let Err(e) =
@@ -472,11 +510,35 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     // them. In particular, a queue's capacity cannot be changed after the
     // queue exists; loading `core_queue` later would make that console setting
     // a permanent no-op.
-    let (pool, managed_config) = match config.database.as_ref().map(|db| db.url.clone()) {
-        Some(database_url) => {
-            let pool = crate::db::connect_and_migrate(&database_url)
-                .await
+    let (pool, managed_config) = match config
+        .database
+        .as_ref()
+        .map(|db| (db.url.clone(), db.startup_wait_seconds))
+    {
+        Some((database_url, startup_wait_seconds)) => {
+            let wait = crate::db::StartupDatabaseWait::from_seconds(startup_wait_seconds)
                 .map_err(io::Error::other)?;
+            let pool = crate::db::connect_and_migrate_with_retry(&database_url, wait, |attempt| {
+                match attempt.retry_in {
+                    Some(pause) => eprintln!(
+                        "e6ircd: database connection attempt {} failed after {:.1}s: {}; retrying \
+                         in {:.1}s (giving up after {}s)",
+                        attempt.attempt,
+                        attempt.waited.as_secs_f64(),
+                        attempt.error,
+                        pause.as_secs_f64(),
+                        wait.duration().as_secs(),
+                    ),
+                    None => eprintln!(
+                        "e6ircd: database connection attempt {} failed after {:.1}s: {}; giving up",
+                        attempt.attempt,
+                        attempt.waited.as_secs_f64(),
+                        attempt.error,
+                    ),
+                }
+            })
+            .await
+            .map_err(io::Error::other)?;
             let imported =
                 crate::config::ManagedConfig::from_config(&config, secret_key.as_deref())
                     .map_err(io::Error::other)?;
@@ -603,6 +665,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                     secret_key.as_deref(),
                     &owner,
                     config.internal_upstreams,
+                    crate::bouncer::FirstDial::Staggered,
                 ) {
                     Ok(driver) => {
                         // A configuration-file network may already hold this
@@ -757,20 +820,22 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             preflight_limiter: crate::http::PreflightLimiter::new(),
             ui_sockets: crate::http::UiSocketLimiter::new(),
             conn_limiter: limiter.clone(),
-            request_id_prefix: {
-                use aws_lc_rs::rand::SecureRandom;
-                let mut bytes = [0u8; 8];
-                aws_lc_rs::rand::SystemRandom::new()
-                    .fill(&mut bytes)
-                    .map_err(|_| io::Error::other("system RNG for HTTP request identifiers"))?;
-                u64::from_le_bytes(bytes)
-            },
-            request_id_counter: std::sync::atomic::AtomicU64::new(0),
-            hsts_enabled: config
-                .http
-                .as_ref()
-                .and_then(|http| http.public_url.as_deref())
-                .is_some_and(|url| url.starts_with("https://")),
+            observation: Arc::new(crate::http::RequestObservation::new(
+                telemetry.clone(),
+                {
+                    use aws_lc_rs::rand::SecureRandom;
+                    let mut bytes = [0u8; 8];
+                    aws_lc_rs::rand::SystemRandom::new()
+                        .fill(&mut bytes)
+                        .map_err(|_| io::Error::other("system RNG for HTTP request identifiers"))?;
+                    u64::from_le_bytes(bytes)
+                },
+                config
+                    .http
+                    .as_ref()
+                    .and_then(|http| http.public_url.as_deref())
+                    .is_some_and(|url| url.starts_with("https://")),
+            )),
             bootstrap_token_digest: config
                 .bootstrap
                 .as_ref()
@@ -825,7 +890,10 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             .collect(),
         clock: wall_clock,
         mono_clock,
-        command_burst: config.limits.command_burst,
+        command_flood: Some(
+            crate::core::CommandFlood::new(config.limits.command_burst, config.limits.command_rate)
+                .map_err(io::Error::other)?,
+        ),
         registration_burst: config.limits.registration_burst,
     };
     let shard_count = core_tx.shard_count();
@@ -990,6 +1058,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             db_worker,
             critical_failures: critical_rx,
             bnc_listener,
+            bnc_registry,
         },
     })
 }
@@ -1032,10 +1101,138 @@ async fn core_worker(
 /// Per-IP concurrent-connection cap. When `max_per_ip` is `None` the
 /// limiter is a no-op; otherwise it refuses connections beyond the cap
 /// and releases the slot when the connection's guard drops.
+/// A refused or failed connection attempt from one peer, by class; each class
+/// is summarised separately so a TLS scanner and an over-limit client from the
+/// same address are two stories, not one count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum PeerRefusal {
+    PerIpLimit,
+    ConnectionIdExhausted,
+    SocketSetup,
+    TlsHandshakeFailed,
+    TlsHandshakeTimedOut,
+}
+
+impl PeerRefusal {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::PerIpLimit => "per-IP connection limit reached",
+            Self::ConnectionIdExhausted => "no connection identifier available",
+            Self::SocketSetup => "socket setup failed",
+            Self::TlsHandshakeFailed => "TLS handshake failed",
+            Self::TlsHandshakeTimedOut => "TLS handshake timed out",
+        }
+    }
+}
+
+/// After the first line for a (peer, class), further occurrences are counted
+/// and reported once per window.
+const PEER_REFUSAL_LOG_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// Distinct (peer, class) pairs remembered at once; past it the oldest quiet
+/// entries are evicted, and an entry that cannot be remembered is logged
+/// immediately rather than dropped.
+const PEER_REFUSAL_LOG_CAPACITY: usize = 4_096;
+
+/// Per-peer, per-class log summariser for connection refusals. The first
+/// occurrence is logged at once; within the following window the rest are only
+/// counted, and the next occurrence after the window logs again with the count
+/// it stands for. A scanner or a stuck client therefore costs one line per
+/// minute per class, never one per attempt, while the counters the metrics
+/// export are unchanged (they are incremented by the caller, not here).
+pub(crate) struct PeerRefusalLog {
+    window: std::time::Duration,
+    entries: std::sync::Mutex<
+        std::collections::HashMap<(std::net::IpAddr, PeerRefusal), PeerRefusalWindow>,
+    >,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PeerRefusalWindow {
+    last_logged: std::time::Instant,
+    /// Occurrences since `last_logged` that were not logged.
+    suppressed: u64,
+}
+
+impl PeerRefusalLog {
+    pub(crate) fn new(window: std::time::Duration) -> Self {
+        Self {
+            window,
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Log one occurrence now, if it is this window's line.
+    pub(crate) fn note(
+        &self,
+        peer: std::net::IpAddr,
+        refusal: PeerRefusal,
+        detail: Option<&dyn std::fmt::Display>,
+    ) {
+        if let Some(line) = self.line_at(std::time::Instant::now(), peer, refusal, detail) {
+            eprintln!("{line}");
+        }
+    }
+
+    /// The line to log for one occurrence at `now`, or `None` when it is
+    /// counted into the open window instead.
+    pub(crate) fn line_at(
+        &self,
+        now: std::time::Instant,
+        peer: std::net::IpAddr,
+        refusal: PeerRefusal,
+        detail: Option<&dyn std::fmt::Display>,
+    ) -> Option<String> {
+        let describe = |suppressed: u64| {
+            let mut line = format!("refused {peer}: {}", refusal.label());
+            if let Some(detail) = detail {
+                line.push_str(&format!(": {detail}"));
+            }
+            if suppressed > 0 {
+                line.push_str(&format!(
+                    " ({suppressed} more from this peer in the last {}s not logged)",
+                    self.window.as_secs()
+                ));
+            }
+            line
+        };
+        let mut entries = self.entries.lock().expect("peer refusal log poisoned");
+        if let Some(entry) = entries.get_mut(&(peer, refusal)) {
+            if now.duration_since(entry.last_logged) < self.window {
+                entry.suppressed += 1;
+                return None;
+            }
+            let suppressed = entry.suppressed;
+            *entry = PeerRefusalWindow {
+                last_logged: now,
+                suppressed: 0,
+            };
+            return Some(describe(suppressed));
+        }
+        if entries.len() >= PEER_REFUSAL_LOG_CAPACITY {
+            let window = self.window;
+            entries.retain(|_, entry| now.duration_since(entry.last_logged) < window);
+        }
+        if entries.len() < PEER_REFUSAL_LOG_CAPACITY {
+            entries.insert(
+                (peer, refusal),
+                PeerRefusalWindow {
+                    last_logged: now,
+                    suppressed: 0,
+                },
+            );
+        }
+        Some(describe(0))
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ConnLimiter {
     counts: Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
     max_per_ip: Option<usize>,
+    /// Per-peer admission failures are summarised here rather than logged one
+    /// line per attempt; it travels with the limiter because every listener
+    /// that admits peers (IRC, WS-IRC, BNC) already shares this one value.
+    refusals: Arc<PeerRefusalLog>,
 }
 
 impl ConnLimiter {
@@ -1043,7 +1240,13 @@ impl ConnLimiter {
         Self {
             counts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             max_per_ip,
+            refusals: Arc::new(PeerRefusalLog::new(PEER_REFUSAL_LOG_WINDOW)),
         }
+    }
+
+    /// The shared per-peer refusal summariser.
+    pub(crate) fn refusals(&self) -> &Arc<PeerRefusalLog> {
+        &self.refusals
     }
 
     /// Reserve a slot for `ip`, or `None` if it is already at the cap.
@@ -1148,15 +1351,16 @@ struct AcceptContext<'a> {
 }
 
 fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &AcceptContext<'_>) {
+    let refusals = context.limiter.refusals().clone();
     let Some(guard) = context.limiter.try_acquire(peer.ip()) else {
-        eprintln!("refused {peer}: per-IP connection limit reached");
+        refusals.note(peer.ip(), PeerRefusal::PerIpLimit, None);
         context.telemetry.record_connection_rejected();
         return;
     };
     let conn = match context.next_conn.allocate() {
         Ok(conn) => conn,
         Err(error) => {
-            eprintln!("refused {peer}: {error}");
+            refusals.note(peer.ip(), PeerRefusal::ConnectionIdExhausted, Some(&error));
             context.telemetry.record_error(ErrorKind::ConnectionSetup);
             return;
         }
@@ -1168,7 +1372,7 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
     tokio::spawn(async move {
         let _guard = guard;
         if let Err(e) = stream.set_nodelay(true) {
-            eprintln!("socket setup failed for {peer}: {e}");
+            refusals.note(peer.ip(), PeerRefusal::SocketSetup, Some(&e));
             telemetry.record_error(ErrorKind::ConnectionSetup);
             return;
         }
@@ -1194,11 +1398,11 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
                     }
                     Ok(Err(e)) => {
                         telemetry.record_error(ErrorKind::TlsHandshake);
-                        eprintln!("TLS handshake failed from {peer}: {e}");
+                        refusals.note(peer.ip(), PeerRefusal::TlsHandshakeFailed, Some(&e));
                     }
                     Err(_) => {
                         telemetry.record_error(ErrorKind::TlsHandshake);
-                        eprintln!("TLS handshake from {peer} timed out");
+                        refusals.note(peer.ip(), PeerRefusal::TlsHandshakeTimedOut, None);
                     }
                 }
             }
@@ -1407,6 +1611,112 @@ mod tests {
     use crate::core::Input;
     use e6irc_queue::Sender;
     use std::pin::Pin;
+
+    #[test]
+    fn peer_refusals_log_once_per_window_with_the_suppressed_count() {
+        use std::time::{Duration, Instant};
+        let log = PeerRefusalLog::new(Duration::from_secs(60));
+        let peer: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let other: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+        let start = Instant::now();
+        let first = log
+            .line_at(start, peer, PeerRefusal::PerIpLimit, None)
+            .expect("the first occurrence is logged at once");
+        assert_eq!(
+            first,
+            "refused 203.0.113.9: per-IP connection limit reached"
+        );
+        for i in 1..=500u64 {
+            assert!(
+                log.line_at(
+                    start + Duration::from_millis(i),
+                    peer,
+                    PeerRefusal::PerIpLimit,
+                    None,
+                )
+                .is_none(),
+                "occurrence {i} inside the window must only be counted"
+            );
+        }
+        // Another class from the same peer, and the same class from another
+        // peer, are their own windows.
+        let error = std::io::Error::other("bad record mac");
+        assert_eq!(
+            log.line_at(start, peer, PeerRefusal::TlsHandshakeFailed, Some(&error))
+                .as_deref(),
+            Some("refused 203.0.113.9: TLS handshake failed: bad record mac")
+        );
+        assert!(
+            log.line_at(start, other, PeerRefusal::PerIpLimit, None)
+                .is_some()
+        );
+        let later = log
+            .line_at(
+                start + Duration::from_secs(60),
+                peer,
+                PeerRefusal::PerIpLimit,
+                None,
+            )
+            .expect("the window has passed");
+        assert_eq!(
+            later,
+            "refused 203.0.113.9: per-IP connection limit reached (500 more from this peer in \
+             the last 60s not logged)"
+        );
+        assert!(
+            log.line_at(
+                start + Duration::from_secs(61),
+                peer,
+                PeerRefusal::PerIpLimit,
+                None,
+            )
+            .is_none(),
+            "a new window opened at the second line"
+        );
+    }
+
+    #[test]
+    fn peer_refusal_log_is_bounded_and_never_drops_a_first_line() {
+        use std::time::{Duration, Instant};
+        let log = PeerRefusalLog::new(Duration::from_secs(60));
+        let start = Instant::now();
+        for i in 0..PEER_REFUSAL_LOG_CAPACITY as u32 {
+            let peer = std::net::IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000 + i));
+            assert!(
+                log.line_at(start, peer, PeerRefusal::PerIpLimit, None)
+                    .is_some()
+            );
+        }
+        // Full, and every entry's window is still open: the newcomer is logged
+        // (not remembered), and logged again on its next attempt.
+        let newcomer: std::net::IpAddr = "198.51.100.1".parse().unwrap();
+        assert!(
+            log.line_at(start, newcomer, PeerRefusal::PerIpLimit, None)
+                .is_some()
+        );
+        assert!(
+            log.line_at(start, newcomer, PeerRefusal::PerIpLimit, None)
+                .is_some(),
+            "an entry the bound could not remember must not be silently dropped"
+        );
+        assert!(log.entries.lock().unwrap().len() <= PEER_REFUSAL_LOG_CAPACITY);
+        // Once the windows have passed, the quiet entries are evicted for it.
+        assert!(
+            log.line_at(
+                start + Duration::from_secs(61),
+                newcomer,
+                PeerRefusal::PerIpLimit,
+                None,
+            )
+            .is_some()
+        );
+        assert!(
+            log.entries
+                .lock()
+                .unwrap()
+                .contains_key(&(newcomer, PeerRefusal::PerIpLimit))
+        );
+    }
     use std::task::{Context, Poll};
 
     #[derive(Default)]
@@ -1650,7 +1960,7 @@ mod tests {
             opers: Vec::new(),
             clock: wall_clock,
             mono_clock,
-            command_burst: None,
+            command_flood: None,
             registration_burst: None,
         }
     }
@@ -1678,7 +1988,99 @@ mod tests {
             })),
             critical_failures,
             bnc_listener: None,
+            bnc_registry: None,
         }
+    }
+
+    /// A process restart used to leave every upstream with a ghost of the old
+    /// session: nothing stopped the drivers, so no `QUIT` was sent, and the
+    /// restarted daemon met the ghost as a 433. Shutdown stops the drivers,
+    /// and each says goodbye before its socket closes -- before `run` returns,
+    /// because the process exits right after. The registry is held by the HTTP
+    /// state and the attach listener in production, so a stop that relied on
+    /// the last `Arc` dropping would not happen; the test holds a clone for the
+    /// same reason.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_stops_the_bouncer_drivers_with_a_goodbye() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let (heard_tx, mut heard_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line.starts_with("CAP LS") {
+                    writer.write_all(b":up CAP * LS :\r\n").await.unwrap();
+                } else if line.starts_with("USER ") {
+                    writer
+                        .write_all(b":up 001 bncbot :welcome\r\n")
+                        .await
+                        .unwrap();
+                    heard_tx.send(Some("registered".into())).await.unwrap();
+                } else if line.starts_with("QUIT") {
+                    heard_tx.send(Some(line)).await.unwrap();
+                }
+            }
+            heard_tx.send(None).await.unwrap();
+        });
+        let (core_tx, _core_rx) = queue::<Input>(e6irc_queue::Config {
+            name: "t-shutdown-bnc-core",
+            capacity: 4,
+            policy: Policy::Fifo,
+        });
+        let registry = Arc::new(
+            crate::bouncer::Registry::start_observed(
+                &[crate::config::NetworkEntry {
+                    kind: crate::config::NetworkKind::Irc,
+                    name: "up".into(),
+                    owner: None,
+                    addr: upstream_addr.to_string(),
+                    tls: false,
+                    nick: "bncbot".into(),
+                    username: Some("bncbot".into()),
+                    realname: Some("bnc".into()),
+                    autojoin: vec![],
+                    buffer_cap: 16,
+                    sasl_account: None,
+                    sasl_password: None,
+                }],
+                None,
+                crate::bouncer::CoreHandles {
+                    core_tx: CoreIngress::single(core_tx),
+                    next_conn: Arc::new(ConnectionIdAllocator::new(
+                        std::num::NonZeroU64::new(1).unwrap(),
+                    )),
+                    sendq: 64,
+                },
+                Arc::new(Telemetry::new()),
+                crate::egress::InternalUpstreams::Allow,
+            )
+            .expect("registry"),
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), heard_rx.recv())
+                .await
+                .expect("the driver never registered"),
+            Some(Some("registered".into()))
+        );
+        let flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut handle = shutdown_handle(tokio::task::JoinSet::new(), flushed);
+        handle.bnc_registry = Some(registry.clone());
+        assert_eq!(handle.run().await, ShutdownOutcome::Flushed);
+        // What the upstream had read by the time `run` returned.
+        let mut heard = Vec::new();
+        while let Ok(line) = heard_rx.try_recv() {
+            heard.push(line);
+        }
+        assert_eq!(
+            heard,
+            vec![Some("QUIT :e6irc bouncer stopping".to_string()), None],
+            "the upstream reads the goodbye, then end of stream, before shutdown completes"
+        );
+        drop(registry);
     }
 
     /// A shard that panicked has lost its own state; what the database worker
@@ -1703,7 +2105,10 @@ mod tests {
         let mut core_workers = tokio::task::JoinSet::new();
         core_workers.spawn(std::future::pending());
         let outcome = shutdown_handle(core_workers, flushed.clone())
-            .run_within(std::time::Duration::from_millis(100))
+            .run_within(
+                std::time::Duration::from_millis(100),
+                SHUTDOWN_DRIVER_STOP_TIMEOUT,
+            )
             .await;
         assert_eq!(outcome, ShutdownOutcome::CoreTimedOut);
         assert!(flushed.load(std::sync::atomic::Ordering::SeqCst));

@@ -158,13 +158,23 @@ impl AdvertisedCapabilities {
 }
 
 /// Whether the server took part in capability negotiation at all. A server
-/// that answers `CAP` with 421 has no negotiation to end, so `CAP END` must not
-/// be sent to it.
+/// that answers `CAP` with 421 or 451 has no negotiation to end, so `CAP END`
+/// must not be sent to it. One that answers nothing within
+/// [`CAP_DISCOVERY_DEADLINE`] is not known either way: it may be ignoring an
+/// unknown command, or holding registration open for a `CAP END` it will
+/// answer late, so registration proceeds and still ends the negotiation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CapabilityNegotiation {
     Open,
     Unsupported,
+    Unanswered,
 }
+
+/// How long the server has to say anything about `CAP LS`. A server without
+/// capability negotiation may drop the command on the floor rather than answer
+/// 421; without a bound the registration would hang until its own timeout and
+/// then be misread as a lost connection.
+const CAP_DISCOVERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The server's answer to one `CAP REQ`.
 #[derive(Debug, PartialEq, Eq)]
@@ -798,25 +808,48 @@ impl Connection {
     }
 
     /// Discover what the server offers. A server with no capability
-    /// negotiation (421 for `CAP`) advertises nothing; whether that is
-    /// acceptable is the caller's decision, because only the caller knows
-    /// whether authentication was required.
+    /// negotiation answers `CAP` with 421 (unknown command) or 451 (a command
+    /// it does not accept before registration) and advertises nothing; one
+    /// that says nothing within [`CAP_DISCOVERY_DEADLINE`] is treated the same
+    /// way. Whether that is acceptable is the caller's decision, because only
+    /// the caller knows whether authentication was required.
     async fn begin_cap(&mut self) -> io::Result<CapabilityNegotiation> {
         self.send_line("CAP LS 302").await?;
+        let first_reply_by = tokio::time::Instant::now() + CAP_DISCOVERY_DEADLINE;
+        // The bound covers the wait for the first `CAP LS` reply only; the
+        // continuation lines of a multi-line list follow at the server's pace.
+        let mut listing_begun = false;
         loop {
-            let msg = self.recv("closed during CAP discovery").await?;
+            let msg = if listing_begun {
+                self.recv("closed during CAP discovery").await?
+            } else {
+                match tokio::time::timeout_at(
+                    first_reply_by,
+                    self.recv("closed during CAP discovery"),
+                )
+                .await
+                {
+                    Ok(msg) => msg?,
+                    Err(_) => return Ok(CapabilityNegotiation::Unanswered),
+                }
+            };
             if let Some(err) = registration_refused(&msg) {
                 return Err(err);
             }
-            if msg.command == "421"
-                && msg
-                    .params
-                    .get(1)
-                    .is_some_and(|command| command.eq_ignore_ascii_case("CAP"))
+            // 421 names the command it did not know; 451 does not reliably
+            // (`451 * :You have not registered`), and nothing but `CAP LS` has
+            // been sent, so any 451 here is the answer to it.
+            if msg.command == "451"
+                || (msg.command == "421"
+                    && msg
+                        .params
+                        .get(1)
+                        .is_some_and(|command| command.eq_ignore_ascii_case("CAP")))
             {
                 return Ok(CapabilityNegotiation::Unsupported);
             }
             if msg.command == "CAP" && msg.params.get(1).map(String::as_str) == Some("LS") {
+                listing_begun = true;
                 self.advertised
                     .record(msg.params.last().map(String::as_str).unwrap_or(""))?;
                 if msg.params.get(2).map(String::as_str) != Some("*") {
@@ -836,8 +869,14 @@ impl Connection {
         let unavailable = |diagnostic: &str| {
             Err(SaslRejection::new(SaslFailure::CapabilityNotOffered, diagnostic).into_error())
         };
-        if self.begin_cap().await? == CapabilityNegotiation::Unsupported {
-            return unavailable("the server does not support capability negotiation");
+        match self.begin_cap().await? {
+            CapabilityNegotiation::Open => {}
+            CapabilityNegotiation::Unsupported => {
+                return unavailable("the server does not support capability negotiation");
+            }
+            CapabilityNegotiation::Unanswered => {
+                return unavailable("the server did not answer capability discovery in time");
+            }
         }
         if !self.advertised.offers("sasl") {
             return unavailable("the server does not advertise the sasl capability");
@@ -1091,6 +1130,13 @@ impl Connection {
             // capability negotiation costs only the optional metadata.
             CapabilityNegotiation::Unsupported => {
                 self.send_registration_identity(identity).await?;
+            }
+            // Unknown either way: a server that does negotiate but answered
+            // late is holding registration open for `CAP END`, and one that
+            // never will answers it with a harmless 421.
+            CapabilityNegotiation::Unanswered => {
+                self.send_registration_identity(identity).await?;
+                self.send_line("CAP END").await?;
             }
         }
         self.await_welcome(identity.nick).await
@@ -1390,19 +1436,54 @@ fn is_join_refusal(command: &str) -> bool {
 /// one of them hangs forever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistrationRefusal {
+    /// 432: the server will not accept the requested nickname at all.
     InvalidNickname,
+    /// 468: the server will not accept the `USER` name.
     InvalidUsername,
+    /// 433, 436 or 437: the nickname is held, collided, or delayed after a
+    /// recent holder; it becomes free without anything changing here.
     NicknameInUse,
+    /// 464: the server wants a server password this connection did not send.
     ServerPasswordRejected,
+    /// 465: the server refuses this connection by policy (a ban, a limit).
     NetworkBanned,
+    /// A pre-welcome `ERROR`: the server closed the link with its reason (a
+    /// connection throttle, a host limit, a ban, "SASL access only").
     NotRegistered,
+    /// The server welcomed the connection under a nickname other than the one
+    /// requested. Built only by [`RegistrationRejection::welcomed_as`].
+    WelcomedAsAnotherNickname,
     /// The server does not offer the SASL capability or mechanism this
     /// connection was asked to authenticate with. Built only from a
     /// [`SaslRejection`].
     SaslUnavailable,
+    /// 906: the server aborted the SASL exchange before a verdict (services
+    /// going away mid-exchange). Built only from a [`SaslRejection`].
+    SaslAborted,
     /// SASL ended without a verdict on the credentials (a locked account, an
-    /// aborted or over-long exchange). Built only from a [`SaslRejection`].
+    /// over-long exchange, a connection already authenticated). Built only
+    /// from a [`SaslRejection`].
     SaslFailed,
+}
+
+/// What a client that keeps trying may do about a refusal. Decided by the
+/// refusal's kind alone, so no caller can retype a policy answer as a
+/// configuration error or the reverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalRetry {
+    /// The refusal ends by itself with nothing about the client's
+    /// configuration changed: a throttle, a host limit, a ban that expires,
+    /// services that are down. Whoever the client serves would have to notice
+    /// and re-save settings that were never wrong, so it is retried, slowly,
+    /// for as long as it lasts.
+    UntilItClears,
+    /// The refusal may be the client's own doing (a ghost of its previous
+    /// session on the nickname) or a setting the server will not take. A slow
+    /// schedule outlasts the former; a refusal that survives it is the latter.
+    ScheduleThenPark,
+    /// Nothing but a change to the configuration can end it: retrying changes
+    /// nothing, so the client stops at once and says why.
+    ParkNow,
 }
 
 /// A server-supplied registration refusal whose detail is bounded and safe to
@@ -1429,7 +1510,7 @@ impl RegistrationRejection {
     /// builds, not an error this library raises.
     pub fn welcomed_as(requested: &str, welcomed: &str) -> Self {
         Self {
-            refusal: RegistrationRefusal::InvalidNickname,
+            refusal: RegistrationRefusal::WelcomedAsAnotherNickname,
             diagnostic: bounded_diagnostic(&format!(
                 "requested {requested}, but the server welcomed {welcomed}"
             )),
@@ -1440,15 +1521,22 @@ impl RegistrationRejection {
     /// Public because not every registration goes through this library's
     /// socket: the bouncer's in-process network registers over a queue and must
     /// read the core's replies by the same table, not a second copy of it.
+    ///
+    /// 451 (`ERR_NOTREGISTERED`) is deliberately absent: it does not refuse
+    /// registration, it answers a command the server does not take before
+    /// registration — `CAP LS` on a server without capability negotiation,
+    /// which [`Connection::register`] reads as such — and a client that ended
+    /// on it registered nowhere it could have.
     pub fn from_reply(message: &OwnedMessage) -> Option<Self> {
         let refusal = match message.command.as_str() {
             "ERROR" => RegistrationRefusal::NotRegistered,
             "432" => RegistrationRefusal::InvalidNickname,
             "468" => RegistrationRefusal::InvalidUsername,
-            "433" => RegistrationRefusal::NicknameInUse,
+            // 433 is held; 436 is a collision the server is resolving; 437 is
+            // the nick delay after a recent holder. Each ends by itself.
+            "433" | "436" | "437" => RegistrationRefusal::NicknameInUse,
             "464" => RegistrationRefusal::ServerPasswordRejected,
             "465" => RegistrationRefusal::NetworkBanned,
-            "451" => RegistrationRefusal::NotRegistered,
             _ => return None,
         };
         Some(Self {
@@ -1499,28 +1587,35 @@ impl std::fmt::Display for RegistrationRefusalError {
 impl std::error::Error for RegistrationRefusalError {}
 
 impl RegistrationRefusal {
-    /// Whether this refusal ends by itself, with nothing about the client's
-    /// configuration changed. A caller that gives up on repeated refusals must
-    /// not give up on these: whoever it serves would have to notice and re-save
-    /// settings that were never wrong.
+    /// What a client that keeps trying may do about this refusal.
     ///
-    /// `SaslUnavailable` is the one such refusal: Solanum-family servers
-    /// withdraw the `sasl` capability for as long as services are down.
-    /// `NotRegistered` is deliberately not one, although a connection throttle
-    /// arrives that way: a pre-welcome `ERROR` also carries bans, "SASL access
-    /// only" and rejected usernames, and only the server's prose tells them
-    /// apart. A throttle is outlasted by any slow retry schedule; the permanent
-    /// closures never are, and retrying those forever is the worse mistake.
-    pub const fn clears_without_reconfiguration(self) -> bool {
+    /// The network's capacity and policy answers never park: a pre-welcome
+    /// `ERROR` (a throttle, "too many host connections", a ban that expires,
+    /// "SASL access only" while services are down), a 465, services that
+    /// withdraw `sasl` or abort the exchange. Only the server's prose tells a
+    /// throttle from a permanent closure, and a permanent closure retried
+    /// every few minutes costs the network one refused connection; a
+    /// throttle parked on costs its owner a network that never comes back
+    /// although nothing about it was wrong.
+    ///
+    /// A taken nickname is retried on the slow schedule, which outlasts the
+    /// usual holder — a ghost of the client's own previous session — and
+    /// parks when the holder stays. A nickname or user name the server will
+    /// not take, and a server password it wants, take the same schedule. A
+    /// welcome under another nickname parks at once: it cannot end without a
+    /// shorter, or different, configured nickname.
+    pub const fn retry_policy(self) -> RefusalRetry {
         match self {
-            Self::SaslUnavailable => true,
-            Self::InvalidNickname
-            | Self::InvalidUsername
-            | Self::NicknameInUse
-            | Self::ServerPasswordRejected
+            Self::NotRegistered
             | Self::NetworkBanned
-            | Self::NotRegistered
-            | Self::SaslFailed => false,
+            | Self::SaslUnavailable
+            | Self::SaslAborted => RefusalRetry::UntilItClears,
+            Self::NicknameInUse
+            | Self::InvalidNickname
+            | Self::InvalidUsername
+            | Self::ServerPasswordRejected
+            | Self::SaslFailed => RefusalRetry::ScheduleThenPark,
+            Self::WelcomedAsAnotherNickname => RefusalRetry::ParkNow,
         }
     }
 
@@ -1531,11 +1626,11 @@ impl RegistrationRefusal {
     const fn error_kind(self) -> io::ErrorKind {
         match self {
             Self::NicknameInUse => io::ErrorKind::AlreadyExists,
-            Self::InvalidNickname => io::ErrorKind::InvalidInput,
+            Self::InvalidNickname | Self::WelcomedAsAnotherNickname => io::ErrorKind::InvalidInput,
             Self::InvalidUsername => io::ErrorKind::InvalidInput,
             Self::ServerPasswordRejected => io::ErrorKind::PermissionDenied,
             Self::NetworkBanned => io::ErrorKind::ConnectionAborted,
-            Self::NotRegistered | Self::SaslFailed => io::ErrorKind::Other,
+            Self::NotRegistered | Self::SaslFailed | Self::SaslAborted => io::ErrorKind::Other,
             Self::SaslUnavailable => io::ErrorKind::Unsupported,
         }
     }
@@ -1658,10 +1753,10 @@ impl SaslRejection {
             SaslFailure::MechanismNotOffered | SaslFailure::CapabilityNotOffered => {
                 RegistrationRefusal::SaslUnavailable
             }
-            SaslFailure::NickLocked
-            | SaslFailure::TooLong
-            | SaslFailure::Aborted
-            | SaslFailure::AlreadyAuthenticated => RegistrationRefusal::SaslFailed,
+            SaslFailure::Aborted => RegistrationRefusal::SaslAborted,
+            SaslFailure::NickLocked | SaslFailure::TooLong | SaslFailure::AlreadyAuthenticated => {
+                RegistrationRefusal::SaslFailed
+            }
         };
         SaslRejectionClass::RegistrationRefused(RegistrationRejection {
             refusal,
@@ -1719,9 +1814,10 @@ mod tests {
             ("432", RegistrationRefusal::InvalidNickname),
             ("468", RegistrationRefusal::InvalidUsername),
             ("433", RegistrationRefusal::NicknameInUse),
+            ("436", RegistrationRefusal::NicknameInUse),
+            ("437", RegistrationRefusal::NicknameInUse),
             ("464", RegistrationRefusal::ServerPasswordRejected),
             ("465", RegistrationRefusal::NetworkBanned),
-            ("451", RegistrationRefusal::NotRegistered),
         ] {
             let message = OwnedMessage::from(
                 &Message::parse(&format!(":srv {numeric} nick :refused")).expect("numeric"),
@@ -1732,6 +1828,11 @@ mod tests {
             assert_eq!(rejection.refusal(), expected);
             assert_eq!(rejection.diagnostic(), "refused");
         }
+        // 451 answers a command, it does not refuse the registration.
+        let not_registered = OwnedMessage::from(
+            &Message::parse(":srv 451 * :You have not registered").expect("numeric"),
+        );
+        assert!(registration_refused(&not_registered).is_none());
     }
 
     #[test]
@@ -2043,15 +2144,93 @@ mod tests {
             )
             .await
             .expect("a rejection");
-            assert_eq!(
-                matches!(
-                    rejection.class(),
-                    SaslRejectionClass::CredentialsRejected(_)
+            match rejection.class() {
+                SaslRejectionClass::CredentialsRejected(_) => assert_eq!(
+                    expected,
+                    SaslFailure::Failed,
+                    "only a 904 for an offered mechanism is about the credentials"
                 ),
-                expected == SaslFailure::Failed,
-                "only a 904 for an offered mechanism is about the credentials"
-            );
+                SaslRejectionClass::RegistrationRefused(refused) => {
+                    assert_ne!(expected, SaslFailure::Failed);
+                    // Services that abort the exchange are a passing state of
+                    // the network, not of this configuration.
+                    let clears_by_itself =
+                        refused.refusal().retry_policy() == RefusalRetry::UntilItClears;
+                    assert_eq!(
+                        clears_by_itself,
+                        expected == SaslFailure::Aborted,
+                        "{verdict}: {refused:?}"
+                    );
+                }
+            }
         }
+    }
+
+    /// A server without capability negotiation may answer `CAP LS` with 451
+    /// rather than 421 (it is a command it does not take before registration).
+    /// Either way, registration proceeds plainly and no `CAP END` is sent.
+    #[tokio::test]
+    async fn a_451_to_capability_discovery_registers_plainly() {
+        assert_registration(
+            vec![
+                Expect("CAP LS 302"),
+                Send(":srv 451 * :You have not registered"),
+                Expect("NICK nick"),
+                Expect("USER ident 0 * :real"),
+                Send(":srv 001 nick :Welcome"),
+            ],
+            Ending::Welcomed,
+        )
+        .await;
+    }
+
+    /// A server that ignores `CAP LS` would otherwise hold registration until
+    /// the caller's own deadline and be misread as a lost connection. After
+    /// the discovery bound the identity is sent anyway, and the negotiation is
+    /// still ended for a server that merely answered late.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_capability_discovery_registers_and_still_ends_negotiation() {
+        let (mut connection, server) = scripted(vec![
+            Expect("CAP LS 302"),
+            Expect("NICK nick"),
+            Expect("USER ident 0 * :real"),
+            Expect("CAP END"),
+            Send(":srv 001 nick :Welcome"),
+        ]);
+        let started = tokio::time::Instant::now();
+        let welcomed = tokio::time::timeout(
+            CAP_DISCOVERY_DEADLINE * 3,
+            connection.register(&TEST_IDENTITY),
+        )
+        .await
+        .expect("registration neither finished nor failed")
+        .expect("registered");
+        assert_eq!(welcomed, "nick");
+        assert!(started.elapsed() >= CAP_DISCOVERY_DEADLINE);
+        drop(connection);
+        assert_eq!(server.await.unwrap(), Vec::<String>::new());
+    }
+
+    /// With SASL configured, the same silence is a loud refusal: registering
+    /// unauthenticated would be a silent downgrade.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_capability_discovery_refuses_sasl_loudly() {
+        let (mut connection, server) = scripted(vec![Expect("CAP LS 302")]);
+        let error = tokio::time::timeout(
+            CAP_DISCOVERY_DEADLINE * 3,
+            connection.register_sasl(&TEST_IDENTITY, "acct", "pw"),
+        )
+        .await
+        .expect("registration neither finished nor failed")
+        .expect_err("SASL cannot be negotiated with a silent server");
+        let rejection = SaslRejection::from_error(&error).expect("typed SASL rejection");
+        assert_eq!(rejection.failure(), SaslFailure::CapabilityNotOffered);
+        assert_eq!(
+            rejection.diagnostic(),
+            "the server did not answer capability discovery in time"
+        );
+        drop(connection);
+        assert_eq!(server.await.unwrap(), Vec::<String>::new());
     }
 
     #[tokio::test]

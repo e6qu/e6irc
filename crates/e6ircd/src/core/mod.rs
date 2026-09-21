@@ -15,7 +15,9 @@ mod timer;
 pub(crate) use handler::fit_trailing;
 pub(crate) use timer::TimerWheel;
 
-pub use state::{ChannelOwner, ConnId, CoreConfig, dm_conversation_key};
+pub use state::{
+    ChannelOwner, CommandFlood, CommandFloodError, ConnId, CoreConfig, dm_conversation_key,
+};
 
 use std::collections::VecDeque;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -2972,7 +2974,7 @@ mod ingress_tests {
             opers: Vec::new(),
             clock: wall_clock,
             mono_clock,
-            command_burst: None,
+            command_flood: None,
             registration_burst: None,
         }
     }
@@ -3128,6 +3130,70 @@ mod ingress_tests {
             Some("+im".into())
         );
         assert_eq!(second.state.access_modes(&key, "alice"), (true, true));
+    }
+
+    /// Each worker indexes the accounts of its own sessions; the index equals
+    /// a scan of that worker's sessions after login, logout and close, and a
+    /// login on one worker is invisible to the other.
+    #[test]
+    fn account_index_is_per_worker_and_equals_a_scan_on_each() {
+        fn scan(core: &Core, account: &str) -> Vec<ConnId> {
+            let want = core.state.casemap.casefold(account);
+            let mut out: Vec<ConnId> = core
+                .state
+                .sessions
+                .iter()
+                .filter(|(_, s)| {
+                    s.account()
+                        .is_some_and(|a| core.state.casemap.casefold(a) == want)
+                })
+                .map(|(c, _)| *c)
+                .collect();
+            out.sort_by_key(|c| c.0);
+            out
+        }
+        fn indexed(core: &Core, account: &str) -> Vec<ConnId> {
+            let mut out = core.state.account_connections(account);
+            out.sort_by_key(|c| c.0);
+            out
+        }
+        let TwoWorkerHarness {
+            mut first,
+            mut second,
+            ..
+        } = two_worker_harness();
+        let (session, _output) = open_session_on_first(&mut first, "account-index-first");
+        let (second_tx, _second_output) = queue(Config {
+            name: "account-index-second",
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        second.state.open(
+            ConnId(9),
+            second_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        let check = |first: &Core, second: &Core| {
+            for core in [first, second] {
+                for account in ["alice", "ALICE", "nobody"] {
+                    assert_eq!(indexed(core, account), scan(core, account), "{account}");
+                }
+            }
+        };
+        check(&first, &second);
+        first.state.set_account(session.conn(), "Alice".into());
+        second.state.set_account(ConnId(9), "alice".into());
+        check(&first, &second);
+        assert_eq!(indexed(&first, "alice"), vec![session.conn()]);
+        assert_eq!(indexed(&second, "alice"), vec![ConnId(9)]);
+        first.state.clear_account(session.conn());
+        check(&first, &second);
+        assert!(indexed(&first, "alice").is_empty());
+        assert_eq!(indexed(&second, "alice"), vec![ConnId(9)]);
+        second.state.close(ConnId(9), "bye");
+        check(&first, &second);
+        assert!(indexed(&second, "alice").is_empty());
     }
 
     #[test]
@@ -4430,6 +4496,41 @@ mod ingress_tests {
         assert_eq!(
             (joined, refused.len()),
             (on_one_worker.0, on_one_worker.1.len()),
+            "the answer on two workers is the answer on one"
+        );
+    }
+
+    /// alice (on shard 0) joins the channel shard 1 owns, then joins it again
+    /// under three spellings and NAMES it under three. Returns what the second
+    /// JOIN and the NAMES produced.
+    fn rejoin_and_names_answer(mut shards: Shards) -> (Vec<String>, Vec<String>) {
+        let remote = shards.owned[1];
+        shards.client(2, "alice", "");
+        shards.line(2, &format!("JOIN {remote}"));
+        shards.drain(2);
+        let upper = remote.to_ascii_uppercase();
+        shards.line(2, &format!("JOIN {remote},{upper},{remote}"));
+        let rejoin = shards.drain(2);
+        shards.line(2, &format!("NAMES {remote},{upper},{remote}"));
+        let names = shards.drain(2);
+        (rejoin, names)
+    }
+
+    /// A JOIN of a channel already joined is silent, and a NAMES list is one
+    /// channel once — whether the channel's owner is the session's shard or
+    /// another: the owner answers `AlreadyMember`, and the session's shard
+    /// deduplicates and caps the list before routing.
+    #[test]
+    fn a_rejoin_across_shards_is_silent_and_names_is_served_once() {
+        let (rejoin, names) = rejoin_and_names_answer(Shards::new());
+        assert!(rejoin.is_empty(), "a rejoin replays nothing: {rejoin:#?}");
+        assert_eq!(lines_with(&names, " 353 ").len(), 1, "{names:#?}");
+        assert_eq!(lines_with(&names, " 366 ").len(), 1, "{names:#?}");
+        MONO_NOW.with(|now| now.set(0));
+        let on_one_worker = rejoin_and_names_answer(Shards::on_one_worker());
+        assert_eq!(
+            (rejoin.len(), names.len()),
+            (on_one_worker.0.len(), on_one_worker.1.len()),
             "the answer on two workers is the answer on one"
         );
     }

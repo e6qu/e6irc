@@ -28,6 +28,11 @@ POSTGRES_IMAGE = os.environ.get("E6IRC_TEST_POSTGRES_IMAGE", "postgres:18-alpine
 POSTGRES_PASSWORD = "recovery test:p@ss/word#1"
 POSTGRES_PASSWORD_IN_URL = urllib.parse.quote(POSTGRES_PASSWORD, safe="")
 POSTGRES_DATABASE = "e6irc_recovery"
+# A second, freshly created database the same archive is restored into: the
+# case of standing up a replacement server from a backup, where nothing in the
+# target existed before (no schema, no `_sqlx_migrations`), so the daemon's
+# migration checksum validation runs against restored rows alone.
+FRESH_DATABASE = "e6irc_recovery_fresh"
 # PostgreSQL listens off its default port inside the container, so a client
 # there reaches it only by honoring the port in the database URL.
 POSTGRES_CONTAINER_PORT = 5544
@@ -86,7 +91,9 @@ def docker(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[s
     )
 
 
-def container_sql(container: str, statement: str) -> str:
+def container_sql(
+    container: str, statement: str, database: str = POSTGRES_DATABASE
+) -> str:
     return docker(
         "exec",
         container,
@@ -96,7 +103,7 @@ def container_sql(container: str, statement: str) -> str:
         "--username",
         "postgres",
         "--dbname",
-        POSTGRES_DATABASE,
+        database,
         "--tuples-only",
         "--no-align",
         "--command",
@@ -413,10 +420,14 @@ def main() -> None:
             ).stdout.strip()
             assert container_address, "PostgreSQL container has no network address"
 
-            def tool_url(password: str, sslmode: str = "disable") -> str:
+            def tool_url(
+                password: str,
+                sslmode: str = "disable",
+                database: str = POSTGRES_DATABASE,
+            ) -> str:
                 return (
                     f"postgresql://postgres:{password}@{container_address}:"
-                    f"{POSTGRES_CONTAINER_PORT}/{POSTGRES_DATABASE}"
+                    f"{POSTGRES_CONTAINER_PORT}/{database}"
                     f"?sslmode={sslmode}&application_name=e6irc%20recovery"
                 )
 
@@ -520,6 +531,77 @@ def main() -> None:
                 server.send_signal(signal.SIGTERM)
                 assert server.wait(timeout=10) == 0
 
+            # The same archive into a database that never held e6irc: created
+            # empty, restored by the shipped script (its `--clean --if-exists`
+            # has nothing to drop), and booted. The daemon validates every
+            # applied migration's checksum against the restored
+            # `_sqlx_migrations`, so a restore that lost or altered that table
+            # would refuse to start here rather than re-run migrations over
+            # restored data.
+            container_sql(
+                container,
+                f"CREATE DATABASE {FRESH_DATABASE}",
+                database="postgres",
+            )
+            assert (
+                container_sql(
+                    container,
+                    "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'",
+                    database=FRESH_DATABASE,
+                )
+                == "0"
+            ), "the fresh database must start empty"
+            run_database_tool(
+                "restore-postgres.sh",
+                str(backup),
+                FRESH_DATABASE,
+                environment={
+                    **tool_environment,
+                    "E6IRC_DATABASE_URL": tool_url(
+                        POSTGRES_PASSWORD_IN_URL, database=FRESH_DATABASE
+                    ),
+                    "E6IRC_RESTORE_CONFIRM": FRESH_DATABASE,
+                },
+            )
+            fresh_restored = container_sql(
+                container,
+                "SELECT (SELECT count(*) FROM server_settings), "
+                "(SELECT count(*) FROM device_grants), "
+                "(SELECT count(*) FROM _sqlx_migrations WHERE success)",
+                database=FRESH_DATABASE,
+            )
+            assert fresh_restored == f"1|{expected_grants}|{expected_migrations}", (
+                fresh_restored
+            )
+            fresh_config = temporary / "e6ircd-fresh.toml"
+            fresh_config.write_text(
+                config.read_text(encoding="utf-8").replace(
+                    f"/{POSTGRES_DATABASE}", f"/{FRESH_DATABASE}"
+                ),
+                encoding="utf-8",
+            )
+            with server_log_path.open("ab") as server_log:
+                server = subprocess.Popen(
+                    [str(SERVER), "--config", str(fresh_config)],
+                    cwd=ROOT,
+                    stdout=server_log,
+                    stderr=subprocess.STDOUT,
+                )
+                fresh_body, _ = wait_for_http(origin, "/readyz", 200)
+                assert json.loads(fresh_body)["database"] == "ready"
+                server.send_signal(signal.SIGTERM)
+                assert server.wait(timeout=10) == 0
+            assert (
+                int(
+                    container_sql(
+                        container,
+                        "SELECT count(*) FROM _sqlx_migrations WHERE success",
+                        database=FRESH_DATABASE,
+                    )
+                )
+                == expected_migrations
+            ), "booting from the restored database must not re-run migrations"
+
             server_output = server_log_path.read_text(encoding="utf-8", errors="replace")
             for secret in (POSTGRES_PASSWORD, POSTGRES_PASSWORD_IN_URL):
                 assert secret not in server_output, (
@@ -529,8 +611,8 @@ def main() -> None:
                 "PostgreSQL recovery journey passed: fresh boot, migrations, "
                 "bounded readiness, hot IRC traffic, visible dependency failure, "
                 "recovery, graceful shutdown, scripted custom backup, guarded "
-                "transactional restore, "
-                "and restored boot"
+                "transactional restore, restored boot, "
+                "and restore into an empty database with a checksum-validated boot"
             )
         except Exception:
             if server_log_path.exists():

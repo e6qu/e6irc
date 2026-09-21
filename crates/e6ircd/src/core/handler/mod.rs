@@ -560,39 +560,45 @@ fn begin_channel_capture(
     conn
 }
 
-/// Whether `lines` is a single self-contained batch: the first line opens a
-/// `BATCH +ref` and the last closes the same `BATCH -ref`.
+/// Whether `lines` is a single self-contained batch: the first line *is* a
+/// `BATCH +ref` command and the last *is* the `BATCH -ref` that closes it.
+/// Decided by parsing the lines, never by searching their text: a PRIVMSG
+/// whose body reads `BATCH +z BATCH -z` is a PRIVMSG, and a substring test
+/// let a multi-target echo of exactly that text escape its labeled batch.
 fn is_self_contained_batch(lines: &[bytes::Bytes]) -> bool {
-    let Some(first) = lines.first() else {
+    let (Some(first), Some(last)) = (lines.first(), lines.last()) else {
         return false;
     };
-    let Some(last) = lines.last() else {
-        return false;
-    };
-    let first = String::from_utf8_lossy(first);
-    let last = String::from_utf8_lossy(last);
-    match (batch_ref_after(&first, '+'), batch_ref_after(&last, '-')) {
+    match (batch_command_ref(first, '+'), batch_command_ref(last, '-')) {
         (Some(open), Some(close)) => open == close,
         _ => false,
     }
 }
 
-/// The batch reference following `BATCH <sign>` in a serialized line, if any.
-fn batch_ref_after(line: &str, sign: char) -> Option<&str> {
-    let marker = if sign == '+' { "BATCH +" } else { "BATCH -" };
-    let rest = &line[line.find(marker)? + marker.len()..];
-    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-    Some(&rest[..end])
+/// The reference of a serialized (CRLF-terminated) `BATCH <sign><ref> …`
+/// command line, or `None` when the line is any other command.
+fn batch_command_ref(line: &[u8], sign: char) -> Option<String> {
+    let text = std::str::from_utf8(line).ok()?;
+    let message = Message::parse(text.trim_end_matches("\r\n")).ok()?;
+    if !message.command.eq_ignore_ascii_case("BATCH") {
+        return None;
+    }
+    message
+        .params
+        .first()?
+        .strip_prefix(sign)
+        .filter(|reference| !reference.is_empty())
+        .map(str::to_string)
 }
 
 /// Spend one command-flood token. Returns `true` if the command may
 /// proceed, `false` if the bucket is empty (the caller closes the link).
-/// No-op (always `true`) when the throttle is off, or for pre-registered
-/// and oper sessions. Refills one token per elapsed second up to the
-/// configured burst; a fresh session is seeded full at `open()` (with its
+/// Always `true` for pre-registered and oper sessions, and for a harness
+/// core built without a bucket. Refills `rate` tokens per elapsed second up
+/// to `burst`; a fresh session is seeded full at `open()` (with its
 /// watermark at the open time), so it starts with the whole burst available.
 fn flood_ok(state: &mut ServerState, conn: ConnId) -> bool {
-    let Some(burst) = state.config.command_burst else {
+    let Some(flood) = state.config.command_flood else {
         return true;
     };
     {
@@ -610,13 +616,18 @@ fn flood_ok(state: &mut ServerState, conn: ConnId) -> bool {
     if now < s.flood_refilled_to_ms {
         s.flood_refilled_to_ms = now;
     }
-    // The clock is milliseconds but the bucket refills per whole second, so
-    // credit only elapsed whole seconds and advance the watermark by exactly
-    // what was credited — otherwise sub-second command bursts would keep
-    // resetting the watermark and the bucket would never refill at all.
-    let refill = now.saturating_sub(s.flood_refilled_to_ms).as_secs();
-    let tokens = (u64::from(s.flood_tokens) + refill).min(burst as u64) as u32;
-    s.flood_refilled_to_ms = s.flood_refilled_to_ms.saturating_add_millis(refill * 1000);
+    // Credit whole tokens only (`rate` per 1000 ms) and advance the watermark
+    // by exactly the milliseconds those tokens cost — never to `now` — so a
+    // sub-token remainder carries forward instead of being discarded. Resetting
+    // the watermark on every command would let a steady sub-interval stream
+    // starve the bucket of refill forever.
+    let rate = u64::from(flood.rate());
+    let elapsed_ms = now.saturating_sub(s.flood_refilled_to_ms).as_millis();
+    let credited = elapsed_ms.saturating_mul(rate) / 1000;
+    // `credited * 1000 / rate <= elapsed_ms`, so the watermark never passes `now`.
+    let credited_ms = credited.saturating_mul(1000) / rate;
+    let tokens = (u64::from(s.flood_tokens) + credited).min(u64::from(flood.burst())) as u32;
+    s.flood_refilled_to_ms = s.flood_refilled_to_ms.saturating_add_millis(credited_ms);
     if tokens == 0 {
         return false;
     }
@@ -629,8 +640,8 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
     let command = msg.command.to_ascii_uppercase();
     let p = &msg.params;
 
-    // Command-flood throttle (opt-in). Keepalive is exempt; a depleted
-    // bucket closes the link loudly (Excess Flood), never silently drops.
+    // Command-flood throttle. Keepalive is exempt; a depleted bucket closes
+    // the link loudly (Excess Flood), never silently drops.
     if command != "PING" && command != "PONG" && !flood_ok(state, conn) {
         state.send(
             conn,
@@ -693,7 +704,7 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
         "PRIVMSG" => cmd_message(state, conn, msg, p, crate::core::MessageKind::Privmsg),
         "NOTICE" => cmd_message(state, conn, msg, p, crate::core::MessageKind::Notice),
         "TAGMSG" => cmd_tagmsg(state, conn, msg, p),
-        "TOPIC" => cmd_topic(state, conn, msg, p),
+        "TOPIC" => cmd_topic(state, conn, p),
         "NAMES" => cmd_names(state, conn, p),
         "MODE" => cmd_mode(state, conn, p),
         "WHO" => cmd_who(state, conn, p),
@@ -748,7 +759,13 @@ fn cmd_ping(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     let server = state.config.server_name.clone();
-    state.send(conn, &format!(":{server} PONG {server} :{token}"));
+    // The token is echoed behind a head the client never sent (`:server PONG
+    // server :`), so a maximal token must be fitted like every other relay of
+    // client text — an over-long PONG is discarded by the client's framing,
+    // and in debug builds panics the shared core worker.
+    let head = format!(":{server} PONG {server} :");
+    let token = fit_trailing(&head, token);
+    state.send(conn, &format!("{head}{token}"));
 }
 
 /// Deadline for an unregistered connection to complete registration.

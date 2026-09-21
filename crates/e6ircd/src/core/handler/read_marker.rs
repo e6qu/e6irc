@@ -31,10 +31,7 @@ pub(super) fn send_current_markread(
 ) {
     let account = state.sessions[&conn].account().map(str::to_owned);
     let ms = match &account {
-        Some(a) => state
-            .read_markers
-            .get(&(state.account_key(a), key.clone()))
-            .copied(),
+        Some(a) => state.read_marker(&(state.account_key(a), key.clone())),
         None => state.sessions[&conn].anon_read_markers.get(key).copied(),
     };
     let marker = ms
@@ -84,9 +81,7 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let key = state.chan_key(target);
     let server = state.config.server_name.clone();
     let marker_pending = account.as_ref().is_some_and(|account| {
-        state
-            .pending_read_markers
-            .contains_key(&(state.account_key(account), key.clone()))
+        state.read_marker_pending(&(state.account_key(account), key.clone()))
     });
     let output_held = state.sessions[&conn].deferred_replies > 0;
 
@@ -160,19 +155,11 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // and later queried as "alice" resolves to one entry, not two.
     let account_key = state.account_key(&account);
     let marker_key = (account_key.clone(), key.clone());
-    let is_new = !state.read_markers.contains_key(&marker_key)
-        && !state.pending_read_markers.contains_key(&marker_key);
-    let confirmed_count = state
-        .read_markers
-        .keys()
-        .filter(|(a, _)| a == &account_key)
-        .count();
-    let pending_only_count = state
-        .pending_read_markers
-        .keys()
-        .filter(|pending @ (a, _)| a == &account_key && !state.read_markers.contains_key(*pending))
-        .count();
-    if is_new && confirmed_count + pending_only_count >= MAX_READ_MARKERS_PER_ACCOUNT {
+    // The slot count is kept at every write, so the cap is a lookup here —
+    // never a scan of every account's markers on every command.
+    if !state.read_marker_slot_held(&marker_key)
+        && state.read_marker_slots(&account_key) >= MAX_READ_MARKERS_PER_ACCOUNT
+    {
         markread_fail(
             state,
             conn,
@@ -186,7 +173,7 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // no write. Everything else waits for PostgreSQL: mutating the hot mirror
     // and broadcasting first would make a queue/store failure look successful
     // until the next restart exposed the lost marker.
-    let existing = state.read_markers.get(&marker_key).copied();
+    let existing = state.read_marker(&marker_key);
     if !marker_pending
         && let Some(current) = existing
         && new_ms <= current
@@ -221,24 +208,14 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
 
-    *state.pending_read_markers.entry(marker_key).or_default() += 1;
+    state.reserve_read_marker(marker_key);
     state.defer_captured_reply(conn);
 }
 
 fn release_pending_marker(state: &mut ServerState, account: &str, target: &str) {
     let key = (state.account_key(account), state.chan_key(target));
-    match state.pending_read_markers.entry(key) {
-        std::collections::hash_map::Entry::Occupied(mut entry) if *entry.get() > 1 => {
-            *entry.get_mut() -= 1;
-        }
-        std::collections::hash_map::Entry::Occupied(entry) => {
-            entry.remove();
-        }
-        std::collections::hash_map::Entry::Vacant(_) => {
-            eprintln!(
-                "core: invariant violation: read-marker DB reply without a pending reservation"
-            );
-        }
+    if state.release_read_marker(&key).is_err() {
+        eprintln!("core: invariant violation: read-marker DB reply without a pending reservation");
     }
 }
 
@@ -254,8 +231,7 @@ pub(super) fn read_marker_stored(
     release_pending_marker(state, &account, &target);
     let marker_key = (state.account_key(&account), state.chan_key(&target));
     let moved_forward = state
-        .read_markers
-        .insert(marker_key, marker_ms)
+        .store_read_marker(marker_key, marker_ms)
         .is_none_or(|previous| marker_ms > previous);
     let server = state.config.server_name.clone();
     let line = format!(
@@ -297,13 +273,12 @@ pub(crate) fn apply_stored_marker(
 ) {
     let key = (state.account_key(account), state.chan_key(target));
     if state
-        .read_markers
-        .get(&key)
-        .is_some_and(|current| *current >= marker_ms)
+        .read_marker(&key)
+        .is_some_and(|current| current >= marker_ms)
     {
         return;
     }
-    state.read_markers.insert(key, marker_ms);
+    state.store_read_marker(key, marker_ms);
     let server = state.config.server_name.clone();
     let line = format!(
         ":{server} MARKREAD {} timestamp={}",
