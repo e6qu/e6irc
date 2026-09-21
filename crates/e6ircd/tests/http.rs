@@ -367,7 +367,10 @@ async fn an_idle_kept_alive_connection_is_not_logged_as_a_refusal() {
     let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_e6ircd"))
         .arg("--config")
         .arg(&config_path)
+        // Not `env_clear`: Windows sockets need `SystemRoot`. Only this
+        // daemon's own variables are kept out.
         .env_clear()
+        .envs(std::env::vars().filter(|(name, _)| !name.starts_with("E6IRC_")))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -400,7 +403,11 @@ async fn an_idle_kept_alive_connection_is_not_logged_as_a_refusal() {
     let started = std::time::Instant::now();
     while TcpStream::connect(http).await.is_err() {
         if let Some(status) = daemon.try_wait().expect("poll e6ircd") {
-            panic!("e6ircd exited before listening: {status}");
+            reader.join().expect("stderr reader");
+            panic!(
+                "e6ircd exited before listening: {status}\n{}",
+                lines.lock().expect("stderr lines").join("\n")
+            );
         }
         assert!(
             started.elapsed() < std::time::Duration::from_secs(20),
