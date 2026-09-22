@@ -187,10 +187,11 @@ current network and conversation selection.
 7. Inactive conversations retain both unread traffic and unread direct-mention
    counts, so attention-worthy traffic is distinguishable before switching.
 8. Errors from the driver or IRC server appear in the relevant status path.
-   **Server log**, beside the conversations, opens a bounded log containing
-   every exact safe inbound wire line, so state changes, numerics, service
-   replies, and parser presentation can be compared without leaving the
-   browser.
+   The **console**, the first entry in the conversations, holds the whole
+   exchange: every exact safe inbound wire line beside e6irc's own notices, so
+   state changes, numerics, service replies, and parser presentation can be
+   compared without leaving the browser. What is typed there is sent as the IRC
+   line itself, so a command can be issued by hand.
 
 **Visible failures and recovery.** A disconnected composer cannot display a
 false successful send. CR/LF/NUL input, an over-limit complete line, more than
@@ -232,9 +233,8 @@ chat.
 2. Reloading the application restores the selected theme. System mode follows
    the browser/operating-system color preference rather than freezing the
    color observed when it was selected.
-3. The Server log is off by default. Its one switch is in the sidebar, not in
-   this menu; enabling it exposes the wire form already present in the bounded
-   transcript and persists that typed preference.
+3. The console needs no switch: it is a conversation, always in the list, and
+   shows the wire form beside the readable one.
 4. Desktop notifications are off by default. Enabling them is an explicit
    action that requests browser permission at that moment, never on page load.
 5. With permission granted and notifications enabled, a hidden tab asks the

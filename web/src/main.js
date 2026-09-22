@@ -109,8 +109,6 @@ const alertsEl = el("alerts");
 const sidebarToggle = el("sidebar-toggle");
 const sidebarEl = el("sidebar");
 const settingsEl = el("settings");
-const rawOutputPanel = el("raw-output-panel");
-const rawOutputLines = el("raw-output-lines");
 const jumpLatestButton = el("jump-latest");
 const sendButton = composer.querySelector("button[type=submit]");
 const joinInput = el("join-input");
@@ -126,9 +124,10 @@ const MAX_LOADED_LINES = 1500;
 const MAX_BUFFERS = 200;
 const MAX_NICKS = 5000;
 const MAX_PENDING_SENDS = 64;
-const MAX_RAW_LINES = 1000;
 const SERVER = "*server*";
-const rawTape = [];
+/// What the server buffer is called on screen: it is where every line the
+/// network sends is shown and where a command can be typed by hand.
+const CONSOLE_NAME = "console";
 
 // ---- client settings (persisted in localStorage) -----------------------
 const loadedSettings = loadSettings(() => window.localStorage);
@@ -269,6 +268,10 @@ function acceptPendingSend(requestId) {
     } else if (!text.startsWith("/")) {
       addLine(buffer.display, "msg", buffer.kind, myNick, text);
     }
+  } else {
+    // Sent from the console: show the line that went out, so the console reads
+    // as the exchange it is.
+    addServer(`» ${text.startsWith("/raw ") ? text.slice(5) : text}`);
   }
   rememberSentText(text);
   return true;
@@ -512,7 +515,7 @@ function renderBufferList() {
     const archived = b.kind === "channel" && !b.joined;
     button.className = "buf" + (b.key === active ? " active" : "") + (archived ? " archived" : "");
     if (b.key === active) button.setAttribute("aria-current", "true");
-    const bufferName = b.key === SERVER ? "server" : b.display;
+    const bufferName = b.key === SERVER ? CONSOLE_NAME : b.display;
     const inactive = b.key !== active;
     const unreadLabel = b.unread > 0 && inactive
       ? `, ${b.unread} unread message${b.unread === 1 ? "" : "s"}`
@@ -610,39 +613,10 @@ function messageRow(line) {
   return row;
 }
 
-function rawOutputRow(wire) {
-  const row = document.createElement("li");
-  const code = document.createElement("code");
-  code.className = "raw-wire";
-  code.textContent = wire;
-  row.append(code);
-  return row;
-}
-
-function renderRawOutput() {
-  if (!rawOutputPanel || !rawOutputLines) return;
-  rawOutputPanel.hidden = !settings.rawOutput;
-  rawOutputLines.replaceChildren();
-  if (!settings.rawOutput) return;
-  for (const wire of rawTape) rawOutputLines.append(rawOutputRow(wire));
-  rawOutputLines.scrollTop = rawOutputLines.scrollHeight;
-}
-
-function recordRawOutput(wire) {
-  rawTape.push(wire);
-  if (rawTape.length > MAX_RAW_LINES) rawTape.shift();
-  if (!settings.rawOutput || !rawOutputLines) return;
-  rawOutputLines.append(rawOutputRow(wire));
-  while (rawOutputLines.children.length > MAX_RAW_LINES && rawOutputLines.firstChild) {
-    rawOutputLines.removeChild(rawOutputLines.firstChild);
-  }
-  rawOutputLines.scrollTop = rawOutputLines.scrollHeight;
-}
-
 function renderActive({ atLatest = true } = {}) {
   const b = buffers.get(active);
   routeNetworkEl.textContent = network || "";
-  bufnameEl.textContent = !b || b.key === SERVER ? "server" : b.display;
+  bufnameEl.textContent = !b || b.key === SERVER ? CONSOLE_NAME : b.display;
   buftopicEl.textContent = b ? b.topic : "";
   if (!b || b.kind === "server") {
     bufferActionEl.hidden = true;
@@ -793,6 +767,10 @@ function settleInitialView() {
 
 function setActive(name) {
   active = fold(name);
+  messageInput.placeholder =
+    fold(name) === SERVER
+      ? "IRC command, sent as typed — e.g. PRIVMSG NickServ :IDENTIFY account password"
+      : "message… (/help for IRC commands)";
   if (initialViewSettled) rememberOpenConversation();
   const b = buffers.get(active);
   if (b) {
@@ -1034,7 +1012,9 @@ function maybeNotify(b, line) {
 }
 
 function handleLine(raw) {
-  recordRawOutput(raw);
+  // The console is the whole exchange: every line the network sent, beside the
+  // ones typed here. Other buffers keep their readable rendering.
+  addLine(SERVER, "wire", "server", null, `« ${raw}`, null, raw);
   const m = parseIrc(raw);
   switch (m.command) {
     case "001":
@@ -1539,13 +1519,11 @@ composer.addEventListener("submit", (e) => {
   // The server maps correlated {id, target, message} requests (including
   // slash-commands) to one validated IRC line.
   const b = active !== SERVER ? buffers.get(active) : null;
-  // In the server buffer there is no target, so plain text would be sent as a
-  // raw IRC line and bounce back as "421 Unknown command". Require a /command
-  // (e.g. /join #chan) there instead of emitting a bogus line.
+  // The console has no target: what is typed there is the IRC line itself, so
+  // a command can be sent by hand (`PRIVMSG NickServ :IDENTIFY …`). `/name`
+  // still means the slash command everywhere.
   if (!b && !text.startsWith("/")) {
-    addServer("There is no conversation open to send that to — use a command here (for example /join #channel) or pick a conversation.");
-    messageInput.focus();
-    return;
+    text = `/raw ${text}`;
   }
   // A past channel is a transcript, not a membership: a PRIVMSG into it is
   // refused by the network (or, worse, delivered nowhere) while the composer
@@ -1694,6 +1672,18 @@ function renderNetworkList(networks, failure = null) {
       open.append(note);
     }
 
+    // Enabling is where the network is, not in a separate administration page:
+    // a disabled network cannot be opened, and this is the control that fixes
+    // that. It is the same PATCH the console sends.
+    const enabled = item.enabled !== false;
+    const power = document.createElement("button");
+    power.type = "button";
+    power.className = "network-power";
+    power.textContent = enabled ? "Disable" : "Enable";
+    power.title = `${power.textContent} ${item.name}`;
+    power.setAttribute("aria-label", `${power.textContent} ${item.name}`);
+    power.addEventListener("click", () => void setNetworkEnabled(item.name, !enabled, power));
+
     // The dialog speaks IRC: nickname, NickServ, server. A bridge's fields are
     // a token and room identifiers, which the console's per-type form owns.
     const irc = item.kind === "irc";
@@ -1709,8 +1699,32 @@ function renderNetworkList(networks, failure = null) {
       cog.href = `/console/networks/${encodeURIComponent(item.name)}`;
     }
 
-    row.append(open, cog);
+    row.append(open, power, cog);
     networksEl.append(row);
+  }
+}
+
+/// Enable or disable a network from the list, then reload it so the row and
+/// the open network agree with the server. The button says what happened; a
+/// refusal is shown, never swallowed.
+async function setNetworkEnabled(name, enabled, button) {
+  const was = button.textContent;
+  button.disabled = true;
+  button.textContent = enabled ? "Enabling…" : "Disabling…";
+  try {
+    await apiSend("PATCH", `/api/v1/me/networks/${encodeURIComponent(name)}`, { enabled });
+    clearAlert("network-unavailable");
+    addServer(`${name} ${enabled ? "enabled" : "disabled"}.`);
+    await refreshNetworkList();
+    if (enabled && network && fold(network) === fold(name)) window.location.reload();
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = was;
+    showAlert(
+      "network-power",
+      errorMessage(`${enabled ? "enable" : "disable"} ${name}`, error),
+      "error",
+    );
   }
 }
 
@@ -1869,7 +1883,10 @@ async function openNetworkDialog(name = null) {
   el("nf-preset-row").hidden = editing;
   el("nf-clear-row").hidden = !editing;
   el("nf-clear-server-password-row").hidden = !editing;
-  el("nf-advanced").open = false;
+  // Editing shows the whole connection: the server, TLS, and the names sent to
+  // it are what a person came here to change, and a closed section reads as
+  // "these settings do not exist".
+  el("nf-advanced").open = editing;
   el("nf-sasl-password-note").textContent = editing
     ? "Leave blank to keep the stored password. Stored encrypted; never shown again."
     : "Stored encrypted; never shown again once saved.";
@@ -2041,27 +2058,6 @@ for (const button of document.querySelectorAll("[data-reveal]")) {
 
 el("help-toggle")?.addEventListener("click", () => helpDialog?.showModal());
 el("help-close")?.addEventListener("click", () => helpDialog?.close());
-
-// The wire log is recorded whether or not it is on screen, so this only decides
-// visibility. Its one switch lives in the sidebar because it is consulted
-// precisely when a connection is misbehaving.
-const serverLogLink = el("server-log-link");
-function syncServerLogLink() {
-  if (!serverLogLink) return;
-  serverLogLink.setAttribute("aria-pressed", String(Boolean(settings.rawOutput)));
-  serverLogLink.classList.toggle("is-active", Boolean(settings.rawOutput));
-}
-if (serverLogLink) {
-  serverLogLink.addEventListener("click", () => {
-    settings.rawOutput = !settings.rawOutput;
-    persistSetting("rawOutput");
-    renderRawOutput();
-    syncServerLogLink();
-    if (settings.rawOutput) {
-      rawOutputPanel?.scrollIntoView({ block: "nearest" });
-    }
-  });
-}
 
 // What the message area shows when no network is open: nothing to pick from
 // here -- the sidebar is the list -- only what to do next.
@@ -2263,8 +2259,6 @@ function updateSettingsUI() {
       : "Desktop notifications: off";
     notifyBtn.setAttribute("aria-pressed", String(settings.notifications));
   }
-  syncServerLogLink();
-  renderRawOutput();
 }
 if (themeSelect) {
   themeSelect.addEventListener("change", () => {
@@ -2358,6 +2352,15 @@ async function boot() {
     }
   }
   renderNetworkList(networks, networkFailure);
+  // `?settings=1` opens this network's settings straight away, even when it is
+  // disabled or cannot run — that is exactly when they need changing. The
+  // console links here rather than carrying a second editor of its own.
+  if (network && params.get("settings") !== null) {
+    const url = new URL(window.location.href);
+    url.searchParams.delete("settings");
+    window.history.replaceState(null, "", url);
+    void openNetworkDialog(network);
+  }
   // A landing page that failed to load offers Retry instead; everywhere else
   // the list keeps following the server, including after a failed first read.
   if (network || !networkFailure) keepNetworkListCurrent();
@@ -2381,16 +2384,24 @@ async function boot() {
       return;
     }
     if (selected.enabled === false || selected.runtime == null) {
-      const reason =
-        selected.enabled === false
-          ? `${selected.name} is disabled.`
-          : `${selected.name} cannot run on this server.`;
+      const disabled = selected.enabled === false;
+      const reason = disabled
+        ? `${selected.name} is disabled.`
+        : `${selected.name} cannot run on this server.`;
       setStatus(`${selected.name} unavailable`, "error");
       showAlert(
         "network-unavailable",
-        `${reason} Enable or reconfigure it before opening chat.`,
+        `${reason} ${disabled ? "Enable it to open chat." : "Reconfigure it before opening chat."}`,
         "error",
-        { href: `/console/networks/${encodeURIComponent(selected.name)}`, label: "Open network" },
+        // Enabling is one action, taken here; a network that cannot run needs
+        // its settings instead.
+        disabled
+          ? {
+              label: `Enable ${selected.name}`,
+              onClick: (event) =>
+                void setNetworkEnabled(selected.name, true, event.currentTarget),
+            }
+          : { href: `/console/networks/${encodeURIComponent(selected.name)}`, label: "Open network" },
       );
       addServer(`${reason} The live socket was not opened.`);
       return;

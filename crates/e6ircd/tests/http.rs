@@ -2915,31 +2915,19 @@ async fn console_networks_page_lists_the_callers_networks() {
             "network detail retained the stored database projection {stored_value:?}: {detail}"
         );
     }
-    let editor_req = format!(
-        "GET /console/networks/libera/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
-    );
-    let (status, _, editor) = request(http, &editor_req).await;
-    assert_eq!(status, 200, "{editor}");
-    assert!(editor.contains("data-api-owner-network-editor"), "{editor}");
-    assert!(editor.contains("Loading network…"), "{editor}");
-    assert!(!editor.contains("irc.libera.chat:6697"), "{editor}");
-    let log_req = format!(
-        "GET /console/networks/libera/logs HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
-    );
-    let (status, _, log) = request(http, &log_req).await;
-    assert_eq!(status, 200, "{log}");
-    for needle in [
-        "data-api-network-log",
-        "data-network-name=\"libera\"",
-        "Network log",
-        "Loading network log…",
+    // The network's settings have one editor — the chat client's dialog — and
+    // the stored log is read on this page, so neither has a console page of
+    // its own any more.
+    for gone in [
+        "/console/networks/libera/edit",
+        "/console/networks/libera/logs",
     ] {
-        assert!(
-            log.contains(needle),
-            "network log missing {needle:?}: {log}"
+        let request_line = format!(
+            "GET {gone} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
         );
+        let (status, _, body) = request(http, &request_line).await;
+        assert_eq!(status, 404, "{gone} is still served: {body}");
     }
-    assert!(!log.contains("irc.libera.chat:6697"), "{log}");
     let operations_req = format!(
         "GET /api/v1/me/networks/libera/operations HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );

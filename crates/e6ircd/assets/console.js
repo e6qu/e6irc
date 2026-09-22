@@ -758,7 +758,35 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     }
     fragment.append(timeline);
     const backlog = element("section", "panel");
-    backlog.append(append(element("div", "panel-head"), append(element("div"), element("h2", "", "IRC transcript"), element("p", "", "The newest 100 stored IRC lines, oldest first, including NickServ replies and connection errors.")), element("span", "count", `${view.storage.lines} stored`)));
+    backlog.append(append(element("div", "panel-head"), append(element("div"), element("h2", "", "IRC transcript"), element("p", "", "The newest stored IRC lines, oldest first, including NickServ replies and connection errors.")), element("span", "count", `${view.storage.lines} stored`)));
+    // The live panel carries the newest hundred; the whole stored log is one
+    // click away, in the same node, so there is no second page for it.
+    if (view.storage.lines > 0) {
+      const whole = element("button", "", `Load the full log (${view.storage.lines} lines)`);
+      whole.type = "button";
+      whole.addEventListener("click", () => {
+        whole.disabled = true;
+        whole.textContent = "Loading…";
+        void (async () => {
+          try {
+            const stored_name = panel.dataset.networkName || "";
+            const result = await apiRead(`/api/v1/me/networks/${encodeURIComponent(stored_name)}/buffer?limit=1000`);
+            const stored = apiCollection(result, "lines");
+            if (!Array.isArray(stored)) throw new Error("the stored log response carried no lines");
+            const lines = panel.querySelector('.backlog[aria-label="Recent raw IRC backlog"]');
+            if (lines) {
+              fillLog(lines, stored, "");
+              lines.scrollTop = lines.scrollHeight;
+            }
+            whole.remove();
+          } catch (error) {
+            whole.disabled = false;
+            whole.textContent = `Load the full log (${error.message}) — try again`;
+          }
+        })();
+      });
+      backlog.querySelector(".panel-head")?.append(whole);
+    }
     if (view.recent_lines.length === 0) {
       backlog.append(element("p", "empty", "No IRC output has been stored for this network."));
     } else {
@@ -820,56 +848,6 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     }
   }
 
-  const renderNetworkLog = (panel, lines) => {
-    fillLog(logIn(panel, "Network log"), lines, "No log lines have been stored yet.");
-  };
-
-  const refreshNetworkLogNow = async (root, byPerson) => {
-    const panel = root.querySelector("#network-log-panel");
-    const statusLine = document.getElementById(root.dataset.refreshStatus);
-    const status = spokenStatus(statusLine, byPerson);
-    if (!(panel instanceof HTMLElement)) return;
-    panel.setAttribute("aria-busy", "true");
-    if (status) {
-      status.textContent = "Refreshing…";
-      status.classList.remove("refresh-error");
-    }
-    try {
-      const name = root.dataset.networkName;
-      if (!name) throw new Error("This network log has no resource ID. Return to networks and try again.");
-      const network = await apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`);
-      const title = root.querySelector("[data-network-log-title]");
-      if (title) title.textContent = `${network.name} log`;
-      const detail = root.querySelector("[data-network-log-detail]");
-      if (detail instanceof HTMLAnchorElement) detail.href = `/console/networks/${encodeURIComponent(network.name)}`;
-      const result = await apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}/buffer?limit=1000`);
-      renderNetworkLog(panel, apiCollection(result, "lines", "network log"));
-      if (status) status.textContent = "Live log refreshed.";
-    } catch (error) {
-      panel.replaceChildren(monitoringEmpty(`Network log failed (${error.message}). Use Refresh to retry.`));
-      if (statusLine) {
-        statusLine.textContent = `Live log refresh failed (${error.message}). Use Refresh to retry.`;
-        statusLine.classList.add("refresh-error");
-      }
-    } finally {
-      panel.removeAttribute("aria-busy");
-    }
-  };
-
-  for (const root of document.querySelectorAll("[data-api-network-log]")) {
-    const refresh = serializeRefresh(
-      (byPerson) => refreshNetworkLogNow(root, byPerson),
-      () => {
-        const status = document.getElementById(root.dataset.refreshStatus);
-        if (status) status.textContent = "Refresh queued.";
-      },
-    );
-    const panel = root.querySelector("[id$='-log-panel']");
-    if (!(panel instanceof HTMLElement)) throw new Error("This log page has no panel to refresh.");
-    panelRefreshers.set(panel, refresh);
-    void refresh();
-    scheduleBackgroundRefresh(panel, refresh, Number(root.dataset.refreshSeconds));
-  }
 
   const renderServerLog = (panel, entries) => {
     const lines = entries.map((entry) => `${new Date(entry.at_ms).toISOString()} — ${entry.component} — ${entry.severity}: ${entry.message}`);
@@ -2512,13 +2490,11 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     scheduleBackgroundRefresh(ownerNetworkRows, refreshOwnerNetworks, Number(ownerNetworkRows.dataset.refreshSeconds));
   }
 
-  let refreshOwnerNetworkEditor;
   let refreshOwnerBridgeEditor;
   let refreshOwnerNetworkDetail;
   let refreshIntegrations;
   const ownerNetworkPreflight = Symbol("owner-network-preflight");
   const ownerNetworkRefresher = (form) => {
-    if (form.closest("[data-api-owner-network-editor]")) return refreshOwnerNetworkEditor;
     if (form.closest("[data-api-owner-bridge-editor]")) return refreshOwnerBridgeEditor;
     if (form.closest("[data-api-owner-network-detail]")) return refreshOwnerNetworkDetail;
     if (form.closest("[data-api-integrations]")) return refreshIntegrations;
@@ -2677,7 +2653,17 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   // replaces its token. A stored IRC account whose box was emptied is refused
   // rather than sent as `keep`, because the box says the opposite of the body.
   const ownerCredentialAction = (form, fields) => {
-    if (fields.has("clear_sasl")) return { action: "remove" };
+    if (fields.has("clear_sasl")) {
+      // Typed credentials under a ticked Remove said two things at once; this
+      // used to answer "remove" and drop what was typed, reporting success.
+      if (String(fields.get("sasl_account") || "") || String(fields.get("sasl_password") || "")) {
+        throw Object.assign(
+          new Error("Remove is ticked, so the account and password boxes would be discarded. Clear them, or untick Remove to save what is typed."),
+          { field: "sasl_account" },
+        );
+      }
+      return { action: "remove" };
+    }
     const password = String(fields.get("sasl_password") || "");
     const account = optionalValue(String(fields.get("sasl_account") || ""));
     if (!account && !password) {
@@ -2784,40 +2770,6 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     void refreshIntegrations();
   }
 
-  const ownerNetworkEditor = document.querySelector("[data-api-owner-network-editor]");
-  if (ownerNetworkEditor instanceof HTMLElement) {
-    const name = ownerNetworkEditor.dataset.networkName || "";
-    const form = ownerNetworkEditor.querySelector("[data-api-owner-network-update]");
-    const showFailure = (error, retry) => {
-      if (!(ownerNetworkResult instanceof HTMLElement)) return;
-      ownerNetworkResult.replaceChildren(element("span", "", error instanceof Error ? error.message : "Network configuration failed to load."), retryButton(retry));
-      ownerNetworkResult.className = "banner-error";
-    };
-    if (form instanceof HTMLFormElement) preserveFormEdits(form);
-    const render = (network) => {
-      if (network.kind !== "irc") { window.location.replace("/console/networks"); return; }
-      if (ownerNetworkResult instanceof HTMLElement) { ownerNetworkResult.replaceChildren(); ownerNetworkResult.className = ""; }
-      hydrateTextInput(form, "addr", network.addr); hydrateTextInput(form, "nick", network.nick); hydrateTextInput(form, "username", network.username ?? ""); hydrateTextInput(form, "realname", network.realname ?? ""); hydrateTextInput(form, "autojoin", network.autojoin.join(", ")); hydrateTextInput(form, "sasl_account", network.sasl_account ?? "");
-      // What the account box held before editing, so emptying it is refused
-      // instead of being sent as `keep`.
-      form.dataset.storedSaslAccount = network.sasl_account ?? "";
-      hydrateCheckbox(form, "tls", network.tls);
-      form.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
-      const title = ownerNetworkEditor.querySelector("[data-network-editor-title]"); if (title) title.textContent = `Edit ${network.name}`;
-      form.hidden = false;
-    };
-    refreshOwnerNetworkEditor = async () => {
-      try {
-        render(await apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`));
-      } catch (error) {
-        showFailure(error, () => void refreshOwnerNetworkEditor());
-        return false;
-      }
-      return true;
-    };
-    if (!name || !(form instanceof HTMLFormElement)) setOwnerNetworkResult("This network editor has no resource ID. Return to the network directory and try again.", false); else void refreshOwnerNetworkEditor();
-  }
-
   const ownerBridgeEditor = document.querySelector("[data-api-owner-bridge-editor]");
   if (ownerBridgeEditor instanceof HTMLElement) {
     const name = ownerBridgeEditor.dataset.networkName || "";
@@ -2895,25 +2847,18 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const enabled = ownerNetworkDetail.querySelector("[data-network-enabled]"); if (enabled instanceof HTMLInputElement) enabled.value = String(!network.enabled);
       const toggleForm = ownerNetworkDetail.querySelector("[data-api-owner-network-toggle]"); if (toggleForm instanceof HTMLFormElement) toggleForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
       const deleteForm = ownerNetworkDetail.querySelector("[data-api-owner-network-delete]"); if (deleteForm instanceof HTMLFormElement) { deleteForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; deleteForm.dataset.confirm = `Remove network ${network.name}? Its live connection and stored backlog will be deleted.`; }
-      const edit = ownerNetworkDetail.querySelector("[data-network-edit]"); if (edit instanceof HTMLAnchorElement) { if (network.kind === "irc") { edit.href = `/console/networks/${encodeURIComponent(network.name)}/edit`; edit.hidden = false; } else if (ownerNetworkDetail.dataset.isAdmin === "true") { edit.href = `/console/integrations/${encodeURIComponent(network.name)}/edit`; edit.textContent = "Edit integration"; edit.hidden = false; } }
-      const logs = ownerNetworkDetail.querySelector("[data-network-logs]"); if (logs instanceof HTMLAnchorElement) logs.href = `/console/networks/${encodeURIComponent(network.name)}/logs`;
+      const edit = ownerNetworkDetail.querySelector("[data-network-edit]"); if (edit instanceof HTMLAnchorElement) { if (network.kind === "irc") { edit.href = `/?network=${encodeURIComponent(network.name)}&settings=1`; edit.textContent = "Edit settings"; edit.hidden = false; } else if (ownerNetworkDetail.dataset.isAdmin === "true") { edit.href = `/console/integrations/${encodeURIComponent(network.name)}/edit`; edit.textContent = "Edit integration"; edit.hidden = false; } }
       const accountSetup = ownerNetworkDetail.querySelector("[data-network-account-setup]");
       if (accountSetup instanceof HTMLElement) {
         accountSetup.hidden = network.kind !== "irc";
         const chat = accountSetup.querySelector("[data-network-chat]");
         if (chat instanceof HTMLAnchorElement) chat.href = `/?network=${encodeURIComponent(network.name)}`;
-        const account = accountSetup.querySelector('[name="sasl_account"]');
-        if (account instanceof HTMLInputElement && !account.value) account.value = network.sasl_account || network.nick;
-        // Saving into a disabled network also enables it (nothing would
-        // reconnect otherwise), so the control says so instead of doing it
-        // under a label that promises only a reconnect.
-        const saveLabel = network.enabled ? "Save and reconnect" : "Save credentials and enable";
-        const saveButton = accountSetup.querySelector("[data-network-account-save-button]");
-        if (saveButton) saveButton.textContent = saveLabel;
-        const saveName = accountSetup.querySelector("[data-network-account-save-name]");
-        if (saveName) saveName.textContent = saveLabel;
-        const saveNote = accountSetup.querySelector("[data-network-account-save-note]");
-        if (saveNote instanceof HTMLElement) saveNote.hidden = network.enabled;
+        // The credentials live in one editor; this page points at it rather
+        // than carrying a second form with rules of its own.
+        const settings = accountSetup.querySelector("[data-network-settings]");
+        if (settings instanceof HTMLAnchorElement) {
+          settings.href = `/?network=${encodeURIComponent(network.name)}&settings=1`;
+        }
         const warning = accountSetup.querySelector("[data-network-registration-warning]");
         if (warning instanceof HTMLElement) warning.hidden = !network.addr.toLowerCase().includes("libera.chat");
       }
@@ -2948,8 +2893,6 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const email = fieldValue(fields, "email");
       const password = fieldValue(fields, "password");
       if (!email || !password) { setOwnerNetworkResult("Enter an email address and NickServ password.", false); return; }
-      const savedPassword = ownerNetworkDetail.querySelector('[data-api-network-account-save] [name="sasl_password"]');
-      if (savedPassword instanceof HTMLInputElement) savedPassword.value = password;
       void accountCommand(register, { action: "register", email, password }, "NickServ REGISTER queued. Read the IRC transcript for the network's response, then check your email.");
     });
     const verify = ownerNetworkDetail.querySelector("[data-api-network-account-verify]");
@@ -2958,43 +2901,6 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const code = fieldValue(new FormData(verify), "code");
       if (!code) { setOwnerNetworkResult("Enter the verification code from the email.", false); return; }
       void accountCommand(verify, { action: "verify", code }, "NickServ VERIFY REGISTER queued. Confirm the result in the IRC transcript before saving the account and password.");
-    });
-    const save = ownerNetworkDetail.querySelector("[data-api-network-account-save]");
-    if (save instanceof HTMLFormElement) save.addEventListener("submit", (event) => {
-      event.preventDefault();
-      if (currentNetwork === null) { setOwnerNetworkResult("Network details are not loaded. Refresh and try again.", false); return; }
-      const fields = new FormData(save);
-      const account = fieldValue(fields, "sasl_account");
-      const password = fieldValue(fields, "sasl_password");
-      if (!account || !password) { setOwnerNetworkResult("Enter the NickServ account and password.", false); return; }
-      const body = {
-        addr: currentNetwork.addr,
-        tls: currentNetwork.tls,
-        nick: currentNetwork.nick,
-        username: currentNetwork.username,
-        realname: currentNetwork.realname,
-        autojoin: currentNetwork.autojoin,
-        credentials: { action: "set", account, password },
-        server_password: { action: "keep" },
-      };
-      const url = `/api/v1/me/networks/${encodeURIComponent(name)}`;
-      const enabling = !currentNetwork.enabled;
-      void runFormSubmission(save, async () => {
-        try {
-          await apiRequest(save, apiMutation("PUT", url), body);
-          if (enabling) {
-            await apiRequest(save, apiMutation("PATCH", url), { enabled: true });
-          }
-          const registrationPassword = ownerNetworkDetail.querySelector('[data-api-network-account-register] [name="password"]');
-          if (registrationPassword instanceof HTMLInputElement) registrationPassword.value = "";
-          const savedPassword = save.querySelector('[name="sasl_password"]');
-          if (savedPassword instanceof HTMLInputElement) savedPassword.value = "";
-          await refreshOwnerNetworkDetail();
-          setOwnerNetworkResult(enabling ? "NickServ account saved and the network enabled. It is connecting with it." : "NickServ account saved. The network is reconnecting with it.", true);
-        } catch (error) {
-          setOwnerNetworkResult(error instanceof Error ? error.message : "NickServ account update failed.", false);
-        }
-      });
     });
     if (!name) showFailure(new Error("This network page has no resource ID. Return to the network directory and try again."), () => void refreshOwnerNetworkDetail()); else void refreshOwnerNetworkDetail();
   }

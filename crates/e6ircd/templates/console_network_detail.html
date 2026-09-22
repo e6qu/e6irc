@@ -11,7 +11,6 @@
       </div>
       <div class="page-actions" data-network-actions hidden>
         <button type="button" data-refresh-target="#network-operations">Refresh</button>
-        <a class="button-link secondary-link" data-network-logs>Network log</a>
         <a class="button-link secondary-link" data-network-edit hidden>Edit configuration</a>
         <form method="post" data-api-owner-network-toggle>
           <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
@@ -43,20 +42,12 @@
         </div>
         <a class="button-link secondary-link" data-network-chat>Open IRC client</a>
       </div>
-      <form class="network-form" method="post" data-api-network-account-save>
-        <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-        <label class="field"><span>NickServ account</span><input name="sasl_account" autocomplete="off" maxlength="255" required /></label>
-        <label class="field"><span>NickServ password</span><input type="password" name="sasl_password" autocomplete="new-password" maxlength="512" required /></label>
-        <div class="form-actions field-wide">
-          <button class="primary" type="submit" data-network-account-save-button>Save and reconnect</button>
-          <small class="section-note" data-network-account-save-note hidden>This network is disabled. Saving enables it, so it connects with these credentials.</small>
-        </div>
-      </form>
+      <p class="section-note">The account and password are stored in this network's settings, which is the one place they are edited: <a data-network-settings>open its settings</a>. An empty password box there keeps the stored one.</p>
       <details class="advanced account-registration" data-network-account-registration>
         <summary>Register a new NickServ account</summary>
         <p class="section-note">Each step sends a standard message to NickServ. Its replies appear in the IRC transcript below, and the same commands work from chat with <code>/msg NickServ …</code>.</p>
         <div class="banner-info" data-network-registration-warning hidden>
-          <div><strong>Libera Chat refuses account creation from some hosting-provider addresses.</strong> If its reply says a verified account is required, do steps 1 and 2 from another IRC connection, then save the account and password above.</div>
+          <div><strong>Libera Chat refuses account creation from some hosting-provider addresses.</strong> If its reply says a verified account is required, do steps 1 and 2 from another IRC connection, then save the account and password in this network's settings.</div>
           <a class="button-link" href="https://libera.chat/guides/sasl" target="_blank" rel="noopener noreferrer">Libera SASL guide</a>
         </div>
         <div class="account-setup-steps">

@@ -63,9 +63,9 @@ export function networkStateHelp(network) {
   if (network.connected === true) return null;
   // The network's own words are the most useful thing on the row: "SASL access
   // only" or "Trying to reconnect too fast" says what no classification can.
-  // Without them the advice points at the Server log, where they would be.
+  // Without them the advice points at the console, where they would be.
   const said = network.failureDetail ? `The network said: “${network.failureDetail}”` : null;
-  const repair = stateRepair(network, said ? "" : " Open Server log for its reason.");
+  const repair = stateRepair(network, said ? "" : " Open the console for its reason.");
   // A refusal with no specific repair (a throttle, a ban) still has the
   // network's own words, and they are the whole point.
   if (repair === null) return said;

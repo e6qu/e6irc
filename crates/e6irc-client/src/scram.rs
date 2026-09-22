@@ -176,6 +176,12 @@ impl ScramClient {
         self,
         server_first: &str,
     ) -> Result<(String, ScramAwaitingSignature), ScramError> {
+        // A server that refuses before any proof says so here: Libera answers
+        // `e=other-error` for an account whose stored password cannot do SCRAM,
+        // though it advertises the mechanism.
+        if let Some(error) = server_first.strip_prefix("e=") {
+            return Err(ScramError::ServerError(error.to_owned()));
+        }
         let malformed = || ScramError::MalformedServerFirst(server_first.to_owned());
         let mut attributes = server_first.split(',');
         let nonce = attributes
@@ -346,6 +352,19 @@ mod tests {
             start().client_final("s=c2FsdA==,r=abcdef,i=4096"),
             Err(ScramError::MalformedServerFirst(_))
         ));
+    }
+
+    /// Libera answers the client's first message with `e=other-error` when the
+    /// account cannot do SCRAM. That is the server refusing before any proof,
+    /// not a malformed message.
+    #[test]
+    fn a_server_error_in_place_of_the_first_message_is_reported_as_one() {
+        let client =
+            ScramClient::with_nonce(ScramHash::Sha512, "user", "pencil", "abc").expect("prepared");
+        assert_eq!(
+            client.client_final("e=other-error").err(),
+            Some(ScramError::ServerError("other-error".into()))
+        );
     }
 
     #[test]

@@ -372,6 +372,10 @@ body {
 .line-event .from, .line-server .from { display: none; }
 .line-event .text, .line-server .text { grid-column: 2 / -1; }
 .line-server { color: var(--muted); }
+/* The console's raw exchange: every line as it went over the wire. */
+.line-wire { color: var(--muted); font: 0.72rem/1.45 var(--font-mono); }
+.line-wire .from { display: none; }
+.line-wire .text { grid-column: 2 / -1; overflow-wrap: anywhere; white-space: pre-wrap; }
 #raw-output-panel { flex: 0 0 min(15rem, 32vh); min-height: 8rem; border-top: 2px solid var(--accent); background: #080d19; color: #bfdbfe; }
 .raw-output-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; padding: 0.4rem 0.75rem; border-bottom: 1px solid #1e293b; color: #94a3b8; font-size: 0.72rem; }
 .raw-output-head strong { color: #f8fafc; font: 700 0.76rem/1.4 var(--font-mono); letter-spacing: 0.04em; text-transform: uppercase; }
@@ -593,6 +597,9 @@ body {
 }
 .network-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .network-state { color: inherit; opacity: 0.75; font: 0.65rem/1 var(--font-mono); }
+.network-power { flex: none; border: 1px solid currentColor; background: transparent; color: inherit; border-radius: 6px; padding: 0.15rem 0.45rem; font-size: 0.72rem; cursor: pointer; }
+.network-power:hover:not(:disabled) { background: var(--chrome-raised); }
+.network-power:disabled { opacity: 0.6; cursor: progress; }
 .network-cog {
   border: 0;
   background: transparent;

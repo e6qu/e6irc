@@ -636,7 +636,12 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     ends.begin_irc_session(identity.nick.clone());
     ends.emit(ConnectionEvent::Connected);
     // The mechanism is the client's choice among what the network offered, so
-    // the owner is told which one carried the password.
+    // the owner is told which one carried the password — and which ones the
+    // network refused before any credential was sent, so a weaker one that is
+    // used instead is never a silent choice.
+    for note in conn.sasl_notes() {
+        ends.emit_line(format!(":*bnc* NOTICE * :upstream SASL: {note}"));
+    }
     if let (Some(mechanism), Some((account, _))) = (conn.sasl_mechanism(), &config.sasl) {
         ends.emit_line(format!(
             ":*bnc* NOTICE * :upstream logged in as {account} with SASL {mechanism}"

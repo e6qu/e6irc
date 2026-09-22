@@ -195,6 +195,9 @@ pub struct Connection {
     server_password_sent: ServerPasswordSent,
     /// The SASL mechanism the server's 903 confirmed, once it has.
     authenticated_with: Option<String>,
+    /// Mechanisms the server refused before any credential, and what was
+    /// offered instead.
+    sasl_notes: Vec<String>,
     /// Whether a credential may be written to this connection, decided by how
     /// it was built ([`Transport`]).
     transport: Transport,
@@ -388,6 +391,10 @@ const CAP_DISCOVERY_DEADLINE: std::time::Duration = std::time::Duration::from_se
 /// server sent before leaving. Everything it sent is already buffered or in
 /// flight on a closed connection, so this bounds only a peer that half-closed.
 const PEER_GONE_READ: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long the server has to acknowledge an abandoned SASL mechanism before
+/// the next one is offered.
+const SASL_ABORT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The server's answer to one `CAP REQ`.
 #[derive(Debug, PartialEq, Eq)]
@@ -1040,6 +1047,7 @@ impl Connection {
             advertised: AdvertisedCapabilities::default(),
             server_password_sent: ServerPasswordSent::No,
             authenticated_with: None,
+            sasl_notes: Vec::new(),
         }
     }
 
@@ -1576,22 +1584,97 @@ impl Connection {
             mechanism = learned;
             self.offer_mechanism(mechanism.name()).await?;
         }
-        let name = mechanism.name();
         self.send_registration_identity(identity).await?;
-        match mechanism {
-            PasswordMechanism::Plain => {
-                let mut bytes = vec![0u8];
-                bytes.extend_from_slice(account.as_bytes());
-                bytes.push(0);
-                bytes.extend_from_slice(password.as_bytes());
-                self.send_sasl_payload(&e6irc_proto::base64::encode(&bytes))
-                    .await?;
+        // A network may advertise a mechanism it cannot use for this account:
+        // Libera answers SCRAM's first message with `e=other-error` when the
+        // account's stored password predates SCRAM. That refusal arrives before
+        // any credential is sent, so the next mechanism is offered on the same
+        // connection — loudly (`sasl_notes`), and never after a verdict on the
+        // password itself.
+        let mut weaker = PasswordMechanism::STRONGEST_FIRST
+            .into_iter()
+            .skip_while(|candidate| *candidate != mechanism)
+            .skip(1)
+            .filter(|candidate| {
+                self.advertised
+                    .sasl_mechanism_offered(&[candidate.name()])
+                    .is_ok()
+            })
+            .collect::<Vec<_>>()
+            .into_iter();
+        loop {
+            let name = mechanism.name();
+            let refused = match mechanism {
+                PasswordMechanism::Plain => {
+                    let mut bytes = vec![0u8];
+                    bytes.extend_from_slice(account.as_bytes());
+                    bytes.push(0);
+                    bytes.extend_from_slice(password.as_bytes());
+                    self.send_sasl_payload(&e6irc_proto::base64::encode(&bytes))
+                        .await?;
+                    None
+                }
+                PasswordMechanism::Scram(hash) => {
+                    self.scram_exchange(hash, account, password).await?
+                }
+            };
+            let Some(reason) = refused else {
+                return self.finish_sasl_then_welcome(identity.nick, name).await;
+            };
+            let Some(next) = weaker.next() else {
+                return Err(SaslRejection::new(
+                    SaslFailure::Protocol,
+                    &format!("{name}: {reason}; no other mechanism this client speaks is offered"),
+                )
+                .into_error());
+            };
+            self.sasl_notes.push(format!(
+                "{name} was refused before any credential was sent ({reason}); offering {}",
+                next.name()
+            ));
+            self.abort_sasl().await?;
+            mechanism = next;
+            self.offer_mechanism(mechanism.name()).await?;
+        }
+    }
+
+    /// Abandon the mechanism in progress and consume the server's verdict on
+    /// it, so the next `AUTHENTICATE` starts from a settled exchange. The 904
+    /// that precedes the abort acknowledgement is the refused mechanism's, not
+    /// a verdict on any credential: nothing was sent.
+    async fn abort_sasl(&mut self) -> io::Result<()> {
+        self.send_line("AUTHENTICATE *").await?;
+        let settled_by = tokio::time::Instant::now() + SASL_ABORT_DEADLINE;
+        loop {
+            let msg =
+                match tokio::time::timeout_at(settled_by, self.recv("closed during SASL")).await {
+                    Ok(msg) => msg?,
+                    Err(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "the server did not answer the SASL abort",
+                        ));
+                    }
+                };
+            if let Some(err) = self.registration_refused(&msg) {
+                return Err(err);
             }
-            PasswordMechanism::Scram(hash) => {
-                self.scram_exchange(hash, account, password).await?;
+            match msg.command.as_str() {
+                // 906 acknowledges the abort; 904 is the abandoned mechanism's.
+                "906" => return Ok(()),
+                "904" => {}
+                _ => {
+                    self.answer_ping(&msg).await?;
+                }
             }
         }
-        self.finish_sasl_then_welcome(identity.nick, name).await
+    }
+
+    /// What this connection did on the way to authenticating that its owner
+    /// should see: a mechanism the server refused before any credential, and
+    /// the one offered instead.
+    pub fn sasl_notes(&self) -> &[String] {
+        &self.sasl_notes
     }
 
     /// Offer `mechanism` and wait for the server's empty initial challenge.
@@ -1601,13 +1684,14 @@ impl Connection {
     }
 
     /// The SCRAM messages after the empty initial challenge, up to the empty
-    /// response that follows a verified server signature.
+    /// response that follows a verified server signature. `Some(reason)` is the
+    /// server refusing the mechanism before any proof was sent.
     async fn scram_exchange(
         &mut self,
         hash: scram::ScramHash,
         account: &str,
         password: &str,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<String>> {
         let name = hash.mechanism();
         let failed = |error: scram::ScramError| {
             SaslRejection::new(SaslFailure::Protocol, &error.to_string()).into_error()
@@ -1623,7 +1707,12 @@ impl Connection {
                 "not UTF-8".to_owned(),
             ))
         })?;
-        let (client_final, awaiting) = client.client_final(server_first).map_err(failed)?;
+        let (client_final, awaiting) = match client.client_final(server_first) {
+            Ok(exchange) => exchange,
+            // The server refused the mechanism itself; no proof was sent.
+            Err(scram::ScramError::ServerError(reason)) => return Ok(Some(reason)),
+            Err(error) => return Err(failed(error)),
+        };
         self.send_sasl_payload(&e6irc_proto::base64::encode(client_final.as_bytes()))
             .await?;
         let server_final = self.read_sasl_challenge(name).await?;
@@ -1633,7 +1722,8 @@ impl Connection {
             ))
         })?;
         awaiting.verify(server_final).map_err(failed)?;
-        self.send_line("AUTHENTICATE +").await
+        self.send_line("AUTHENTICATE +").await?;
+        Ok(None)
     }
 
     /// The SASL mechanism that authenticated this connection, once it has.
@@ -2896,11 +2986,13 @@ mod tests {
     /// sends.
     enum Step {
         Expect(&'static str),
+        /// A line whose tail the test cannot predict (a random SCRAM nonce).
+        ExpectStart(&'static str),
         Send(&'static str),
         /// The server says nothing for this long (paused-clock tests).
         Pause(std::time::Duration),
     }
-    use Step::{Expect, Pause, Send};
+    use Step::{Expect, ExpectStart, Pause, Send};
 
     /// A client wired to a server that plays `steps`, then reads to end of
     /// stream and yields every line the client sent that no step expected.
@@ -2918,6 +3010,13 @@ mod tests {
                         Some(line),
                         "the client's next line"
                     ),
+                    ExpectStart(prefix) => {
+                        let line = lines.next_line().await.unwrap().unwrap_or_default();
+                        assert!(
+                            line.starts_with(prefix),
+                            "the client's next line {line:?} does not start with {prefix:?}"
+                        );
+                    }
                     Send(line) => writer
                         .write_all(format!("{line}\r\n").as_bytes())
                         .await
@@ -3215,6 +3314,84 @@ mod tests {
             after.push(line);
         }
         after
+    }
+
+    /// Libera advertises SCRAM-SHA-512 for every connection, but answers the
+    /// client's first message with `e=other-error` when the account's stored
+    /// password cannot do SCRAM. Nothing was sent yet, so the next mechanism is
+    /// offered on the same connection and the owner is told.
+    #[tokio::test]
+    async fn a_mechanism_refused_before_any_credential_falls_back_and_says_so() {
+        let (mut connection, server) = scripted(vec![
+            Expect("CAP LS 302"),
+            Send(":srv CAP * LS :sasl=EXTERNAL,PLAIN,SCRAM-SHA-512"),
+            Expect("CAP REQ :sasl"),
+            Send(":srv CAP * ACK :sasl"),
+            Expect("AUTHENTICATE SCRAM-SHA-512"),
+            Send("AUTHENTICATE +"),
+            Expect("NICK nick"),
+            Expect("USER ident 0 * :real"),
+            // The client's first message carries a random nonce.
+            ExpectStart("AUTHENTICATE "),
+            Send("AUTHENTICATE ZT1vdGhlci1lcnJvcg=="),
+            Expect("AUTHENTICATE *"),
+            Send(":srv 904 * :SASL authentication failed"),
+            Send(":srv 906 * :SASL authentication aborted"),
+            Expect("AUTHENTICATE PLAIN"),
+            Send("AUTHENTICATE +"),
+            Expect("AUTHENTICATE AHVzZXIAcGVuY2ls"),
+            Send(":srv 903 nick :SASL authentication successful"),
+            Expect("CAP END"),
+            Send(":srv 001 nick :Welcome"),
+        ]);
+        assert_eq!(
+            connection
+                .register_sasl(&TEST_IDENTITY, "user", "pencil")
+                .await
+                .expect("the weaker mechanism authenticates"),
+            "nick"
+        );
+        assert_eq!(connection.sasl_mechanism(), Some("PLAIN"));
+        assert_eq!(
+            connection.sasl_notes(),
+            [
+                "SCRAM-SHA-512 was refused before any credential was sent (other-error); offering PLAIN"
+            ]
+        );
+        drop(connection);
+        assert_eq!(server.await.unwrap(), Vec::<String>::new());
+    }
+
+    /// With nothing weaker offered, the refusal is the failure: there is
+    /// nothing to fall back to, and it is not a verdict on the password.
+    #[tokio::test]
+    async fn a_refused_mechanism_with_no_alternative_fails_loudly() {
+        let (mut connection, server) = scripted(vec![
+            Expect("CAP LS 302"),
+            Send(":srv CAP * LS :sasl=SCRAM-SHA-512"),
+            Expect("CAP REQ :sasl"),
+            Send(":srv CAP * ACK :sasl"),
+            Expect("AUTHENTICATE SCRAM-SHA-512"),
+            Send("AUTHENTICATE +"),
+            Expect("NICK nick"),
+            Expect("USER ident 0 * :real"),
+            ExpectStart("AUTHENTICATE "),
+            Send("AUTHENTICATE ZT1vdGhlci1lcnJvcg=="),
+        ]);
+        let error = connection
+            .register_sasl(&TEST_IDENTITY, "user", "pencil")
+            .await
+            .expect_err("nothing else is offered");
+        let rejection = SaslRejection::from_error(&error).expect("typed SASL rejection");
+        assert_eq!(rejection.failure(), SaslFailure::Protocol);
+        assert!(
+            rejection.diagnostic().contains("other-error")
+                && rejection.diagnostic().contains("no other mechanism"),
+            "{}",
+            rejection.diagnostic()
+        );
+        drop(connection);
+        assert_eq!(server.await.unwrap(), Vec::<String>::new());
     }
 
     /// Libera offers ECDSA, EXTERNAL, PLAIN and SCRAM-SHA-512: a password
