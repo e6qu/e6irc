@@ -841,6 +841,23 @@ async fn driver_authenticates_to_sasl_upstream() {
     });
     let mut events = handle.subscribe();
     wait_connected(&handle, &mut events).await;
+    // The mechanism is chosen, not configured, so the owner is told which one
+    // carried the password: e6ircd offers PLAIN and OAUTHBEARER, and PLAIN is
+    // the password mechanism among them.
+    let told = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(e6ircd::bouncer::DriverEvent::Line(line)) = events.recv().await
+                && line.line.contains("logged in as bncacct with SASL PLAIN")
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        told.is_ok(),
+        "the driver never said which mechanism logged in"
+    );
 
     // Connected implies SASL success (register_sasl errors on 904, so
     // 001 only follows successful AUTHENTICATE). Confirm the upstream
@@ -2536,7 +2553,7 @@ async fn an_upstream_without_the_sasl_mechanism_is_not_a_credential_rejection() 
             let mut session = fake_accept(&listener).await;
             assert_eq!(session.read_line().await, "CAP LS 302");
             session
-                .send(":up CAP * LS :sasl=EXTERNAL,SCRAM-SHA-256 server-time")
+                .send(":up CAP * LS :sasl=EXTERNAL,ECDSA-NIST256P-CHALLENGE server-time")
                 .await;
             assert_eq!(
                 session.read_line().await,
@@ -2578,7 +2595,9 @@ async fn an_upstream_without_the_sasl_mechanism_is_not_a_credential_rejection() 
     );
     assert_eq!(
         snapshot.last_error_diagnostic.as_deref(),
-        Some("requested PLAIN; the server offers EXTERNAL,SCRAM-SHA-256"),
+        Some(
+            "requested one of SCRAM-SHA-512, SCRAM-SHA-256, PLAIN; the server offers EXTERNAL,ECDSA-NIST256P-CHALLENGE"
+        ),
         "{snapshot:?}"
     );
 }

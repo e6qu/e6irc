@@ -213,7 +213,8 @@ created from a different accepted connection.
    `PRIVMSG NickServ :VERIFY REGISTER nick code`.
 4. Confirm NickServ's success in the transcript, then save the account and
    password. The normal network replacement path seals the password and
-   reconnects with SASL PLAIN.
+   reconnects with SASL, using the strongest mechanism the network offers
+   (SCRAM-SHA-512 on Libera) and saying which one logged in.
 5. An attached IRC client may perform the same exchange with normal
    `/msg NickServ ...` commands; the guided forms are not a separate protocol.
 

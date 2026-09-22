@@ -1608,14 +1608,18 @@ fn operations() -> serde_json::Value {
                             "content": { "application/json": { "schema": {
                                 "type": "object",
                                 "additionalProperties": false,
-                                "required": ["ok", "resolved_addresses", "dns_ms", "connect_ms", "registration_ms", "confirmed_nick"],
+                                "required": ["ok", "resolved_addresses", "dns_ms", "connect_ms", "registration_ms", "confirmed_nick", "sasl_mechanism"],
                                 "properties": {
                                     "ok": { "const": true },
                                     "resolved_addresses": { "type": "integer", "minimum": 1 },
                                     "dns_ms": { "type": "integer", "format": "int64", "minimum": 0 },
                                     "connect_ms": { "type": "integer", "format": "int64", "minimum": 0 },
                                     "registration_ms": { "type": "integer", "format": "int64", "minimum": 0 },
-                                    "confirmed_nick": { "type": "string", "minLength": 1, "maxLength": 64 }
+                                    "confirmed_nick": { "type": "string", "minLength": 1, "maxLength": 64 },
+                                    "sasl_mechanism": {
+                                        "description": "the SASL mechanism that logged in, the strongest the network offered for the configured password; null when no account is configured",
+                                        "enum": ["SCRAM-SHA-512", "SCRAM-SHA-256", "PLAIN", null]
+                                    }
                                 }
                             } } }
                         },

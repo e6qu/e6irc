@@ -9,7 +9,7 @@ claim.
 | Generic IRC client | RFC 1459 registration, channels, direct messages, services, and common modes | It can use any advertised IRCv3 capability that it implements | Core, socket, irctest, property, and fuzz suites |
 | IRCv3 client or bot | Same baseline | Negotiates the server's `CAP LS` surface; unsupported requests receive `NAK` | Core capability and Libera-snapshot tests |
 | BNC attach client | SASL PLAIN plus `NICK` and `USER` | `server-time`, `message-tags`, `account-tag`, `echo-message`, `batch`, `draft/chathistory`, and `draft/read-marker` | PostgreSQL listener and attach journeys |
-| `e6irc` CLI | Anonymous, SASL PLAIN, or OAUTHBEARER | `send` requires `echo-message` to confirm delivery; `history` requires `batch draft/chathistory server-time` | Socket, API, executable, and PostgreSQL journeys |
+| `e6irc` CLI | Anonymous, SASL password (SCRAM-SHA-512/256 or PLAIN, strongest offered), or OAUTHBEARER | `send` requires `echo-message` to confirm delivery; `history` requires `batch draft/chathistory server-time` | Socket, API, executable, and PostgreSQL journeys |
 | `e6irc-tui` | Same authentication paths as the CLI | Requires `batch draft/chathistory server-time`; requires `draft/read-marker` unless disabled | Duplex, fuzz, and pseudo-terminal journeys |
 | Web chat | Browser session and `/api/v1` | REST history and `/ws/ui`; it does not depend on IRC `CAP` | Three-engine browser and API-contract journeys |
 

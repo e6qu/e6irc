@@ -1833,8 +1833,17 @@ upstream's.
   reconnect-flood lever on the shared daemon. Past the bound the session ends
   as `channel_limit_exceeded`; a confirmed name e6irc cannot track is announced
   live and not rejoined. A process restart falls back to the configured
-  autojoin, which is the operator-declared floor. Upstream SASL PLAIN uses
-  credentials stored encrypted (§15). A network may also carry a server
+  autojoin, which is the operator-declared floor. Upstream SASL uses
+  credentials stored encrypted (§15) with the strongest password mechanism the
+  network offers — SCRAM-SHA-512, then SCRAM-SHA-256 (RFC 5802/7677, the
+  server's signature verified in constant time), then PLAIN — and says which one
+  logged in (a `:*bnc*` notice after connecting; `sasl_mechanism` in the
+  connection-test result). A server that names no mechanisms is offered PLAIN;
+  when its 908 then names a stronger one this client speaks, that one is
+  offered once on the same connection. A failed SCRAM (a 904 on the proof, a
+  forged or malformed server message, a credential SASLprep cannot carry) is
+  never retried as PLAIN: that would hand the password to the server that just
+  failed to prove itself. SCRAM's iteration count is bounded at 1,000,000. A network may also carry a server
   password — the `PASS` a private server requires before `CAP LS`, `NICK` and
   `USER`; the driver and the connection test send it as the first line
   through the one `register()`. It is a `ServerPassword` (at most 504 bytes,
@@ -2458,7 +2467,7 @@ not stops the command with a request for `--username` and is never shortened or
 rewritten to fit.
 
 A secret never has to be typed where the process list and the shell history
-can see it. Each one — the SASL PLAIN password, the SASL OAUTHBEARER token, the
+can see it. Each one — the SASL password, the SASL OAUTHBEARER token, the
 `api` bearer token — comes from exactly one of a file (`--password-file`,
 `--oauth-token-file`, `api --bearer-token-file`), the environment
 (`E6IRC_PASSWORD`, `E6IRC_OAUTH_TOKEN`, `E6IRC_API_TOKEN`), or the command-line
@@ -2513,7 +2522,8 @@ can use the same cache for SASL OAUTHBEARER with `--oauth-from-cache`.
 ### 14.2 `e6irc-tui`
 
 The shipped ratatui client uses one owned `e6irc-client::ConnectionOptions`
-request for plaintext/public-CA TLS and anonymous, SASL PLAIN, or SASL
+request for plaintext/public-CA TLS and anonymous, SASL password (the
+strongest of SCRAM-SHA-512, SCRAM-SHA-256 and PLAIN the server offers), or SASL
 OAUTHBEARER registration. An `account/network` SASL account selects an owned
 BNC network. It has bounded channel/query buffers, Alt-Left/Right, Alt-b/f
 (macOS Option-arrows arrive as ESC b/f) and Ctrl-P/N switching (other Alt/Ctrl

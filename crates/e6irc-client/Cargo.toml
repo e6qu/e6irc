@@ -17,6 +17,12 @@ tokio = { version = "1.53.0", default-features = false, features = [
     "time",
     "macros",
 ] }
+# aws-lc-rs 1.18.1 is already in the tree as rustls's provider; named here
+# for SCRAM's HMAC, digest, PBKDF2, random nonce and constant-time compare.
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys"] }
+# stringprep 0.1.5 is already in the tree through sqlx; SCRAM requires
+# SASLprep of the account name and password (RFC 5802 §5.1).
+stringprep = { version = "0.1.5", default-features = false }
 rustls = { version = "0.23.45", default-features = false, features = [
     "aws_lc_rs",
     "tls12",

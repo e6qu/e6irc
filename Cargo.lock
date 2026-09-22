@@ -853,11 +853,13 @@ dependencies = [
 name = "e6irc-client"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "e6irc-proto",
  "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "stringprep",
  "tokio",
  "tokio-rustls",
  "webpki-roots 1.0.9",

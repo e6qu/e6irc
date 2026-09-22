@@ -98,16 +98,17 @@ struct Cli {
     /// and asks for --username.
     #[arg(long, short, global = true)]
     username: Option<String>,
-    /// SASL PLAIN account. Its password comes from --password-file, the
+    /// SASL account (the strongest of SCRAM-SHA-512, SCRAM-SHA-256 and PLAIN
+    /// the server offers). Its password comes from --password-file, the
     /// E6IRC_PASSWORD environment variable, or --password.
     #[arg(long, global = true)]
     account: Option<String>,
-    /// SASL PLAIN password. A value typed here is visible to every local user
+    /// SASL password. A value typed here is visible to every local user
     /// in the process list and is kept by the shell's history: prefer
     /// --password-file or E6IRC_PASSWORD.
     #[arg(long, global = true, conflicts_with = "password_file")]
     password: Option<String>,
-    /// File holding the SASL PLAIN password (one trailing line break is
+    /// File holding the SASL password (one trailing line break is
     /// dropped). Refused if group or other users can read it.
     #[arg(long, global = true)]
     password_file: Option<PathBuf>,

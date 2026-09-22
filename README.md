@@ -30,7 +30,8 @@ surface. See the [client capability matrix](docs/client-capabilities.md).
 
 ## Highlights
 
-- **IRCv3**: SASL (PLAIN + OAUTHBEARER), message tags, labeled responses,
+- **IRCv3**: SASL (serving PLAIN + OAUTHBEARER; as a client and bouncer,
+  SCRAM-SHA-512/256 or PLAIN, the strongest a network offers), message tags, labeled responses,
   batch, CHATHISTORY, MONITOR, echo-message, account-tag, extended-join,
   setname, away-notify, bot mode, and the common channel modes —
   conformance-tested against the [irctest](https://github.com/progval/irctest)

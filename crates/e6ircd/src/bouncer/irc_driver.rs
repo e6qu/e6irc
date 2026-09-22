@@ -141,6 +141,9 @@ pub struct IrcPreflight {
     pub connect_ms: u64,
     pub registration_ms: u64,
     pub confirmed_nick: String,
+    /// The SASL mechanism that logged in (the strongest the network offered
+    /// for the configured password), or `None` when no account is configured.
+    pub sasl_mechanism: Option<String>,
 }
 
 /// Closed failure taxonomy for an IRC preflight. Raw resolver, TLS, and server
@@ -323,6 +326,7 @@ pub async fn preflight_irc(
         Err(_) => Err(IrcPreflightFailure::RegistrationTimedOut),
     };
     let registration_ms = elapsed_millis(registration_started.elapsed());
+    let sasl_mechanism = connection.sasl_mechanism().map(str::to_owned);
 
     say_goodbye(&mut connection, "connection test complete", "irc preflight").await;
 
@@ -332,6 +336,7 @@ pub async fn preflight_irc(
         connect_ms,
         registration_ms,
         confirmed_nick: outcome?,
+        sasl_mechanism,
     })
 }
 
@@ -630,6 +635,13 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     }
     ends.begin_irc_session(identity.nick.clone());
     ends.emit(ConnectionEvent::Connected);
+    // The mechanism is the client's choice among what the network offered, so
+    // the owner is told which one carried the password.
+    if let (Some(mechanism), Some((account, _))) = (conn.sasl_mechanism(), &config.sasl) {
+        ends.emit_line(format!(
+            ":*bnc* NOTICE * :upstream logged in as {account} with SASL {mechanism}"
+        ));
+    }
     // With `echo-message` the upstream echoes each message it accepts, and
     // only those: its echo is relayed as the one echo of the line. Without it
     // the driver synthesizes the echo when it writes the line.
@@ -1394,8 +1406,11 @@ mod tests {
     /// offers SASL, but not the mechanism the driver speaks.
     #[tokio::test]
     async fn a_missing_sasl_mechanism_is_a_worded_refusal_not_rejected_credentials() {
-        let outcome =
-            sasl_outcome_against(&[("CAP LS", ":up CAP * LS :sasl=EXTERNAL,SCRAM-SHA-256")]).await;
+        let outcome = sasl_outcome_against(&[(
+            "CAP LS",
+            ":up CAP * LS :sasl=EXTERNAL,ECDSA-NIST256P-CHALLENGE",
+        )])
+        .await;
         let Err(super::super::SessionOutcome::RegistrationRejected(rejection)) = outcome else {
             panic!("a mechanism the upstream does not offer is not a credential rejection");
         };
@@ -1405,7 +1420,7 @@ mod tests {
         );
         assert_eq!(
             rejection.diagnostic(),
-            "requested PLAIN; the server offers EXTERNAL,SCRAM-SHA-256"
+            "requested one of SCRAM-SHA-512, SCRAM-SHA-256, PLAIN; the server offers EXTERNAL,ECDSA-NIST256P-CHALLENGE"
         );
     }
 
