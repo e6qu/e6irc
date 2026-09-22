@@ -1293,9 +1293,17 @@ async fn serve_http_connection(
         refusals.note(client, PeerRefusal::SocketSetup, Some(&error));
         return;
     }
+    // Whether this connection has carried a request: hyper reports the same
+    // header timeout for a peer that never finished its first request and for
+    // a kept-alive connection that sat idle after one, and only the first is a
+    // refusal. A reverse proxy holding idle upstream connections hit the second
+    // every ten seconds and filled the log with "refused" lines.
+    let served_a_request = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let served_flag = served_a_request.clone();
     // `ConnectInfo` so handlers see the socket peer (rate limiting, and the
     // forwarded-address resolution behind a trusted proxy).
     let service = router.map_request(move |mut request: axum::http::Request<_>| {
+        served_flag.store(true, std::sync::atomic::Ordering::Relaxed);
         request
             .extensions_mut()
             .insert(axum::extract::ConnectInfo(peer));
@@ -1312,6 +1320,10 @@ async fn serve_http_connection(
         .await;
     match served {
         Ok(()) => {}
+        // An idle kept-alive connection closed at the bound: ordinary.
+        Err(error)
+            if error.is_timeout()
+                && served_a_request.load(std::sync::atomic::Ordering::Relaxed) => {}
         Err(error) if error.is_timeout() => {
             refusals.note(client, PeerRefusal::HttpHeaderTimedOut, None);
         }

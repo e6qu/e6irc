@@ -433,6 +433,18 @@ supply chain) found, and this change fixes:
   reference accounts by id (0065), and `cargo` now rebuilds when a migration is
   added.
 
+Deploying c51261725b5d to Scaleway (2026-09-21) found, and 0067 plus this
+change fix:
+
+- **A stored `null` stopped the daemon.** The live settings row, written by an
+  older release, held `limits.command_burst: null`; #336 had made the field
+  required, and the daemon crash-looped for about 45 minutes until migration
+  0067 (#338) removed the `null`. Released settings rows are now fixtures that
+  every change must still load (`tests/fixtures/server_settings/`).
+- **Idle upstream connections logged as refusals.** A reverse proxy's idle
+  kept-alive connections, closed at the header bound, were each logged as a
+  refused peer; only a connection that never completed a request is now.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each
