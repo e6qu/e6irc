@@ -1716,7 +1716,13 @@ async function setNetworkEnabled(name, enabled, button) {
     clearAlert("network-unavailable");
     addServer(`${name} ${enabled ? "enabled" : "disabled"}.`);
     await refreshNetworkList();
-    if (enabled && network && fold(network) === fold(name)) window.location.reload();
+    // Enabling the open network opens its socket here rather than reloading
+    // the page: a reload would throw away an unsent message, and it raced
+    // whatever the person did next.
+    if (enabled && network && fold(network) === fold(name)) {
+      clearAlert("networks");
+      connect();
+    }
   } catch (error) {
     button.disabled = false;
     button.textContent = was;
