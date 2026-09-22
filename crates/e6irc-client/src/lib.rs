@@ -329,8 +329,12 @@ enum CapabilityNegotiation {
 /// How long the server has to say anything about `CAP LS`. A server without
 /// capability negotiation may drop the command on the floor rather than answer
 /// 421; without a bound the registration would hang until its own timeout and
-/// then be misread as a lost connection.
-const CAP_DISCOVERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+/// then be misread as a lost connection. Many servers read nothing a client
+/// sends until their ident and DNS checks end: Libera answered after 6.9 s
+/// from a host whose firewall drops ident, past the 5 s this used to be, so a
+/// SASL network there could never connect. Within the bouncer's 30 s
+/// registration budget, with room left for SASL and the welcome.
+const CAP_DISCOVERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// How long a registration whose write found the server gone reads what the
 /// server sent before leaving. Everything it sent is already buffered or in
@@ -1246,8 +1250,17 @@ impl Connection {
             CapabilityNegotiation::Unsupported => {
                 return unavailable("the server does not support capability negotiation");
             }
+            // Silence is not a "no": the server may still be checking this
+            // connection. It is a timeout, retried as one, never reported as
+            // the server lacking SASL.
             CapabilityNegotiation::Unanswered => {
-                return unavailable("the server did not answer capability discovery in time");
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "the server did not answer capability negotiation within {} s",
+                        CAP_DISCOVERY_DEADLINE.as_secs()
+                    ),
+                ));
             }
         }
         if !self.advertised.offers("sasl") {
@@ -2381,13 +2394,17 @@ fn registration_diagnostic(message: &OwnedMessage) -> String {
 }
 
 /// The one bound on server-influenced text carried inside a typed refusal:
-/// short enough for a status line, and free of control characters so it can be
-/// relayed as an IRC NOTICE or printed to a terminal. Public so that a caller
-/// with refusals of its own (the bouncer's bridges) bounds them identically.
+/// short enough to ride in one IRC NOTICE after its prefix, and free of control
+/// characters so it can be relayed or printed to a terminal. Public so that a
+/// caller with refusals of its own (the bouncer's bridges) bounds them
+/// identically. 160 cut Libera's cloud-address refusal (about 240 characters)
+/// before the words that say what to do.
+pub const MAX_DIAGNOSTIC_CHARS: usize = 300;
+
 pub fn bounded_diagnostic(detail: &str) -> String {
     detail
         .chars()
-        .take(160)
+        .take(MAX_DIAGNOSTIC_CHARS)
         .map(|character| {
             if character.is_control() {
                 ' '
@@ -2572,10 +2589,10 @@ mod tests {
             tags: Vec::new(),
             source: None,
             command: "ERROR".into(),
-            params: vec![format!("{}\r\nnext", "x".repeat(200))],
+            params: vec![format!("{}\r\nnext", "x".repeat(MAX_DIAGNOSTIC_CHARS + 40))],
         };
         let diagnostic = registration_diagnostic(&message);
-        assert_eq!(diagnostic.chars().count(), 160);
+        assert_eq!(diagnostic.chars().count(), MAX_DIAGNOSTIC_CHARS);
         assert!(!diagnostic.chars().any(char::is_control));
     }
 
@@ -2716,8 +2733,10 @@ mod tests {
     enum Step {
         Expect(&'static str),
         Send(&'static str),
+        /// The server says nothing for this long (paused-clock tests).
+        Pause(std::time::Duration),
     }
-    use Step::{Expect, Send};
+    use Step::{Expect, Pause, Send};
 
     /// A client wired to a server that plays `steps`, then reads to end of
     /// stream and yields every line the client sent that no step expected.
@@ -2739,6 +2758,7 @@ mod tests {
                         .write_all(format!("{line}\r\n").as_bytes())
                         .await
                         .unwrap(),
+                    Pause(duration) => tokio::time::sleep(duration).await,
                 }
             }
             let mut unexpected = Vec::new();
@@ -2981,10 +3001,12 @@ mod tests {
         assert_eq!(server.await.unwrap(), Vec::<String>::new());
     }
 
-    /// With SASL configured, the same silence is a loud refusal: registering
-    /// unauthenticated would be a silent downgrade.
+    /// With SASL configured, the same silence fails loudly: registering
+    /// unauthenticated would be a silent downgrade. It is a timeout, retried as
+    /// one, and never reported as the server lacking SASL, which it may well
+    /// offer once it has finished checking the connection.
     #[tokio::test(start_paused = true)]
-    async fn an_unanswered_capability_discovery_refuses_sasl_loudly() {
+    async fn an_unanswered_capability_discovery_is_a_timeout_for_sasl() {
         let (mut connection, server) = scripted(vec![Expect("CAP LS 302")]);
         let error = tokio::time::timeout(
             CAP_DISCOVERY_DEADLINE * 3,
@@ -2993,12 +3015,42 @@ mod tests {
         .await
         .expect("registration neither finished nor failed")
         .expect_err("SASL cannot be negotiated with a silent server");
-        let rejection = SaslRejection::from_error(&error).expect("typed SASL rejection");
-        assert_eq!(rejection.failure(), SaslFailure::CapabilityNotOffered);
-        assert_eq!(
-            rejection.diagnostic(),
-            "the server did not answer capability discovery in time"
-        );
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(SaslRejection::from_error(&error).is_none(), "{error}");
+        drop(connection);
+        assert_eq!(server.await.unwrap(), Vec::<String>::new());
+    }
+
+    /// Libera read nothing until its ident check gave up, and answered `CAP LS`
+    /// after 6.9 s from a host that drops ident. That is a slow server, not a
+    /// silent one: SASL must still be negotiated.
+    #[tokio::test(start_paused = true)]
+    async fn a_capability_answer_held_behind_the_ident_check_still_negotiates_sasl() {
+        let (mut connection, server) = scripted(vec![
+            Expect("CAP LS 302"),
+            Send(":srv NOTICE * :*** Checking Ident"),
+            Pause(std::time::Duration::from_millis(6_900)),
+            Send(":srv NOTICE * :*** No Ident response"),
+            Send(":srv CAP * LS :sasl=PLAIN"),
+            Expect("CAP REQ :sasl"),
+            Send(":srv CAP * ACK :sasl"),
+            Expect("AUTHENTICATE PLAIN"),
+            Send("AUTHENTICATE +"),
+            Expect("NICK nick"),
+            Expect("USER ident 0 * :real"),
+            Expect("AUTHENTICATE AGFjY3QAcHc="),
+            Send(":srv 903 nick :SASL authentication successful"),
+            Expect("CAP END"),
+            Send(":srv 001 nick :Welcome"),
+        ]);
+        let welcomed = tokio::time::timeout(
+            CAP_DISCOVERY_DEADLINE * 3,
+            connection.register_sasl(&TEST_IDENTITY, "acct", "pw"),
+        )
+        .await
+        .expect("registration neither finished nor failed")
+        .expect("a slow capability answer still authenticates");
+        assert_eq!(welcomed, "nick");
         drop(connection);
         assert_eq!(server.await.unwrap(), Vec::<String>::new());
     }

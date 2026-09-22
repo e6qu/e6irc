@@ -309,6 +309,12 @@ pub async fn preflight_irc(
                 IrcPreflightFailure::AuthenticationRejected(Some(rejection))
             }
             RegistrationError::Refused(rejection) => preflight_refusal(Some(rejection)),
+            // A server that never answered in time (capability negotiation
+            // held past its bound) is a timeout, not a failure of its own.
+            RegistrationError::Failed(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                eprintln!("irc preflight: registration timed out: {error}");
+                IrcPreflightFailure::RegistrationTimedOut
+            }
             RegistrationError::Failed(error) => {
                 eprintln!("irc preflight: registration failed: {error}");
                 IrcPreflightFailure::RegistrationFailed
@@ -470,6 +476,9 @@ fn registration_outcome(
             RegistrationError::Refused(rejection) => {
                 eprintln!("irc registration rejected: {rejection:?}");
                 super::SessionOutcome::RegistrationRejected(rejection)
+            }
+            RegistrationError::Failed(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                dropped(super::NetworkFailure::RegistrationTimedOut)
             }
             RegistrationError::Failed(_) => dropped(super::NetworkFailure::RegistrationFailed),
         }),
@@ -1427,6 +1436,23 @@ mod tests {
             registration_outcome(Ok(Err(error))),
             Err(super::super::SessionOutcome::Dropped(
                 super::super::NetworkFailure::RegistrationFailed
+            ))
+        ));
+    }
+
+    /// A server that never answered in time is retried as a timeout. Reported
+    /// as the server lacking SASL, it sent the owner looking for a missing
+    /// capability that Libera does offer once its ident check is done.
+    #[test]
+    fn a_server_that_answered_too_late_is_a_registration_timeout() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the server did not answer capability negotiation within 20 s",
+        );
+        assert!(matches!(
+            registration_outcome(Ok(Err(error))),
+            Err(super::super::SessionOutcome::Dropped(
+                super::super::NetworkFailure::RegistrationTimedOut
             ))
         ));
     }

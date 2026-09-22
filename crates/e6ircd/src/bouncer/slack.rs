@@ -1883,6 +1883,24 @@ mod tests {
         #[tokio::test]
         async fn the_socket_is_pinged_while_the_workspace_is_quiet() {
             let mut b = bridge(Options::default()).await;
+            // The driver arms its ping interval in the same poll that announces
+            // it connected. Pausing before that let the clock jump straight to
+            // this test's own 40 s bound while the socket's first frames were
+            // still in flight on the real network (seen under load in CI's
+            // coverage job).
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Ok(DriverEvent::Status {
+                        status: DriverConnectionStatus::Connected,
+                        ..
+                    }) = b.events.recv().await
+                    {
+                        return;
+                    }
+                }
+            })
+            .await
+            .expect("the bridge announces it connected");
             // Real sockets, virtual time: the clock jumps to the next timer
             // whenever every task is waiting.
             tokio::time::pause();

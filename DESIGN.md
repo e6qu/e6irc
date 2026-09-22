@@ -1855,10 +1855,16 @@ upstream's.
   retried until it clears), is a registration refusal carrying the server's own
   words. Treating those as "rejected credentials" parked a network instantly
   and left its owner retyping a correct password. A server with no capability
-  negotiation at all — a 421 or 451 to `CAP LS`, or five seconds of silence —
+  negotiation at all — a 421 or 451 to `CAP LS`, or twenty seconds of silence —
   registers plainly (NICK/USER and then `CAP END`, harmless to a server that
   merely answered slowly) — unless SASL is configured, where registering
-  unauthenticated would be a silent downgrade, so it is refused loudly. A
+  unauthenticated would be a silent downgrade, so it fails loudly as a
+  `registration_timed_out`, retried, never as `sasl_unavailable`. The bound is
+  twenty seconds because servers read nothing a client sends until their ident
+  and DNS checks end: Libera answered after 6.9 s from a host that drops ident,
+  and the old five-second bound made every SASL attempt from there fail as
+  "SASL unavailable". An upstream's reason is carried up to 300 characters,
+  which holds Libera's cloud-address refusal whole. A
   post-registration `ERROR :Closing Link …` from the upstream (a ping timeout,
   a rolling restart, a services GHOST, an operator KILL) never reaches an
   attached client or the backlog as `ERROR` — several clients treat that as
