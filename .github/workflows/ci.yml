@@ -387,7 +387,20 @@ jobs:
         run: tools/test-production-container.sh e6irc:ci
       # The same SBOM generator release.yml attests with; the binary is built
       # with cargo auditable, so its Rust crates must appear in it.
+      # One retry for the action's syft download (see release.yml); the check
+      # below fails the job if neither attempt wrote an SBOM.
       - name: Generate the image SBOM
+        id: sbom
+        continue-on-error: true
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: e6irc:ci
+          output-file: sbom-ci.spdx.json
+          format: spdx-json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Retry the image SBOM
+        if: steps.sbom.outcome == 'failure'
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: e6irc:ci

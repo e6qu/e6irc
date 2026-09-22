@@ -2999,7 +2999,9 @@ Layers, bottom to top:
   shell, package manager or script — pinned by digest like every other base. Each architecture digest has signed build-provenance
   and SPDX software-bill-of-materials attestations — the binary is built with
   `cargo auditable`, so the SBOM names its Rust crates and CI requires
-  `rustls` in it — and every shipped build passes `--locked`
+  `rustls` in it; generating it downloads syft, so one failed attempt is
+  retried once and the requirement still fails a job with no SBOM — and every
+  shipped build passes `--locked`
   (`tools/check-locked-builds.sh`); native releases build with the image's
   pinned Rust (`tools/check-release-toolchain.sh`) and no restored cache. The
   assembled manifest has signed provenance,

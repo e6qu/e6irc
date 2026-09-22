@@ -120,7 +120,21 @@ jobs:
           tags: ${{ env.IMAGE }}:${{ needs.metadata.outputs.tag }}-${{ matrix.arch }}
       - name: Verify the direct architecture image
         run: tools/verify-container-shape.sh "${IMAGE}:${{ needs.metadata.outputs.tag }}" "${{ matrix.arch }}"
+      # The action downloads syft from GitHub releases on every run; one HTTP
+      # 500 there failed the release of b532432c5894. One retry; the Rust-crate
+      # check below still fails the job if neither attempt wrote an SBOM.
       - name: Generate the architecture SBOM
+        id: sbom
+        continue-on-error: true
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.IMAGE }}:${{ needs.metadata.outputs.tag }}-${{ matrix.arch }}
+          output-file: sbom-${{ matrix.arch }}.spdx.json
+          format: spdx-json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Retry the architecture SBOM
+        if: steps.sbom.outcome == 'failure'
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ env.IMAGE }}:${{ needs.metadata.outputs.tag }}-${{ matrix.arch }}
