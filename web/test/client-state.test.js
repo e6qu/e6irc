@@ -179,7 +179,7 @@ test("a refused registration directs verified-account failures to log and settin
     state: "registration_failed",
     failureCode: "registration_rejected",
   });
-  assert.match(help, /Server log/);
+  assert.match(help, /the console/);
   assert.match(help, /verified SASL/);
   assert.equal(networkStateIsFailure({ state: "registration_failed" }), true);
 });
@@ -191,7 +191,7 @@ test("parked lifecycle states remain actionable without a last-error detail", ()
   );
   assert.match(
     networkStateHelp({ state: "registration_failed", failureCode: null }),
-    /Open Server log for its reason/,
+    /Open the console for its reason/,
   );
 });
 
