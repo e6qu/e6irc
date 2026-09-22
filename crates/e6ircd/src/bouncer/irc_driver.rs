@@ -141,6 +141,9 @@ pub struct IrcPreflight {
     pub connect_ms: u64,
     pub registration_ms: u64,
     pub confirmed_nick: String,
+    /// The SASL mechanism that logged in (the strongest the network offered
+    /// for the configured password), or `None` when no account is configured.
+    pub sasl_mechanism: Option<String>,
 }
 
 /// Closed failure taxonomy for an IRC preflight. Raw resolver, TLS, and server
@@ -309,6 +312,12 @@ pub async fn preflight_irc(
                 IrcPreflightFailure::AuthenticationRejected(Some(rejection))
             }
             RegistrationError::Refused(rejection) => preflight_refusal(Some(rejection)),
+            // A server that never answered in time (capability negotiation
+            // held past its bound) is a timeout, not a failure of its own.
+            RegistrationError::Failed(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                eprintln!("irc preflight: registration timed out: {error}");
+                IrcPreflightFailure::RegistrationTimedOut
+            }
             RegistrationError::Failed(error) => {
                 eprintln!("irc preflight: registration failed: {error}");
                 IrcPreflightFailure::RegistrationFailed
@@ -317,6 +326,7 @@ pub async fn preflight_irc(
         Err(_) => Err(IrcPreflightFailure::RegistrationTimedOut),
     };
     let registration_ms = elapsed_millis(registration_started.elapsed());
+    let sasl_mechanism = connection.sasl_mechanism().map(str::to_owned);
 
     say_goodbye(&mut connection, "connection test complete", "irc preflight").await;
 
@@ -326,6 +336,7 @@ pub async fn preflight_irc(
         connect_ms,
         registration_ms,
         confirmed_nick: outcome?,
+        sasl_mechanism,
     })
 }
 
@@ -470,6 +481,9 @@ fn registration_outcome(
             RegistrationError::Refused(rejection) => {
                 eprintln!("irc registration rejected: {rejection:?}");
                 super::SessionOutcome::RegistrationRejected(rejection)
+            }
+            RegistrationError::Failed(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                dropped(super::NetworkFailure::RegistrationTimedOut)
             }
             RegistrationError::Failed(_) => dropped(super::NetworkFailure::RegistrationFailed),
         }),
@@ -621,6 +635,13 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     }
     ends.begin_irc_session(identity.nick.clone());
     ends.emit(ConnectionEvent::Connected);
+    // The mechanism is the client's choice among what the network offered, so
+    // the owner is told which one carried the password.
+    if let (Some(mechanism), Some((account, _))) = (conn.sasl_mechanism(), &config.sasl) {
+        ends.emit_line(format!(
+            ":*bnc* NOTICE * :upstream logged in as {account} with SASL {mechanism}"
+        ));
+    }
     // With `echo-message` the upstream echoes each message it accepts, and
     // only those: its echo is relayed as the one echo of the line. Without it
     // the driver synthesizes the echo when it writes the line.
@@ -1385,8 +1406,11 @@ mod tests {
     /// offers SASL, but not the mechanism the driver speaks.
     #[tokio::test]
     async fn a_missing_sasl_mechanism_is_a_worded_refusal_not_rejected_credentials() {
-        let outcome =
-            sasl_outcome_against(&[("CAP LS", ":up CAP * LS :sasl=EXTERNAL,SCRAM-SHA-256")]).await;
+        let outcome = sasl_outcome_against(&[(
+            "CAP LS",
+            ":up CAP * LS :sasl=EXTERNAL,ECDSA-NIST256P-CHALLENGE",
+        )])
+        .await;
         let Err(super::super::SessionOutcome::RegistrationRejected(rejection)) = outcome else {
             panic!("a mechanism the upstream does not offer is not a credential rejection");
         };
@@ -1396,7 +1420,7 @@ mod tests {
         );
         assert_eq!(
             rejection.diagnostic(),
-            "requested PLAIN; the server offers EXTERNAL,SCRAM-SHA-256"
+            "requested one of SCRAM-SHA-512, SCRAM-SHA-256, PLAIN; the server offers EXTERNAL,ECDSA-NIST256P-CHALLENGE"
         );
     }
 
@@ -1427,6 +1451,23 @@ mod tests {
             registration_outcome(Ok(Err(error))),
             Err(super::super::SessionOutcome::Dropped(
                 super::super::NetworkFailure::RegistrationFailed
+            ))
+        ));
+    }
+
+    /// A server that never answered in time is retried as a timeout. Reported
+    /// as the server lacking SASL, it sent the owner looking for a missing
+    /// capability that Libera does offer once its ident check is done.
+    #[test]
+    fn a_server_that_answered_too_late_is_a_registration_timeout() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the server did not answer capability negotiation within 20 s",
+        );
+        assert!(matches!(
+            registration_outcome(Ok(Err(error))),
+            Err(super::super::SessionOutcome::Dropped(
+                super::super::NetworkFailure::RegistrationTimedOut
             ))
         ));
     }

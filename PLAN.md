@@ -445,6 +445,20 @@ change fix:
   kept-alive connections, closed at the header bound, were each logged as a
   refused peer; only a connection that never completed a request is now.
 
+- **Libera from a cloud host.** Libera answered `CAP LS` only after its ident
+  check timed out (6.9 s from Scaleway, whose firewall dropped ident), past the
+  client's 5 s bound, so every SASL attempt failed as "SASL unavailable" — and
+  Libera requires SASL from cloud addresses, so the network could not connect
+  at all. The bound is 20 s, silence is a retried timeout rather than a missing
+  capability, and an upstream's reason is no longer cut at 160 characters (it
+  hid the end of Libera's "SASL … required to connect from your current IP").
+
+- **SASL mechanisms.** The bouncer and native clients spoke only PLAIN. They
+  now choose the strongest password mechanism a network offers — SCRAM-SHA-512,
+  SCRAM-SHA-256, then PLAIN — verify a SCRAM server's signature, never fall
+  back from a failed SCRAM to PLAIN, and say which mechanism logged in (tested
+  against RFC 7677's vector, an in-test SCRAM server, and a real Ergo server).
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

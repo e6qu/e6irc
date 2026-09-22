@@ -145,8 +145,18 @@ opers.
 ## Authentication, accounts, and single sign-on
 
 **SASL** — Simple Authentication and Security Layer: the in-band mechanism a
-client uses to authenticate during the IRC handshake. e6irc supports
-`PLAIN` (account + password) and `OAUTHBEARER` (a token).
+client uses to authenticate during the IRC handshake. e6ircd accepts `PLAIN`
+(account + password) and `OAUTHBEARER` (a token). As a client — the bouncer
+towards an upstream network, and the native clients — e6irc chooses the
+strongest password mechanism the server offers: `SCRAM-SHA-512`,
+`SCRAM-SHA-256`, then `PLAIN`.
+
+**SCRAM** — Salted Challenge Response Authentication Mechanism (RFC 5802;
+`SCRAM-SHA-256` in RFC 7677): a SASL password mechanism in which the password
+never crosses the wire and the server proves it holds the account's verifier.
+It uses **SASLprep** (RFC 4013), the normalization applied to the account name
+and password first, and **PBKDF2**, the iterated key derivation that salts the
+password.
 
 **App password** — a long, random per-use password minted for an account
 (argon2id-hashed at rest); usable immediately for SASL.

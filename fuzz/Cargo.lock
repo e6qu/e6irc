@@ -740,11 +740,13 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 name = "e6irc-client"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "e6irc-proto",
  "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "stringprep",
  "tokio",
  "tokio-rustls",
  "webpki-roots",

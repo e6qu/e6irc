@@ -80,8 +80,8 @@ or deliberately chooses anonymous IRC.
 
 **Flow.**
 
-- `e6irc send TARGET MESSAGE` connects, optionally authenticates with SASL
-  PLAIN, joins a channel when needed, sends, drains the server response, and
+- `e6irc send TARGET MESSAGE` connects, optionally authenticates with a SASL
+  password, joins a channel when needed, sends, drains the server response, and
   exits nonzero on join/delivery failure.
 - `e6irc tail TARGET [--count N]` follows matching PRIVMSG lines and answers
   PING; `--json` emits one object per message with source, target, text, and
@@ -95,12 +95,14 @@ or deliberately chooses anonymous IRC.
   explicit token, `E6IRC_API_TOKEN`, or the login cache supplies bearer
   authentication; with no `--base`, it uses the cached issuing origin or
   fails if none exists.
-- IRC authentication is anonymous, paired SASL PLAIN, direct OAUTHBEARER, or
+- IRC authentication is anonymous, a paired SASL account and password (the
+  strongest of SCRAM-SHA-512, SCRAM-SHA-256 and PLAIN the server offers),
+  direct OAUTHBEARER, or
   OAUTHBEARER from that same cache.
 - IRC connections support plaintext or public-CA TLS with an explicit server
   name override.
 
-**Visible failures and recovery.** Supplying only one SASL PLAIN field is an
+**Visible failures and recovery.** Supplying only one SASL account field is an
 error, not unauthenticated fallback. Join refusal, send rejection, disconnect,
 TLS validation failure, oversized API body/response, and non-2xx HTTP produce
 nonzero exit. A token is never printed. Cached tokens are origin-bound for API
@@ -133,7 +135,7 @@ private to the current user.
 
 1. Connect to one `host:port` with a nick and initial channel, using plaintext
    or public-CA TLS with an optional certificate-name override.
-2. Register anonymously, with SASL PLAIN, or with direct/cached SASL
+2. Register anonymously, with a SASL password, or with direct/cached SASL
    OAUTHBEARER. For a BNC attachment, `--account account/network` selects the
    owned network. The shared client chunks encoded SASL responses at 400 bytes,
    emits the required empty terminator after an exact chunk, and treats every
@@ -206,7 +208,8 @@ TLS name where applicable, and one explicit authentication variant.
 **Flow.**
 
 - `e6irc-client` provides plaintext/public-CA TLS connection, framing through
-  `e6irc-proto`, registration, SASL PLAIN, SASL OAUTHBEARER, uniform optional
+  `e6irc-proto`, registration, SASL SCRAM-SHA-512/256 and PLAIN (the
+  strongest offered), SASL OAUTHBEARER, uniform optional
   metadata-capability requests, PING handling, owned messages, typed
   steady-state message/relay/rejection events, terminal-safe output, explicit
   capability requirements, marker-aware CHATHISTORY helpers, and the

@@ -2562,7 +2562,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const result = await apiRequest(form, apiMutation(method, url), body);
       if (mode === ownerNetworkPreflight) {
         setOwnerNetworkResult(
-          `Registered as ${result.confirmed_nick}; no channels were joined. Resolved ${result.resolved_addresses} address${result.resolved_addresses === 1 ? "" : "es"}; DNS ${result.dns_ms}ms, connection ${result.connect_ms}ms, registration ${result.registration_ms}ms. No network was created.`,
+          `Registered as ${result.confirmed_nick}${result.sasl_mechanism ? `, logged in with SASL ${result.sasl_mechanism}` : ""}; no channels were joined. Resolved ${result.resolved_addresses} address${result.resolved_addresses === 1 ? "" : "es"}; DNS ${result.dns_ms}ms, connection ${result.connect_ms}ms, registration ${result.registration_ms}ms. No network was created.`,
           true,
         );
       } else {
