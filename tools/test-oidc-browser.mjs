@@ -215,7 +215,7 @@ try {
     if (request.isNavigationRequest()) navigationTrace.push(`request ${request.method()} ${sanitizeURL(request.url())}`);
   });
   page.on("console", (message) => {
-    const sourceURL = message.location().url || page.url();
+    const sourceURL = consoleSourceURL(message, page.url());
     if (
       message.type() === "error"
       && isApplicationURL(sourceURL)
@@ -2115,6 +2115,7 @@ try {
   // needed below.
   await page.goto(`${applicationOrigin}/`);
   await page.getByRole("button", { name: "Settings for journey", exact: true }).waitFor();
+  const removalErrorStart = applicationErrors.length;
   await page.locator("#network-add").click();
   const spareDialog = page.getByRole("dialog", { name: "Add a network" });
   await spareDialog.locator("#nf-save:not([disabled])").waitFor();
@@ -2144,6 +2145,16 @@ try {
   // Gone from the server too, not just from this page.
   const spareAfter = await context.request.get(`${applicationOrigin}/api/v1/me/networks/spare`);
   assert.equal(spareAfter.status(), 404);
+  // Closing the removed network's socket is the point, and Firefox reports a
+  // connection closed before it finished opening as a page error. Only that
+  // socket is expected noise: everything else this step logged still counts.
+  assert.deepEqual(
+    applicationErrors
+      .splice(removalErrorStart)
+      .filter((error) => !(error.includes("ws://") && error.includes("network=spare"))),
+    [],
+    "removing a network reported an application error",
+  );
 
   assert.ok(
     navigationTrace.includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/start`),
@@ -2289,7 +2300,31 @@ function sanitizeURL(value) {
 }
 
 function isApplicationURL(value) {
-  return new URL(value).origin === applicationOrigin;
+  // Not every console message has a real URL behind it: Firefox reports
+  // anything run through `page.evaluate` as "debugger eval code", which is not
+  // a URL at all. Parsing it threw, and the throw happened inside a page event
+  // handler, so it killed the whole journey with `TypeError: Invalid URL` and
+  // no hint of where it was. An unreadable location is treated as no location,
+  // which the caller already resolves to the page being looked at -- so an
+  // error from the application is still reported, with its own text.
+  try {
+    return new URL(value).origin === applicationOrigin;
+  } catch {
+    return false;
+  }
+}
+
+/// Where a console message came from: its own location when that is a URL,
+/// else the page it was reported on.
+function consoleSourceURL(message, pageURL) {
+  const reported = message.location().url;
+  if (!reported) return pageURL;
+  try {
+    new URL(reported);
+    return reported;
+  } catch {
+    return pageURL;
+  }
 }
 
 async function startIrcUpstream() {

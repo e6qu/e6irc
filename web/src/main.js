@@ -2163,11 +2163,19 @@ removeButton?.addEventListener("click", () => {
   void (async () => {
     removeButton.disabled = true;
     removeButton.textContent = "Removing…";
+    // Stop using the connection *before* asking for the network to go: the
+    // server closes the socket as it deletes, and a close the client has not
+    // been told to expect schedules a retry -- which then opens a socket for a
+    // network that no longer exists.
+    const wasOpen = Boolean(network) && fold(network) === fold(name);
+    if (wasOpen) stopLiveConnection();
     try {
       await apiSend("DELETE", `/api/v1/me/networks/${encodeURIComponent(name)}`);
     } catch (error) {
       setDialogError(errorMessage(`remove ${name}`, error));
       disarmRemove();
+      // It is still there, so the connection this just gave up is wanted back.
+      if (wasOpen) connect();
       return;
     }
     networkDialog.close();
@@ -2175,7 +2183,7 @@ removeButton?.addEventListener("click", () => {
     // conversations, its unread counts -- is now state about something that
     // does not exist, so the client goes back to the picker rather than
     // sitting on a conversation it can no longer send to.
-    if (network && fold(network) === fold(name)) await leaveOpenNetwork();
+    if (wasOpen) await leaveOpenNetwork();
     else await refreshNetworkList();
   })();
 });
@@ -2206,13 +2214,26 @@ el("help-close")?.addEventListener("click", () => helpDialog?.close());
 // when the network is removed from here: a reload would do it too, but it
 // throws away everything else the tab is holding, and the state that has to go
 // is exactly the state this network owns.
-async function leaveOpenNetwork() {
+// Stop using the live connection and stop trying to get it back. A retry
+// already waiting would call connect(), which clears the terminal flag, so the
+// timer has to go with the socket -- otherwise the client reconnects to a
+// network that is being deleted, and the browser reports that dead connection
+// as a page error.
+function stopLiveConnection() {
   terminalSocket = true;
+  if (reconnectTimer) {
+    window.clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
   if (socket) {
     const closing = socket;
     socket = null;
     closing.close();
   }
+}
+
+async function leaveOpenNetwork() {
+  stopLiveConnection();
   network = null;
   window.history.replaceState(null, "", "/");
   buffers.clear();
