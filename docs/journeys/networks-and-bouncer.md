@@ -247,10 +247,12 @@ while it is happening.
 
 **Preconditions.** A browser session on the chat client.
 
-**Flow.** Select **Server log** in the sidebar, beside the conversations — its
-only switch. It shows every inbound wire line, newest last, and keeps recording
-whether or not it is on screen, so switching it on after something has gone
-wrong still shows what happened.
+**Flow.** Open the **console**, the first entry in the conversations. It shows
+every inbound wire line, newest last, beside e6irc's own notices, and records
+whether or not it is the open conversation, so opening it after something has
+gone wrong still shows what happened. Typing there sends the IRC line as
+written (`PRIVMSG NickServ :IDENTIFY …`), and the line sent is shown beside the
+replies.
 
 **Visible failures and recovery.** A network parked on rejected credentials or
 a refused registration says so on its own row, with the repair, next to the
@@ -262,7 +264,7 @@ identify the upstream cause used to choose the recovery text.
 
 **Security and observability.** Commands carrying a password, email, code, or
 recovery token are redacted in the synthesized echo while still being sent
-upstream verbatim, so the Server log never becomes a place credentials
+upstream verbatim, so the console never becomes a place credentials
 accumulate.
 
 **Evidence.** The parked lifecycle/error-code pairings, generic parked-state

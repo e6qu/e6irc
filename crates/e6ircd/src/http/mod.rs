@@ -1444,14 +1444,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/console/configuration", get(pages::console_configuration))
         .route("/console/networks", get(pages::console_networks))
         .route(
-            "/console/networks/{name}/edit",
-            get(pages::console_edit_network),
-        )
-        .route(
-            "/console/networks/{name}/logs",
-            get(pages::console_network_logs),
-        )
-        .route(
             "/console/networks/{name}",
             get(pages::console_network_detail),
         )
@@ -3113,13 +3105,6 @@ mod pages {
     }
 
     #[derive(Template)]
-    #[template(path = "console_network_edit.html")]
-    struct ConsoleNetworkEdit {
-        shell: ConsoleShell,
-        name: String,
-    }
-
-    #[derive(Template)]
     #[template(path = "console_bridge_edit.html")]
     struct ConsoleBridgeEdit {
         shell: ConsoleShell,
@@ -3144,13 +3129,6 @@ mod pages {
     #[derive(Template)]
     #[template(path = "console_network_detail.html")]
     struct ConsoleNetworkDetail {
-        shell: ConsoleShell,
-        name: String,
-    }
-
-    #[derive(Template)]
-    #[template(path = "console_network_logs.html")]
-    struct ConsoleNetworkLogs {
         shell: ConsoleShell,
         name: String,
     }
@@ -3241,21 +3219,6 @@ mod pages {
 
     /// Console → network component log. The browser reads the owner-scoped
     /// buffer API; every BNC driver uses the same persisted stream.
-    pub async fn console_network_logs(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(name): Path<String>,
-    ) -> Response {
-        let actor = match page_actor(&state, &headers, false).await {
-            Ok(actor) => actor,
-            Err(response) => return response.into(),
-        };
-        render_private(ConsoleNetworkLogs {
-            shell: console_shell(actor, "networks"),
-            name,
-        })
-    }
-
     /// Bounded owner-scoped network runtime and persisted backlog.
     pub async fn owner_network_operations(
         State(state): State<Arc<AppState>>,
@@ -3323,21 +3286,6 @@ mod pages {
 
     /// Console → edit-network document. The browser obtains the typed owner
     /// resource before it populates or submits the form.
-    pub async fn console_edit_network(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(name): Path<String>,
-    ) -> Response {
-        let actor = match page_actor(&state, &headers, false).await {
-            Ok(actor) => actor,
-            Err(response) => return response.into(),
-        };
-        render_private(ConsoleNetworkEdit {
-            shell: console_shell(actor, "networks"),
-            name,
-        })
-    }
-
     struct BridgePlatformMeta {
         name: &'static str,
         kind: crate::config::NetworkKind,

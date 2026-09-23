@@ -459,6 +459,19 @@ change fix:
   back from a failed SCRAM to PLAIN, and say which mechanism logged in (tested
   against RFC 7677's vector, an in-test SCRAM server, and a real Ergo server).
 
+- **One editor for a network, and a console to type in.** Setting a NickServ
+  account and password behaved differently on each screen that offered it: the
+  console editor discarded typed credentials when Remove was ticked (and said
+  "Updated."), the network page trimmed the password, made "leave blank to
+  keep" impossible and replayed a `null` real name the API refuses. Those
+  duplicate forms are gone: the chat client's settings dialog is the one
+  editor, opened from the console by link, and the `/console/networks/{name}`
+  `edit` and `logs` pages with them. The chat client gained a **console**
+  conversation (the old server buffer) that shows every line in both
+  directions and sends what is typed as the IRC line itself, replacing the
+  separate Server log panel and its switch; a network is enabled or disabled
+  from the list where it appears.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

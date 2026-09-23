@@ -71,16 +71,6 @@
           </div>
           <ul id="networks" aria-label="Networks"></ul>
 
-          <!-- The raw wire log is where you look when a connection or a
-               NickServ exchange misbehaves, so its one switch sits beside the
-               conversations rather than in a preferences menu. -->
-          <button
-            id="server-log-link"
-            type="button"
-            class="side-link"
-            aria-pressed="false"
-          >Server log<small>Every line received</small></button>
-
           <div class="side-head">Conversations</div>
           <form id="join-form" autocomplete="off">
             <input type="text" id="join-input" placeholder="join #channel" aria-label="Join a channel" autocomplete="off" disabled />
@@ -110,13 +100,6 @@
           <button id="load-earlier" type="button" hidden>Load earlier messages</button>
           <ol id="messages" tabindex="0" aria-live="polite" aria-relevant="additions text" aria-label="Messages"></ol>
           <button id="jump-latest" type="button" hidden>Jump to latest messages</button>
-          <section id="raw-output-panel" aria-labelledby="raw-output-title" hidden>
-            <div class="raw-output-head">
-              <strong id="raw-output-title">Server log</strong>
-              <span>Every line received, newest at the bottom</span>
-            </div>
-            <ol id="raw-output-lines" tabindex="0" aria-label="Raw IRC output"></ol>
-          </section>
           <form id="composer" autocomplete="off">
             <input
               type="text"
@@ -300,10 +283,10 @@
           <li><code>/raw COMMAND</code> — send a literal IRC line</li>
         </ul>
         <p>
-          To talk to services directly, use <code>/msg NickServ IDENTIFY …</code>
-          or <code>/raw</code>. The <strong>Server log</strong> conversation shows
-          every raw line received, which is where to look when a connection or a
-          NickServ exchange does not behave.
+          The <strong>console</strong>, at the top of the conversations, shows
+          every line the network sends and sends what you type there as the IRC
+          line itself — no slash needed. That is where to look, and to type,
+          when a connection or a NickServ exchange does not behave.
         </p>
         <div class="dialog-actions">
           <button type="button" id="help-close">Close</button>

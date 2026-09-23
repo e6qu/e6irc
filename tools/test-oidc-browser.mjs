@@ -374,7 +374,7 @@ try {
   await page.waitForFunction(() => document.documentElement.dataset.theme === "light");
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
-    { theme: "light", notifications: false, rawOutput: false },
+    { theme: "light", notifications: false },
   );
   await page.reload();
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
@@ -388,7 +388,7 @@ try {
   await page.waitForFunction(() => !document.documentElement.hasAttribute("data-theme"));
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
-    { theme: "auto", notifications: false, rawOutput: false },
+    { theme: "auto", notifications: false },
   );
   assert.equal(
     await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()),
@@ -549,7 +549,7 @@ try {
   );
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
-    { theme: "dark", notifications: true, rawOutput: false },
+    { theme: "dark", notifications: true },
   );
   await page.reload();
   assert.equal(await page.locator("html").getAttribute("data-theme"), "dark");
@@ -1170,14 +1170,17 @@ try {
     (response) => response.url() === `${applicationOrigin}/api/v1/me/networks/journey/buffer?limit=1000`
       && response.request().method() === "GET",
   );
-  const componentLogPage = await page.goto(`${applicationOrigin}/console/networks/journey/logs`);
+  // The stored log is read where the network is, not on a page of its own:
+  // the transcript loads the whole of it on request.
+  const componentLogPage = await page.goto(`${applicationOrigin}/console/networks/journey`);
   assert.equal(componentLogPage.status(), 200);
+  const componentLog = page.getByRole("log", { name: "Recent raw IRC backlog", exact: true });
+  await componentLog.waitFor();
+  await page.getByRole("button", { name: /^Load the full log/ }).click();
   assert.equal((await componentLogBuffer).status(), 200);
-  const componentLog = page.getByRole("log", { name: "Network log", exact: true });
   await componentLog.getByText("browser replays through the real stack", { exact: false })
     .waitFor();
   assert.equal(await componentLog.getAttribute("tabindex"), "0");
-  await page.getByRole("heading", { name: "journey log", exact: true }).waitFor();
 
   const serverLogRead = page.waitForResponse(
     (response) => response.url() === `${applicationOrigin}/api/v1/admin/logs`
@@ -1212,18 +1215,24 @@ try {
   const peerMember = page.getByRole("button", { name: "Open conversation with peer", exact: true });
   await peerMember.waitFor();
   assert.equal(await peerMember.evaluate((button) => button.tagName), "BUTTON");
-  // The wire log has one switch, beside the conversations.
-  const serverLog = page.getByRole("button", { name: /^Server log/ });
-  assert.equal(await serverLog.getAttribute("aria-pressed"), "false");
-  await serverLog.click();
-  assert.equal(await serverLog.getAttribute("aria-pressed"), "true");
-  await page.locator("#raw-output-lines .raw-wire").filter({ hasText: "browser replays through the real stack" }).waitFor();
+  // The console carries the exchange both ways: every line the network sent,
+  // and a command typed by hand as the IRC line itself.
+  await page.locator("#buffers").getByRole("button", { name: /^Open console/ }).click();
+  const consoleLine = page
+    .locator("#messages .line-wire")
+    .filter({ hasText: "browser replays through the real stack" });
+  await consoleLine.waitFor();
   assert.match(
-    await page.locator("#raw-output-lines .raw-wire").filter({ hasText: "browser replays through the real stack" }).innerText(),
-    /PRIVMSG #journey :browser replays through the real stack/,
+    await consoleLine.innerText(),
+    /« .*PRIVMSG #journey :browser replays through the real stack/,
   );
-  await serverLog.click();
-  assert.equal(await page.locator("#raw-output-panel").isHidden(), true);
+  await page.locator("#message").fill("PRIVMSG #journey :typed into the console");
+  await page.locator("#composer button[type=submit]").click();
+  await upstream.waitForLine((line) => line === "PRIVMSG #journey :typed into the console");
+  await page
+    .locator("#messages .line-server")
+    .filter({ hasText: "» PRIVMSG #journey :typed into the console" })
+    .waitFor();
   await page.locator("#message").fill("/help");
   await page.locator("#composer button[type=submit]").click();
   await page.getByText(/Commands: \/join #channel/).waitFor();
@@ -1349,10 +1358,18 @@ try {
     .waitFor();
   assert.match(await page.locator("#network-operations").innerText(), /browser receives through the real stack/);
   const accountRegister = page.locator("[data-api-network-account-register]");
-  // Registration is the uncommon path, so it is closed until asked for; the
-  // account and password pair it finishes with is always visible.
+  // Registration is the uncommon path, so it is closed until asked for. The
+  // account and password it finishes with are saved in the network's one
+  // editor, which this page links to rather than duplicating.
   assert.equal(await accountRegister.isVisible(), false);
-  assert.equal(await page.locator("[data-api-network-account-save]").getByLabel("NickServ password").isVisible(), true);
+  assert.equal(await page.locator("[data-api-network-account-save]").count(), 0);
+  assert.equal(
+    new URL(
+      await page.getByRole("link", { name: "open its settings", exact: true }).getAttribute("href"),
+      applicationOrigin,
+    ).search,
+    "?network=journey&settings=1",
+  );
   await page.getByText("Register a new NickServ account", { exact: true }).click();
   await accountRegister.getByLabel("Email address").fill("webjourney@example.test");
   await accountRegister.getByLabel("New NickServ password").fill("journey-secret");
@@ -1373,18 +1390,25 @@ try {
   await page.locator("[data-api-owner-network-toggle]").getByRole("button", { name: "Disable", exact: true }).click();
   await page.locator('[data-network-field="enabled"]', { hasText: "Disabled" }).waitFor();
   upstream.resetJoin("#journey");
-  const accountSave = page.locator("[data-api-network-account-save]");
-  // The network was just disabled, so the control says what it will do: save
-  // the credentials AND enable the network. Nothing is enabled silently.
-  assert.equal(await accountSave.getByRole("button", { name: "Save and reconnect", exact: true }).count(), 0);
-  await accountSave.getByRole("button", { name: "Save credentials and enable", exact: true }).click();
-  await expectStatus(page, /saved and the network enabled/);
+
+  // The credentials are saved in the one editor, and the disabled network is
+  // enabled where it is listed. Neither is done silently by the other.
+  await page.goto(`${applicationOrigin}/?network=journey&settings=1`);
+  const credentialDialog = page.getByRole("dialog", { name: "Settings — journey" });
+  await credentialDialog.locator("#nf-sasl-account").fill("webjourney");
+  await credentialDialog.locator("#nf-sasl-password").fill("journey-secret");
+  await credentialDialog.getByRole("button", { name: "Save" }).click();
+  await credentialDialog.waitFor({ state: "hidden" });
+  // Two controls offer it — the list row and the message that says chat is
+  // unavailable — and both do the same thing; this drives the list row.
+  await page.locator("#networks").getByRole("button", { name: "Enable journey", exact: true }).click();
   await upstream.waitForLine((line) => line === "AUTHENTICATE PLAIN");
   await upstream.waitForJoin("#journey");
+
+  await page.goto(`${applicationOrigin}/console/networks/journey`);
   await page.locator('[data-network-field="enabled"]', { hasText: "Enabled" }).waitFor();
   await page.locator('[data-network-field="account-credential"]', { hasText: "Stored" }).waitFor();
   await page.locator('[data-network-field="secret-credential"]', { hasText: "Stored encrypted" }).waitFor();
-  assert.equal(await accountSave.getByLabel("NickServ password").inputValue(), "");
   assert.equal(await accountRegister.getByLabel("New NickServ password").inputValue(), "");
   assert.ok(
     !applicationRequests.slice(operationsReadStart).includes(
@@ -1407,14 +1431,13 @@ try {
       await route.continue();
     }
   });
-  await page.goto(`${applicationOrigin}/console/networks/journey/edit`);
+  await page.goto(`${applicationOrigin}/console/networks/journey`);
   const ownerNetworkEditorFailure = page.locator("#network-api-result");
   await ownerNetworkEditorFailure.getByRole("button", { name: "Retry", exact: true }).waitFor();
   assert.match(await ownerNetworkEditorFailure.innerText(), /Network editor unavailable/);
   await ownerNetworkEditorFailure.getByRole("button", { name: "Retry", exact: true }).click();
-  // The editor leads with what people change; the server sits under Advanced.
-  await page.locator('input[name="nick"]').waitFor({ state: "visible" });
-  assert.equal(ownerNetworkEditorReads, 2, "Retry made exactly one replacement owner-network-editor request");
+  await page.getByRole("heading", { name: "journey", exact: true }).waitFor();
+  assert.equal(ownerNetworkEditorReads, 2, "Retry made exactly one replacement owner-network request");
   assert.deepEqual(
     applicationErrors.splice(ownerNetworkEditorFailureErrorStart),
     [`503 GET ${applicationOrigin}/api/v1/me/networks/journey`],
@@ -1427,14 +1450,27 @@ try {
       response.url() === `${applicationOrigin}/api/v1/me/networks/journey` &&
       response.request().method() === "GET",
   );
-  await page.goto(`${applicationOrigin}/console/networks/journey/edit`);
+  // One editor for a network's settings: the console page links to the chat
+  // client's dialog, which opens with every stored value in it.
+  await page.goto(`${applicationOrigin}/console/networks/journey`);
   assert.equal((await editorRead).status(), 200);
-  await page.locator('input[name="nick"]').waitFor({ state: "visible" });
-  assert.equal(await page.locator('input[name="addr"]').isVisible(), false);
-  await page.getByText("Advanced", { exact: true }).click();
-  await page.locator('input[name="addr"]').waitFor({ state: "visible" });
-  assert.equal(await page.locator('input[name="addr"]').inputValue(), upstream.address);
-  assert.equal(await page.locator('input[name="nick"]').inputValue(), "webjourney");
+  const settingsLink = page.getByRole("link", { name: "Edit settings", exact: true });
+  assert.equal(
+    new URL(await settingsLink.getAttribute("href"), applicationOrigin).search,
+    "?network=journey&settings=1",
+  );
+  await settingsLink.click();
+  const settingsDialog = page.getByRole("dialog", { name: "Settings — journey" });
+  await settingsDialog.locator('input[name="addr"]').waitFor({ state: "visible" });
+  // The dialog fills itself from the stored network; wait for that read.
+  await page.waitForFunction(
+    (expected) => document.getElementById("nf-addr")?.value === expected,
+    upstream.address,
+  );
+  assert.equal(await settingsDialog.locator('input[name="addr"]').inputValue(), upstream.address);
+  assert.equal(await settingsDialog.locator('input[name="nick"]').inputValue(), "webjourney");
+  assert.equal(new URL(page.url()).searchParams.get("settings"), null, "the deep link is not left in the address bar");
+  await settingsDialog.getByRole("button", { name: "Cancel" }).click();
 
   // Exercise the daemon's actual signal handler and startup preload while the
   // same browser context, account session, network definition, upstream, and
@@ -1941,7 +1977,7 @@ try {
     .waitFor();
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
-    { theme: "dark", notifications: false, rawOutput: false },
+    { theme: "dark", notifications: false },
   );
   assert.equal(
     await page.locator("#notify-toggle").getAttribute("aria-pressed"),
@@ -1963,11 +1999,11 @@ try {
   });
   await page.getByText("Preferences", { exact: true }).click();
   await page.getByRole("button", { name: "Desktop notifications: off" }).click();
-  await page.locator(".buf-name").filter({ hasText: /^server$/ }).click();
+  await page.locator(".buf-name").filter({ hasText: /^console$/ }).click();
   await page.getByText("Notification permission was not granted.", { exact: true }).waitFor();
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
-    { theme: "dark", notifications: false, rawOutput: false },
+    { theme: "dark", notifications: false },
   );
   await page.evaluate(() => {
     delete globalThis.Notification;
@@ -1978,7 +2014,7 @@ try {
     .waitFor();
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
-    { theme: "dark", notifications: false, rawOutput: false },
+    { theme: "dark", notifications: false },
   );
 
   // Restoring a working browser API lets the user opt in again and then turn
@@ -1999,7 +2035,7 @@ try {
   await page.getByRole("button", { name: "Desktop notifications: on" }).click();
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
-    { theme: "dark", notifications: false, rawOutput: false },
+    { theme: "dark", notifications: false },
   );
 
   // On a narrow screen, the conversation rail is a focused, dismissible
@@ -2305,6 +2341,12 @@ async function startIrcUpstream() {
       }
     });
     socket.on("close", () => sockets.delete(socket));
+    // A driver that is disabled mid-session resets its socket; unhandled, that
+    // error ends the whole journey instead of the connection.
+    socket.on("error", () => {
+      sockets.delete(socket);
+      socket.destroy();
+    });
   });
 
   await new Promise((resolveListen, rejectListen) => {

@@ -1481,12 +1481,20 @@ directory in CI so a newly added operational table cannot silently regress to
 an unnamed grid.
 
 The console is also the home of `/console/networks` — a per-user BNC network
-manager with add/remove/enable-disable, and **edit** of an IRC
-network's connection/identity fields (addr, tls, nick, realname, autojoin) and
-write-only SASL credentials (keep the encrypted password while changing its
-account, replace it, or remove both halves). The password is never rendered
-back to the browser. A bridge is configured on the Integrations page, so the
-IRC edit form refuses non-IRC kinds. The manager is available to any
+manager with add (with a connection test) / remove / enable-disable. An IRC
+network's settings have exactly **one** editor, the chat client's dialog
+(`/?network=<name>&settings=1`, which the console links to): connection and
+identity fields (addr, tls, nick, username, realname, autojoin) and write-only
+SASL and server credentials — keep the encrypted password while changing its
+account, replace it, or remove both halves, with typed values under a ticked
+Remove refused rather than silently dropped. The password is never rendered
+back to the browser. The console carried a second editor and a third
+credential form whose rules disagreed with it (one trimmed the password, one
+made "keep the stored one" impossible, one discarded what was typed); they are
+gone, and with them the `/console/networks/{name}/edit` and
+`/console/networks/{name}/logs` pages — the stored log is read in the network
+page's own transcript, which loads all of it on request. A bridge is
+configured on the Integrations page. The manager is available to any
 authenticated user for their own networks. The create form defaults to a
 Libera Chat preset and offers a small, provenance-dated catalog of published
 TLS endpoints (Libera, OFTC, Snoonet — each verified as a TLS registration
@@ -2375,9 +2383,12 @@ update every affected buffer using the same pairing rules as the BNC session
 tracker. Malformed membership commands and incomplete topic numerics are shown
 in the server buffer rather than ignored or allowed to throw in the socket
 handler.
-The browser has an optional Server log that retains and renders every exact
-safe inbound IRC wire line, including state-changing lines, numerics, and
-NickServ replies; its one switch sits beside the conversations. The command
+The browser's **console** — the first entry in the conversations, where the
+server buffer used to be — shows every exact safe inbound IRC wire line,
+including state-changing lines, numerics and NickServ replies, beside e6irc's
+own notices, and sends what is typed there as the IRC line itself (a `/command`
+still means the command). It replaced a separate Server log panel with a
+switch of its own. The command
 reference exists once, in the help dialog, and `/help` prints that same list; `/query`, `/msg`, `/notice`, `/join`, `/part`, `/nick`, `/me`, `/raw`,
 and `/quote` preserve normal IRC workflows instead of requiring a
 configuration-only UI.
