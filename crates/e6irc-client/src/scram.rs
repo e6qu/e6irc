@@ -55,9 +55,17 @@ impl ScramHash {
 }
 
 /// The most PBKDF2 iterations a server may demand. The count is the server's
-/// to choose and costs this client CPU for every attempt; RFC 7677 asks for at
-/// least 4096 and Atheme's default is far below this bound.
+/// to choose and costs this client CPU for every attempt; Atheme's default is
+/// far below this bound.
 pub const MAX_ITERATIONS: u32 = 1_000_000;
+
+/// The fewest a server may demand. RFC 7677 §3 makes 4096 a MUST (the
+/// SCRAM-SHA-512 draft mirrors it), and the reason is this client's: the
+/// iteration count is what makes a captured transcript expensive to attack, so
+/// a server asking for fewer is weakening *our* credential. It is refused
+/// rather than quietly obeyed -- a server that cannot meet the floor of the
+/// mechanism it advertised is one to hear about, not to log in to.
+pub const MIN_ITERATIONS: u32 = 4_096;
 
 /// Why a SCRAM exchange could not continue. Every one is the server's (or the
 /// credential's) fault and ends the attempt: none is retried as another
@@ -70,7 +78,7 @@ pub enum ScramError {
     MalformedServerFirst(String),
     /// The server's nonce does not extend the one this client sent.
     NonceMismatch,
-    /// The iteration count is zero or above [`MAX_ITERATIONS`].
+    /// The iteration count is outside [`MIN_ITERATIONS`]..=[`MAX_ITERATIONS`].
     Iterations(u32),
     /// The server's final message is not `v=…` or `e=…`.
     MalformedServerFinal(String),
@@ -98,7 +106,8 @@ impl std::fmt::Display for ScramError {
             Self::NonceMismatch => write!(f, "the server's SCRAM nonce does not extend ours"),
             Self::Iterations(count) => write!(
                 f,
-                "the server asked for {count} SCRAM iterations (accepted: 1 to {MAX_ITERATIONS})"
+                "the server asked for {count} SCRAM iterations \
+                 (accepted: {MIN_ITERATIONS} to {MAX_ITERATIONS})"
             ),
             Self::MalformedServerFinal(message) => {
                 write!(
@@ -202,7 +211,7 @@ impl ScramClient {
             return Err(ScramError::NonceMismatch);
         }
         let iterations = NonZeroU32::new(iterations)
-            .filter(|count| count.get() <= MAX_ITERATIONS)
+            .filter(|count| (MIN_ITERATIONS..=MAX_ITERATIONS).contains(&count.get()))
             .ok_or(ScramError::Iterations(iterations))?;
 
         let hash = self.hash;
@@ -341,6 +350,20 @@ mod tests {
         assert_eq!(
             start().client_final("r=abcdef,s=c2FsdA==,i=0").err(),
             Some(ScramError::Iterations(0))
+        );
+        // Below RFC 7677's floor the derived key is cheap to attack from a
+        // captured transcript, so the exchange stops rather than obeying.
+        assert_eq!(
+            start()
+                .client_final(&format!("r=abcdef,s=c2FsdA==,i={}", MIN_ITERATIONS - 1))
+                .err(),
+            Some(ScramError::Iterations(MIN_ITERATIONS - 1))
+        );
+        assert!(
+            start()
+                .client_final(&format!("r=abcdef,s=c2FsdA==,i={MIN_ITERATIONS}"))
+                .is_ok(),
+            "the floor itself is acceptable"
         );
         assert_eq!(
             start()
