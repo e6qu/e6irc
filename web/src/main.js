@@ -29,6 +29,7 @@ import { serializeComposerRequest } from "./composer-request.js";
 import {
   NetworkRequestError,
   createNetworkBody,
+  preflightNetworkBody,
   updateNetworkBody,
 } from "./network-request.js";
 import { parseUiEvent } from "./ui-event.js";
@@ -49,7 +50,6 @@ import {
   nickPrefix,
   parseIrc,
   reconcileChannelSnapshot,
-  serverBufferText,
   splitSigil,
   stripFormatting,
   stripSigil,
@@ -109,6 +109,11 @@ const alertsEl = el("alerts");
 const sidebarToggle = el("sidebar-toggle");
 const sidebarEl = el("sidebar");
 const settingsEl = el("settings");
+// A disclosure used as a menu over the conversation: clicking away closes it,
+// as every other menu does. Escape is handled with the other keys below.
+document.addEventListener("pointerdown", (event) => {
+  if (settingsEl?.open && !settingsEl.contains(event.target)) settingsEl.open = false;
+});
 const jumpLatestButton = el("jump-latest");
 const sendButton = composer.querySelector("button[type=submit]");
 const joinInput = el("join-input");
@@ -191,26 +196,17 @@ function clearAlert(key) {
   alertsEl.querySelector(`[data-alert="${CSS.escape(key)}"]`)?.remove();
 }
 
+// A setting that could not be stored is reported once, as an alert: the same
+// sentence also sat inside the Preferences menu, where it was invisible unless
+// the menu happened to be open -- two places to keep in step, one of them
+// unreadable.
 function persistSetting(key) {
   const warning = saveSetting(() => window.localStorage, key, settings[key]);
-  const storageState = el("storage-state");
-  if (warning) {
-    storageState.textContent = warning;
-    storageState.hidden = false;
-    showAlert("storage", warning);
-  } else {
-    storageState.textContent = "";
-    storageState.hidden = true;
-    clearAlert("storage");
-  }
+  if (warning) showAlert("storage", warning);
+  else clearAlert("storage");
 }
 
-if (loadedSettings.warning) {
-  const storageState = el("storage-state");
-  storageState.textContent = loadedSettings.warning;
-  storageState.hidden = false;
-  showAlert("storage", loadedSettings.warning);
-}
+if (loadedSettings.warning) showAlert("storage", loadedSettings.warning);
 // "light"/"dark" force the theme via data-theme (CSS overrides prefers-color-
 // scheme); "auto" removes it so the OS preference applies.
 function applyTheme() {
@@ -801,15 +797,15 @@ bufferActionEl.addEventListener("click", () => {
     return;
   }
   if (!socket || socket.readyState !== WebSocket.OPEN) {
-    addServer(`Not connected — ${buffer.display} was not left.`);
+    showAlert("send", `Not connected — ${buffer.display} was not left.`, "error");
     return;
   }
   try {
     if (!sendComposer("", `/part ${buffer.display}`)) {
-      addServer(`Not connected — ${buffer.display} was not left.`);
+      showAlert("send", `Not connected — ${buffer.display} was not left.`, "error");
     }
   } catch {
-    addServer(`The request to leave ${buffer.display} was not sent.`);
+    showAlert("send", `The request to leave ${buffer.display} was not sent.`, "error");
   }
 });
 
@@ -1021,8 +1017,6 @@ function handleLine(raw) {
       if (m.params[0]) {
         myNick = m.params[0];
         addServer(`connected as ${myNick}`, raw);
-      } else {
-        addServer(raw, raw);
       }
       break;
     case "PRIVMSG":
@@ -1033,7 +1027,6 @@ function handleLine(raw) {
         (candidate) => buffers.get(fold(candidate))?.kind === "channel",
       );
       if (!route) {
-        addServer(raw, raw);
         break;
       }
       const text = m.params[1] ?? "";
@@ -1053,7 +1046,6 @@ function handleLine(raw) {
     case "JOIN": {
       const channels = membershipTargets(m.params[0]);
       if (!channels.length) {
-        addServer(raw, raw);
         break;
       }
       for (const channel of channels) {
@@ -1069,7 +1061,6 @@ function handleLine(raw) {
           addNick(channel, m.nick);
           addEvent(channel, `${m.nick} joined`);
         } else {
-          addServer(raw, raw);
           break;
         }
       }
@@ -1078,7 +1069,6 @@ function handleLine(raw) {
     case "PART": {
       const channels = membershipTargets(m.params[0]);
       if (!channels.length || !m.nick) {
-        addServer(raw, raw);
         break;
       }
       const reason = m.params[1] ? ` (${m.params[1]})` : "";
@@ -1096,7 +1086,6 @@ function handleLine(raw) {
     case "KICK": {
       const pairs = kickPairs(m.params[0], m.params[1]);
       if (!pairs.length) {
-        addServer(raw, raw);
         break;
       }
       const reason = m.params[2] ? ` (${m.params[2]})` : "";
@@ -1116,7 +1105,7 @@ function handleLine(raw) {
       if (m.nick) {
         const reason = m.params[0] ? ` (${m.params[0]})` : "";
         removeNickEverywhere(m.nick, `${stripSigil(m.nick, channelModes)} quit${reason}`);
-      } else addServer(raw, raw);
+      }
       break;
     case "005": {
       // RPL_ISUPPORT: the network's own PREFIX and CHANMODES replace the
@@ -1126,7 +1115,6 @@ function handleLine(raw) {
       if (malformed.length) {
         addServer(`Ignored unreadable ISUPPORT ${malformed.join(" ")}; channel modes keep the previous table.`);
       }
-      addServer(serverBufferText(m, raw, myNick), raw);
       break;
     }
     case "MODE": {
@@ -1137,7 +1125,6 @@ function handleLine(raw) {
           if (argument && isPrefixMode(channelModes, mode)) setNickMode(chan, argument, mode, adding);
         }
       } else {
-        addServer(serverBufferText(m, raw, myNick), raw);
       }
       break;
     }
@@ -1145,25 +1132,23 @@ function handleLine(raw) {
       if (m.nick && m.params[0]) {
         renameNick(m.nick, m.params[0]);
         if (isMe(m.nick)) myNick = m.params[0];
-      } else addServer(raw, raw);
+      }
       break;
     case "TOPIC":
       if (m.params[0] && m.params[1] !== undefined) {
         setTopic(m.params[0], m.params[1]);
         addEvent(m.params[0], `${m.nick || "?"} set the topic`);
-      } else addServer(raw, raw);
+      }
       break;
     case "332": { // RPL_TOPIC: <me> <chan> :topic
       const reply = topicReply(m.params);
       if (reply) setTopic(reply.channel, reply.topic);
-      else addServer(raw, raw);
       break;
     }
     case "353": {
       // RPL_NAMREPLY: <me> <sym> <chan> :n1 n2 ...
       const chan = m.params[2];
       if (!chan) {
-        addServer(raw, raw);
         break;
       }
       const buffer = ensureBuffer(chan, "channel");
@@ -1187,13 +1172,12 @@ function handleLine(raw) {
         buffer.membershipKnown = true;
         namesSnapshots.delete(buffer.key);
         if (buffer.key === active) renderNickList();
-      } else addServer(raw, raw);
+      }
       break;
     }
     default:
       // Numerics and everything else land in the server buffer: a numeric's
       // human text, a command with its source and subject.
-      addServer(serverBufferText(m, raw, myNick), raw);
   }
 }
 
@@ -1283,15 +1267,25 @@ async function reconcileUnavailableNetwork() {
       }
       return;
     }
+    const disabled = replacement?.enabled === false;
     const reason = replacement
-      ? `${replacement.name} is disabled or cannot run on this server.`
+      ? disabled
+        ? `${replacement.name} is disabled.`
+        : `${replacement.name} cannot run on this server.`
       : `No network named ${network} belongs to this account.`;
     setStatus(`${network} unavailable`, "error");
     showAlert(
       "network-unavailable",
-      `${reason} Choose another network or update its configuration.`,
+      `${reason} ${disabled ? "Enable it to carry on." : "Choose another network or update its configuration."}`,
       "error",
-      { href: "/console/networks", label: "Manage networks" },
+      // A disabled network is enabled here, as it is at startup: this used to
+      // send the reader to a page that could not bring them back.
+      disabled
+        ? {
+            label: `Enable ${replacement.name}`,
+            onClick: (event) => void setNetworkEnabled(replacement.name, true, event.currentTarget),
+          }
+        : { href: "/console/networks", label: "Manage networks" },
     );
   } catch (error) {
     setStatus(`${network} unavailable`, "error");
@@ -1357,15 +1351,11 @@ function connect() {
     clearAlert("socket-close");
     clearAlert("network-unavailable");
   });
-  liveSocket.addEventListener("error", () => {
-    if (socket !== liveSocket) return;
-    showAlert(
-      "socket",
-      `The live connection to ${network} failed. e6irc keeps retrying, waiting longer each time.`,
-      "error",
-      { label: "Retry now", onClick: retryConnectionNow },
-    );
-  });
+  // No alert here: a `close` always follows, and its wording is the one this
+  // alert carries. Two sentences under one key alternated, so the repeat guard
+  // never matched, a dismissed alert came back within the second, and a screen
+  // reader re-announced the outage on every backoff.
+  liveSocket.addEventListener("error", () => {});
   liveSocket.addEventListener("close", (event) => {
     if (socket !== liveSocket) return;
     socket = null;
@@ -1490,19 +1480,17 @@ composer.addEventListener("submit", (e) => {
   let text = messageInput.value;
   if (!text) return;
   if (/^\/help\s*$/i.test(text)) {
-    // The help dialog's list is the one copy of the command reference.
-    const commands = Array.from(document.querySelectorAll("#help-commands code"), (code) => code.textContent);
-    addServer(`Commands: ${commands.join(" · ")}. Other slash commands pass through as IRC commands.`);
-    setActive(SERVER);
+    // The dialog is the one copy of the command reference; printing a worse
+    // one into the console also threw the reader out of their conversation.
     messageInput.value = "";
+    helpDialog?.showModal();
     return;
   }
   const query = text.match(/^\/query(?:\s+(\S+))?(?:\s+([\s\S]+))?$/i);
   if (query) {
     const [, nick, message] = query;
     if (!nick) {
-      addServer("/query requires a nickname; nothing was sent.");
-      setActive(SERVER);
+      showAlert("send", "/query needs a nickname: /query <nick> [message]. Nothing was sent.", "error");
       return;
     }
     setActive(ensureBuffer(nick, "dm").display);
@@ -1513,7 +1501,7 @@ composer.addEventListener("submit", (e) => {
     text = message;
   }
   if (!socket || socket.readyState !== WebSocket.OPEN) {
-    addServer("Not connected — your message was not sent.");
+    showAlert("send", "Not connected — your message was not sent.", "error");
     return;
   }
   // The server maps correlated {id, target, message} requests (including
@@ -1571,13 +1559,13 @@ composer.addEventListener("submit", (e) => {
 // True when the request entered the live connection.
 function requestJoin(chan) {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
-    addServer("Not connected — cannot join yet.");
+    showAlert("send", "Not connected — cannot join yet.", "error");
     return false;
   }
   rememberRequestedJoins(chan);
   try {
     if (!sendComposer("", `/join ${chan}`)) {
-      addServer("Not connected — cannot join yet.");
+      showAlert("send", "Not connected — cannot join yet.", "error");
       return false;
     }
   } catch {
@@ -1625,13 +1613,10 @@ function renderNetworkList(networks, failure = null) {
     networksEl.append(row);
     return;
   }
-  if (!networks.length) {
-    const row = document.createElement("li");
-    row.className = "network-row network-row-empty";
-    row.textContent = "No networks yet — add one with +.";
-    networksEl.append(row);
-    return;
-  }
+  // An account with no networks gets one explanation, not two: the picker
+  // filling the pane beside this rail says the same sentence and carries the
+  // button that acts on it, so a second copy here was only more to read.
+  if (!networks.length) return;
   for (const item of networks) {
     const row = document.createElement("li");
     row.className = "network-row";
@@ -1657,6 +1642,7 @@ function renderNetworkList(networks, failure = null) {
     // words. Both failures it can park on are fixed in this network's settings,
     // which is the control immediately beside this text.
     const help = networkStateHelp(item);
+    let rowNote = null;
     if (networkStateIsFailure(item)) {
       row.classList.add("is-failed");
       state.classList.add("network-state-failed");
@@ -1664,12 +1650,14 @@ function renderNetworkList(networks, failure = null) {
     if (help) {
       // The label above replaces the link's text for assistive technology, so
       // the repair sentence is attached as its description instead of lost.
+      // On the row, not inside the link: as a child of the link, clicking the
+      // sentence that names the repair reloaded the network instead.
       const note = document.createElement("span");
       note.className = "network-help";
       note.id = `network-help-${networksEl.children.length}`;
       note.textContent = help;
       open.setAttribute("aria-describedby", note.id);
-      open.append(note);
+      rowNote = note;
     }
 
     // Enabling is where the network is, not in a separate administration page:
@@ -1700,6 +1688,8 @@ function renderNetworkList(networks, failure = null) {
     }
 
     row.append(open, power, cog);
+    // Last, so it wraps onto its own line under the controls it names.
+    if (rowNote) row.append(rowNote);
     networksEl.append(row);
   }
 }
@@ -1736,6 +1726,16 @@ async function setNetworkEnabled(name, enabled, button) {
 
 function setDialogError(message) {
   const box = el("nf-error");
+  if (!box) return;
+  box.textContent = message || "";
+  box.hidden = !message;
+}
+
+// What a connection test found. It goes in the dialog rather than the console
+// because the console belongs to a network, and a test is run before there is
+// one -- reported there, the first test of a first network reported nowhere.
+function setDialogResult(message) {
+  const box = el("nf-result");
   if (!box) return;
   box.textContent = message || "";
   box.hidden = !message;
@@ -1876,6 +1876,7 @@ async function openNetworkDialog(name = null) {
   dialogOpening += 1;
   const opening = dialogOpening;
   setDialogError("");
+  setDialogResult("");
   clearFieldMarks();
   networkForm.reset();
   hideRevealedSecrets();
@@ -1887,6 +1888,10 @@ async function openNetworkDialog(name = null) {
     ? "The name of a network cannot be changed."
     : "A short label for this connection.";
   el("nf-preset-row").hidden = editing;
+  // A stored password is never sent back here, so a test on an existing
+  // network would judge a connection nobody configured.
+  const test = el("nf-test");
+  if (test) test.hidden = editing;
   el("nf-clear-row").hidden = !editing;
   el("nf-clear-server-password-row").hidden = !editing;
   // Editing shows the whole connection: the server, TLS, and the names sent to
@@ -2027,7 +2032,19 @@ if (networkForm) {
       if (!editing) {
         // A network was added to be used: open it rather than asking the
         // person to find the row that just appeared.
-        window.location.assign(`/?network=${encodeURIComponent(name)}`);
+        network = name;
+        window.history.replaceState(null, "", `/?network=${encodeURIComponent(name)}`);
+        let networks = [];
+        let listFailure = null;
+        try {
+          networks = networksFrom(await apiGet("/api/v1/me/networks"));
+          clearAlert("networks");
+        } catch (listError) {
+          listFailure = listError;
+        }
+        renderNetworkList(networks, listFailure);
+        keepNetworkListCurrent();
+        openChosenNetwork(networks, listFailure);
         return;
       }
       // Saving restarts the driver, so the list is stale the moment it returns.
@@ -2041,6 +2058,66 @@ if (networkForm) {
     }
   });
 }
+
+// The fields as typed, shared by Save and Test connection.
+function networkDialogFields() {
+  return {
+    name: el("nf-name").value.trim(),
+    addr: el("nf-addr").value,
+    tls: el("nf-tls").checked,
+    nick: el("nf-nick").value.trim(),
+    username: el("nf-username").value,
+    realname: el("nf-realname").value,
+    autojoin: el("nf-autojoin").value,
+    account: el("nf-sasl-account").value.trim(),
+    password: el("nf-sasl-password").value,
+    serverPassword: el("nf-server-password").value,
+  };
+}
+
+// Test what was typed without storing it: the one moment a test helps is
+// before a network exists, because afterwards the network reports its own
+// state. The result says which SASL mechanism logged in.
+const testButton = el("nf-test");
+testButton?.addEventListener("click", () => {
+  void (async () => {
+    setDialogError("");
+    setDialogResult("");
+    clearFieldMarks();
+    let body;
+    try {
+      body = preflightNetworkBody(networkDialogFields());
+    } catch (error) {
+      if (!(error instanceof NetworkRequestError)) throw error;
+      setDialogError(error.message);
+      markFieldAtFault(error.field);
+      return;
+    }
+    const was = testButton.textContent;
+    testButton.disabled = true;
+    testButton.textContent = "Testing…";
+    try {
+      const result = await apiSend("POST", "/api/v1/me/network-preflight", body);
+      const mechanism = result.result?.sasl_mechanism;
+      setDialogError("");
+      setDialogResult(
+        `Connection test succeeded: registered as ${result.result?.confirmed_nick}` +
+          `${mechanism ? `, logged in with SASL ${mechanism}` : ", without SASL"}.` +
+          " Nothing was saved.",
+      );
+      testButton.textContent = "Test succeeded";
+    } catch (error) {
+      setDialogError(errorMessage("test the connection", error));
+      if (error instanceof ApiError && error.field) markFieldAtFault(error.field);
+      testButton.textContent = was;
+    } finally {
+      testButton.disabled = false;
+      window.setTimeout(() => {
+        if (testButton.textContent === "Test succeeded") testButton.textContent = was;
+      }, 4000);
+    }
+  })();
+});
 
 el("nf-cancel")?.addEventListener("click", () => networkDialog?.close());
 el("network-add")?.addEventListener("click", () => void openNetworkDialog(null));
@@ -2142,7 +2219,14 @@ function renderNetworkListKeepingFocus(networks) {
   const focused = document.activeElement;
   const row = focused instanceof HTMLElement && networksEl.contains(focused) ? focused.closest(".network-row") : null;
   const name = row?.dataset.network ?? null;
-  const control = focused?.classList.contains("network-cog") ? ".network-cog" : ".network-open";
+  // Which control the person was on, so a re-render puts them back on it.
+  // Enable/Disable fell through to the row's link: a second Enter — the
+  // natural "did that work?" keypress — reloaded the whole client.
+  const control = focused?.classList.contains("network-cog")
+    ? ".network-cog"
+    : focused?.classList.contains("network-power")
+      ? ".network-power"
+      : ".network-open";
   renderNetworkList(networks);
   if (name === null) return;
   const again = Array.from(networksEl.querySelectorAll(".network-row")).find((item) => item.dataset.network === name);
@@ -2151,8 +2235,19 @@ function renderNetworkListKeepingFocus(networks) {
 
 async function refreshNetworkList() {
   try {
-    renderNetworkListKeepingFocus(networksFrom(await apiGet("/api/v1/me/networks")));
+    const networks = networksFrom(await apiGet("/api/v1/me/networks"));
+    renderNetworkListKeepingFocus(networks);
     clearAlert("networks");
+    const open = network && networks.find((item) => fold(item.name) === fold(network));
+    // Enabled from somewhere else — the console, another browser, an
+    // administrator — this client used to sit on "unavailable" until a reload.
+    if (terminalSocket && open && open.enabled !== false && open.runtime != null) {
+      clearAlert("network-unavailable");
+      connect();
+    }
+    // The landing page is a snapshot; without this it went on saying that
+    // nothing is running after a network was enabled from the row beside it.
+    if (!network) renderLanding(networks);
   } catch (error) {
     const expired = error instanceof ApiError && error.status === 401;
     showAlert(
@@ -2169,6 +2264,10 @@ async function refreshNetworkList() {
   }
 }
 function keepNetworkListCurrent() {
+  // Idempotent: opening a network after the landing page has already started
+  // following the server would otherwise leave a second interval and a second
+  // visibility listener running for the life of the tab.
+  if (networkListTimer !== null) return;
   const refreshWhenShown = () => {
     if (document.visibilityState === "visible" && !networkDialog?.open) void refreshNetworkList();
   };
@@ -2187,6 +2286,11 @@ async function loadEarlier() {
   const b = buffers.get(active);
   if (!network || !b || b.kind === "server" || b.historyLoaded) return;
   const btn = el("load-earlier");
+  const restore = () => {
+    if (!btn) return;
+    btn.disabled = false;
+    btn.textContent = "Load earlier messages";
+  };
   if (btn) {
     btn.disabled = true;
     btn.textContent = "Loading…";
@@ -2203,10 +2307,7 @@ async function loadEarlier() {
     const message = errorMessage("load earlier messages", error);
     addServer(message);
     showAlert("history", message, "error");
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = "Load earlier messages";
-    }
+    restore();
     return;
   }
   const rebuilt = [];
@@ -2236,6 +2337,10 @@ async function loadEarlier() {
   // Stable msgids suppress true overlap; unidentified rows are retained.
   b.lines = mergeTimeline(rebuilt, b.lines, MAX_LOADED_LINES);
   b.historyLoaded = true;
+  // The control is one node shared by every conversation: left as it was
+  // during the request, it stayed disabled and reading "Loading…" for the rest
+  // of the page's life, and no other conversation could load its history.
+  restore();
   // Loading older context is an explicit reader action. Keep that context in
   // view instead of snapping back to the live edge where it cannot be seen.
   if (b.key === active) renderActive({ atLatest: false });
@@ -2290,7 +2395,10 @@ if (notifyBtn) {
         return;
       }
       if (perm !== "granted") {
-        addServer("Notification permission was not granted.");
+        showAlert(
+          "notifications",
+          "The browser did not grant notification permission, so notifications stay off.",
+        );
         return;
       }
       settings.notifications = true;
@@ -2306,8 +2414,6 @@ updateSettingsUI();
 // ---- boot ---------------------------------------------------------------
 
 async function boot() {
-  ensureBuffer(SERVER, "server");
-  setActive(SERVER);
   setComposerAvailable(false);
 
   try {
@@ -2376,6 +2482,15 @@ async function boot() {
     return;
   }
 
+  openChosenNetwork(networks, networkFailure);
+}
+
+// Everything that opening a network means: check it can be opened, say why
+// when it cannot, seed what the connection needs, and open the socket. Boot
+// runs it for the network in the address; adding one runs it for the network
+// just created, so a new network opens without reloading the page -- a reload
+// throws away an unsent message and races whatever the person does next.
+function openChosenNetwork(networks, networkFailure) {
   if (!networkFailure) {
     const selected = networks.find((item) => fold(item.name) === fold(network));
     if (!selected) {
@@ -2420,6 +2535,11 @@ async function boot() {
       selected.kind === "local";
   }
 
+  // The console belongs to a network's connection: with none chosen, creating
+  // it put a conversation in the list for a network that does not exist, and
+  // opening it replaced the "add a network" page with an empty pane.
+  ensureBuffer(SERVER, "server");
+  setActive(SERVER);
   connect();
 }
 

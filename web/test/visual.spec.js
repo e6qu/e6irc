@@ -80,6 +80,38 @@ const apiContract = {
         }) },
       },
     },
+    "/api/v1/me/network-preflight": {
+      post: {
+        requestBody: { required: true, content: { "application/json": { schema: {
+          type: "object", additionalProperties: false,
+          required: ["addr", "tls", "nick", "username", "realname"],
+          properties: {
+            addr: { type: "string" }, tls: { type: "boolean" }, nick: { type: "string" },
+            username: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$" },
+            realname: { type: "string" },
+            autojoin: { type: "array", items: { type: "string" } },
+            sasl_account: { type: "string" }, sasl_password: { type: "string" },
+            server_password: { type: "string" },
+          },
+        } } } },
+        responses: { 200: response({
+          type: "object", additionalProperties: false, required: ["ok", "result"],
+          properties: {
+            ok: { const: true },
+            result: {
+              type: "object", additionalProperties: false,
+              required: ["resolved_addresses", "dns_ms", "connect_ms", "registration_ms", "confirmed_nick", "sasl_mechanism"],
+              properties: {
+                resolved_addresses: { type: "integer" }, dns_ms: { type: "integer" },
+                connect_ms: { type: "integer" }, registration_ms: { type: "integer" },
+                confirmed_nick: { type: "string" },
+                sasl_mechanism: { type: ["string", "null"] },
+              },
+            },
+          },
+        }) },
+      },
+    },
   },
 };
 
@@ -335,56 +367,6 @@ test("console phone navigation reveals the active destination", async ({ page })
   await expectAccessible(page);
 });
 
-test("console adds a known network from a nickname alone, with no forced test", async ({ page }) => {
-  const form = await consoleTemplate("console_networks.html", {
-    "shell.csrf": "test-csrf", "preset.id": "libera", "preset.name": "libera", "preset.label": "Libera Chat",
-    "preset.addr": "irc.libera.chat:6697", "form.name": "libera", "form.addr": "irc.libera.chat:6697", "form.nick": "alice",
-  });
-  await mountConsoleRuntime(page, `<main>${form}</main>`, await consoleStyles(), { "/api/v1/me/networks": { networks: [] } });
-
-  const add = page.getByRole("button", { name: "Add network", exact: true });
-  const advanced = page.locator("[data-network-advanced]");
-  await expect(add).toBeEnabled();
-  await expect(advanced).not.toHaveAttribute("open");
-  expect(await page.locator("form[data-api-owner-network-create] label > span:first-of-type").allTextContents()).toEqual([
-    "IRC network", "Nickname", "NickServ account optional", "NickServ password optional", "Channels to join optional",
-    "Name", "Server", "Use TLSRecommended for public IRC networks.", "Username optional", "Real name optional",
-    "Server password optional",
-  ]);
-  await expect(page.locator('input[name="server_password"]')).toHaveAttribute("autocomplete", "new-password");
-  await expectAccessible(page);
-
-  await add.click();
-  await expect.poll(() => page.evaluate(() => window.consoleApiMutations)).toEqual([{
-    method: "POST", url: "/api/v1/me/networks", json: {
-      kind: "irc", name: "libera", addr: "irc.libera.chat:6697", tls: false, nick: "alice", username: "alice", realname: "alice",
-      autojoin: [], sasl_account: null, sasl_password: null,
-    },
-  }]);
-
-  // A custom server is the one case that needs the advanced fields, and a
-  // missing one must never refuse the submission from inside closed details.
-  await page.locator('select[name="preset"]').selectOption("custom");
-  await expect(advanced).toHaveAttribute("open");
-  const name = page.locator('input[name="name"]');
-  await name.fill("");
-  await advanced.evaluate((node) => { node.open = false; });
-  await add.click();
-  await expect(advanced).toHaveAttribute("open");
-  await expect(name).toBeFocused();
-  expect(await page.evaluate(() => window.consoleApiMutations.length)).toBe(1);
-
-  // Testing stays available, needs no name, and sends what Add would.
-  await page.getByLabel("Real name").fill("Alice Example");
-  await page.getByRole("button", { name: "Test connection", exact: true }).click();
-  await expect.poll(() => page.evaluate(() => window.consoleApiMutations.at(-1))).toEqual({
-    method: "POST", url: "/api/v1/me/network-preflight", json: {
-      addr: "irc.libera.chat:6697", tls: false, nick: "alice", username: "alice", realname: "Alice Example",
-      autojoin: [], sasl_account: null, sasl_password: null,
-    },
-  });
-});
-
 test("console bridge editor sends only the fields the contract declares for a bridge", async ({ page }) => {
   const editor = await consoleTemplate("console_bridge_edit.html", { name: "team", "shell.csrf": "test-csrf" });
   const network = {
@@ -638,8 +620,12 @@ test("chat preferences are keyboard-dismissible and retain their trigger focus",
 });
 
 test("the selected conversation exposes current navigation state", async ({ page }) => {
-  await mockSession(page, []);
-  await page.goto("/");
+  // The console belongs to a network's connection, so one is open here.
+  await mockSession(page, [{
+    name: "Libera", kind: "irc", nick: "viewer", enabled: true, connected: true,
+    runtime: { state: "connected", last_error: null },
+  }]);
+  await page.goto("/?network=Libera");
 
   const server = page.getByRole("button", { name: "Open console" });
   await expect(server).toHaveAttribute("aria-current", "true");
@@ -1101,12 +1087,69 @@ test("a refused network field is marked, revealed, and focused", async ({ page }
   await expectAccessible(page);
 });
 
-test("adding a network asks only what a known network cannot supply, and carries the session token", async ({ page }) => {
+/// Testing a connection before it is saved was the console form's one unique
+/// control; it belongs where networks are now added.
+test("the add dialog tests a connection without saving it, and says how it logged in", async ({ page }) => {
   await mockSession(page, []);
+  let tested;
+  await page.route(/\/api\/v1\/me\/network-preflight$/, async (route) => {
+    tested = route.request().postDataJSON();
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ok: true,
+        result: {
+          resolved_addresses: 2, dns_ms: 4, connect_ms: 30, registration_ms: 120,
+          confirmed_nick: "visual", sasl_mechanism: "SCRAM-SHA-512",
+        },
+      }),
+    });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Add a network", exact: true }).last().click();
+  const dialog = page.getByRole("dialog", { name: "Add a network" });
+  await dialog.locator("#nf-nick").fill("visual");
+  await dialog.locator("#nf-sasl-account").fill("visual-account");
+  await dialog.locator("#nf-sasl-password").fill("correct horse");
+  await dialog.getByRole("button", { name: "Test connection", exact: true }).click();
+
+  await expect.poll(() => tested).toEqual({
+    addr: "irc.libera.chat:6697",
+    tls: true,
+    nick: "visual",
+    username: "visual",
+    realname: "visual",
+    autojoin: [],
+    sasl_account: "visual-account",
+    sasl_password: "correct horse",
+  });
+  // The result is reported in the dialog: a test runs before there is any
+  // network, so there is no console for it to be reported into.
+  await expect(dialog.locator("#nf-result")).toContainText("logged in with SASL SCRAM-SHA-512");
+  // Nothing was stored: the dialog is still open, on the same fields.
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator("#nf-sasl-account")).toHaveValue("visual-account");
+});
+
+test("adding a network asks only what a known network cannot supply, and carries the session token", async ({ page }) => {
+  // The socket the new network opens once it is created, so the client reaches
+  // the state a person sees after adding one: a live connection, not a page
+  // that reloaded itself.
+  let sockets = 0;
+  await page.routeWebSocket(/\/ws\/ui/, () => { sockets += 1; });
+  // The list the mocked API answers with: creating a network adds to it, as
+  // the server would, so what happens next is what happens to a real account.
+  const stored = [];
+  await mockSession(page, stored);
   let created;
   await page.route(/\/api\/v1\/me\/networks$/, async (route) => {
     if (route.request().method() !== "POST") return route.fallback();
     created = { csrf: await route.request().headerValue("x-e6irc-csrf"), body: route.request().postDataJSON() };
+    stored.push({
+      name: "libera", kind: "irc", nick: "visual-test", enabled: true, connected: true,
+      runtime: { state: "connected", attached_clients: 0, errors: 0, last_error: null },
+    });
     return route.fulfill({
       status: 201,
       contentType: "application/json",
@@ -1145,9 +1188,18 @@ test("adding a network asks only what a known network cannot supply, and carries
   await expect(dialog.locator("#nf-username")).toHaveAttribute("aria-invalid", "true");
   expect(created).toBeUndefined();
   await dialog.locator("#nf-username").fill("visual");
+  // Survives only if this document does: the new network must open in place,
+  // because a reload throws away an unsent message and whatever else the tab
+  // was holding.
+  await page.evaluate(() => { window.__sameDocument = true; });
   await dialog.getByRole("button", { name: "Save" }).click();
 
   await expect(page).toHaveURL(/\?network=libera$/);
+  // The network opens: its console conversation, and the composer live.
+  await expect(page.locator("#buffers")).toContainText("console");
+  await expect(page.locator("#message")).toBeEnabled();
+  expect(sockets).toBe(1);
+  expect(await page.evaluate(() => window.__sameDocument)).toBe(true);
   expect(created).toEqual({
     csrf: "session-bound-token",
     body: {
@@ -1266,8 +1318,11 @@ test("network picker keeps recovery controls usable in forced colors", async ({ 
 
 test("phone conversation rail returns focus after Escape", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  await mockSession(page, []);
-  await page.goto("/");
+  await mockSession(page, [{
+    name: "Libera", kind: "irc", nick: "viewer", enabled: true, connected: true,
+    runtime: { state: "connected", last_error: null },
+  }]);
+  await page.goto("/?network=Libera");
 
   const conversations = page.getByRole("button", { name: "Conversations" });
   await conversations.click();

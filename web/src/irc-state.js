@@ -291,20 +291,6 @@ export function asMessage(kind, from, text) {
   return { kind, from, text: stripFormatting(text) };
 }
 
-// What a line that is not conversation reads as in the server buffer. A
-// numeric carries its human text last, so that is shown. Any other command
-// from a user keeps its subject: `:alice INVITE me :#secret` used to render as
-// "#secret", with no trace of who or what.
-export function serverBufferText(message, raw, ownNick) {
-  const { command, nick, params } = message;
-  if (command === "INVITE" && nick && params.length >= 2) {
-    const invitee = ownNick && fold(params[0]) === fold(ownNick) ? "you" : params[0];
-    return `${nick} invited ${invitee} to ${params[1]}`;
-  }
-  if (!command || /^\d{3}$/.test(command)) return params.length ? params[params.length - 1] : raw;
-  return [nick, command, ...params].filter((part) => part).join(" ");
-}
-
 // Prepend persisted history without replacing lines already present in the
 // live buffer. The API page and socket replay can share an ordered suffix /
 // prefix even when an upstream supplies no msgid; remove only that exact wire

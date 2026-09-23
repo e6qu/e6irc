@@ -552,6 +552,10 @@ pub struct StorageMaintenanceReport {
     /// Historical monitoring samples past `observability.retention_hours`,
     /// pruned here whether or not sampling is currently on.
     pub observability_samples: u64,
+    /// Read markers -- core (`read_markers`) and bouncer (`bnc_read_markers`)
+    /// together -- that point older than the history retention, where no
+    /// message they could resume from is kept any more.
+    pub read_markers: u64,
     /// At least one collection filled its bounded batch and may have more
     /// expired rows. [`drain_storage_maintenance`] keeps going while this is
     /// set, up to its batch budget.
@@ -583,6 +587,9 @@ impl StorageMaintenanceReport {
             MaintenanceCollection::LogoutTokens => &mut self.logout_tokens,
             MaintenanceCollection::AccountInvitations => &mut self.account_invitations,
             MaintenanceCollection::ObservabilitySamples => &mut self.observability_samples,
+            MaintenanceCollection::ReadMarkers | MaintenanceCollection::BncReadMarkers => {
+                &mut self.read_markers
+            }
         }
     }
 }
@@ -634,10 +641,12 @@ pub enum MaintenanceCollection {
     LogoutTokens,
     AccountInvitations,
     ObservabilitySamples,
+    ReadMarkers,
+    BncReadMarkers,
 }
 
 impl MaintenanceCollection {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 11] = [
         Self::Messages,
         Self::BncBuffer,
         Self::AuditLog,
@@ -647,6 +656,8 @@ impl MaintenanceCollection {
         Self::LogoutTokens,
         Self::AccountInvitations,
         Self::ObservabilitySamples,
+        Self::ReadMarkers,
+        Self::BncReadMarkers,
     ];
 
     pub fn table(self) -> &'static str {
@@ -660,6 +671,8 @@ impl MaintenanceCollection {
             Self::LogoutTokens => "oidc_logout_tokens",
             Self::AccountInvitations => "account_invitations",
             Self::ObservabilitySamples => "observability_samples",
+            Self::ReadMarkers => "read_markers",
+            Self::BncReadMarkers => "bnc_read_markers",
         }
     }
 
@@ -729,6 +742,29 @@ impl MaintenanceCollection {
                      WHERE sampled_at_ms < $1
                      ORDER BY sampled_at_ms LIMIT $2))"
             }
+            // A marker names a position in history. Past the history
+            // retention, nothing it could resume from is stored any more, so
+            // the marker is a row about messages that no longer exist -- and
+            // this table feeds the per-shard mirror built at boot, so its size
+            // is start-up cost too. Composite keys, named by `ctid` within the
+            // statement's own snapshot, as the logout-token sweep does.
+            Self::ReadMarkers => {
+                "DELETE FROM read_markers WHERE ctid = ANY(ARRAY(
+                     SELECT ctid FROM read_markers
+                     WHERE marker_ts < now() - make_interval(days => $1)
+                     ORDER BY marker_ts LIMIT $2))"
+            }
+            // The bouncer's markers store the same instant as ISO-8601 UTC
+            // text, which sorts and compares lexically -- the ordering the
+            // attach layer's own queries are built on.
+            Self::BncReadMarkers => {
+                r#"DELETE FROM bnc_read_markers WHERE ctid = ANY(ARRAY(
+                     SELECT ctid FROM bnc_read_markers
+                     WHERE timestamp < to_char(
+                         (now() - make_interval(days => $1)) AT TIME ZONE 'UTC',
+                         'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+                     ORDER BY timestamp LIMIT $2))"#
+            }
         }
     }
 }
@@ -796,9 +832,10 @@ pub async fn run_storage_maintenance(
     let mut failures = Vec::new();
     for collection in MaintenanceCollection::ALL {
         let bound = match collection {
-            MaintenanceCollection::Messages | MaintenanceCollection::BncBuffer => {
-                RetentionBound::Days(history_days)
-            }
+            MaintenanceCollection::Messages
+            | MaintenanceCollection::BncBuffer
+            | MaintenanceCollection::ReadMarkers
+            | MaintenanceCollection::BncReadMarkers => RetentionBound::Days(history_days),
             MaintenanceCollection::AuditLog => RetentionBound::Days(audit_days),
             MaintenanceCollection::ObservabilitySamples => {
                 RetentionBound::Millis(observability_cutoff_ms)
@@ -814,7 +851,9 @@ pub async fn run_storage_maintenance(
         match query.execute(pool).await {
             Ok(result) => {
                 let deleted = result.rows_affected();
-                *report.slot(collection) = deleted;
+                // Added, not assigned: the two marker tables report through one
+                // counter, and the second would otherwise overwrite the first.
+                *report.slot(collection) += deleted;
                 report.saturated |= deleted == STORAGE_MAINTENANCE_BATCH;
             }
             Err(error) => failures.push(MaintenanceFailure {
@@ -2609,7 +2648,24 @@ async fn run_worker_inner(
         let mut next = Some(envelope.payload);
         while let Some(request) = next.take() {
             match request {
-                DbRequest::LogMessage { .. } => log_batch.push(request),
+                DbRequest::LogMessage { .. } => {
+                    log_batch.push(request);
+                    // A drain of nothing but messages contains no await at all,
+                    // so the batch grew for as long as producers kept the queue
+                    // non-empty — one INSERT sized to the burst, and no yield to
+                    // the runtime meanwhile. A full batch is written here.
+                    if log_batch.len() >= MAX_LOG_BATCH {
+                        let started = Instant::now();
+                        let succeeded =
+                            flush_log_batch(&pool, std::mem::take(&mut log_batch)).await;
+                        if let Some(telemetry) = &telemetry {
+                            telemetry.record_database_request(started.elapsed());
+                            if !succeeded {
+                                telemetry.record_error(crate::observability::ErrorKind::Database);
+                            }
+                        }
+                    }
+                }
                 // Password verification is a pure read of the accounts/credential
                 // tables (never `messages`) with no ordering dependency on any
                 // other request, and its argon2 verify is ~tens of ms. Run it off
@@ -2719,6 +2775,11 @@ async fn run_worker_inner(
 /// Group-insert buffered LogMessage rows. Persistence is best-effort:
 /// chat delivery already happened, so a failed flush is logged loudly and
 /// dropped rather than retried into duplicate rows.
+/// Messages written in one `INSERT … UNNEST`. The drain writes at this size
+/// rather than at whatever a burst accumulated: it bounds the statement and
+/// the vectors built for it, and gives the worker a yield point under load.
+const MAX_LOG_BATCH: usize = 1_024;
+
 async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) -> bool {
     let n = batch.len();
     let (mut msgids, mut targets, mut prefixes, mut accounts, mut kinds, mut bodies, mut tss) = (
@@ -6945,6 +7006,42 @@ pub enum BncHistorySelector {
     Timestamp(String),
 }
 
+/// Which stored lines a paging client can be sent. A `TAGMSG` is nothing but
+/// tags, so a client that did not negotiate `message-tags` cannot receive one
+/// at all -- dropping those rows after the SQL `LIMIT` is what made a page
+/// come back shorter than it asked for, indistinguishable from the end of the
+/// buffer. The scope goes into the query instead, so the `LIMIT` counts only
+/// lines that will reach the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BncHistoryScope {
+    /// The client negotiated `message-tags`: every stored line reaches it.
+    EveryLine,
+    /// The client did not: a tag-only message has nothing left to send.
+    ExceptTagOnly,
+}
+
+impl BncHistoryScope {
+    /// From the one capability that decides it, so no call site can pass the
+    /// scope that disagrees with the client's caps.
+    pub fn for_message_tags(message_tags: bool) -> Self {
+        if message_tags {
+            Self::EveryLine
+        } else {
+            Self::ExceptTagOnly
+        }
+    }
+
+    /// The predicate that keeps only deliverable rows, if any is needed.
+    /// `IS DISTINCT FROM` because `command` is null for a line the frame
+    /// regex cannot read, and such a row is not a TAGMSG.
+    fn sql_predicate(self) -> &'static str {
+        match self {
+            Self::EveryLine => "",
+            Self::ExceptTagOnly => " AND command IS DISTINCT FROM 'TAGMSG'",
+        }
+    }
+}
+
 /// Which window a CHATHISTORY subcommand asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BncHistoryPaging {
@@ -6968,10 +7065,12 @@ type BncPosition = (String, i64);
 /// inclusive; `before` is exclusive. Served by `bnc_buffer_sent_at_idx`
 /// `(owner, network, target, sent_at, id)` as an index range scan under the
 /// LIMIT.
+#[allow(clippy::too_many_arguments)]
 async fn bnc_history_range(
     pool: &PgPool,
     key: &BncBufferKey,
     target: &str,
+    scope: BncHistoryScope,
     after: Option<(&BncPosition, bool)>,
     before: Option<&BncPosition>,
     newest: bool,
@@ -6985,7 +7084,8 @@ async fn bnc_history_range(
         .push(" AND network = ")
         .push_bind(&key.network)
         .push(" AND target = ")
-        .push_bind(target);
+        .push_bind(target)
+        .push(scope.sql_predicate());
     if let Some(((sent_at, id), inclusive)) = after {
         query
             .push(if inclusive {
@@ -7038,6 +7138,7 @@ pub async fn bnc_history_window(
     network: &str,
     target: &str,
     paging: BncHistoryPaging,
+    scope: BncHistoryScope,
     first: &BncHistorySelector,
     second: &BncHistorySelector,
     limit: i64,
@@ -7098,27 +7199,55 @@ pub async fn bnc_history_window(
     let rows = match paging {
         BncHistoryPaging::Latest => {
             let after = first.after.as_ref().map(|p| (p, false));
-            bnc_history_range(pool, key, target, after, None, true, limit).await?
+            bnc_history_range(pool, key, target, scope, after, None, true, limit).await?
         }
         BncHistoryPaging::Before => {
-            bnc_history_range(pool, key, target, None, first.before.as_ref(), true, limit).await?
+            bnc_history_range(
+                pool,
+                key,
+                target,
+                scope,
+                None,
+                first.before.as_ref(),
+                true,
+                limit,
+            )
+            .await?
         }
         BncHistoryPaging::After => {
             let after = first.after.as_ref().map(|p| (p, false));
-            bnc_history_range(pool, key, target, after, None, false, limit).await?
+            bnc_history_range(pool, key, target, scope, after, None, false, limit).await?
         }
         BncHistoryPaging::Around => {
             let older = limit / 2;
             let mut rows = if older > 0 {
-                bnc_history_range(pool, key, target, None, first.before.as_ref(), true, older)
-                    .await?
+                bnc_history_range(
+                    pool,
+                    key,
+                    target,
+                    scope,
+                    None,
+                    first.before.as_ref(),
+                    true,
+                    older,
+                )
+                .await?
             } else {
                 Vec::new()
             };
             let from_pivot = first.before.as_ref().map(|p| (p, true));
             rows.extend(
-                bnc_history_range(pool, key, target, from_pivot, None, false, limit - older)
-                    .await?,
+                bnc_history_range(
+                    pool,
+                    key,
+                    target,
+                    scope,
+                    from_pivot,
+                    None,
+                    false,
+                    limit - older,
+                )
+                .await?,
             );
             rows
         }
@@ -7139,6 +7268,7 @@ pub async fn bnc_history_window(
                 pool,
                 key,
                 target,
+                scope,
                 older.after.as_ref().map(|p| (p, false)),
                 newer.before.as_ref(),
                 first_is_newer,
@@ -7158,28 +7288,37 @@ pub async fn bnc_history_targets(
     pool: &PgPool,
     owner: &str,
     network: &str,
+    scope: BncHistoryScope,
     min_timestamp: &str,
     max_timestamp: &str,
     limit: i64,
 ) -> Result<Vec<(String, String)>, DbError> {
     let key = BncBufferKey::new(owner, network);
-    sqlx::query_as(
-        "SELECT target, max(sent_at)
-         FROM bnc_buffer
-         WHERE owner = $1 AND network = $2 AND target IS NOT NULL
-         GROUP BY target
-         HAVING max(sent_at) > $3 AND max(sent_at) < $4
-         ORDER BY max(sent_at) ASC, max(id) ASC
-         LIMIT $5",
-    )
-    .bind(&key.owner)
-    .bind(&key.network)
-    .bind(min_timestamp)
-    .bind(max_timestamp)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .map_err(query_error)
+    // Same scope as a page: a target whose only backlog is tag-only messages
+    // has nothing to replay to this client, so naming it here would promise a
+    // page that comes back empty. Built with a `QueryBuilder` because the
+    // scope varies the text and sqlx accepts only literal SQL otherwise --
+    // the varying part is a constant of this module, never input.
+    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "SELECT target, max(sent_at) FROM bnc_buffer WHERE owner = ",
+    );
+    query
+        .push_bind(&key.owner)
+        .push(" AND network = ")
+        .push_bind(&key.network)
+        .push(" AND target IS NOT NULL")
+        .push(scope.sql_predicate())
+        .push(" GROUP BY target HAVING max(sent_at) > ")
+        .push_bind(min_timestamp)
+        .push(" AND max(sent_at) < ")
+        .push_bind(max_timestamp)
+        .push(" ORDER BY max(sent_at) ASC, max(id) ASC LIMIT ")
+        .push_bind(limit);
+    query
+        .build_query_as()
+        .fetch_all(pool)
+        .await
+        .map_err(query_error)
 }
 
 // ---- BNC read markers -----------------------------------------------------

@@ -775,6 +775,62 @@ async fn buffered_history_flushes_when_the_sender_is_dropped() {
     );
 }
 
+/// A drain of nothing but messages contains no await, so the batch used to
+/// grow for as long as producers kept the queue full — one statement sized to
+/// the burst, and no yield to the runtime. Writing at a bound holds both.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_flood_of_messages_is_written_in_bounded_batches() {
+    let pool = db::connect_and_migrate(&support::test_db("a_flood_of_messages_is_written").await)
+        .await
+        .expect("connect");
+    let (req_tx, req_rx) = queue::<DbRequest>(QueueConfig {
+        name: "t-db-flood",
+        capacity: 8192,
+        policy: Policy::Fifo,
+    });
+    let (core_tx, _core_rx) = queue::<Input>(QueueConfig {
+        name: "t-core-flood",
+        capacity: 8,
+        policy: Policy::Fifo,
+    });
+    let worker = tokio::spawn(db::run_worker(
+        pool.clone(),
+        req_rx,
+        CoreIngress::single(core_tx),
+    ));
+    // More than one bound's worth, queued before the worker can drain them.
+    let flood = 2_500;
+    for i in 0..flood {
+        req_tx
+            .push(DbRequest::LogMessage {
+                msgid: format!("flood-{i}"),
+                target: "#flood".into(),
+                dm_peers: Vec::new(),
+                sender_prefix: "alice!a@host".into(),
+                sender_account: None,
+                kind: e6ircd::core::MessageKind::Privmsg,
+                body: format!("line {i}"),
+                sender_is_bot: false,
+                multiline: None,
+                ts: e6irc_proto::time::Millis::from_millis(1_700_000_000_000 + i as u64),
+            })
+            .await
+            .expect("enqueue log");
+    }
+    drop(req_tx);
+    tokio::time::timeout(std::time::Duration::from_secs(60), worker)
+        .await
+        .expect("the worker drains the flood")
+        .expect("worker task");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE target = $1")
+        .bind("#flood")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(count, flood as i64, "every flooded row is written");
+}
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn history_worker_tells_an_unknown_msgid_from_an_empty_page() {
@@ -3125,6 +3181,108 @@ async fn concurrent_bnc_read_markers_cannot_exceed_the_account_cap() {
     assert_eq!(count, db::BNC_READ_MARKER_LIMIT);
 }
 
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_history_page_counts_only_lines_the_client_can_receive() {
+    let pool = db::connect_and_migrate(&support::test_db("bnc_history_scope").await)
+        .await
+        .expect("connect");
+    let buffer = db::open_bnc_buffer(
+        &pool,
+        Some("alice"),
+        "libera",
+        db::BncNetworkDefinition::Configured,
+    )
+    .await
+    .expect("open buffer");
+    // Alternating messages and tag-only typing notifications, as a busy channel
+    // produces them: six of the ten stored lines are TAGMSG.
+    for id in 1..=10 {
+        let line = if id % 2 == 0 {
+            format!(
+                "@msgid=m{id};time=2026-01-01T00:00:{id:02}.000Z :n!u@h PRIVMSG #room :body {id}"
+            )
+        } else {
+            format!(
+                "@msgid=m{id};time=2026-01-01T00:00:{id:02}.000Z;+typing=active :n!u@h TAGMSG #room"
+            )
+        };
+        db::persist_bnc_line(&pool, &buffer, Some("alice"), &line)
+            .await
+            .expect("persist");
+    }
+    let page = async |scope, limit| {
+        db::bnc_history_window(
+            &pool,
+            "alice",
+            "libera",
+            "#room",
+            db::BncHistoryPaging::Latest,
+            scope,
+            &db::BncHistorySelector::Star,
+            &db::BncHistorySelector::Star,
+            limit,
+        )
+        .await
+        .expect("query")
+        .expect("LATEST * has no msgid to miss")
+        .into_iter()
+        .map(|row| row.msgid.expect("msgid"))
+        .collect::<Vec<_>>()
+    };
+    // A client with message-tags receives every kind of line, so its page is
+    // the newest four rows whatever they are.
+    assert_eq!(
+        page(db::BncHistoryScope::EveryLine, 4).await,
+        ["m7", "m8", "m9", "m10"],
+    );
+    // A client without it cannot receive a TAGMSG at all. Asking for four must
+    // still yield four lines it can read -- before the scope reached the query,
+    // the TAGMSG rows were cut after the LIMIT and the page came back short.
+    assert_eq!(
+        page(db::BncHistoryScope::ExceptTagOnly, 4).await,
+        ["m4", "m6", "m8", "m10"],
+    );
+    assert_eq!(
+        db::BncHistoryScope::for_message_tags(false),
+        db::BncHistoryScope::ExceptTagOnly,
+    );
+    // The generated column reads the command out of the frame, not out of the
+    // body: a message that merely talks about TAGMSG is still deliverable.
+    db::persist_bnc_line(
+        &pool,
+        &buffer,
+        Some("alice"),
+        "@msgid=m11;time=2026-01-01T00:00:11.000Z :n!u@h PRIVMSG #room :TAGMSG is a command",
+    )
+    .await
+    .expect("persist");
+    assert_eq!(page(db::BncHistoryScope::ExceptTagOnly, 1).await, ["m11"]);
+    // TARGETS answers in the same scope: a conversation whose only backlog is
+    // tag-only messages would otherwise be named and then page back empty.
+    db::persist_bnc_line(
+        &pool,
+        &buffer,
+        Some("alice"),
+        "@msgid=t1;time=2026-01-01T00:00:12.000Z;+typing=active :n!u@h TAGMSG #quiet",
+    )
+    .await
+    .expect("persist");
+    let targets = async |scope| {
+        db::bnc_history_targets(&pool, "alice", "libera", scope, "0000", "9999", 50)
+            .await
+            .expect("targets")
+            .into_iter()
+            .map(|(target, _)| target)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        targets(db::BncHistoryScope::EveryLine).await,
+        ["#room", "#quiet"],
+    );
+    assert_eq!(targets(db::BncHistoryScope::ExceptTagOnly).await, ["#room"]);
+}
+
 /// Every retained line of one alice/libera target, oldest first.
 async fn history_latest(
     pool: &sqlx::PgPool,
@@ -3136,6 +3294,7 @@ async fn history_latest(
         "libera",
         target,
         db::BncHistoryPaging::Latest,
+        db::BncHistoryScope::EveryLine,
         &db::BncHistorySelector::Star,
         &db::BncHistorySelector::Star,
         500,
@@ -7333,6 +7492,31 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     .await
     .expect("observability samples");
 
+    // A marker is a position in history: once history retention has removed
+    // every message that old, it points where nothing can be read from.
+    sqlx::query(
+        "INSERT INTO read_markers (account_id, target, marker_ts)
+         VALUES ($1, '#old', now() - interval '31 days'),
+                ($1, '#new', now())",
+    )
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .expect("read markers");
+    sqlx::query(
+        "INSERT INTO bnc_read_markers (account_id, network, target, timestamp)
+         VALUES ($1, 'libera', '#old',
+                 to_char((now() - interval '31 days') AT TIME ZONE 'UTC',
+                         'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')),
+                ($1, 'libera', '#new',
+                 to_char(now() AT TIME ZONE 'UTC',
+                         'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))",
+    )
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .expect("bouncer read markers");
+
     let retention = db::StorageRetention {
         history_days: 30,
         audit_days: 365,
@@ -7350,6 +7534,8 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     assert_eq!(report.logout_tokens, 1);
     assert_eq!(report.account_invitations, 1);
     assert_eq!(report.observability_samples, 1);
+    // One from each marker table: the counter covers both.
+    assert_eq!(report.read_markers, 2);
     assert!(!report.saturated);
     let counts: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
@@ -7378,6 +7564,18 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
         .await
         .expect("remaining bouncer line");
     assert!(remaining.ends_with("new dm"), "{remaining}");
+    let markers: (String, String) = sqlx::query_as(
+        "SELECT (SELECT target FROM read_markers),
+                (SELECT target FROM bnc_read_markers)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("remaining markers");
+    assert_eq!(
+        markers,
+        ("#new".to_string(), "#new".to_string()),
+        "a marker survives exactly as long as history it could resume from"
+    );
 }
 
 /// A saturated batch every five minutes never catches up with a backlog of
@@ -9153,7 +9351,15 @@ async fn every_bouncer_history_window_has_the_specified_boundary_and_direction()
     let window =
         async |paging, first: db::BncHistorySelector, second: db::BncHistorySelector, limit| {
             db::bnc_history_window(
-                &pool, "alice", "libera", "#ROOM", paging, &first, &second, limit,
+                &pool,
+                "alice",
+                "libera",
+                "#ROOM",
+                paging,
+                db::BncHistoryScope::EveryLine,
+                &first,
+                &second,
+                limit,
             )
             .await
             .expect("query")

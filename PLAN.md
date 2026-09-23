@@ -472,6 +472,50 @@ change fix:
   separate Server log panel and its switch; a network is enabled or disabled
   from the list where it appears.
 
+Sweeping after #342 found, and this change fixes:
+
+- **The same `null` two fields over.** Reviewing every persisted field whose
+  type had changed found `limits.api_rate_burst` and
+  `limits.administrator_api_rate_burst`: `Option<usize>` until API rate limits
+  were made explicit, required since, and stored as `null` by any row written
+  before that release — the crash-loop of 0067 waiting to happen again.
+  Migration 0068 removes both, and the released-settings fixture for that
+  release (`0052-b0084a00a04a.json`, captured by building that release) is now
+  part of the suite that every settings change must still load.
+- **A short CHATHISTORY page read as the end of the buffer.** The attach
+  listener cut its page with a SQL `LIMIT`, then dropped every stored `TAGMSG`
+  for a client that had not negotiated `message-tags` — a request for 100 came
+  back with 87 and no way to tell that from "there is no more". The client's
+  scope is now part of the query (`BncHistoryScope`, built from the one
+  capability that decides it), so the `LIMIT` counts only lines that will be
+  sent; `CHATHISTORY TARGETS` answers in the same scope, so it cannot name a
+  conversation that pages back empty. The command is a generated column
+  (migration 0069) rather than a flag the insert path writes, so it cannot
+  disagree with the line it describes, and it reads the frame rather than the
+  body: a message *about* `TAGMSG` is still delivered.
+- **Read markers were the one collection with no bound.** Capped at 256 per
+  account but unbounded in accounts, and absent from the storage sweep, so the
+  table only grew — and every row of it is read at boot and mirrored into each
+  core shard, making its size the daemon's start-up cost too. Both marker
+  tables are now swept against the history retention (0070): a marker older
+  than that names a position no stored message can be read from.
+- **A storage failure announced itself to the future.** A `BacklogStorage`
+  failure notice was retained in the bouncer's ring, so every client that
+  attached later replayed a failure that was over; it is live-only now, like
+  the other transient notices, and the per-network status dedup keys on the
+  lifecycle rather than the message. The persist-failure log is rate-limited to
+  the transition, and a log batch is bounded at 1,024 rows so a flood cannot
+  hold the writer in one drain.
+- **The UI says things once.** A connection can be tested from the add dialog
+  before anything is stored, and the result is reported in the dialog — it used
+  to be written to the console buffer, which does not exist until a network is
+  open, so the first test of a first network reported nowhere. The storage
+  warning that sat inside the Preferences menu (invisible unless the menu was
+  open) and again as an alert is now only the alert; the sidebar's "no networks
+  yet" is gone, because the picker filling the pane beside it says the same
+  sentence and carries the button that acts on it. Dead rules for three
+  removed screens (`.side-link`, `#raw-output-*`, `.raw-wire`) went with them.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

@@ -499,8 +499,13 @@ fn spawn_persistence(
     use super::DriverEvent;
     let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
     let owner_key = owner.clone().unwrap_or_else(|| "*".to_string());
+    // Subscribed before the task is spawned, not on its first poll: a
+    // broadcast reaches only the receivers that exist when a line is sent, so
+    // anything the driver emitted in between was kept in the ring and never
+    // written to the backlog. The local driver reaches the in-process core
+    // fast enough for that window to be real.
+    let mut events = handle.subscribe();
     let task = tokio::spawn(async move {
-        let mut events = handle.subscribe();
         match crate::db::recent_bnc_lines(&pool, &owner_key, &network, PRELOAD_LIMIT).await {
             Ok(lines) => handle.preload_front(lines),
             Err(e) => {
@@ -534,6 +539,9 @@ fn spawn_persistence(
         // appends is what makes the amortized trim reach every network — see
         // `db::BNC_TRIM_INTERVAL`.
         let mut since_trim = 0u64;
+        // Whether the last write failed, so an outage logs once, and its end
+        // logs once.
+        let mut storage_failing = false;
         loop {
             // A stop is honoured only here, between two writes: a write in
             // progress always completes (or fails) before the task ends.
@@ -578,11 +586,28 @@ fn spawn_persistence(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
-            if let Err(e) =
-                persist_and_trim(&pool, &buffer, own_nick.as_deref(), &line, &mut since_trim).await
+            match persist_and_trim(&pool, &buffer, own_nick.as_deref(), &line, &mut since_trim)
+                .await
             {
-                handle.record_error(super::NetworkFailure::BacklogStorageFailed);
-                eprintln!("bnc: buffer persist or trim failed for {owner_key}/{network}: {e}");
+                Err(e) => {
+                    handle.record_error(super::NetworkFailure::BacklogStorageFailed);
+                    // One line per outage, not one per upstream message: a
+                    // database away for an hour under a busy channel wrote
+                    // stderr at the channel's full rate.
+                    if !storage_failing {
+                        storage_failing = true;
+                        eprintln!(
+                            "bnc: buffer persist or trim failed for {owner_key}/{network}: {e}; \
+                             further failures are counted, not logged, until it stores again"
+                        );
+                    }
+                }
+                Ok(()) => {
+                    if storage_failing {
+                        storage_failing = false;
+                        eprintln!("bnc: buffer storage recovered for {owner_key}/{network}");
+                    }
+                }
             }
         }
     });

@@ -216,6 +216,7 @@ async fn paged(
         &history.network,
         target,
         paging,
+        crate::db::BncHistoryScope::for_message_tags(caps.message_tags),
         &selector,
         &selector2,
         limit,
@@ -318,6 +319,7 @@ async fn targets(
         &history.pool,
         &history.owner,
         &history.network,
+        crate::db::BncHistoryScope::for_message_tags(caps.message_tags),
         &minimum,
         &maximum,
         count,
@@ -388,9 +390,20 @@ async fn reply_lines(
 ) -> std::io::Result<()> {
     let inner: Vec<String> = rows
         .iter()
-        .filter_map(|row| {
-            let line = history_replay_line(row, caps)?;
-            format!("{line}\r\n").into()
+        .map(|row| {
+            // The query already excluded what this client cannot receive, so a
+            // row with nothing left to send means the two disagree -- which
+            // would shorten the page silently, the very fault the scope fixes.
+            // Say so on the wire instead of quietly sending fewer lines.
+            let Some(line) = history_replay_line(row, caps) else {
+                eprintln!(
+                    "bnc: stored backlog line {} is undeliverable inside its own history scope",
+                    row.id,
+                );
+                return ":*bnc* NOTICE * :backlog line omitted: not deliverable to this client\r\n"
+                    .to_string();
+            };
+            format!("{line}\r\n")
         })
         .collect();
     write_batch(write, caps.batch, HistoryBatch::Messages(target), &inner).await

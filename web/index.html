@@ -32,7 +32,6 @@
               </select>
             </label>
             <button id="notify-toggle" type="button">Desktop notifications: off</button>
-            <span id="storage-state" class="settings-note" hidden></span>
           </div>
         </details>
         <nav id="user-nav" aria-label="User">
@@ -254,9 +253,16 @@
           </details>
 
           <p id="nf-error" class="dialog-error" role="alert" hidden></p>
+          <!-- A test says how it went here, beside the button that ran it: the
+               console it used to report into does not exist until a network is
+               open, so the first test of the first network said nothing. -->
+          <p id="nf-result" class="dialog-result" role="status" hidden></p>
 
           <div class="dialog-actions">
             <button type="button" id="nf-cancel">Cancel</button>
+            <!-- Adding a network is the one place a test helps: afterwards the
+                 network itself reports what it is doing. -->
+            <button type="button" id="nf-test">Test connection</button>
             <button type="submit" id="nf-save">Save</button>
           </div>
         </form>

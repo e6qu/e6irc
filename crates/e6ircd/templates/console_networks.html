@@ -23,89 +23,12 @@
           </div>
         {% endif %}
 
-        <section class="panel">
-          <div class="panel-head">
-            <div>
-              <h2>Add an IRC network</h2>
-              <p>Choose a known network, or pick Custom server to enter your own.</p>
-            </div>
-          </div>
         <p id="network-api-result" role="status" aria-live="polite"></p>
-        <noscript><div class="banner-error">JavaScript is required to manage networks because these controls use the network API directly.</div></noscript>
-        <form class="network-form" method="post" action="/api/v1/me/networks" data-network-form data-api-owner-network-create>
-          <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-          <label class="field field-wide">
-            <span>IRC network</span>
-            <select name="preset" data-network-preset>
-              {% for preset in presets %}
-                <option value="{{ preset.id }}" data-name="{{ preset.name }}" data-addr="{{ preset.addr }}" data-tls="{% if preset.tls %}true{% else %}false{% endif %}" {% if form.preset == preset.id %}selected{% endif %}>{{ preset.label }}</option>
-              {% endfor %}
-              <option value="custom" {% if form.preset == "custom" || form.preset == "" %}selected{% endif %}>Custom server</option>
-            </select>
-            <small>Popular-network endpoints come from each network’s published connection guide.</small>
-          </label>
-          <label class="field field-wide">
-            <span>Nickname</span>
-            <input name="nick" autocomplete="nickname" value="{{ form.nick }}" maxlength="64" required />
-          </label>
-          <label class="field">
-            <span>NickServ account <em>optional</em></span>
-            <input name="sasl_account" autocomplete="off" value="{{ form.sasl_account }}" maxlength="255" {% if !can_store_secrets %}disabled{% endif %} />
-          </label>
-          <label class="field">
-            <span>NickServ password <em>optional</em></span>
-            <input type="password" name="sasl_password" autocomplete="new-password" maxlength="512" {% if !can_store_secrets %}disabled{% endif %} />
-          </label>
-          {% if !can_store_secrets %}
-            <div class="banner-info field-wide">
-              <div><strong>NickServ credentials are unavailable.</strong> This deployment has no master key, so e6irc refuses to store passwords in plaintext. Networks that do not require a NickServ account can still be added.</div>
-              {% if shell.is_admin %}<a class="button-link" href="/console/configuration">View configuration</a>{% endif %}
-            </div>
-          {% endif %}
-          <label class="field field-wide">
-            <span>Channels to join <em>optional</em></span>
-            <input name="autojoin" autocomplete="off" value="{{ form.autojoin }}" placeholder="#e6irc, #rust" />
-            <small>Separate channels with commas or spaces.</small>
-          </label>
-          <details class="advanced field-wide" data-network-advanced {% if form.preset == "custom" || form.preset == "" %}open{% endif %}>
-            <summary>Advanced</summary>
-            <div class="field-grid">
-              <label class="field">
-                <span>Name</span>
-                <input name="name" autocomplete="off" value="{{ form.name }}" maxlength="64" pattern="[A-Za-z0-9._\-]+" data-network-name required />
-                <small>Letters, digits, dot, underscore, and hyphen only.</small>
-              </label>
-              <label class="field">
-                <span>Server</span>
-                <input name="addr" autocomplete="off" value="{{ form.addr }}" maxlength="255" placeholder="irc.example.net:6697" data-network-addr required />
-              </label>
-              <label class="check field-wide">
-                <input type="checkbox" name="tls" data-network-tls {% if form.tls %}checked{% endif %} />
-                <span><strong>Use TLS</strong><small>Recommended for public IRC networks.</small></span>
-              </label>
-              <label class="field field-wide">
-                <span>Username <em>optional</em></span>
-                <input name="username" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="10" pattern="[A-Za-z0-9][A-Za-z0-9_\-]{0,9}" title="Letters, digits, - and _ only, starting with a letter or digit, at most 10 characters" />
-                <small>The ident shown before the @ in your address. Your nickname is used when this is blank.</small>
-              </label>
-              <label class="field field-wide">
-                <span>Real name <em>optional</em></span>
-                <input name="realname" autocomplete="name" value="{{ form.realname }}" maxlength="128" />
-                <small>Your nickname is used when this is blank.</small>
-              </label>
-              <label class="field field-wide">
-                <span>Server password <em>optional</em></span>
-                <input type="password" name="server_password" autocomplete="new-password" maxlength="504" {% if !can_store_secrets %}disabled{% endif %} />
-                <small>{% if can_store_secrets %}Only for private servers that require one. Stored encrypted; never shown again.{% else %}Unavailable: this deployment has no master key to store it encrypted.{% endif %}</small>
-              </label>
-            </div>
-          </details>
-          <div class="form-actions field-wide">
-            <button class="primary" type="submit">Add network</button>
-            <button type="button" data-api-network-preflight>Test connection</button>
-          </div>
-        </form>
-        </section>
+        <div class="banner-info">
+          <div><strong>Networks are added and configured in the IRC client</strong>, which is also where a new one is tested before it is saved.</div>
+          <a class="button-link" href="/">Open IRC client</a>
+        </div>
+
 
         <div class="panel-head list-head">
           <div>
