@@ -3169,7 +3169,50 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
             .as_array()
             .is_some_and(|drivers| drivers.contains(&serde_json::json!("irc")))
     );
+    // The obvious way to change one setting, and the only way a script can:
+    // read the resource, change a field, send it back. The credential
+    // collections it carries are managed elsewhere, but echoing them exactly
+    // as read must not be refused -- it was, so a read-modify-write could not
+    // work at all.
+    let mut round_trip = current["settings"].clone();
+    round_trip["description"] = serde_json::Value::String("round trip".into());
+    let round_trip_body =
+        serde_json::json!({ "revision": current["revision"], "settings": round_trip }).to_string();
+    let round_trip_request = format!(
+        "PATCH /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{round_trip_body}",
+        round_trip_body.len()
+    );
+    let (status, _, body) = request(http, &round_trip_request).await;
+    assert_eq!(status, 200, "a faithful round-trip was refused: {body}");
+    let revision_after_round_trip = serde_json::from_str::<serde_json::Value>(&body)
+        .expect("patch JSON")["revision"]
+        .as_i64()
+        .expect("revision");
+
+    // Changing one of those collections here is refused by name, with the
+    // endpoint that does change it -- never silently dropped.
+    let mut forged = current["settings"].clone();
+    forged["opers"] = serde_json::json!([{ "name": "sneaky", "password": "x" }]);
+    let forged_body =
+        serde_json::json!({ "revision": revision_after_round_trip, "settings": forged })
+            .to_string();
+    let forged_request = format!(
+        "PATCH /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{forged_body}",
+        forged_body.len()
+    );
+    let (status, _, body) = request(http, &forged_request).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.contains("/api/v1/admin/configuration/opers"),
+        "the refusal names the endpoint that changes it: {body}"
+    );
+
     let mut settings = current["settings"].clone();
+    settings["description"] = serde_json::Value::String("round trip".into());
     let settings_object = settings.as_object_mut().expect("settings object");
     settings_object.remove("oidc_providers");
     settings_object.remove("opers");
@@ -3180,7 +3223,8 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     settings_object["observability"]["sample_interval_seconds"] = 5.into();
     settings_object["observability"]["retention_hours"] = 1.into();
     let patch_body =
-        serde_json::json!({ "revision": current["revision"], "settings": settings }).to_string();
+        serde_json::json!({ "revision": revision_after_round_trip, "settings": settings })
+            .to_string();
     let patch = format!(
         "PATCH /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
@@ -3191,14 +3235,16 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
-        2
+        revision_after_round_trip + 1
     );
     // An attach listener off loopback without a certificate would take account
     // passwords in cleartext: the save is refused, naming the setting.
     let mut cleartext = settings.clone();
     cleartext["bnc_addr"] = serde_json::Value::String("0.0.0.0:0".into());
     cleartext["bnc_tls"] = serde_json::Value::Null;
-    let cleartext_body = serde_json::json!({ "revision": 2, "settings": cleartext }).to_string();
+    let cleartext_body =
+        serde_json::json!({ "revision": revision_after_round_trip + 1, "settings": cleartext })
+            .to_string();
     let (status, _, body) = request(
         http,
         &format!(
@@ -3301,7 +3347,7 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     let snapshot = e6ircd::db::load_managed_config(&pool)
         .await
         .expect("settings");
-    assert_eq!(snapshot.revision, 2);
+    assert_eq!(snapshot.revision, revision_after_round_trip + 1);
     assert_eq!(
         snapshot.settings.bnc_addr,
         Some("127.0.0.1:0".parse().unwrap())

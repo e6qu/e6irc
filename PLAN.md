@@ -579,6 +579,25 @@ chat client reads no response field the served contract does not declare
 whose tests skip entirely on this server; eight minutes of fuzzing across
 `core_multi`, `core_dispatch` and `bouncer_lines` found nothing.
 
+Sweeping after #345 found, and this change fixes:
+
+- **The configuration API could be read but not written back.** `GET
+  /api/v1/admin/configuration` returns settings including the OIDC, operator
+  and server-network collections; `PATCH` refused exactly those fields, so the
+  obvious loop -- read the resource, change one setting, send it back, which is
+  the only shape a script has -- failed with a 400. It was found by doing it:
+  turning on the BNC attach listener from the command line. The write now
+  accepts those collections when they are echoed as read (the read redacts
+  every secret and the write compares against that same redaction) and refuses
+  a *changed* one by name, with the endpoint that does change it.
+
+Checked against the real world rather than a mock, and sound: a local daemon
+connected to Libera on the first poll, stored its backlog, and served a client
+attaching over the BNC listener -- SASL, welcome, the `*bnc*` lifecycle notices
+and the replay with `server-time` tags -- and held the connection open. Libera
+answers `e=other-error` as its SCRAM server-first for an unknown account, the
+case the client has handled since #342.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each
