@@ -518,7 +518,20 @@ pub(super) async fn oidc_callback(
             Some("A verified email claim in an allowed domain is required."),
         );
     }
-    let token_claims = jwt_string_claims(&id_token.to_string()).ok();
+    // The provider's own claims for this session. The token was verified
+    // above, so failing to read it back is a fault worth hearing about rather
+    // than a quiet `None`: without `sid`, a back-channel logout can only match
+    // this session by subject, which revokes more than the provider asked.
+    let token_claims = match jwt_string_claims(&id_token.to_string()) {
+        Ok(claims) => Some(claims),
+        Err(error) => {
+            eprintln!(
+                "oidc: {issuer}: a verified id_token's claims could not be read ({error}); \
+                 this session has no sid and logs out by subject"
+            );
+            None
+        }
+    };
     let sid = token_claims.as_ref().and_then(|claims| claims.sid.clone());
     // The state-binding cookie has done its job (the pending entry was
     // consumed above); every completed flow expires it now rather than leaving

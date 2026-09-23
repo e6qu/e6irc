@@ -553,6 +553,32 @@ Sweeping after #343 found, and this change fixes:
   sentence and a busy machine does not. The short `from_millis` windows that
   assert *nothing* arrived are deliberately untouched.
 
+Sweeping after #344 found, and this change fixes:
+
+- **The SCRAM client accepted an iteration count RFC 7677 forbids.** The
+  constant's own comment cited the 4096 minimum, but only the upper bound was
+  enforced: a server could ask for `i=1` and this client would derive a key
+  from it. The iteration count is what makes a captured transcript expensive to
+  attack, so a server asking for fewer is weakening our credential; the
+  exchange now stops and says so, rather than obeying.
+- **Nothing held the settings row the deployed release writes.** Fixtures
+  existed for the two shape changes already found, but not for
+  `b532432c5894` -- the revision production is actually running, whose row the
+  next deploy has to load. Captured by that release's own code and added to the
+  suite: it loads cleanly after migrating through 0068-0070, so the deploy that
+  is pending does not repeat the crash-loop, and the row is guarded from here
+  on.
+- **A verified token whose claims could not be read said nothing.** The OpenID
+  Connect login parsed the id_token's claims for `sid` and dropped a failure on
+  the floor; without `sid` a back-channel logout can only match by subject,
+  which revokes more than the provider asked for. It is reported now.
+
+Also checked and found sound, so recorded rather than re-derived next time: the
+chat client reads no response field the served contract does not declare
+(the fault behind #343's preflight); the irctest green list omits only files
+whose tests skip entirely on this server; eight minutes of fuzzing across
+`core_multi`, `core_dispatch` and `bouncer_lines` found nothing.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

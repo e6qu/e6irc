@@ -1864,7 +1864,10 @@ upstream's.
   autojoin, which is the operator-declared floor. Upstream SASL uses
   credentials stored encrypted (§15) with the strongest password mechanism the
   network offers — SCRAM-SHA-512, then SCRAM-SHA-256 (RFC 5802/7677, the
-  server's signature verified in constant time), then PLAIN — and says which one
+  server's signature verified in constant time, and the iteration count held to
+  RFC 7677's 4096 floor as well as a ceiling: the count is what makes a captured
+  transcript expensive to attack, so a server asking for less is weakening our
+  credential and is refused, not obeyed), then PLAIN — and says which one
   logged in (a `:*bnc*` notice after connecting; `sasl_mechanism` in the
   connection-test result). A server that names no mechanisms is offered PLAIN;
   when its 908 then names a stronger one this client speaks, that one is

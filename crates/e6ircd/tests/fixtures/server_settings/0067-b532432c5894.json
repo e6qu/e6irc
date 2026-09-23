@@ -1,0 +1,44 @@
+{
+  "server_name": "irc.localhost",
+  "network_name": "e6irc",
+  "description": "e6irc server",
+  "motd": [],
+  "nicklen": 16,
+  "sendq": 1024,
+  "core_queue": 65536,
+  "core_workers": 1,
+  "max_hot_channels": 8192,
+  "listeners": [],
+  "registration": {
+    "before_connect": false,
+    "require_email": false
+  },
+  "limits": {
+    "max_connections_per_ip": null,
+    "command_burst": 40,
+    "command_rate": 20,
+    "trusted_proxies": [],
+    "auth_rate_burst": null,
+    "api_rate_burst": 240,
+    "administrator_api_rate_burst": 60,
+    "registration_burst": null
+  },
+  "observability": {
+    "enabled": true,
+    "sample_interval_seconds": 15,
+    "retention_hours": 168
+  },
+  "storage": {
+    "history_retention_days": 30,
+    "audit_retention_days": 365
+  },
+  "bnc_addr": null,
+  "bnc_tls": null,
+  "public_url": null,
+  "secure_cookies": true,
+  "admin_accounts": [],
+  "oidc_providers": [],
+  "opers": [],
+  "networks": [],
+  "credentials_from_bootstrap": false
+}
