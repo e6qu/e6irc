@@ -7654,6 +7654,53 @@ fn chanserv_metadata_store_failures_are_loud_labeled_and_non_mutating() {
 }
 
 #[test]
+fn a_multiline_message_of_only_blank_lines_has_no_text_to_send() {
+    // A blank line is a line break, not text. A message made only of them
+    // would reach a client without the capability as nothing at all -- and,
+    // stored, as a history row that replays as no line, making a page of N
+    // rows arrive as fewer than N messages. It is refused exactly as an empty
+    // PRIVMSG is, and nothing is delivered or stored.
+    let mut s = TestServer::new_no_persistence();
+    let alice = register_with_caps(
+        &mut s,
+        1,
+        "alice",
+        "batch draft/multiline message-tags echo-message labeled-response",
+    );
+    let bob = register_with_caps(&mut s, 2, "bob", "batch draft/multiline message-tags");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #blank");
+    }
+    for c in [alice, bob] {
+        s.drain(c);
+    }
+    s.line(alice, "@label=blank BATCH +7 draft/multiline #blank");
+    s.line(alice, "@batch=7 PRIVMSG #blank :");
+    s.line(alice, "@batch=7 PRIVMSG #blank :");
+    s.line(alice, "BATCH -7");
+
+    let sender = s.drain(alice);
+    assert!(
+        sender.iter().any(|line| line.contains(" 412 ")),
+        "an all-blank message is refused as having no text: {sender:#?}"
+    );
+    // The batch that opened still owes its label an answer, or the client
+    // waits forever for a message that will never come.
+    assert!(
+        sender.iter().any(|line| line.contains("@label=blank")),
+        "the opening BATCH's label went unanswered: {sender:#?}"
+    );
+    assert!(
+        !sender.iter().any(|line| line.contains("PRIVMSG #blank")),
+        "nothing was echoed for a message with no text: {sender:#?}"
+    );
+    assert!(
+        s.drain(bob).is_empty(),
+        "a message with no text reached a recipient"
+    );
+}
+
+#[test]
 fn multiline_batch_is_one_message_to_capable_and_flattened_to_others() {
     // A multiline message is one message: both forms carry the same msgid, the
     // batch keeps the sender's blank lines and concat tags, and a client

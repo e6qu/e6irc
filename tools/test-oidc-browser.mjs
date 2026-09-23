@@ -2109,6 +2109,42 @@ try {
   await page.unroute(historyURL);
   await page.unroute(networkURL);
 
+  // Removing a network is destructive and reaches the registry, the stored
+  // backlog and the read markers, so it is crossed here rather than mocked.
+  // A second network is added for it: the one this journey runs on is still
+  // needed below.
+  await page.goto(`${applicationOrigin}/`);
+  await page.getByRole("button", { name: "Settings for journey", exact: true }).waitFor();
+  await page.locator("#network-add").click();
+  const spareDialog = page.getByRole("dialog", { name: "Add a network" });
+  await spareDialog.locator("#nf-save:not([disabled])").waitFor();
+  await spareDialog.locator("#nf-preset").selectOption("custom");
+  await spareDialog.locator("#nf-name").fill("spare");
+  await spareDialog.locator("#nf-addr").fill(upstream.address);
+  await spareDialog.locator("#nf-nick").fill("sparenick");
+  await spareDialog.locator("#nf-username").fill("spare");
+  await spareDialog.locator("#nf-realname").fill("Spare Journey");
+  await spareDialog.locator("#nf-tls").uncheck();
+  await spareDialog.getByRole("button", { name: "Save", exact: true }).click();
+  await spareDialog.waitFor({ state: "hidden" });
+  // Adding opens it, so this is also the "remove the network you are reading"
+  // path: everything the page holds for it has to go with it.
+  assert.match(page.url(), /\?network=spare$/);
+  await page.getByRole("button", { name: "Settings for spare", exact: true }).click();
+  const spareSettings = page.getByRole("dialog", { name: "Settings — spare" });
+  await spareSettings.getByRole("button", { name: "Remove…", exact: true }).click();
+  // Asked once, saying what goes with it; the second press is the answer.
+  await spareSettings.getByText("cannot be undone", { exact: false }).waitFor();
+  await spareSettings.getByRole("button", { name: "Remove spare for good", exact: true }).click();
+  await spareSettings.waitFor({ state: "hidden" });
+  await page.getByRole("button", { name: "Settings for journey", exact: true }).waitFor();
+  assert.equal(await page.locator("#networks").getByText("spare", { exact: true }).count(), 0);
+  assert.equal(new URL(page.url()).search, "", "the removed network was still in the address");
+  assert.equal(await page.locator("#message").isDisabled(), true);
+  // Gone from the server too, not just from this page.
+  const spareAfter = await context.request.get(`${applicationOrigin}/api/v1/me/networks/spare`);
+  assert.equal(spareAfter.status(), 404);
+
   assert.ok(
     navigationTrace.includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/start`),
     `portal flow bypassed the e6irc OpenID Connect starter:\n${navigationTrace.join("\n")}`,

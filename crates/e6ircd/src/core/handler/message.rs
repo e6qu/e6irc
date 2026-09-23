@@ -1013,11 +1013,20 @@ pub(super) fn deliver_multiline(
     conn: ConnId,
     batch: crate::core::state::MultilineBatch,
 ) {
-    if batch.lines.is_empty() {
-        // Opened and closed without content: nothing happened — but if the
-        // opening BATCH was labeled, that command still owes a response (the
-        // framer was told not to ACK it when the batch opened), so the "no
-        // response" ACK is emitted here or the client waits forever.
+    // Nothing to send: either no lines at all, or only blank ones. A blank
+    // line is a line break, not text, so a message made only of them has no
+    // text in it -- exactly what ERR_NOTEXTTOSEND refuses for a PRIVMSG, and
+    // what recipients without `draft/multiline` would be sent: nothing. Stored
+    // instead, it became a history row that replays as no line at all, so a
+    // page of N rows reached such a client as fewer than N messages and read
+    // as the end of the buffer.
+    if batch.lines.iter().all(|(text, _)| text.is_empty()) {
+        if !batch.lines.is_empty() && batch.kind.is_some_and(crate::core::MessageKind::is_loud) {
+            state.numeric(conn, ERR_NOTEXTTOSEND, &[], Some("No text to send"));
+        }
+        // The opening BATCH was labeled, so that command still owes a response
+        // (the framer was told not to ACK it when the batch opened), or the
+        // client waits forever.
         ack_multiline_label(state, conn, batch.label.as_deref());
         return;
     }

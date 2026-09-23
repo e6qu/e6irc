@@ -659,6 +659,10 @@ dialog legend { font-size: 0.8rem; padding: 0 0.3rem; }
    the stored account and password" on a network that does not exist yet. */
 dialog [hidden] { display: none; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.9rem; }
+/* The destructive action sits away from the ones that are safe to hit. */
+.dialog-actions #nf-remove { margin-right: auto; }
+.dialog-actions button.danger { border-color: var(--off); color: var(--off); }
+.dialog-actions button.danger[data-armed] { background: var(--off); color: var(--warn-text); }
 .dialog-error { color: var(--off); font-size: 0.85rem; }
 .dialog-result { color: var(--ok); font-size: 0.85rem; }
 #help-commands { margin: 0.5rem 0; padding-left: 1.1rem; line-height: 1.7; }

@@ -259,6 +259,10 @@
           <p id="nf-result" class="dialog-result" role="status" hidden></p>
 
           <div class="dialog-actions">
+            <!-- Removing a network belongs with editing it. It used to exist
+                 only in the console, so a network added here had to be deleted
+                 in another application. -->
+            <button type="button" id="nf-remove" class="danger" hidden>Remove…</button>
             <button type="button" id="nf-cancel">Cancel</button>
             <!-- Adding a network is the one place a test helps: afterwards the
                  network itself reports what it is doing. -->

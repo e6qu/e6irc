@@ -894,7 +894,13 @@ its labeled batch.
 Recipients that negotiated the capability receive the batch as sent, blank lines
 and `draft/multiline-concat` tags intact, because those are what the sender
 wrote. Everyone else receives one message per non-blank line: a PRIVMSG has no
-way to carry a line break, and a blank line would be an empty message. The
+way to carry a line break, and a blank line would be an empty message. A batch
+whose lines are *all* blank therefore has no text in it, and is refused with
+`ERR_NOTEXTTOSEND` exactly as an empty PRIVMSG is -- delivered, it would reach
+those recipients as nothing at all, and stored it would be a history row that
+replays as no line, so a page of N rows would arrive as fewer than N messages
+and read as the end of the buffer (§11.2). Refusing it at the sender keeps
+every stored message one that its recipients can actually receive. The
 limits (`max-bytes`, `max-lines`) are advertised as the capability's value, so a
 client can see them before starting a batch it cannot finish.
 
@@ -2321,7 +2327,18 @@ back to the same control of the same network; an expired session offers Sign
 in once and stops asking. Each opening of the settings dialog is numbered, so a
 slow answer for an earlier opening can neither fill in nor throw inside a later
 one, and settings that failed to load cannot be saved as blanks over the stored
-ones. Only a join asked for in this client moves the view: the bouncer
+ones. The dialog also *removes* the network, because it is the one editor and a
+person who added a network here had otherwise to go to the console to delete
+it: the button asks once, naming what goes with the network (its stored
+backlog, read positions, and credentials), and the second press is the answer
+-- no browser dialog, which cannot be styled, translated, or driven by the
+tests that have to prove a destructive path. Removing the network that is open
+returns the client to the picker in this document, because its socket and its
+conversations are state about something that no longer exists. The console
+lists networks and keeps the same control on the network's own page (where a
+bridge, which the dialog does not edit, is also removed); it carries no Remove
+on each row of the list, where a destructive button repeated per row is the
+easiest to hit by mistake. Only a join asked for in this client moves the view: the bouncer
 rejoining every channel after an upstream reconnect does not. Replay therefore
 no longer decides where a network opens (it used to leave whichever channel it
 mentioned last): once the attach replay ends, the client reopens the
@@ -2331,7 +2348,14 @@ network's settings control leads to its own per-type form rather than the IRC
 dialog. No field that takes a third-party credential is marked `username` or
 `current-password`: the only credential a browser holds for this origin is the
 e6irc login, and those tokens invite it to be filled in and sent to another
-network (a test scans the chat shell and every template for it). The
+network (a test scans the chat shell and every template for it). A failure of something the person just asked for -- a message that
+did not enter the socket, a join that was not sent, backlog that would not
+load, a refused notification permission -- is reported once, as an alert above
+the chat, which is read whatever conversation is open and is deduplicated by
+key. The console conversation keeps the connection's own record (what it sent
+and received, what was enabled, why a socket was not opened); it is not a
+second place for failures, which used to be written there as well, in wording
+that had drifted from the alert's. The
 preferences menu owns validated theme/notification settings, stored one key at
 a time so the chat and the console — which share the record — cannot undo each
 other's change, and responsive conversation navigation
