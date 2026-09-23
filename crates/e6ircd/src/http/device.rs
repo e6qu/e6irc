@@ -1016,20 +1016,7 @@ pub(super) async fn admin_configuration(
         );
     };
     let snapshot = config.read().await.clone();
-    let mut settings = snapshot.settings;
-    for provider in &mut settings.oidc_providers {
-        provider.client_secret.clear();
-    }
-    for oper in &mut settings.opers {
-        oper.password.clear();
-    }
-    for network in &mut settings.networks {
-        network.sasl_password = None;
-        network.server_password = None;
-        if network.kind.account_is_secret() {
-            network.sasl_account = None;
-        }
-    }
+    let settings = without_secrets(snapshot.settings);
     let bound_bnc_addr = match &state.bnc_listener {
         Some(listener) => listener.status().await.map(|(_, bound)| bound),
         None => None,
@@ -1141,6 +1128,27 @@ impl ManagedNetworkOwner {
     }
 }
 
+/// The managed configuration as it is *shown*: every stored secret cleared.
+/// One function, because the read serves it and the write compares against it
+/// -- a client may send back exactly what it was given, and it can only do
+/// that if both sides mean the same thing by "the current configuration".
+fn without_secrets(mut settings: crate::config::ManagedConfig) -> crate::config::ManagedConfig {
+    for provider in &mut settings.oidc_providers {
+        provider.client_secret.clear();
+    }
+    for oper in &mut settings.opers {
+        oper.password.clear();
+    }
+    for network in &mut settings.networks {
+        network.sasl_password = None;
+        network.server_password = None;
+        if network.kind.account_is_secret() {
+            network.sasl_account = None;
+        }
+    }
+    settings
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AdminConfigurationPatch {
@@ -1170,6 +1178,65 @@ struct AdminScalarSettings {
     public_url: Option<String>,
     secure_cookies: bool,
     admin_accounts: Vec<String>,
+    // The collections this request does not carry. They hold secrets, so each
+    // has its own endpoint and the current revision's values are kept. They
+    // are accepted here only so that reading the configuration, changing one
+    // scalar and sending it back -- the obvious way to use a revisioned
+    // resource, and the only way a script can -- is not refused for echoing
+    // fields it was given. Sending a *different* value is refused by name
+    // rather than silently dropped.
+    #[serde(default)]
+    oidc_providers: Option<serde_json::Value>,
+    #[serde(default)]
+    opers: Option<serde_json::Value>,
+    #[serde(default)]
+    networks: Option<serde_json::Value>,
+    #[serde(default)]
+    credentials_from_bootstrap: Option<serde_json::Value>,
+}
+
+/// A collection sent back unchanged is fine; a changed one names the endpoint
+/// that owns it. Compared against the configuration as it is *shown*, because
+/// that is what the client was given to echo.
+fn echoed_collections_are_unchanged(
+    settings: &AdminScalarSettings,
+    shown: &crate::config::ManagedConfig,
+) -> Result<(), (&'static str, &'static str)> {
+    let same = |sent: &Option<serde_json::Value>, current: serde_json::Value| -> bool {
+        sent.as_ref().is_none_or(|value| *value == current)
+    };
+    for (sent, current, field, endpoint) in [
+        (
+            &settings.oidc_providers,
+            serde_json::to_value(&shown.oidc_providers).unwrap_or(serde_json::Value::Null),
+            "oidc_providers",
+            "/api/v1/admin/configuration/oidc-providers",
+        ),
+        (
+            &settings.opers,
+            serde_json::to_value(&shown.opers).unwrap_or(serde_json::Value::Null),
+            "opers",
+            "/api/v1/admin/configuration/opers",
+        ),
+        (
+            &settings.networks,
+            serde_json::to_value(&shown.networks).unwrap_or(serde_json::Value::Null),
+            "networks",
+            "/api/v1/admin/configuration/networks",
+        ),
+        (
+            &settings.credentials_from_bootstrap,
+            serde_json::to_value(shown.credentials_from_bootstrap)
+                .unwrap_or(serde_json::Value::Null),
+            "credentials_from_bootstrap",
+            "the bootstrap flow",
+        ),
+    ] {
+        if !same(sent, current) {
+            return Err((field, endpoint));
+        }
+    }
+    Ok(())
 }
 
 impl AdminScalarSettings {
@@ -1224,6 +1291,20 @@ pub(super) async fn admin_patch_configuration(
             StatusCode::CONFLICT,
             "Configuration revision conflict",
             Some("Reload the configuration and retry with its current revision."),
+        );
+    }
+    // A faithful round-trip is allowed; a changed collection is named, with the
+    // endpoint that owns it, rather than quietly ignored.
+    if let Err((field, endpoint)) =
+        echoed_collections_are_unchanged(&body.settings, &without_secrets(current.settings.clone()))
+    {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid configuration",
+            Some(&format!(
+                "{field} is not changed here; it is managed by {endpoint}. \
+                 Send it back unchanged, or leave it out."
+            )),
         );
     }
     let settings = body.settings.apply_to(&current.settings);

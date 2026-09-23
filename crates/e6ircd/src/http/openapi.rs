@@ -724,6 +724,23 @@ fn operations() -> serde_json::Value {
             "audit_retention_days": { "type": "integer", "minimum": 1, "maximum": 3650 }
         }
     });
+    // The collections the configuration read returns. Named once: the read
+    // serves them, and the write accepts them back unchanged, so both sides
+    // have to mean the same shape.
+    let opers_schema = serde_json::json!({
+        "type": "array", "items": { "type": "object", "additionalProperties": false,
+            "required": ["name", "password"], "properties": { "name": { "type": "string" }, "password": { "type": "string" } } }
+    });
+    let oidc_providers_schema = serde_json::json!({
+        "type": "array", "items": { "type": "object", "additionalProperties": false,
+            "required": ["name", "issuer_url", "client_id", "client_secret", "account_claim", "scopes", "allowed_email_domains", "end_session_endpoint", "token_endpoint_auth_method"],
+            "properties": { "name": { "type": "string" }, "issuer_url": { "type": "string" }, "client_id": { "type": "string" }, "client_secret": { "type": "string" }, "account_claim": { "type": "string", "enum": ["preferred_username", "email"] }, "scopes": { "type": "array", "items": { "type": "string" } }, "allowed_email_domains": { "type": "array", "items": { "type": "string" } }, "end_session_endpoint": { "type": ["string", "null"] }, "token_endpoint_auth_method": { "type": "string", "enum": ["client_secret_basic", "client_secret_post"] } } }
+    });
+    let networks_schema = serde_json::json!({
+        "type": "array", "items": { "type": "object", "additionalProperties": false,
+            "required": ["name", "owner", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "buffer_cap", "sasl_account", "sasl_password", "server_password"],
+            "properties": { "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": ["string", "null"] }, "realname": { "type": ["string", "null"] }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] }, "server_password": { "type": "null", "description": "Always null on read: a stored server password is never returned." } } }
+    });
     let scalar_settings_schema = serde_json::json!({
         "type": "object",
         "additionalProperties": false,
@@ -755,33 +772,19 @@ fn operations() -> serde_json::Value {
             },
             "public_url": { "type": ["string", "null"] },
             "secure_cookies": { "type": "boolean" },
-            "admin_accounts": { "type": "array", "items": { "type": "string" } }
+            "admin_accounts": { "type": "array", "items": { "type": "string" } },
+            // Optional, and only as read: the credential collections are kept
+            // from the current revision, and each has its own endpoint. They
+            // are accepted here so that reading this resource, changing one
+            // scalar and sending it back is not refused for echoing fields it
+            // was given; a *changed* one is refused by name.
+            "oidc_providers": oidc_providers_schema,
+            "opers": opers_schema,
+            "networks": networks_schema,
+            "credentials_from_bootstrap": { "type": "boolean" }
         }
     });
     let mut configuration_settings_schema = scalar_settings_schema.clone();
-    let configuration_properties = configuration_settings_schema["properties"]
-        .as_object_mut()
-        .expect("configuration settings properties are an object");
-    configuration_properties.insert("opers".into(), serde_json::json!({
-        "type": "array", "items": { "type": "object", "additionalProperties": false,
-            "required": ["name", "password"], "properties": { "name": { "type": "string" }, "password": { "type": "string" } } }
-    }));
-    configuration_properties.insert("oidc_providers".into(), serde_json::json!({
-        "type": "array", "items": { "type": "object", "additionalProperties": false,
-            "required": ["name", "issuer_url", "client_id", "client_secret", "account_claim", "scopes", "allowed_email_domains", "end_session_endpoint", "token_endpoint_auth_method"],
-            "properties": { "name": { "type": "string" }, "issuer_url": { "type": "string" }, "client_id": { "type": "string" }, "client_secret": { "type": "string" }, "account_claim": { "type": "string", "enum": ["preferred_username", "email"] }, "scopes": { "type": "array", "items": { "type": "string" } }, "allowed_email_domains": { "type": "array", "items": { "type": "string" } }, "end_session_endpoint": { "type": ["string", "null"] }, "token_endpoint_auth_method": { "type": "string", "enum": ["client_secret_basic", "client_secret_post"] } } }
-    }));
-    configuration_properties.insert("networks".into(), serde_json::json!({
-        "type": "array", "items": { "type": "object", "additionalProperties": false,
-            "required": ["name", "owner", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "buffer_cap", "sasl_account", "sasl_password", "server_password"],
-            "properties": { "name": { "type": "string" }, "owner": { "type": ["string", "null"] }, "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": ["string", "null"] }, "realname": { "type": ["string", "null"] }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] }, "server_password": { "type": "null", "description": "Always null on read: a stored server password is never returned." } } }
-    }));
-    configuration_properties.insert(
-        "credentials_from_bootstrap".into(),
-        serde_json::json!({
-            "type": "boolean"
-        }),
-    );
     configuration_settings_schema["required"]
         .as_array_mut()
         .expect("configuration settings required fields are an array")
@@ -2033,7 +2036,7 @@ fn operations() -> serde_json::Value {
                     "description": "Returns the compare-and-swap revision, redacted operational settings, and the configuration console's secret-free runtime/bootstrap status. OIDC client secrets, oper passwords, upstream SASL passwords, and secret bridge accounts are never returned.",
                     "security": authenticated,
                     "responses": { "200": configuration_response["200"], "403": { "description": "not an admin account" }, "503": { "description": "managed configuration unavailable" } } },
-                "patch": { "summary": "Update revisioned scalar managed configuration", "description": "Updates typed scalar settings while retaining OIDC, operator, and network credential collections from the current revision. A live BNC listener change is applied before persistence and rolled back if persistence fails.", "security": authenticated,
+                "patch": { "summary": "Update revisioned scalar managed configuration", "description": "Updates typed scalar settings while retaining OIDC, operator, and network credential collections from the current revision. Those collections may be sent back exactly as read (so a read-modify-write of one scalar works); a changed one is refused by name, never silently dropped. A live BNC listener change is applied before persistence and rolled back if persistence fails.", "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision", "settings"], "properties": { "revision": { "type": "integer" }, "settings": scalar_settings_schema } } } } },
                     "responses": { "200": configuration_patch_response["200"], "400": { "description": "invalid settings or BNC listener" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration or BNC listener unavailable" } } }
             },

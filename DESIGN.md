@@ -3000,7 +3000,15 @@ Layers, bottom to top:
   bootstrap values are imported once with provenance. Later starts load the
   persisted revision before constructing the core or listeners, so the UI is
   authoritative. Writes use compare-and-swap revisions and a same-transaction
-  redacted audit entry; stale writers fail visibly.
+  redacted audit entry; stale writers fail visibly. The write takes the scalar
+  settings only: the collections that hold secrets (OIDC providers, operators,
+  server-level networks) are kept from the current revision and changed through
+  their own endpoints. They may nevertheless be *sent back exactly as read* --
+  the read redacts every secret, and the write compares against that same
+  redaction -- so reading the resource, changing one field and sending it back
+  works, which is the only shape a script has. Sending a collection that
+  differs is refused by name, with the endpoint that does change it; it is
+  never quietly dropped.
 - `[secrets].key_file` and `E6IRC_SECRET_KEY` are alternatives; a configuration
   stating both is refused naming both sources, never resolved by precedence.
   Rules about a secret's *content* (bootstrap token length, a non-empty OIDC
