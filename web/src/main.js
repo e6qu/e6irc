@@ -278,7 +278,8 @@ function rejectPendingSend(requestId, message) {
   if (!pending) return false;
   pendingSends.delete(requestId);
   rememberSentText(pending.text);
-  addServer(message || "Message was not sent.");
+  // Said once. A failure used to go into the console buffer as well, which is
+  // rarely the buffer being read and worded it differently from the alert.
   showAlert(
     "send",
     message || "Message was not sent.",
@@ -307,7 +308,6 @@ function rejectAllPendingSends(reason) {
   const count = pendingSends.size;
   for (const pending of pendingSends.values()) rememberSentText(pending.text);
   pendingSends.clear();
-  addServer(`${count} message(s) were not confirmed before ${reason}.`);
   showAlert(
     "send",
     `${count} message(s) were not confirmed before ${reason}; use input history to retry.`,
@@ -397,11 +397,11 @@ function requestNames(buffer) {
   try {
     if (!sendComposer("", `/raw NAMES ${buffer.display}`)) {
       namesRequested.delete(buffer.key);
-      addServer(`Could not refresh members for ${buffer.display}.`);
+      showAlert("members", `Could not refresh members for ${buffer.display}.`, "error");
     }
   } catch {
     namesRequested.delete(buffer.key);
-    addServer(`Could not refresh members for ${buffer.display}.`);
+    showAlert("members", `Could not refresh members for ${buffer.display}.`, "error");
   }
 }
 
@@ -1527,7 +1527,6 @@ composer.addEventListener("submit", (e) => {
     return;
   }
   if (pendingSends.size >= MAX_PENDING_SENDS) {
-    addServer(`Not sending more than ${MAX_PENDING_SENDS} messages without server confirmation.`);
     showAlert(
       "send",
       `${MAX_PENDING_SENDS} messages are still waiting to be confirmed; wait or reconnect before sending more.`,
@@ -1547,7 +1546,6 @@ composer.addEventListener("submit", (e) => {
     if (!sendComposer(target, text, requestId)) throw new Error("The live connection closed.");
   } catch (error) {
     pendingSends.delete(requestId);
-    addServer("The message could not enter the live connection and was not sent.");
     showAlert("send", errorMessage("send the message", error), "error");
     return;
   }
@@ -1569,7 +1567,7 @@ function requestJoin(chan) {
       return false;
     }
   } catch {
-    addServer("The request to join was not sent.");
+    showAlert("send", "Not connected — cannot join yet.", "error");
     return false;
   }
   return true;
@@ -1828,6 +1826,7 @@ function revealName(button) {
 networkDialog?.addEventListener("close", () => {
   networkForm?.reset();
   hideRevealedSecrets();
+  disarmRemove();
 });
 
 // A required field inside a closed <details> would refuse the submit with no
@@ -1892,6 +1891,10 @@ async function openNetworkDialog(name = null) {
   // network would judge a connection nobody configured.
   const test = el("nf-test");
   if (test) test.hidden = editing;
+  // There is nothing to remove until a network exists, and a half-armed
+  // Remove must never survive from one network's dialog into another's.
+  if (removeButton) removeButton.hidden = !editing;
+  disarmRemove();
   el("nf-clear-row").hidden = !editing;
   el("nf-clear-server-password-row").hidden = !editing;
   // Editing shows the whole connection: the server, TLS, and the names sent to
@@ -2130,6 +2133,61 @@ testButton?.addEventListener("click", () => {
 el("nf-cancel")?.addEventListener("click", () => networkDialog?.close());
 el("network-add")?.addEventListener("click", () => void openNetworkDialog(null));
 
+// Removing a network is destructive and cannot be undone, so the button asks
+// once and says what goes with it. The second press is the answer: no browser
+// dialog, which cannot be styled, translated, or reached by the tests that
+// have to prove this path.
+const removeButton = el("nf-remove");
+function disarmRemove() {
+  if (!removeButton) return;
+  removeButton.removeAttribute("data-armed");
+  removeButton.textContent = "Remove…";
+  removeButton.disabled = false;
+}
+removeButton?.addEventListener("click", () => {
+  const name = networkForm.dataset.editing;
+  if (!name) return;
+  // Attribute presence, not `dataset.armed`: the empty string a bare data
+  // attribute carries is falsy, so a second press read as a first one and the
+  // question could never be answered.
+  if (!removeButton.hasAttribute("data-armed")) {
+    removeButton.dataset.armed = "yes";
+    removeButton.textContent = `Remove ${name} for good`;
+    setDialogResult("");
+    setDialogError(
+      `Removing ${name} stops its connection and deletes its stored backlog, ` +
+        "read positions, and credentials. This cannot be undone.",
+    );
+    return;
+  }
+  void (async () => {
+    removeButton.disabled = true;
+    removeButton.textContent = "Removing…";
+    // Stop using the connection *before* asking for the network to go: the
+    // server closes the socket as it deletes, and a close the client has not
+    // been told to expect schedules a retry -- which then opens a socket for a
+    // network that no longer exists.
+    const wasOpen = Boolean(network) && fold(network) === fold(name);
+    if (wasOpen) stopLiveConnection();
+    try {
+      await apiSend("DELETE", `/api/v1/me/networks/${encodeURIComponent(name)}`);
+    } catch (error) {
+      setDialogError(errorMessage(`remove ${name}`, error));
+      disarmRemove();
+      // It is still there, so the connection this just gave up is wanted back.
+      if (wasOpen) connect();
+      return;
+    }
+    networkDialog.close();
+    // Everything this page holds for the network -- its socket, its
+    // conversations, its unread counts -- is now state about something that
+    // does not exist, so the client goes back to the picker rather than
+    // sitting on a conversation it can no longer send to.
+    if (wasOpen) await leaveOpenNetwork();
+    else await refreshNetworkList();
+  })();
+});
+
 // A pasted password cannot be verified any other way, and this is exactly
 // where a silent typo becomes a failed SASL exchange that reads as "wrong
 // credentials". The toggle never reveals a stored secret -- only what is
@@ -2152,6 +2210,55 @@ el("help-close")?.addEventListener("click", () => helpDialog?.close());
 
 // What the message area shows when no network is open: nothing to pick from
 // here -- the sidebar is the list -- only what to do next.
+// Leave the open network and return to the picker, in this document. Used
+// when the network is removed from here: a reload would do it too, but it
+// throws away everything else the tab is holding, and the state that has to go
+// is exactly the state this network owns.
+// Stop using the live connection and stop trying to get it back. A retry
+// already waiting would call connect(), which clears the terminal flag, so the
+// timer has to go with the socket -- otherwise the client reconnects to a
+// network that is being deleted, and the browser reports that dead connection
+// as a page error.
+function stopLiveConnection() {
+  terminalSocket = true;
+  if (reconnectTimer) {
+    window.clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (socket) {
+    const closing = socket;
+    socket = null;
+    closing.close();
+  }
+}
+
+async function leaveOpenNetwork() {
+  stopLiveConnection();
+  network = null;
+  window.history.replaceState(null, "", "/");
+  buffers.clear();
+  namesSnapshots.clear();
+  namesRequested.clear();
+  active = null;
+  upstreamConnected = false;
+  myNick = null;
+  clearAlert("network-unavailable");
+  clearAlert("socket");
+  setComposerAvailable(false);
+  renderBufferList();
+  renderNickList();
+  let networks = [];
+  let failure = null;
+  try {
+    networks = networksFrom(await apiGet("/api/v1/me/networks"));
+    clearAlert("networks");
+  } catch (error) {
+    failure = error;
+  }
+  renderNetworkList(networks, failure);
+  renderLanding(networks, failure);
+}
+
 function renderLanding(networks, failure = null) {
   routeNetworkEl.textContent = "";
   setStatus(failure ? "network list unavailable" : "no network open", failure ? "error" : "connecting");
@@ -2312,9 +2419,7 @@ async function loadEarlier() {
     );
     clearAlert("history");
   } catch (error) {
-    const message = errorMessage("load earlier messages", error);
-    addServer(message);
-    showAlert("history", message, "error");
+    showAlert("history", errorMessage("load earlier messages", error), "error");
     restore();
     return;
   }

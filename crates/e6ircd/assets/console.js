@@ -2424,18 +2424,11 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       toggleButton.type = "submit";
       toggleButton.textContent = enabled ? "Disable" : "Enable";
       toggle.append(csrf, nextEnabled, toggleButton);
-      const remove = document.createElement("form");
-      remove.method = "post";
-      remove.action = toggle.action;
-      remove.dataset.apiOwnerNetworkDelete = "";
-      remove.dataset.confirm = `Remove network ${network.name}? This also stops its live connection.`;
-      const removeCsrf = csrf.cloneNode();
-      const removeButton = document.createElement("button");
-      removeButton.className = "danger";
-      removeButton.type = "submit";
-      removeButton.textContent = "Remove";
-      remove.append(removeCsrf, removeButton);
-      actions.append(inspect, toggle, remove);
+      // No Remove on a row: a destructive button repeated down a list is the
+      // easiest one to hit by mistake, and removing a network is offered where
+      // the network is -- in its own page here, and in the settings dialog
+      // that edits it.
+      actions.append(inspect, toggle);
       row.append(status, nameCell, kind, upstream, clients, errors, actions);
       body.append(row);
     }

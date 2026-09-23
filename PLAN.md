@@ -516,6 +516,43 @@ Sweeping after #342 found, and this change fixes:
   sentence and carries the button that acts on it. Dead rules for three
   removed screens (`.side-link`, `#raw-output-*`, `.raw-wire`) went with them.
 
+Sweeping after #343 found, and this change fixes:
+
+- **A network could be added in the editor but not removed there.** Removing
+  one existed only in the console, so a person who added a network in the chat
+  client had to go to another application to delete it. The settings dialog --
+  the one editor -- now removes it: asked once, naming what goes with it, the
+  second press being the answer. Removing the network that is open returns the
+  client to the picker in this document rather than leaving it on conversations
+  it can no longer send to. The console keeps the control on a network's own
+  page, where a bridge is removed too, and loses the duplicate on each row of
+  the list. The real-browser journey now crosses removal end to end; it never
+  did, so the destructive path had no coverage outside unit tests.
+- **The same failure said twice, in two wordings.** A message that did not
+  enter the socket, unconfirmed sends at a disconnect, the in-flight cap,
+  backlog that would not load and a member list that could not be refreshed
+  were written into the console buffer *and* raised as an alert -- with
+  different sentences -- while a failed join was written only to the console,
+  which is rarely the conversation being read. Every one of them is an alert
+  now; the console keeps the connection's own record.
+- **A message with no text in it could be stored.** A `draft/multiline` batch
+  whose lines are all blank delivers nothing to a client without the capability
+  (a blank line is a line break, not text), so stored it became a history row
+  that replays as no line at all -- a CHATHISTORY page of N rows reaching such
+  a client as fewer than N messages, the same false "end of the buffer" that
+  #343 fixed for `TAGMSG`. It is refused at the sender with `ERR_NOTEXTTOSEND`,
+  exactly as an empty PRIVMSG is, so every stored message is one its recipients
+  can receive.
+
+- **Tests that failed for being slow.** Around seventy integration-test waits
+  were bounded at a handful of seconds each. The bound is there to turn a hang
+  into a readable failure, but written that short it also asserts latency: the
+  attach suite failed on a CI runner, and five database tests failed locally,
+  purely for running beside a browser suite. They share one generous deadline
+  now (`tests/support/deadline.rs`), so a hang still fails with its own
+  sentence and a busy machine does not. The short `from_millis` windows that
+  assert *nothing* arrived are deliberately untouched.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

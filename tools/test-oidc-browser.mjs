@@ -215,7 +215,7 @@ try {
     if (request.isNavigationRequest()) navigationTrace.push(`request ${request.method()} ${sanitizeURL(request.url())}`);
   });
   page.on("console", (message) => {
-    const sourceURL = message.location().url || page.url();
+    const sourceURL = consoleSourceURL(message, page.url());
     if (
       message.type() === "error"
       && isApplicationURL(sourceURL)
@@ -2109,6 +2109,53 @@ try {
   await page.unroute(historyURL);
   await page.unroute(networkURL);
 
+  // Removing a network is destructive and reaches the registry, the stored
+  // backlog and the read markers, so it is crossed here rather than mocked.
+  // A second network is added for it: the one this journey runs on is still
+  // needed below.
+  await page.goto(`${applicationOrigin}/`);
+  await page.getByRole("button", { name: "Settings for journey", exact: true }).waitFor();
+  const removalErrorStart = applicationErrors.length;
+  await page.locator("#network-add").click();
+  const spareDialog = page.getByRole("dialog", { name: "Add a network" });
+  await spareDialog.locator("#nf-save:not([disabled])").waitFor();
+  await spareDialog.locator("#nf-preset").selectOption("custom");
+  await spareDialog.locator("#nf-name").fill("spare");
+  await spareDialog.locator("#nf-addr").fill(upstream.address);
+  await spareDialog.locator("#nf-nick").fill("sparenick");
+  await spareDialog.locator("#nf-username").fill("spare");
+  await spareDialog.locator("#nf-realname").fill("Spare Journey");
+  await spareDialog.locator("#nf-tls").uncheck();
+  await spareDialog.getByRole("button", { name: "Save", exact: true }).click();
+  await spareDialog.waitFor({ state: "hidden" });
+  // Adding opens it, so this is also the "remove the network you are reading"
+  // path: everything the page holds for it has to go with it.
+  assert.match(page.url(), /\?network=spare$/);
+  await page.getByRole("button", { name: "Settings for spare", exact: true }).click();
+  const spareSettings = page.getByRole("dialog", { name: "Settings — spare" });
+  await spareSettings.getByRole("button", { name: "Remove…", exact: true }).click();
+  // Asked once, saying what goes with it; the second press is the answer.
+  await spareSettings.getByText("cannot be undone", { exact: false }).waitFor();
+  await spareSettings.getByRole("button", { name: "Remove spare for good", exact: true }).click();
+  await spareSettings.waitFor({ state: "hidden" });
+  await page.getByRole("button", { name: "Settings for journey", exact: true }).waitFor();
+  assert.equal(await page.locator("#networks").getByText("spare", { exact: true }).count(), 0);
+  assert.equal(new URL(page.url()).search, "", "the removed network was still in the address");
+  assert.equal(await page.locator("#message").isDisabled(), true);
+  // Gone from the server too, not just from this page.
+  const spareAfter = await context.request.get(`${applicationOrigin}/api/v1/me/networks/spare`);
+  assert.equal(spareAfter.status(), 404);
+  // Closing the removed network's socket is the point, and Firefox reports a
+  // connection closed before it finished opening as a page error. Only that
+  // socket is expected noise: everything else this step logged still counts.
+  assert.deepEqual(
+    applicationErrors
+      .splice(removalErrorStart)
+      .filter((error) => !(error.includes("ws://") && error.includes("network=spare"))),
+    [],
+    "removing a network reported an application error",
+  );
+
   assert.ok(
     navigationTrace.includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/start`),
     `portal flow bypassed the e6irc OpenID Connect starter:\n${navigationTrace.join("\n")}`,
@@ -2253,7 +2300,31 @@ function sanitizeURL(value) {
 }
 
 function isApplicationURL(value) {
-  return new URL(value).origin === applicationOrigin;
+  // Not every console message has a real URL behind it: Firefox reports
+  // anything run through `page.evaluate` as "debugger eval code", which is not
+  // a URL at all. Parsing it threw, and the throw happened inside a page event
+  // handler, so it killed the whole journey with `TypeError: Invalid URL` and
+  // no hint of where it was. An unreadable location is treated as no location,
+  // which the caller already resolves to the page being looked at -- so an
+  // error from the application is still reported, with its own text.
+  try {
+    return new URL(value).origin === applicationOrigin;
+  } catch {
+    return false;
+  }
+}
+
+/// Where a console message came from: its own location when that is a URL,
+/// else the page it was reported on.
+function consoleSourceURL(message, pageURL) {
+  const reported = message.location().url;
+  if (!reported) return pageURL;
+  try {
+    new URL(reported);
+    return reported;
+  } catch {
+    return pageURL;
+  }
 }
 
 async function startIrcUpstream() {

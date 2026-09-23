@@ -517,31 +517,41 @@ test("the network page loads the whole stored log into the transcript it already
   await expectAccessible(page);
 });
 
-test("a background refresh never pulls the rows out from under a pending confirmation", async ({ page }) => {
-  const form = (await consoleTemplate("console_networks.html", {
-    "shell.csrf": "test-csrf", "preset.id": "libera", "preset.name": "libera", "preset.label": "Libera Chat",
-    "preset.addr": "irc.libera.chat:6697", "form.name": "libera", "form.addr": "irc.libera.chat:6697", "form.nick": "alice",
+test("a background refresh never pulls a page out from under a pending confirmation", async ({ page }) => {
+  // The network's own page: it refreshes on a timer and carries the confirming
+  // Remove, so it exercises the rule that a tick is skipped while a
+  // confirmation is open -- replacing the page under the dialog would detach
+  // the form it is about to submit, and confirming would then do nothing.
+  const body = (await consoleTemplate("console_network_detail.html", {
+    "shell.csrf": "test-csrf", name: "libera",
   })).replace(/data-refresh-seconds="\d+"/, 'data-refresh-seconds="5"');
-  // The shell's own confirmation dialog, so the test cannot drift from it.
   const shell = await readFile(new URL("../../crates/e6ircd/templates/console_base.html", import.meta.url), "utf8");
   const confirmDialog = shell.match(/<dialog class="confirm-dialog"[\s\S]*?<\/dialog>/)[0];
-  await mountConsoleRuntime(page, `<main>${form}</main>${confirmDialog}`, await consoleStyles(), {
-    "/api/v1/me/networks": { networks: [{
-      name: "libera", kind: "irc", addr: "irc.libera.chat:6697", tls: true, nick: "alice", username: "alice", realname: "Alice", autojoin: [],
-      sasl_account: null, has_sasl_account: false, has_sasl_password: false, has_server_password: false, enabled: true, connected: true,
+  await mountConsoleRuntime(page, `<main>${body}</main>${confirmDialog}`, await consoleStyles(), {
+    "/api/v1/me/networks/libera/operations": {
+      name: "libera", enabled: true, runtime: null, attempts: 0, errors: 0,
+      last_error: null, last_connected_at: null, last_activity_at: null,
+      attached_clients: 0, lines_in: 0, lines_out: 0, bytes_in: 0, bytes_out: 0,
+      buffer_lines: 0, buffer_bytes: 0, oldest_line_at: null, newest_line_at: null,
+    },
+    "/api/v1/me/networks/libera": {
+      name: "libera", kind: "irc", addr: "irc.libera.chat:6697", tls: true, nick: "alice",
+      username: "alice", realname: "Alice", autojoin: [], sasl_account: null,
+      has_sasl_account: false, has_sasl_password: false, has_server_password: false,
+      enabled: true, connected: true,
       runtime: { state: "connected", attached_clients: 0, errors: 0, last_error: null },
-    }] },
+    },
   });
-  await page.getByRole("button", { name: "Remove", exact: true }).click();
+  await page.getByRole("button", { name: "Remove network", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Confirm action" });
   await expect(dialog).toBeVisible();
-  const reads = () => page.evaluate(() => window.consoleApiRequests.filter((url) => url === "/api/v1/me/networks").length);
+  const reads = () => page.evaluate(() => window.consoleApiRequests.length);
   const before = await reads();
-  // Longer than the refresh interval: replacing the rows now would detach the
-  // form this dialog is about to submit, and confirming would then do nothing.
+  // Longer than the refresh interval.
   await page.waitForTimeout(6_500);
   expect(await reads()).toBe(before);
-  await dialog.getByRole("button", { name: "Remove", exact: true }).click();
+  // The dialog's action carries the wording of the button that opened it.
+  await dialog.getByRole("button", { name: "Remove network", exact: true }).click();
   await expect.poll(() => page.evaluate(() => window.consoleApiMutations)).toEqual([
     { method: "DELETE", url: "/api/v1/me/networks/libera", json: undefined },
   ]);
@@ -826,6 +836,11 @@ async function mockNetworkDetails(page, respond) {
       put: {
         ...replaceContract,
         parameters: [{ name: "name", in: "path", required: true, schema: { type: "string" } }],
+      },
+      // As the served contract declares it: no body, 204 on success.
+      delete: {
+        parameters: [{ name: "name", in: "path", required: true, schema: { type: "string" } }],
+        responses: { 204: { description: "deleted" } },
       },
     } } }),
   }));
@@ -1597,6 +1612,60 @@ test("Remove clears and disables the credential boxes in the settings dialog", a
   await expect(dialog.getByRole("alert")).toContainText("ada is still stored");
   await expect(dialog.locator("#nf-sasl-account")).toBeFocused();
   await expect(dialog.locator("#nf-sasl-account")).toHaveAttribute("aria-invalid", "true");
+});
+
+test("a network is removed from the editor, after being asked once", async ({ page }) => {
+  await mockLiveSocket(page);
+  // The list the mocked API answers with: the removal takes the network out of
+  // it, as the server would, so the client meets the state it really lands in.
+  const stored = [ircNetwork("Libera")];
+  await mockSession(page, stored);
+  let deleted = 0;
+  await mockNetworkDetails(page, (route) => {
+    if (route.request().method() === "DELETE") {
+      deleted += 1;
+      stored.length = 0;
+      return route.fulfill({ status: 204 });
+    }
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(networkDetail("Libera", "irc.libera.example:6697")),
+    });
+  });
+  await page.goto("/?network=Libera");
+  await page.getByRole("button", { name: "Settings for Libera" }).click();
+  const dialog = page.getByRole("dialog", { name: "Settings — Libera" });
+
+  // The first press asks, naming what goes with it; nothing is sent yet.
+  await dialog.getByRole("button", { name: "Remove…", exact: true }).click();
+  await expect(dialog.getByRole("alert")).toContainText("cannot be undone");
+  await expect(dialog.getByRole("alert")).toContainText("stored backlog");
+  expect(deleted).toBe(0);
+
+  // Closing the dialog disarms it: a half-answered question must not survive
+  // into the next network's settings.
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await page.getByRole("button", { name: "Settings for Libera" }).click();
+  await expect(dialog.getByRole("button", { name: "Remove…", exact: true })).toBeVisible();
+
+  await dialog.getByRole("button", { name: "Remove…", exact: true }).click();
+  await dialog.getByRole("button", { name: "Remove Libera for good", exact: true }).click();
+  await expect(dialog).toBeHidden();
+  expect(deleted).toBe(1);
+  // The open network is gone, so the client goes back to the picker instead of
+  // sitting on conversations it can no longer send to.
+  await expect(page).toHaveURL(/\/$/);
+  await expect(page.locator("#messages")).toContainText("No networks are configured for this account.");
+  await expect(page.locator("#message")).toBeDisabled();
+  await expect(page.locator("#buffers")).not.toContainText("console");
+});
+
+test("adding a network offers no Remove, because there is nothing to remove yet", async ({ page }) => {
+  await mockSession(page, []);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Add a network", exact: true }).last().click();
+  const dialog = page.getByRole("dialog", { name: "Add a network" });
+  await expect(dialog.getByRole("button", { name: "Remove…", exact: true })).toBeHidden();
 });
 
 test("the server password sits under Advanced, is revealed on request, and is omitted on create when blank", async ({ page }) => {

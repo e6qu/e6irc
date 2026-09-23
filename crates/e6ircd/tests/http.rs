@@ -10,6 +10,9 @@ use tokio::net::TcpStream;
 
 mod support;
 
+#[path = "support/deadline.rs"]
+mod deadline;
+
 /// A full-access personal access token with the default lifetime, minted the
 /// way the REST endpoint mints one.
 async fn issue_api_token(
@@ -148,7 +151,7 @@ async fn wait_irc_ready(addr: std::net::SocketAddr) {
             "ready{}",
             NEXT_NICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let result = tokio::time::timeout(deadline::HANG, async {
             let mut client = e6irc_client::Connection::connect(&addr.to_string()).await?;
             client
                 .register(&e6irc_client::Identity {
@@ -463,7 +466,7 @@ async fn an_idle_kept_alive_connection_is_not_logged_as_a_refusal() {
     .expect("the half-sent request is closed at the deadline")
     .expect("read");
 
-    let logged = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let logged = tokio::time::timeout(deadline::HANG, async {
         while refusals() == 0 {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -1858,7 +1861,7 @@ async fn a_server_password_is_sealed_write_only_and_replaced_only_by_an_action()
         "{body}"
     );
     // The driver sent it: the network connects.
-    let connected = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let connected = tokio::time::timeout(deadline::HANG, async {
         loop {
             let (_, _, body) = request(http, &detail_req).await;
             if body.contains(r#""connected":true"#) {
@@ -5983,7 +5986,7 @@ async fn admin_connection_directory_and_disconnect_controls() {
     assert_eq!(status, 204, "{head}");
 
     // The victim's connection is closed by the server (an ERROR then EOF).
-    let killed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let killed = tokio::time::timeout(deadline::HANG, async {
         loop {
             match victim.next_message().await {
                 Ok(Some(m)) if m.command == "ERROR" => return true,
@@ -6190,7 +6193,7 @@ async fn my_sessions_are_scoped_to_the_caller() {
 
     // bob is still alive: a PING gets a PONG.
     bob_cli.send_line("PING :stillhere").await.unwrap();
-    let bob_alive = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    let bob_alive = tokio::time::timeout(deadline::HANG, async {
         loop {
             match bob_cli.next_message().await {
                 Ok(Some(m)) if m.command == "PONG" => return true,
@@ -9308,7 +9311,7 @@ async fn connection_tests_are_bounded_per_account() {
         );
         async move { request(http, &request_text).await }
     });
-    let _held = tokio::time::timeout(std::time::Duration::from_secs(5), silent.accept())
+    let _held = tokio::time::timeout(deadline::HANG, silent.accept())
         .await
         .expect("the first connection test never dialed")
         .expect("accept");
@@ -9887,7 +9890,7 @@ async fn deleting_a_busy_network_or_account_leaves_no_backlog_behind() {
     let persisting = |network: &'static str| {
         let pool = pool.clone();
         async move {
-            tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            tokio::time::timeout(deadline::HANG, async {
                 loop {
                     let rows: i64 = sqlx::query_scalar(
                         "SELECT count(*) FROM bnc_buffer

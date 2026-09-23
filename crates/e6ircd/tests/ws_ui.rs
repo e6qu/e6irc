@@ -12,6 +12,9 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 mod support;
 
+#[path = "support/deadline.rs"]
+mod deadline;
+
 /// A full-access personal access token with the default lifetime, minted the
 /// way the REST endpoint mints one.
 async fn issue_api_token(
@@ -139,7 +142,7 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
     // Initial status and detached-buffer playback end at an explicit typed
     // boundary. The browser waits for this before asking for current NAMES, so
     // a replayed stale NAMES reply can never win an ordering race.
-    let (boundary, session) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let (boundary, session) = tokio::time::timeout(deadline::HANG, async {
         let mut session = None;
         loop {
             match ws.next().await {
@@ -180,7 +183,7 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
     // upstream -> UI: the peer posts, the UI receives a JSON line event
     // carrying the raw IRC line (the browser client parses it into a buffer).
     peer.send_line("PRIVMSG #lobby :hello web").await.unwrap();
-    let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let event = tokio::time::timeout(deadline::HANG, async {
         loop {
             match ws.next().await {
                 Some(Ok(Tung::Text(t))) if t.contains("hello web") => return t.to_string(),
@@ -217,7 +220,7 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
     ))
     .await
     .unwrap();
-    let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let got = tokio::time::timeout(deadline::HANG, async {
         loop {
             let m = peer.next_message().await.unwrap().unwrap();
             if m.command == "PRIVMSG"
@@ -233,7 +236,7 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
         got.source.as_deref().unwrap_or("").starts_with("alicebnc!"),
         "{got:?}"
     );
-    let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let accepted = tokio::time::timeout(deadline::HANG, async {
         loop {
             match ws.next().await {
                 Some(Ok(Tung::Text(text))) => {
@@ -256,7 +259,7 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
     ws.send(Tung::binary(b"not a composer frame".to_vec()))
         .await
         .unwrap();
-    let binary_rejected = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let binary_rejected = tokio::time::timeout(deadline::HANG, async {
         loop {
             match ws.next().await {
                 Some(Ok(Tung::Text(text))) if text.contains("must be text JSON") => return text,
@@ -279,7 +282,7 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
     ))
     .await
     .unwrap();
-    let rejected = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let rejected = tokio::time::timeout(deadline::HANG, async {
         loop {
             match ws.next().await {
                 Some(Ok(Tung::Text(text))) if text.contains("invalid composer request") => {
@@ -304,7 +307,7 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
     ))
     .await
     .unwrap();
-    let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let got = tokio::time::timeout(deadline::HANG, async {
         loop {
             let message = peer.next_message().await.unwrap().unwrap();
             if message.command == "PRIVMSG"
@@ -328,7 +331,7 @@ async fn events_until_snapshot(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
 ) -> Vec<serde_json::Value> {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(deadline::HANG, async {
         let mut events = Vec::new();
         loop {
             match ws.next().await {
@@ -463,7 +466,7 @@ async fn ws_ui_resumes_after_a_cursor_and_says_when_it_cannot() {
         "a first attach presented no cursor and is told of no reset: {initial:?}"
     );
     peer.send_line("PRIVMSG #lobby :one").await.unwrap();
-    let one = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let one = tokio::time::timeout(deadline::HANG, async {
         loop {
             match first.next().await {
                 Some(Ok(Tung::Text(text))) if text.contains(":one") => {
@@ -691,7 +694,7 @@ async fn ws_ui_detaches_when_its_network_is_removed() {
 
     // The socket must send a typed terminal status and detach promptly. The
     // browser uses this event to stop reconnecting a removed/disabled network.
-    let detached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let detached = tokio::time::timeout(deadline::HANG, async {
         loop {
             match ws.next().await {
                 Some(Ok(Tung::Text(t))) => {

@@ -6,8 +6,10 @@
 //!
 //!   cargo test -p e6ircd --test live_compat -- --ignored --nocapture
 
+#[path = "support/deadline.rs"]
+mod deadline;
+
 use std::collections::HashMap;
-use std::time::Duration;
 
 use e6irc_client::{Connection, webpki_root_store};
 
@@ -27,7 +29,7 @@ async fn probe(addr: &str, server_name: &str) -> std::io::Result<(bool, HashMap<
     let mut welcomed = false;
     let mut isupport: HashMap<String, String> = HashMap::new();
 
-    let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+    let outcome = tokio::time::timeout(deadline::HANG, async {
         while let Some(msg) = conn.next_message().await? {
             match msg.command.as_str() {
                 "PING" => {
