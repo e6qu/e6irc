@@ -94,20 +94,18 @@ const apiContract = {
             server_password: { type: "string" },
           },
         } } } },
+        // The same flat shape the served OpenAPI declares: a mock that invents
+        // a nesting the server does not send is a test that passes while the
+        // product is broken, which is exactly what happened here.
         responses: { 200: response({
-          type: "object", additionalProperties: false, required: ["ok", "result"],
+          type: "object", additionalProperties: false,
+          required: ["ok", "resolved_addresses", "dns_ms", "connect_ms", "registration_ms", "confirmed_nick", "sasl_mechanism"],
           properties: {
             ok: { const: true },
-            result: {
-              type: "object", additionalProperties: false,
-              required: ["resolved_addresses", "dns_ms", "connect_ms", "registration_ms", "confirmed_nick", "sasl_mechanism"],
-              properties: {
-                resolved_addresses: { type: "integer" }, dns_ms: { type: "integer" },
-                connect_ms: { type: "integer" }, registration_ms: { type: "integer" },
-                confirmed_nick: { type: "string" },
-                sasl_mechanism: { type: ["string", "null"] },
-              },
-            },
+            resolved_addresses: { type: "integer" }, dns_ms: { type: "integer" },
+            connect_ms: { type: "integer" }, registration_ms: { type: "integer" },
+            confirmed_nick: { type: "string" },
+            sasl_mechanism: { enum: ["SCRAM-SHA-512", "SCRAM-SHA-256", "PLAIN", null] },
           },
         }) },
       },
@@ -1099,10 +1097,8 @@ test("the add dialog tests a connection without saving it, and says how it logge
       contentType: "application/json",
       body: JSON.stringify({
         ok: true,
-        result: {
-          resolved_addresses: 2, dns_ms: 4, connect_ms: 30, registration_ms: 120,
-          confirmed_nick: "visual", sasl_mechanism: "SCRAM-SHA-512",
-        },
+        resolved_addresses: 2, dns_ms: 4, connect_ms: 30, registration_ms: 120,
+        confirmed_nick: "visual", sasl_mechanism: "SCRAM-SHA-512",
       }),
     });
   });
@@ -1127,6 +1123,11 @@ test("the add dialog tests a connection without saving it, and says how it logge
   // The result is reported in the dialog: a test runs before there is any
   // network, so there is no console for it to be reported into.
   await expect(dialog.locator("#nf-result")).toContainText("logged in with SASL SCRAM-SHA-512");
+  // The timings ride with the verdict: a connection that works slowly is not
+  // the same answer as one that works.
+  await expect(dialog.locator("#nf-result")).toContainText(
+    "DNS 4ms, connection 30ms, registration 120ms",
+  );
   // Nothing was stored: the dialog is still open, on the same fields.
   await expect(dialog).toBeVisible();
   await expect(dialog.locator("#nf-sasl-account")).toHaveValue("visual-account");

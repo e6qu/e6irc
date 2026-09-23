@@ -2097,13 +2097,21 @@ testButton?.addEventListener("click", () => {
     testButton.disabled = true;
     testButton.textContent = "Testing…";
     try {
-      const result = await apiSend("POST", "/api/v1/me/network-preflight", body);
-      const mechanism = result.result?.sasl_mechanism;
+      // The served contract answers flat -- timings and verdict at the top
+      // level -- and the client validates against it, so this reads what the
+      // server actually sends.
+      const outcome = await apiSend("POST", "/api/v1/me/network-preflight", body);
+      const mechanism = outcome.sasl_mechanism;
       setDialogError("");
+      // The timings come back with the verdict and are what distinguishes "it
+      // works" from "it works, slowly" -- the console form that used to show
+      // them is gone, so this is where they are read now.
       setDialogResult(
-        `Connection test succeeded: registered as ${result.result?.confirmed_nick}` +
+        `Connection test succeeded: registered as ${outcome.confirmed_nick}` +
           `${mechanism ? `, logged in with SASL ${mechanism}` : ", without SASL"}.` +
-          " Nothing was saved.",
+          ` DNS ${outcome.dns_ms}ms, connection ${outcome.connect_ms}ms,` +
+          ` registration ${outcome.registration_ms}ms.` +
+          " No network was created.",
       );
       testButton.textContent = "Test succeeded";
     } catch (error) {
@@ -2381,17 +2389,19 @@ if (themeSelect) {
 if (notifyBtn) {
   notifyBtn.addEventListener("click", async () => {
     if (!settings.notifications) {
+      // Every way this can fail is reported the same way: an alert, read from
+      // whatever conversation is open. One of these used to print into the
+      // console buffer instead, which need not exist and need not be the one
+      // being read.
       if (typeof Notification === "undefined") {
-        addServer("This browser does not support desktop notifications.");
+        showAlert("notifications", "This browser does not support desktop notifications.");
         return;
       }
       let perm;
       try {
         perm = await Notification.requestPermission();
       } catch (error) {
-        const message = errorMessage("request notification permission", error);
-        addServer(message);
-        showAlert("notifications", message);
+        showAlert("notifications", errorMessage("request notification permission", error));
         return;
       }
       if (perm !== "granted") {
