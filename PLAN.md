@@ -598,6 +598,24 @@ and the replay with `server-time` tags -- and held the connection open. Libera
 answers `e=other-error` as its SCRAM server-first for an unknown account, the
 case the client has handled since #342.
 
+Sweeping after #346 found, and this change fixes:
+
+- **The documented way to attach a client to your own bouncer did not work.**
+  The TUI's own `--help`, the README, `DESIGN.md` and three journey documents
+  all say a BNC network is selected with `account/network` as the SASL user
+  name -- soju's convention. The attach listener only ever read the selector
+  from the *nickname*, ZNC's convention, so following the instructions gave
+  `904 SASL authentication failed`. Running the TUI exactly as its help says
+  is how it was found. The listener now accepts either, because neither alone
+  is enough: every client can set a SASL user name, while `<nick>/<network>`
+  asks for a nickname containing `/`, which is not a legal nickname and which
+  many clients will not send. A client that sends both must agree, or it is
+  refused naming both networks.
+
+Exercised rather than inspected, and sound: the `e6irc` CLI against both the
+core listener and the attach listener -- `send`, `history`, `raw` (including
+its nonzero exit on a refused line) and `api` -- and the TUI over a pty.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

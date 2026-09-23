@@ -708,6 +708,96 @@ async fn bnc_listener_rejects_unauthenticated_and_wrong_password() {
     );
 }
 
+/// A client names the network it wants either soju's way -- in the SASL user
+/// name -- or ZNC's, in the nickname. Every client can set a SASL user name;
+/// `<nick>/<network>` asks for a nickname containing `/`, which is not a legal
+/// nickname and which many clients will not send. Both work, and two different
+/// answers are refused rather than one of them being guessed at.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_network_is_selected_by_the_sasl_user_name_or_the_nickname() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let url = bnc_account_db(
+        "a_network_is_selected_by_the_sasl_user_name_or_the_nickname",
+        "alice",
+        "s3cr3t",
+    )
+    .await;
+    let up = upstream().await;
+    let running = net::start(bnc_config(up, url)).await.expect("start");
+    let bnc = running.bnc_addr.expect("bnc bound");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    // `nick`, `user name`: what the client sends; `expect`: what it must read.
+    async fn attach(bnc: std::net::SocketAddr, nick: &str, user_name: &str) -> String {
+        let mut sock = tokio::net::TcpStream::connect(bnc).await.unwrap();
+        sock.write_all(
+            format!(
+                "CAP LS 302\r\nCAP REQ :sasl\r\nNICK {nick}\r\nUSER x 0 * :x\r\n\
+                 AUTHENTICATE PLAIN\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut buffer = [0u8; 4096];
+        let mut seen = String::new();
+        tokio::time::timeout(deadline::HANG, async {
+            loop {
+                let read = sock.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    return;
+                }
+                seen.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                if seen.contains("AUTHENTICATE +") {
+                    break;
+                }
+            }
+            let payload = e6irc_proto::base64::encode(format!("\0{user_name}\0s3cr3t").as_bytes());
+            sock.write_all(format!("AUTHENTICATE {payload}\r\nCAP END\r\n").as_bytes())
+                .await
+                .unwrap();
+            loop {
+                let read = sock.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    return;
+                }
+                seen.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                if seen.contains(" 001 ") || seen.contains(" 904 ") || seen.contains(" 432 ") {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the attach verdict");
+        seen
+    }
+
+    // soju's form: the nickname is an ordinary nickname.
+    let sasl_form = attach(bnc, "alice", "alice/up").await;
+    assert!(
+        sasl_form.contains(" 001 ") && sasl_form.contains("attached to 'up'"),
+        "the SASL user name must select the network: {sasl_form}"
+    );
+    // ZNC's form still works.
+    let nick_form = attach(bnc, "alice/up", "alice").await;
+    assert!(
+        nick_form.contains(" 001 ") && nick_form.contains("attached to 'up'"),
+        "the nickname must still select the network: {nick_form}"
+    );
+    // Two different answers to the same question are not guessed at.
+    let conflict = attach(bnc, "alice/up", "alice/other").await;
+    assert!(
+        conflict.contains(" 432 ") && conflict.contains("other"),
+        "a disagreement must name both networks: {conflict}"
+    );
+    assert!(
+        !conflict.contains(" 001 "),
+        "a disagreement must not attach: {conflict}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn bnc_listener_accepts_chunked_sasl_plain() {
