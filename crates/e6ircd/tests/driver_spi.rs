@@ -5,7 +5,8 @@
 //! driver (which echoes each command back as a line) and exercises the
 //! shared `attach` path against it — no external service required.
 
-use std::time::Duration;
+#[path = "support/deadline.rs"]
+mod deadline;
 
 use e6ircd::bouncer::{
     DriverEvent, LoopbackDriver, NetworkDriver, NetworkHandle, SendOutcome, attach,
@@ -14,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast::Receiver;
 
 async fn wait_for(events: &mut Receiver<DriverEvent>, pred: impl Fn(&DriverEvent) -> bool) -> bool {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(deadline::HANG, async {
         loop {
             match events.recv().await {
                 Ok(ev) if pred(&ev) => return true,
@@ -39,7 +40,7 @@ async fn assert_echo_driver_contract(driver: Box<dyn NetworkDriver>) {
     // the `Connected` event may fire before this task subscribes (a
     // broadcast receiver never sees a message sent before it existed),
     // which is exactly the race that made this test flaky on loaded CI.
-    let connected = tokio::time::timeout(Duration::from_secs(2), async {
+    let connected = tokio::time::timeout(deadline::HANG, async {
         loop {
             if handle.runtime_snapshot().lifecycle == e6ircd::bouncer::NetworkLifecycle::Connected {
                 return true;
@@ -66,7 +67,7 @@ async fn assert_echo_driver_contract(driver: Box<dyn NetworkDriver>) {
     );
 
     // The line is also recorded to the detached buffer for playback.
-    let buffered = tokio::time::timeout(Duration::from_secs(2), async {
+    let buffered = tokio::time::timeout(deadline::HANG, async {
         loop {
             if handle.buffer_snapshot().iter().any(|l| l == "hello world") {
                 return true;
@@ -92,7 +93,7 @@ async fn attach_relays_over_the_loopback_driver() {
     // Poll for it rather than sleeping a fixed interval (a fixed sleep is
     // a latent flake on a slow runner).
     assert_eq!(handle.send("earlier"), SendOutcome::Sent);
-    let buffered = tokio::time::timeout(Duration::from_secs(2), async {
+    let buffered = tokio::time::timeout(deadline::HANG, async {
         loop {
             if handle.buffer_snapshot().iter().any(|l| l == "earlier") {
                 return true;
@@ -123,7 +124,7 @@ async fn attach_relays_over_the_loopback_driver() {
     let mut lines = BufReader::new(r).lines();
 
     // Attach greeting: the current upstream connection status comes first.
-    let status = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+    let status = tokio::time::timeout(deadline::HANG, lines.next_line())
         .await
         .expect("timeout")
         .expect("io")
@@ -133,7 +134,7 @@ async fn attach_relays_over_the_loopback_driver() {
         "attach sends an initial status line: {status}"
     );
     // Then playback includes lifecycle notices and the buffered line.
-    let replayed = tokio::time::timeout(Duration::from_secs(2), async {
+    let replayed = tokio::time::timeout(deadline::HANG, async {
         loop {
             let line = lines.next_line().await?.ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "attach closed")
@@ -150,7 +151,7 @@ async fn attach_relays_over_the_loopback_driver() {
 
     // Live: a client line is echoed by the loopback driver back to us.
     w.write_all(b"live ping\r\n").await.unwrap();
-    let echoed = tokio::time::timeout(Duration::from_secs(2), async {
+    let echoed = tokio::time::timeout(deadline::HANG, async {
         loop {
             let line = lines.next_line().await.unwrap().unwrap();
             if line == "live ping" {

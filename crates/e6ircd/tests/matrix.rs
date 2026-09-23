@@ -8,6 +8,9 @@
 
 #![cfg(feature = "matrix")]
 
+#[path = "support/deadline.rs"]
+mod deadline;
+
 use std::time::Duration;
 
 use e6ircd::bouncer::{
@@ -92,7 +95,7 @@ async fn matrix_bridge_relays_both_ways() {
     }))
     .start();
     let mut events = handle.subscribe();
-    let connected = tokio::time::timeout(Duration::from_secs(10), async {
+    let connected = tokio::time::timeout(deadline::HANG, async {
         loop {
             match events.recv().await {
                 Ok(DriverEvent::Status {
@@ -120,7 +123,7 @@ async fn matrix_bridge_relays_both_ways() {
     .await
     .expect("alice send");
 
-    let line = tokio::time::timeout(Duration::from_secs(10), async {
+    let line = tokio::time::timeout(deadline::HANG, async {
         loop {
             match events.recv().await {
                 Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line: l, .. }))
@@ -147,7 +150,7 @@ async fn matrix_bridge_relays_both_ways() {
         handle.send(&format!("PRIVMSG #{room_local} :from the bridge")),
         e6ircd::bouncer::SendOutcome::Sent
     );
-    let seen = tokio::time::timeout(Duration::from_secs(10), async {
+    let seen = tokio::time::timeout(deadline::HANG, async {
         let mut since = String::new();
         loop {
             let mut req = http

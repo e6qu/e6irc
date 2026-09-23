@@ -12,6 +12,9 @@ use e6ircd::net;
 
 mod support;
 
+#[path = "support/deadline.rs"]
+mod deadline;
+
 async fn upstream() -> std::net::SocketAddr {
     let config = Config {
         server_name: "irc.upstream.example".into(),
@@ -35,7 +38,7 @@ async fn upstream() -> std::net::SocketAddr {
 
 /// Poll the sticky lifecycle until the driver reaches `expected`.
 async fn wait_lifecycle(handle: &NetworkHandle, expected: NetworkLifecycle) {
-    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+    tokio::time::timeout(deadline::HANG, async {
         while handle.runtime_snapshot().lifecycle != expected {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -59,7 +62,7 @@ async fn wait_connected(
     if handle.runtime_snapshot().lifecycle == NetworkLifecycle::Connected {
         return;
     }
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(deadline::HANG, async {
         loop {
             match events.recv().await {
                 Ok(DriverEvent::Status {
@@ -150,7 +153,7 @@ async fn driver_registers_relays_and_buffers() {
         .unwrap();
 
     // the driver relays it as an event
-    let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let got = tokio::time::timeout(deadline::HANG, async {
         loop {
             match events.recv().await {
                 Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line: l, .. }))
@@ -189,7 +192,7 @@ async fn driver_registers_relays_and_buffers() {
         handle.send("PRIVMSG #bnc :from the bouncer"),
         SendOutcome::Sent
     );
-    let echoed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let echoed = tokio::time::timeout(deadline::HANG, async {
         loop {
             let m = other.next_message().await.unwrap().unwrap();
             if m.command == "PRIVMSG"
@@ -221,7 +224,7 @@ async fn driver_reconnects_after_upstream_drop() {
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
-    let disconnected = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let disconnected = tokio::time::timeout(deadline::HANG, async {
         loop {
             match events.recv().await {
                 Ok(DriverEvent::Status {
@@ -331,7 +334,7 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
 
     // Collect events until the post-bad-line message arrives; assert no
     // Disconnected (reconnect) happened in between.
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let outcome = tokio::time::timeout(deadline::HANG, async {
         let mut saw_bad_line = false;
         let mut saw_rejection = false;
         let mut disconnected_before_after = false;
@@ -376,7 +379,7 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
     );
     drop(events);
     drop(handle);
-    tokio::time::timeout(std::time::Duration::from_secs(5), upstream)
+    tokio::time::timeout(deadline::HANG, upstream)
         .await
         .expect("mock upstream did not observe driver shutdown")
         .expect("mock upstream task failed");
@@ -527,7 +530,7 @@ async fn bnc_listener_authenticates_and_routes_client_to_network() {
         .send_line("PRIVMSG #lobby :hi from bnc client")
         .await
         .unwrap();
-    let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let got = tokio::time::timeout(deadline::HANG, async {
         loop {
             let m = peer.next_message().await.unwrap().unwrap();
             if m.command == "PRIVMSG"
@@ -548,7 +551,7 @@ async fn bnc_listener_authenticates_and_routes_client_to_network() {
     peer.send_line("PRIVMSG #lobby :hi from upstream")
         .await
         .unwrap();
-    let live = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let live = tokio::time::timeout(deadline::HANG, async {
         loop {
             let m = client.next_message().await.unwrap().unwrap();
             if m.command == "PRIVMSG"
@@ -758,7 +761,7 @@ async fn bnc_listener_accepts_chunked_sasl_plain() {
     // Only correct accumulation yields the valid credential -> RPL_SASLSUCCESS
     // (903); a broken chunker would verify the first chunk alone and fail (904).
     let mut acc = String::new();
-    let ok = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let ok = tokio::time::timeout(deadline::HANG, async {
         loop {
             let n = sock.read(&mut b).await.unwrap();
             if n == 0 {
@@ -779,7 +782,7 @@ async fn bnc_listener_accepts_chunked_sasl_plain() {
 
     sock.write_all(b"AUTHENTICATE PLAIN\r\n").await.unwrap();
     let mut already = String::new();
-    let refused = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let refused = tokio::time::timeout(deadline::HANG, async {
         loop {
             let n = sock.read(&mut b).await.unwrap();
             if n == 0 {
@@ -844,7 +847,7 @@ async fn driver_authenticates_to_sasl_upstream() {
     // The mechanism is chosen, not configured, so the owner is told which one
     // carried the password: e6ircd offers PLAIN and OAUTHBEARER, and PLAIN is
     // the password mechanism among them.
-    let told = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let told = tokio::time::timeout(deadline::HANG, async {
         loop {
             if let Ok(e6ircd::bouncer::DriverEvent::Line(line)) = events.recv().await
                 && line.line.contains("logged in as bncacct with SASL PLAIN")
@@ -875,7 +878,7 @@ async fn driver_authenticates_to_sasl_upstream() {
         .await
         .unwrap();
     observer.send_line("WHOIS bncacct").await.unwrap();
-    let logged_in = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let logged_in = tokio::time::timeout(deadline::HANG, async {
         loop {
             let m = observer.next_message().await.unwrap().unwrap();
             // 330 RPL_WHOISACCOUNT: <me> <nick> <account> :is logged in as
@@ -933,7 +936,7 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
 
     // Wait until the line is in the persisted buffer.
     let pool = observer_pool(&url).await;
-    let persisted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let persisted = tokio::time::timeout(deadline::HANG, async {
         loop {
             let lines = e6ircd::db::recent_bnc_lines(&pool, "alice", "up", 100)
                 .await
@@ -1010,7 +1013,7 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
         .await
         .expect("attach");
     // Playback of the restored backlog contains the persisted line.
-    let replayed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let replayed = tokio::time::timeout(deadline::HANG, async {
         loop {
             let m = client.next_message().await.unwrap();
             match m {
@@ -1125,7 +1128,7 @@ async fn local_driver_presents_the_in_process_network() {
     peer.send_line("PRIVMSG #local :hi from the main listener")
         .await
         .unwrap();
-    let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let got = tokio::time::timeout(deadline::HANG, async {
         loop {
             let m = client.next_message().await.unwrap();
             match m {
@@ -1215,7 +1218,7 @@ async fn persisted_bnc_buffer_is_trimmed_by_its_own_traffic() {
         sent += 250;
         // Let persistence catch up before sending more.
         let want = sent.min(5_000);
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::time::timeout(deadline::HANG, async {
             while rows().await < want {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
@@ -1229,7 +1232,7 @@ async fn persisted_bnc_buffer_is_trimmed_by_its_own_traffic() {
     // *passing through* the bound on its way past it — which is exactly what an
     // earlier version of this test did, and it stayed green with the trim
     // disabled.
-    let settled = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+    let settled = tokio::time::timeout(deadline::HANG, async {
         let mut last = -1i64;
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1291,7 +1294,7 @@ async fn buffered_upstream_lines_keep_their_wire_form() {
     peer.send_line("PRIVMSG #lobby :hi").await.expect("send");
 
     let pool = observer_pool(&url).await;
-    let line = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let line = tokio::time::timeout(deadline::HANG, async {
         loop {
             let lines = e6ircd::db::recent_bnc_lines(&pool, "alice", "up", 100)
                 .await
@@ -1444,7 +1447,7 @@ async fn a_connection_test_out_of_budget_names_its_stage_and_still_quits() {
     .await
     .expect_err("an upstream that never welcomes cannot qualify");
     assert_eq!(failure.code(), "registration_timed_out");
-    let goodbye = tokio::time::timeout(std::time::Duration::from_secs(5), heard_rx.recv())
+    let goodbye = tokio::time::timeout(deadline::HANG, heard_rx.recv())
         .await
         .expect("the upstream never heard a goodbye")
         .expect("upstream script ended");
@@ -1487,7 +1490,7 @@ async fn the_configured_username_is_what_the_upstream_is_sent() {
         .expect("the connection test registers");
     let handle = IrcNetwork::start(config);
     for registration in ["the connection test", "the driver"] {
-        let user = tokio::time::timeout(std::time::Duration::from_secs(10), user_rx.recv())
+        let user = tokio::time::timeout(deadline::HANG, user_rx.recv())
             .await
             .unwrap_or_else(|_| panic!("{registration} never sent USER"))
             .expect("upstream script ended");
@@ -1650,7 +1653,7 @@ async fn a_connection_test_joins_nothing_and_still_quits() {
     .expect("registration qualifies the upstream");
     assert_eq!(result.confirmed_nick, "preflight");
     let mut heard = Vec::new();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(deadline::HANG, async {
         loop {
             let line = heard_rx.recv().await.expect("upstream script ended");
             let goodbye = line.starts_with("QUIT");
@@ -1726,7 +1729,7 @@ async fn a_taken_nickname_is_reported_and_never_replaced() {
     });
     let mut events = handle.subscribe();
 
-    let refused = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let refused = tokio::time::timeout(deadline::HANG, async {
         loop {
             let snapshot = handle.runtime_snapshot();
             if snapshot.last_error.is_some() {
@@ -1795,7 +1798,7 @@ async fn driver_tracks_forced_upstream_nick_change() {
     nick_tx.send(()).await.unwrap();
     // Drain the NICK line itself, then send a message whose echo must use
     // the new nick.
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(deadline::HANG, async {
         loop {
             if let Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line, .. })) =
                 events.recv().await
@@ -1807,7 +1810,7 @@ async fn driver_tracks_forced_upstream_nick_change() {
     })
     .await
     .expect("nick line never relayed");
-    let renamed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let renamed = tokio::time::timeout(deadline::HANG, async {
         loop {
             let snapshot = handle.runtime_snapshot();
             if snapshot.last_error.is_some() {
@@ -1849,7 +1852,7 @@ async fn driver_tracks_forced_upstream_nick_change() {
         SendOutcome::Sent
     );
     go_tx.send(()).await.unwrap();
-    let echo = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let echo = tokio::time::timeout(deadline::HANG, async {
         loop {
             if let Ok(DriverEvent::Echo {
                 line: e6ircd::bouncer::BufferedLine { line, .. },
@@ -2078,7 +2081,7 @@ async fn runtime_joined_channels_are_rejoined_after_reconnect() {
     // Join a channel at runtime, wait for the driver's membership tracking to
     // observe the upstream's confirmation (relayed as a normal line).
     assert_eq!(handle.send("JOIN #dynamic"), SendOutcome::Sent);
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(deadline::HANG, async {
         loop {
             if let Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line, .. })) =
                 events.recv().await
@@ -2093,7 +2096,7 @@ async fn runtime_joined_channels_are_rejoined_after_reconnect() {
     drop_tx.send(()).await.unwrap();
     // The driver reconnects and rejoins both channels.
     let mut rejoined = std::collections::HashSet::new();
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(deadline::HANG, async {
         while rejoined.len() < 2 {
             rejoined.insert(join_rx.recv().await.expect("join channel closed"));
         }
@@ -2150,7 +2153,7 @@ async fn silent_upstream_trips_keepalive_and_reconnects() {
     let mut events = handle.subscribe();
     wait_connected(&handle, &mut events).await;
     // Disconnect (keepalive timeout) then reconnect.
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(deadline::HANG, async {
         loop {
             match events.recv().await {
                 Ok(DriverEvent::Status {
@@ -2206,7 +2209,7 @@ async fn a_welcome_under_a_different_nickname_is_a_refusal_not_an_identity() {
         internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
-    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let snapshot = tokio::time::timeout(deadline::HANG, async {
         loop {
             let snapshot = handle.runtime_snapshot();
             assert_ne!(
@@ -2237,7 +2240,7 @@ async fn a_welcome_under_a_different_nickname_is_a_refusal_not_an_identity() {
         "a welcome under another nickname parks on the first occurrence: {snapshot:?}"
     );
     assert!(handle.irc_session_snapshot().is_none());
-    let goodbye = tokio::time::timeout(std::time::Duration::from_secs(5), heard_rx.recv())
+    let goodbye = tokio::time::timeout(deadline::HANG, heard_rx.recv())
         .await
         .expect("the upstream heard neither a goodbye nor a close")
         .expect("upstream script ended");
@@ -2274,7 +2277,7 @@ async fn upstream_capability_changes_are_not_relayed_to_attached_clients() {
         internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
-    let lines = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let lines = tokio::time::timeout(deadline::HANG, async {
         loop {
             let lines = handle.buffer_snapshot();
             if lines
@@ -2327,7 +2330,7 @@ async fn downstream_traffic_does_not_hide_a_silent_upstream() {
             tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         }
     });
-    let tripped = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    let tripped = tokio::time::timeout(deadline::HANG, async {
         loop {
             match events.recv().await {
                 Ok(DriverEvent::Status {
@@ -2370,7 +2373,7 @@ async fn repeated_registration_rejection_parks_the_driver() {
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
-    let notice = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    let notice = tokio::time::timeout(deadline::HANG, async {
         loop {
             match events.recv().await {
                 Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line, .. }))
@@ -2467,7 +2470,7 @@ async fn a_services_outage_is_outlasted_not_parked() {
         ..NetworkConfig::default()
     });
     for dial in 1..=OUTAGE_DIALS {
-        tokio::time::timeout(std::time::Duration::from_secs(10), dial_rx.recv())
+        tokio::time::timeout(deadline::HANG, dial_rx.recv())
             .await
             .unwrap_or_else(|_| {
                 panic!(
@@ -2572,7 +2575,7 @@ async fn an_upstream_without_the_sasl_mechanism_is_not_a_credential_rejection() 
     });
     // Wait on exactly what is asserted: the recorded refusal. (It is retried,
     // never parked — see `a_services_outage_is_outlasted_not_parked`.)
-    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+    let snapshot = tokio::time::timeout(deadline::HANG, async {
         loop {
             let snapshot = handle.runtime_snapshot();
             if snapshot.last_error.is_some() {
@@ -2677,7 +2680,7 @@ async fn a_refused_registration_keeps_its_reason_while_retrying() {
         internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
-    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let snapshot = tokio::time::timeout(deadline::HANG, async {
         loop {
             let snapshot = handle.runtime_snapshot();
             if snapshot.last_error.is_some() {
@@ -2748,7 +2751,7 @@ async fn full_buffer_evicts_oldest() {
             .await
             .unwrap();
     }
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(deadline::HANG, async {
         loop {
             let snapshot = handle.buffer_snapshot();
             let messages: Vec<&String> = snapshot
@@ -2809,7 +2812,7 @@ async fn self_echo_is_persisted_to_the_backlog() {
         .unwrap();
 
     let pool = observer_pool(&url).await;
-    let line = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let line = tokio::time::timeout(deadline::HANG, async {
         loop {
             let lines = e6ircd::db::recent_bnc_lines(&pool, "alice", "up", 100)
                 .await
@@ -3197,7 +3200,7 @@ async fn outlasted_never_parked(answer: PreWelcomeAnswer) {
         ..NetworkConfig::default()
     });
     let mut reason_seen = false;
-    let connected = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+    let connected = tokio::time::timeout(deadline::HANG, async {
         loop {
             let snapshot = handle.runtime_snapshot();
             assert_ne!(
@@ -3269,7 +3272,7 @@ async fn an_upstream_error_after_registration_is_a_notice_not_an_error() {
     drop_tx.send(()).await.unwrap();
     // What an attached client reads, up to and including the notice.
     let mut read = Vec::new();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(deadline::HANG, async {
         loop {
             match events.recv().await {
                 Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line, .. }))
@@ -3303,7 +3306,7 @@ async fn an_upstream_error_after_registration_is_a_notice_not_an_error() {
         !read.iter().any(|line| is_error_command(line)),
         "an ERROR command reached the attached client: {read:?}"
     );
-    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let snapshot = tokio::time::timeout(deadline::HANG, async {
         loop {
             let snapshot = handle.runtime_snapshot();
             if snapshot.lifecycle == NetworkLifecycle::Reconnecting {
@@ -3367,7 +3370,7 @@ async fn a_nick_delay_is_a_typed_refusal_within_milliseconds() {
         internal_upstreams: InternalUpstreams::Allow,
         ..NetworkConfig::default()
     });
-    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let snapshot = tokio::time::timeout(deadline::HANG, async {
         loop {
             let snapshot = handle.runtime_snapshot();
             if snapshot.last_error.is_some() {
@@ -3435,7 +3438,7 @@ async fn a_rejoin_of_many_channels_takes_few_join_lines() {
     wait_connected(&handle, &mut events).await;
     let mut lines = Vec::new();
     let mut named: Vec<String> = Vec::new();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(deadline::HANG, async {
         while named.len() < channels.len() {
             let line = lines_rx.recv().await.expect("upstream script ended");
             named.extend(line["JOIN ".len()..].split(',').map(str::to_string));
@@ -3493,7 +3496,7 @@ async fn self_echoes_carry_the_identity_the_upstream_shows() {
     let mut events = handle.subscribe();
     wait_connected(&handle, &mut events).await;
     async fn next_echo(events: &mut tokio::sync::broadcast::Receiver<DriverEvent>) -> String {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(deadline::HANG, async {
             loop {
                 if let Ok(DriverEvent::Echo {
                     line: e6ircd::bouncer::BufferedLine { line, .. },
@@ -3514,7 +3517,7 @@ async fn self_echoes_carry_the_identity_the_upstream_shows() {
         "the configured user name and the server name, until better is known: {before}"
     );
     confirm_tx.send(()).await.unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(deadline::HANG, async {
         loop {
             if let Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line, .. })) =
                 events.recv().await
@@ -3651,7 +3654,7 @@ async fn the_backlog_cap_holds_across_restarts() {
             .await
             .expect("start");
         // The start trims the buffer back to the cap.
-        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        tokio::time::timeout(deadline::HANG, async {
             while rows_through(before).await > CAP {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -3668,7 +3671,7 @@ async fn the_backlog_cap_holds_across_restarts() {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::time::timeout(deadline::HANG, async {
             while batch_rows(batch).await < 600 {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -3682,7 +3685,7 @@ async fn the_backlog_cap_holds_across_restarts() {
     let running = net::start(bnc_config(up, url.clone()))
         .await
         .expect("start");
-    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+    tokio::time::timeout(deadline::HANG, async {
         while rows_through(before).await > CAP {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }

@@ -1,6 +1,9 @@
 //! e2e for the ws-irc endpoint: a real WebSocket client registers and
 //! exchanges messages with a TCP client through the same core.
 
+#[path = "support/deadline.rs"]
+mod deadline;
+
 use e6ircd::config::{Config, HttpConfig, ListenerConfig};
 use e6ircd::net;
 use futures_util::{SinkExt, StreamExt};
@@ -39,7 +42,7 @@ async fn ws_client_registers_and_messages_a_tcp_client() {
     ws.send(Tung::text("NICK wsclient")).await.unwrap();
     ws.send(Tung::text("USER w 0 * :WS")).await.unwrap();
     // read frames until welcome
-    let welcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let welcome = tokio::time::timeout(deadline::HANG, async {
         loop {
             if let Some(Ok(Tung::Text(t))) = ws.next().await {
                 if t.contains(" 001 ") {
@@ -56,7 +59,7 @@ async fn ws_client_registers_and_messages_a_tcp_client() {
 
     ws.send(Tung::text("JOIN #ws")).await.unwrap();
     // wait for end-of-names
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(deadline::HANG, async {
         loop {
             if let Some(Ok(Tung::Text(t))) = ws.next().await {
                 if t.contains(" 366 ") {
@@ -94,7 +97,7 @@ async fn ws_client_registers_and_messages_a_tcp_client() {
         .await
         .unwrap();
 
-    let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let got = tokio::time::timeout(deadline::HANG, async {
         loop {
             if let Some(Ok(Tung::Text(t))) = ws.next().await {
                 if t.contains("PRIVMSG #ws") {
@@ -143,7 +146,7 @@ async fn read_until(
     ws: &mut (impl StreamExt<Item = Result<Tung, tokio_tungstenite::tungstenite::Error>> + Unpin),
     needle: &str,
 ) -> String {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(deadline::HANG, async {
         loop {
             match ws.next().await {
                 Some(Ok(Tung::Text(t))) if t.contains(needle) => return t.to_string(),

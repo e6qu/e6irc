@@ -2,6 +2,9 @@
 //! (driver connected to an e6ircd-as-upstream), receives buffered +
 //! live traffic, and its sent lines reach the upstream.
 
+#[path = "support/deadline.rs"]
+mod deadline;
+
 use e6ircd::bouncer::{IrcNetwork, NetworkConfig, NetworkHandle, attach};
 use e6ircd::config::{Config, ListenerConfig};
 use e6ircd::egress::InternalUpstreams;
@@ -30,7 +33,7 @@ async fn wait_connected(handle: &NetworkHandle) {
     if handle.runtime_snapshot().lifecycle == e6ircd::bouncer::NetworkLifecycle::Connected {
         return;
     }
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(deadline::HANG, async {
         loop {
             match events.recv().await {
                 Ok(e6ircd::bouncer::DriverEvent::Status {
@@ -109,7 +112,7 @@ async fn attached_client_gets_playback_and_live_and_can_send() {
     let mut client = BufReader::new(cr);
 
     // playback: the buffered message arrives first
-    let playback = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let playback = tokio::time::timeout(deadline::HANG, async {
         loop {
             let mut line = String::new();
             client.read_line(&mut line).await.unwrap();
@@ -126,7 +129,7 @@ async fn attached_client_gets_playback_and_live_and_can_send() {
     peer.send_line("PRIVMSG #room :live after attach")
         .await
         .unwrap();
-    let live = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let live = tokio::time::timeout(deadline::HANG, async {
         loop {
             let mut line = String::new();
             client.read_line(&mut line).await.unwrap();
@@ -143,7 +146,7 @@ async fn attached_client_gets_playback_and_live_and_can_send() {
     cw.write_all(b"PRIVMSG #room :from attached client\r\n")
         .await
         .unwrap();
-    let echoed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let echoed = tokio::time::timeout(deadline::HANG, async {
         loop {
             let m = peer.next_message().await.unwrap().unwrap();
             if m.command == "PRIVMSG"
@@ -162,7 +165,7 @@ async fn attached_client_gets_playback_and_live_and_can_send() {
 
     drop(cw);
     drop(client);
-    tokio::time::timeout(std::time::Duration::from_secs(5), attach_task)
+    tokio::time::timeout(deadline::HANG, attach_task)
         .await
         .expect("attach did not stop after its client closed")
         .expect("attach task panicked");
@@ -224,7 +227,7 @@ async fn two_clients_attach_to_one_always_on_network() {
     for client in [c1, c2] {
         let (r, _w) = tokio::io::split(client);
         let mut br = BufReader::new(r);
-        let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let got = tokio::time::timeout(deadline::HANG, async {
             loop {
                 let mut line = String::new();
                 br.read_line(&mut line).await.unwrap();
@@ -261,7 +264,7 @@ async fn lagged_attach_is_not_left_open_with_stale_session_state() {
         .await
     });
 
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(deadline::HANG, async {
         while handle.runtime_snapshot().attached_clients == 0 {
             tokio::task::yield_now().await;
         }
@@ -278,7 +281,7 @@ async fn lagged_attach_is_not_left_open_with_stale_session_state() {
     ends.emit_line(":attacher!u@h PART #room :gone".into());
 
     let mut reader = BufReader::new(client);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let output = tokio::time::timeout(deadline::HANG, async {
         let mut output = String::new();
         reader.read_to_string(&mut output).await.unwrap();
         output
@@ -323,7 +326,7 @@ async fn read_until(
     br: &mut BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
     needle: &str,
 ) -> String {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(deadline::HANG, async {
         loop {
             let mut line = String::new();
             br.read_line(&mut line).await.unwrap();
@@ -393,7 +396,7 @@ async fn self_echo_excluded_for_originator_but_reaches_others_and_buffer() {
     assert!(own.is_err(), "originator must not be echoed: {own:?}");
 
     // The detached buffer records it (playback holds both sides).
-    let buffered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let buffered = tokio::time::timeout(deadline::HANG, async {
         loop {
             let snapshot = handle.buffer_snapshot();
             if let Some(line) = snapshot.iter().find(|l| l.contains("both sides now")) {
@@ -459,7 +462,7 @@ async fn self_echo_delivered_once_when_negotiated() {
 
 /// Wait for the next command the driver receives.
 async fn next_driver_command(ends: &mut e6ircd::bouncer::DriverEnds) -> String {
-    tokio::time::timeout(std::time::Duration::from_secs(5), ends.next_command())
+    tokio::time::timeout(deadline::HANG, ends.next_command())
         .await
         .expect("driver command timeout")
         .expect("driver command queue closed")
@@ -477,7 +480,7 @@ async fn attached_client_quit_ends_the_attachment_and_never_reaches_the_driver()
     read_until(&mut reader, "upstream disconnected").await;
 
     writer.write_all(b"QUIT :leaving\r\n").await.unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+    tokio::time::timeout(deadline::HANG, task)
         .await
         .expect("QUIT did not end the attachment")
         .expect("attach task panicked");
@@ -573,7 +576,7 @@ async fn a_silent_client_is_pinged_and_then_let_go_while_an_answering_one_stays(
 
     let ping = read_until(&mut silent_reader, "PING").await;
     assert!(ping.starts_with(":*bnc* PING "), "{ping}");
-    let end = tokio::time::timeout(std::time::Duration::from_secs(5), silent)
+    let end = tokio::time::timeout(deadline::HANG, silent)
         .await
         .expect("a client that answers nothing stayed attached")
         .expect("attach task panicked")

@@ -544,6 +544,15 @@ Sweeping after #343 found, and this change fixes:
   exactly as an empty PRIVMSG is, so every stored message is one its recipients
   can receive.
 
+- **Tests that failed for being slow.** Around seventy integration-test waits
+  were bounded at a handful of seconds each. The bound is there to turn a hang
+  into a readable failure, but written that short it also asserts latency: the
+  attach suite failed on a CI runner, and five database tests failed locally,
+  purely for running beside a browser suite. They share one generous deadline
+  now (`tests/support/deadline.rs`), so a hang still fails with its own
+  sentence and a busy machine does not. The short `from_millis` windows that
+  assert *nothing* arrived are deliberately untouched.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

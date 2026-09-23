@@ -13,6 +13,9 @@ use tokio::net::TcpStream;
 
 mod support;
 
+#[path = "support/deadline.rs"]
+mod deadline;
+
 /// A full-access personal access token with the default lifetime, minted the
 /// way the REST endpoint mints one.
 async fn issue_api_token(
@@ -350,7 +353,7 @@ async fn sasl_over_real_socket() {
     let (r, mut w) = stream.into_split();
     let mut reader = BufReader::new(r);
     let mut expect = async |needle: &str| {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(deadline::HANG, async {
             loop {
                 let mut line = String::new();
                 assert!(reader.read_line(&mut line).await.expect("read") > 0, "EOF");
@@ -429,7 +432,7 @@ async fn sasl_oauthbearer_with_api_token() {
     assert_eq!(nick, "toknick");
     // Confirm the login mapped to the token's account (self WHOIS 330).
     c.send_line("WHOIS toknick").await.unwrap();
-    let logged = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let logged = tokio::time::timeout(deadline::HANG, async {
         loop {
             let m = c.next_message().await.unwrap().unwrap();
             if m.command == "330" && m.params.get(2).map(String::as_str) == Some("tokuser") {
@@ -543,7 +546,7 @@ async fn app_password_issued_over_http_works_for_sasl() {
     let (r, mut w) = stream.into_split();
     let mut reader = BufReader::new(r);
     let mut expect = async |needle: &str| {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(deadline::HANG, async {
             loop {
                 let mut line = String::new();
                 assert!(reader.read_line(&mut line).await.expect("read") > 0, "EOF");
@@ -662,7 +665,7 @@ async fn channel_messages_are_persisted() {
     let (r, mut w) = stream.into_split();
     let mut reader = BufReader::new(r);
     let mut expect = async |needle: &str| {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(deadline::HANG, async {
             loop {
                 let mut line = String::new();
                 assert!(reader.read_line(&mut line).await.expect("read") > 0, "EOF");
@@ -759,7 +762,7 @@ async fn buffered_history_flushes_when_the_sender_is_dropped() {
     // Drop the sender (what dropping the core does) and wait for the worker to
     // finish. Awaiting the JoinHandle is the guarantee shutdown depends on.
     drop(req_tx);
-    tokio::time::timeout(std::time::Duration::from_secs(10), worker)
+    tokio::time::timeout(deadline::HANG, worker)
         .await
         .expect("worker drains and flushes before the timeout")
         .expect("worker task");
@@ -819,7 +822,7 @@ async fn a_flood_of_messages_is_written_in_bounded_batches() {
             .expect("enqueue log");
     }
     drop(req_tx);
-    tokio::time::timeout(std::time::Duration::from_secs(60), worker)
+    tokio::time::timeout(deadline::HANG, worker)
         .await
         .expect("the worker drains the flood")
         .expect("worker task");
@@ -1570,7 +1573,7 @@ async fn read_marker_persists() {
         reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
         needle: &str,
     ) -> String {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(deadline::HANG, async {
             loop {
                 let mut line = String::new();
                 assert!(reader.read_line(&mut line).await.expect("read") > 0, "EOF");
@@ -1941,7 +1944,7 @@ async fn chathistory_pages_from_postgres_past_the_ring() {
         reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
         needle: &str,
     ) -> String {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::time::timeout(deadline::HANG, async {
             loop {
                 let mut line = String::new();
                 assert!(reader.read_line(&mut line).await.expect("read") > 0, "EOF");
@@ -2036,7 +2039,7 @@ async fn expect_line(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
     needle: &str,
 ) -> String {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(deadline::HANG, async {
         loop {
             let mut line = String::new();
             assert!(reader.read_line(&mut line).await.expect("read") > 0, "EOF");

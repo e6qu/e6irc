@@ -12,6 +12,9 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 mod support;
 
+#[path = "support/deadline.rs"]
+mod deadline;
+
 type UiSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -96,7 +99,7 @@ async fn attach(http: std::net::SocketAddr, headers: &[(&'static str, String)]) 
     let (mut socket, _) = tokio_tungstenite::connect_async(request)
         .await
         .expect("ws/ui connect");
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(deadline::HANG, async {
         loop {
             match socket.next().await {
                 Some(Ok(Tung::Text(text))) if text.contains("\"snapshot\"") => return,
@@ -118,7 +121,7 @@ async fn compose(socket: &mut UiSocket, id: &str, message: &str) -> serde_json::
         ))
         .await
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(deadline::HANG, async {
         loop {
             match socket.next().await {
                 Some(Ok(Tung::Text(text))) => {
@@ -210,7 +213,7 @@ async fn ui_socket_sending_requires_write_authority() {
 
     // The upstream delivers in order, so everything the peer hears from the
     // bouncer up to the browser's line is everything the bouncer ever sent.
-    let heard = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let heard = tokio::time::timeout(deadline::HANG, async {
         let mut heard = Vec::new();
         loop {
             let message = peer.next_message().await.unwrap().unwrap();
@@ -284,7 +287,7 @@ async fn the_composer_cannot_end_or_renegotiate_the_upstream_session() {
 
     // The upstream delivers in order: had any refused line reached it, the
     // session would have quit before this text, and the peer would never hear it.
-    let heard = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let heard = tokio::time::timeout(deadline::HANG, async {
         let mut heard = Vec::new();
         loop {
             let message = peer.next_message().await.unwrap().unwrap();
