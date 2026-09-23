@@ -812,6 +812,8 @@ where
     let mut sasl_buf = String::new();
     let mut credential_attempts = crate::identity::CredentialAttemptBudget::default();
     let mut account: Option<String> = None;
+    // The network the SASL username named, if it named one (soju's form).
+    let mut sasl_network: Option<String> = None;
     let mut caps = super::AttachCaps::default();
 
     loop {
@@ -992,7 +994,7 @@ where
                                             )
                                             .await?;
                                     }
-                                    PlainVerification::Accepted(acct) => {
+                                    PlainVerification::Accepted(acct, selected) => {
                                         write
                                             .write_all(
                                                 format!(
@@ -1003,6 +1005,7 @@ where
                                             )
                                             .await?;
                                         account = Some(acct);
+                                        sasl_network = selected;
                                     }
                                     PlainVerification::AttemptsExhausted => {
                                         write
@@ -1077,12 +1080,38 @@ where
 
     let raw = nick.expect("checked");
     let account = account.expect("checked");
+    let nick_network = raw.split_once('/').map(|(_, network)| network.to_string());
+    // Both forms name a network, so both are accepted -- but never two
+    // different answers to the same question: a client that says one network
+    // in its nickname and another in its SASL username is told, not guessed
+    // at.
+    if let (Some(from_nick), Some(from_sasl)) = (&nick_network, &sasl_network)
+        && !e6irc_proto::casemap::CaseMapping::Rfc1459.eq(from_nick, from_sasl)
+    {
+        handshake_numeric(
+            write,
+            server_name,
+            Some(&raw),
+            432,
+            Some(&raw),
+            &format!(
+                "Nickname selects network {from_nick} but the SASL user name selects {from_sasl}"
+            ),
+        )
+        .await?;
+        return Ok(Registered::Closed);
+    }
     // ZNC/soju `<nick>/<network>` addressing; a slash-less nick selects the
     // in-process `local` network (DESIGN §10.4: bare `alice` = `local`), so a
     // client that doesn't know the convention still reaches a working network
     // rather than being turned away.
     let (requested_nick, network) = raw.split_once('/').map_or(
-        (raw.as_str(), super::local_driver::LOCAL_NETWORK),
+        (
+            raw.as_str(),
+            sasl_network
+                .as_deref()
+                .unwrap_or(super::local_driver::LOCAL_NETWORK),
+        ),
         |(nick, network)| (nick, network),
     );
     Ok(Registered::Ok {
@@ -1314,7 +1343,9 @@ where
 /// Verify a SASL PLAIN payload (`base64(authzid \0 authcid \0 passwd)`)
 /// against the account store. Returns the canonical account name.
 enum PlainVerification {
-    Accepted(String),
+    /// The stored account name, and the network its SASL username selected
+    /// (soju's `<account>/<network>`), if it carried one.
+    Accepted(String, Option<String>),
     Rejected,
     Unavailable,
     AttemptsExhausted,
@@ -1331,11 +1362,24 @@ async fn verify_plain(
     let Some(credentials) = e6irc_proto::sasl::parse_plain_payload(payload) else {
         return PlainVerification::Rejected;
     };
+    // soju addresses a network in the SASL username: `<account>/<network>`.
+    // Every client can set that, while `<nick>/<network>` -- ZNC's way, which
+    // this listener also accepts -- asks for a nickname containing `/`, which
+    // is not a legal nickname and which many clients refuse to send. Both are
+    // accepted; the caller reconciles them.
+    let (account, network) = match credentials.account.split_once('/') {
+        Some((account, network)) if crate::sanitize::valid_network_name(network) => {
+            (account, Some(network.to_string()))
+        }
+        // A `/` that is not a network selector is left in the account name, so
+        // it fails as the bad credential it is rather than as a bad network.
+        _ => (credentials.account.as_str(), None),
+    };
     // A DB failure is not an auth rejection (verify_credentials' contract):
     // fail closed, but surface the error instead of silently masking it as a
     // bad password.
-    match crate::db::verify_credentials(pool, &credentials.account, &credentials.password).await {
-        Ok(Some(name)) => PlainVerification::Accepted(name),
+    match crate::db::verify_credentials(pool, account, &credentials.password).await {
+        Ok(Some(name)) => PlainVerification::Accepted(name, network),
         Ok(None) => PlainVerification::Rejected,
         Err(e) => {
             eprintln!("bnc: credential check failed (database error): {e}");

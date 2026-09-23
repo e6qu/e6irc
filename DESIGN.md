@@ -1960,6 +1960,16 @@ upstream's.
 
 Downstream clients select a network with the ZNC/soju username convention:
 `alice/libera` (default network configurable; bare `alice` = `local`).
+It may be sent **either way round**: in the SASL user name, as soju takes it,
+or in the nickname, as ZNC does. Both because neither alone is enough — every
+client can set a SASL user name, while a nickname containing `/` is not a
+legal nickname and many clients will not send one, so requiring the nickname
+form made the documented way to attach fail. A client that sends both must
+send the same network in each (RFC1459-folded); two different answers to one
+question are refused naming both, never resolved by precedence. A `/` in a
+SASL user name whose right-hand side is not a valid network name is left in
+the account name, so it fails as the bad credential it is rather than as a bad
+network.
 The selector's nick and network components are independently validated; the
 slash-bearing selector is routing input, never the downstream IRC identity.
 Registration and later session reconciliation use the actual upstream nick (or
