@@ -2964,13 +2964,23 @@ fn emit_failure_notice(
     failure: NetworkFailure,
 ) {
     let line = crate::sanitize::upstream_line(failure_notice(failure));
-    let mut buffer = buffer.lock().expect("buffer poisoned");
-    let seq = buffer.push(line.clone());
-    let entry = BufferedLine { seq, line };
-    let event = if matches!(
+    let buffer = buffer.lock().expect("buffer poisoned");
+    // A storage failure repeats for every line the upstream sends while the
+    // database is away: retained, its identical notices would evict the
+    // conversation the ring exists to keep, and an attaching client's replay
+    // would be mostly error notices. It is told live instead, at its position.
+    let live_only = matches!(
         failure,
         NetworkFailure::BacklogStorageFailed | NetworkFailure::BacklogStorageLagged
-    ) {
+    );
+    let mut buffer = buffer;
+    let seq = if live_only {
+        buffer.position()
+    } else {
+        buffer.push(line.clone())
+    };
+    let entry = BufferedLine { seq, line };
+    let event = if live_only {
         DriverEvent::Notice(entry)
     } else {
         DriverEvent::Line(entry)
@@ -4350,7 +4360,17 @@ impl DriverEnds {
             .buffered_status
             .lock()
             .expect("buffered status poisoned");
-        if buffered_status.replace(status) == Some(status) {
+        // Keyed by lifecycle, not by the failure inside it: a round-robin
+        // upstream rotates addresses per attempt, so consecutive retries
+        // genuinely alternate (connection_failed, connection_timed_out) and
+        // every one of them used to write a retained line — thousands of them
+        // across a long outage, into a ring of a thousand.
+        let stage = status.lifecycle();
+        if buffered_status
+            .replace(status)
+            .map(DriverConnectionStatus::lifecycle)
+            == Some(stage)
+        {
             // Live only: the ring's position is unchanged, read under its lock.
             let buffer = self.buffer.lock().expect("buffer poisoned");
             drop(self.events.send(DriverEvent::Notice(BufferedLine {
@@ -5511,24 +5531,36 @@ mod tests {
         );
         assert_eq!(handle.runtime_snapshot().errors, 50);
 
-        // A different failure, and a recovery in between, are transitions.
+        // Another failure *of the same stage* is the same outage continuing:
+        // an upstream with several addresses alternates its failures per
+        // attempt (one refuses, one black-holes), and a line per attempt would
+        // fill the ring over a long outage. A recovery, and the reconnecting
+        // that follows it, are transitions.
         ends.emit(ConnectionEvent::Reconnecting(
             NetworkFailure::ConnectionTimedOut,
         ));
         ends.emit(ConnectionEvent::Reconnecting(
             NetworkFailure::ConnectionLost,
         ));
+        assert_eq!(
+            handle.buffer_snapshot().len(),
+            2,
+            "an alternating failure is still one reconnecting stage: {:?}",
+            handle.buffer_snapshot()
+        );
         ends.emit(ConnectionEvent::Connected);
         ends.emit(ConnectionEvent::Reconnecting(
             NetworkFailure::ConnectionLost,
         ));
         assert_eq!(
             handle.buffer_snapshot().len(),
-            6,
-            "{:?}",
+            4,
+            "a recovery and the reconnecting after it are both transitions: {:?}",
             handle.buffer_snapshot()
         );
-        assert_eq!(live_notices(&mut events), (4, 0));
+        // Two retained (the recovery and the reconnecting after it) and two
+        // live-only (the alternating failures within the one outage).
+        assert_eq!(live_notices(&mut events), (2, 2));
     }
 
     #[test]
@@ -5706,9 +5738,34 @@ mod tests {
             "{runtime:?}"
         );
         assert_eq!(telemetry.snapshot(0, 0).errors["bouncer"], 1);
+        // Told live, never retained: a database away for an hour repeats this
+        // for every upstream line, and a ring full of identical notices is a
+        // ring with no conversation left in it.
+        assert_eq!(handle.buffer_snapshot(), Vec::<String>::new());
+    }
+
+    /// The live notice still reaches an attached client, at the ring position
+    /// it was told at, so a replay cursor taken from it resumes correctly.
+    #[tokio::test]
+    async fn a_backlog_storage_failure_is_told_live_and_not_retained() {
+        let (handle, ends) = NetworkHandle::channels(8);
+        let mut events = handle.subscribe();
+        ends.emit_line(":peer PRIVMSG #room :kept".to_string());
+        let retained = match events.recv().await.expect("line") {
+            DriverEvent::Line(line) => line.seq,
+            other => panic!("expected the line, got {other:?}"),
+        };
+        handle.record_error(NetworkFailure::BacklogStorageFailed);
+        match events.recv().await.expect("notice") {
+            DriverEvent::Notice(notice) => {
+                assert_eq!(notice.seq, retained, "the ring did not move");
+                assert!(notice.line.contains("backlog_storage_failed"), "{notice:?}");
+            }
+            other => panic!("expected a live notice, got {other:?}"),
+        }
         assert_eq!(
             handle.buffer_snapshot(),
-            vec![failure_notice(NetworkFailure::BacklogStorageFailed)]
+            vec![":peer PRIVMSG #room :kept".to_string()]
         );
     }
 

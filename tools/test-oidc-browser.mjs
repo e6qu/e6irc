@@ -285,9 +285,9 @@ try {
   // slower runners), so wait for the render itself.
   await page.locator("#messages").getByText("No networks are configured").waitFor();
   await expectAccessible(page, "#app");
-  // The one network list says the account is empty, and the empty state's
-  // action adds a network here rather than sending the person elsewhere.
-  assert.match(await page.locator("#networks").innerText(), /No networks yet/);
+  // The account being empty is said once, by the picker that also carries the
+  // action: the rail beside it used to repeat the same sentence.
+  assert.equal(await page.locator("#networks").innerText(), "");
   assert.equal(await page.locator("#messages").getByRole("button", { name: "Add a network", exact: true }).count(), 1);
   assert.equal(await page.locator("#message").isDisabled(), true);
   assert.equal(await page.locator("#composer button").isDisabled(), true);
@@ -1118,22 +1118,32 @@ try {
     !applicationRequests.slice(networkReadStart).includes(`GET ${applicationOrigin}/console/networks/rows`),
     "owner network list used a rendered console fragment instead of its API resource",
   );
-  assert.equal(await page.locator('select[name="preset"]').inputValue(), "libera");
-  assert.equal(await page.locator('input[name="addr"]').inputValue(), "irc.libera.chat:6697");
-  assert.equal(await page.locator('input[name="tls"]').isChecked(), true);
-  // Adding never depends on a prior test, and a known network needs none of
-  // the advanced fields; choosing a custom server reveals them.
-  assert.equal(await page.getByRole("button", { name: "Add network", exact: true }).isEnabled(), true);
-  assert.equal(await page.locator("[data-network-advanced]").getAttribute("open"), null);
-  await page.locator('select[name="preset"]').selectOption("custom");
-  assert.equal(await page.locator("[data-network-advanced]").getAttribute("open"), "");
-  await page.locator('input[name="name"]').fill("journey");
-  await page.locator('input[name="addr"]').fill(upstream.address);
-  await page.locator('input[name="nick"]').fill("webjourney");
-  await page.locator('input[name="username"]').fill("webident");
-  await page.locator('input[name="realname"]').fill("Web Journey");
-  await page.locator('input[name="autojoin"]').fill("#journey");
-  await page.locator('input[name="tls"]').uncheck();
+  // The console lists networks and links to the editor; it does not carry a
+  // second form of its own, so adding one is done where it is edited.
+  assert.equal(await page.locator("#network-rows form").count(), 0);
+
+  await page.goto(`${applicationOrigin}/`);
+  await page.getByRole("button", { name: "Add a network", exact: true }).last().click();
+  const addDialog = page.getByRole("dialog", { name: "Add a network" });
+  await addDialog.waitFor();
+  // The dialog opens at once and fills from the known networks when they
+  // arrive; Save is enabled at that point, so it is the readiness signal.
+  await addDialog.locator("#nf-save:not([disabled])").waitFor();
+  assert.equal(await addDialog.locator("#nf-preset").inputValue(), "libera");
+  assert.equal(await addDialog.locator("#nf-addr").inputValue(), "irc.libera.chat:6697");
+  assert.equal(await addDialog.locator("#nf-tls").isChecked(), true);
+  // A known network needs none of the advanced fields; a custom server reveals
+  // them, because then there is nothing to fill them in from.
+  assert.equal(await addDialog.locator("#nf-advanced").getAttribute("open"), null);
+  await addDialog.locator("#nf-preset").selectOption("custom");
+  assert.equal(await addDialog.locator("#nf-advanced").getAttribute("open"), "");
+  await addDialog.locator("#nf-name").fill("journey");
+  await addDialog.locator("#nf-addr").fill(upstream.address);
+  await addDialog.locator("#nf-nick").fill("webjourney");
+  await addDialog.locator("#nf-username").fill("webident");
+  await addDialog.locator("#nf-realname").fill("Web Journey");
+  await addDialog.locator("#nf-autojoin").fill("#journey");
+  await addDialog.locator("#nf-tls").uncheck();
   const preflightResponse = page.waitForResponse(
     (response) => response.url() === `${applicationOrigin}/api/v1/me/network-preflight`
       && response.request().method() === "POST",
@@ -1141,27 +1151,34 @@ try {
   );
   // The user name typed in the form is what the upstream is sent -- by the
   // connection test and by the network itself -- not something made from the nick.
-  await page.getByRole("button", { name: "Test connection", exact: true }).click();
+  await addDialog.getByRole("button", { name: "Test connection", exact: true }).click();
   await upstream.waitForLine((line) => line === "USER webident 0 * :Web Journey");
   const preflight = await preflightResponse;
   assert.equal(preflight.status(), 200, await preflight.text());
-  await page.getByRole("status").filter({ hasText: /Registered as webjourney/ }).waitFor({ timeout: 45_000 });
-  assert.match(await page.getByRole("status").innerText(), /DNS \d+ms, connection \d+ms, registration \d+ms/);
-  assert.match(await page.getByRole("status").innerText(), /No network was created/);
-  assert.equal(page.url(), `${applicationOrigin}/console/networks`);
-  assert.equal(await page.getByRole("link", { name: "journey", exact: true }).count(), 0);
-  assert.equal(await page.locator('input[name="addr"]').inputValue(), upstream.address);
+  const testResult = addDialog.locator("#nf-result");
+  await testResult.filter({ hasText: /registered as webjourney/ }).waitFor({ timeout: 45_000 });
+  assert.match(await testResult.innerText(), /DNS \d+ms, connection \d+ms, registration \d+ms/);
+  assert.match(await testResult.innerText(), /No network was created/);
+  // A test stores nothing: the dialog is still open on what was typed, and no
+  // network by that name exists yet.
+  assert.equal(await addDialog.isVisible(), true);
+  assert.equal(await addDialog.locator("#nf-addr").inputValue(), upstream.address);
+  assert.equal(await page.locator("#networks").getByText("journey", { exact: true }).count(), 0);
   upstream.resetJoin("#journey");
+
   const networkDocument = await page.evaluate(() => performance.timeOrigin);
   const refreshedNetworks = page.waitForResponse(
     (response) => response.url() === `${applicationOrigin}/api/v1/me/networks`
       && response.request().method() === "GET" && response.status() === 200,
   );
-  await page.getByRole("button", { name: "Add network", exact: true }).click();
+  await addDialog.getByRole("button", { name: "Save", exact: true }).click();
   await refreshedNetworks;
+  await addDialog.waitFor({ state: "hidden" });
+  // The new network opens in this document: a reload would throw away an
+  // unsent message and race whatever the person does next.
   assert.equal(await page.evaluate(() => performance.timeOrigin), networkDocument);
-  assert.equal(page.url(), `${applicationOrigin}/console/networks`);
-  await page.getByRole("link", { name: "journey", exact: true }).waitFor();
+  assert.match(page.url(), /\?network=journey$/);
+  await page.locator("#networks").getByText("journey", { exact: true }).waitFor();
   await upstream.waitForJoin("#journey");
   await upstream.sendPeerMessage("#journey", "browser replays through the real stack");
   await waitForBufferedLine(context.request, "journey", "browser replays through the real stack");
@@ -1233,9 +1250,14 @@ try {
     .locator("#messages .line-server")
     .filter({ hasText: "» PRIVMSG #journey :typed into the console" })
     .waitFor();
+  // `/help` opens the one command reference the client has, rather than
+  // printing a second, worse copy into the conversation being read.
   await page.locator("#message").fill("/help");
   await page.locator("#composer button[type=submit]").click();
-  await page.getByText(/Commands: \/join #channel/).waitFor();
+  const helpDialog = page.getByRole("dialog", { name: "IRC commands" });
+  await helpDialog.getByText("/join #channel", { exact: true }).waitFor();
+  await helpDialog.getByRole("button", { name: "Close", exact: true }).click();
+  await helpDialog.waitFor({ state: "hidden" });
   await page.locator("#message").fill("/query peer browser query through normal IRC command");
   await page.locator("#composer button[type=submit]").click();
   await upstream.waitForLine(
@@ -1999,8 +2021,12 @@ try {
   });
   await page.getByText("Preferences", { exact: true }).click();
   await page.getByRole("button", { name: "Desktop notifications: off" }).click();
-  await page.locator(".buf-name").filter({ hasText: /^console$/ }).click();
-  await page.getByText("Notification permission was not granted.", { exact: true }).waitFor();
+  // A refused permission is an alert, where a failure is read whatever
+  // conversation is open -- not a line in one buffer that has to be found.
+  await page.locator("#alerts").getByText(
+    "The browser did not grant notification permission, so notifications stay off.",
+    { exact: true },
+  ).waitFor();
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
     { theme: "dark", notifications: false },
@@ -2010,6 +2036,7 @@ try {
   });
   await page.getByRole("button", { name: "Desktop notifications: off" }).click();
   await page
+    .locator("#alerts")
     .getByText("This browser does not support desktop notifications.", { exact: true })
     .waitFor();
   assert.deepEqual(

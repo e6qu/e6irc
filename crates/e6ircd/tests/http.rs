@@ -1988,7 +1988,6 @@ async fn console_runtime_is_served_in_every_build() {
     assert!(body.contains("data-api-account-app-password"), "{body}");
     assert!(body.contains("data-api-channel-register"), "{body}");
     assert!(body.contains("/console-settings.js"), "{body}");
-    assert!(body.contains("data-api-owner-network-create"), "{body}");
     assert!(body.contains("data-api-admin-account-create"), "{body}");
     // The console hands its session token to the shared contract module, which
     // is the only place the header is built.

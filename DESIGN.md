@@ -1057,7 +1057,13 @@ Principal tables (columns abridged):
   `BNC_TRIM_INTERVAL`, and rows older than `storage.history_retention_days`
   are deleted by storage maintenance in bounded batches (index
   `bnc_buffer_created_at_idx`, migration 0060) — "history retention" means
-  bouncer history, direct messages included, not only the server's own. The count belongs to that task, not to the table's `id`
+  bouncer history, direct messages included, not only the server's own. Read
+  markers (`read_markers` and `bnc_read_markers`) are swept against that same
+  retention (migration 0070): a marker is a position in history, so once no
+  message that old is kept, it points where nothing can be read from. They are
+  capped per account but unbounded in accounts, and `read_markers` is read
+  whole at boot and mirrored into every core shard, so the sweep bounds the
+  daemon's start-up cost as well as the table. The count belongs to that task, not to the table's `id`
   sequence — one sequence is shared by every network, so triggering off it
   makes retention depend on the interleaving between them. Each persistence
   task also trims once when it starts (after restoring the backlog), in batches
@@ -1693,7 +1699,15 @@ above the trait, provides for every network kind:
   keys, and replay emits that same canonical `time=` value. `batch` is optional:
   a client that negotiated it receives the applicable batch envelope and tags;
   otherwise the same bounded page is emitted directly. `message-tags`,
-  `server-time`, and `account-tag` independently gate their own replay metadata.
+  `server-time`, and `account-tag` independently gate their own replay metadata,
+  and `message-tags` also scopes *which rows the page is cut from* (§11.2).
+- **A notice is retained only if it will still be true.** A `*bnc*` notice
+  about the network's own lifecycle belongs in the ring, so a client attaching
+  later learns the state it is joining; a transient failure — backlog storage
+  refusing a write — does not, because replaying it announces a fault that is
+  over. Transient notices go to the live broadcast only, and the per-network
+  status dedup keys on the lifecycle rather than on the message text, so a
+  reworded diagnostic is not a new transition.
 - **Authoritative attach state**: replay is followed by an
   `IrcSessionSnapshot` containing the current upstream nick and confirmed
   memberships. Raw clients receive the NICK/JOIN/PART reconciliation needed to
@@ -2151,7 +2165,17 @@ Design constraints recorded now:
   :unknown msgid`, never an empty page: a client resuming from a vanished msgid
   would read "nothing newer" as "up to date". A timestamp that matches nothing
   is a real position and stays an empty page. The bouncer's CHATHISTORY emits
-  the same line. A session may have at most 8 history requests waiting on the
+  the same line. A page is cut by the database in the *client's* scope: a
+  stored `TAGMSG` is nothing but tags, so a client that did not negotiate
+  `message-tags` cannot receive one at all, and excluding those rows after the
+  `LIMIT` returned fewer lines than asked for — indistinguishable from the end
+  of the buffer. `BncHistoryScope` is built from that one capability and rides
+  into the query, so the `LIMIT` counts only deliverable lines, and TARGETS
+  answers in the same scope rather than naming a conversation whose page comes
+  back empty. What decides it is `bnc_buffer.command`, a column generated from
+  the line (migration 0069) rather than written beside it: it cannot disagree
+  with the line it describes, it covers rows stored before it existed, and it
+  reads the frame — a message whose *body* mentions `TAGMSG` still arrives. A session may have at most 8 history requests waiting on the
   database; beyond that it is answered `FAIL CHATHISTORY MESSAGE_ERROR …
   :Too many history requests in flight`, so one client cannot fill the database
   queue that logins and message logging share.

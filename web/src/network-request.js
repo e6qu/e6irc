@@ -189,6 +189,30 @@ export function createNetworkBody(form) {
 }
 
 /**
+ * Body for testing a connection before it is saved: the same fields the
+ * network would use, without a name (nothing is stored).
+ */
+export function preflightNetworkBody(form) {
+  const base = connection(form);
+  const account = String(form.account ?? "").trim();
+  const password = form.password ?? "";
+  const serverPassword = checkedServerPassword(form.serverPassword);
+  if (password && !account) {
+    throw new NetworkRequestError("sasl_account", "Enter the NickServ account this password belongs to.");
+  }
+  if (account && !password) {
+    throw new NetworkRequestError("sasl_password", "Enter the password for this NickServ account.");
+  }
+  return {
+    ...base,
+    realname: String(form.realname ?? "").trim() || base.nick,
+    ...(account ? { sasl_account: account } : {}),
+    ...(password ? { sasl_password: password } : {}),
+    ...(serverPassword ? { server_password: serverPassword } : {}),
+  };
+}
+
+/**
  * Body for replacing an IRC network's mutable configuration.
  *
  * An IRC network always has a real name -- the server refuses null for one --

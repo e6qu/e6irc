@@ -2493,7 +2493,6 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   let refreshOwnerBridgeEditor;
   let refreshOwnerNetworkDetail;
   let refreshIntegrations;
-  const ownerNetworkPreflight = Symbol("owner-network-preflight");
   const ownerNetworkRefresher = (form) => {
     if (form.closest("[data-api-owner-bridge-editor]")) return refreshOwnerBridgeEditor;
     if (form.closest("[data-api-owner-network-detail]")) return refreshOwnerNetworkDetail;
@@ -2531,20 +2530,12 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     url,
     method,
     body,
-    mode,
     trigger = form.querySelector('button[type="submit"]'),
   ) => runFormSubmission(form, async () => {
     try {
       const result = await apiRequest(form, apiMutation(method, url), body);
-      if (mode === ownerNetworkPreflight) {
-        setOwnerNetworkResult(
-          `Registered as ${result.confirmed_nick}${result.sasl_mechanism ? `, logged in with SASL ${result.sasl_mechanism}` : ""}; no channels were joined. Resolved ${result.resolved_addresses} address${result.resolved_addresses === 1 ? "" : "es"}; DNS ${result.dns_ms}ms, connection ${result.connect_ms}ms, registration ${result.registration_ms}ms. No network was created.`,
-          true,
-        );
-      } else {
-        await refreshAfterMutation(ownerNetworkRefresher(form));
-        setOwnerNetworkResult("Updated.", true);
-      }
+      await refreshAfterMutation(ownerNetworkRefresher(form));
+      setOwnerNetworkResult("Updated.", true);
       return result;
     } catch (error) {
       showOwnerNetworkFailure(form, error);
@@ -2566,65 +2557,6 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       { field: "username" },
     );
   };
-
-  // A blank real name sends the nickname, as an IRC client conventionally does.
-  const ownerNetworkConnection = (fields) => ({
-    addr: fieldValue(fields, "addr"),
-    tls: fields.has("tls"),
-    nick: fieldValue(fields, "nick"),
-    username: userNameFor(fields),
-    realname: fieldValue(fields, "realname") || fieldValue(fields, "nick"),
-    // Commas or spaces, as the chat client accepts: an IRC channel name can
-    // contain neither, and "#a #b" typed here used to become one bogus channel.
-    autojoin: splitValues(String(fields.get("autojoin") || ""), /[\s,]+/),
-    sasl_account: optionalValue(String(fields.get("sasl_account") || "")),
-    // Verbatim: a password may begin or end with a space, and trimming it
-    // here stored a different secret than the one typed (the editor and the
-    // chat client never trimmed).
-    sasl_password: String(fields.get("sasl_password") || "") || null,
-    // Verbatim for the same reason, and omitted when blank: only a private
-    // server wants one.
-    ...(String(fields.get("server_password") || "") ? { server_password: String(fields.get("server_password")) } : {}),
-  });
-
-  for (const form of document.querySelectorAll("[data-api-owner-network-create]")) {
-    const preflightButton = form.querySelector("[data-api-network-preflight]");
-    if (preflightButton) {
-      preflightButton.addEventListener("click", () => {
-        // A test needs no name, so only the fields it sends are validated.
-        for (const required of ["nick", "addr", "username"]) {
-          const input = form.elements.namedItem(required);
-          if (input instanceof HTMLInputElement && !input.reportValidity()) return;
-        }
-        const fields = new FormData(form);
-        if (!fieldValue(fields, "addr") || !fieldValue(fields, "nick")) {
-          setOwnerNetworkResult("Enter a server and nickname.", false);
-          return;
-        }
-        const connection = ownerNetworkBody(form, () => ownerNetworkConnection(fields));
-        if (!connection) return;
-        void mutateOwnerNetwork(form, "/api/v1/me/network-preflight", "POST", connection, ownerNetworkPreflight, preflightButton);
-      });
-    }
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      const fields = new FormData(form);
-      const name = fieldValue(fields, "name");
-      if (!name || !fieldValue(fields, "addr") || !fieldValue(fields, "nick")) {
-        setOwnerNetworkResult("Enter a name, server, and nickname.", false);
-        return;
-      }
-      const connection = ownerNetworkBody(form, () => ownerNetworkConnection(fields));
-      if (!connection) return;
-      void mutateOwnerNetwork(form, form.action, "POST", { kind: "irc", name, ...connection }).then((created) => {
-        if (!created) return;
-        // Back to the defaults, so the NickServ password does not sit in the
-        // form and a second click is not a confusing "already exists".
-        form.reset();
-        setOwnerNetworkResult(`Added ${created.name}. It is connecting now.`, true);
-      });
-    });
-  }
 
   for (const form of document.querySelectorAll("[data-api-owner-bridge-create]")) {
     form.addEventListener("submit", (event) => {

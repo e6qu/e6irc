@@ -984,7 +984,8 @@ pub(crate) async fn run_storage_maintenance(
                     "storage maintenance ran {} bounded batches in one tick \
                      (messages={}, bnc_buffer={}, audit_events={}, web_sessions={}, \
                      api_tokens={}, device_grants={}, logout_tokens={}, \
-                     account_invitations={}, observability_samples={}); {}",
+                     account_invitations={}, observability_samples={}, \
+                     read_markers={}); {}",
                     drain.batches_run,
                     report.messages,
                     report.bnc_buffer,
@@ -995,6 +996,7 @@ pub(crate) async fn run_storage_maintenance(
                     report.logout_tokens,
                     report.account_invitations,
                     report.observability_samples,
+                    report.read_markers,
                     if report.saturated {
                         "the last batch still filled; expired rows remain for the next tick"
                     } else {

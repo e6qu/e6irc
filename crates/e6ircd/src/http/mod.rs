@@ -2652,34 +2652,6 @@ mod pages {
             .into_response()
     }
 
-    struct NetworkFormView {
-        preset: String,
-        name: String,
-        addr: String,
-        nick: String,
-        realname: String,
-        autojoin: String,
-        sasl_account: String,
-        tls: bool,
-    }
-
-    impl NetworkFormView {
-        fn libera(account: &str) -> Self {
-            let preset =
-                irc_network_preset("libera").expect("Libera preset is part of the catalog");
-            Self {
-                preset: preset.id.into(),
-                name: preset.name.into(),
-                addr: preset.addr.into(),
-                nick: account.into(),
-                realname: String::new(),
-                autojoin: String::new(),
-                sasl_account: String::new(),
-                tls: preset.tls,
-            }
-        }
-    }
-
     #[derive(Template)]
     #[template(path = "console_account.html")]
     struct ConsoleAccount {
@@ -3099,9 +3071,6 @@ mod pages {
         attach_addr: Option<std::net::SocketAddr>,
         /// Whether the attach listener is TLS (else loopback plaintext).
         attach_tls: bool,
-        presets: &'static [IrcNetworkPreset],
-        form: NetworkFormView,
-        can_store_secrets: bool,
     }
 
     #[derive(Template)]
@@ -3273,14 +3242,10 @@ mod pages {
             Some(listener) => listener.status().await,
             None => None,
         };
-        let form = NetworkFormView::libera(&actor.account);
         render_private(ConsoleNetworks {
             shell: console_shell(actor, "networks"),
             attach_addr: attach.as_ref().map(|(_, bound)| *bound),
             attach_tls: attach.is_some_and(|(requested, _)| requested.tls.is_some()),
-            presets: IRC_NETWORK_PRESETS,
-            form,
-            can_store_secrets: state.secret_key.is_some(),
         })
     }
 

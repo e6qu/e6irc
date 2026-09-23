@@ -166,13 +166,6 @@ pub(super) async fn network_presets() -> Response {
     })
 }
 
-pub(super) fn irc_network_preset(id: &str) -> Option<IrcNetworkPreset> {
-    IRC_NETWORK_PRESETS
-        .iter()
-        .copied()
-        .find(|preset| preset.id == id)
-}
-
 /// Complete, kind-specific network creation request.
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]

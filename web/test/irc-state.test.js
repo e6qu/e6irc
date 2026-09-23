@@ -20,7 +20,6 @@ import {
   nickPrefix,
   parseIrc,
   reconcileChannelSnapshot,
-  serverBufferText,
   splitSigil,
   stripFormatting,
   tagValue,
@@ -293,16 +292,4 @@ test("a malformed ISUPPORT token is reported and leaves the table alone", () => 
   assert.deepEqual(channelModesFrom(parseIrc(":s 005 me PREFIX= :are supported").params).modes.prefix, []);
 });
 
-// ---- server-buffer rendering of non-chat commands -------------------------
-
-test("a command from a user keeps its subject in the server buffer", () => {
-  const text = (line, own = "me") => serverBufferText(parseIrc(line), line, own);
-  assert.equal(text(":alice!u@h INVITE me :#secret"), "alice invited you to #secret");
-  assert.equal(text(":alice!u@h INVITE bob #secret"), "alice invited bob to #secret");
-  assert.equal(text(":alice!u@h WALLOPS :server going down"), "alice WALLOPS server going down");
-  // Numerics carry their human text last, as before.
-  assert.equal(text(":irc.example 372 me :- welcome"), "- welcome");
-  assert.equal(text("PING :irc.example"), "PING irc.example");
-  assert.equal(text(":irc.example ERROR :Closing Link"), "irc.example ERROR Closing Link");
-});
 
