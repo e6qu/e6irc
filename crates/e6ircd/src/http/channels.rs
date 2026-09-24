@@ -104,7 +104,7 @@ pub(super) async fn register_owned_channel(
 pub(super) async fn get_owned_channel(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Path(name): Path<String>,
+    PathParams(name): PathParams<String>,
 ) -> Response {
     let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&name);
     match crate::db::list_owned_channels(pool_of(&state), &account).await {
@@ -158,7 +158,7 @@ pub(super) struct AccessBody {
 pub(super) async fn patch_owned_channel(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Path(name): Path<String>,
+    PathParams(name): PathParams<String>,
     JsonBody(patch): JsonBody<ChannelPatch>,
 ) -> Response {
     mutate_response(&state, name, account, patch.into_mutation()).await
@@ -167,7 +167,7 @@ pub(super) async fn patch_owned_channel(
 pub(super) async fn delete_owned_channel(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Path(name): Path<String>,
+    PathParams(name): PathParams<String>,
 ) -> Response {
     mutate_response(&state, name, account, crate::core::ChannelMutation::Drop).await
 }
@@ -178,7 +178,7 @@ pub(super) async fn delete_owned_channel(
 pub(super) async fn delete_admin_channel(
     State(state): State<Arc<AppState>>,
     AdminAccount(actor): AdminAccount,
-    Path(name): Path<String>,
+    PathParams(name): PathParams<String>,
 ) -> Response {
     match core_reply(
         &state,
@@ -204,7 +204,7 @@ pub(super) async fn delete_admin_channel(
 pub(super) async fn put_channel_access(
     State(state): State<Arc<AppState>>,
     Authenticated(owner, _): Authenticated,
-    Path((name, account)): Path<(String, String)>,
+    PathParams((name, account)): PathParams<(String, String)>,
     JsonBody(body): JsonBody<AccessBody>,
 ) -> Response {
     access_response(&state, name, owner, account, Some(body.flags)).await
@@ -213,7 +213,7 @@ pub(super) async fn put_channel_access(
 pub(super) async fn delete_channel_access(
     State(state): State<Arc<AppState>>,
     Authenticated(owner, _): Authenticated,
-    Path((name, account)): Path<(String, String)>,
+    PathParams((name, account)): PathParams<(String, String)>,
 ) -> Response {
     access_response(&state, name, owner, account, None).await
 }

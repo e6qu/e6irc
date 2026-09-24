@@ -645,7 +645,7 @@ pub(super) async fn list_networks(
 pub(super) async fn get_network(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Path(name): Path<String>,
+    PathParams(name): PathParams<String>,
 ) -> Response {
     let pool = pool_of(&state);
     let network = match crate::db::get_bnc_network(pool, &account, &name).await {
@@ -826,7 +826,7 @@ pub(super) async fn preflight_network_core(
 pub(super) async fn network_account_command(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Path(name): Path<String>,
+    PathParams(name): PathParams<String>,
     JsonBody(request): JsonBody<NetworkAccountCommand>,
 ) -> Response {
     let network = match crate::db::get_bnc_network(pool_of(&state), &account, &name).await {
@@ -942,10 +942,10 @@ pub(super) async fn network_account_command(
             }),
         )
             .into_response(),
-        crate::bouncer::SendOutcome::Full => problem(
-            StatusCode::TOO_MANY_REQUESTS,
+        crate::bouncer::SendOutcome::Full => retry_later(
             "Upstream command queue is full",
-            Some("nothing was sent; wait for the upstream to recover and try again"),
+            "nothing was sent; retry after the interval in the Retry-After header",
+            retry_after_seconds(handle.full_queue_retry_after()),
         ),
         crate::bouncer::SendOutcome::Closed | crate::bouncer::SendOutcome::Unavailable => problem(
             StatusCode::CONFLICT,
@@ -2048,7 +2048,7 @@ pub(super) const DEFAULT_BUFFER_READ_LIMIT: usize = 200;
 pub(super) async fn network_buffer(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Path(name): Path<String>,
+    PathParams(name): PathParams<String>,
     QueryParams(params): QueryParams<BufferQuery>,
 ) -> Response {
     if state.bnc_registry.is_none() {
@@ -2119,7 +2119,9 @@ pub(super) struct UpdateNetwork {
     pub(super) username: Option<String>,
     #[serde(default)]
     pub(super) realname: Option<String>,
-    #[serde(default)]
+    /// Required: `PUT` replaces the whole configuration, so an omitted list
+    /// cannot mean "keep" — and read as "none", it silently cleared the stored
+    /// channels. An empty list is how a replace says "join nothing".
     pub(super) autojoin: Vec<String>,
     pub(super) credentials: UpdateNetworkCredentials,
     /// Required for the same reason as `credentials`: an omitted field would
@@ -2159,7 +2161,7 @@ pub(super) enum UpdateNetworkCredentials {
 pub(super) async fn update_network(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Path(name): Path<String>,
+    PathParams(name): PathParams<String>,
     JsonBody(req): JsonBody<UpdateNetwork>,
 ) -> Response {
     let Some(registry) = &state.bnc_registry else {
@@ -2331,7 +2333,7 @@ async fn delete_network_in_lane(
 pub(super) async fn patch_network(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Path(name): Path<String>,
+    PathParams(name): PathParams<String>,
     JsonBody(req): JsonBody<PatchNetwork>,
 ) -> Response {
     let Some(registry) = &state.bnc_registry else {
@@ -2358,7 +2360,7 @@ pub(super) struct AdminNetworkPatch {
 pub(super) async fn patch_admin_network(
     State(state): State<Arc<AppState>>,
     AdminAccount(actor): AdminAccount,
-    Path((owner, name)): Path<(String, String)>,
+    PathParams((owner, name)): PathParams<(String, String)>,
     JsonBody(req): JsonBody<AdminNetworkPatch>,
 ) -> Response {
     let Some(registry) = &state.bnc_registry else {
@@ -2378,7 +2380,7 @@ pub(super) async fn patch_admin_network(
 pub(super) async fn delete_network(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Path(name): Path<String>,
+    PathParams(name): PathParams<String>,
 ) -> Response {
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);

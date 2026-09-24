@@ -13,6 +13,11 @@ mod state;
 mod timer;
 
 pub(crate) use handler::fit_trailing;
+
+/// How long an unregistered connection may hold its slot before the core
+/// closes it: the soonest a per-address connection slot is certain to free.
+pub(crate) const REGISTRATION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(handler::REGISTRATION_TIMEOUT_MS);
 pub(crate) use timer::TimerWheel;
 
 pub use state::{

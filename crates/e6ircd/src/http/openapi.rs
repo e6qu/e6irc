@@ -51,9 +51,9 @@ fn operation_authenticates_an_account(operation: &serde_json::Value) -> bool {
         })
 }
 
-/// Give every account-authenticated operation the shared admission responses
-/// it lacks, keeping any it already states.
-fn merge_standard_authenticated_responses(spec: &mut serde_json::Value) {
+/// Every operation's JSON object in the description, for the passes that
+/// complete them.
+fn each_operation(spec: &mut serde_json::Value, mut visit: impl FnMut(&mut serde_json::Value)) {
     let Some(paths) = spec["paths"].as_object_mut() else {
         return;
     };
@@ -61,24 +61,50 @@ fn merge_standard_authenticated_responses(spec: &mut serde_json::Value) {
         let Some(item) = item.as_object_mut() else {
             continue;
         };
-        for operation in item.values_mut() {
-            if !operation_authenticates_an_account(operation) {
-                continue;
-            }
-            let Some(responses) = operation["responses"].as_object_mut() else {
-                continue;
-            };
-            for (status, response) in standard_authenticated_responses() {
-                responses.entry(status).or_insert(response);
-            }
-        }
+        item.values_mut().for_each(&mut visit);
     }
 }
 
-/// Build the OpenAPI 3.1 description consumed by generated clients.
+/// Give every account-authenticated operation the shared admission responses
+/// it lacks, keeping any it already states.
+fn merge_standard_authenticated_responses(spec: &mut serde_json::Value) {
+    each_operation(spec, |operation| {
+        if !operation_authenticates_an_account(operation) {
+            return;
+        }
+        let Some(responses) = operation["responses"].as_object_mut() else {
+            return;
+        };
+        for (status, response) in standard_authenticated_responses() {
+            responses.entry(status).or_insert(response);
+        }
+    });
+}
+
+/// Give every operation with a path parameter the `400` its extractor
+/// produces for a value that does not parse (`PathParams`), keeping any `400`
+/// the operation already describes.
+fn merge_path_parameter_responses(spec: &mut serde_json::Value) {
+    each_operation(spec, |operation| {
+        let has_path_parameter = operation["parameters"]
+            .as_array()
+            .is_some_and(|parameters| parameters.iter().any(|parameter| parameter["in"] == "path"));
+        let Some(responses) = operation["responses"]
+            .as_object_mut()
+            .filter(|_| has_path_parameter)
+        else {
+            return;
+        };
+        responses.entry("400").or_insert_with(|| {
+            serde_json::json!({ "description": "a path parameter does not parse as its schema (a problem document)" })
+        });
+    });
+}
+
 fn document() -> serde_json::Value {
     let mut spec = operations();
     merge_standard_authenticated_responses(&mut spec);
+    merge_path_parameter_responses(&mut spec);
     spec
 }
 
@@ -1163,7 +1189,7 @@ fn operations() -> serde_json::Value {
                         "schema": { "type": "string" } }],
                     "responses": { "307": { "description": "redirect into the provider" },
                         "404": { "description": "unknown provider" },
-                        "429": { "description": "the client's authentication rate limit is spent" },
+                        "429": { "description": "the client's authentication rate limit is spent; Retry-After gives the seconds until it holds a token again" },
                         "502": { "description": "the provider is unreachable or its discovery document is unusable" } } }
             },
             "/api/v1/auth/oidc/{provider}/callback": {
@@ -1193,7 +1219,7 @@ fn operations() -> serde_json::Value {
                         "schema": { "type": "string" } }],
                     "responses": { "307": { "description": "redirect into the provider" },
                         "404": { "description": "unknown provider" },
-                        "429": { "description": "the client's authentication rate limit is spent" },
+                        "429": { "description": "the client's authentication rate limit is spent; Retry-After gives the seconds until it holds a token again" },
                         "502": { "description": "the provider is unreachable or its discovery document is unusable" } } }
             },
             "/api/v1/auth/logout": {
@@ -1260,7 +1286,7 @@ fn operations() -> serde_json::Value {
                         "403": { "description": "invalid or missing CSRF token" },
                         "404": { "description": "unknown provider" },
                         "409": { "description": "identity already linked to another account (on return)" },
-                        "429": { "description": "the client's authentication rate limit is spent" },
+                        "429": { "description": "the client's authentication rate limit is spent; Retry-After gives the seconds until it holds a token again" },
                         "502": { "description": "the provider is unreachable or its discovery document is unusable" } } }
             },
             "/api/v1/me/identities": {
@@ -1682,7 +1708,7 @@ fn operations() -> serde_json::Value {
                         },
                         "400": { "description": "invalid email, password, code, or command size" },
                         "409": { "description": "not an IRC network or no connected driver" },
-                        "429": { "description": "bounded upstream command queue is full" },
+                        "429": { "description": "bounded upstream command queue is full; nothing was sent, and Retry-After gives the seconds to wait" },
                         "404": { "description": "no owner-scoped network with this name" },
                         "503": { "description": "database unavailable" }
                     }
@@ -1700,14 +1726,14 @@ fn operations() -> serde_json::Value {
                     "parameters": network_name_parameter,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "type": "object", "additionalProperties": false,
-                            "required": ["addr", "tls", "nick", "credentials", "server_password"],
+                            "required": ["addr", "tls", "nick", "autojoin", "credentials", "server_password"],
                             "properties": {
                                 "addr": { "type": "string" },
                                 "tls": { "type": "boolean" },
                                 "nick": { "type": "string" },
                                 "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required when the stored network is kind=irc (400 with field=username when absent or invalid); refused for a bridge." },
-                                "realname": { "type": "string" },
-                                "autojoin": { "type": "array", "items": { "type": "string" } },
+                                "realname": { "type": "string", "description": "IRC real name sent in USER. Required when the stored network is kind=irc (400 with field=realname when absent); refused for a bridge." },
+                                "autojoin": { "type": "array", "items": { "type": "string" }, "description": "The complete channel (or bridge room) list; PUT replaces the whole configuration, so it is required and an empty list joins nothing." },
                                 "credentials": {
                                     "oneOf": [
                                         { "type": "object", "additionalProperties": false,
@@ -2610,6 +2636,40 @@ mod tests {
                 ["schema"];
             assert_closed_object_branch(schema, path, method);
         }
+    }
+
+    /// `PUT` is a full replacement: the contract and the parser agree that the
+    /// autojoin list cannot be omitted, where omission once cleared it.
+    #[test]
+    fn network_replace_requires_the_autojoin_list() {
+        let spec = super::document();
+        let replace = &spec["paths"]["/api/v1/me/networks/{name}"]["put"]["requestBody"]["content"]
+            ["application/json"]["schema"];
+        let required: Vec<&str> = replace["required"]
+            .as_array()
+            .expect("required list")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(required.contains(&"autojoin"), "{required:?}");
+        assert!(
+            replace["properties"]["realname"]["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("Required when the stored network is kind=irc")),
+            "{replace}"
+        );
+        let without = serde_json::json!({
+            "addr": "irc.example.net:6697", "tls": true, "nick": "n",
+            "username": "n", "realname": "n",
+            "credentials": { "action": "keep" }, "server_password": { "action": "keep" }
+        });
+        let refused = serde_json::from_value::<super::UpdateNetwork>(without.clone())
+            .err()
+            .expect("an omitted autojoin is refused");
+        assert!(refused.to_string().contains("autojoin"), "{refused}");
+        let mut with = without;
+        with["autojoin"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<super::UpdateNetwork>(with).is_ok());
     }
 
     #[test]

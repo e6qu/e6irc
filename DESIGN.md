@@ -348,7 +348,7 @@ These are project-wide rules, enforced in review and (where possible) CI:
   - `RateLimited` — a request that has spent one token from the per-IP
     auth-rate budget, as a `FromRequestParts` extractor. Every unauthenticated,
     work-inducing route declares the throttle by asking for `_: RateLimited`
-    instead of opening with the `client_ip` + `auth_rate_ok` prologue (and
+    instead of opening with the `client_ip` + `spend_auth_budget` prologue (and
     pulling in `ConnectInfo` + `HeaderMap`) by hand — so the gate lives in one
     place and an ungated route is a conspicuous omission rather than a forgotten
     first line, which is how `device_token` came to lack it. Same shape as the
@@ -1582,7 +1582,18 @@ Server-rendered data tables carry screen-reader captions, and navigation
 landmarks carry accessible names. `tools/check-template-accessibility.py`
 checks those structural contracts across the complete Askama template
 directory in CI so a newly added operational table cannot silently regress to
-an unnamed grid.
+an unnamed grid. The console script builds most of its rows at runtime, out of
+a template parser's reach, so the same tool holds it to its builders instead:
+a form control comes only from `hiddenInput`, `namedControl` (an `aria-label`)
+or `labelledControl` (inside its `<label>`), a table only from
+`captionedTable`, an accessible name only from `ariaName` (which refuses a
+`div` or `span` with no role), and no markup is assembled from a string. The
+per-row forms those rows carry are handled by delegated `submit` listeners on
+`document`, never bound at startup to rows that do not exist yet — which is how
+token revocation and channel unregistration once posted natively into a 405.
+The mutation helpers share one `submitMutation`, whose success is an outcome
+object, so a `204` reads as success rather than as the missing body of a
+failure.
 
 The console is also the home of `/console/networks` — a per-user BNC network
 manager with add (with a connection test) / remove / enable-disable. An IRC
@@ -2378,7 +2389,20 @@ Design constraints recorded now:
 
 ## 12. REST API (`/api/v1`)
 
-Versioned under `/api/v1`; JSON; errors use RFC 9457 problem+json shape.
+Versioned under `/api/v1`; JSON; errors use RFC 9457 problem+json shape —
+all of them, including the ones axum answers before a handler runs: a path
+parameter of the wrong type (`/tokens/abc`) is a problem-document 400 through
+the `PathParams` extractor (handlers never take `axum::extract::Path`; a
+unit test over the HTTP sources refuses it), a known path with an unserved method
+is a problem-document 405 that keeps the `Allow` header, and an unknown path is
+a problem-document 404. Every `429` carries `Retry-After`, because
+`retry_later` is the one place that builds one (the same source test refuses
+any other): the per-address
+authentication budget gives the seconds until its bucket holds a token again,
+the `/ws/irc` per-address connection cap the registration timeout (the soonest
+a slot held by an unregistered connection is reclaimed), and a full upstream
+command queue the upstream write deadline (by which the queue has drained or
+the upstream has been declared dead).
 Every URL query and form is closed: unknown fields are rejected before a
 handler runs. The one exception is the OIDC callback, whose query is the
 provider's authorization response rather than this server's API: RFC 6749
@@ -2394,7 +2418,11 @@ Surface (initial):
 - `me`: profile, credentials (app passwords CRUD — secret shown once),
   API tokens CRUD, OIDC identity link/list/unlink
 - `networks`: BNC network CRUD (+ enable/disable, status), buffers list,
-  read-marker get/set. Full IRC updates use `PUT /me/networks/{name}` with a
+  read-marker get/set. `PUT /me/networks/{name}` is a full replacement: every
+  field it carries is required (`autojoin` included — an omitted list used to
+  clear the stored one silently, while an omitted `realname` was refused), and
+  an IRC network requires `username` and `realname` besides. Full IRC updates
+  carry a
   required credential action (`keep`, `set`, or `remove`), so a write-only
   secret is never changed through an ambiguous omitted-field convention. The
   server password has its own required action beside it (`keep`, `set` with

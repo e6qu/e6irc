@@ -636,6 +636,10 @@ async fn auth_endpoint_rate_limit_returns_429_after_burst() {
         third.starts_with("HTTP/1.1 429"),
         "3rd should be limited: {third}"
     );
+    assert!(
+        third.to_ascii_lowercase().contains("\r\nretry-after: "),
+        "a 429 says when to retry: {third}"
+    );
 }
 
 #[tokio::test]

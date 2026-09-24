@@ -50,6 +50,14 @@ test("replacing a network carries a tagged action, not flat credentials", () => 
   assert.ok(!("sasl_password" in body), "replace must not send the create shape");
 });
 
+// A replace is the whole configuration: the server refuses one without the
+// auto-join list (an omitted list once cleared it), so an empty box sends [].
+test("replacing a network always carries the auto-join list, even an empty one", () => {
+  const body = updateNetworkBody({ addr: "irc.libera.chat:6697", tls: true, nick: "ada", autojoin: "" });
+  assert.deepEqual(body.autojoin, []);
+  assert.deepEqual(updateNetworkBody({ addr: "irc.libera.chat:6697", tls: true, nick: "ada" }).autojoin, []);
+});
+
 // An omitted password has to mean something unambiguous, and the API models
 // that as an explicit action rather than an absent field.
 test("an empty credential box on replace keeps the sealed password", () => {

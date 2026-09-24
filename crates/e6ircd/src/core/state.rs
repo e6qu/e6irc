@@ -3246,7 +3246,7 @@ pub(crate) struct ServerState {
 }
 
 /// Hard ceiling on the account-creation bucket map, mirroring the HTTP
-/// `auth_rate_ok` limiter: the refill window is long (an hour), so a flood
+/// `spend_auth_budget` limiter: the refill window is long (an hour), so a flood
 /// from many distinct IPs keeps every entry below full and nothing prunes —
 /// this cap bounds the map by evicting the least-recently-seen entry.
 pub(crate) const MAX_REGISTRATION_BUCKETS: usize = 4096;
@@ -4080,7 +4080,7 @@ impl ServerState {
     /// `REGISTRATION_REFILL_WINDOW_MS`; fully-refilled entries are pruned, and
     /// the map is hard-capped at `MAX_REGISTRATION_BUCKETS` so it can't grow
     /// without bound even under a distinct-IP flood. Mirrors the HTTP
-    /// `auth_rate_ok` limiter, but on the core's monotonic clock.
+    /// `spend_auth_budget` limiter, but on the core's monotonic clock.
     pub fn registration_rate_ok(&mut self, host: &str) -> bool {
         let Some(burst) = self.config.registration_burst else {
             return true;
