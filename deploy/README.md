@@ -197,6 +197,8 @@ configured, the next start seals and imports them atomically.
 | `E6IRC_HTTP_ADDR` | no (`0.0.0.0:8080`) | HTTP/REST/WebSocket listen address |
 | `E6IRC_IRC_ADDR` | no (`127.0.0.1:6667`) | Raw IRC listener — loopback only; IRC is reached over WebSocket (`/ws/irc`) publicly |
 | `E6IRC_SECURE_COOKIES` | no (`true`) | Mark session cookies `Secure`; exactly `true` or `false` |
+| `E6IRC_HSTS_INCLUDE_SUBDOMAINS` | no (`false`) | Add `includeSubDomains` to the HSTS header, forcing every sibling host of the domain onto HTTPS for a year; exactly `true` or `false`, and `true` needs an `https://` `E6IRC_PUBLIC_URL` |
+| `E6IRC_MONITORING_TOKEN` | no (secret; at least 32 non-whitespace characters) | Bearer for the read-only `/api/v1/monitoring/observation` endpoint; unset, the endpoint is closed |
 | `E6IRC_ADMIN_ACCOUNTS` | no | Comma-separated admin account names; empty fields are ignored |
 | `E6IRC_BOOTSTRAP_TOKEN` | no (secret; 32–512 bytes) | One-time browser token for creating the first durable administrator on an empty account store |
 | `E6IRC_DATABASE_MAX_CONNECTIONS` | no (sized to the host) | Most connections the shared PostgreSQL pool opens, 2–200 (`[database] max_connections` in a configuration file). The default is 1 (the serial database worker) + 4 (concurrent Argon2 verifications) + 2 × the host's CPU threads; size the PostgreSQL server's `max_connections` for every replica's pool plus your own sessions. The pool's size, idle count and acquire timeouts are on `/metrics` (`e6irc_database_pool_*`) |
@@ -207,6 +209,9 @@ configured, the next start seals and imports them atomically.
 | `E6IRC_OIDC_END_SESSION` | with issuer | Relying-party-initiated logout endpoint, e.g. `https://auth.dev.e6qu.dev/oauth2/sessions/logout` |
 | `E6IRC_OIDC_ACCOUNT_CLAIM` | no (`preferred_username`) | ID-token claim that names the e6irc account: `preferred_username` or `email` |
 | `E6IRC_OIDC_TOKEN_AUTH` | no (`client_secret_post`) | How the client authenticates at the token endpoint: `client_secret_post` (how Shauth registers managed applications) or `client_secret_basic`. It belongs to the client registration, so discovery cannot report it |
+
+Every `E6IRC_OIDC_*` variable configures the provider `E6IRC_OIDC_ISSUER` names;
+one set without the issuer is refused at start rather than ignored.
 
 ### Rotate the credential key
 
@@ -236,7 +241,7 @@ recover on the host, where the configuration and the database already are:
 ```sh
 docker exec CONTAINER /usr/local/bin/e6ircd recover-administrator --account NAME --config-from-environment
 # or, natively:
-e6ircd recover-administrator --account NAME --config /etc/e6irc/e6irc.toml
+sudo -u e6irc e6ircd recover-administrator --account NAME --config /etc/e6irc/e6ircd.toml
 ```
 
 It acts on one existing, active account: prints a new password once, grants
@@ -264,8 +269,9 @@ shutdown that was still flushing cleanly.
 Any host that runs an OCI image can run e6irc. It has to provide:
 
 - **The environment** in the table above. Four variables are required; secrets
-  (`E6IRC_DATABASE_URL`, `E6IRC_SECRET_KEY`, `E6IRC_OIDC_CLIENT_SECRET`,
-  `E6IRC_BOOTSTRAP_TOKEN`) belong in the host's secret store, not in the image
+  (`E6IRC_DATABASE_URL`, `E6IRC_SECRET_KEY`, `E6IRC_PREVIOUS_SECRET_KEYS`,
+  `E6IRC_OIDC_CLIENT_SECRET`, `E6IRC_BOOTSTRAP_TOKEN`, `E6IRC_MONITORING_TOKEN`)
+  belong in the host's secret store, not in the image
   or a committed file. A value with a pasted carriage return or newline is
   refused at start by variable name.
 - **A persistent PostgreSQL** reachable from the container. Every durable

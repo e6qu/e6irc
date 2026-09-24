@@ -616,6 +616,42 @@ Exercised rather than inspected, and sound: the `e6irc` CLI against both the
 core listener and the attach listener -- `send`, `history`, `raw` (including
 its nonzero exit on a refused line) and `api` -- and the TUI over a pty.
 
+A sweep of the bouncer found, and this change fixes:
+
+- **Bridges echoed nothing a client sent.** Discord, Slack and Matrix drop the
+  provider's copy of their own posts and emitted no echo in its place, so a
+  message sent through a bridge reached neither the other attached clients nor
+  the backlog. Each target the provider accepted is now echoed once, under the
+  bridge account's IRC identity; a refused one still gets only its notice.
+- **One unreadable Matrix event stalled the bridge.** A redacted or malformed
+  `m.room.message` failed the whole sync, whose position then never advanced.
+  Events are decoded one at a time; such an event is one "not relayed" notice.
+- **CHATHISTORY batches whose lines did not say so.** Lines inside a `BATCH`
+  on the attach listener lacked their `batch=` tag.
+- **A nick change the owner asked for was reported as forced.** The upstream's
+  confirmation of a client's own `NICK` counted as `renamed_by_upstream`.
+- **The local driver.** A stop during registration left the half-registered
+  core session to the reaper, and its synthesized echo showed `~nick` where
+  the core shows the `USER` name.
+- **Lines sent with `CAP END` were refused.** The attach handshake answered
+  lines arriving in the same read as `CAP END` with 421, and dropped the half
+  of a line it had framed; both now reach the attached session.
+- **A bridge's echo named someone the client was not.** A client attached to
+  a bridge was welcomed under the nick it asked for, while its echo named the
+  provider account, so echo-message clients did not recognise their own lines
+  and `e6irc send` waited for an echo that never came. A bridge now begins
+  its session under the account's nick, in its mapped channels, before it
+  reports connected; the attach layer answers `NICK` (447) and `JOIN`
+  (re-stated, or 403) on a bridge itself, and the web composer refuses
+  `NICK`, `JOIN` and `PART` there. The web client marks the bridge's channels
+  joined from the session (it had refused to send into them), offers no Leave
+  for them, and no longer takes a bridge's empty configured nick for a nick
+  that every trailing punctuation mark mentioned.
+- **Matrix dropped the account's other devices.** Every event from the
+  logged-in account was dropped as the bridge's own; now only events carrying
+  a transaction id (which the homeserver shows only to the sending device)
+  are, and posts from the account's other devices are relayed.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

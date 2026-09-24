@@ -414,7 +414,7 @@ pub(super) fn cmd_setname(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .get_mut(&conn)
         .expect("checked")
         .set_realname(new_name.to_string());
-    let line = format!(":{prefix} SETNAME :{new_name}");
+    let line = super::fitted_line(format!(":{prefix} SETNAME :"), new_name);
     // SETNAME echoes to the originator (its own client sees the change), then
     // to the channel-peer / extended-monitor fan-out.
     state.send_timed(conn, &line);
@@ -518,10 +518,10 @@ pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
             &format!("TOPICLEN={TOPICLEN}"),
             &format!("KICKLEN={KICKLEN}"),
             &format!("AWAYLEN={AWAYLEN}"),
-            "PREFIX=(ov)@+",
-            "STATUSMSG=@+",
+            &prefix_isupport(),
+            &format!("STATUSMSG={PREFIX_SIGILS}"),
             "BOT=B",
-            "CHANMODES=eIbq,k,l,imnstC",
+            &chanmodes_isupport(),
             &format!("NETWORK={}", state.config.network_name),
         ],
         Some("are supported by this server"),

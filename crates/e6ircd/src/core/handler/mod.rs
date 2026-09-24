@@ -394,6 +394,19 @@ pub(crate) fn fit_trailing<'a>(head: &str, text: &'a str) -> &'a str {
     e6irc_proto::message::truncate_on_char_boundary(text, 510usize.saturating_sub(head.len()))
 }
 
+/// `head` followed by `text` cut by [`fit_trailing`] — the whole relayed line,
+/// for a caller that has nothing else to do with the fitted text. `head` ends
+/// in `" :"`. Building the line through this, rather than `format!`ing the
+/// trailing in directly, is what keeps a relay of user-supplied text (AWAY,
+/// SETNAME, an extended JOIN's realname) inside the wire limit when the
+/// configured nick length and the host make the source prefix long.
+pub(crate) fn fitted_line(head: String, text: &str) -> String {
+    let fitted = fit_trailing(&head, text);
+    let mut line = head;
+    line.push_str(fitted);
+    line
+}
+
 /// Pack space-separated `items` into a single trailing parameter that fits the
 /// wire limit, given `head_len` bytes already on the line (`:prefix CODE target
 /// :`). Whole items only: a reply like RPL_USERHOST / RPL_ISON is a single
@@ -431,13 +444,15 @@ pub(crate) fn pack_trailing_list(items: &[String], head_len: usize) -> String {
 pub(crate) fn clip_echo(token: &str) -> &str {
     // A client token echoed back into a reply lands in a *middle* parameter
     // position, so it must be able to stand as one: an empty token collapses
-    // into the field separator, and a ':'-leading token opens the trailing
-    // early and swallows the rest of the line (the numeric-middle framing
-    // class — e.g. a fuzzer's `CAP :` echoed into ERR_INVALIDCAPCMD). Show the
-    // conventional "*" placeholder for both, and clip the rest to bound the
-    // echo. A single parsed parameter cannot contain a space or CR/LF/NUL, so
-    // those need no handling here.
-    if token.is_empty() || token.starts_with(':') {
+    // into the field separator, a ':'-leading token opens the trailing early
+    // and swallows the rest of the line (the numeric-middle framing class —
+    // e.g. a fuzzer's `CAP :` echoed into ERR_INVALIDCAPCMD), and a token with
+    // a space splits into two parameters. A parsed parameter *can* hold a
+    // space: the last one may be in trailing form (`KICK #c :a b` makes the
+    // nick `a b`), so a space is refused like the other two, and each of them
+    // shows the conventional "*" placeholder. The rest is clipped to bound the
+    // echo. CR/LF/NUL never survive the parser.
+    if token.is_empty() || token.starts_with(':') || token.contains(' ') {
         return "*";
     }
     e6irc_proto::message::truncate_on_char_boundary(token, 64)
@@ -474,7 +489,7 @@ pub(super) fn deny_hidden(
     target: &str,
     _proof: crate::core::state::Hidden,
 ) {
-    state.err_nosuchchannel(conn, clip_echo(target));
+    state.err_nosuchchannel(conn, target);
 }
 
 /// Inject a tag into the front of an already-serialized wire line
@@ -905,5 +920,58 @@ mod tests {
         // otherwise `!@` would match nothing and silently no-op the ban.
         assert_eq!(normalize_ban_mask("!@"), "*!*@*");
         assert_eq!(normalize_ban_mask("nick!@host"), "nick!*@host");
+    }
+
+    #[test]
+    fn clip_echo_renders_every_unframeable_token_as_a_placeholder() {
+        for token in ["", ":x", "a b", " ", "trailing "] {
+            assert_eq!(clip_echo(token), "*", "{token:?}");
+        }
+        assert_eq!(clip_echo("nick"), "nick");
+        assert_eq!(clip_echo(&"x".repeat(100)).len(), 64);
+    }
+
+    #[test]
+    fn a_channel_key_must_stand_as_a_parameter_and_a_join_key_entry() {
+        for bad in ["", ":x", "a,b", "a b", "a\tb", "a\u{1}b", "a\u{7f}b"] {
+            assert!(!valid_channel_key(bad), "{bad:?}");
+        }
+        for good in ["secret", "a:b", "p@ss!", "\u{e9}t\u{e9}"] {
+            assert!(valid_channel_key(good), "{good:?}");
+        }
+    }
+
+    #[test]
+    fn a_list_mask_add_must_stand_as_a_parameter() {
+        let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
+        assert!(channel_list_mask("::x", true, casemap).is_err());
+        assert!(channel_list_mask("a\u{1}b", true, casemap).is_err());
+        assert!(channel_list_mask("a b", true, casemap).is_err());
+        assert!(channel_list_mask("a!b@c", true, casemap).is_ok());
+        // A removal never refuses, so whatever was stored stays removable.
+        assert!(channel_list_mask("::x", false, casemap).is_ok());
+    }
+
+    /// The mode tables the advertisements are derived from match what the
+    /// handlers actually apply: every flag is a boolean channel mode and every
+    /// user mode is one `user_mode_is_set` knows.
+    #[test]
+    fn the_mode_tables_match_the_handlers() {
+        let modes = crate::core::state::ChanModes::default();
+        for c in CHANMODES_FLAGS.chars() {
+            assert!(chan_bool_mode(&modes, c).is_some(), "flag {c}");
+        }
+        for c in (b'A'..=b'z').map(char::from) {
+            if chan_bool_mode(&modes, c).is_some() {
+                assert!(CHANMODES_FLAGS.contains(c), "unadvertised flag {c}");
+            }
+        }
+        assert_eq!(PREFIX_MODES.len(), PREFIX_SIGILS.len());
+        let myinfo = myinfo_channel_modes();
+        let with_param = myinfo_param_channel_modes();
+        for c in with_param.chars() {
+            assert!(myinfo.contains(c), "{c}");
+        }
+        assert!(CHANMODES_FLAGS.chars().all(|c| !with_param.contains(c)));
     }
 }

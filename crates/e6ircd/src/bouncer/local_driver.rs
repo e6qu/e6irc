@@ -14,6 +14,10 @@ use crate::core::{ConnId, ConnectionIdAllocator, CoreIngress, Input, Output};
 /// network a slash-less BNC attach defaults to (DESIGN §10.4: bare = `local`).
 pub(crate) const LOCAL_NETWORK: &str = "local";
 
+/// The host the in-process session is opened with, and so the host the core
+/// shows in its prefix — the one value the synthesized echo must repeat.
+const LOCAL_SESSION_HOST: &str = LOCAL_NETWORK;
+
 /// Handles into the core, so the driver can open an in-process session.
 #[derive(Clone)]
 pub struct CoreHandles {
@@ -178,7 +182,7 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
         .push(Input::Open {
             conn,
             tx: out_tx,
-            host: "local".into(),
+            host: LOCAL_SESSION_HOST.into(),
             transport: crate::core::ConnectionTransport::Local,
         })
         .await
@@ -198,7 +202,7 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
         }
     }
     let welcomed = tokio::select! {
-        _ = ends.stop_signal() => return Stopped,
+        _ = ends.stop_signal() => Err(Stopped),
         welcome = tokio::time::timeout(
             WELCOME_DEADLINE,
             await_welcome(session, conn, &mut out_rx, ends),
@@ -284,14 +288,16 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
             // Downstream command -> core.
             cmd = ends.next_command() => match cmd {
                 Some(cmd) => {
-                    // The in-process core shows every user as `~user@local`.
+                    // The core shows this session as it registered it: the
+                    // `USER` name verbatim (there is no identd to answer) at
+                    // the host the session was opened with.
                     let echo = ends.irc_session_snapshot().and_then(|snapshot| {
                         super::irc_driver::self_echo(
                             &cmd.line,
                             &super::irc_driver::SelfIdentity {
                                 nick: snapshot.nick,
-                                user: format!("~{}", session.nick),
-                                host: LOCAL_NETWORK.to_string(),
+                                user: session.username.clone(),
+                                host: LOCAL_SESSION_HOST.to_string(),
                             },
                         )
                     });
@@ -544,6 +550,50 @@ mod tests {
             stopped(task).await,
             super::super::SessionOutcome::Stopped
         ));
+    }
+
+    /// A stop that arrives while the core has not yet welcomed the session
+    /// closes the half-registered core session, as every other way out of
+    /// registration does, instead of leaving it to the liveness reaper.
+    #[tokio::test]
+    async fn a_stop_during_registration_closes_the_core_session() {
+        let (core_tx, mut core_rx) = core_queue(8);
+        let (handle, _events, task) = spawn_session(core_tx, Vec::new());
+        let _out_tx = finish_registration(&mut core_rx).await;
+        handle.shutdown();
+        assert!(matches!(
+            stopped(task).await,
+            super::super::SessionOutcome::Stopped
+        ));
+        assert!(matches!(
+            core_rx.pop().await.expect("close").payload,
+            Input::Closed { .. }
+        ));
+    }
+
+    /// The synthesized echo shows the session as the core does: the `USER`
+    /// name exactly as sent, at the session's host.
+    #[tokio::test]
+    async fn the_echo_carries_the_user_name_the_core_shows() {
+        let (_core_rx, handle, mut events, _task, _out_tx) = connected_session().await;
+        assert_eq!(
+            handle.send_from(3, "PRIVMSG #room :hello"),
+            super::super::SendOutcome::Sent
+        );
+        let (line, origin) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(super::super::DriverEvent::Echo { line, origin }) = events.recv().await {
+                    return (line.line, origin);
+                }
+            }
+        })
+        .await
+        .expect("the echo");
+        assert_eq!(origin, 3);
+        assert!(
+            line.ends_with(" :alice!ident@local PRIVMSG #room :hello"),
+            "{line}"
+        );
     }
 
     #[tokio::test]

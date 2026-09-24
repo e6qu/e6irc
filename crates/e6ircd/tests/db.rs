@@ -7266,12 +7266,23 @@ async fn permanent_account_deletion_requires_succession_purges_and_retires() {
     db::create_account_with_contact(&pool, "Dana", "administrator candidate", None)
         .await
         .expect("Dana");
+    let target = db::account_deletion_target(&pool, alice_id, &["alice".into(), "dana".into()])
+        .await
+        .expect("effective administrator check")
+        .expect("a second existing active configuration-backed administrator is a recovery path");
+    assert!(!target.suspended);
+    sqlx::query("UPDATE accounts SET flags = 2 WHERE id = $1")
+        .bind(alice_id)
+        .execute(&pool)
+        .await
+        .expect("suspend Alice");
+    // A deletion that does not commit must leave this suspension standing.
     assert!(
         db::account_deletion_target(&pool, alice_id, &["alice".into(), "dana".into()])
             .await
-            .expect("effective administrator check")
-            .is_some(),
-        "a second existing active configuration-backed administrator is a recovery path"
+            .expect("suspended target")
+            .expect("Alice")
+            .suspended
     );
 }
 

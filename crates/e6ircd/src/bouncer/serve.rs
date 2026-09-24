@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::{BufferedLine, NetworkConfig, NetworkHandle, attach};
 use crate::config::NetworkEntry;
-use e6irc_proto::framing::{LineBuffer, LineEvent};
+use e6irc_proto::framing::LineEvent;
 use e6irc_proto::message::Message;
 
 /// Registry key: the owning account (`None` = shared) and the network
@@ -639,6 +639,8 @@ enum Registered {
         network: String,
         requested_nick: String,
         caps: super::AttachCaps,
+        /// What the client sent after registering, for the attached session.
+        input: super::ClientInput,
     },
     /// The client hung up or violated the handshake; the loop returns.
     Closed,
@@ -662,7 +664,7 @@ where
     // Bound the pre-attach handshake: a client that connects and never
     // completes registration (sends nothing, or authenticates but never ends
     // CAP negotiation) must not hold a task + socket indefinitely.
-    let (account, network, requested_nick, caps) = match tokio::time::timeout(
+    let (account, network, requested_nick, caps, input) = match tokio::time::timeout(
         std::time::Duration::from_secs(30),
         handshake(&mut read, &mut write, pool, server_name),
     )
@@ -673,7 +675,8 @@ where
             network,
             requested_nick,
             caps,
-        })) => (account, network, requested_nick, caps),
+            input,
+        })) => (account, network, requested_nick, caps, input),
         Ok(Ok(Registered::Closed)) => return Ok(()),
         Ok(Err(e)) => return Err(e),
         Err(_) => {
@@ -746,24 +749,8 @@ where
 
     // Complete the client's registration burst (welcome, ISUPPORT, and
     // end-of-MOTD) so it considers itself registered, then attach.
-    // The attach selector is registration input, not the client's IRC
-    // identity. Once the upstream session exists, 001 must name its actual nick
-    // so clients classify the following JOIN/NICK traffic as their own.
-    let downstream_nick = handle
-        .irc_session_snapshot()
-        .map_or(requested_nick, |session| session.nick);
-    for line in [
-        format!(
-            ":{server_name} 001 {downstream_nick} :Welcome to e6irc BNC, attached to '{network}'"
-        ),
-        format!(
-            ":{server_name} 005 {downstream_nick} CASEMAPPING=rfc1459 CHANTYPES=#& \
-             CHANNELLEN=64 NICKLEN=30 PREFIX=(qaohv)~&@%+ CHATHISTORY={} \
-             MSGREFTYPES=timestamp,msgid :are supported by this server",
-            super::chathistory::CHATHISTORY_LIMIT_MAX,
-        ),
-        format!(":{server_name} 422 {downstream_nick} :MOTD is on the upstream network"),
-    ] {
+    let (downstream_nick, burst) = welcome(server_name, &network, &handle, requested_nick);
+    for line in burst {
         write.write_all(line.as_bytes()).await?;
         write.write_all(b"\r\n").await?;
     }
@@ -772,6 +759,7 @@ where
     let joined = read.unsplit(write);
     let end = attach(
         joined,
+        input,
         &handle,
         caps,
         &account,
@@ -783,6 +771,35 @@ where
     // answering" are different stories to whoever reads this log.
     eprintln!("bnc: {account} detached from '{network}': {end}");
     Ok(())
+}
+
+/// The nick an attaching client is welcomed under, and its registration
+/// burst: welcome, ISUPPORT and end-of-MOTD. The attach selector is
+/// registration input, not the client's IRC identity: once the network has a
+/// session, 001 names the session's nick — an IRC upstream's, or a bridge's
+/// provider account — so the client classifies the JOIN, NICK and echoed
+/// traffic that follows as its own. Before then it is the nick the client
+/// asked for, and the session's arrives as a NICK when it begins.
+pub(super) fn welcome(
+    server_name: &str,
+    network: &str,
+    handle: &NetworkHandle,
+    requested_nick: String,
+) -> (String, [String; 3]) {
+    let nick = handle
+        .irc_session_snapshot()
+        .map_or(requested_nick, |session| session.nick);
+    let burst = [
+        format!(":{server_name} 001 {nick} :Welcome to e6irc BNC, attached to '{network}'"),
+        format!(
+            ":{server_name} 005 {nick} CASEMAPPING=rfc1459 CHANTYPES=#& \
+             CHANNELLEN=64 NICKLEN=30 PREFIX=(qaohv)~&@%+ CHATHISTORY={} \
+             MSGREFTYPES=timestamp,msgid :are supported by this server",
+            super::chathistory::CHATHISTORY_LIMIT_MAX,
+        ),
+        format!(":{server_name} 422 {nick} :MOTD is on the upstream network"),
+    ];
+    (nick, burst)
 }
 
 /// Drive registration to a `Registered` verdict. Requires a successful
@@ -798,7 +815,8 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut framing = LineBuffer::new(e6irc_proto::message::MAX_CLIENT_FRAME_LEN);
+    // The attached session reads on from where the handshake stops.
+    let mut input = super::ClientInput::default();
     let mut buf = vec![0u8; 4096];
     let mut events = Vec::new();
 
@@ -816,18 +834,32 @@ where
     let mut sasl_network: Option<String> = None;
     let mut caps = super::AttachCaps::default();
 
-    loop {
-        // Registration is complete only once the client has a nick, has
-        // sent USER, has authenticated, and has closed CAP negotiation.
-        if nick.is_some() && have_user && account.is_some() && !cap_open {
+    // Registration is complete only once the client has a nick, has sent
+    // USER, has authenticated, and has closed CAP negotiation.
+    let registered =
+        |nick: &Option<String>, have_user: bool, account: &Option<String>, cap_open: bool| {
+            nick.is_some() && have_user && account.is_some() && !cap_open
+        };
+    'handshake: loop {
+        if registered(&nick, have_user, &account, cap_open) {
             break;
         }
         let n = read.read(&mut buf).await?;
         if n == 0 {
             return Ok(Registered::Closed);
         }
-        framing.feed(&buf[..n], &mut events);
-        for ev in events.drain(..) {
+        input.framing.feed(&buf[..n], &mut events);
+        let mut arrived = std::mem::take(&mut events).into_iter();
+        while let Some(ev) = arrived.next() {
+            // What follows the line that completed registration is the
+            // attached session's input, not the handshake's: a client that
+            // sends its first JOIN in the same write as `CAP END` must not
+            // have it refused here as an unknown command.
+            if registered(&nick, have_user, &account, cap_open) {
+                input.pending.push(ev);
+                input.pending.extend(arrived);
+                break 'handshake;
+            }
             let LineEvent::Line(line) = ev else {
                 super::write_client_line_error(write, super::ClientLineError::TooLong).await?;
                 continue;
@@ -1119,6 +1151,7 @@ where
         network: network.to_string(),
         requested_nick: requested_nick.to_string(),
         caps,
+        input,
     })
 }
 

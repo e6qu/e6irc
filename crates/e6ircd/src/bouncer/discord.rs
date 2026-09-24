@@ -10,7 +10,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as Ws;
 
-use super::{ConnectionEvent, DriverEnds, NetworkDriver, NetworkHandle};
+use super::{DriverEnds, NetworkDriver, NetworkHandle};
 
 const DEFAULT_API: &str = "https://discord.com/api/v10";
 const INTENTS: u64 = e6irc_proto::provider::DISCORD_GATEWAY_INTENTS;
@@ -73,9 +73,6 @@ impl NetworkDriver for DiscordDriver {
 struct ResumeState {
     session_id: String,
     resume_url: String,
-    /// This bot's own user id, from READY, so its echoes stay filtered after
-    /// a RESUME (which carries no READY).
-    user_id: String,
     seq: Option<u64>,
 }
 
@@ -204,6 +201,15 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
         Err(outcome) => return outcome,
     };
 
+    // Who the bot is, before anything is sent as it: its own posts come back
+    // on the gateway and are dropped there, and each delivered message is
+    // echoed under its name instead.
+    let me = match fetch_self(&http, &base, &config.token).await {
+        Ok(me) => me,
+        Err(error) => return error.into_outcome("discord bot user"),
+    };
+    let identity = super::bridged_identity("discord", &me.username);
+
     let resume = shared.resume_state();
     let gateway = match &resume {
         Some(resume) => resume.resume_url.clone(),
@@ -269,11 +275,9 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
     };
 
     let mut last_seq: Option<u64> = None;
-    let mut our_id = String::new();
     let opened = match &resume {
         Some(resume) => {
             last_seq = resume.seq;
-            our_id = resume.user_id.clone();
             send_gateway(
                 &mut write,
                 &ResumeFrame::new(&config.token, &resume.session_id, resume.seq),
@@ -286,7 +290,9 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
     if let Err(outcome) = opened {
         return outcome;
     }
-    ends.emit(ConnectionEvent::Connected);
+    if let Err(outcome) = ends.begin_bridge_session(&identity, id_to_channel.values()) {
+        return outcome;
+    }
 
     let mut heartbeat = tokio::time::interval(Duration::from_millis(hb_interval));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -335,9 +341,8 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
                     shared.advance(s);
                 }
                 match frame.event {
-                    Event::Ready { user_id, session_id, resume_url } => {
-                        our_id = user_id.clone();
-                        shared.remember(ResumeState { session_id, resume_url, user_id, seq: last_seq });
+                    Event::Ready { session_id, resume_url } => {
+                        shared.remember(ResumeState { session_id, resume_url, seq: last_seq });
                     }
                     Event::Resumed => eprintln!("discord: gateway session resumed"),
                     Event::HeartbeatRequest => {
@@ -359,7 +364,7 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
                         return Dropped(NetworkFailure::ConnectionLost);
                     }
                     Event::Message { channel_id, author_id, author, content, attachments } => {
-                        if author_id == our_id {
+                        if author_id == me.id {
                             continue;
                         }
                         let body = if !content.is_empty() {
@@ -389,7 +394,7 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
                         async move { send_message(&http, &base, &token, &id, &text).await }
                     }
                 };
-                if super::queue_channel_command(ends, cmd, &channel_to_id, "Discord", &mut deliveries, deliver)
+                if super::queue_channel_command(ends, cmd, &channel_to_id, &identity, "Discord", &mut deliveries, deliver)
                     .is_none()
                 {
                     return super::SessionOutcome::Stopped;
@@ -407,7 +412,6 @@ struct Frame {
 enum Event {
     Hello(u64),
     Ready {
-        user_id: String,
         session_id: String,
         resume_url: String,
     },
@@ -532,14 +536,8 @@ struct HelloData {
 
 #[derive(serde::Deserialize)]
 struct ReadyData {
-    user: ReadyUser,
     session_id: String,
     resume_gateway_url: String,
-}
-
-#[derive(serde::Deserialize)]
-struct ReadyUser {
-    id: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -597,11 +595,10 @@ fn parse_frame(text: &str) -> Result<Frame, String> {
             match name {
                 "READY" => {
                     let ready: ReadyData = decode_data(text, "READY")?;
-                    if ready.user.id.is_empty() || ready.session_id.is_empty() {
-                        return Err("READY without a user id or session id".to_string());
+                    if ready.session_id.is_empty() {
+                        return Err("READY without a session id".to_string());
                     }
                     Event::Ready {
-                        user_id: ready.user.id,
                         session_id: ready.session_id,
                         resume_url: ready.resume_gateway_url,
                     }
@@ -671,6 +668,35 @@ fn gateway_connection_url(gateway: &str) -> Result<String, String> {
         .append_pair("v", "10")
         .append_pair("encoding", "json");
     Ok(url.to_string())
+}
+
+/// The bot's own account, from `GET /users/@me`.
+#[derive(serde::Deserialize)]
+struct Me {
+    id: String,
+    username: String,
+}
+
+async fn fetch_self(
+    http: &super::BridgeHttp,
+    base: &str,
+    token: &str,
+) -> Result<Me, super::ConnectFail> {
+    let me: Me = super::bridge_send_credentials(
+        http.get(&format!("{base}/users/@me"))?
+            .header("Authorization", format!("Bot {token}")),
+        "bot user lookup",
+    )
+    .await?
+    .bounded_json()
+    .await?;
+    if me.id.is_empty() || me.username.is_empty() {
+        Err("the bot user lookup returned no id or name"
+            .to_string()
+            .into())
+    } else {
+        Ok(me)
+    }
 }
 
 async fn fetch_channel_name(
@@ -748,8 +774,8 @@ mod tests {
         assert_eq!(f.seq, Some(7));
         assert!(matches!(
             f.event,
-            Event::Ready { user_id, session_id, resume_url }
-                if user_id == "999" && session_id == "abc" && resume_url == "wss://resume.example"
+            Event::Ready { session_id, resume_url }
+                if session_id == "abc" && resume_url == "wss://resume.example"
         ));
     }
 
@@ -850,34 +876,31 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("#general".to_string(), "42".to_string());
         use crate::bouncer::{BridgeText, RouteResult, route_privmsg};
+        let deliver = |target: &str, text: &str| RouteResult::Deliver {
+            id: "42".to_string(),
+            target: target.to_string(),
+            text: BridgeText::Text(text.to_string()),
+        };
         assert_eq!(
             route_privmsg("PRIVMSG #general :hello", &map),
-            vec![RouteResult::Deliver(
-                "42".to_string(),
-                BridgeText::Text("hello".to_string())
-            )]
+            vec![deliver("#general", "hello")]
         );
-        // Case-insensitive: a differently-cased target still routes.
+        // Case-insensitive: a differently-cased target still routes, and is
+        // named as the client spelled it.
         assert_eq!(
             route_privmsg("PRIVMSG #General :hi", &map),
-            vec![RouteResult::Deliver(
-                "42".to_string(),
-                BridgeText::Text("hi".to_string())
-            )]
+            vec![deliver("#General", "hi")]
         );
         // A STATUSMSG prefix is stripped before the lookup.
         assert_eq!(
             route_privmsg("PRIVMSG @#general :ops", &map),
-            vec![RouteResult::Deliver(
-                "42".to_string(),
-                BridgeText::Text("ops".to_string())
-            )]
+            vec![deliver("#general", "ops")]
         );
         // A comma target list routes each independently.
         assert_eq!(
             route_privmsg("PRIVMSG #general,#other :x", &map),
             vec![
-                RouteResult::Deliver("42".to_string(), BridgeText::Text("x".to_string())),
+                deliver("#general", "x"),
                 RouteResult::Unmapped("#other".to_string()),
             ]
         );
@@ -1308,32 +1331,51 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    /// The scripted oracle, and a bridge network's session connecting to it,
+    /// with a subscription taken before the session starts.
     #[cfg(feature = "slack")]
-    async fn real_http_and_websocket_transport_bridge_both_directions() {
-        use crate::bouncer::NetworkHandle;
-        use crate::bouncer::bridge_oracle::Provider;
-
-        let mut oracle = crate::bouncer::bridge_oracle::start(Provider::Discord).await;
-        let config = DiscordConfig {
+    async fn scripted_session() -> (
+        crate::bouncer::bridge_oracle::Oracle,
+        crate::bouncer::NetworkHandle,
+        tokio::sync::broadcast::Receiver<crate::bouncer::DriverEvent>,
+        tokio::task::JoinHandle<crate::bouncer::SessionOutcome>,
+    ) {
+        let oracle =
+            crate::bouncer::bridge_oracle::start(crate::bouncer::bridge_oracle::Provider::Discord)
+                .await;
+        let config = Shared::new(DiscordConfig {
             token: "discord-token".into(),
             api_base: oracle.api_base.clone(),
             channels: vec!["42".into()],
             internal_upstreams: crate::egress::InternalUpstreams::Allow,
             buffer_cap: 10,
-        };
-        let (handle, mut ends) = NetworkHandle::channels(10);
+        });
+        let (handle, mut ends) = crate::bouncer::NetworkHandle::bridge_channels(10);
         let driver_events = handle.subscribe();
-        let session =
-            tokio::spawn(async move { session_once(&Shared::new(config), &mut ends).await });
+        let session = tokio::spawn(async move { session_once(&config, &mut ends).await });
+        (oracle, handle, driver_events, session)
+    }
 
+    #[tokio::test]
+    #[cfg(feature = "slack")]
+    async fn real_http_and_websocket_transport_bridge_both_directions() {
+        let (mut oracle, handle, driver_events, session) = scripted_session().await;
         crate::bouncer::bridge_oracle::verify_round_trip(
-            Provider::Discord,
+            crate::bouncer::bridge_oracle::Provider::Discord,
             handle,
             driver_events,
             session,
             &mut oracle,
         )
         .await;
+    }
+
+    /// An attached echo-message client is the bot: welcomed under its name,
+    /// and handed an echo under that same name.
+    #[tokio::test]
+    #[cfg(feature = "slack")]
+    async fn an_attached_client_is_welcomed_as_the_bot_and_knows_its_echo() {
+        let (_oracle, handle, _, session) = scripted_session().await;
+        crate::bouncer::bridge_oracle::verify_attached_client(handle, session).await;
     }
 }

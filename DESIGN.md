@@ -685,8 +685,7 @@ strip = "symbols"
 
 ### 7.2 Connection lifecycle
 
-- Listeners: plaintext (default 6667) and TLS (6697, rustls); optional
-  PROXY-protocol v2 support for LB deployments (config-gated).
+- Listeners: plaintext (default 6667) and TLS (6697, rustls).
 - One tokio task per connection owning the socket; outbound traffic goes
   through a **bounded** per-connection queue of `Bytes` (SendQ). Queue-full →
   the classic ircd answer: kill the slow client with a "SendQ exceeded" quit.
@@ -932,8 +931,23 @@ subset's exact behavior.
   (+o) and `+` (+v) only — **no halfop**, matching Libera. The authoritative
   mode-by-mode behavior list is pinned from Solanum's documentation/help
   files (with provenance) as a vendored compat reference, and verified by
-  the differential harness (§7.7).
-- User modes: Solanum-compatible core (`+i +w +Z +R …`) plus oper modes.
+  the differential harness (§7.7). RPL_MYINFO's mode lists and ISUPPORT
+  `CHANMODES`/`PREFIX` are derived from one set of mode tables in the core, so
+  the advertisements cannot disagree. A `+k` key or list-mode mask that could
+  not stand as a middle parameter (a leading `:`, a space or control byte, and
+  for a key a `,`, which would split JOIN's key list) is refused, not rewritten.
+- A plain member (no op or voice) banned or quieted in any channel it is in
+  cannot change nick (Solanum `ERR_BANNICKCHANGE` 435) — renaming would escape a
+  `nick!*@*` mask. The check spans core shards through the published channel
+  directory.
+- The first joiner of an unregistered channel creates it and is opped. A
+  *registered* channel recreated after it emptied opens no ops by arrival:
+  only the founder or an access holder is opped on join (Atheme semantics).
+- User modes: Solanum-compatible core (`+i +w +Z +R …`) plus oper modes. A
+  user MODE reports only the net change (nothing when nothing changed), and
+  `MODE <nick>` for a nick nobody holds is `ERR_NOSUCHNICK`, not 502.
+- An over-long `USER` name is truncated to `USERLEN`, never refused (Modern
+  IRC); only a character the source prefix cannot carry is refused (468).
 - Oper system: config-defined opers, privileges (kline/dline/xline-style
   bans, SETHOST, global notices), all actions audit-logged.
 - **Integrated services** (no separate Atheme process): `NickServ` and
@@ -1272,6 +1286,25 @@ provider-verified email claim.
   auto-provisions an account (nick derived from `preferred_username`,
   conflict → user picks). Subsequent logins match on (issuer, subject),
   never on email.
+- An in-flight OIDC authorization is held by the browser, not the server:
+  `/start`, `/sso`, and `/link` seal the provider, OAuth `state`, PKCE
+  verifier, nonce, ten-minute expiry, link target, and silent flag into the
+  `HttpOnly; SameSite=Lax` state cookie with ChaCha20-Poly1305 under a
+  per-startup key and a flow-specific associated-data context (the same
+  lifetime and reason as the CSRF key: short-lived browser state that must not
+  depend on the optional at-rest secret key). The callback admits only the
+  sealed flow whose `state` equals the returned one (constant-time), for that
+  provider, before its expiry. An anonymous flood of starts therefore holds no
+  server capacity a real login needs — the earlier bounded in-memory table
+  refused every login with a 503 once 4096 anonymous starts filled it.
+  Replay is bounded without server state: the authorization code is
+  single-use at the provider and bound to the flow's PKCE verifier, every
+  callback that proves the binding clears the cookie, and a restart ends
+  every flow. A refused callback leaves the cookie alone, so an attacker who
+  learns a victim's `state` cannot burn the victim's login.
+- Linking an identity is a cookie-authenticated top-level GET (a provider
+  redirect cannot carry the CSRF header), so it requires the session-bound
+  CSRF value as its `csrf` query parameter, as RP-initiated logout does.
 - Local-account login form (argon2id verify) for accounts without OIDC. It
   accepts only the primary password, not an IRC app password, is covered by the
   per-IP authentication rate limit, bounds every credential field before
@@ -1655,7 +1688,13 @@ above the trait, provides for every network kind:
   echo synthesized when the line is written. Either way the originator
   receives its echo only when it negotiated `echo-message` on attach, the same
   contract a real server has, and a NickServ command that can carry a secret
-  is redacted in the upstream's echo exactly as in a synthesized one.
+  is redacted in the upstream's echo exactly as in a synthesized one. A bridge
+  holds to the same rule: the provider's copy of a post the bridge made is
+  dropped, and each target the provider accepted is echoed once instead —
+  under the bridge account's IRC identity, the prefix that copy would have
+  carried — while a refused one is answered by its undelivered notice alone.
+  The `local` driver's synthesized echo shows the session as the core does,
+  the `USER` name verbatim.
   Synthesized echoes retain only
   validated client-only tags and mint their own `time` provenance; a downstream
   cannot forge or duplicate server `time`/`msgid` tags in persisted history.
@@ -1704,7 +1743,9 @@ above the trait, provides for every network kind:
   Stored timestamps are validated and canonicalized before they become sort
   keys, and replay emits that same canonical `time=` value. `batch` is optional:
   a client that negotiated it receives the applicable batch envelope and tags;
-  otherwise the same bounded page is emitted directly. `message-tags`,
+  otherwise the same bounded page is emitted directly. Every line inside a
+  batch carries its `batch=` tag (merged into the line's own tags), as the
+  core's replies do. `message-tags`,
   `server-time`, and `account-tag` independently gate their own replay metadata,
   and `message-tags` also scopes *which rows the page is cut from* (§11.2).
 - **A notice is retained only if it will still be true.** A `*bnc*` notice
@@ -1832,7 +1873,11 @@ upstream's.
   *after* the welcome (Atheme's ENFORCE moving an unidentified nick to
   `Guest12345`) is tracked, as it must be, and announced: `renamed_by_upstream`
   in the runtime snapshot with the diagnostic "upstream renamed this session
-  from X to Y", and one `*bnc*` notice into the backlog. The `USER`
+  from X to Y", and one `*bnc*` notice into the backlog. A rename an attached
+  client asked for with `NICK` is the owner's own choice: its confirmation is
+  tracked the same way but is neither recorded as a failure nor announced
+  (the driver remembers the last few names requested, since one the upstream
+  refuses is never confirmed). The `USER`
   name is configured, never derived. It used to be the first ten bytes of the
   nickname, so a legal nickname such as `_bot` registered as `USER _bot`, which
   Solanum-family servers answer by closing the link. `UpstreamUsername` admits
@@ -1972,8 +2017,9 @@ the account name, so it fails as the bad credential it is rather than as a bad
 network.
 The selector's nick and network components are independently validated; the
 slash-bearing selector is routing input, never the downstream IRC identity.
-Registration and later session reconciliation use the actual upstream nick (or
-the validated nick component while no upstream session exists). Off loopback
+Registration and later session reconciliation use the actual upstream nick — a
+bridge's is its provider account's (§10.5) — or the validated nick component
+while no upstream session exists. Off loopback
 the attach listener requires `[bnc].tls` (console: `bnc_tls`), because
 attaching clients send their account password; the configuration file and
 every console save refuse a cleartext non-loopback bind. Attach SASL
@@ -1981,6 +2027,10 @@ PLAIN accepts an empty authorization identity or the same RFC1459-folded
 identity as its authentication identity; it cannot authenticate one account
 while requesting authorization as another. The web client and REST API address
 networks explicitly by id.
+A client need not wait for the welcome before it sends: whatever arrives after
+the line that completes registration (`CAP END`, typically) — whole lines, and
+the start of one — is handed with the handshake's framing to the attached
+session and handled there, after the replay, never refused by the handshake.
 
 ### 10.5 Bridges: `matrix` / `discord` / `slack` drivers
 
@@ -2068,8 +2118,15 @@ Design constraints recorded now:
   `m.emote` becomes a CTCP ACTION, `m.notice` a NOTICE, media its body plus the
   spec's `/_matrix/media/v3/download` link (homeservers that enforce
   authenticated media will not open it), `m.location` its body plus a geo URI;
-  any other msgtype produces one bounded "not relayed" notice.
-- Discord keeps its gateway session per driver and RESUMEs on
+  any other msgtype produces one bounded "not relayed" notice. Timeline events
+  are decoded one at a time: a redacted `m.room.message` (empty content) or a
+  malformed event (no sender, msgtype or body, or not an event at all) is one
+  such notice in its channel, and the rest of the sync is relayed and its
+  position kept. Decoded as a whole, one such event failed every sync from that
+  position, and the bridge stalled on it forever.
+- Discord learns the bot's own account from `GET /users/@me` before it opens
+  the gateway, so the bot's posts are recognised, and echoes named, from the
+  first frame on. It keeps its gateway session per driver and RESUMEs on
   `resume_gateway_url` after a drop, so the gap is replayed and the daily
   IDENTIFY budget is not spent; op 9 (invalid session) ends the session — it
   used to be ignored while the gateway kept ACKing heartbeats, leaving the
@@ -2094,6 +2151,32 @@ Design constraints recorded now:
   produces a bounded notice. A failed name lookup is not cached. The
   display-name cache is bounded at 4096 upstream ids; overflow clears it,
   counted and logged.
+- A bridge's IRC session is its provider account. It begins, before the
+  bridge reports connected, under the account's nick (`bridged_identity`:
+  Discord's `GET /users/@me` name, Slack's `auth.test` user, the Matrix
+  login's localpart) and in the channels the bridge maps, through one call
+  (`DriverEnds::begin_bridge_session`) — so the nick a client is welcomed
+  under (`001` names the session's nick once there is one, §10.4) is the nick
+  every echo carries, and echo-message clients and `e6irc send` recognise
+  their own lines. The session is `SessionAuthority::Provider`: only the
+  provider (a rename) or the owner (a reconfiguration) changes it, so the
+  attach layer answers a client's `NICK` and `JOIN` itself and never relays
+  them. `NICK` to the current nick is no change, as on any server; any other
+  nick is refused with `447` to that client. `JOIN` of a bridged channel
+  re-states the membership (`JOIN`, `353`, `366`) — a client that joins
+  before it speaks gets the confirmation it waits for — and any other channel
+  is `403` (`437` before the bridge first connects, when its channels are not
+  yet known). The web composer refuses `NICK`, `JOIN` and `PART` on a bridge
+  with a typed rejection; the browser takes the nick and the joined channels
+  from the session event, shows no member list and offers no Leave for a
+  bridge channel. A mapped channel no IRC client could be joined to, or more
+  than the tracked-channel bound, is a `ChannelMappingFailed` configuration
+  refusal, and no session is begun.
+- Matrix drops a timeline event as the bridge's own send only when it carries
+  `unsigned.transaction_id`, which the homeserver includes only for the
+  device that sent it — those were echoed when the homeserver accepted them.
+  A post by the same account from any other device carries none and is
+  relayed like anyone's, under the account's nick.
 - Reverse bridge delivery accepts `PRIVMSG` only. A CTCP ACTION becomes the
   provider's emote (Matrix `m.emote`, Discord/Slack italics) and any other CTCP
   is refused; IRC formatting is stripped outbound; inbound provider text loses
@@ -2224,8 +2307,14 @@ Design constraints recorded now:
 
 Versioned under `/api/v1`; JSON; errors use RFC 9457 problem+json shape.
 Every URL query and form is closed: unknown fields are rejected before a
-handler runs. OIDC callback issuers, when returned, must exactly match the
-configured provider.
+handler runs. The one exception is the OIDC callback, whose query is the
+provider's authorization response rather than this server's API: RFC 6749
+§4.1.2 requires a client to ignore unrecognized response parameters (Google
+appends `authuser`, `hd` and `prompt`; Keycloak and Microsoft Entra
+`session_state`), and §3.3 lets a provider grant a scope set other than the
+one requested, so the returned `scope` is not acted on either — the verified
+ID token is what is trusted. OIDC callback issuers, when returned, must
+exactly match the configured provider.
 Surface (initial):
 
 - `auth`: OIDC start/callback, device-flow bootstrap, logout
@@ -2249,11 +2338,11 @@ Surface (initial):
 - A first OpenID Connect login provisions an account named exactly by the
   provider's configured claim; a name already in use or retired is a
   `409 Account name already taken` naming the claim — the server never
-  suffixes or invents a name for a person. The callback query is a closed set:
-  `session_state` (Keycloak, Microsoft Entra) is admitted and ignored, and any
-  other unknown parameter is a problem-document 400, as is every other
-  handler's query (`QueryParams`). Linking an identity requires an active
-  account.
+  suffixes or invents a name for a person. The callback ignores response
+  parameters it does not act on (see above); every other handler's query is
+  closed, an unknown parameter being a problem-document 400 (`QueryParams`).
+  Linking an identity requires an active account and the session's CSRF
+  value.
 - `channels`: owner-scoped registered-channel inventory and management at
   `/me/channels` (live-operator registration, retained topic, KEEPTOPIC,
   canonical MLOCK, access flags, founder transfer, unregister)
@@ -2414,8 +2503,13 @@ ring's lifetime and the line's position); a reconnecting socket presents it as
 honour — another lifetime after a restart or a replaced driver, an evicted
 position, or text that is not a cursor — is answered with
 `{"t":"replay","v":"full"}` followed by the whole ring, and the client resets
-its transcripts with one "history reloaded" note. The client keeps no
-de-duplication heuristic. Before each transport retry the
+its transcripts with one "history reloaded" note (and offers "Load earlier"
+again, since the loaded history went with them). The cursor is the open
+network's: adding a network while another is open, or leaving one, runs the
+single `resetNetworkState()`, which drops the cursor with the buffers, the
+mode table, the pending joins and the rest of that network's state. A topic or
+NAMES reply updates a channel buffer that is already open and never opens one.
+The client keeps no de-duplication heuristic. Before each transport retry the
 client checks the session; a 401 ends the retry loop and offers sign-in once.
 A message typed into a channel the session no longer holds is refused with a
 one-click rejoin; only slash commands pass. The composer sends
@@ -2520,7 +2614,11 @@ reader that goes away (a broken pipe) ends `tail`/`history` output cleanly.
 `&` channels are joined like `#` ones. Every wait on the server — connecting
 and registering, a capability request, a join with its history, and every
 wait after `QUIT` — is bounded by `--response-timeout` (30 s by default), so
-a peer that holds the socket open with irrelevant lines cannot hang a script.
+a peer that holds the socket open with irrelevant lines cannot hang a script;
+it bounds each HTTP request of `api` and `login` too. Those two open no IRC
+connection, so an IRC-only global option given to them (`--server`, `--nick`,
+`--tls`, the SASL and server-password options, ...) is an argument error
+naming it, not a silently ignored flag.
 `send` confirms delivery: it requires `echo-message` and, without it, fails
 with "delivery cannot be confirmed" before sending anything; it gets past the
 registration burst with a PING round trip and exits 0 only on its own echo,
@@ -2613,7 +2711,12 @@ two-second loop: rejected credentials, a rejected server password, and a ban
 are never retried (the client stops with a final status, as the bouncer's
 driver parks), and any other failure backs off exponentially from
 `--reconnect-delay` to five minutes. A refused channel is dropped from the
-session with a status line instead of failing the whole connect. The client
+session with a status line instead of failing the whole connect. A refusal is
+any error numeric or `FAIL JOIN` about that channel, not a list of known
+numerics: one this client never heard of (479, 489, 520, ...) would otherwise
+leave the join waiting out its deadline and the client reconnecting forever.
+Messages to a STATUSMSG target (`@#chan`, `+#chan`, with the sigils the
+server's `005 STATUSMSG` declares) are shown in the channel's buffer. The client
 adopts the nickname the server confirmed — a BNC's welcome carries the real
 upstream nick, which may differ from `--nick` — and follows its own NICK
 changes, so direct messages and its own JOIN/PART are recognised. Every error

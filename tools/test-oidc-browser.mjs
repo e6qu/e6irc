@@ -844,10 +844,9 @@ try {
     await clickAndWaitForURL(
       guest,
       guest.getByRole("button", { name: "Create account", exact: true }),
-      `${applicationOrigin}/console`,
+      // An invitee without administration lands on their own account page.
+      `${applicationOrigin}/console/account`,
     );
-
-    await guest.goto(`${applicationOrigin}/console/account`);
     await guest.getByRole("heading", { name: "Security activity", exact: true }).waitFor();
     await guest.getByText("ACCOUNT_LOGIN", { exact: true }).waitFor();
     if (browserName === "chromium") {

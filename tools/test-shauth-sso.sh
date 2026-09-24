@@ -43,11 +43,12 @@ start_shauth_stack() {
   local status
   while (( attempt <= 3 )); do
     output="$temporary/compose-up-$attempt.log"
-    if "${compose[@]}" up --build --detach >"$output" 2>&1; then
+    status=0
+    "${compose[@]}" up --build --detach >"$output" 2>&1 || status=$?
+    if (( status == 0 )); then
       cat "$output"
-      return
+      return 0
     fi
-    status=$?
     cat "$output" >&2
     if ! grep -Fq 'failed to solve: Unavailable: error reading from server: EOF' "$output"; then
       return "$status"

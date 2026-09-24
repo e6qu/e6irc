@@ -36,8 +36,11 @@ import { parseUiEvent } from "./ui-event.js";
 import {
   DEFAULT_CHANNEL_MODES,
   asMessage,
+  bufferAction,
   channelModesFrom,
   chatMessageRoute,
+  clearTranscript,
+  existingChannelBuffer,
   fold,
   isChannel,
   isPrefixMode,
@@ -50,6 +53,7 @@ import {
   nickPrefix,
   parseIrc,
   reconcileChannelSnapshot,
+  seededNick,
   splitSigil,
   stripFormatting,
   stripSigil,
@@ -484,7 +488,8 @@ function ensureBuffer(name, kind) {
 
 // The network's channel-mode table: which modes rank a member, their sigils,
 // and which consume a MODE parameter. The default applies until the network's
-// 005 replaces it; the page is one network, so it is kept across reconnects.
+// 005 replaces it. It is kept across reconnects to the same network and goes
+// with the rest of that network's state (resetNetworkState).
 let channelModes = DEFAULT_CHANNEL_MODES;
 
 // ---- rendering ----------------------------------------------------------
@@ -614,15 +619,14 @@ function renderActive({ atLatest = true } = {}) {
   routeNetworkEl.textContent = network || "";
   bufnameEl.textContent = !b || b.key === SERVER ? CONSOLE_NAME : b.display;
   buftopicEl.textContent = b ? b.topic : "";
-  if (!b || b.kind === "server") {
-    bufferActionEl.hidden = true;
-  } else {
-    bufferActionEl.hidden = false;
-    const canLeave = b.kind === "channel" && b.joined;
+  const action = bufferAction(b, memberTracking);
+  bufferActionEl.hidden = action === null;
+  if (action !== null) {
+    const canLeave = action === "leave";
     bufferActionEl.textContent = canLeave ? "Leave" : "Close";
-    const action = canLeave ? `Leave ${b.display}` : `Close conversation with ${b.display}`;
-    bufferActionEl.title = action;
-    bufferActionEl.setAttribute("aria-label", action);
+    const label = canLeave ? `Leave ${b.display}` : `Close conversation with ${b.display}`;
+    bufferActionEl.title = label;
+    bufferActionEl.setAttribute("aria-label", label);
   }
   // "Load earlier" is offered for a real conversation buffer (channel/DM) whose
   // persisted backlog hasn't been pulled yet, and only when attached (network set).
@@ -791,8 +795,9 @@ function closeBuffer(name) {
 
 bufferActionEl.addEventListener("click", () => {
   const buffer = buffers.get(active);
-  if (!buffer || buffer.kind === "server") return;
-  if (buffer.kind === "dm" || !buffer.joined) {
+  const action = buffer ? bufferAction(buffer, memberTracking) : null;
+  if (action === null) return;
+  if (action === "close") {
     closeBuffer(buffer.key);
     return;
   }
@@ -878,8 +883,8 @@ const addEvent = (chan, text) => addLine(chan, "event", "channel", null, text);
 function addNick(chan, nick, render = true) {
   const { name, modes } = splitSigil(nick, channelModes);
   if (!name) return;
-  const b = ensureBuffer(chan, "channel");
-  if (b.kind !== "channel") return;
+  const b = existingChannelBuffer(buffers, chan);
+  if (!b) return;
   const key = fold(name);
   if (b.nicks.size >= MAX_NICKS && !b.nicks.has(key)) {
     b.membersTruncated = true;
@@ -953,8 +958,8 @@ function renameNick(from, to) {
 }
 
 function setTopic(chan, topic) {
-  const b = ensureBuffer(chan, "channel");
-  if (b.kind !== "channel") return;
+  const b = existingChannelBuffer(buffers, chan);
+  if (!b) return;
   b.topic = stripFormatting(topic);
   if (b.key === active) buftopicEl.textContent = b.topic;
 }
@@ -964,14 +969,14 @@ function setTopic(chan, topic) {
 // Is this our own nick? Compared under the casefold, since the upstream may
 // echo a different casing than our configured nick.
 function isMe(nick) {
-  return nick != null && myNick != null && fold(nick) === fold(myNick);
+  return nick != null && !!myNick && fold(nick) === fold(myNick);
 }
 
 // Does `text` mention our nick as a whole token (casefolded)? Splits on runs of
 // non-nick characters (an IRC nick is letters/digits and `[]{}\|^`_-`), so
 // "hey alice!" highlights but "alicexyz" does not.
 function mentionsMe(text) {
-  if (myNick == null || typeof text !== "string") return false;
+  if (!myNick || typeof text !== "string") return false;
   const me = fold(myNick);
   return fold(text)
     .split(/[^a-z0-9{}[\]\\^`_|-]+/)
@@ -1151,8 +1156,8 @@ function handleLine(raw) {
       if (!chan) {
         break;
       }
-      const buffer = ensureBuffer(chan, "channel");
-      if (buffer.kind !== "channel") break;
+      const buffer = existingChannelBuffer(buffers, chan);
+      if (!buffer) break;
       if (!namesSnapshots.has(buffer.key)) {
         namesSnapshots.add(buffer.key);
         buffer.nicks.clear();
@@ -1307,12 +1312,7 @@ async function reconcileUnavailableNetwork() {
 let replayCursor = null;
 
 function resetTranscripts() {
-  for (const b of buffers.values()) {
-    b.lines.length = 0;
-    b.unread = 0;
-    b.mentions = 0;
-    b.pendingVisibleMessages = 0;
-  }
+  for (const b of buffers.values()) clearTranscript(b);
   renderActive();
   renderBufferList();
   addServer("history reloaded: the server could not continue from where this page stopped, so it replayed everything it holds");
@@ -2034,7 +2034,10 @@ if (networkForm) {
       networkDialog.close();
       if (!editing) {
         // A network was added to be used: open it rather than asking the
-        // person to find the row that just appeared.
+        // person to find the row that just appeared. Whatever network was
+        // open is left first, or its conversations and replay cursor would
+        // be carried into the new one.
+        resetNetworkState();
         network = name;
         window.history.replaceState(null, "", `/?network=${encodeURIComponent(name)}`);
         let networks = [];
@@ -2232,21 +2235,41 @@ function stopLiveConnection() {
   }
 }
 
-async function leaveOpenNetwork() {
+// Forget everything the open network owns, so the next network (or none)
+// starts clean: its connection and retry, its conversations, the replay cursor
+// (sent to another network it names lines that network never had), its mode
+// table, the joins asked for, and the once-per-page view choice. Every way of
+// leaving a network runs this one function, so none of them misses a piece.
+// web/test/network-state.test.js holds each piece of page state to either
+// being reset here or being named there as the page's own.
+function resetNetworkState() {
   stopLiveConnection();
-  network = null;
-  window.history.replaceState(null, "", "/");
+  rejectAllPendingSends("the network was changed");
+  reconnectDelay = 0;
+  reconnectAttempt = 0;
   buffers.clear();
   namesSnapshots.clear();
   namesRequested.clear();
+  requestedJoins.clear();
   active = null;
-  upstreamConnected = false;
   myNick = null;
+  upstreamConnected = false;
+  snapshotComplete = false;
+  memberTracking = true;
+  channelModes = DEFAULT_CHANNEL_MODES;
+  initialViewSettled = false;
+  replayCursor = null;
   clearAlert("network-unavailable");
   clearAlert("socket");
   setComposerAvailable(false);
   renderBufferList();
-  renderNickList();
+  renderActive();
+}
+
+async function leaveOpenNetwork() {
+  resetNetworkState();
+  network = null;
+  window.history.replaceState(null, "", "/");
   let networks = [];
   let failure = null;
   try {
@@ -2642,8 +2665,10 @@ function openChosenNetwork(networks, networkFailure) {
       addServer(`${reason} The live socket was not opened.`);
       return;
     }
-    // Seed our nick from the stored configuration (overridden by 001/NICK).
-    if (typeof selected.nick === "string") myNick = selected.nick;
+    // Seed our nick from the stored configuration (overridden by 001/NICK and
+    // the session snapshot). A bridge stores none: its nick is the provider
+    // account's, and arrives with the session.
+    myNick = seededNick(selected.nick);
     memberTracking =
       typeof selected.kind !== "string" ||
       selected.kind === "irc" ||

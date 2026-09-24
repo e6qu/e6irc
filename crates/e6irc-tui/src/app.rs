@@ -216,7 +216,14 @@ pub struct App {
     buffer_limit_reported: bool,
     input_limit_reported: bool,
     outbound_limit_reported: bool,
+    /// The STATUSMSG sigils the server declared in `005` (`@#chan` addresses
+    /// the channel's operators, but is still said in `#chan`).
+    statusmsg_sigils: String,
 }
+
+/// The STATUSMSG sigils assumed until the server's `005` says otherwise: the
+/// two every network that supports STATUSMSG at all offers.
+const DEFAULT_STATUSMSG_SIGILS: &str = "@+";
 
 /// A command the UI wants the network layer to perform.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,7 +271,17 @@ impl App {
             buffer_limit_reported: false,
             input_limit_reported: false,
             outbound_limit_reported: false,
+            statusmsg_sigils: DEFAULT_STATUSMSG_SIGILS.to_owned(),
         }
+    }
+
+    /// The channel a message target is said in: the target itself, or the
+    /// channel a STATUSMSG target (`@#chan`, `+#chan`) addresses a subset of.
+    fn channel_of<'a>(&self, target: &'a str) -> Option<&'a str> {
+        let bare = target.trim_start_matches(|sigil| self.statusmsg_sigils.contains(sigil));
+        [bare, target]
+            .into_iter()
+            .find(|candidate| e6irc_client::is_channel_target(candidate))
     }
 
     /// Adopt the nickname the server confirmed at registration. It is the
@@ -468,8 +485,8 @@ impl App {
                 // us opens/uses a query buffer named after the sender. What a
                 // server says to us, or to no one in particular (`NOTICE *`,
                 // a bouncer's status), belongs to no conversation.
-                let buffer = if e6irc_client::is_channel_target(&target) {
-                    target
+                let buffer = if let Some(channel) = self.channel_of(&target) {
+                    channel.to_owned()
                 } else if casemap.eq(&target, &self.nick) && from_a_user {
                     sender.clone()
                 } else if casemap.eq(&sender, &self.nick) {
@@ -620,6 +637,9 @@ impl App {
             // conversation it names, else in the server buffer. `params[0]` is
             // our own nick.
             numeric if numeric.len() == 3 && numeric.bytes().all(|byte| byte.is_ascii_digit()) => {
+                if numeric == "005" {
+                    self.adopt_isupport(msg);
+                }
                 let subject = msg.params.get(1).map(String::as_str).unwrap_or("");
                 let detail = msg.params.get(1..).unwrap_or_default().join(" ");
                 self.note_about(subject, &detail);
@@ -629,6 +649,22 @@ impl App {
             command => {
                 let detail = msg.params.join(" ");
                 self.note_server(&format!("{sender} {command} {detail}"));
+            }
+        }
+    }
+
+    /// Adopt what a `005` line declares that routing depends on. Tokens sit
+    /// between the nick and the trailing "are supported by this server".
+    fn adopt_isupport(&mut self, msg: &OwnedMessage) {
+        let tokens = msg
+            .params
+            .get(1..msg.params.len().saturating_sub(1))
+            .unwrap_or_default();
+        for token in tokens {
+            if let Some(sigils) = token.strip_prefix("STATUSMSG=") {
+                sigils.clone_into(&mut self.statusmsg_sigils);
+            } else if token == "-STATUSMSG" {
+                self.statusmsg_sigils.clear();
             }
         }
     }
@@ -646,7 +682,9 @@ impl App {
     /// would attribute an event to a conversation it never touched.
     fn note_about_user(&mut self, nick: &str, text: &str) {
         for buffer in &mut self.buffers {
-            if e6irc_client::is_channel_target(&buffer.name) || buffer.name == nick {
+            if e6irc_client::is_channel_target(&buffer.name)
+                || e6irc_proto::casemap::CaseMapping::Rfc1459.eq(&buffer.name, nick)
+            {
                 buffer.push(LogLine::new("*", text));
             }
         }
@@ -1219,6 +1257,40 @@ mod tests {
         app.on_message(&msg(":alice!u@h NICK alicia"));
         assert_eq!(app.nick, "renamed");
         assert_eq!(last_line(&app, "alice"), "alice is now known as alicia");
+    }
+
+    /// A STATUSMSG line (`@#c`: to the channel's operators) is part of that
+    /// channel's conversation, not a query with a nick named `@#c`.
+    #[test]
+    fn statusmsg_targets_are_said_in_their_channel() {
+        let mut app = App::new("#c".into(), "me".into());
+        app.on_message(&msg(":op!o@h NOTICE @#c :ops only"));
+        app.on_message(&msg(":op!o@h PRIVMSG +#C :voiced"));
+        assert_eq!(app.buffers.len(), 1, "no buffer named for a sigil");
+        assert_eq!(app.buffers[0].log[0].text, "ops only");
+        assert_eq!(app.buffers[0].log[1].text, "voiced");
+        // The server's own declaration governs which sigils those are.
+        app.on_message(&msg(
+            ":srv 005 me STATUSMSG=~@ CHANTYPES=# :are supported by this server",
+        ));
+        app.on_message(&msg(":op!o@h PRIVMSG ~#c :owners"));
+        assert_eq!(last_line(&app, "#c"), "owners");
+        // A server-local `&channel` stays itself even when `&` is a sigil.
+        app.on_message(&msg(
+            ":srv 005 me STATUSMSG=&@ :are supported by this server",
+        ));
+        app.on_message(&msg(":op!o@h PRIVMSG &local :here"));
+        assert_eq!(last_line(&app, "&local"), "here");
+    }
+
+    /// A QUIT is reported in the query with that user whatever case the
+    /// server spells the nick in: nicknames compare under RFC 1459.
+    #[test]
+    fn user_events_reach_their_query_under_any_case() {
+        let mut app = App::new("#c".into(), "me".into());
+        app.on_message(&msg(":Al[ex]!a@h PRIVMSG me :psst"));
+        app.on_message(&msg(":al{EX}!a@h QUIT :bye"));
+        assert_eq!(last_line(&app, "Al[ex]"), "al{EX} quit");
     }
 
     #[test]

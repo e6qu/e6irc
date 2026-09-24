@@ -82,12 +82,18 @@ mkdir -p "$output_dir"
 result="$output_dir/result.json"
 evidence="$output_dir/qualification.json"
 host="$output_dir/host.txt"
+# /proc/cpuinfo names the model in lowercase on x86 and not at all on arm64;
+# lscpu names it on both. Evidence without it is refused, not written short.
+cpu_model="$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -n 1)"
+[[ -n "$cpu_model" ]] || { echo "lscpu reports no CPU model name" >&2; exit 1; }
+memory_total="$(grep -m 1 '^MemTotal:' /proc/meminfo)"
 {
   date -u +%Y-%m-%dT%H:%M:%SZ
   git -C "$root" rev-parse HEAD
   uname -a
   nproc
-  grep -E '^(Model name|MemTotal):' /proc/cpuinfo /proc/meminfo
+  printf 'cpu_model=%s\n' "$cpu_model"
+  printf '%s\n' "$memory_total"
   printf 'load_executable=%s\n' "$load_bin"
   sha256sum "$load_bin"
   printf 'server_executable=%s\n' "$server_executable"

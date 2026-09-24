@@ -122,6 +122,63 @@ pub(super) const BANMASKLEN: usize = 100;
 /// (clipped) key is exactly what is echoed and enforced. Advertised as `KEYLEN`.
 pub(super) const KEYLEN: usize = 24;
 
+/// The channel modes this server implements, grouped by ISUPPORT `CHANMODES`
+/// type. RPL_MYINFO and RPL_ISUPPORT (`CHANMODES`, `PREFIX`) are both derived
+/// from these tables (see [`chanmodes_isupport`], [`myinfo_channel_modes`]),
+/// so the two advertisements cannot disagree with each other; a unit test pins
+/// the flags to [`chan_bool_mode`], the table the mode-apply loop reads.
+///
+/// Type A: list modes, always taking a mask to add or remove.
+pub(super) const CHANMODES_LIST: &str = "eIbq";
+/// Type B: always takes a parameter (`+k key`, `-k *`).
+pub(super) const CHANMODES_ALWAYS_PARAM: &str = "k";
+/// Type C: takes a parameter only when set (`+l 10`, `-l`).
+pub(super) const CHANMODES_SET_PARAM: &str = "l";
+/// Type D: flags, never a parameter. Exactly the chars [`chan_bool_mode`] knows.
+pub(super) const CHANMODES_FLAGS: &str = "imnstC";
+/// Membership prefix modes, in rank order, with their `PREFIX` sigils.
+pub(super) const PREFIX_MODES: &str = "ov";
+pub(super) const PREFIX_SIGILS: &str = "@+";
+/// User modes, as [`user_mode`] applies them and RPL_UMODEIS reports them.
+pub(super) const USER_MODES: &str = "iowB";
+
+/// `CHANMODES=A,B,C,D` from the tables above.
+pub(super) fn chanmodes_isupport() -> String {
+    format!(
+        "CHANMODES={CHANMODES_LIST},{CHANMODES_ALWAYS_PARAM},{CHANMODES_SET_PARAM},{CHANMODES_FLAGS}"
+    )
+}
+
+/// `PREFIX=(modes)sigils` from the tables above.
+pub(super) fn prefix_isupport() -> String {
+    format!("PREFIX=({PREFIX_MODES}){PREFIX_SIGILS}")
+}
+
+/// RPL_MYINFO's `<available channel modes>`: every channel mode, list and
+/// prefix modes included.
+pub(super) fn myinfo_channel_modes() -> String {
+    [
+        CHANMODES_LIST,
+        CHANMODES_ALWAYS_PARAM,
+        CHANMODES_SET_PARAM,
+        CHANMODES_FLAGS,
+        PREFIX_MODES,
+    ]
+    .concat()
+}
+
+/// RPL_MYINFO's `[<channel modes with a parameter>]`: every channel mode that
+/// takes one — list, key, limit and prefix modes; everything but the flags.
+pub(super) fn myinfo_param_channel_modes() -> String {
+    [
+        CHANMODES_LIST,
+        CHANMODES_ALWAYS_PARAM,
+        CHANMODES_SET_PARAM,
+        PREFIX_MODES,
+    ]
+    .concat()
+}
+
 /// Canonicalize a channel list-mode (+b/+q/+e/+I) mask to `nick!user@host`,
 /// filling missing components with `*` (Solanum's `clean_ban_mask`). Without
 /// this a bare `nick` is stored verbatim and never matches `nick!user@host`,
@@ -156,25 +213,46 @@ pub(super) fn truncate_chars(s: &str, max: usize) -> &str {
 
 /// Parse a channel list-mode (`+b/+q/+e/+I`) mask argument into its stored
 /// [`MaskKey`] — the one constructor for the "a stored channel mask is canonical
-/// `nick!user@host`, ≤ `BANMASKLEN`, and (for an add) space-free" invariant, so
-/// it holds by construction rather than by keeping three steps in order at a call
-/// site (DESIGN §2, mirroring `oper::BanMask::parse`). `Err` is a
-/// space-containing *add*: an embedded space (reachable only via the trailing
-/// form, `MODE #c +b :a b`) would split the mask across two tokens in both the
-/// MODE broadcast and the RPL_BANLIST middle, and copying the displayed form into
+/// `nick!user@host`, ≤ `BANMASKLEN`, and (for an add) a well-formed middle
+/// parameter" invariant, so it holds by construction rather than by keeping
+/// three steps in order at a call site (DESIGN §2, mirroring
+/// `oper::BanMask::parse`). `Err` names why an *add* was refused: an embedded
+/// space or control byte (reachable only via the trailing form,
+/// `MODE #c +b :a b`) would split the mask across two tokens in both the MODE
+/// broadcast and the RPL_BANLIST middle, and a leading `:` (`MODE #c +b ::x`)
+/// would open the trailing early in both — so copying the displayed form into
 /// `-b` could never remove it. Removals (`adding == false`) never reject, so a
-/// legacy space-containing mask stays removable via the same form that set it.
+/// legacy mask stays removable via the same form that set it.
 pub(super) fn channel_list_mask(
     raw: &str,
     adding: bool,
     casemap: e6irc_proto::casemap::CaseMapping,
-) -> Result<crate::core::state::MaskKey, ()> {
+) -> Result<crate::core::state::MaskKey, &'static str> {
     let norm = normalize_ban_mask(raw);
     let mask = truncate_chars(&norm, BANMASKLEN);
-    if adding && mask.contains(' ') {
-        return Err(());
+    if adding {
+        if mask.bytes().any(|b| b <= b' ' || b == 0x7f) {
+            return Err("Mask contains a space or control character");
+        }
+        if mask.starts_with(':') {
+            return Err("Mask may not start with ':'");
+        }
     }
     Ok(crate::core::state::MaskKey::new(mask, casemap))
+}
+
+/// Whether `key` may be set as a channel key (`+k`). A key rides as a middle
+/// parameter in the MODE broadcast and RPL_CHANNELMODEIS, and as one entry of
+/// JOIN's comma-separated key list, so each byte that breaks one of those is
+/// refused: empty, a leading `:` (opens the trailing early), a `,` (splits the
+/// JOIN key list, so the key could never be supplied), and space or any other
+/// control byte (splits or corrupts the parameter). Solanum's `fix_key` strips
+/// the same bytes; refusing instead keeps what the op typed and what is enforced
+/// identical — a silently rewritten key is one nobody was told.
+pub(super) fn valid_channel_key(key: &str) -> bool {
+    !key.is_empty()
+        && !key.starts_with(':')
+        && !key.bytes().any(|b| b <= b' ' || b == b',' || b == 0x7f)
 }
 
 pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
@@ -332,12 +410,19 @@ pub(super) fn join_on_owner(
         });
     }
     let first = !chan.has_members();
+    // The first joiner of an *unregistered* channel creates it and is its op.
+    // A registered channel belongs to its founder: recreating it after it
+    // emptied grants nothing by arriving first — only the founder or an access
+    // holder is opped (Atheme semantics, DESIGN §7.6), or anyone could take
+    // the channel over by waiting for it to empty.
+    let registered = state.is_registered(&key) || state.channel_registration_pending(&key);
+    let chan = state.channels.get_mut(&key).expect("just inserted");
     chan.add_member_with_profile(
         actor.recipient,
         actor.profile,
         actor.identity.clone(),
         MemberModes {
-            op: first || is_founder || access_op,
+            op: (first && !registered) || is_founder || access_op,
             voice: access_voice,
         },
     );
@@ -348,8 +433,14 @@ pub(super) fn join_on_owner(
     let account = actor.account.unwrap_or_else(|| "*".into());
     let realname = actor.realname;
     let plain_join = format!(":{prefix} JOIN {display}");
-    let extended_join = format!(":{prefix} JOIN {display} {account} :{realname}");
-    let joiner_away = actor.away;
+    let extended_join =
+        super::fitted_line(format!(":{prefix} JOIN {display} {account} :"), &realname);
+    // away-notify: an away joiner's status follows the JOIN. Built once, and
+    // fitted like the AWAY broadcast itself (see `cmd_away`).
+    let away_line = actor
+        .away
+        .as_deref()
+        .map(|away| super::fitted_line(format!(":{prefix} AWAY :"), away));
     let members = state.channels[&key].recipients();
     for recipient in members.iter().copied() {
         let caps = recipient.caps();
@@ -361,13 +452,11 @@ pub(super) fn join_on_owner(
         if recipient.conn() != conn {
             state.send_timed_recipient(recipient, line);
         }
-        // away-notify: an away joiner's status follows the JOIN.
         if recipient.conn() != conn
             && caps.away_notify
-            && let Some(away) = &joiner_away
+            && let Some(away_line) = &away_line
         {
-            let away_line = format!(":{prefix} AWAY :{away}");
-            state.send_timed_recipient(recipient, &away_line);
+            state.send_timed_recipient(recipient, away_line);
         }
     }
 
@@ -898,7 +987,7 @@ fn require_channel<'a>(
         let chan = state.channels.get(&key).expect("checked");
         Some((key, chan))
     } else {
-        state.err_nosuchchannel(conn, clip_echo(target));
+        state.err_nosuchchannel(conn, target);
         None
     }
 }
@@ -1086,7 +1175,7 @@ fn emit_topic_result_now(
 ) {
     match result {
         crate::core::state::ChannelTopicResult::NoSuchChannel { target } => {
-            state.err_nosuchchannel(conn, clip_echo(&target));
+            state.err_nosuchchannel(conn, &target);
         }
         crate::core::state::ChannelTopicResult::Hidden { target, proof } => {
             super::deny_hidden(state, conn, &target, proof);
@@ -1509,7 +1598,7 @@ fn emit_mode_query_result_now(
 ) {
     match result {
         crate::core::state::ChannelModeQueryResult::NoSuchChannel { target } => {
-            state.err_nosuchchannel(conn, super::clip_echo(&target))
+            state.err_nosuchchannel(conn, &target)
         }
         crate::core::state::ChannelModeQueryResult::Hidden { target, proof } => {
             super::deny_hidden(state, conn, &target, proof)
@@ -1593,7 +1682,7 @@ fn emit_mode_list_query_result_now(
 ) {
     match result {
         crate::core::state::ChannelModeListQueryResult::NoSuchChannel { target } => {
-            state.err_nosuchchannel(conn, super::clip_echo(&target))
+            state.err_nosuchchannel(conn, &target)
         }
         crate::core::state::ChannelModeListQueryResult::Hidden { target, proof } => {
             super::deny_hidden(state, conn, &target, proof)
@@ -1681,67 +1770,67 @@ pub(super) fn apply_mlock(state: &mut ServerState, key: &ChanKey) {
     state.broadcast_channel(key, &line, None);
 }
 
+/// Whether user mode `c` is set on `session`; `None` for a char that is not a
+/// user mode. The one reading of the user-mode table: RPL_UMODEIS and the
+/// changed-modes echo both go through it, so neither can report a mode the
+/// other does not know (a core test pins RPL_UMODEIS to [`USER_MODES`]).
+pub(super) fn user_mode_is_set(session: &crate::core::state::Session, c: char) -> Option<bool> {
+    Some(match c {
+        'i' => session.invisible,
+        'o' => session.oper.is_some(),
+        'w' => session.wallops,
+        'B' => session.bot,
+        _ => return None,
+    })
+}
+
+/// The user modes set on `session`, in [`USER_MODES`] order.
+fn user_modes_set(session: &crate::core::state::Session) -> String {
+    USER_MODES
+        .chars()
+        .filter(|&c| user_mode_is_set(session, c) == Some(true))
+        .collect()
+}
+
 pub(super) fn user_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&str]) {
     let self_nick = state.sessions[&conn]
         .nick()
         .map(String::from)
         .expect("registered");
-    if state.nick_key(target) != state.nick_key(&self_nick) {
-        state.numeric(
-            conn,
-            ERR_USERSDONTMATCH,
-            &[],
-            Some("Can't change mode for other users"),
-        );
+    let target_key = state.nick_key(target);
+    if target_key != state.nick_key(&self_nick) {
+        // A nick nobody holds is ERR_NOSUCHNICK; ERR_USERSDONTMATCH is for a
+        // real user who is not you (Modern IRC / Solanum).
+        if state.registered_nick_owner(&target_key).is_none() {
+            state.err_nosuchnick(conn, target);
+        } else {
+            state.numeric(
+                conn,
+                ERR_USERSDONTMATCH,
+                &[],
+                Some("Can't change mode for other users"),
+            );
+        }
         return;
     }
+    let before = user_modes_set(&state.sessions[&conn]);
     if rest.is_empty() {
-        let mut modes = String::from("+");
-        if state.sessions[&conn].invisible {
-            modes.push('i');
-        }
-        if state.sessions[&conn].oper.is_some() {
-            modes.push('o');
-        }
-        if state.sessions[&conn].wallops {
-            modes.push('w');
-        }
-        if state.sessions[&conn].bot {
-            modes.push('B');
-        }
-        state.numeric(conn, RPL_UMODEIS, &[&modes], None);
+        state.numeric(conn, RPL_UMODEIS, &[&format!("+{before}")], None);
         return;
     }
-    // Apply the self-service user modes we support (+i invisible). +o is
-    // grantable only via OPER; a self -o (deopering) is accepted.
+    // Apply the self-service user modes we support. +o is grantable only via
+    // OPER; a self -o (deopering) is accepted.
     let mut adding = true;
-    let mut applied = String::new();
-    let mut last_sign = ' ';
     let mut unknown = false;
-    let mut member_profile_changed = false;
+    let session = state.sessions.get_mut(&conn).expect("registered");
     for c in rest.join("").chars() {
         match c {
             '+' => adding = true,
             '-' => adding = false,
-            'i' => {
-                state.sessions.get_mut(&conn).expect("registered").invisible = adding;
-                push_mode(&mut applied, &mut last_sign, adding, 'i');
-                member_profile_changed = true;
-            }
-            'w' => {
-                state.sessions.get_mut(&conn).expect("registered").wallops = adding;
-                push_mode(&mut applied, &mut last_sign, adding, 'w');
-            }
-            'B' => {
-                state.sessions.get_mut(&conn).expect("registered").bot = adding;
-                push_mode(&mut applied, &mut last_sign, adding, 'B');
-                member_profile_changed = true;
-            }
-            'o' if !adding => {
-                state.sessions.get_mut(&conn).expect("registered").oper = None;
-                push_mode(&mut applied, &mut last_sign, false, 'o');
-                member_profile_changed = true;
-            }
+            'i' => session.invisible = adding,
+            'w' => session.wallops = adding,
+            'B' => session.bot = adding,
+            'o' if !adding => session.oper = None,
             'o' => {} // +o only via OPER
             _ => unknown = true,
         }
@@ -1749,15 +1838,28 @@ pub(super) fn user_mode(state: &mut ServerState, conn: ConnId, target: &str, res
     if unknown {
         state.numeric(conn, ERR_UMODEUNKNOWNFLAG, &[], Some("Unknown MODE flag"));
     }
-    if !applied.is_empty() {
-        let nick = state.sessions[&conn]
-            .nick()
-            .map(String::from)
-            .expect("registered");
-        let server = state.config.server_name.clone();
-        state.send(conn, &format!(":{server} MODE {nick} :{applied}"));
+    // Report only what actually changed, as the net difference from before:
+    // re-setting a mode already set (`+i` while +i), dropping one never held
+    // (`-o` by a non-oper) or undoing it in the same string (`+i-i`) is no
+    // change, and echoing it would tell the client a phantom transition — the
+    // same rule the channel-mode loop and AWAY keep. Nothing changed, nothing
+    // is sent.
+    let after = user_modes_set(&state.sessions[&conn]);
+    let mut applied = String::new();
+    let mut last_sign = ' ';
+    for (adding, from, to) in [(true, &before, &after), (false, &after, &before)] {
+        for c in to.chars().filter(|&c| !from.contains(c)) {
+            push_mode(&mut applied, &mut last_sign, adding, c);
+        }
     }
-    if member_profile_changed {
+    if applied.is_empty() {
+        return;
+    }
+    let server = state.config.server_name.clone();
+    state.send(conn, &format!(":{server} MODE {self_nick} :{applied}"));
+    // Every user mode but +w is part of what channel peers see (WHO flags,
+    // the bot tag, oper status), so any change republishes the member.
+    if applied.chars().any(|c| c != 'w' && c != '+' && c != '-') {
         state.sync_channel_member(conn, crate::core::state::ChannelMemberChange::Identity);
     }
 }
@@ -2004,8 +2106,7 @@ fn channel_mode_with_prefix(
                         // still broadcast after the loop.
                         continue;
                     };
-                    // Keys with spaces or empty are unusable on the wire.
-                    if k.is_empty() || k.contains(' ') {
+                    if !valid_channel_key(k) {
                         state.numeric(
                             conn,
                             ERR_INVALIDKEY,
@@ -2092,16 +2193,16 @@ fn channel_mode_with_prefix(
                 // One constructor canonicalizes to nick!user@host (so a bare
                 // `+b nick` matches, Solanum clean_ban_mask), clips to BANMASKLEN
                 // (so the stored mask fits the RPL_BANLIST middle and the MODE
-                // broadcast), and rejects a space-containing add — the invariant
-                // now holds by construction. `Err` is the space rejection.
+                // broadcast), and rejects an add that is not a well-formed middle
+                // parameter — the invariant holds by construction. `Err` says why.
                 let mask_key = match channel_list_mask(raw_mask, adding, casemap) {
                     Ok(m) => m,
-                    Err(()) => {
+                    Err(reason) => {
                         state.numeric(
                             conn,
                             ERR_INVALIDMODEPARAM,
                             &[&display, &c.to_string(), "*"],
-                            Some("Mask contains a space"),
+                            Some(reason),
                         );
                         continue;
                     }
@@ -2180,26 +2281,16 @@ fn channel_mode_with_prefix(
                     state.channels[&key].member_named(state.casemap, who)
                 else {
                     if state.registered_nick_owner(&nick_key).is_none() {
-                        state.err_nosuchnick(conn, clip_echo(who));
+                        state.err_nosuchnick(conn, who);
                     } else {
-                        state.numeric(
-                            conn,
-                            ERR_USERNOTINCHANNEL,
-                            &[who, &display],
-                            Some("They aren't on that channel"),
-                        );
+                        state.err_usernotinchannel(conn, who, &display);
                     }
                     continue;
                 };
                 let member_nick = identity.nick.clone();
                 let chan = state.channels.get_mut(&key).expect("checked");
                 let Some(member) = chan.member_mut(member_conn) else {
-                    state.numeric(
-                        conn,
-                        ERR_USERNOTINCHANNEL,
-                        &[who, &display],
-                        Some("They aren't on that channel"),
-                    );
+                    state.err_usernotinchannel(conn, who, &display);
                     continue;
                 };
                 // Suppress a no-op privilege change (op-ing an existing op, etc.)

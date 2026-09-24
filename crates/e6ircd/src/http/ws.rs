@@ -8,6 +8,8 @@ use super::*;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 
+use crate::bouncer::SessionAuthority;
+
 /// IRCv3 WebSocket carries exactly one CRLF-stripped IRC line per message, so
 /// the protocol's full client frame allowance is also the transport cap.
 const MAX_IRC_WS_FRAME: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN;
@@ -506,6 +508,7 @@ pub(super) async fn ws_ui_conn(
     }
     let _attachment = handle.track_attachment();
     let attach_id = handle.next_attachment_id();
+    let authority = handle.session_authority();
     let after = match resume {
         Some(ReplayRequest::After(cursor)) => Some(cursor),
         Some(ReplayRequest::Unknown) | None => None,
@@ -674,7 +677,7 @@ pub(super) async fn ws_ui_conn(
                 peer_silence.restart();
                 match frame {
                 Some(Ok(WsMessage::Text(t))) => {
-                    let request = match composer_request(&t) {
+                    let request = match composer_request(&t, authority) {
                         Ok(request) => request,
                         Err(error) => {
                             let event = composer_result_event(cursor, ComposerResult::Rejected {
@@ -872,19 +875,29 @@ struct ComposerRequestError {
 /// attach path answers them locally and never forwards them. This is asked of
 /// the command the final line parses to, so `/raw`, `/quote`, tags, a source
 /// prefix, or letter case cannot carry one past it.
-fn composer_command_refusal(command: &str) -> Option<&'static str> {
+///
+/// On a bridge ([`SessionAuthority::Provider`]) the nick is the provider
+/// account's name and the channels are the bridge's configuration, so `NICK`,
+/// `JOIN` and `PART` could change nothing; each is refused here, to this
+/// socket, rather than reaching the bridge as a line it can only reject.
+fn composer_command_refusal(command: &str, authority: SessionAuthority) -> Option<&'static str> {
     const SESSION: &str = "QUIT would disconnect this always-on network; disable the network instead. Nothing was sent";
     const ATTACH_LAYER: &str =
         "e6irc answers this command itself, so the network never sees it. Nothing was sent";
+    const PROVIDER: &str = "on a bridge the nick is the provider account's name and the channels are the bridge's configuration; change them there. Nothing was sent";
     match command.to_ascii_uppercase().as_str() {
         "QUIT" => Some(SESSION),
         "PING" | "PONG" | "CAP" | "AUTHENTICATE" | "CHATHISTORY" | "MARKREAD" => Some(ATTACH_LAYER),
+        "NICK" | "JOIN" | "PART" if authority == SessionAuthority::Provider => Some(PROVIDER),
         _ => None,
     }
 }
 
 /// Parse and bound one browser composer frame.
-fn composer_request(frame: &str) -> Result<ComposerRequest, ComposerRequestError> {
+fn composer_request(
+    frame: &str,
+    authority: SessionAuthority,
+) -> Result<ComposerRequest, ComposerRequestError> {
     if frame.len() > MAX_UI_WS_FRAME {
         return Err(ComposerRequestError {
             request_id: None,
@@ -917,7 +930,7 @@ fn composer_request(frame: &str) -> Result<ComposerRequest, ComposerRequestError
         });
     }
     let refusal = match e6irc_proto::message::Message::parse(&line) {
-        Ok(message) => composer_command_refusal(message.command),
+        Ok(message) => composer_command_refusal(message.command, authority),
         Err(_) => Some("message is not a complete IRC command; nothing was sent"),
     };
     if let Some(message) = refusal {
@@ -1280,17 +1293,22 @@ mod tests {
 
     #[test]
     fn composer_request_is_correlated_and_never_truncated() {
-        let request =
-            composer_request(r##"{"id":"send-1","target":"#rust","message":"hi"}"##).unwrap();
+        let request = composer_request(
+            r##"{"id":"send-1","target":"#rust","message":"hi"}"##,
+            SessionAuthority::Upstream,
+        )
+        .unwrap();
         assert_eq!(
             request.request_id.as_ref().map(ComposerRequestId::as_str),
             Some("send-1")
         );
         assert_eq!(request.line, "PRIVMSG #rust :hi");
 
-        let injection =
-            composer_request(r##"{"id":"send-2","target":"#rust","message":"hi\r\nJOIN #bad"}"##)
-                .expect_err("embedded delimiter must reject the whole request");
+        let injection = composer_request(
+            r##"{"id":"send-2","target":"#rust","message":"hi\r\nJOIN #bad"}"##,
+            SessionAuthority::Upstream,
+        )
+        .expect_err("embedded delimiter must reject the whole request");
         assert_eq!(
             injection.request_id.as_ref().map(ComposerRequestId::as_str),
             Some("send-2")
@@ -1303,7 +1321,8 @@ mod tests {
             "message": "x".repeat(e6irc_proto::message::MAX_LINE_LEN),
         })
         .to_string();
-        let overlong = composer_request(&frame).expect_err("over-long line must be refused");
+        let overlong = composer_request(&frame, SessionAuthority::Upstream)
+            .expect_err("over-long line must be refused");
         assert_eq!(
             overlong.request_id.as_ref().map(ComposerRequestId::as_str),
             Some("send-3")
@@ -1317,7 +1336,7 @@ mod tests {
         })
         .to_string();
         assert!(
-            composer_request(&tagged)
+            composer_request(&tagged, SessionAuthority::Upstream)
                 .expect("the independent client-tag allowance")
                 .line
                 .starts_with("@example=")
@@ -1325,7 +1344,7 @@ mod tests {
 
         let oversized_envelope = "x".repeat(MAX_UI_WS_FRAME + 1);
         assert!(
-            composer_request(&oversized_envelope)
+            composer_request(&oversized_envelope, SessionAuthority::Upstream)
                 .expect_err("oversized JSON envelope")
                 .message
                 .contains("bounded envelope")
@@ -1338,7 +1357,7 @@ mod tests {
             r##"{"id":"send-7","target":"","message":"hello"}"##,
             r##"{"id":"send-8","target":"","message":"/me waves"}"##,
         ] {
-            let error = composer_request(malformed)
+            let error = composer_request(malformed, SessionAuthority::Upstream)
                 .expect_err("an empty IRC command must not be acknowledged as sent");
             assert!(error.message.contains("nothing was sent"), "{error:?}");
         }
@@ -1360,7 +1379,8 @@ mod tests {
             "/raw MARKREAD #rust",
         ] {
             let frame = serde_json::json!({ "id": "a1", "target": "#rust", "message": message });
-            let error = composer_request(&frame.to_string()).expect_err(message);
+            let error = composer_request(&frame.to_string(), SessionAuthority::Upstream)
+                .expect_err(message);
             assert_eq!(
                 error.request_id.as_ref().map(ComposerRequestId::as_str),
                 Some("a1")
@@ -1374,14 +1394,51 @@ mod tests {
         // Text that merely mentions a command is conversation.
         for message in ["QUIT", "/me will QUIT soon", "/msg friend PING me"] {
             let frame = serde_json::json!({ "target": "#rust", "message": message });
-            assert!(composer_request(&frame.to_string()).is_ok(), "{message}");
+            assert!(
+                composer_request(&frame.to_string(), SessionAuthority::Upstream).is_ok(),
+                "{message}"
+            );
         }
+    }
+
+    /// A bridge's nick and channels are the provider's and the configuration's:
+    /// the composer refuses to send what could only be rejected, and says why.
+    #[test]
+    fn composer_refuses_session_commands_on_a_bridge() {
+        for message in [
+            "/nick other",
+            "/join #elsewhere",
+            "/part #general",
+            "/raw NICK x",
+        ] {
+            let frame = serde_json::json!({ "id": "b1", "target": "#general", "message": message });
+            let error = composer_request(&frame.to_string(), SessionAuthority::Provider)
+                .expect_err(message);
+            assert!(
+                error.message.contains("provider account"),
+                "{message}: {error:?}"
+            );
+            assert!(
+                error.message.contains("Nothing was sent"),
+                "{message}: {error:?}"
+            );
+            // The same command on an IRC network is the upstream's to answer.
+            assert!(
+                composer_request(&frame.to_string(), SessionAuthority::Upstream).is_ok(),
+                "{message}"
+            );
+        }
+        let frame = serde_json::json!({ "target": "#general", "message": "hello" });
+        assert!(composer_request(&frame.to_string(), SessionAuthority::Provider).is_ok());
     }
 
     #[test]
     fn composer_request_is_a_closed_json_contract() {
-        let uncorrelated = composer_request(r##"{"target":"","message":"/join #rust"}"##)
-            .expect("uncorrelated command");
+        let uncorrelated = composer_request(
+            r##"{"target":"","message":"/join #rust"}"##,
+            SessionAuthority::Upstream,
+        )
+        .expect("uncorrelated command");
         assert_eq!(uncorrelated.line, "JOIN #rust");
         assert!(uncorrelated.request_id.is_none());
 
@@ -1402,7 +1459,10 @@ mod tests {
             ),
             r##"{"target":"#rust","message":"hello","extra":true}"##,
         ] {
-            assert!(composer_request(frame).is_err(), "accepted {frame}");
+            assert!(
+                composer_request(frame, SessionAuthority::Upstream).is_err(),
+                "accepted {frame}"
+            );
         }
     }
 

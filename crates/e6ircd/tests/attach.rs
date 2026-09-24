@@ -99,6 +99,7 @@ async fn attached_client_gets_playback_and_live_and_can_send() {
     let attach_task = tokio::spawn(async move {
         let _ = attach(
             server_side,
+            e6ircd::bouncer::ClientInput::default(),
             &attach_handle,
             Default::default(),
             "attacher",
@@ -190,6 +191,7 @@ async fn two_clients_attach_to_one_always_on_network() {
         tokio::spawn(async move {
             let _ = attach(
                 s,
+                e6ircd::bouncer::ClientInput::default(),
                 &h,
                 Default::default(),
                 "attacher",
@@ -255,6 +257,7 @@ async fn lagged_attach_is_not_left_open_with_stale_session_state() {
     let task = tokio::spawn(async move {
         attach(
             server,
+            e6ircd::bouncer::ClientInput::default(),
             &attach_handle,
             Default::default(),
             "attacher",
@@ -309,6 +312,7 @@ fn attach_client(
     let task = tokio::spawn(async move {
         let _ = attach(
             server_side,
+            e6ircd::bouncer::ClientInput::default(),
             &attach_handle,
             caps,
             "attacher",
@@ -544,6 +548,7 @@ async fn a_silent_client_is_pinged_and_then_let_go_while_an_answering_one_stays(
         let task = tokio::spawn(async move {
             attach(
                 server_side,
+                e6ircd::bouncer::ClientInput::default(),
                 &handle,
                 Default::default(),
                 "attacher",

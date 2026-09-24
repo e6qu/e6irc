@@ -1249,8 +1249,13 @@ impl Inbound {
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RouteResult {
-    /// A PRIVMSG mapped to `(upstream_id, text)`; deliver it.
-    Deliver(String, BridgeText),
+    /// A PRIVMSG to `target` (as the client named it, less any STATUSMSG
+    /// prefix), mapped to the upstream `id`; deliver `text` there.
+    Deliver {
+        id: String,
+        target: String,
+        text: BridgeText,
+    },
     /// A PRIVMSG to `target` that maps to no bridged channel — surface loss.
     Unmapped(String),
     /// The bridge cannot execute this command; surface a fixed safe reason.
@@ -1310,7 +1315,11 @@ pub(crate) fn route_privmsg(
         .map(|t| {
             let bare = conversation_target(t);
             match targets.get(&casemap.casefold(bare)) {
-                Some(id) => RouteResult::Deliver(id.clone(), text.clone()),
+                Some(id) => RouteResult::Deliver {
+                    id: id.clone(),
+                    target: bare.to_string(),
+                    text: text.clone(),
+                },
                 None => RouteResult::Unmapped(bare.to_string()),
             }
         })
@@ -1329,11 +1338,38 @@ pub(crate) fn route_privmsg(
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 pub(crate) const RATE_LIMIT_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The echo of one routed delivery: the line an attached client sent, as the
+/// bridge's own account says it on IRC, to the one target delivered. Emitted
+/// only once the provider accepted the message — a refused one is answered by
+/// its undelivered notice alone, as a real server answers with its refusal.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+#[derive(Debug)]
+pub(crate) struct PendingEcho {
+    line: String,
+    origin: u64,
+}
+
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+impl PendingEcho {
+    /// The echo of `command` delivered to `target`, or `None` for a line with
+    /// no echo (see [`irc_driver::self_echo`]).
+    fn of(
+        command: &ClientCommand,
+        target: &str,
+        identity: &irc_driver::SelfIdentity,
+    ) -> Option<Self> {
+        irc_driver::self_echo_to(&command.line, target, identity).map(|line| Self {
+            line,
+            origin: command.origin,
+        })
+    }
+}
+
 /// How one routed delivery ended, for [`report_delivery`].
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 #[derive(Debug)]
 pub(crate) enum DeliveryOutcome {
-    Delivered,
+    Delivered(Option<PendingEcho>),
     Failed {
         id: String,
         detail: String,
@@ -1354,6 +1390,7 @@ pub(crate) async fn deliver_with_retry<F, Fut>(
     mut deliver: F,
     id: String,
     text: BridgeText,
+    echo: Option<PendingEcho>,
 ) -> DeliveryOutcome
 where
     F: FnMut(String, BridgeText) -> Fut,
@@ -1364,11 +1401,11 @@ where
         BridgeFailure::Failed(detail) => DeliveryOutcome::Failed { id, detail },
     };
     match deliver(id.clone(), text.clone()).await {
-        Ok(()) => DeliveryOutcome::Delivered,
+        Ok(()) => DeliveryOutcome::Delivered(echo),
         Err(BridgeFailure::RateLimited(wait)) if wait <= RATE_LIMIT_WAIT_CAP => {
             tokio::time::sleep(wait).await;
             match deliver(id.clone(), text).await {
-                Ok(()) => DeliveryOutcome::Delivered,
+                Ok(()) => DeliveryOutcome::Delivered(echo),
                 Err(failure) => failed(id, failure),
             }
         }
@@ -1376,7 +1413,7 @@ where
     }
 }
 
-/// Say what became of one delivery: nothing for a delivered message, and for
+/// Say what became of one delivery: its echo for a delivered message, and for
 /// a lost one a counted failure plus a `*bnc*` notice naming the target (and
 /// the limit, when it was a rate limit) — never a silent drop (DESIGN §2).
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
@@ -1387,7 +1424,11 @@ pub(crate) fn report_delivery(
     outcome: DeliveryOutcome,
 ) {
     match outcome {
-        DeliveryOutcome::Delivered => {}
+        DeliveryOutcome::Delivered(echo) => {
+            if let Some(PendingEcho { line, origin }) = echo {
+                ends.emit_echo(line, origin);
+            }
+        }
         DeliveryOutcome::Failed { id, detail } => {
             eprintln!("{platform}: send to {id} failed: {detail}");
             ends.record_error(NetworkFailure::UpstreamWriteFailed);
@@ -1401,12 +1442,13 @@ pub(crate) fn report_delivery(
     }
 }
 
-/// Deliver one already-routed batch of PRIVMSG targets and surface the outcome
-/// of **each** one to the attached client. `route_privmsg` yields one
-/// `RouteResult` per comma-separated target; this consumes the whole list, so a
-/// mapped target that fails to send and an unmapped target both produce their
-/// own `*bnc*` NOTICE — a multi-target line can't have all-but-one target's
-/// non-delivery silently dropped. That fold-N-outcomes-into-one silent drop
+/// Route one client command to its bridged targets, deliver each, and surface
+/// the outcome of **each** one to the attached client. `route_privmsg` yields
+/// one `RouteResult` per comma-separated target; this consumes the whole list,
+/// so a mapped target that fails to send and an unmapped target both produce
+/// their own `*bnc*` NOTICE — a multi-target line can't have all-but-one
+/// target's non-delivery silently dropped — and each delivered target gets its
+/// own echo, as `identity` says it. That fold-N-outcomes-into-one silent drop
 /// (DESIGN §2) is exactly what the Matrix bridge did before this was shared:
 /// every bridge now routes its per-target outcome through one definition that
 /// cannot collapse the list. `deliver` performs the platform's upstream send for
@@ -1418,7 +1460,9 @@ pub(crate) fn report_delivery(
 #[cfg(feature = "matrix")]
 pub(crate) async fn relay_routed<F, Fut>(
     ends: &DriverEnds,
-    routed: Vec<RouteResult>,
+    command: &ClientCommand,
+    targets: &std::collections::HashMap<String, String>,
+    identity: &irc_driver::SelfIdentity,
     platform: &str,
     kind: &str,
     mut deliver: F,
@@ -1426,10 +1470,11 @@ pub(crate) async fn relay_routed<F, Fut>(
     F: FnMut(String, BridgeText) -> Fut,
     Fut: std::future::Future<Output = Result<(), BridgeFailure>>,
 {
-    for routed in routed {
+    for routed in route_privmsg(&command.line, targets) {
         match routed {
-            RouteResult::Deliver(id, text) => {
-                let outcome = deliver_with_retry(&mut deliver, id, text).await;
+            RouteResult::Deliver { id, target, text } => {
+                let echo = PendingEcho::of(command, &target, identity);
+                let outcome = deliver_with_retry(&mut deliver, id, text, echo).await;
                 report_delivery(ends, platform, kind, outcome);
             }
             RouteResult::Unmapped(target) => {
@@ -1814,7 +1859,7 @@ pub(crate) async fn next_bridge_text(
 macro_rules! bridge_start {
     () => {
         fn start(self: Box<Self>) -> NetworkHandle {
-            let (handle, ends) = NetworkHandle::channels(self.config.buffer_cap);
+            let (handle, ends) = NetworkHandle::bridge_channels(self.config.buffer_cap);
             tokio::spawn(run(self.config, ends));
             handle
         }
@@ -2176,13 +2221,14 @@ pub(crate) async fn bridge_send_credentials(
 /// delivery on `queue` — never awaited here, so the socket keeps being read.
 /// `None` means every handle was dropped (or the network was shut down) and
 /// the session must stop. Discord and Slack differ only in how one message is
-/// sent, which is `deliver`; the loop reports each finished delivery with
-/// [`report_delivery`].
+/// sent, which is `deliver`; the loop reports each finished delivery — and
+/// emits its echo, as `identity` says it — with [`report_delivery`].
 #[cfg(any(feature = "discord", feature = "slack"))]
 pub(crate) fn queue_channel_command<F, Fut>(
     ends: &DriverEnds,
     command: Option<ClientCommand>,
     channel_to_id: &HashMap<String, String>,
+    identity: &irc_driver::SelfIdentity,
     platform: &str,
     queue: &mut DeliveryQueue,
     deliver: F,
@@ -2191,10 +2237,12 @@ where
     F: FnMut(String, BridgeText) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<(), BridgeFailure>> + Send + 'static,
 {
-    for routed in route_privmsg(&command?.line, channel_to_id) {
+    let command = command?;
+    for routed in route_privmsg(&command.line, channel_to_id) {
         match routed {
-            RouteResult::Deliver(id, text) => {
-                let work = deliver_with_retry(deliver.clone(), id.clone(), text);
+            RouteResult::Deliver { id, target, text } => {
+                let echo = PendingEcho::of(&command, &target, identity);
+                let work = deliver_with_retry(deliver.clone(), id.clone(), text, echo);
                 if queue.push(work).is_err() {
                     eprintln!(
                         "{platform}: {DELIVERY_QUEUE_CAPACITY} sends in flight; refused one to {id}"
@@ -2266,9 +2314,10 @@ pub struct AttachCaps {
     pub server_time: bool,
     pub message_tags: bool,
     pub account_tag: bool,
-    /// echo-message: the attaching client wants its own messages echoed back
-    /// (synthesized by the driver — the upstream is never asked for
-    /// echo-message, so there is exactly one echo, never two).
+    /// echo-message: the attaching client wants its own messages echoed back.
+    /// The driver emits exactly one echo per delivered line — the upstream's
+    /// own when it echoes, else one it synthesizes — and this decides only
+    /// whether the originator is sent it.
     pub echo_message: bool,
     /// batch: the client can receive BATCH-wrapped responses (CHATHISTORY).
     pub batch: bool,
@@ -2412,6 +2461,20 @@ impl DriverEvent {
             | Self::ReadMarker { .. } => None,
         }
     }
+}
+
+/// Who decides a network's nick and channel memberships, which decides what an
+/// attached client's `NICK` and `JOIN` mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAuthority {
+    /// An IRC server: `NICK`, `JOIN` and `PART` are relayed to it, and its
+    /// confirmations are the session.
+    Upstream,
+    /// A bridged provider account: the nick is the account's name and the
+    /// channels are the ones the bridge's configuration maps. Only the
+    /// provider (a rename) or the owner (a reconfiguration) changes either,
+    /// so the attach layer answers `NICK` and `JOIN` itself.
+    Provider,
 }
 
 /// Current identity and confirmed channel memberships of an IRC network.
@@ -2759,6 +2822,8 @@ pub struct NetworkHandle {
     /// Runtime state and per-network counters, shared with the driver endpoint.
     runtime: std::sync::Arc<NetworkRuntime>,
     irc_session: std::sync::Arc<std::sync::Mutex<IrcSessionState>>,
+    /// Who decides this network's nick and channels; see [`SessionAuthority`].
+    authority: SessionAuthority,
     /// PG-backed history context for CHATHISTORY/MARKREAD on the attach
     /// listener, set when the network is registered with a database.
     history: std::sync::Arc<std::sync::Mutex<Option<NetworkHistory>>>,
@@ -3573,7 +3638,7 @@ pub(crate) fn render_bridged(
     message: &Inbound,
 ) -> Vec<String> {
     use e6irc_proto::message::MAX_LINE_LEN;
-    let nick = crate::sanitize::nick_token(sender);
+    let who = bridged_identity(host, sender);
     let (command, open, close) = match message.kind {
         InboundKind::Message => ("PRIVMSG", "", ""),
         #[cfg(any(feature = "matrix", feature = "slack"))]
@@ -3581,7 +3646,10 @@ pub(crate) fn render_bridged(
         #[cfg(feature = "matrix")]
         InboundKind::Notice => ("NOTICE", "", ""),
     };
-    let prefix = format!(":{nick}!{nick}@{host} {command} {channel} :{open}");
+    let prefix = format!(
+        ":{}!{}@{} {command} {channel} :{open}",
+        who.nick, who.user, who.host
+    );
     // `nick_token` bounds the nick and `host` is one of three literals, so only
     // a pathologically long configured channel name can exhaust the line. The
     // floor keeps the split making progress if one ever does; the resulting
@@ -3617,12 +3685,33 @@ pub(crate) fn render_bridged(
     out
 }
 
+/// How a bridge shows a provider account on IRC: `nick!nick@<platform>`, the
+/// nick reduced to a safe token. Every relayed post is prefixed from it, and so
+/// is the echo of our own — the line the provider's copy of the post would have
+/// been — so the two can never disagree about who the bridge's account is.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) fn bridged_identity(host: &str, name: &str) -> irc_driver::SelfIdentity {
+    let nick = crate::sanitize::nick_token(name);
+    irc_driver::SelfIdentity {
+        user: nick.clone(),
+        nick,
+        host: host.to_string(),
+    }
+}
+
 /// A `*bnc*` NOTICE to `channel` saying a message from `sender` of a kind the
 /// bridge cannot show (`what`, the provider's own type name) was not relayed.
 /// `what` is upstream text: it is reduced to a bounded token of type-name
 /// characters, so it can carry neither controls nor a line's worth of bytes.
+/// A message too malformed to name its sender is said to be from an unknown
+/// one rather than dropped.
 #[cfg(any(feature = "matrix", feature = "slack"))]
-pub(crate) fn unrelayed_notice(platform: &str, channel: &str, what: &str, sender: &str) -> String {
+pub(crate) fn unrelayed_notice(
+    platform: &str,
+    channel: &str,
+    what: &str,
+    sender: Option<&str>,
+) -> String {
     let what: String = what
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
@@ -3633,7 +3722,10 @@ pub(crate) fn unrelayed_notice(platform: &str, channel: &str, what: &str, sender
     } else {
         what.as_str()
     };
-    let sender = crate::sanitize::nick_token(sender);
+    let sender = sender.map_or_else(
+        || "an unknown sender".to_string(),
+        crate::sanitize::nick_token,
+    );
     format!(":*bnc* NOTICE {channel} :{platform}: a {what} message from {sender} was not relayed")
 }
 
@@ -3747,9 +3839,10 @@ impl NetworkHandle {
         (events, replay, irc_session.snapshot())
     }
 
-    /// Authoritative IRC identity/membership state, when this driver represents
-    /// an IRC session. Bridge drivers that do not model an IRC identity return
-    /// `None` rather than inventing one.
+    /// Authoritative IRC identity/membership state, once the driver has begun
+    /// a session: an IRC upstream's welcome, or a bridge's connect under its
+    /// provider account (see [`DriverEnds::begin_bridge_session`]). `None`
+    /// before the first one.
     pub fn irc_session_snapshot(&self) -> Option<IrcSessionSnapshot> {
         self.irc_session
             .lock()
@@ -3877,6 +3970,25 @@ impl NetworkHandle {
     /// task that reads commands, records lines to the buffer, and
     /// broadcasts events through the returned [`DriverEnds`].
     pub fn channels(buffer_cap: usize) -> (NetworkHandle, DriverEnds) {
+        Self::channels_with(buffer_cap, SessionAuthority::Upstream)
+    }
+
+    /// [`NetworkHandle::channels`] for a bridge: the provider account owns
+    /// the session's nick and channels ([`SessionAuthority::Provider`]).
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    pub(crate) fn bridge_channels(buffer_cap: usize) -> (NetworkHandle, DriverEnds) {
+        Self::channels_with(buffer_cap, SessionAuthority::Provider)
+    }
+
+    /// Who decides this network's nick and channel memberships.
+    pub fn session_authority(&self) -> SessionAuthority {
+        self.authority
+    }
+
+    fn channels_with(
+        buffer_cap: usize,
+        authority: SessionAuthority,
+    ) -> (NetworkHandle, DriverEnds) {
         let (events, _) = tokio::sync::broadcast::channel(1024);
         // Bounded, not unbounded: the driver drains one command per loop
         // iteration, and during a reconnect wait (up to ~30s of backoff) it
@@ -3904,6 +4016,7 @@ impl NetworkHandle {
             buffer: buffer.clone(),
             runtime: runtime.clone(),
             irc_session: irc_session.clone(),
+            authority,
             telemetry: telemetry.clone(),
         };
         // A process-wide counter gives each driver a distinct, stable jitter
@@ -4090,6 +4203,58 @@ impl DriverEnds {
         let mut irc_session = self.irc_session.lock().expect("IRC session state poisoned");
         let snapshot = irc_session.begin(nick);
         drop(self.events.send(DriverEvent::Session(snapshot)));
+    }
+
+    /// Begin a bridge's session and report the bridge connected, in one step:
+    /// the session's nick is the provider account's, as `identity` (from
+    /// [`bridged_identity`]) names it, and its channels are the ones the
+    /// bridge maps. An attached client is welcomed under the session's nick
+    /// and the echo of what it sends names `identity`, so the two are the same
+    /// nick by construction — a client recognises its own echoes, and a
+    /// bridge cannot be connected with no session for them to match.
+    ///
+    /// A channel a client could not be told it is in, or more of them than
+    /// [`MAX_TRACKED_CHANNELS`], is a configuration the bridge cannot serve,
+    /// and nothing is begun.
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    pub(crate) fn begin_bridge_session<'a>(
+        &self,
+        identity: &irc_driver::SelfIdentity,
+        channels: impl IntoIterator<Item = &'a String>,
+    ) -> Result<(), SessionOutcome> {
+        let refused = |detail: &str| {
+            SessionOutcome::ConfigurationRejected(ConfigurationRefusal::new(
+                NetworkFailure::ChannelMappingFailed,
+                detail,
+            ))
+        };
+        let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
+        let mut bridged = std::collections::HashMap::new();
+        for channel in channels {
+            let Some(confirmed) = upstream_identity::ConfirmedChannel::parse(channel) else {
+                return Err(refused(&format!(
+                    "{channel} is not a channel name an IRC client can be joined to"
+                )));
+            };
+            bridged.insert(casemap.casefold(channel), confirmed);
+        }
+        if bridged.len() > MAX_TRACKED_CHANNELS {
+            return Err(refused(&format!(
+                "the bridge maps {} channels; at most {MAX_TRACKED_CHANNELS} are served",
+                bridged.len()
+            )));
+        }
+        {
+            let mut irc_session = self.irc_session.lock().expect("IRC session state poisoned");
+            irc_session.begin(identity.nick.clone());
+            irc_session.channels = bridged;
+            let snapshot = irc_session
+                .snapshot()
+                .expect("a begun IRC session has a nick");
+            drop(self.events.send(DriverEvent::Session(snapshot)));
+        }
+        self.emit(ConnectionEvent::Connected);
+        Ok(())
     }
 
     fn irc_session_snapshot(&self) -> Option<IrcSessionSnapshot> {
@@ -4622,6 +4787,9 @@ pub enum AttachEnd {
 /// closes. This is the session multiplexer's core operation, serving
 /// every driver kind (`irc`, `local`, and the bridges) uniformly.
 ///
+/// `input` is what the client already sent on `stream` that nothing handled
+/// (see [`ClientInput`]); it is handled first, after the replay, as the
+/// attached session's own input.
 /// `account` is the authenticated account, used to key the BNC-local
 /// per-target read markers (shared networks keep per-account positions).
 /// `liveness` is how long the client may stay silent before it is pinged, and
@@ -4629,6 +4797,7 @@ pub enum AttachEnd {
 /// production).
 pub async fn attach<S>(
     stream: S,
+    input: ClientInput,
     handle: &NetworkHandle,
     mut caps: AttachCaps,
     account: &str,
@@ -4638,7 +4807,6 @@ pub async fn attach<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    use e6irc_proto::framing::{LineBuffer, LineEvent};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (mut read, mut write) = tokio::io::split(stream);
@@ -4703,15 +4871,39 @@ where
             &mut write,
             &mut downstream_session,
             &snapshot,
-            handle,
-            caps,
-            account,
+            JoinAudience {
+                handle,
+                caps,
+                account,
+            },
         )
         .await?;
     }
     write.flush().await?;
 
-    let mut framing = LineBuffer::new(e6irc_proto::message::MAX_CLIENT_FRAME_LEN);
+    let attachment = Attachment {
+        handle,
+        account,
+        id: attach_id,
+        nick: downstream_nick,
+    };
+    let ClientInput {
+        mut framing,
+        pending,
+    } = input;
+    for event in pending {
+        if let Some(end) = client_event(
+            &mut write,
+            event,
+            &attachment,
+            &mut caps,
+            &downstream_session,
+        )
+        .await?
+        {
+            return Ok(end);
+        }
+    }
     let mut read_buf = vec![0u8; 8192];
     let mut parsed = Vec::new();
     // Anything the client sends shows it is there; only its silence is timed,
@@ -4758,9 +4950,11 @@ where
                         &mut write,
                         &mut downstream_session,
                         &snapshot,
-                        handle,
-                        caps,
-                        account,
+                        JoinAudience {
+                            handle,
+                            caps,
+                            account,
+                        },
                     )
                     .await?;
                     write.flush().await?;
@@ -4819,168 +5013,8 @@ where
                     client_silence.restart();
                     framing.feed(&read_buf[..n], &mut parsed);
                     for event in parsed.drain(..) {
-                        match event {
-                            LineEvent::Line(line) => match String::from_utf8(line) {
-                                Ok(text) => {
-                                    let msg = match parse_client_line(&text) {
-                                        Ok(msg) => msg,
-                                        Err(error) => {
-                                            write_client_line_error(&mut write, error).await?;
-                                            continue;
-                                        }
-                                    };
-                                    // Attach-local protocol state must never be
-                                    // forwarded onto the account's shared
-                                    // upstream connection. CAP mutates only
-                                    // this downstream's view; SASL is already
-                                    // complete; history and markers belong to
-                                    // the BNC store; liveness and QUIT concern
-                                    // this one downstream transport, while the
-                                    // upstream session outlives every client.
-                                    let mut handled = true;
-                                    let cmd = msg.command.to_ascii_uppercase();
-                                    let params: Vec<&str> = msg.params.to_vec();
-                                    match cmd.as_str() {
-                                        "PING" => match params.first() {
-                                            Some(token) => {
-                                                write
-                                                    .write_all(attach_pong(token).as_bytes())
-                                                    .await?;
-                                                write.flush().await?;
-                                            }
-                                            None => {
-                                                write_attach_numeric(
-                                                    &mut write,
-                                                    downstream_nick,
-                                                    409,
-                                                    None,
-                                                    "No origin specified",
-                                                )
-                                                .await?;
-                                            }
-                                        },
-                                        // A reply, never a request: it answers
-                                        // nothing the upstream asked this client.
-                                        "PONG" => {}
-                                        "QUIT" => {
-                                            write.write_all(ATTACH_QUIT_REPLY).await?;
-                                            write.flush().await?;
-                                            return Ok(AttachEnd::ClientQuit);
-                                        }
-                                        "CAP" => {
-                                            let target = downstream_session
-                                                .snapshot()
-                                                .map(|session| session.nick)
-                                                .unwrap_or_else(|| downstream_nick.to_string());
-                                            let mut cap_open = false;
-                                            serve::handle_cap(
-                                                &mut write,
-                                                "*bnc*",
-                                                &target,
-                                                &msg,
-                                                true,
-                                                &mut cap_open,
-                                                &mut caps,
-                                            )
-                                            .await?;
-                                        }
-                                        "AUTHENTICATE" => {
-                                            write_attach_numeric(
-                                                &mut write,
-                                                downstream_nick,
-                                                907,
-                                                None,
-                                                "You have already authenticated",
-                                            )
-                                            .await?;
-                                        }
-                                        "CHATHISTORY" if caps.chathistory => {
-                                            chathistory::handle_chathistory(
-                                                handle, &mut write, caps, &params,
-                                            )
-                                            .await?;
-                                        }
-                                        "CHATHISTORY" => {
-                                            write
-                                                .write_all(
-                                                    b":*bnc* FAIL CHATHISTORY NEED_CAPS :draft/chathistory required\r\n",
-                                                )
-                                                .await?;
-                                            write.flush().await?;
-                                        }
-                                        "MARKREAD" if caps.read_marker => {
-                                            chathistory::handle_markread(
-                                                handle, &mut write, account, attach_id, &params,
-                                            )
-                                            .await?;
-                                        }
-                                        "MARKREAD" => {
-                                            write_attach_numeric(
-                                                &mut write,
-                                                downstream_nick,
-                                                421,
-                                                Some("MARKREAD"),
-                                                "Unknown command",
-                                            )
-                                            .await?;
-                                        }
-                                        _ => handled = false,
-                                    }
-                                    if !handled {
-                                        match handle.send_from(attach_id, &text) {
-                                            SendOutcome::Sent => {}
-                                            // Full: the upstream is congested/reconnecting.
-                                            // Drop this line loudly rather than block —
-                                            // blocking here would stall every other client
-                                            // sharing this network's queue. Never silent.
-                                            SendOutcome::Full => {
-                                                write
-                                                    .write_all(
-                                                        b":*bnc* NOTICE * :upstream busy; line not sent, try again\r\n",
-                                                    )
-                                                    .await?;
-                                                write.flush().await?;
-                                            }
-                                            SendOutcome::Closed => {
-                                                return Ok(AttachEnd::DriverStopped);
-                                            }
-                                            SendOutcome::Unavailable => {
-                                                write
-                                                    .write_all(
-                                                        b":*bnc* NOTICE * :upstream registration is parked; reconfigure the network before sending\r\n",
-                                                    )
-                                                    .await?;
-                                                write.flush().await?;
-                                            }
-                                            SendOutcome::Rejected(error) => {
-                                                // The attach path validates before handling
-                                                // local commands. Keep the shared queue
-                                                // boundary authoritative as well, so future
-                                                // callers cannot bypass the same contract.
-                                                write_client_line_error(&mut write, error).await?;
-                                            }
-                                        }
-                                    }
-                                }
-                                // This relay is UTF-8, like the core ingest
-                                // path; reject a non-UTF-8 line loudly rather
-                                // than swallowing it.
-                                Err(_) => {
-                                    write
-                                        .write_all(
-                                            b":*bnc* NOTICE * :input was not valid UTF-8; not sent upstream\r\n",
-                                        )
-                                        .await?;
-                                    write.flush().await?;
-                                }
-                            },
-                            // The framing contract forbids silently dropping an
-                            // over-long line; tell the client its line was not
-                            // relayed rather than swallowing it.
-                            LineEvent::TooLong => {
-                                write_client_line_error(&mut write, ClientLineError::TooLong)
-                                    .await?;
-                            }
+                        if let Some(end) = client_event(&mut write, event, &attachment, &mut caps, &downstream_session).await? {
+                            return Ok(end);
                         }
                     }
                 }
@@ -4988,6 +5022,314 @@ where
             },
         }
     }
+}
+
+/// What a client sent on its stream before [`attach`] took it that nothing
+/// has handled yet: the lines already framed, and the start of one still
+/// arriving. The attach listener's registration handshake frames the same
+/// stream first, and a client need not wait for the welcome before sending —
+/// the lines that arrived in the same read as its `CAP END`, and half of the
+/// next, belong to the attached session. A fresh stream has none.
+pub struct ClientInput {
+    framing: e6irc_proto::framing::LineBuffer,
+    pending: Vec<e6irc_proto::framing::LineEvent>,
+}
+
+impl Default for ClientInput {
+    fn default() -> Self {
+        Self {
+            framing: e6irc_proto::framing::LineBuffer::new(
+                e6irc_proto::message::MAX_CLIENT_FRAME_LEN,
+            ),
+            pending: Vec::new(),
+        }
+    }
+}
+
+/// Who an attachment is, for [`client_event`]: the network it is attached to,
+/// the account it authenticated as, its id among the network's attachments,
+/// and the nick it was welcomed under.
+struct Attachment<'a> {
+    handle: &'a NetworkHandle,
+    account: &'a str,
+    id: u64,
+    nick: &'a str,
+}
+
+/// Handle one framed line from an attached client: answer what belongs to the
+/// attachment itself, and send the rest to the network. `Some` ends the
+/// attachment.
+async fn client_event<W>(
+    write: &mut W,
+    event: e6irc_proto::framing::LineEvent,
+    attachment: &Attachment<'_>,
+    caps: &mut AttachCaps,
+    downstream_session: &IrcSessionState,
+) -> std::io::Result<Option<AttachEnd>>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use e6irc_proto::framing::LineEvent;
+    use tokio::io::AsyncWriteExt;
+
+    match event {
+        LineEvent::Line(line) => match String::from_utf8(line) {
+            Ok(text) => {
+                let msg = match parse_client_line(&text) {
+                    Ok(msg) => msg,
+                    Err(error) => {
+                        write_client_line_error(write, error).await?;
+                        return Ok(None);
+                    }
+                };
+                // Attach-local protocol state must never be
+                // forwarded onto the account's shared
+                // upstream connection. CAP mutates only
+                // this downstream's view; SASL is already
+                // complete; history and markers belong to
+                // the BNC store; liveness and QUIT concern
+                // this one downstream transport, while the
+                // upstream session outlives every client.
+                let mut handled = true;
+                let cmd = msg.command.to_ascii_uppercase();
+                let params: Vec<&str> = msg.params.to_vec();
+                match cmd.as_str() {
+                    "PING" => match params.first() {
+                        Some(token) => {
+                            write.write_all(attach_pong(token).as_bytes()).await?;
+                            write.flush().await?;
+                        }
+                        None => {
+                            write_attach_numeric(
+                                write,
+                                attachment.nick,
+                                409,
+                                None,
+                                "No origin specified",
+                            )
+                            .await?;
+                        }
+                    },
+                    // A reply, never a request: it answers
+                    // nothing the upstream asked this client.
+                    "PONG" => {}
+                    "QUIT" => {
+                        write.write_all(ATTACH_QUIT_REPLY).await?;
+                        write.flush().await?;
+                        return Ok(Some(AttachEnd::ClientQuit));
+                    }
+                    "CAP" => {
+                        let target = downstream_session
+                            .snapshot()
+                            .map(|session| session.nick)
+                            .unwrap_or_else(|| attachment.nick.to_string());
+                        let mut cap_open = false;
+                        serve::handle_cap(write, "*bnc*", &target, &msg, true, &mut cap_open, caps)
+                            .await?;
+                    }
+                    "AUTHENTICATE" => {
+                        write_attach_numeric(
+                            write,
+                            attachment.nick,
+                            907,
+                            None,
+                            "You have already authenticated",
+                        )
+                        .await?;
+                    }
+                    "CHATHISTORY" if caps.chathistory => {
+                        chathistory::handle_chathistory(attachment.handle, write, *caps, &params)
+                            .await?;
+                    }
+                    "CHATHISTORY" => {
+                        write
+                            .write_all(
+                                b":*bnc* FAIL CHATHISTORY NEED_CAPS :draft/chathistory required\r\n",
+                            )
+                            .await?;
+                        write.flush().await?;
+                    }
+                    "MARKREAD" if caps.read_marker => {
+                        chathistory::handle_markread(
+                            attachment.handle,
+                            write,
+                            attachment.account,
+                            attachment.id,
+                            &params,
+                        )
+                        .await?;
+                    }
+                    "MARKREAD" => {
+                        write_attach_numeric(
+                            write,
+                            attachment.nick,
+                            421,
+                            Some("MARKREAD"),
+                            "Unknown command",
+                        )
+                        .await?;
+                    }
+                    "NICK" | "JOIN"
+                        if attachment.handle.session_authority() == SessionAuthority::Provider =>
+                    {
+                        answer_provider_session_command(
+                            write,
+                            &cmd,
+                            &params,
+                            attachment,
+                            *caps,
+                            downstream_session,
+                        )
+                        .await?;
+                    }
+                    _ => handled = false,
+                }
+                if !handled {
+                    match attachment.handle.send_from(attachment.id, &text) {
+                        SendOutcome::Sent => {}
+                        // Full: the upstream is congested/reconnecting.
+                        // Drop this line loudly rather than block —
+                        // blocking here would stall every other client
+                        // sharing this network's queue. Never silent.
+                        SendOutcome::Full => {
+                            write
+                                .write_all(
+                                    b":*bnc* NOTICE * :upstream busy; line not sent, try again\r\n",
+                                )
+                                .await?;
+                            write.flush().await?;
+                        }
+                        SendOutcome::Closed => {
+                            return Ok(Some(AttachEnd::DriverStopped));
+                        }
+                        SendOutcome::Unavailable => {
+                            write
+                                .write_all(
+                                    b":*bnc* NOTICE * :upstream registration is parked; reconfigure the network before sending\r\n",
+                                )
+                                .await?;
+                            write.flush().await?;
+                        }
+                        SendOutcome::Rejected(error) => {
+                            // The attach path validates before handling
+                            // local commands. Keep the shared queue
+                            // boundary authoritative as well, so future
+                            // callers cannot bypass the same contract.
+                            write_client_line_error(write, error).await?;
+                        }
+                    }
+                }
+            }
+            // This relay is UTF-8, like the core ingest
+            // path; reject a non-UTF-8 line loudly rather
+            // than swallowing it.
+            Err(_) => {
+                write
+                    .write_all(b":*bnc* NOTICE * :input was not valid UTF-8; not sent upstream\r\n")
+                    .await?;
+                write.flush().await?;
+            }
+        },
+        // The framing contract forbids silently dropping an
+        // over-long line; tell the client its line was not
+        // relayed rather than swallowing it.
+        LineEvent::TooLong => {
+            write_client_line_error(write, ClientLineError::TooLong).await?;
+        }
+    }
+    Ok(None)
+}
+
+/// Answer a `NICK` or `JOIN` on a network whose session a provider account
+/// owns ([`SessionAuthority::Provider`]) as a server answers its own client.
+/// Neither can change that session — the nick is the account's name and the
+/// channels are the bridge's configuration — so neither is sent to the bridge:
+///
+/// - `NICK` to the nick the client already has is answered with nothing, as a
+///   server does; any other nick is refused with `447` (the numeric servers
+///   use for "you may not change your nick here"), to this client alone.
+/// - `JOIN` of a bridged channel re-states the membership to this client
+///   (`JOIN`, and the member list ending in `366`), which is what a client
+///   that joins before it speaks — `e6irc send` — waits for. Any other
+///   channel is `403`; while the bridge has not connected yet its channels
+///   are not known, and every channel is `437` (temporarily unavailable).
+async fn answer_provider_session_command<W>(
+    write: &mut W,
+    command: &str,
+    params: &[&str],
+    attachment: &Attachment<'_>,
+    caps: AttachCaps,
+    downstream: &IrcSessionState,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
+    let current = downstream
+        .snapshot()
+        .expect("downstream IRC state is initialized before a client line is handled");
+    let nick = current.nick.as_str();
+    let Some(&first) = params.first().filter(|first| !first.is_empty()) else {
+        return match command {
+            "NICK" => write_attach_numeric(write, nick, 431, None, "No nickname given").await,
+            _ => {
+                write_attach_numeric(write, nick, 461, Some(command), "Not enough parameters").await
+            }
+        };
+    };
+    if command == "NICK" {
+        if casemap.eq(first, nick) {
+            return Ok(());
+        }
+        return write_attach_numeric(
+            write,
+            nick,
+            447,
+            None,
+            "Cannot change nickname: on a bridge the nick is the provider account's name, \
+             which only the provider changes",
+        )
+        .await;
+    }
+    let connected = attachment.handle.irc_session_snapshot().is_some();
+    for channel in first.split(',').filter(|channel| !channel.is_empty()) {
+        let shown = e6irc_proto::message::truncate_on_char_boundary(
+            channel,
+            upstream_identity::ConfirmedChannel::MAX_BYTES,
+        );
+        match downstream.channels.get(&casemap.casefold(channel)) {
+            Some(bridged) => {
+                let audience = JoinAudience {
+                    handle: attachment.handle,
+                    caps,
+                    account: attachment.account,
+                };
+                write_joined(write, nick, bridged.as_str(), audience).await?;
+            }
+            None if !connected => {
+                write_attach_numeric(
+                    write,
+                    nick,
+                    437,
+                    Some(shown),
+                    "The bridge has not connected yet; it is in its channels once it has",
+                )
+                .await?;
+            }
+            None => {
+                write_attach_numeric(
+                    write,
+                    nick,
+                    403,
+                    Some(shown),
+                    "No such channel: this bridge relays only the channels its configuration maps",
+                )
+                .await?;
+            }
+        }
+    }
+    write.flush().await
 }
 
 /// The bouncer's own liveness check of an attached client. Its `PONG` is
@@ -5062,13 +5404,20 @@ pub mod fuzz {
     }
 }
 
+/// Whom a synthesized JOIN is written for: the network, what the client
+/// negotiated, and the account whose read markers it carries.
+#[derive(Clone, Copy)]
+struct JoinAudience<'a> {
+    handle: &'a NetworkHandle,
+    caps: AttachCaps,
+    account: &'a str,
+}
+
 async fn write_irc_session_snapshot<W>(
     write: &mut W,
     downstream: &mut IrcSessionState,
     snapshot: &IrcSessionSnapshot,
-    handle: &NetworkHandle,
-    caps: AttachCaps,
-    account: &str,
+    audience: JoinAudience<'_>,
 ) -> std::io::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -5104,78 +5453,87 @@ where
     }
     for channel in &snapshot.channels {
         if !downstream.channels.contains_key(&casemap.casefold(channel)) {
-            write
-                .write_all(format!(":{}!~bnc@e6irc JOIN {channel}\r\n", snapshot.nick).as_bytes())
-                .await?;
             // This JOIN is synthesized because the real one aged out of the
-            // bounded replay. Complete the same registration shape a server
-            // sends for a real JOIN: optional MARKREAD before end-of-NAMES,
-            // then a minimal authoritative member list containing ourselves.
-            if caps.read_marker {
-                match handle.history() {
-                    Some(history) => match crate::db::get_bnc_read_marker(
-                        &history.pool,
-                        account,
-                        &history.network,
-                        channel,
-                    )
-                    .await
-                    {
-                        Ok(Some(timestamp)) => {
-                            write
-                                .write_all(
-                                    format!(":*bnc* MARKREAD {channel} timestamp={timestamp}\r\n")
-                                        .as_bytes(),
-                                )
-                                .await?;
-                        }
-                        Ok(None) => {
-                            write
-                                .write_all(format!(":*bnc* MARKREAD {channel} *\r\n").as_bytes())
-                                .await?;
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "bnc: read marker query failed for {account}/{}/{channel}: {error}",
-                                history.network
-                            );
-                            write
-                                .write_all(
-                                    b":*bnc* FAIL MARKREAD TEMPORARY_FAILURE :read markers unavailable\r\n",
-                                )
-                                .await?;
-                        }
-                    },
-                    None => {
-                        write
-                            .write_all(
-                                b":*bnc* FAIL MARKREAD UNAVAILABLE :read markers are not configured\r\n",
-                            )
-                            .await?;
-                    }
-                }
-            }
-            write
-                .write_all(
-                    format!(
-                        ":*bnc* 353 {} = {channel} :{}\r\n",
-                        snapshot.nick, snapshot.nick
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-            write
-                .write_all(
-                    format!(
-                        ":*bnc* 366 {} {channel} :End of /NAMES list\r\n",
-                        snapshot.nick
-                    )
-                    .as_bytes(),
-                )
-                .await?;
+            // bounded replay (or, on a bridge, there never was one).
+            write_joined(write, &snapshot.nick, channel, audience).await?;
         }
     }
     downstream.replace(snapshot);
+    Ok(())
+}
+
+/// Tell one client it is in `channel` as `nick`, in the shape a server
+/// answers a JOIN with: the JOIN, the channel's read marker when the client
+/// asked for read markers, and a minimal member list naming itself.
+async fn write_joined<W>(
+    write: &mut W,
+    nick: &str,
+    channel: &str,
+    audience: JoinAudience<'_>,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    let JoinAudience {
+        handle,
+        caps,
+        account,
+    } = audience;
+
+    write
+        .write_all(format!(":{nick}!~bnc@e6irc JOIN {channel}\r\n").as_bytes())
+        .await?;
+    if caps.read_marker {
+        match handle.history() {
+            Some(history) => match crate::db::get_bnc_read_marker(
+                &history.pool,
+                account,
+                &history.network,
+                channel,
+            )
+            .await
+            {
+                Ok(Some(timestamp)) => {
+                    write
+                        .write_all(
+                            format!(":*bnc* MARKREAD {channel} timestamp={timestamp}\r\n")
+                                .as_bytes(),
+                        )
+                        .await?;
+                }
+                Ok(None) => {
+                    write
+                        .write_all(format!(":*bnc* MARKREAD {channel} *\r\n").as_bytes())
+                        .await?;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "bnc: read marker query failed for {account}/{}/{channel}: {error}",
+                        history.network
+                    );
+                    write
+                        .write_all(
+                            b":*bnc* FAIL MARKREAD TEMPORARY_FAILURE :read markers unavailable\r\n",
+                        )
+                        .await?;
+                }
+            },
+            None => {
+                write
+                    .write_all(
+                        b":*bnc* FAIL MARKREAD UNAVAILABLE :read markers are not configured\r\n",
+                    )
+                    .await?;
+            }
+        }
+    }
+    write
+        .write_all(format!(":*bnc* 353 {nick} = {channel} :{nick}\r\n").as_bytes())
+        .await?;
+    write
+        .write_all(format!(":*bnc* 366 {nick} {channel} :End of /NAMES list\r\n").as_bytes())
+        .await?;
     Ok(())
 }
 
@@ -5840,6 +6198,7 @@ mod tests {
             std::time::Duration::from_secs(5),
             attach(
                 server_side,
+                ClientInput::default(),
                 &handle,
                 AttachCaps::default(),
                 "testuser",
@@ -6357,6 +6716,60 @@ mod tests {
         }
     }
 
+    /// A bridge's session is its account's nick in its mapped channels, begun
+    /// before it is reported connected; a channel no client could be joined to
+    /// refuses the configuration and begins nothing.
+    #[test]
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    fn a_bridge_session_is_the_account_in_its_channels_or_nothing() {
+        let (handle, ends) = NetworkHandle::bridge_channels(4);
+        let mut events = handle.subscribe();
+        let identity = bridged_identity("test", "my bot");
+        let refused = ends.begin_bridge_session(
+            &identity,
+            [&"#ok".to_string(), &"no spaces allowed".to_string()],
+        );
+        match refused {
+            Err(SessionOutcome::ConfigurationRejected(refusal)) => {
+                assert_eq!(refusal.failure(), NetworkFailure::ChannelMappingFailed);
+                assert!(
+                    refusal.diagnostic().contains("no spaces allowed"),
+                    "{refusal:?}"
+                );
+            }
+            Err(_) => panic!("an untrackable channel was refused as something else"),
+            Ok(()) => panic!("an untrackable channel was served"),
+        }
+        assert_eq!(handle.irc_session_snapshot(), None);
+        assert!(
+            events.try_recv().is_err(),
+            "a refused session announced something"
+        );
+
+        assert!(
+            ends.begin_bridge_session(&identity, [&"#Ok".to_string(), &"#two".to_string()])
+                .is_ok(),
+            "a servable configuration was refused"
+        );
+        let session = IrcSessionSnapshot {
+            nick: "my_bot".to_string(),
+            channels: vec!["#Ok".to_string(), "#two".to_string()],
+        };
+        assert_eq!(
+            events.try_recv().ok(),
+            Some(DriverEvent::Session(session.clone()))
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Ok(DriverEvent::Status {
+                status: DriverConnectionStatus::Connected,
+                ..
+            })
+        ));
+        assert_eq!(handle.irc_session_snapshot(), Some(session));
+        assert_eq!(handle.session_authority(), SessionAuthority::Provider);
+    }
+
     #[tokio::test]
     #[cfg(feature = "matrix")]
     async fn relay_routed_surfaces_every_target_outcome() {
@@ -6365,18 +6778,45 @@ mod tests {
         map.insert("#a".to_string(), "id_a".to_string());
         map.insert("#b".to_string(), "id_b".to_string());
         // #c is deliberately absent from the map (unmapped).
-        let routed = route_privmsg("PRIVMSG #a,#b,#c :hi", &map);
-        relay_routed(&ends, routed, "Test", "channel", |id, _text| {
-            let failed = id == "id_b"; // #b's upstream send fails; #a succeeds.
-            async move {
-                if failed {
-                    Err(BridgeFailure::Failed("boom".to_string()))
-                } else {
-                    Ok(())
+        let command = ClientCommand {
+            origin: 9,
+            line: "PRIVMSG #a,#b,#c :hi".to_string(),
+        };
+        let identity = bridged_identity("test", "me");
+        let mut events = handle.subscribe();
+        relay_routed(
+            &ends,
+            &command,
+            &map,
+            &identity,
+            "Test",
+            "channel",
+            |id, _text| {
+                let failed = id == "id_b"; // #b's upstream send fails; #a succeeds.
+                async move {
+                    if failed {
+                        Err(BridgeFailure::Failed("boom".to_string()))
+                    } else {
+                        Ok(())
+                    }
                 }
-            }
-        })
+            },
+        )
         .await;
+        // Only the delivered target is echoed, to the attachment that sent it.
+        let mut echoes = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let DriverEvent::Echo { line, origin } = event {
+                echoes.push((line.line, origin));
+            }
+        }
+        assert_eq!(echoes.len(), 1, "{echoes:?}");
+        assert_eq!(echoes[0].1, 9);
+        assert!(
+            echoes[0].0.ends_with(" :me!me@test PRIVMSG #a :hi"),
+            "{}",
+            echoes[0].0
+        );
         let runtime = handle.runtime_snapshot();
         assert_eq!(runtime.errors, 1, "{runtime:?}");
         assert!(runtime.last_error_at.is_some(), "{runtime:?}");
@@ -6417,10 +6857,19 @@ mod tests {
             "the component diagnostic is retained: {lines:#?}"
         );
 
-        let routed = route_privmsg("JOIN #a", &map);
-        relay_routed(&ends, routed, "Test", "channel", |_id, _text| async {
-            Ok(())
-        })
+        let command = ClientCommand {
+            origin: 9,
+            line: "JOIN #a".to_string(),
+        };
+        relay_routed(
+            &ends,
+            &command,
+            &map,
+            &identity,
+            "Test",
+            "channel",
+            |_id, _text| async { Ok(()) },
+        )
         .await;
         assert!(
             handle
@@ -6591,7 +7040,7 @@ mod tests {
             "matrix",
             "#c",
             "m.\u{1}evil type ".repeat(40).as_str(),
-            "bob",
+            Some("bob"),
         );
         assert!(
             notice.starts_with(":*bnc* NOTICE #c :matrix: a m.eviltypem.eviltype"),
@@ -7028,6 +7477,61 @@ mod tests {
         assert_eq!(mirror.channels.len(), MAX_TRACKED_CHANNELS);
     }
 
+    /// Before a bridge has connected it has no channels to be in: a JOIN is
+    /// temporarily unavailable, not relayed to a driver that can only refuse
+    /// it, and a NICK is refused as it is once connected.
+    #[tokio::test]
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    async fn a_bridge_answers_join_and_nick_itself_before_it_connects() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (client, server) = tokio::io::duplex(4096);
+        let (handle, mut ends) = NetworkHandle::bridge_channels(4);
+        let attach = tokio::spawn(async move {
+            attach(
+                server,
+                ClientInput::default(),
+                &handle,
+                AttachCaps::default(),
+                "alice",
+                "alice",
+                ATTACH_LIVENESS_INTERVAL,
+            )
+            .await
+        });
+        let (read, mut write) = tokio::io::split(client);
+        write
+            .write_all(b"NICK alice\r\nNICK bob\r\nJOIN #general\r\nJOIN\r\n")
+            .await
+            .expect("send");
+        let mut lines = tokio::io::BufReader::new(read).lines();
+        let mut replies = Vec::new();
+        while replies.len() < 3 {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(1), lines.next_line())
+                .await
+                .expect("attach went silent")
+                .expect("attach read")
+                .expect("attach closed");
+            if !line.starts_with(":*bnc* NOTICE") {
+                replies.push(line);
+            }
+        }
+        assert!(replies[0].starts_with(":*bnc* 447 alice :"), "{replies:?}");
+        assert!(
+            replies[1].starts_with(":*bnc* 437 alice #general :"),
+            "{replies:?}"
+        );
+        assert_eq!(replies[2], ":*bnc* 461 alice JOIN :Not enough parameters");
+        // Nothing reached the driver.
+        assert!(
+            ends.commands.try_recv().is_err(),
+            "a session command was relayed to the bridge"
+        );
+        drop(write);
+        drop(lines);
+        attach.await.expect("attach task").expect("attach result");
+    }
+
     #[tokio::test]
     async fn raw_attach_snapshot_renames_and_rejoins_the_downstream_client() {
         use tokio::io::AsyncReadExt;
@@ -7040,6 +7544,7 @@ mod tests {
         let attach = tokio::spawn(async move {
             attach(
                 server,
+                ClientInput::default(),
                 &handle,
                 AttachCaps::default(),
                 "alice",
@@ -7098,6 +7603,7 @@ mod tests {
         let attach = tokio::spawn(async move {
             attach(
                 server,
+                ClientInput::default(),
                 &handle,
                 AttachCaps::default(),
                 "alice",

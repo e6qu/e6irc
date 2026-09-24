@@ -257,6 +257,28 @@ export function kickPairs(channelsValue, targetsValue) {
   return [];
 }
 
+// The channel buffer already open for `name`, or null. A topic or NAMES reply
+// describes a channel; it is not a reason to open one. `/topic #elsewhere`,
+// `/names #elsewhere` and the `*` of a NAMES reply for no channel would
+// otherwise each leave a conversation in the list the person never joined.
+// (The line itself is still shown: every line reaches the console.)
+export function existingChannelBuffer(buffers, name) {
+  if (typeof name !== "string") return null;
+  const buffer = buffers.get(fold(name));
+  return buffer?.kind === "channel" ? buffer : null;
+}
+
+// Empty a buffer's transcript so the server's full replay can refill it. The
+// persisted history loaded into it went with the lines, so "Load earlier" is
+// offered again rather than hidden for the rest of the page's life.
+export function clearTranscript(buffer) {
+  buffer.lines.length = 0;
+  buffer.unread = 0;
+  buffer.mentions = 0;
+  buffer.pendingVisibleMessages = 0;
+  buffer.historyLoaded = false;
+}
+
 export function topicReply(params) {
   if (
     !Array.isArray(params)
@@ -326,6 +348,25 @@ export function mergeTimeline(history, live, limit) {
   }
   prependReversed.reverse();
   return [...prependReversed, ...live].slice(-limit);
+}
+
+// What a buffer's action button does: "leave" a joined channel, "close" a
+// past channel or a conversation, or nothing (null) for the console. A
+// bridge's channels are its configuration -- the provider account, not the
+// person, is in them (`membershipIsIrc` false) -- so a joined bridge channel
+// has nothing to leave, and a PART would only be refused.
+export function bufferAction(buffer, membershipIsIrc) {
+  if (!buffer || buffer.kind === "server") return null;
+  if (buffer.kind === "channel" && buffer.joined) return membershipIsIrc ? "leave" : null;
+  return "close";
+}
+
+// The nick a network's stored configuration gives before the server names
+// one. A bridge stores none (an empty string); an empty nick is no nick, or
+// every line with a leading or trailing non-nick character would read as a
+// mention of it.
+export function seededNick(configured) {
+  return typeof configured === "string" && configured.length > 0 ? configured : null;
 }
 
 // Reconcile channel buffers against an authoritative BNC session snapshot.

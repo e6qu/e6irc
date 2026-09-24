@@ -38,6 +38,6 @@ echo "dead-code guard: building production artifacts only (cfg(test) off) ..."
 # mask dead code. RUSTFLAGS carries -D warnings so dead_code becomes an error.
 # Clippy is used (not plain check) so its unused-code lints apply too.
 RUSTFLAGS="${RUSTFLAGS:-} -D warnings" \
-	cargo clippy --workspace --all-features --lib --bins --quiet
+	cargo clippy --locked --workspace --all-features --lib --bins --quiet
 
 echo "dead-code guard: clean (no code kept alive only by tests)"

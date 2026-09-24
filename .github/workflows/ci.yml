@@ -73,7 +73,7 @@ jobs:
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web test && pnpm -C web build
       - run: cargo fmt --all --check
       - run: rustfmt --edition 2024 --check crates/e6irc-qualification/tests/support/native.rs
-      - run: cargo clippy --workspace --all-targets --all-features
+      - run: cargo clippy --locked --workspace --all-targets --all-features
       # `--all-features` is the union, so it never compiles a bridge on its
       # own. Code behind `cfg(feature = "discord")` that happens to depend on
       # something `matrix` pulls in builds there and breaks for the deployment
@@ -83,7 +83,7 @@ jobs:
         # (not in the --all-features union above) would otherwise ship unseen.
         run: |
           for feature in discord matrix slack; do
-            cargo clippy -p e6ircd --all-targets --features "$feature"
+            cargo clippy --locked -p e6ircd --all-targets --features "$feature"
           done
       # No-op guard (AGENTS.md / DESIGN §2): shipped source must carry no
       # deferred-work markers or unmessaged panics.
@@ -156,7 +156,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # --all-features includes embed-web, which embeds web/dist.
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
-      - run: cargo test --workspace --all-features --target ${{ matrix.target }}
+      - run: cargo test --locked --workspace --all-features --target ${{ matrix.target }}
 
   # Coverage is a ratchet, not a claim that one percentage proves the product.
   # Combine the portable all-feature suite with the real PostgreSQL database
@@ -191,9 +191,9 @@ jobs:
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
         run: |
-          cargo llvm-cov --workspace --all-features --no-report
-          cargo llvm-cov --no-clean -p e6ircd --all-features --test db -- --ignored --test-threads=1
-          cargo llvm-cov --no-clean -p e6ircd --all-features --test http -- --ignored --test-threads=1
+          cargo llvm-cov --locked --workspace --all-features --no-report
+          cargo llvm-cov --locked --no-clean -p e6ircd --all-features --test db -- --ignored --test-threads=1
+          cargo llvm-cov --locked --no-clean -p e6ircd --all-features --test http -- --ignored --test-threads=1
       - name: Enforce production-line coverage ratchet
         run: cargo llvm-cov report --summary-only --fail-under-lines 80
 
@@ -222,16 +222,16 @@ jobs:
       # Each Rust test owns a database created through this administrative URL.
       # Serial binaries keep the service load predictable; the browser may
       # intentionally persist managed state, so the later CLI suite is isolated.
-      - run: cargo test -p e6ircd --test db -- --ignored --test-threads=1
+      - run: cargo test --locked -p e6ircd --test db -- --ignored --test-threads=1
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
-      - run: cargo test -p e6ircd --test bouncer -- --ignored --test-threads=1
+      - run: cargo test --locked -p e6ircd --test bouncer -- --ignored --test-threads=1
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
-      - run: cargo test -p e6ircd --test ws_ui -- --ignored --test-threads=1
+      - run: cargo test --locked -p e6ircd --test ws_ui -- --ignored --test-threads=1
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
-      - run: cargo test -p e6ircd --test ws_scope -- --ignored --test-threads=1
+      - run: cargo test --locked -p e6ircd --test ws_scope -- --ignored --test-threads=1
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
       - name: Start dex (mock connector)
@@ -244,7 +244,7 @@ jobs:
             [ "$i" = 30 ] && { echo "dex did not become ready"; docker logs dex; exit 1; }
             sleep 1
           done
-      - run: cargo test -p e6ircd --test oidc -- --ignored --test-threads=1
+      - run: cargo test --locked -p e6ircd --test oidc -- --ignored --test-threads=1
         # covers the dex OIDC flow and the PAT bearer-auth test
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
@@ -268,10 +268,10 @@ jobs:
           name: browser-diagnostics-chromium
           path: test-results/browser
           if-no-files-found: ignore
-      - run: cargo test -p e6ircd --all-features --test http -- --ignored --test-threads=1
+      - run: cargo test --locked -p e6ircd --all-features --test http -- --ignored --test-threads=1
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
-      - run: cargo test -p e6irc-cli --test e2e -- --include-ignored --test-threads=1
+      - run: cargo test --locked -p e6irc-cli --test e2e -- --include-ignored --test-threads=1
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
 
@@ -591,7 +591,7 @@ jobs:
             [ "$i" = 40 ] && { echo "conduit did not become ready"; docker logs conduit; exit 1; }
             sleep 1
           done
-      - run: cargo test -p e6ircd --features matrix --test matrix -- --ignored
+      - run: cargo test --locked -p e6ircd --features matrix --test matrix -- --ignored
         env:
           E6IRC_TEST_MATRIX_URL: http://127.0.0.1:16167
 
@@ -604,7 +604,7 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - run: cargo test -p e6irc-queue --release
+      - run: cargo test --locked -p e6irc-queue --release
         env:
           RUSTFLAGS: --cfg loom -Dwarnings
 
@@ -668,17 +668,23 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - run: cargo build --locked --release --workspace
+      # Each binary is measured in the profile it ships in: the server in
+      # `release`, the clients in `release-client` (release.yml).
+      - run: cargo build --locked --release -p e6ircd
+      - run: cargo build --locked --profile release-client -p e6irc-cli -p e6irc-tui
       - name: Report stripped binary sizes
         run: |
           {
-            echo '### Binary sizes (release, stripped)'
-            echo '| binary | size |'
-            echo '|---|---|'
-            for bin in e6ircd e6irc e6irc-tui; do
-              if [ -f "target/release/$bin" ]; then
-                echo "| $bin | $(du -h "target/release/$bin" | cut -f1) |"
+            echo '### Binary sizes (stripped, as shipped)'
+            echo '| binary | profile | size |'
+            echo '|---|---|---|'
+            for entry in release/e6ircd release-client/e6irc release-client/e6irc-tui; do
+              binary="target/$entry"
+              if [ ! -f "$binary" ]; then
+                echo "$binary was not built" >&2
+                exit 1
               fi
+              echo "| ${entry#*/} | ${entry%%/*} | $(du -h "$binary" | cut -f1) |"
             done
           } >> "$GITHUB_STEP_SUMMARY"
 
