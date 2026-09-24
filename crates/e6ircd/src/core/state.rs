@@ -4943,6 +4943,25 @@ impl ServerState {
         }
     }
 
+    /// Drop every confirmed mirror entry of a permanently deleted `account`:
+    /// its rows cascaded away with the account. A write still in flight keeps
+    /// its slot until its reply releases it, as in [`Self::expire_read_markers`].
+    pub(crate) fn forget_account_read_markers(&mut self, account: &str) {
+        let account = self.account_key(account);
+        let forgotten: Vec<(AccountKey, ChanKey)> = self
+            .read_markers
+            .keys()
+            .filter(|(holder, _)| *holder == account)
+            .cloned()
+            .collect();
+        for key in forgotten {
+            self.read_markers.remove(&key);
+            if !self.pending_read_markers.contains_key(&key) {
+                self.free_read_marker_slot(&key.0);
+            }
+        }
+    }
+
     /// The `(auto_op, auto_voice)` flags `account` holds on channel `key`.
     pub fn access_modes(&self, key: &ChanKey, account: &str) -> (bool, bool) {
         let account = self.account_key(account);
@@ -6752,6 +6771,19 @@ mod session_store_tests {
             .release_read_marker(&key(&state, "alice", "#c"))
             .expect("reserved across the preload");
         check(&state, 2, 1);
+
+        // Deleting an account forgets its confirmed markers, keeps a write in
+        // flight counted, and leaves every other account alone.
+        state.reserve_read_marker(key(&state, "alice", "#x"));
+        state.forget_account_read_markers("ALICE");
+        check(&state, 1, 1);
+        assert_eq!(state.read_marker(&key(&state, "alice", "#x")), None);
+        assert_eq!(state.read_marker(&key(&state, "alice", "#y")), None);
+        assert_eq!(state.read_marker(&key(&state, "bob", "#z")), Some(ms(8)));
+        state
+            .release_read_marker(&key(&state, "alice", "#x"))
+            .expect("reserved across the deletion");
+        check(&state, 0, 1);
     }
 
     /// The account → connections index equals a scan of every session after

@@ -938,6 +938,23 @@ async fn delete_account_in_lane(
             return Err(account_deletion_error(error));
         }
     };
+    // The account's read markers cascaded away with its row; every core
+    // shard's mirror drops them too, or they would count against nothing
+    // until a restart. The live gate stays: the name is retired.
+    if state
+        .core_tx
+        .broadcast_account_deleted(&target.folded)
+        .await
+        .is_err()
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "Permanently deleted {}, but a live core shard is unavailable and still holds its read markers.",
+                deleted.name
+            ),
+        ));
+    }
     Ok(format!(
         "Permanently deleted {} and stopped {stopped_networks} owned network(s). The account name is retired.",
         deleted.name
@@ -1073,6 +1090,18 @@ mod problem_contract_tests {
         // However it is imported, taking it as a handler argument names its
         // generic type.
         assert_eq!(occurrences(concat!("Path", "<")), vec![("oidc.rs", 1)]);
+    }
+
+    /// `parse_form` is the one reader of a console form's rejection, so every
+    /// malformed form is answered with the same problem document. The OIDC
+    /// back-channel logout endpoint answers its own refusal for every
+    /// malformed request, a well-formed but invalid logout token included.
+    #[test]
+    fn only_parse_form_unwraps_a_form() {
+        assert_eq!(
+            occurrences(concat!("Form", "(")),
+            vec![("mod.rs", 1), ("oidc.rs", 1)]
+        );
     }
 
     /// `too_many_requests` (and `retry_later` through it) is the one builder
@@ -3604,9 +3633,9 @@ mod pages {
             Ok(actor) => actor,
             Err(response) => return response.into(),
         };
-        let axum::Form(fields) = match form {
-            Ok(f) => f,
-            Err(r) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&r.to_string())),
+        let fields = match parse_form(form) {
+            Ok(fields) => fields,
+            Err(response) => return response.into(),
         };
         if !state.csrf_valid(&session, &fields.csrf) {
             return problem(StatusCode::FORBIDDEN, "Bad CSRF token", None);

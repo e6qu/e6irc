@@ -13037,6 +13037,55 @@ fn read_markers_expired_by_maintenance_free_their_slots_in_the_mirror() {
     assert_eq!(request.target, "#new", "the freed slot admits a new target");
 }
 
+/// A permanently deleted account's read-marker rows cascade away with it, but
+/// each shard's mirror kept up to the per-account cap of entries for it until
+/// a restart. The deletion now reaches every shard, which forgets the
+/// account's markers — and only that account's.
+#[test]
+fn a_deleted_accounts_read_markers_leave_the_mirror() {
+    let mut s = TestServer::new();
+    let at = e6irc_proto::time::parse_server_time_millis("2020-01-01T00:00:00.000Z")
+        .expect("test timestamp");
+    s.core.preload_read_markers(
+        (0..256)
+            .map(|index| ("Alice".to_string(), format!("#old{index}"), at))
+            .chain(std::iter::once((
+                "bob".to_string(),
+                "#kept".to_string(),
+                at,
+            )))
+            .collect(),
+    );
+
+    s.core.handle(Input::AccountDeleted {
+        account: "ALICE".into(),
+    });
+
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/read-marker");
+    identify(&mut s, alice, "alice");
+    s.line(alice, "MARKREAD #old0");
+    assert_eq!(
+        s.drain(alice),
+        vec![":irc.test.example MARKREAD #old0 *"],
+        "the deleted account's marker is gone"
+    );
+    s.line(alice, "MARKREAD #new timestamp=2026-07-18T12:00:00.000Z");
+    let request = take_read_marker_request(&mut s);
+    assert_eq!(
+        request.target, "#new",
+        "no slot is held by the deleted rows"
+    );
+
+    let bob = register_with_caps(&mut s, 2, "bob", "draft/read-marker");
+    identify(&mut s, bob, "bob");
+    s.line(bob, "MARKREAD #kept");
+    assert_eq!(
+        s.drain(bob),
+        vec![":irc.test.example MARKREAD #kept timestamp=2020-01-01T00:00:00.000Z"],
+        "another account's markers stay"
+    );
+}
+
 // ---- per-address limits, reserved names, throttled logins, history floors --
 
 fn created_accounts(s: &mut TestServer) -> Vec<String> {

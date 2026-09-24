@@ -250,6 +250,17 @@ impl CoreIngress {
         .await
     }
 
+    /// Tell every shard that `account` was permanently deleted, so each drops
+    /// its read-marker mirror entries for it: the database rows cascaded away
+    /// with the account, and nothing would otherwise evict them before a
+    /// restart.
+    pub(crate) async fn broadcast_account_deleted(&self, account: &str) -> Result<(), ()> {
+        self.broadcast(|| Input::AccountDeleted {
+            account: account.to_owned(),
+        })
+        .await
+    }
+
     /// Offer every shard its copy. One closed shard does not excuse the rest:
     /// during shutdown the others still need theirs.
     async fn broadcast(&self, mut input: impl FnMut() -> Input) -> Result<(), ()> {
@@ -316,7 +327,10 @@ impl Input {
             Input::ChannelMultilineResult { session, .. } => session.shard(),
             Input::ChannelTagmsg { tagmsg } => tagmsg.owner().shard(),
             Input::ChannelTagmsgResult { session, .. } => session.shard(),
-            Input::Tick { .. } | Input::Shutdown | Input::ReadMarkersExpired { .. } => {
+            Input::Tick { .. }
+            | Input::Shutdown
+            | Input::ReadMarkersExpired { .. }
+            | Input::AccountDeleted { .. } => {
                 panic!("broadcast core event must use its dedicated ingress method")
             }
             Input::ServerBanResult { requester, .. } => match requester {
@@ -737,6 +751,12 @@ pub enum Input {
     /// database would admit.
     ReadMarkersExpired {
         markers: Arc<[ExpiredReadMarker]>,
+    },
+    /// An account was permanently deleted, broadcast to every shard so its
+    /// read-marker mirror drops the account's entries (their rows cascaded
+    /// away with the account row).
+    AccountDeleted {
+        account: String,
     },
     /// An answer from the DB worker to an earlier [`DbRequest`].
     DbReply {
@@ -2733,6 +2753,7 @@ impl Core {
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
             Input::Tick { now } => handler::reap_idle(&mut self.state, now),
             Input::ReadMarkersExpired { markers } => self.state.expire_read_markers(&markers),
+            Input::AccountDeleted { account } => self.state.forget_account_read_markers(&account),
             Input::DbReply { conn, reply } => handler::db_reply(&mut self.state, conn, reply),
             Input::HistoryPage {
                 conn,

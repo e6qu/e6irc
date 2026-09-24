@@ -2503,14 +2503,21 @@ mod tests {
         assert!(json["last_error"].get("diagnostic").is_none(), "{json}");
 
         ends.emit(crate::bouncer::ConnectionEvent::RegistrationFailed(
-            e6irc_client::RegistrationRejection::without_diagnostic(
-                e6irc_client::RegistrationRefusal::NotRegistered,
-            ),
+            e6irc_client::RegistrationRejection::from_reply(
+                &e6irc_client::OwnedMessage::from(
+                    &e6irc_proto::message::Message::parse(
+                        "ERROR :Closing link: too many host connections",
+                    )
+                    .expect("a scripted reply parses"),
+                ),
+                e6irc_client::ServerPasswordSent::No,
+            )
+            .expect("a pre-welcome ERROR refuses registration"),
         ));
         let rejected = serde_json::to_value(runtime_response(&handle.runtime_snapshot()))
             .expect("runtime response is serializable");
         assert_eq!(
-            rejected["last_error"]["diagnostic"], "no detail from upstream",
+            rejected["last_error"]["diagnostic"], "Closing link: too many host connections",
             "the IRC parser's bounded owner-safe detail remains actionable: {rejected}"
         );
     }
