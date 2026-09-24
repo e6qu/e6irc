@@ -6298,10 +6298,11 @@ async fn device_grants_are_pruned_on_create() {
         db::connect_and_migrate(&support::test_db("device_grants_are_pruned_on_create").await)
             .await
             .expect("connect");
-    // An already-expired grant, as a never-approved /device/start flood leaves.
+    // A grant expired past the grace period, as a never-approved /device/start
+    // flood leaves.
     sqlx::query(
         "INSERT INTO device_grants (device_code, user_code, expires_at)
-         VALUES ('dead', 'DEADDEAD', now() - interval '1 minute')",
+         VALUES ('dead', 'DEADDEAD', now() - interval '1 day')",
     )
     .execute(&pool)
     .await
@@ -7448,10 +7449,12 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     .execute(&pool)
     .await
     .expect("API tokens");
+    // An expired grant is kept for a grace period (a late poll is answered
+    // `expired_token`); one past it is pruned.
     sqlx::query(
         "INSERT INTO device_grants (device_code, user_code, expires_at)
          VALUES
-           ('old-device', 'OLDDEV01', now() - interval '1 second'),
+           ('old-device', 'OLDDEV01', now() - interval '1 day'),
            ('new-device', 'NEWDEV01', now() + interval '1 day')",
     )
     .execute(&pool)
@@ -7550,6 +7553,15 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     assert_eq!(report.observability_samples, 1);
     // One from each marker table: the counter covers both.
     assert_eq!(report.read_markers, 2);
+    // The core's row is also returned, as deleted, for the core's mirror.
+    assert_eq!(
+        report
+            .expired_read_markers
+            .iter()
+            .map(|marker| (marker.account.as_str(), marker.target.as_str()))
+            .collect::<Vec<_>>(),
+        [("Alice", "#old")]
+    );
     assert!(!report.saturated);
     let counts: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
@@ -9560,5 +9572,258 @@ async fn maintenance_trims_buffers_over_the_backlog_cap() {
             .await
             .expect("second sweep"),
         0
+    );
+}
+
+/// Wait until some session of this test's database is blocked on a lock: the
+/// point an interleaving test has arranged for.
+async fn wait_for_lock_wait(pool: &sqlx::PgPool) {
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("lock waits");
+            if waiting > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("no session ever waited on a lock");
+}
+
+/// Alice (the administrator) and Bob, for the deletion interleavings below.
+async fn alice_and_bob(test: &str) -> (sqlx::PgPool, i64) {
+    let pool = db::connect_and_migrate(&support::test_db(test).await)
+        .await
+        .expect("connect");
+    db::bootstrap_first_admin(&pool, "Alice", "administrator password")
+        .await
+        .expect("Alice");
+    let bob_id = db::create_account_with_contact(&pool, "Bob", "member password", None)
+        .await
+        .expect("Bob");
+    (pool, bob_id)
+}
+
+/// A founder transfer to an account being deleted, still uncommitted when the
+/// deletion counts founded channels, used to be invisible to that count while
+/// its foreign-key lock did not conflict with deletion's row lock: the DELETE
+/// then waited for the transfer to commit and its cascade removed the channel.
+/// Deletion now waits for the transfer before counting, and refuses.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn account_deletion_never_cascades_through_a_concurrent_founder_transfer() {
+    let (pool, bob_id) =
+        alice_and_bob("account_deletion_never_cascades_through_a_concurrent_founder_transfer")
+            .await;
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#room', '#room', id FROM accounts WHERE name_folded = 'alice'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel");
+    let mut transfer = pool.begin().await.expect("transfer transaction");
+    sqlx::query("UPDATE channels SET founder_account_id = $1 WHERE name_folded = '#room'")
+        .bind(bob_id)
+        .execute(&mut *transfer)
+        .await
+        .expect("transfer to Bob");
+    let deletion = tokio::spawn({
+        let pool = pool.clone();
+        async move { db::delete_account_permanently(&pool, bob_id, "Alice", &[]).await }
+    });
+    wait_for_lock_wait(&pool).await;
+    transfer.commit().await.expect("commit transfer");
+    let outcome = tokio::time::timeout(deadline::HANG, deletion)
+        .await
+        .expect("deletion finished")
+        .expect("deletion task");
+    assert!(
+        matches!(outcome, Err(db::DbError::AccountOwnsChannels(1))),
+        "{outcome:?}"
+    );
+    let founder: Option<String> = sqlx::query_scalar(
+        "SELECT a.name FROM channels c JOIN accounts a ON a.id = c.founder_account_id
+         WHERE c.name_folded = '#room'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("channel lookup");
+    assert_eq!(founder.as_deref(), Some("Bob"), "the channel must survive");
+}
+
+/// However the application counts, storage refuses to delete a founder: the
+/// founder reference restricts rather than cascading the channel away.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn storage_refuses_to_delete_a_channel_founder() {
+    let (pool, bob_id) = alice_and_bob("storage_refuses_to_delete_a_channel_founder").await;
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id) VALUES ('#bob', '#bob', $1)",
+    )
+    .bind(bob_id)
+    .execute(&pool)
+    .await
+    .expect("channel");
+    let error = sqlx::query("DELETE FROM accounts WHERE id = $1")
+        .bind(bob_id)
+        .execute(&pool)
+        .await
+        .expect_err("deleting a founder must fail");
+    assert_eq!(
+        error.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("23503"),
+        "{error}"
+    );
+    let channels: i64 = sqlx::query_scalar("SELECT count(*) FROM channels")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(channels, 1);
+}
+
+async fn messages_naming_bob(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM messages
+         WHERE sender_account IN ('Bob', 'bob') OR dm_peers @> ARRAY['bob']",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("count")
+}
+
+/// Write one message the way the database worker's batch does (a plain
+/// INSERT; the storage trigger is what decides).
+async fn log_message<'e, E>(executor: E, msgid: &str, sender: &str, dm_peers: Option<&[&str]>)
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query(
+        "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts, dm_peers)
+         VALUES ($1, '#test', $2 || '!u@h', $2, 'privmsg', 'late', now(), $3)",
+    )
+    .bind(msgid)
+    .bind(sender)
+    .bind(dm_peers)
+    .execute(executor)
+    .await
+    .expect("insert message");
+}
+
+/// Messages reach PostgreSQL asynchronously -- batched by the database worker,
+/// from shards that apply an account's suspension at their own pace -- so one
+/// naming an account could commit after deletion's purge. Storage now refuses
+/// every such row, whatever its timing: in flight when deletion starts (the
+/// purge waits for it and removes it), written while deletion holds the
+/// account (dropped), or after it committed (dropped).
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn messages_naming_a_deleted_account_never_outlive_the_purge() {
+    let (pool, bob_id) =
+        alice_and_bob("messages_naming_a_deleted_account_never_outlive_the_purge").await;
+
+    // While deletion holds the account row, a row naming it is not stored;
+    // once the lock is gone without a deletion, it is.
+    let mut deleting = pool.begin().await.expect("deletion stand-in");
+    sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(bob_id)
+        .execute(&mut *deleting)
+        .await
+        .expect("lock Bob");
+    log_message(&pool, "during", "Bob", None).await;
+    assert_eq!(messages_naming_bob(&pool).await, 0);
+    deleting.rollback().await.expect("release");
+    log_message(&pool, "kept", "Bob", None).await;
+    assert_eq!(messages_naming_bob(&pool).await, 1);
+
+    // A batch still uncommitted when deletion starts: deletion waits for it,
+    // and its purge removes the row.
+    let mut batch = pool.begin().await.expect("batch transaction");
+    log_message(&mut *batch, "in-flight", "Bob", None).await;
+    let deletion = tokio::spawn({
+        let pool = pool.clone();
+        async move { db::delete_account_permanently(&pool, bob_id, "Alice", &[]).await }
+    });
+    wait_for_lock_wait(&pool).await;
+    batch.commit().await.expect("commit batch");
+    tokio::time::timeout(deadline::HANG, deletion)
+        .await
+        .expect("deletion finished")
+        .expect("deletion task")
+        .expect("delete")
+        .expect("Bob");
+    assert_eq!(messages_naming_bob(&pool).await, 0);
+
+    // After the deletion committed: neither as sender nor as a peer.
+    log_message(&pool, "late-sent", "Bob", None).await;
+    log_message(&pool, "late-dm", "Alice", Some(&["alice", "bob"])).await;
+    assert_eq!(messages_naming_bob(&pool).await, 0);
+    // Rows naming a live account, or a name no account ever held, are kept.
+    log_message(&pool, "alice", "Alice", None).await;
+    log_message(&pool, "service", "SomeService", None).await;
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM messages")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(kept, 2);
+}
+
+/// RFC 8628 has a device that polls past expiry told `expired_token`, its cue
+/// to start over. Grants were pruned the moment they expired, so the poll
+/// found no row and answered as for an unknown code; they are now kept for a
+/// grace period, through both pruning paths.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn an_expired_device_grant_polls_as_expired_until_pruned() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("an_expired_device_grant_polls_as_expired_until_pruned").await,
+    )
+    .await
+    .expect("connect");
+    let (expired, _) = db::create_device_grant(&pool).await.expect("grant");
+    let (stale, _) = db::create_device_grant(&pool).await.expect("grant");
+    sqlx::query(
+        "UPDATE device_grants SET expires_at = CASE device_code
+             WHEN $1 THEN now() - interval '1 second'
+             ELSE now() - interval '1 day' END
+         WHERE device_code IN ($1, $2)",
+    )
+    .bind(&expired)
+    .bind(&stale)
+    .execute(&pool)
+    .await
+    .expect("expire");
+    // Both pruning paths: a new grant, and storage maintenance.
+    db::create_device_grant(&pool).await.expect("grant");
+    let report = db::run_storage_maintenance(
+        &pool,
+        db::StorageRetention {
+            history_days: 30,
+            audit_days: 365,
+            observability_hours: 1,
+        },
+    )
+    .await
+    .expect("maintenance");
+    assert_eq!(report.device_grants, 0, "the stale grant went at start");
+    assert_eq!(
+        db::poll_device_grant(&pool, &expired, "device")
+            .await
+            .expect("poll"),
+        db::DeviceStatus::Expired
+    );
+    assert_eq!(
+        db::poll_device_grant(&pool, &stale, "device")
+            .await
+            .expect("poll"),
+        db::DeviceStatus::Unknown,
+        "past the grace period the grant is pruned"
     );
 }

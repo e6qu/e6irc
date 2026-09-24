@@ -7607,6 +7607,31 @@ async fn device_authorization_grant_flow() {
     assert_eq!(status, 400);
     assert!(body.contains("invalid_grant"), "{body}");
 
+    // A device polling past expiry is told `expired_token` (RFC 8628 §3.5),
+    // even after another start has run the expired-grant pruning.
+    let (status, _, body) = request(http, &post("/api/v1/auth/device/start", "", "")).await;
+    assert_eq!(status, 200, "{body}");
+    let lapsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let lapsed_code = lapsed["device_code"].as_str().unwrap().to_string();
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    sqlx::query(
+        "UPDATE device_grants SET expires_at = now() - interval '1 second'
+         WHERE device_code = $1",
+    )
+    .bind(&lapsed_code)
+    .execute(&pool)
+    .await
+    .expect("expire grant");
+    let (status, _, body) = request(http, &post("/api/v1/auth/device/start", "", "")).await;
+    assert_eq!(status, 200, "{body}");
+    let lapsed_poll = format!(r#"{{"device_code":"{lapsed_code}"}}"#);
+    let (status, _, body) =
+        request(http, &post("/api/v1/auth/device/token", "", &lapsed_poll)).await;
+    assert_eq!(status, 400);
+    assert!(body.contains("expired_token"), "{body}");
+
     // A device token counts toward the per-account cap like any other. A grant
     // approved while a slot was free, then beaten to it, is denied once.
     let start_grant = || async {

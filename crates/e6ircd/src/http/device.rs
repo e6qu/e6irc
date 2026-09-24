@@ -304,7 +304,7 @@ pub(super) async fn device_start(State(state): State<Arc<AppState>>, _rl: RateLi
             user_code,
             verification_uri,
             interval: 5,
-            expires_in: 600,
+            expires_in: crate::db::DEVICE_GRANT_LIFETIME_SECONDS,
         }),
         Err(e) => {
             eprintln!("http: device start failed: {e}");

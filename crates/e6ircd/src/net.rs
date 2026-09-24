@@ -834,6 +834,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             pool.clone(),
             telemetry.clone(),
             settings.clone(),
+            core_tx.clone(),
         ));
         listeners.push(supervise_listener(
             "storage maintenance",

@@ -4545,6 +4545,30 @@ impl ServerState {
         }
     }
 
+    /// Drop mirror entries whose stored row storage maintenance deleted. An
+    /// entry is dropped only while it still holds the deleted value (or an
+    /// older one): a marker written again after the sweep is a new row the
+    /// database holds, and stays. A write still in flight keeps its slot.
+    pub(crate) fn expire_read_markers(&mut self, markers: &[crate::core::ExpiredReadMarker]) {
+        for marker in markers {
+            let key = (
+                self.account_key(&marker.account),
+                ChanKey(marker.target.clone()),
+            );
+            let std::collections::hash_map::Entry::Occupied(entry) = self.read_markers.entry(key)
+            else {
+                continue;
+            };
+            if *entry.get() > marker.marker_ms {
+                continue;
+            }
+            let (key, _) = entry.remove_entry();
+            if !self.pending_read_markers.contains_key(&key) {
+                self.free_read_marker_slot(&key.0);
+            }
+        }
+    }
+
     /// The `(auto_op, auto_voice)` flags `account` holds on channel `key`.
     pub fn access_modes(&self, key: &ChanKey, account: &str) -> (bool, bool) {
         let account = self.account_key(account);

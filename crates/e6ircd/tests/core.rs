@@ -12698,3 +12698,55 @@ fn only_an_unregistered_channel_ops_its_first_joiner() {
         .expect("353");
     assert!(names.ends_with(":@alice"), "{names}");
 }
+
+/// Storage maintenance deletes read markers older than the history retention.
+/// The core's mirror, loaded at boot, kept counting them toward the per-account
+/// cap, so an account whose old markers the database had already dropped was
+/// refused every new target until a restart. The deleted rows are now handed
+/// to the core, which drops them -- unless the mirror holds a newer value, a
+/// marker written again since.
+#[test]
+fn read_markers_expired_by_maintenance_free_their_slots_in_the_mirror() {
+    let mut s = TestServer::new();
+    let old = e6irc_proto::time::parse_server_time_millis("2020-01-01T00:00:00.000Z")
+        .expect("test timestamp");
+    let newer = e6irc_proto::time::parse_server_time_millis("2020-02-01T00:00:00.000Z")
+        .expect("test timestamp");
+    s.core.preload_read_markers(
+        (0..256)
+            .map(|index| {
+                let at = if index == 1 { newer } else { old };
+                ("Alice".to_string(), format!("#old{index}"), at)
+            })
+            .collect(),
+    );
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/read-marker");
+    identify(&mut s, alice, "alice");
+    s.line(alice, "MARKREAD #new timestamp=2026-07-18T12:00:00.000Z");
+    assert!(
+        s.drain(alice)
+            .iter()
+            .any(|line| line.contains("Too many read markers")),
+        "the mirror is full"
+    );
+
+    let expired = |target: &str| e6ircd::core::ExpiredReadMarker {
+        account: "Alice".into(),
+        target: target.into(),
+        marker_ms: old,
+    };
+    s.core.handle(Input::ReadMarkersExpired {
+        markers: std::sync::Arc::from([expired("#old0"), expired("#old1")]),
+    });
+    s.line(alice, "MARKREAD #old0");
+    assert_eq!(s.drain(alice), vec![":irc.test.example MARKREAD #old0 *"]);
+    s.line(alice, "MARKREAD #old1");
+    assert_eq!(
+        s.drain(alice),
+        vec![":irc.test.example MARKREAD #old1 timestamp=2020-02-01T00:00:00.000Z"],
+        "a marker newer than the deleted row is not the row that was deleted"
+    );
+    s.line(alice, "MARKREAD #new timestamp=2026-07-18T12:00:00.000Z");
+    let request = take_read_marker_request(&mut s);
+    assert_eq!(request.target, "#new", "the freed slot admits a new target");
+}

@@ -100,7 +100,7 @@ pub enum DbError {
     /// One or more storage-maintenance collections failed; the others
     /// committed their batches (`completed`).
     MaintenanceFailed {
-        completed: StorageMaintenanceReport,
+        completed: Box<StorageMaintenanceReport>,
         failures: Vec<MaintenanceFailure>,
     },
 }
@@ -537,7 +537,7 @@ pub async fn connect_and_migrate_with_retry(
 
 const STORAGE_MAINTENANCE_BATCH: u64 = 10_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StorageMaintenanceReport {
     pub messages: u64,
     /// Bouncer history (`bnc_buffer`, every network's external lines, direct
@@ -556,6 +556,11 @@ pub struct StorageMaintenanceReport {
     /// together -- that point older than the history retention, where no
     /// message they could resume from is kept any more.
     pub read_markers: u64,
+    /// The core's (`read_markers`) rows among them, each as deleted. Every
+    /// core shard mirrors that table and counts it toward the per-account cap,
+    /// so the caller hands these to the core: the database's delete is the one
+    /// source of what expired.
+    pub expired_read_markers: Vec<crate::core::ExpiredReadMarker>,
     /// At least one collection filled its bounded batch and may have more
     /// expired rows. [`drain_storage_maintenance`] keeps going while this is
     /// set, up to its batch budget.
@@ -565,7 +570,7 @@ pub struct StorageMaintenanceReport {
 impl StorageMaintenanceReport {
     /// Destructures `other` exhaustively, so a counter added to the report
     /// fails to compile here until it is summed too.
-    fn add(&mut self, other: &Self) {
+    fn add(&mut self, other: Self) {
         let Self {
             messages,
             bnc_buffer,
@@ -577,8 +582,9 @@ impl StorageMaintenanceReport {
             account_invitations,
             observability_samples,
             read_markers,
+            expired_read_markers,
             saturated,
-        } = *other;
+        } = other;
         self.messages += messages;
         self.bnc_buffer += bnc_buffer;
         self.audit_events += audit_events;
@@ -589,6 +595,7 @@ impl StorageMaintenanceReport {
         self.account_invitations += account_invitations;
         self.observability_samples += observability_samples;
         self.read_markers += read_markers;
+        self.expired_read_markers.extend(expired_read_markers);
         self.saturated = saturated;
     }
 
@@ -630,7 +637,7 @@ pub struct MaintenanceDrainPlan {
 }
 
 /// What one tick of [`drain_storage_maintenance`] did in total.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageMaintenanceDrain {
     /// Rows deleted across every batch; `saturated` is the last batch's.
     pub totals: StorageMaintenanceReport,
@@ -641,6 +648,7 @@ pub struct StorageMaintenanceDrain {
 #[derive(Debug, Clone, Copy)]
 enum RetentionBound {
     Days(i32),
+    Seconds(i32),
     Millis(i64),
     None,
 }
@@ -732,11 +740,14 @@ impl MaintenanceCollection {
                      WHERE expires_at <= now()
                      ORDER BY expires_at LIMIT $1))"
             }
+            // Kept past expiry for a grace period, so a late poll is still
+            // answered `expired_token` (see
+            // `DEVICE_GRANT_EXPIRED_RETENTION_SECONDS`).
             Self::DeviceGrants => {
                 "DELETE FROM device_grants WHERE id = ANY(ARRAY(
                      SELECT id FROM device_grants
-                     WHERE expires_at <= now()
-                     ORDER BY expires_at, id LIMIT $1))"
+                     WHERE expires_at <= now() - make_interval(secs => $1)
+                     ORDER BY expires_at, id LIMIT $2))"
             }
             // A composite key: the candidates are named by their row
             // position, which the same statement's snapshot keeps valid.
@@ -764,11 +775,18 @@ impl MaintenanceCollection {
             // this table feeds the per-shard mirror built at boot, so its size
             // is start-up cost too. Composite keys, named by `ctid` within the
             // statement's own snapshot, as the logout-token sweep does.
+            //
+            // The deleted rows are returned, as `list_all_read_markers` reads
+            // them, for the core's mirror.
             Self::ReadMarkers => {
-                "DELETE FROM read_markers WHERE ctid = ANY(ARRAY(
-                     SELECT ctid FROM read_markers
-                     WHERE marker_ts < now() - make_interval(days => $1)
-                     ORDER BY marker_ts LIMIT $2))"
+                "WITH expired AS (
+                     DELETE FROM read_markers WHERE ctid = ANY(ARRAY(
+                         SELECT ctid FROM read_markers
+                         WHERE marker_ts < now() - make_interval(days => $1)
+                         ORDER BY marker_ts LIMIT $2))
+                     RETURNING account_id, target, marker_ts)
+                 SELECT a.name, e.target, (EXTRACT(EPOCH FROM e.marker_ts) * 1000)::bigint
+                 FROM expired e JOIN accounts a ON a.id = e.account_id"
             }
             // The bouncer's markers store the same instant as ISO-8601 UTC
             // text, which sorts and compares lexically -- the ordering the
@@ -805,10 +823,26 @@ pub async fn drain_storage_maintenance(
     let mut totals = StorageMaintenanceReport::default();
     let mut batches_run = 0;
     loop {
-        let report = run_storage_maintenance(pool, retention).await?;
-        totals.add(&report);
+        let report = match run_storage_maintenance(pool, retention).await {
+            Ok(report) => report,
+            // What earlier batches committed is part of what this tick did:
+            // the failure carries it, so the caller can still act on it.
+            Err(DbError::MaintenanceFailed {
+                completed,
+                failures,
+            }) => {
+                totals.add(*completed);
+                return Err(DbError::MaintenanceFailed {
+                    completed: Box::new(totals),
+                    failures,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let saturated = report.saturated;
+        totals.add(report);
         batches_run += 1;
-        if !report.saturated || batches_run >= plan.batches.get() {
+        if !saturated || batches_run >= plan.batches.get() {
             return Ok(StorageMaintenanceDrain {
                 totals,
                 batches_run,
@@ -853,20 +887,32 @@ pub async fn run_storage_maintenance(
             | MaintenanceCollection::ReadMarkers
             | MaintenanceCollection::BncReadMarkers => RetentionBound::Days(history_days),
             MaintenanceCollection::AuditLog => RetentionBound::Days(audit_days),
+            MaintenanceCollection::DeviceGrants => {
+                RetentionBound::Seconds(DEVICE_GRANT_EXPIRED_RETENTION_SECONDS)
+            }
             MaintenanceCollection::ObservabilitySamples => {
                 RetentionBound::Millis(observability_cutoff_ms)
             }
             _ => RetentionBound::None,
         };
-        let query = sqlx::query(collection.statement());
-        let query = match bound {
-            RetentionBound::Days(days) => query.bind(days).bind(limit),
-            RetentionBound::Millis(millis) => query.bind(millis).bind(limit),
-            RetentionBound::None => query.bind(limit),
+        let outcome = if collection == MaintenanceCollection::ReadMarkers {
+            expire_read_markers(pool, history_days, limit, &mut report.expired_read_markers).await
+        } else {
+            let query = sqlx::query(collection.statement());
+            let query = match bound {
+                RetentionBound::Days(days) => query.bind(days).bind(limit),
+                RetentionBound::Seconds(seconds) => query.bind(seconds).bind(limit),
+                RetentionBound::Millis(millis) => query.bind(millis).bind(limit),
+                RetentionBound::None => query.bind(limit),
+            };
+            query
+                .execute(pool)
+                .await
+                .map(|result| result.rows_affected())
+                .map_err(query_error)
         };
-        match query.execute(pool).await {
-            Ok(result) => {
-                let deleted = result.rows_affected();
+        match outcome {
+            Ok(deleted) => {
                 // Added, not assigned: the two marker tables report through one
                 // counter, and the second would otherwise overwrite the first.
                 *report.slot(collection) += deleted;
@@ -874,7 +920,7 @@ pub async fn run_storage_maintenance(
             }
             Err(error) => failures.push(MaintenanceFailure {
                 collection,
-                error: Box::new(query_error(error)),
+                error: Box::new(error),
             }),
         }
     }
@@ -882,10 +928,36 @@ pub async fn run_storage_maintenance(
         Ok(report)
     } else {
         Err(DbError::MaintenanceFailed {
-            completed: report,
+            completed: Box::new(report),
             failures,
         })
     }
+}
+
+/// One batch of [`MaintenanceCollection::ReadMarkers`], appending each deleted
+/// marker to `expired`; returns how many rows were deleted.
+async fn expire_read_markers(
+    pool: &PgPool,
+    history_days: i32,
+    limit: i64,
+    expired: &mut Vec<crate::core::ExpiredReadMarker>,
+) -> Result<u64, DbError> {
+    let rows: Vec<(String, String, i64)> =
+        sqlx::query_as(MaintenanceCollection::ReadMarkers.statement())
+            .bind(history_days)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+            .map_err(query_error)?;
+    let deleted = rows.len() as u64;
+    for (account, target, millis) in rows {
+        expired.push(crate::core::ExpiredReadMarker {
+            account,
+            target,
+            marker_ms: millis_from_database(millis, "read_markers.marker_ts")?,
+        });
+    }
+    Ok(deleted)
 }
 
 /// Where the backlog-cap sweep resumes: the last (owner, network) buffer it
@@ -1892,7 +1964,12 @@ pub async fn delete_account_permanently(
         name,
         folded,
         flags,
-    }) = lock_account_state(&mut transaction, account_id).await?
+    }) = lock_account_state(
+        &mut transaction,
+        account_id,
+        AccountStateChangeKind::Deletion,
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -2071,20 +2148,45 @@ const ACCOUNT_AUTHORITY_ADVISORY_LOCK_KEY: i64 = 0x6536_6972_6300_0003;
 async fn lock_account_state(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: i64,
+    change: AccountStateChangeKind,
 ) -> Result<Option<LockedAccountState>, DbError> {
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(ACCOUNT_AUTHORITY_ADVISORY_LOCK_KEY)
         .execute(&mut **transaction)
         .await
         .map_err(query_error)?;
-    sqlx::query_as(
-        "SELECT name, name_folded AS folded, flags FROM accounts WHERE id = $1
-         FOR NO KEY UPDATE",
-    )
+    sqlx::query_as(match change {
+        AccountStateChangeKind::Flags => {
+            "SELECT name, name_folded AS folded, flags FROM accounts WHERE id = $1
+             FOR NO KEY UPDATE"
+        }
+        AccountStateChangeKind::Deletion => {
+            "SELECT name, name_folded AS folded, flags FROM accounts WHERE id = $1
+             FOR UPDATE"
+        }
+    })
     .bind(account_id)
     .fetch_optional(&mut **transaction)
     .await
     .map_err(query_error)
+}
+
+/// What an authority change will do to the account row, which decides how
+/// strongly [`lock_account_state`] locks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountStateChangeKind {
+    /// Rewrites `flags` only; rows referencing the account are unaffected, so
+    /// `FOR NO KEY UPDATE` leaves foreign-key checks (`FOR KEY SHARE`) free.
+    Flags,
+    /// Deletes the row, after counting what still refers to it (founded
+    /// channels) and purging what names it (messages). Every insert or update
+    /// that references the account takes `FOR KEY SHARE` on its row -- a
+    /// foreign-key check, or the `messages` deleted-account trigger (migration
+    /// 0072) -- and only `FOR UPDATE` conflicts with that. So such a write
+    /// either commits before deletion counts and purges, or meets the lock
+    /// (a foreign key waits and then fails; the trigger drops the row); it
+    /// can never land between count and delete.
+    Deletion,
 }
 
 /// Preserve the system-wide invariant that an account mutation cannot remove
@@ -2168,7 +2270,7 @@ pub async fn set_account_administrator(
         name,
         folded,
         flags,
-    }) = lock_account_state(&mut transaction, account_id).await?
+    }) = lock_account_state(&mut transaction, account_id, AccountStateChangeKind::Flags).await?
     else {
         return Ok(None);
     };
@@ -2233,7 +2335,7 @@ pub async fn set_account_suspended(
         name,
         folded,
         flags,
-    }) = lock_account_state(&mut transaction, account_id).await?
+    }) = lock_account_state(&mut transaction, account_id, AccountStateChangeKind::Flags).await?
     else {
         return Ok(None);
     };
@@ -5380,8 +5482,19 @@ pub enum DeviceStatus {
     Unknown,
 }
 
+/// How long a device grant may be approved and polled: RFC 8628 `expires_in`,
+/// advertised by `/device/start` from this same value.
+pub const DEVICE_GRANT_LIFETIME_SECONDS: u16 = 600;
+
+/// How long an expired device grant is kept before it is pruned. A device keeps
+/// polling until it is told the grant expired; pruned at expiry, the row would
+/// be gone and the device told `invalid_grant` (an unknown code) instead of RFC
+/// 8628's `expired_token`, which is what tells it to start over.
+const DEVICE_GRANT_EXPIRED_RETENTION_SECONDS: i32 = 600;
+
 /// Start a device grant: a secret `device_code` the client polls with and
-/// a short `user_code` the user enters to approve. Valid for 10 minutes.
+/// a short `user_code` the user enters to approve. Valid for
+/// [`DEVICE_GRANT_LIFETIME_SECONDS`].
 pub async fn create_device_grant(pool: &PgPool) -> Result<(String, String), DbError> {
     use argon2::password_hash::rand_core::RngCore;
     // URL-safe: a device code in a form body spelled with `+` would arrive as
@@ -5405,17 +5518,21 @@ pub async fn create_device_grant(pool: &PgPool) -> Result<(String, String), DbEr
     }
     // Prune expired grants on write: `/device/start` is unauthenticated and a
     // grant is otherwise only removed when it is approved and polled, so a
-    // flood of never-approved starts would grow the table without bound.
-    sqlx::query("DELETE FROM device_grants WHERE expires_at <= now()")
+    // flood of never-approved starts would grow the table without bound. The
+    // same bounded batch storage maintenance runs, past the same grace.
+    sqlx::query(MaintenanceCollection::DeviceGrants.statement())
+        .bind(DEVICE_GRANT_EXPIRED_RETENTION_SECONDS)
+        .bind(STORAGE_MAINTENANCE_BATCH as i64)
         .execute(pool)
         .await
         .map_err(query_error)?;
     sqlx::query(
         "INSERT INTO device_grants (device_code, user_code, expires_at)
-         VALUES ($1, $2, now() + interval '10 minutes')",
+         VALUES ($1, $2, now() + make_interval(secs => $3))",
     )
     .bind(&device_code)
     .bind(&user_code)
+    .bind(i32::from(DEVICE_GRANT_LIFETIME_SECONDS))
     .execute(pool)
     .await
     .map_err(query_error)?;

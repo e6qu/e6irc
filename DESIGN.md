@@ -1038,8 +1038,15 @@ Principal tables (columns abridged):
 - `web_sessions` (owner-scoped resource id, opaque token hash, account_id,
   creation/expiry, bounded user agent, optional OIDC identity/session metadata)
 - `api_tokens` (hashed PATs, scopes, expiry)
-- `channels` (registered channels: founder, flags, topic retention, mlock)
-- `channel_access` (channel_id, account_id, flags) — Atheme-style FLAGS
+- `channels` (registered channels: founder, flags, topic retention, mlock).
+  The founder reference is `ON DELETE RESTRICT` (migration 0071): a channel is
+  never account-owned data, so no account deletion can remove one — deleting a
+  founder fails in PostgreSQL whatever the application counted. Every other
+  reference to `accounts` cascades (or, for an accepted invitation, sets NULL):
+  each is data about the account itself.
+- `channel_access` (channel_id, account_id, flags) — Atheme-style FLAGS;
+  `account_id` has its own index (migration 0073) for the deletion cascade and
+  per-account lookups, since the primary key leads with `channel_id`.
 - `messages` — append-only history log; columns (id, msgid, target,
   sender_prefix, sender_account, kind, body, ts), indexed `(target, ts)`
   and `(ts, id)`; `messages_sender_account_idx` (migration 0063) together with
@@ -1050,7 +1057,10 @@ Principal tables (columns abridged):
   Native monthly range partitions remain the target representation at the
   scale qualification boundary; retention semantics do not depend on that
   representation. Server-time and account-tag are reconstructed from `ts`
-  and `sender_account`, so no separate tags column is stored.
+  and `sender_account`, so no separate tags column is stored. A storage
+  trigger (migration 0072) refuses any row naming — as sender or direct-message
+  peer — an account that is retired or being deleted, so an asynchronously
+  written message can never outlive account deletion's purge (§9.1).
 - `bnc_networks` (account_id, name, addr, tls, nick, realname, autojoin,
   sasl_account, `sasl_password_sealed` — **sealed** (`enc:v1:`) with the
   server master key (§15), `server_password_sealed` (IRC only, a table CHECK;
@@ -1098,7 +1108,10 @@ Principal tables (columns abridged):
   `bnc_buffer_msgid_idx` as unused: `bnc_buffer_sent_at_idx` serves every
   per-target read and `bnc_buffer_lookup_idx` the replay.
 - `device_grants` — device-authorization approvals; `account_id` references
-  `accounts(id)` ON DELETE CASCADE (migration 0065).
+  `accounts(id)` ON DELETE CASCADE (migration 0065). A grant lives
+  `DEVICE_GRANT_LIFETIME_SECONDS` (the advertised `expires_in`) and is pruned
+  only a grace period after expiry, so a late poll is answered RFC 8628
+  `expired_token` rather than `invalid_grant`.
 - `bnc_read_markers` (BIGINT account_id, network, target, timestamp) —
   per-account, per-BNC-network read position, the source for
   `draft/read-marker` on the attach listener. Distinct from `read_markers`
@@ -1121,6 +1134,10 @@ Principal tables (columns abridged):
   (`GREATEST`) and the returned committed value drives the core mirror and
   client acknowledgement; an enqueue or PostgreSQL failure is never reported
   as success. Anonymous connections use explicitly session-local markers.
+  The retention sweep returns the rows it deleted and storage maintenance
+  broadcasts them to every core shard, which drops each mirror entry still at
+  (or behind) the deleted value — the database's delete is the one source of
+  what expired, so the mirror's cap count cannot hold slots the table freed.
 - `audit_log` (stable id, actor, action, target, detail, creation time for
   privileged oper/control-plane actions). Exact actor/action/target queries use
   `(filter, id DESC)` indexes and paginate with `id < before_id`; a concurrently
@@ -1242,7 +1259,10 @@ effective administrator, including authority supplied by deployment
 configuration. The shared account/network mutation lane first installs a
 folded authentication deny key in the ordered core, then stops the account's
 drivers, so no persistence task can write backlog behind the deletion (they
-are restarted only if the database refuses). The final transaction
+are restarted only if the database refuses). The final transaction locks the
+account row `FOR UPDATE` — the one mode that conflicts with the `FOR KEY SHARE`
+a founder transfer's foreign-key check or a message insert's retirement
+trigger takes, so neither can commit between the checks and the delete — then
 rechecks every invariant, reserves the name permanently, purges pending/
 consumed invitation contact data, device grants, owned BNC buffer, sent and
 direct-message history (in batches of 5,000, in the fixed order messages →

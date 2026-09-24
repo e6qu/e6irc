@@ -233,6 +233,16 @@ impl CoreIngress {
         self.broadcast(|| Input::Shutdown).await
     }
 
+    pub(crate) async fn broadcast_read_markers_expired(
+        &self,
+        markers: Arc<[ExpiredReadMarker]>,
+    ) -> Result<(), ()> {
+        self.broadcast(|| Input::ReadMarkersExpired {
+            markers: markers.clone(),
+        })
+        .await
+    }
+
     /// Offer every shard its copy. One closed shard does not excuse the rest:
     /// during shutdown the others still need theirs.
     async fn broadcast(&self, mut input: impl FnMut() -> Input) -> Result<(), ()> {
@@ -299,7 +309,7 @@ impl Input {
             Input::ChannelMultilineResult { session, .. } => session.shard(),
             Input::ChannelTagmsg { tagmsg } => tagmsg.owner().shard(),
             Input::ChannelTagmsgResult { session, .. } => session.shard(),
-            Input::Tick { .. } | Input::Shutdown => {
+            Input::Tick { .. } | Input::Shutdown | Input::ReadMarkersExpired { .. } => {
                 panic!("broadcast core event must use its dedicated ingress method")
             }
             Input::ServerBanResult { requester, .. } => match requester {
@@ -494,6 +504,15 @@ impl std::fmt::Display for ConnectionIdExhausted {
 }
 
 impl std::error::Error for ConnectionIdExhausted {}
+
+/// One stored read marker that storage maintenance deleted: the account's
+/// display name as stored, the folded target, and the value deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiredReadMarker {
+    pub account: String,
+    pub target: String,
+    pub marker_ms: e6irc_proto::time::Millis,
+}
 
 /// Events into the core worker.
 #[derive(Debug)]
@@ -703,6 +722,14 @@ pub enum Input {
     /// mass-close live connections or freeze.
     Tick {
         now: e6irc_proto::time::MonoMillis,
+    },
+    /// Read markers storage maintenance deleted as past the history
+    /// retention, broadcast to every shard so its mirror drops them too. The
+    /// mirror counts toward the per-account marker cap: a marker the database
+    /// no longer holds, still counted here, would refuse a new target the
+    /// database would admit.
+    ReadMarkersExpired {
+        markers: Arc<[ExpiredReadMarker]>,
     },
     /// An answer from the DB worker to an earlier [`DbRequest`].
     DbReply {
@@ -2648,6 +2675,7 @@ impl Core {
             }
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
             Input::Tick { now } => handler::reap_idle(&mut self.state, now),
+            Input::ReadMarkersExpired { markers } => self.state.expire_read_markers(&markers),
             Input::DbReply { conn, reply } => handler::db_reply(&mut self.state, conn, reply),
             Input::HistoryPage {
                 conn,
