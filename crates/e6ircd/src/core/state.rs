@@ -3453,6 +3453,11 @@ pub(crate) struct ServerState {
     /// verification already in flight cannot re-authenticate after the
     /// suspension event has run.
     pub suspended_accounts: HashSet<AccountKey>,
+    /// Accounts permanently deleted while this process runs. A MARKREAD write
+    /// already in flight when one was deleted can answer after its mirror was
+    /// emptied; the confirmation is dropped rather than stored for an account
+    /// that no longer exists. One entry per deletion: the names are retired.
+    deleted_accounts: HashSet<AccountKey>,
     /// Requests to the DB worker (answered via `Input::DbReply`).
     pub db_tx: Sender<super::DbRequest>,
     /// High-water mark of simultaneously registered users (LUSERS max).
@@ -4407,6 +4412,7 @@ impl ServerState {
             doomed: Vec::new(),
             effects: Vec::new(),
             suspended_accounts: HashSet::new(),
+            deleted_accounts: HashSet::new(),
             db_tx,
             started_at,
             msgids: MsgidSource::new(shard),
@@ -4710,12 +4716,17 @@ impl ServerState {
         }
     }
 
-    /// Record a confirmed marker, returning the value it replaced.
+    /// Record a confirmed marker, returning the value it replaced. For a
+    /// permanently deleted account nothing is stored, and the marker is
+    /// reported as already current so no caller fans it out.
     pub(crate) fn store_read_marker(
         &mut self,
         key: (AccountKey, ChanKey),
         marker_ms: e6irc_proto::time::Millis,
     ) -> Option<e6irc_proto::time::Millis> {
+        if self.deleted_accounts.contains(&key.0) {
+            return Some(marker_ms);
+        }
         let held = self.read_marker_slot_held(&key);
         let previous = self.read_markers.insert(key.clone(), marker_ms);
         if !held {
@@ -4948,6 +4959,7 @@ impl ServerState {
     /// its slot until its reply releases it, as in [`Self::expire_read_markers`].
     pub(crate) fn forget_account_read_markers(&mut self, account: &str) {
         let account = self.account_key(account);
+        self.deleted_accounts.insert(account.clone());
         let forgotten: Vec<(AccountKey, ChanKey)> = self
             .read_markers
             .keys()
@@ -6780,6 +6792,14 @@ mod session_store_tests {
         assert_eq!(state.read_marker(&key(&state, "alice", "#x")), None);
         assert_eq!(state.read_marker(&key(&state, "alice", "#y")), None);
         assert_eq!(state.read_marker(&key(&state, "bob", "#z")), Some(ms(8)));
+        // The write in flight answers after the deletion: its confirmation is
+        // not stored for an account that no longer exists, and reads as
+        // already current so nothing fans it out.
+        assert_eq!(
+            state.store_read_marker(key(&state, "alice", "#x"), ms(9)),
+            Some(ms(9))
+        );
+        assert_eq!(state.read_marker(&key(&state, "alice", "#x")), None);
         state
             .release_read_marker(&key(&state, "alice", "#x"))
             .expect("reserved across the deletion");
