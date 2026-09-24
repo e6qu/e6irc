@@ -652,6 +652,39 @@ A sweep of the bouncer found, and this change fixes:
   a transaction id (which the homeserver shows only to the sending device)
   are, and posts from the account's other devices are relayed.
 
+A 2026-09-24 security review found, and this change fixes:
+
+- **Per-address limits counted each IPv6 address alone.** One subscriber holds
+  a whole `/64`, so every per-address limit handed a client 2^64 budgets. All
+  of them — connections, in-flight HTTP requests, the HTTP authentication
+  bucket, IRC account creation — are keyed by one type that folds IPv6 to its
+  `/64`, and a core session is charged to the address it connected from even
+  after SETHOST.
+- **Password guessing against one account was bounded only per address.**
+  Every password check (web login, app-password exchange, password change,
+  SASL PLAIN and NickServ IDENTIFY, the attach listener) reserves one of ten
+  attempts per account name per 15 minutes before checking (migration 0074),
+  and a refusal is `429` + `Retry-After` over HTTP and a `904` or NickServ
+  notice over IRC.
+- **A configured administrator's name could be registered by anyone.** NickServ
+  and IRCv3 `REGISTER`, administrator account creation and invitations refuse
+  it; only OIDC provisioning and the bootstrap/recovery flows create it, and
+  startup names each configured administrator that has no account yet.
+- **Bridged senders could pass as the owner or each other.** Senders were shown
+  by a name (a Matrix localpart, a Slack display name, a Discord or webhook
+  username); they are now keyed by the provider's account id, shown at their
+  homeserver or under their id, and never given the owner's nick or another
+  shown sender's.
+- **A re-created channel served the previous occupants' history.** CHATHISTORY
+  reads of a channel start at its current incarnation; the founder and access
+  list of a registered channel keep the whole record, as over REST.
+- **NickServ `SETPASS` and `RESETPASS` (and `Q`/`X`/`AuthServ` `AUTH`/`LOGIN`)
+  reached the backlog unredacted.** One list of sensitive services commands
+  now serves the bouncer's echoes and the core's echo-message.
+- **Front-channel logout signed out any visitor.** It cleared the session
+  cookie of whoever loaded it; it now clears it only when that cookie named a
+  session the logout revoked.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

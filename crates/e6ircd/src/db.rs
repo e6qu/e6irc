@@ -63,6 +63,9 @@ pub enum DbError {
     StaleServerSettings,
     /// Unknown account or wrong password (indistinguishable on purpose).
     BadCredentials,
+    /// The account name has used every password attempt its window allows;
+    /// nothing was verified. Retry after the given interval.
+    LoginThrottled(LoginRetryAfter),
     /// An authenticated caller tried to create a primary password where one
     /// already exists and therefore must be rotated with the current password.
     LocalPasswordExists,
@@ -139,6 +142,11 @@ impl std::fmt::Display for DbError {
             }
             Self::StaleServerSettings => write!(f, "server settings changed concurrently"),
             Self::BadCredentials => write!(f, "invalid account or password"),
+            Self::LoginThrottled(retry) => write!(
+                f,
+                "too many password attempts for this account; retry in {}s",
+                retry.seconds()
+            ),
             Self::LocalPasswordExists => write!(f, "account already has a primary password"),
             Self::UnknownAccount(n) => write!(f, "no such account: {n}"),
             Self::ReplayedLogoutToken => write!(f, "OpenID Connect logout token was replayed"),
@@ -1246,6 +1254,30 @@ async fn account_name_is_retired(
     .map_err(query_error)
 }
 
+/// The entries of `names` no account holds, in the order and spelling given.
+/// Startup names each configured administrator that is still unclaimed.
+pub async fn unclaimed_account_names(
+    pool: &PgPool,
+    names: &[String],
+) -> Result<Vec<String>, DbError> {
+    let folded: Vec<String> = names
+        .iter()
+        .map(|name| CaseMapping::Rfc1459.casefold(name))
+        .collect();
+    let held: Vec<String> =
+        sqlx::query_scalar("SELECT name_folded FROM accounts WHERE name_folded = ANY($1)")
+            .bind(&folded)
+            .fetch_all(pool)
+            .await
+            .map_err(query_error)?;
+    Ok(names
+        .iter()
+        .zip(folded)
+        .filter(|(_, folded)| !held.contains(folded))
+        .map(|(name, _)| name.clone())
+        .collect())
+}
+
 /// Create an account with an optional validated contact email.
 pub async fn create_account_with_contact(
     pool: &PgPool,
@@ -1599,6 +1631,12 @@ pub async fn accept_account_invitation(
     else {
         return Err(DbError::InvitationUnavailable);
     };
+    // A configured administrator's name is created only by OIDC provisioning
+    // or the bootstrap/recovery flows; an invitation issued for it before the
+    // name was configured cannot claim it now.
+    if configured_administrators.contains(&folded) {
+        return Err(DbError::InvitationUnavailable);
+    }
     if administrator {
         let issuer_is_active_administrator: bool = sqlx::query_scalar(
             "SELECT EXISTS (
@@ -3185,6 +3223,7 @@ async fn handle_request(
         DbRequest::QueryHistory {
             conn,
             target,
+            floor,
             display,
             batch_ref,
             caps,
@@ -3192,8 +3231,10 @@ async fn handle_request(
             label,
         } => {
             let rows = async {
-                let rows = query_history(pool, &target, query.clone()).await?;
-                if rows.is_empty() && positioned_by_unknown_msgid(pool, &target, &query).await? {
+                let rows = query_history(pool, &target, floor, query.clone()).await?;
+                if rows.is_empty()
+                    && positioned_by_unknown_msgid(pool, &target, floor, &query).await?
+                {
                     return Ok(Err(crate::core::HistoryFault::UnknownMsgid {
                         subcommand: query.subcommand(),
                     }));
@@ -3916,14 +3957,18 @@ macro_rules! history_window {
 pub(crate) async fn positioned_by_unknown_msgid(
     pool: &PgPool,
     target: &str,
+    floor: crate::core::HistoryFloor,
     query: &crate::core::HistoryQuery,
 ) -> Result<bool, DbError> {
+    let floor = millis_for_database(floor.millis(), "history floor")?;
     for msgid in query.msgid_pivots() {
         let known: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE msgid = $1 AND target = $2)",
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE msgid = $1 AND target = $2
+                           AND ts >= to_timestamp($3::double precision / 1000))",
         )
         .bind(msgid)
         .bind(target)
+        .bind(floor)
         .fetch_one(pool)
         .await
         .map_err(query_error)?;
@@ -3937,9 +3982,14 @@ pub(crate) async fn positioned_by_unknown_msgid(
 pub async fn query_history(
     pool: &PgPool,
     target: &str,
+    floor: crate::core::HistoryFloor,
     query: crate::core::HistoryQuery,
 ) -> Result<Vec<crate::core::HistoryRow>, DbError> {
     use crate::core::HistoryQuery;
+    // Every statement below binds the target as `$1` and the floor as `$2`,
+    // and reads only rows at or above it — pivots included, so a msgid from
+    // before the floor is as unknown here as one from another buffer.
+    let floor = millis_for_database(floor.millis(), "history floor")?;
     // BETWEEN resolves each pivot's `(ts, id)` in the DB and derives its own
     // direction, so it produces its final oldest-first order itself rather than
     // going through the shared newest-first reversal below.
@@ -3949,7 +3999,7 @@ pub async fn query_history(
         limit,
     } = query
     {
-        return query_between_selectors(pool, target, &first, &second, limit).await;
+        return query_between_selectors(pool, target, floor, &first, &second, limit).await;
     }
     // LATEST/BEFORE (and its msgid pivot) select newest-first and get reversed
     // below; the rest are already oldest-first. Computed before the match
@@ -3962,124 +4012,139 @@ pub async fn query_history(
             | HistoryQuery::Before { .. }
             | HistoryQuery::BeforeMsgid { .. }
     );
-    // Each branch selects a window, then we return it oldest-first.
-    let rows: Result<Vec<HistoryDbRow>, sqlx::Error> = match query {
-        HistoryQuery::Latest { limit } => {
-            sqlx::query_as(history_select!(
-                    "WHERE target = $1 ORDER BY ts DESC, id DESC LIMIT $2"
-                ))
-            .bind(target)
-            .bind(limit as i64)
-            .fetch_all(pool)
-            .await
-        }
-        HistoryQuery::Before { before_ts, limit } => {
-            sqlx::query_as(history_select!(
-                    "WHERE target = $1 AND ts < to_timestamp($2::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $3"
-                ))
-            .bind(target)
-            .bind(millis_for_database(before_ts, "history before selector")?)
-            .bind(limit as i64)
-            .fetch_all(pool)
-            .await
-        }
-        // Bounded LATEST: newest-first within the bound, reversed below, so a
-        // limit smaller than the number of messages after the bound keeps the
-        // most recent ones rather than the oldest.
-        HistoryQuery::LatestAfter { after_ts, limit } => {
-            sqlx::query_as(history_select!(
-                    "WHERE target = $1 AND ts > to_timestamp($2::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $3"
-                ))
-            .bind(target)
-            .bind(millis_for_database(after_ts, "history after selector")?)
-            .bind(limit as i64)
-            .fetch_all(pool)
-            .await
-        }
-        HistoryQuery::LatestAfterMsgid { msgid, limit } => {
-            sqlx::query_as(history_select!(
-                    "WHERE target = $1 AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1) ORDER BY ts DESC, id DESC LIMIT $3"
-                ))
-            .bind(target)
-            .bind(&msgid)
-            .bind(limit as i64)
-            .fetch_all(pool)
-            .await
-        }
-        HistoryQuery::After { after_ts, limit } => {
-            sqlx::query_as(history_select!(
-                    "WHERE target = $1 AND ts > to_timestamp($2::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $3"
-                ))
-            .bind(target)
-            .bind(millis_for_database(after_ts, "history after selector")?)
-            .bind(limit as i64)
-            .fetch_all(pool)
-            .await
-        }
-        HistoryQuery::Around { around_ts, limit } => {
-            // Half older than the point, half at/after it, then oldest-first.
-            let before = (limit / 2) as i64;
-            let after = (limit - limit / 2) as i64;
-            sqlx::query_as(history_window!(
-                    "WHERE target = $1 AND ts < to_timestamp($2::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $3",
-                    "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $4"
-                ))
-            .bind(target)
-            .bind(millis_for_database(around_ts, "history around selector")?)
-            .bind(before)
-            .bind(after)
-            .fetch_all(pool)
-            .await
-        }
-        // Msgid pivots: page on the composite (ts, id) relative to the pivot
-        // row so messages sharing the pivot's timestamp are not skipped.
+    // The one value, beside the target and floor, that positions a window.
+    enum Position {
+        Millis(i64),
+        Msgid(String),
+    }
+    // Each branch names its statement, its position (`$3`) and its limits
+    // (`$3` for LATEST, else `$4`, and `$5` for a window's newer half); the
+    // statement is run once below, then returned oldest-first.
+    let (sql, position, limit, newer_limit): (
+        &'static str,
+        Option<Position>,
+        usize,
+        Option<usize>,
+    ) = match query {
+        HistoryQuery::Latest { limit } => (
+            history_select!(
+                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $3"
+            ),
+            None,
+            limit,
+            None,
+        ),
+        HistoryQuery::Before { before_ts, limit } => (
+            history_select!(
+                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4"
+            ),
+            Some(Position::Millis(millis_for_database(
+                before_ts,
+                "history before selector",
+            )?)),
+            limit,
+            None,
+        ),
+        // Bounded LATEST: newest-first within the bound, reversed below, so
+        // a limit smaller than the number of messages after the bound keeps
+        // the most recent ones rather than the oldest.
+        HistoryQuery::LatestAfter { after_ts, limit } => (
+            history_select!(
+                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND ts > to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4"
+            ),
+            Some(Position::Millis(millis_for_database(
+                after_ts,
+                "history after selector",
+            )?)),
+            limit,
+            None,
+        ),
+        HistoryQuery::LatestAfterMsgid { msgid, limit } => (
+            history_select!(
+                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4"
+            ),
+            Some(Position::Msgid(msgid)),
+            limit,
+            None,
+        ),
+        HistoryQuery::After { after_ts, limit } => (
+            history_select!(
+                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND ts > to_timestamp($3::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $4"
+            ),
+            Some(Position::Millis(millis_for_database(
+                after_ts,
+                "history after selector",
+            )?)),
+            limit,
+            None,
+        ),
+        // Half older than the point, half at/after it, then oldest-first.
+        HistoryQuery::Around { around_ts, limit } => (
+            history_window!(
+                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4",
+                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND ts >= to_timestamp($3::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $5"
+            ),
+            Some(Position::Millis(millis_for_database(
+                around_ts,
+                "history around selector",
+            )?)),
+            limit / 2,
+            Some(limit - limit / 2),
+        ),
+        // Msgid pivots: page on the composite (ts, id) relative to the
+        // pivot row so messages sharing the pivot's timestamp are not
+        // skipped.
         //
-        // The pivot is looked up *within the same target*. Globally, a msgid
-        // that belongs to some other buffer is not "unknown", so an unscoped
-        // lookup would silently position the query from a message the caller
-        // may never have been able to see — answering a request to page from a
-        // position that does not exist in this buffer with a plausible result
-        // instead of an empty one, and turning any known msgid into an oracle
-        // for when it was sent. Scoped, an unknown-here msgid makes the
-        // subquery NULL and the result empty, which is what the caller asked
-        // about.
-        HistoryQuery::BeforeMsgid { msgid, limit } => {
-            sqlx::query_as(history_select!(
-                    "WHERE target = $1 AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1) ORDER BY ts DESC, id DESC LIMIT $3"
-                ))
-            .bind(target)
-            .bind(&msgid)
-            .bind(limit as i64)
-            .fetch_all(pool)
-            .await
-        }
-        HistoryQuery::AfterMsgid { msgid, limit } => {
-            sqlx::query_as(history_select!(
-                    "WHERE target = $1 AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1) ORDER BY ts ASC, id ASC LIMIT $3"
-                ))
-            .bind(target)
-            .bind(&msgid)
-            .bind(limit as i64)
-            .fetch_all(pool)
-            .await
-        }
-        HistoryQuery::AroundMsgid { msgid, limit } => {
-            let before = (limit / 2) as i64;
-            let after = (limit - limit / 2) as i64;
-            sqlx::query_as(history_window!(
-                    "WHERE target = $1 AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1) ORDER BY ts DESC, id DESC LIMIT $3",
-                    "WHERE target = $1 AND (ts, id) >= (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1) ORDER BY ts ASC, id ASC LIMIT $4"
-                ))
-            .bind(target)
-            .bind(&msgid)
-            .bind(before)
-            .bind(after)
-            .fetch_all(pool)
-            .await
-        }
+        // The pivot is looked up *within the same target*. Globally, a
+        // msgid that belongs to some other buffer is not "unknown", so an
+        // unscoped lookup would silently position the query from a message
+        // the caller may never have been able to see — answering a request
+        // to page from a position that does not exist in this buffer with a
+        // plausible result instead of an empty one, and turning any known
+        // msgid into an oracle for when it was sent. Scoped, an
+        // unknown-here msgid makes the subquery NULL and the result empty,
+        // which is what the caller asked about.
+        HistoryQuery::BeforeMsgid { msgid, limit } => (
+            history_select!(
+                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4"
+            ),
+            Some(Position::Msgid(msgid)),
+            limit,
+            None,
+        ),
+        HistoryQuery::AfterMsgid { msgid, limit } => (
+            history_select!(
+                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts ASC, id ASC LIMIT $4"
+            ),
+            Some(Position::Msgid(msgid)),
+            limit,
+            None,
+        ),
+        HistoryQuery::AroundMsgid { msgid, limit } => (
+            history_window!(
+                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4",
+                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND (ts, id) >= (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts ASC, id ASC LIMIT $5"
+            ),
+            Some(Position::Msgid(msgid)),
+            limit / 2,
+            Some(limit - limit / 2),
+        ),
         // Returned early above.
         HistoryQuery::BetweenSelectors { .. } => unreachable!("handled before the match"),
     };
+    let mut statement = sqlx::query_as::<_, HistoryDbRow>(sql)
+        .bind(target)
+        .bind(floor);
+    statement = match position {
+        Some(Position::Millis(millis)) => statement.bind(millis),
+        Some(Position::Msgid(msgid)) => statement.bind(msgid),
+        None => statement,
+    };
+    statement = statement.bind(limit as i64);
+    if let Some(newer_limit) = newer_limit {
+        statement = statement.bind(newer_limit as i64);
+    }
+    let rows = statement.fetch_all(pool).await;
     let mut rows = rows.map_err(query_error)?;
     if newest_first {
         rows.reverse();
@@ -4111,6 +4176,7 @@ fn history_row_from_db(row: HistoryDbRow) -> Result<crate::core::HistoryRow, DbE
 async fn query_between_selectors(
     pool: &PgPool,
     target: &str,
+    floor: i64,
     first: &crate::core::SelectorBound,
     second: &crate::core::SelectorBound,
     limit: usize,
@@ -4131,6 +4197,7 @@ async fn query_between_selectors(
     async fn marker(
         pool: &PgPool,
         target: &str,
+        floor: i64,
         b: &SelectorBound,
     ) -> Result<Option<HistoryMarker>, DbError> {
         match b {
@@ -4142,10 +4209,12 @@ async fn query_between_selectors(
             SelectorBound::Msgid(m) => {
                 let row: Option<HistoryMarkerRow> = sqlx::query_as(
                     "SELECT (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, id \
-                     FROM messages WHERE msgid = $1 AND target = $2",
+                     FROM messages WHERE msgid = $1 AND target = $2 \
+                     AND ts >= to_timestamp($3::double precision / 1000)",
                 )
                 .bind(m)
                 .bind(target)
+                .bind(floor)
                 .fetch_optional(pool)
                 .await
                 .map_err(query_error)?;
@@ -4158,8 +4227,8 @@ async fn query_between_selectors(
         }
     }
     let (m1, m2) = match (
-        marker(pool, target, first).await,
-        marker(pool, target, second).await,
+        marker(pool, target, floor, first).await,
+        marker(pool, target, floor, second).await,
     ) {
         (Ok(Some(a)), Ok(Some(b))) => (a, b),
         // A DB fault is surfaced (Err), never folded into an empty page — the
@@ -4194,21 +4263,22 @@ async fn query_between_selectors(
     );
     let sql = if newest_first {
         history_select!(
-            "WHERE target = $1 \
-             AND (ts, id) > (to_timestamp($2::double precision / 1000), $3::bigint) \
-             AND (ts, id) < (to_timestamp($4::double precision / 1000), $5::bigint) \
-             ORDER BY ts DESC, id DESC LIMIT $6"
+            "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) \
+             AND (ts, id) > (to_timestamp($3::double precision / 1000), $4::bigint) \
+             AND (ts, id) < (to_timestamp($5::double precision / 1000), $6::bigint) \
+             ORDER BY ts DESC, id DESC LIMIT $7"
         )
     } else {
         history_select!(
-            "WHERE target = $1 \
-             AND (ts, id) > (to_timestamp($2::double precision / 1000), $3::bigint) \
-             AND (ts, id) < (to_timestamp($4::double precision / 1000), $5::bigint) \
-             ORDER BY ts ASC, id ASC LIMIT $6"
+            "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) \
+             AND (ts, id) > (to_timestamp($3::double precision / 1000), $4::bigint) \
+             AND (ts, id) < (to_timestamp($5::double precision / 1000), $6::bigint) \
+             ORDER BY ts ASC, id ASC LIMIT $7"
         )
     };
     let rows: Result<Vec<HistoryDbRow>, sqlx::Error> = sqlx::query_as(sql)
         .bind(target)
+        .bind(floor)
         .bind(lo_ts)
         .bind(lo_id)
         .bind(hi_ts)
@@ -4232,7 +4302,7 @@ struct HistoryTargetRow {
 /// Return visible targets with latest activity in the requested window.
 pub async fn query_targets(
     pool: &PgPool,
-    channels: &[String],
+    channels: &[(String, crate::core::HistoryFloor)],
     me: Option<&str>,
     min_ts: e6irc_proto::time::Millis,
     max_ts: e6irc_proto::time::Millis,
@@ -4240,6 +4310,15 @@ pub async fn query_targets(
 ) -> Result<Vec<(String, e6irc_proto::time::Millis)>, DbError> {
     let min_ts = millis_for_database(min_ts, "history target minimum")?;
     let max_ts = millis_for_database(max_ts, "history target maximum")?;
+    let (names, floors): (Vec<&str>, Vec<i64>) = channels
+        .iter()
+        .map(|(name, floor)| {
+            millis_for_database(floor.millis(), "history target floor")
+                .map(|floor| (name.as_str(), floor))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .unzip();
     let rows: Result<Vec<HistoryTargetRow>, sqlx::Error> = sqlx::query_as(
         // A channel's newest message is one backward probe of
         // `messages_target_ts_id_idx` per requested channel (a LATERAL
@@ -4248,9 +4327,11 @@ pub async fn query_targets(
         // channel to find each maximum.
         "SELECT name, (EXTRACT(EPOCH FROM MAX(latest)) * 1000)::bigint AS latest FROM (
              SELECT requested.name, newest.latest
-             FROM unnest($1::text[]) AS requested(name)
+             FROM unnest($1::text[], $6::bigint[]) AS requested(name, floor)
              CROSS JOIN LATERAL (
-                 SELECT max(ts) AS latest FROM messages WHERE target = requested.name
+                 SELECT max(ts) AS latest FROM messages
+                 WHERE target = requested.name
+                   AND ts >= to_timestamp(requested.floor::double precision / 1000)
              ) newest
              WHERE newest.latest IS NOT NULL
              UNION ALL
@@ -4270,11 +4351,12 @@ pub async fn query_targets(
          ORDER BY latest ASC
          LIMIT $4",
     )
-    .bind(channels)
+    .bind(names)
     .bind(min_ts as f64)
     .bind(max_ts as f64)
     .bind(limit as i64)
     .bind(me)
+    .bind(floors)
     .fetch_all(pool)
     .await;
     rows.map_err(query_error)?
@@ -5406,6 +5488,7 @@ pub async fn persist_channel_registration(
 enum VerifyOutcome {
     Verified(String),
     Rejected,
+    Throttled(LoginRetryAfter),
     Unavailable,
 }
 
@@ -5414,6 +5497,10 @@ impl VerifyOutcome {
         match self {
             Self::Verified(account) => DbReply::PasswordVerified { account, origin },
             Self::Rejected => DbReply::PasswordRejected { origin },
+            Self::Throttled(retry_after) => DbReply::PasswordThrottled {
+                origin,
+                retry_after,
+            },
             Self::Unavailable => DbReply::Unavailable { origin },
         }
     }
@@ -5453,6 +5540,7 @@ async fn handle_verify(pool: &PgPool, account: &str, password: &str) -> VerifyOu
     match verify_credentials(pool, account, password).await {
         Ok(Some(account)) => VerifyOutcome::Verified(account),
         Ok(None) => VerifyOutcome::Rejected,
+        Err(DbError::LoginThrottled(retry_after)) => VerifyOutcome::Throttled(retry_after),
         Err(e) => {
             eprintln!("db: credential lookup failed: {e}");
             VerifyOutcome::Unavailable
@@ -5954,6 +6042,101 @@ fn dummy_verify_hash() -> &'static str {
     })
 }
 
+/// Password attempts one account name may use in a window before further
+/// attempts are refused unverified.
+pub const LOGIN_ATTEMPT_LIMIT: i32 = 10;
+/// The window [`LOGIN_ATTEMPT_LIMIT`] counts within, from its first attempt.
+pub const LOGIN_ATTEMPT_WINDOW: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Whole seconds until an account name's password attempts are admitted again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoginRetryAfter(u64);
+
+impl LoginRetryAfter {
+    /// A wait of `seconds`, never less than one: a refusal always asks the
+    /// client to wait.
+    pub fn new(seconds: u64) -> Self {
+        Self(seconds.max(1))
+    }
+
+    pub fn seconds(self) -> u64 {
+        self.0
+    }
+
+    /// What a refused attempt is told, on every surface that checks a
+    /// password: the IRC core's SASL 904 and NickServ notice, the attach
+    /// listener's 904, and the HTTP 429's detail.
+    pub fn explanation(self) -> String {
+        format!(
+            "Too many failed login attempts for this account; try again in {} seconds",
+            self.0
+        )
+    }
+}
+
+/// Reserve one password attempt for `folded`, or refuse it when the name's
+/// window is spent. The reservation is taken *before* the password is checked
+/// and in one statement, so concurrent attempts cannot all pass a count read
+/// before any of them was recorded. Keyed by name whether or not an account
+/// holds it, so a refusal is not an existence oracle.
+async fn reserve_login_attempt(pool: &PgPool, folded: &str) -> Result<(), DbError> {
+    let window = LOGIN_ATTEMPT_WINDOW.as_secs_f64();
+    sqlx::query(
+        "DELETE FROM login_attempts
+         WHERE window_started_at <= now() - make_interval(secs => $1)",
+    )
+    .bind(window)
+    .execute(pool)
+    .await
+    .map_err(query_error)?;
+    let (attempts, retry_after): (i32, i64) = sqlx::query_as(
+        "INSERT INTO login_attempts (name_folded, attempts) VALUES ($1, 1)
+         ON CONFLICT (name_folded) DO UPDATE
+             SET attempts = LEAST(login_attempts.attempts, $3) + 1
+         RETURNING attempts,
+                   CEIL(EXTRACT(EPOCH FROM
+                       window_started_at + make_interval(secs => $2) - now()))::bigint",
+    )
+    .bind(folded)
+    .bind(window)
+    .bind(LOGIN_ATTEMPT_LIMIT)
+    .fetch_one(pool)
+    .await
+    .map_err(query_error)?;
+    if attempts > LOGIN_ATTEMPT_LIMIT {
+        return Err(DbError::LoginThrottled(LoginRetryAfter::new(
+            u64::try_from(retry_after).unwrap_or(0),
+        )));
+    }
+    Ok(())
+}
+
+/// A verified password ends the name's attempt window.
+async fn clear_login_attempts(pool: &PgPool, folded: &str) -> Result<(), DbError> {
+    sqlx::query("DELETE FROM login_attempts WHERE name_folded = $1")
+        .bind(folded)
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(query_error)
+}
+
+/// The one gate every password check passes: reserve an attempt for the
+/// account name, run `verify`, and clear the window when it verified.
+async fn throttled_password_check<T>(
+    pool: &PgPool,
+    account: &str,
+    verify: impl std::future::Future<Output = Result<Option<T>, DbError>>,
+) -> Result<Option<T>, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    reserve_login_attempt(pool, &folded).await?;
+    let verdict = verify.await?;
+    if verdict.is_some() {
+        clear_login_attempts(pool, &folded).await?;
+    }
+    Ok(verdict)
+}
+
 #[derive(sqlx::FromRow)]
 struct CredentialVerificationRow {
     display_name: String,
@@ -5964,8 +6147,23 @@ struct CredentialVerificationRow {
 /// Verify an account password or app password.
 ///
 /// Every attempt costs two Argon2 computations under one permit, whether or
-/// not the account exists (see [`plan_credential_verification`]).
+/// not the account exists (see [`plan_credential_verification`]), and first
+/// reserves one of the name's [`LOGIN_ATTEMPT_LIMIT`] attempts: past it the
+/// answer is [`DbError::LoginThrottled`] and nothing is verified.
 pub async fn verify_credentials(
+    pool: &PgPool,
+    account: &str,
+    password: &str,
+) -> Result<Option<String>, DbError> {
+    throttled_password_check(
+        pool,
+        account,
+        verify_any_credential(pool, account, password),
+    )
+    .await
+}
+
+async fn verify_any_credential(
     pool: &PgPool,
     account: &str,
     password: &str,
@@ -6012,6 +6210,19 @@ pub async fn verify_credentials(
 
 /// Verify only an account's primary password.
 pub async fn verify_local_password(
+    pool: &PgPool,
+    account: &str,
+    password: &str,
+) -> Result<Option<String>, DbError> {
+    throttled_password_check(
+        pool,
+        account,
+        verify_primary_password(pool, account, password),
+    )
+    .await
+}
+
+async fn verify_primary_password(
     pool: &PgPool,
     account: &str,
     password: &str,
@@ -6136,27 +6347,30 @@ pub async fn change_local_password(
     .fetch_optional(pool)
     .await
     .map_err(query_error)?;
-    let Some(LocalCredentialRow {
-        credential_id,
-        argon2_hash,
-    }) = row
-    else {
-        spend_dummy_verification(current_password.to_string()).await;
+    let verified = throttled_password_check(pool, account, async {
+        let Some(LocalCredentialRow {
+            credential_id,
+            argon2_hash,
+        }) = row
+        else {
+            spend_dummy_verification(current_password.to_string()).await;
+            return Ok(None);
+        };
+        let matched = matching_credential_id(
+            vec![CredentialHash {
+                credential_id,
+                argon2_hash: argon2_hash.clone(),
+            }],
+            0,
+            current_password.to_string(),
+        )
+        .await?;
+        Ok(matched.map(|_| (credential_id, argon2_hash)))
+    })
+    .await?;
+    let Some((credential_id, argon2_hash)) = verified else {
         return Err(DbError::BadCredentials);
     };
-    if matching_credential_id(
-        vec![CredentialHash {
-            credential_id,
-            argon2_hash: argon2_hash.clone(),
-        }],
-        0,
-        current_password.to_string(),
-    )
-    .await?
-    .is_none()
-    {
-        return Err(DbError::BadCredentials);
-    }
     let new_hash = hash_password(new_password.to_string()).await?;
     let mut transaction = pool.begin().await.map_err(query_error)?;
     let swapped = sqlx::query(
@@ -7965,12 +8179,26 @@ pub async fn consume_oidc_backchannel_logout(
     Ok(deleted.rows_affected())
 }
 
-/// Revoke sessions named by a verified front-channel issuer/session pair.
+/// What a front-channel logout revoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrontchannelRevocation {
+    /// Browser sessions deleted.
+    pub revoked: u64,
+    /// Whether the session the request itself presented was one of them. Only
+    /// then may the answer clear the browser's session cookie: anyone can make
+    /// a browser load the logout URL with some `sid`, and clearing the cookie
+    /// regardless would sign every such visitor out (logout CSRF).
+    pub presented_session_revoked: bool,
+}
+
+/// Revoke sessions named by a verified front-channel issuer/session pair, and
+/// say whether `presented` (the request's own session token) was among them.
 pub async fn revoke_oidc_frontchannel_sessions(
     pool: &PgPool,
     issuer: &str,
     sid: &str,
-) -> Result<u64, DbError> {
+    presented: Option<&str>,
+) -> Result<FrontchannelRevocation, DbError> {
     let mut transaction = pool.begin().await.map_err(query_error)?;
     let affected_accounts: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT a.name_folded
@@ -7982,12 +8210,14 @@ pub async fn revoke_oidc_frontchannel_sessions(
     .fetch_all(&mut *transaction)
     .await
     .map_err(query_error)?;
-    let deleted = sqlx::query("DELETE FROM web_sessions WHERE oidc_issuer = $1 AND oidc_sid = $2")
-        .bind(issuer)
-        .bind(sid)
-        .execute(&mut *transaction)
-        .await
-        .map_err(query_error)?;
+    let deleted: Vec<Vec<u8>> = sqlx::query_scalar(
+        "DELETE FROM web_sessions WHERE oidc_issuer = $1 AND oidc_sid = $2 RETURNING token_hash",
+    )
+    .bind(issuer)
+    .bind(sid)
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(query_error)?;
     for account in affected_accounts {
         insert_audit_log_with(
             &mut *transaction,
@@ -7999,7 +8229,11 @@ pub async fn revoke_oidc_frontchannel_sessions(
         .await?;
     }
     transaction.commit().await.map_err(query_error)?;
-    Ok(deleted.rows_affected())
+    let presented = presented.map(token_hash);
+    Ok(FrontchannelRevocation {
+        revoked: deleted.len() as u64,
+        presented_session_revoked: presented.is_some_and(|hash| deleted.contains(&hash)),
+    })
 }
 
 #[derive(sqlx::FromRow, Debug, PartialEq, Eq)]

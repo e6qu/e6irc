@@ -258,6 +258,16 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
+    if state.config.reserved_account_names.reserves(&nick) {
+        register_fail(
+            state,
+            conn,
+            "BAD_ACCOUNT_NAME",
+            &nick,
+            "That account name is reserved for a server administrator and cannot be registered",
+        );
+        return;
+    }
     if state.config.registration_require_email && *email == "*" {
         register_fail(
             state,
@@ -311,7 +321,7 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // across a churn of short-lived connections (each of which spends only its
     // own budget). It refills slowly — account creation is rare per genuine
     // client — so a legitimate retry passes while a mint loop is throttled.
-    if !state.registration_rate_ok(&state.sessions[&conn].host.clone()) {
+    if !state.registration_rate_ok(conn) {
         register_fail(
             state,
             conn,

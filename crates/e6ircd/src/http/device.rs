@@ -822,6 +822,13 @@ pub(super) async fn admin_create_account_invitation(
             Some("The account must be a valid IRC nickname of at most 64 bytes."),
         );
     }
+    if state.account_name_reserved(&body.account) {
+        return problem(
+            StatusCode::CONFLICT,
+            "Account name unavailable",
+            Some(super::RESERVED_ACCOUNT_NAME_DETAIL),
+        );
+    }
     let contact_email = match super::parse_optional_contact_email(body.contact_email.as_deref()) {
         Ok(ce) => ce,
         Err(msg) => return problem(StatusCode::BAD_REQUEST, "Invalid contact email", Some(&msg)),

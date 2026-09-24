@@ -68,15 +68,43 @@ struct Session {
     http: super::BridgeHttp,
     base: String,
     token: String,
-    user_id: String,
     rooms: Rooms,
+    /// Who each sender is shown as; the logged-in account is its owner.
+    senders: super::BridgedSenders,
 }
 
 impl Session {
+    fn new(login: Login, base: String, rooms: Rooms) -> Self {
+        let senders = super::BridgedSenders::new(matrix_account(&login.user_id));
+        Self {
+            http: login.http,
+            base,
+            token: login.access_token,
+            rooms,
+            senders,
+        }
+    }
+
     /// The logged-in account as IRC shows it: the session's nick, and the
     /// prefix of every echo.
     fn identity(&self) -> super::irc_driver::SelfIdentity {
-        super::bridged_identity("matrix", matrix_localpart(&self.user_id))
+        self.senders.own().clone()
+    }
+}
+
+/// A Matrix user as a bridge shows it: keyed by the full user id (a localpart
+/// is unique only on its homeserver), named by its localpart, at its
+/// homeserver.
+fn matrix_account(user_id: &str) -> super::ProviderAccount<'_> {
+    let (localpart, server) = user_id
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(':'))
+        .unwrap_or((user_id, "matrix"));
+    super::ProviderAccount {
+        id: user_id,
+        name: localpart,
+        user: localpart,
+        host: server,
     }
 }
 
@@ -277,13 +305,7 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
     let stored = shared.position();
     let mut session = match &stored {
         Some(position) => match shared.login().await {
-            Ok(login) => Session {
-                http: login.http,
-                base: shared.base().to_string(),
-                token: login.access_token,
-                user_id: login.user_id,
-                rooms: position.rooms.clone(),
-            },
+            Ok(login) => Session::new(login, shared.base().to_string(), position.rooms.clone()),
             Err(e) => return e.into_outcome("matrix"),
         },
         None => match connect(shared).await {
@@ -319,7 +341,7 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
                     let initial = since.is_none();
                     since = Some(batch.next.clone());
                     if !initial
-                        && let Some(outcome) = relay_batch(shared, &session, ends, batch)
+                        && let Some(outcome) = relay_batch(shared, &mut session, ends, batch)
                     {
                         return outcome;
                     }
@@ -362,7 +384,7 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
 /// refused like the configuration it now is.
 fn relay_batch(
     shared: &Shared,
-    session: &Session,
+    session: &mut Session,
     ends: &DriverEnds,
     batch: SyncBatch,
 ) -> Option<super::SessionOutcome> {
@@ -380,7 +402,7 @@ fn relay_batch(
         let Some(channel) = session.rooms.room_to_channel.get(&m.room_id) else {
             continue;
         };
-        for line in m.lines(channel) {
+        for line in m.lines(channel, &mut session.senders) {
             ends.emit_line(line);
         }
     }
@@ -475,13 +497,7 @@ async fn connect(shared: &Shared) -> Result<Session, super::ConnectFail> {
     use super::{ConfigurationRefusal, ConnectFail, NetworkFailure};
     let config = &shared.config;
     let login = shared.login().await?;
-    let mut session = Session {
-        http: login.http,
-        base: shared.base().to_string(),
-        token: login.access_token,
-        user_id: login.user_id,
-        rooms: Rooms::default(),
-    };
+    let mut session = Session::new(login, shared.base().to_string(), Rooms::default());
     let unmappable = |detail: String| {
         ConnectFail::Configuration(ConfigurationRefusal::new(
             NetworkFailure::ChannelMappingFailed,
@@ -671,17 +687,22 @@ const MALFORMED: &str = "malformed";
 
 impl Incoming {
     /// The IRC lines this message is in `channel`.
-    fn lines(&self, channel: &str) -> Vec<String> {
+    fn lines(&self, channel: &str, senders: &mut super::BridgedSenders) -> Vec<String> {
         match &self.content {
             IncomingContent::Relay { sender, message } => {
-                super::render_bridged("matrix", matrix_localpart(sender), channel, message)
+                super::render_bridged(&senders.identity(matrix_account(sender)), channel, message)
             }
-            IncomingContent::Unrelayed { sender, what } => vec![super::unrelayed_notice(
-                "matrix",
-                channel,
-                what,
-                sender.as_deref().map(matrix_localpart),
-            )],
+            IncomingContent::Unrelayed { sender, what } => {
+                let shown = sender
+                    .as_deref()
+                    .map(|sender| senders.identity(matrix_account(sender)).nick);
+                vec![super::unrelayed_notice(
+                    "matrix",
+                    channel,
+                    what,
+                    shown.as_deref(),
+                )]
+            }
         }
     }
 }
@@ -1029,13 +1050,6 @@ fn alias_to_channel(alias: &str) -> String {
     }
 }
 
-fn matrix_localpart(sender: &str) -> &str {
-    sender
-        .strip_prefix('@')
-        .and_then(|s| s.split_once(':').map(|(l, _)| l))
-        .unwrap_or(sender)
-}
-
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -1261,7 +1275,7 @@ mod tests {
         assert!(
             lines(&mut events)
                 .iter()
-                .any(|line| line == ":alice!alice@matrix PRIVMSG #room :said during the outage"),
+                .any(|line| line == ":alice!alice@hs.example PRIVMSG #room :said during the outage"),
         );
     }
 
@@ -1293,7 +1307,7 @@ mod tests {
             .collect();
         assert_eq!(
             relayed,
-            [":bot!bot@matrix PRIVMSG #room :sent from my phone"],
+            [":bot!bot@hs.example PRIVMSG #room :sent from my phone"],
             "exactly the other device's post is relayed"
         );
         // The session is the logged-in account, in the bridged room.
@@ -1446,7 +1460,7 @@ mod tests {
         assert!(echo.tag("time").is_some(), "{line}");
         assert!(echo.tag("+draft/reply").is_some(), "{line}");
         assert!(
-            line.ends_with(" :bot!bot@matrix PRIVMSG #ROOM :hello"),
+            line.ends_with(" :bot!bot@hs.example PRIVMSG #ROOM :hello"),
             "{line}"
         );
         assert_eq!(
@@ -1689,16 +1703,17 @@ mod tests {
     fn maps_alias_and_sender() {
         assert_eq!(alias_to_channel("#room:localhost"), "#room");
         assert_eq!(alias_to_channel("#plain"), "#plain");
-        assert_eq!(matrix_localpart("@alice:localhost"), "alice");
-        assert_eq!(matrix_localpart("plain"), "plain");
+        assert_eq!(matrix_account("@alice:localhost").name, "alice");
+        assert_eq!(matrix_account("@alice:localhost").host, "localhost");
+        assert_eq!(matrix_account("plain").name, "plain");
+        let mut senders = super::super::BridgedSenders::new(matrix_account("@bot:localhost"));
         assert_eq!(
             super::super::render_bridged(
-                "matrix",
-                matrix_localpart("@alice:localhost"),
+                &senders.identity(matrix_account("@alice:localhost")),
                 "#room",
                 &super::super::Inbound::new(super::super::InboundKind::Message, "hi there")
             ),
-            vec![":alice!alice@matrix PRIVMSG #room :hi there"]
+            vec![":alice!alice@localhost PRIVMSG #room :hi there"]
         );
     }
 
@@ -1713,9 +1728,9 @@ mod tests {
         // A malicious homeserver sets the sender to smuggle a space and IRC
         // metacharacters into the source-prefix position; the nick token must
         // neutralize them so no second source/command is forged.
+        let mut senders = super::super::BridgedSenders::new(matrix_account("@bot:localhost"));
         let lines = super::super::render_bridged(
-            "matrix",
-            matrix_localpart("@evil x!y@z NOTICE victim :hi:localhost"),
+            &senders.identity(matrix_account("@evil x!y@z NOTICE victim :hi:localhost")),
             "#room",
             &super::super::Inbound::new(super::super::InboundKind::Message, "body"),
         );
@@ -1738,10 +1753,11 @@ mod tests {
     }
 
     fn relayed_lines(batch: SyncBatch) -> Vec<String> {
+        let mut senders = super::super::BridgedSenders::new(matrix_account("@me:example"));
         batch
             .messages
             .iter()
-            .flat_map(|m| m.lines("#room"))
+            .flat_map(|m| m.lines("#room", &mut senders))
             .collect()
     }
 
@@ -1781,22 +1797,22 @@ mod tests {
         assert_eq!(
             relayed_lines(batch),
             [
-                ":alice!alice@matrix PRIVMSG #room :hello",
-                ":alice!alice@matrix PRIVMSG #room :\u{1}ACTION waves\u{1}",
-                ":bot!bot@matrix NOTICE #room :build passed",
-                ":alice!alice@matrix PRIVMSG #room :cat.png \
+                ":alice!alice@example PRIVMSG #room :hello",
+                ":alice!alice@example PRIVMSG #room :\u{1}ACTION waves\u{1}",
+                ":bot!bot@example NOTICE #room :build passed",
+                ":alice!alice@example PRIVMSG #room :cat.png \
                  <https://hs.example/_matrix/media/v3/download/example.org/AbC_12-x>",
-                ":alice!alice@matrix PRIVMSG #room :notes.txt \
+                ":alice!alice@example PRIVMSG #room :notes.txt \
                  <https://hs.example/_matrix/media/v3/download/example.org/f1>",
-                ":alice!alice@matrix PRIVMSG #room :song.ogg \
+                ":alice!alice@example PRIVMSG #room :song.ogg \
                  <https://hs.example/_matrix/media/v3/download/example.org/a1>",
-                ":alice!alice@matrix PRIVMSG #room :clip.mp4 \
+                ":alice!alice@example PRIVMSG #room :clip.mp4 \
                  <https://hs.example/_matrix/media/v3/download/example.org/v1>",
-                ":alice!alice@matrix PRIVMSG #room :the pub <geo:51.5,-0.1>",
+                ":alice!alice@example PRIVMSG #room :the pub <geo:51.5,-0.1>",
                 ":*bnc* NOTICE #room :matrix: a m.image message from alice was not relayed",
                 ":*bnc* NOTICE #room :matrix: a m.key.verification.request message from alice \
                  was not relayed",
-                ":alice!alice@matrix PRIVMSG #room :VERSION",
+                ":alice!alice@example PRIVMSG #room :VERSION",
             ]
         );
 
@@ -1856,7 +1872,7 @@ mod tests {
                 ":*bnc* NOTICE #room :matrix: a malformed message from alice was not relayed",
                 ":*bnc* NOTICE #room :matrix: a malformed message from an unknown sender was \
                  not relayed",
-                ":bob!bob@matrix PRIVMSG #room :still relayed",
+                ":bob!bob@example PRIVMSG #room :still relayed",
             ]
         );
     }

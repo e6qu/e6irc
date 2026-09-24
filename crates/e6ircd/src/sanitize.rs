@@ -98,6 +98,63 @@ pub(crate) fn ctcp_action(text: &str) -> Option<&str> {
     Some(rest.strip_suffix('\u{1}').unwrap_or(rest))
 }
 
+/// What an echo shows in place of a [`sensitive_service_command`].
+pub(crate) const SENSITIVE_SERVICE_COMMAND_REDACTED: &str = "[sensitive services command redacted]";
+
+/// Account services an IRC client authenticates to by message: NickServ (and
+/// its `NS` alias) as Atheme, Anope and this server run it, QuakeNet's `Q`,
+/// Undernet's `X`, and GameSurge's `AuthServ`.
+const ACCOUNT_SERVICES: &[&str] = &["NickServ", "NS", "Q", "X", "AuthServ"];
+
+/// Commands to those services that can carry a password, an email address, a
+/// reset or recovery token, or a verification code.
+const SENSITIVE_SERVICE_COMMANDS: &[&str] = &[
+    "REGISTER",
+    "IDENTIFY",
+    "ID",
+    "LOGIN",
+    "AUTH",
+    "GHOST",
+    "RECOVER",
+    "REGAIN",
+    "RELEASE",
+    "SENDPASS",
+    "SETPASS",
+    "RESETPASS",
+    "VERIFY",
+    "CONFIRM",
+    "DROP",
+    "GROUP",
+];
+
+/// `SET` settings to those services that carry a secret or a contact address.
+const SENSITIVE_SERVICE_SETTINGS: &[&str] = &["PASSWORD", "PASS", "EMAIL", "PUBKEY"];
+
+/// Whether a message to `target` saying `text` is an account-services command
+/// that can carry a secret. The one list every echo consults — the bouncer's
+/// synthesized and upstream-reflected echoes (which reach the persistent
+/// backlog) and the core's echo of a line to its own services — so a command
+/// cannot be redacted on one path and replayed verbatim on another. The whole
+/// argument string is redacted because service dialects disagree about which
+/// position is secret.
+pub(crate) fn sensitive_service_command(target: &str, text: &str) -> bool {
+    let service = target.split_once('@').map_or(target, |(name, _)| name);
+    if !ACCOUNT_SERVICES
+        .iter()
+        .any(|known| service.eq_ignore_ascii_case(known))
+    {
+        return false;
+    }
+    let is_one_of = |word: &str, list: &[&str]| list.iter().any(|w| word.eq_ignore_ascii_case(w));
+    let mut words = text.split_whitespace();
+    let command = words.next().unwrap_or_default();
+    is_one_of(command, SENSITIVE_SERVICE_COMMANDS)
+        || (command.eq_ignore_ascii_case("SET")
+            && words
+                .next()
+                .is_some_and(|setting| is_one_of(setting, SENSITIVE_SERVICE_SETTINGS)))
+}
+
 /// Make one upstream line safe to buffer or broadcast.
 pub(crate) fn upstream_line(line: String) -> String {
     let line = if line.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {

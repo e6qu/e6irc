@@ -1039,6 +1039,7 @@ fn operations() -> serde_json::Value {
                     "responses": { "201": { "description": "the app password (shown once)" },
                         "400": { "description": "invalid account, password, or label" },
                         "401": { "description": "bad credentials" },
+                        "429": { "description": "the account name has spent its password attempts for the window, or this address its authentication budget; Retry-After says when to try again" },
                         "503": { "description": "no database configured" } }
                 }
             },
@@ -1258,7 +1259,7 @@ fn operations() -> serde_json::Value {
             "/api/v1/auth/oidc/frontchannel-logout": {
                 "get": {
                     "summary": "OIDC Front-Channel Logout 1.0 receiver",
-                    "description": "Revokes local sessions correlated by the exact configured issuer and sid, clears the browser session cookie, and returns a non-cacheable response.",
+                    "description": "Revokes local sessions correlated by the exact configured issuer and sid and returns a non-cacheable response. The browser session cookie is cleared only when it named one of the sessions this logout revoked, so a page that makes a browser load this URL cannot sign out anyone else.",
                     "parameters": [
                         { "name": "iss", "in": "query", "required": true,
                             "schema": { "type": "string", "format": "uri" } },
@@ -1418,6 +1419,7 @@ fn operations() -> serde_json::Value {
                         "400": { "description": "password is empty or exceeds 512 bytes" },
                         "401": { "description": "current primary password is incorrect" },
                         "409": { "description": "current_password omitted but a primary password already exists" },
+                        "429": { "description": "the account has spent its password attempts for the window; Retry-After says when to try again" },
                         "503": { "description": "database unavailable" }
                     }
                 }
@@ -1845,7 +1847,7 @@ fn operations() -> serde_json::Value {
                     "responses": {
                         "201": account_created_response["201"],
                         "400": { "description": "invalid account, password, or contact email" },
-                        "409": { "description": "account name exists or is retired" },
+                        "409": { "description": "account name exists, is retired, or is a configured administrator (created only by OIDC sign-in or the bootstrap/recovery flows)" },
                         "503": { "description": "database unavailable" }
                     }
                 }
@@ -1955,7 +1957,7 @@ fn operations() -> serde_json::Value {
                     "responses": {
                         "201": invitation_created_response["201"],
                         "400": { "description": "invalid account, email, or lifetime" },
-                        "409": { "description": "name unavailable or administrator invitation cap reached" },
+                        "409": { "description": "name unavailable (exists, retired, invited, or a configured administrator) or administrator invitation cap reached" },
                         "503": { "description": "database or absolute public URL unavailable" }
                     }
                 }

@@ -69,10 +69,25 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 state.service_notice(conn, "NickServ", "You are already logged in.");
                 return;
             }
+            let name = state.sessions[&conn]
+                .nick()
+                .map(String::from)
+                .expect("registered");
+            if state.config.reserved_account_names.reserves(&name) {
+                state.service_notice(
+                    conn,
+                    "NickServ",
+                    &format!(
+                        "\x02{name}\x02 is reserved for a server administrator and cannot be \
+                         registered."
+                    ),
+                );
+                return;
+            }
             // Per-IP account-creation throttle (mirrors the REGISTER path): the
             // per-connection budget alone doesn't stop one address minting
             // accounts across a churn of short-lived connections.
-            if !state.registration_rate_ok(&state.sessions[&conn].host.clone()) {
+            if !state.registration_rate_ok(conn) {
                 state.service_notice(
                     conn,
                     "NickServ",
@@ -88,10 +103,6 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
             if !credential_attempt_ok(state, conn) {
                 return;
             }
-            let name = state.sessions[&conn]
-                .nick()
-                .map(String::from)
-                .expect("registered");
             let request = crate::core::DbRequest::CreateAccount {
                 conn,
                 name,

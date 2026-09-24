@@ -1420,6 +1420,8 @@ pub enum DbRequest {
         /// of two *accounts*. Never a conversation with an unauthenticated
         /// (`~nick`) party — those are not stored (see `record_history`).
         target: String,
+        /// The oldest history this reader may see.
+        floor: HistoryFloor,
         display: String,
         batch_ref: String,
         /// Request-time capabilities that affect history rendering.
@@ -1434,8 +1436,10 @@ pub enum DbRequest {
     /// [`Input::TargetsPage`].
     QueryTargets {
         conn: ConnId,
-        /// Casefolded channel targets the requester may see.
-        channels: Vec<String>,
+        /// Casefolded channel targets the requester may see, each with the
+        /// oldest history the requester may see of it: a channel whose only
+        /// activity is older is not the requester's buffer.
+        channels: Vec<(String, HistoryFloor)>,
         /// The requester's account identity, used to find the stored
         /// direct-message conversations they take part in. Their correspondents
         /// are buffers too, and a bouncer reconnecting needs them alongside
@@ -1618,6 +1622,43 @@ pub enum HistoryFault {
     /// buffer. Not an empty page: a client resuming from a msgid that is gone
     /// would read "nothing newer" as "up to date".
     UnknownMsgid { subcommand: &'static str },
+}
+
+/// The oldest history a read may return, decided by who is reading. A
+/// channel's name outlives its occupants: once the last member leaves it is
+/// gone, and whoever joins the name next creates a new incarnation. The stored
+/// record of the old one is not theirs to read — only the founder and the
+/// access list of a registered channel keep the whole record, as over REST.
+/// Every history read takes one of these, so none can forget the bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryFloor {
+    /// The whole stored record: a conversation (its key is derived from the
+    /// reader), or a registered channel read by its founder or an access-list
+    /// member.
+    Whole,
+    /// Only messages stamped at or after this time: the current incarnation
+    /// of a channel, for everyone else.
+    Since(e6irc_proto::time::Millis),
+}
+
+impl HistoryFloor {
+    /// Whether a message stamped `ts` is readable under this floor.
+    pub fn admits(self, ts: e6irc_proto::time::Millis) -> bool {
+        match self {
+            Self::Whole => true,
+            Self::Since(since) => ts >= since,
+        }
+    }
+
+    /// The bound as the millisecond value the history queries compare `ts`
+    /// against (`ts >= to_timestamp(bound / 1000)`): the epoch for the whole
+    /// record, before which no message can be stamped.
+    pub fn millis(self) -> e6irc_proto::time::Millis {
+        match self {
+            Self::Whole => e6irc_proto::time::Millis::from_millis(0),
+            Self::Since(since) => since,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1835,6 +1876,12 @@ pub enum DbReply {
     },
     PasswordRejected {
         origin: CredentialOrigin,
+    },
+    /// The account name has spent its password attempts for the current
+    /// window; nothing was verified.
+    PasswordThrottled {
+        origin: CredentialOrigin,
+        retry_after: crate::db::LoginRetryAfter,
     },
     AccountCreated {
         account: String,
@@ -3032,6 +3079,7 @@ mod ingress_tests {
             mono_clock,
             command_flood: None,
             registration_burst: None,
+            reserved_account_names: crate::identity::ReservedAccountNames::default(),
         }
     }
 
@@ -5069,7 +5117,7 @@ mod ingress_tests {
             invite_only: true,
             ..ChanModes::default()
         };
-        let mut channel = Channel::new("#chat".into(), None, modes, 0);
+        let mut channel = Channel::for_test("#chat", modes);
         channel.add_member(
             Recipient::new(
                 SessionOwner::new(ConnId(2), CoreShardId(0)),
@@ -5092,7 +5140,7 @@ mod ingress_tests {
             .state
             .channels
             .entry(other_key)
-            .or_insert(Channel::new(other.into(), None, ChanModes::default(), 0));
+            .or_insert(Channel::for_test(other, ChanModes::default()));
         let first_worker = tokio::spawn(CoreWorker::new(first, first_rx, ingress.clone()).run());
         let second_worker = tokio::spawn(CoreWorker::new(second, second_rx, ingress.clone()).run());
         second_tx
@@ -5422,7 +5470,7 @@ mod ingress_tests {
             line: b"USER sender 0 * :Sender".to_vec(),
         });
         let key = first.state.chan_key("#chat");
-        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        let mut channel = Channel::for_test("#chat", ChanModes::default());
         channel.add_member(
             Recipient::new(
                 SessionOwner::new(ConnId(1), CoreShardId(1)),
@@ -5487,7 +5535,7 @@ mod ingress_tests {
             ConnectionTransport::Tcp,
         );
         let key = first.state.chan_key("#chat");
-        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        let mut channel = Channel::for_test("#chat", ChanModes::default());
         channel.add_member(
             Recipient::new(
                 SessionOwner::new(ConnId(2), CoreShardId(0)),

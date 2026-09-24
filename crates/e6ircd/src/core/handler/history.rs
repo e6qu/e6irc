@@ -149,6 +149,17 @@ pub(super) fn chathistory_fail(
 /// been evicted, a request that reaches older than the ring is resolved
 /// against the `messages` table by composite `(ts, id)` position.
 pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    let account = state
+        .sessions
+        .get(&conn)
+        .and_then(|session| session.account().map(str::to_owned));
+    chathistory(state, conn, p, account.as_deref());
+}
+
+/// CHATHISTORY for the requester `conn`, authenticated as `account`: passed in
+/// rather than read from a session, because a channel's owner answers for a
+/// requester whose session lives on another shard.
+fn chathistory(state: &mut ServerState, conn: ConnId, p: &[&str], account: Option<&str>) {
     let Some(caps) = state.reply_caps(conn) else {
         return;
     };
@@ -200,10 +211,13 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
     // participant in a direct-message conversation, which the requester is a
     // participant of by construction — the key is derived from their own nick,
     // so a client can only ever ask for a conversation it is part of.
-    let (hist_key, stored) = if target.starts_with('#') {
+    let (hist_key, stored, floor) = if target.starts_with('#') {
         let key = state.chan_key(target);
-        let is_member = state.is_channel_member(conn, &key);
-        if !is_member {
+        let floor = state
+            .is_channel_member(conn, &key)
+            .then(|| state.channel_history_floor(&key, account))
+            .flatten();
+        let Some(floor) = floor else {
             chathistory_fail(
                 state,
                 conn,
@@ -212,9 +226,9 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
                 "You are not on that channel",
             );
             return;
-        }
+        };
         let history_key = crate::core::state::HistoryKey::from(&key);
-        (history_key, true)
+        (history_key, true, floor)
     } else {
         if state.sessions[&conn].nick().is_none() {
             chathistory_fail(
@@ -233,7 +247,7 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
         // unauthenticated party lives in the ring alone and is never asked of
         // the database (see `record_history`).
         let stored = !me.starts_with('~') && !peer.starts_with('~');
-        (key, stored)
+        (key, stored, crate::core::HistoryFloor::Whole)
     };
     // Parse the subcommand once into a typed value: the ring resolver and the DB
     // query builder both consume it, so they can no longer enumerate the
@@ -342,7 +356,8 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
             return;
         }
     };
-    let (history, complete) = state.history_ring(&hist_key);
+    let (mut history, complete) = state.history_ring(&hist_key);
+    history.retain(|entry| floor.admits(entry.ts));
 
     // Pure resolution of the requested window against the in-memory ring.
     // Extracted so the arithmetic — which has carried off-by-one and
@@ -434,6 +449,7 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
         let request = crate::core::DbRequest::QueryHistory {
             conn,
             target: hist_key.as_str().to_string(),
+            floor,
             display: display.clone(),
             batch_ref,
             caps: response_caps,
@@ -534,7 +550,7 @@ pub(super) fn history_on_owner(
     assert_eq!(owner.key(), &key, "CHATHISTORY owner does not match target");
     let conn = super::begin_channel_capture(state, &actor, label);
     let parameters: Vec<&str> = request.parameters.iter().map(String::as_str).collect();
-    cmd_chathistory(state, conn, &parameters);
+    chathistory(state, conn, &parameters, actor.account.as_deref());
     let capture = state.capture.take().expect("CHATHISTORY capture installed");
     // Only a queued database page leaves the requester waiting. An answer
     // with no lines (an empty page for a client without `batch`) is still the
@@ -654,7 +670,17 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
         .collect();
 
     if state.config.sasl_enabled {
-        let channels = keys.iter().map(|k| k.as_str().to_string()).collect();
+        // Each channel is bounded as a single-target read of it would be; a
+        // channel whose only stored activity predates what this requester may
+        // read is not their buffer.
+        let account = state.sessions[&conn].account().map(str::to_owned);
+        let channels = keys
+            .iter()
+            .filter_map(|key| {
+                let floor = state.channel_history_floor(key, account.as_deref())?;
+                Some((key.as_str().to_string(), floor))
+            })
+            .collect();
         // The database holds the channels and the conversations between two
         // accounts. One with an unauthenticated party exists only in the rings
         // (see `record_history`), so those ride along to be merged in.

@@ -127,6 +127,9 @@ pub(crate) struct PublicChannel {
     /// ring lives with the channel's owner; with no database it is the whole
     /// record, and CHATHISTORY TARGETS is answered from this on every shard.
     latest_message: Option<e6irc_proto::time::Millis>,
+    /// When this incarnation was created ([`Channel::created_at`]), so a
+    /// shard that does not own the channel bounds its history the same way.
+    created_at: e6irc_proto::time::Millis,
     /// The masks that silence a plain member, so the shard holding a session
     /// can refuse its NICK while it is banned or quieted in a channel another
     /// shard owns (ERR_BANNICKCHANGE) without a round trip.
@@ -168,6 +171,12 @@ impl MembershipDirectory {
         let channels = self.channels.lock().expect("membership directory poisoned");
         let channel = channels.get(key)?;
         Some((channel.name.clone(), channel.latest_message?))
+    }
+
+    /// When a channel's current incarnation was created.
+    fn channel_created_at(&self, key: &ChanKey) -> Option<e6irc_proto::time::Millis> {
+        let channels = self.channels.lock().expect("membership directory poisoned");
+        channels.get(key).map(|channel| channel.created_at)
     }
 
     /// `target`'s channels as WHOIS shows them to `requester`: rank sigil and
@@ -959,6 +968,9 @@ pub struct CoreConfig {
     /// rare per real client, so a small burst suffices to blunt bulk-account
     /// abuse without hindering a genuine sign-up).
     pub registration_burst: Option<usize>,
+    /// Account names account registration refuses: the configured
+    /// administrators (see [`crate::identity::ReservedAccountNames`]).
+    pub reserved_account_names: crate::identity::ReservedAccountNames,
 }
 
 /// SASL negotiation progress of one connection.
@@ -1080,6 +1092,9 @@ impl PendingServiceReply {
 pub(crate) struct Session {
     output: SessionOutput,
     pub host: String,
+    /// What this session's per-address limits are charged to, fixed from the
+    /// host it opened with (a later SETHOST changes only what is shown).
+    limit_key: crate::net::SessionLimitKey,
     pub transport: crate::core::ConnectionTransport,
     /// Registration state and the identity fields, as one sum type (see
     /// [`Registration`]): a registered connection *has* a nick/user/realname.
@@ -2727,9 +2742,13 @@ pub(crate) struct Channel {
     /// authorize entry into an unrelated later channel reusing the name
     /// (a +i bypass). Bounded by `INVITE_LIMIT` per channel.
     pub invited: HashSet<ConnId>,
-    /// Unix **seconds** — RPL_CREATIONTIME reports whole seconds, so this is
-    /// deliberately coarser than the millisecond `Config::clock`.
-    pub created_at_secs: u64,
+    /// When this incarnation of the channel was created, on the same
+    /// millisecond clock that stamps its messages: RPL_CREATIONTIME reports it
+    /// in whole seconds, and it is the oldest history a reader without a
+    /// registered relationship to the channel may see ([`HistoryFloor`]).
+    ///
+    /// [`HistoryFloor`]: crate::core::HistoryFloor
+    pub created_at: e6irc_proto::time::Millis,
 }
 
 /// Proof that a `+s` (secret) channel must look non-existent to a connection.
@@ -2744,7 +2763,12 @@ pub(crate) struct Channel {
 pub struct Hidden(());
 
 impl Channel {
-    pub fn new(name: String, topic: Option<Topic>, modes: ChanModes, created_at_secs: u64) -> Self {
+    pub fn new(
+        name: String,
+        topic: Option<Topic>,
+        modes: ChanModes,
+        created_at: e6irc_proto::time::Millis,
+    ) -> Self {
         Self {
             name,
             topic,
@@ -2756,8 +2780,19 @@ impl Channel {
             ban_exceptions: Vec::new(),
             invite_exceptions: Vec::new(),
             invited: HashSet::new(),
-            created_at_secs,
+            created_at,
         }
+    }
+
+    /// A channel named `name` with `modes`, created at the epoch.
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str, modes: ChanModes) -> Self {
+        Self::new(
+            name.to_string(),
+            None,
+            modes,
+            e6irc_proto::time::Millis::from_millis(0),
+        )
     }
 
     pub fn is_member(&self, conn: ConnId) -> bool {
@@ -3220,11 +3255,13 @@ pub(crate) struct ServerState {
     /// it is the deferred reply itself, which the held output waits behind.
     pub emitting_deferred: Option<ConnId>,
     /// Per-client-IP account-creation token buckets (only used when
-    /// `registration_burst` is set): folded host → (tokens, monotonic
+    /// `registration_burst` is set): the session's limit key (an IPv6
+    /// client's whole `/64`) → (tokens, monotonic
     /// millisecond refill has been credited through). Bounds bulk-account
     /// abuse from one address; hard-capped at `MAX_REGISTRATION_BUCKETS` so
     /// a distinct-IP flood can't grow it without bound.
-    pub registration_buckets: HashMap<String, (f64, e6irc_proto::time::MonoMillis)>,
+    pub registration_buckets:
+        HashMap<crate::net::SessionLimitKey, (f64, e6irc_proto::time::MonoMillis)>,
     /// HTTP admin requests waiting for a registered-channel delete verdict.
     /// The DB queue carries only the numeric ID, keeping `DbRequest` clonable
     /// and comparable while the one-shot responder remains core-owned.
@@ -3766,6 +3803,7 @@ impl ServerState {
                     .history
                     .get(&HistoryKey::from(&key))
                     .and_then(|ring| ring.entries.iter().map(|entry| entry.ts).max()),
+                created_at: channel.created_at,
                 silencing: SilencingMasks {
                     bans: channel.bans.clone(),
                     quiets: channel.quiets.clone(),
@@ -4074,17 +4112,19 @@ impl ServerState {
         }
     }
 
-    /// Spend one token from `host`'s account-creation bucket. Returns `false`
+    /// Spend one token from `conn`'s account-creation bucket, charged to the
+    /// limit key the session opened with. Returns `false`
     /// (rate-limited) when the bucket is empty; always `true` when
     /// `registration_burst` is unset. The bucket refills to full over
     /// `REGISTRATION_REFILL_WINDOW_MS`; fully-refilled entries are pruned, and
     /// the map is hard-capped at `MAX_REGISTRATION_BUCKETS` so it can't grow
     /// without bound even under a distinct-IP flood. Mirrors the HTTP
     /// `spend_auth_budget` limiter, but on the core's monotonic clock.
-    pub fn registration_rate_ok(&mut self, host: &str) -> bool {
+    pub fn registration_rate_ok(&mut self, conn: ConnId) -> bool {
         let Some(burst) = self.config.registration_burst else {
             return true;
         };
+        let key = self.sessions[&conn].limit_key.clone();
         let burst = burst as f64;
         let now = (self.config.mono_clock)();
         let refill_per_ms = burst / REGISTRATION_REFILL_WINDOW_MS as f64;
@@ -4098,7 +4138,7 @@ impl ServerState {
             // room — its bucket simply resets to a fresh burst next time, which
             // is harmless — so memory stays bounded regardless of source spread.
             if buckets.len() >= MAX_REGISTRATION_BUCKETS
-                && !buckets.contains_key(host)
+                && !buckets.contains_key(&key)
                 && let Some(oldest) = buckets
                     .iter()
                     .min_by_key(|(_, (_, last))| *last)
@@ -4107,7 +4147,7 @@ impl ServerState {
                 buckets.remove(&oldest);
             }
         }
-        let entry = buckets.entry(host.to_string()).or_insert((burst, now));
+        let entry = buckets.entry(key).or_insert((burst, now));
         // The refill watermark is monotonic; guard against a non-monotonic
         // source as defense in depth (same as the command-flood bucket).
         if now < entry.1 {
@@ -4656,6 +4696,35 @@ impl ServerState {
         self.memberships.channel_activity(key)
     }
 
+    /// The oldest history of channel `key` that `account` may read, or `None`
+    /// when no such channel exists: the founder and access list of a
+    /// registered channel keep its whole record (the rule REST applies), and
+    /// everyone else sees only the current incarnation, created when the
+    /// channel last came into being. The owner's live channel answers when
+    /// this shard owns it, the published record when another shard does.
+    pub(crate) fn channel_history_floor(
+        &self,
+        key: &ChanKey,
+        account: Option<&str>,
+    ) -> Option<crate::core::HistoryFloor> {
+        let created_at = match self.channels.get(key) {
+            Some(channel) => channel.created_at,
+            None => self.memberships.channel_created_at(key)?,
+        };
+        let keeps_whole_record = account.is_some_and(|account| {
+            self.is_founder(key, account)
+                || self
+                    .channel_options
+                    .access_flags(key, &self.account_key(account))
+                    .is_some()
+        });
+        Some(if keeps_whole_record {
+            crate::core::HistoryFloor::Whole
+        } else {
+            crate::core::HistoryFloor::Since(created_at)
+        })
+    }
+
     /// The ring under `key` gained or lost entries. When it is a channel's,
     /// what this shard publishes about that channel is out of date.
     fn channel_ring_changed(&mut self, key: &HistoryKey) {
@@ -4791,6 +4860,7 @@ impl ServerState {
             conn,
             Session {
                 output: SessionOutput::new(tx),
+                limit_key: crate::net::PeerLimitKey::for_session_host(&host),
                 host,
                 transport,
                 reg: Registration::Registering {
@@ -5882,6 +5952,7 @@ mod session_store_tests {
                 mono_clock,
                 command_flood: None,
                 registration_burst: None,
+                reserved_account_names: crate::identity::ReservedAccountNames::default(),
             },
             db_tx,
             Arc::new(Telemetry::new()),
@@ -6014,7 +6085,7 @@ mod session_store_tests {
 
     #[test]
     fn recipient_snapshot_is_shared_until_membership_changes() {
-        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        let mut channel = Channel::for_test("#chat", ChanModes::default());
         channel.add_member(
             Recipient {
                 owner: SessionOwner::new(ConnId(1), CoreShardId(0)),
@@ -6063,7 +6134,7 @@ mod session_store_tests {
 
     #[test]
     fn member_lookup_uses_channel_identity_and_casemapping() {
-        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        let mut channel = Channel::for_test("#chat", ChanModes::default());
         channel.add_member(
             Recipient::new(
                 SessionOwner::new(ConnId(2), CoreShardId(1)),
@@ -6088,7 +6159,7 @@ mod session_store_tests {
         open(&mut state, ConnId(1));
         let key = state.chan_key("#chat");
         let recipient = state.local_recipient(ConnId(1));
-        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        let mut channel = Channel::for_test("#chat", ChanModes::default());
         channel.add_member(
             recipient,
             MemberIdentity::new("one".into(), "one!u@h".into(), false),
@@ -6122,7 +6193,7 @@ mod session_store_tests {
     fn remote_recipient_becomes_a_typed_delivery_effect() {
         let mut state = state();
         let key = state.chan_key("#chat");
-        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        let mut channel = Channel::for_test("#chat", ChanModes::default());
         channel.add_member(
             Recipient {
                 owner: SessionOwner::new(ConnId(9), CoreShardId(1)),

@@ -25,6 +25,33 @@ impl CredentialAttemptBudget {
     }
 }
 
+/// Account names that only privileged flows may bring into being: the
+/// configured administrators (`http.admin_accounts` / `E6IRC_ADMIN_ACCOUNTS`).
+/// Such a name carries administrator authority the moment an account holds it,
+/// so whoever registered it first — over NickServ `REGISTER`, the IRCv3
+/// `REGISTER` command, or an account invitation — would be an administrator.
+/// Only OIDC provisioning and the bootstrap/recovery flows may create one.
+/// Names are held casefolded, so no spelling of one slips past.
+#[derive(Debug, Clone, Default)]
+pub struct ReservedAccountNames(std::sync::Arc<std::collections::HashSet<String>>);
+
+impl ReservedAccountNames {
+    pub fn new<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        Self(std::sync::Arc::new(
+            names
+                .into_iter()
+                .map(|name| e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(name))
+                .collect(),
+        ))
+    }
+
+    /// Whether `name`, in any spelling, is reserved.
+    pub fn reserves(&self, name: &str) -> bool {
+        self.0
+            .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(name))
+    }
+}
+
 /// Maximum stored contact-email length, following the conventional mailbox
 /// limit used by registration systems.
 pub const MAX_CONTACT_EMAIL_LEN: usize = 254;

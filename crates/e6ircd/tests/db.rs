@@ -142,7 +142,7 @@ async fn hist(
     target: &str,
     query: e6ircd::core::HistoryQuery,
 ) -> Vec<e6ircd::core::HistoryRow> {
-    db::query_history(pool, target, query)
+    db::query_history(pool, target, e6ircd::core::HistoryFloor::Whole, query)
         .await
         .expect("history query")
 }
@@ -157,7 +157,11 @@ async fn tgts(
     max_ts: e6irc_proto::time::Millis,
     limit: usize,
 ) -> Vec<(String, e6irc_proto::time::Millis)> {
-    db::query_targets(pool, channels, Some(me), min_ts, max_ts, limit)
+    let channels: Vec<(String, e6ircd::core::HistoryFloor)> = channels
+        .iter()
+        .map(|channel| (channel.clone(), e6ircd::core::HistoryFloor::Whole))
+        .collect();
+    db::query_targets(pool, &channels, Some(me), min_ts, max_ts, limit)
         .await
         .expect("targets query")
 }
@@ -888,6 +892,7 @@ async fn history_worker_tells_an_unknown_msgid_from_an_empty_page() {
             .push(DbRequest::QueryHistory {
                 conn: e6ircd::core::ConnId(9),
                 target: "#here".into(),
+                floor: e6ircd::core::HistoryFloor::Whole,
                 display: "#here".into(),
                 batch_ref: "batch".into(),
                 caps: e6ircd::core::HistoryResponseCaps {
@@ -2058,13 +2063,15 @@ async fn expect_line(
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn chathistory_recreated_channel_serves_persisted_history_with_label() {
-    // Regression: a channel that empties is dropped from memory; when re-created
-    // its ring is empty but PostgreSQL still holds the old rows. It must NOT be
-    // marked history-complete (which would make CHATHISTORY return an empty
-    // batch), and a labeled request's deferred DB batch must carry the label.
+async fn chathistory_recreated_channel_serves_only_its_own_incarnation_with_label() {
+    // A channel that empties is dropped from memory; when re-created its ring
+    // is empty while PostgreSQL still holds the old incarnation's rows. Those
+    // belong to whoever was there before: a member without a registered
+    // relationship to the channel reads only what was said since it was
+    // re-created — which, the ring being incomplete, is served from the
+    // database, and a labeled request's deferred batch carries the label.
     let url =
-        support::test_db("chathistory_recreated_channel_serves_persisted_history_with_label").await;
+        support::test_db("chathistory_recreated_channel_serves_only_its_own_incarnation").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
 
     let config = Config {
@@ -2120,6 +2127,20 @@ async fn chathistory_recreated_channel_serves_persisted_history_with_label() {
     // Re-create the channel: its ring is empty, PG still holds m0..m4.
     w.write_all(b"JOIN #r\r\n").await.unwrap();
     expect_line(&mut reader, " 366 ").await;
+    w.write_all(b"PRIVMSG #r :since re-creation\r\nPING said\r\n")
+        .await
+        .unwrap();
+    expect_line(&mut reader, "PONG").await;
+    for _ in 0..100 {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE target = '#r'")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        if n == 6 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
     // Labeled CHATHISTORY: the batch is served from PG (empty ring) and its
     // opening BATCH line must carry the label.
@@ -2154,12 +2175,11 @@ async fn chathistory_recreated_channel_serves_persisted_history_with_label() {
             }
         }
     }
-    for i in 0..5 {
-        assert!(
-            bodies.contains(&format!("m{i}")),
-            "recreated channel lost persisted history: {bodies:?}"
-        );
-    }
+    assert_eq!(
+        bodies,
+        ["since re-creation"],
+        "the re-created channel serves its own incarnation only"
+    );
 }
 
 #[tokio::test]
@@ -6224,14 +6244,62 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
         Err(db::DbError::ReplayedLogoutToken)
     ));
     assert_eq!(
-        db::revoke_oidc_frontchannel_sessions(&pool, "https://auth.example", "second-session")
-            .await
-            .expect("front-channel logout"),
-        1
+        db::revoke_oidc_frontchannel_sessions(
+            &pool,
+            "https://auth.example",
+            "second-session",
+            Some(&first),
+        )
+        .await
+        .expect("front-channel logout"),
+        db::FrontchannelRevocation {
+            revoked: 1,
+            presented_session_revoked: false,
+        },
+        "a cookie naming another session is not one this logout revoked"
     );
     assert_eq!(
         db::session_account(&pool, &second).await.expect("second"),
         None
+    );
+    let third = db::create_web_session_with_identity(
+        &pool,
+        "alice",
+        db::OidcSessionIdentity {
+            id_token: Some("third.id.token"),
+            provider: Some("shauth"),
+            issuer: Some("https://auth.example"),
+            subject: Some("alice-subject"),
+            sid: Some("third-session"),
+            email: Some("alice@example.test"),
+            role: Some("developer"),
+        },
+        None,
+    )
+    .await
+    .expect("third session");
+    assert_eq!(
+        db::revoke_oidc_frontchannel_sessions(
+            &pool,
+            "https://auth.example",
+            "third-session",
+            Some(&third),
+        )
+        .await
+        .expect("front-channel logout"),
+        db::FrontchannelRevocation {
+            revoked: 1,
+            presented_session_revoked: true,
+        }
+    );
+    assert_eq!(
+        db::revoke_oidc_frontchannel_sessions(&pool, "https://auth.example", "unknown-sid", None)
+            .await
+            .expect("front-channel logout"),
+        db::FrontchannelRevocation {
+            revoked: 0,
+            presented_session_revoked: false,
+        }
     );
 }
 
@@ -8739,12 +8807,17 @@ async fn a_password_change_waiting_for_argon2_does_not_block_the_account_row() {
     // Keep every Argon2 permit busy for the whole test.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut flood = tokio::task::JoinSet::new();
-    for _ in 0..12 {
+    for worker in 0..12 {
         let pool = pool.clone();
         let stop = stop.clone();
         flood.spawn(async move {
+            // A fresh name each time: one name's attempts are throttled before
+            // any Argon2 work, and the point here is to keep Argon2 busy.
+            let mut attempt = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = db::verify_credentials(&pool, "nobody", "guess").await;
+                attempt += 1;
+                let name = format!("nobody{worker}x{attempt}");
+                let _ = db::verify_credentials(&pool, &name, "guess").await;
             }
         });
     }
@@ -9849,5 +9922,275 @@ async fn an_expired_device_grant_polls_as_expired_until_pruned() {
             .expect("poll"),
         db::DeviceStatus::Unknown,
         "past the grace period the grant is pruned"
+    );
+}
+
+/// Password guessing against one account is bounded whatever addresses it
+/// comes from: past `LOGIN_ATTEMPT_LIMIT` attempts in the window every check —
+/// the correct password included — is refused unverified, on every path that
+/// checks a password, and the refusal is the same for a name no account holds.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn password_attempts_are_bounded_per_account_name() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("password_attempts_are_bounded_per_account_name").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account_with_contact(&pool, "alice", "correct horse", None)
+        .await
+        .expect("alice");
+    db::create_account_with_contact(&pool, "bob", "bob password", None)
+        .await
+        .expect("bob");
+    // A verified password ends the window: a user who mistypes and then gets
+    // it right is not left counting towards a lockout.
+    for _ in 0..3 {
+        assert_eq!(
+            db::verify_credentials(&pool, "alice", "typo")
+                .await
+                .expect("verify"),
+            None
+        );
+    }
+    assert_eq!(
+        db::verify_local_password(&pool, "ALICE", "correct horse")
+            .await
+            .expect("verify")
+            .as_deref(),
+        Some("alice")
+    );
+    for _ in 0..db::LOGIN_ATTEMPT_LIMIT {
+        assert_eq!(
+            db::verify_credentials(&pool, "alice", "guess")
+                .await
+                .expect("verify"),
+            None
+        );
+    }
+    let throttled = |result: Result<Option<String>, db::DbError>| match result {
+        Err(db::DbError::LoginThrottled(retry)) => {
+            assert!(
+                (1..=db::LOGIN_ATTEMPT_WINDOW.as_secs()).contains(&retry.seconds()),
+                "{retry:?}"
+            );
+            true
+        }
+        _ => false,
+    };
+    assert!(throttled(
+        db::verify_credentials(&pool, "Alice", "correct horse").await
+    ));
+    assert!(throttled(
+        db::verify_local_password(&pool, "alice", "correct horse").await
+    ));
+    assert!(matches!(
+        db::issue_app_password(&pool, "alice", "correct horse", "laptop").await,
+        Err(db::DbError::LoginThrottled(_))
+    ));
+    let session = db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("session");
+    assert!(matches!(
+        db::change_local_password(&pool, "alice", "correct horse", "new password", &session).await,
+        Err(db::DbError::LoginThrottled(_))
+    ));
+    // Another account is untouched.
+    assert_eq!(
+        db::verify_credentials(&pool, "bob", "bob password")
+            .await
+            .expect("verify")
+            .as_deref(),
+        Some("bob")
+    );
+    // A name no account holds is throttled the same way, so a refusal says
+    // nothing about which names exist.
+    for _ in 0..db::LOGIN_ATTEMPT_LIMIT {
+        assert_eq!(
+            db::verify_credentials(&pool, "nobody", "guess")
+                .await
+                .expect("verify"),
+            None
+        );
+    }
+    assert!(throttled(
+        db::verify_credentials(&pool, "nobody", "guess").await
+    ));
+    // Once the window has passed the account is admitted again.
+    sqlx::query(
+        "UPDATE login_attempts SET window_started_at = now() - interval '1 hour'
+         WHERE name_folded = 'alice'",
+    )
+    .execute(&pool)
+    .await
+    .expect("age the window");
+    assert_eq!(
+        db::verify_credentials(&pool, "alice", "correct horse")
+            .await
+            .expect("verify")
+            .as_deref(),
+        Some("alice")
+    );
+}
+
+/// A history read never reaches below its floor: not in a window, not through
+/// a pivot older than the floor, and not in the activity TARGETS reports.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn history_reads_stop_at_their_floor() {
+    use e6ircd::core::{HistoryFloor, HistoryQuery, SelectorBound};
+    let pool =
+        db::connect_and_migrate(&support::test_db("history_reads_stop_at_their_floor").await)
+            .await
+            .expect("connect");
+    for ts in [1000_i64, 2000, 3000, 4000, 5000] {
+        sqlx::query(
+            "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts)
+             VALUES ($1, '#h', 'x!x@h', NULL, 'privmsg', $2,
+                     to_timestamp($3::double precision / 1000))",
+        )
+        .bind(format!("m{ts}"))
+        .bind(format!("b{ts}"))
+        .bind(ts)
+        .execute(&pool)
+        .await
+        .expect("insert");
+    }
+    let millis = e6irc_proto::time::Millis::from_millis;
+    let floor = HistoryFloor::Since(millis(3000));
+    let read = |query: HistoryQuery| {
+        let pool = pool.clone();
+        async move {
+            db::query_history(&pool, "#h", floor, query)
+                .await
+                .expect("history")
+                .into_iter()
+                .map(|row| row.msgid)
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(
+        read(HistoryQuery::Latest { limit: 10 }).await,
+        ["m3000", "m4000", "m5000"]
+    );
+    assert_eq!(
+        read(HistoryQuery::Before {
+            before_ts: millis(5000),
+            limit: 10
+        })
+        .await,
+        ["m3000", "m4000"]
+    );
+    assert_eq!(
+        read(HistoryQuery::Around {
+            around_ts: millis(3000),
+            limit: 4
+        })
+        .await,
+        ["m3000", "m4000"]
+    );
+    assert_eq!(
+        read(HistoryQuery::BeforeMsgid {
+            msgid: "m4000".into(),
+            limit: 10
+        })
+        .await,
+        ["m3000"]
+    );
+    // A pivot from below the floor positions nothing.
+    for query in [
+        HistoryQuery::AfterMsgid {
+            msgid: "m1000".into(),
+            limit: 10,
+        },
+        HistoryQuery::BetweenSelectors {
+            first: SelectorBound::Msgid("m1000".into()),
+            second: SelectorBound::Timestamp(millis(9000)),
+            limit: 10,
+        },
+    ] {
+        assert!(read(query.clone()).await.is_empty(), "{query:?}");
+    }
+    assert_eq!(
+        read(HistoryQuery::BetweenSelectors {
+            first: SelectorBound::Timestamp(millis(0)),
+            second: SelectorBound::Timestamp(millis(9000)),
+            limit: 10,
+        })
+        .await,
+        ["m3000", "m4000", "m5000"]
+    );
+    // The whole record is still there for a reader who may see it.
+    assert_eq!(
+        db::query_history(
+            &pool,
+            "#h",
+            HistoryFloor::Whole,
+            HistoryQuery::Latest { limit: 10 }
+        )
+        .await
+        .expect("history")
+        .len(),
+        5
+    );
+    let targets = |floor: HistoryFloor| {
+        let pool = pool.clone();
+        async move {
+            db::query_targets(
+                &pool,
+                &[("#h".to_string(), floor)],
+                None,
+                millis(0),
+                millis(99_000),
+                10,
+            )
+            .await
+            .expect("targets")
+        }
+    };
+    assert_eq!(
+        targets(HistoryFloor::Since(millis(3000))).await,
+        [("#h".to_string(), millis(5000))]
+    );
+    assert!(
+        targets(HistoryFloor::Since(millis(6000))).await.is_empty(),
+        "a channel whose activity all predates the floor is not a buffer"
+    );
+}
+
+/// A configured administrator's name cannot be claimed by an invitation, even
+/// one issued before the name was configured; startup can name the configured
+/// administrators no account holds yet.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn configured_administrator_names_are_not_claimable_by_invitation() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("configured_administrator_names_are_not_claimable").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account_with_contact(&pool, "Alice", "pw", None)
+        .await
+        .expect("alice");
+    let token = db::issue_account_invitation(
+        &pool,
+        "Root",
+        None,
+        false,
+        e6ircd::identity::AccountInvitationLifetimeDays::new(1).expect("lifetime"),
+        "Alice",
+    )
+    .await
+    .expect("issued before the name was configured");
+    assert!(matches!(
+        db::accept_account_invitation(&pool, &token, "chosen password", &["root".to_string()])
+            .await,
+        Err(db::DbError::InvitationUnavailable)
+    ));
+    assert_eq!(
+        db::unclaimed_account_names(&pool, &["ALICE".to_string(), "Root".to_string()])
+            .await
+            .expect("unclaimed"),
+        ["Root"]
     );
 }

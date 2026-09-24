@@ -2164,7 +2164,7 @@ async fn an_upstream_echo_of_a_nickserv_password_is_redacted() {
         .expect("the echo is relayed");
     assert!(!echo.contains("hunter2"), "{echo}");
     assert!(
-        echo.contains("[sensitive NickServ command redacted]"),
+        echo.contains("[sensitive services command redacted]"),
         "{echo}"
     );
     assert!(
@@ -3976,4 +3976,56 @@ async fn the_backlog_cap_holds_across_restarts() {
     .expect("the final start left the backlog over the cap");
     assert_eq!(batch_rows("second").await, 600, "the newest lines are kept");
     running.shutdown.run().await;
+}
+
+/// The attach listener's SASL PLAIN is one of the password checks the
+/// per-account attempt limit bounds: an account name whose attempts are spent
+/// is refused with 904 and the wait, even with the right password.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn bnc_attach_refuses_a_throttled_account_with_the_wait() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let url = bnc_account_db("bnc_attach_refuses_a_throttled_account", "alice", "pw").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    sqlx::query("INSERT INTO login_attempts (name_folded, attempts) VALUES ('alice', $1)")
+        .bind(e6ircd::db::LOGIN_ATTEMPT_LIMIT)
+        .execute(&pool)
+        .await
+        .expect("spend alice's attempts");
+    let up = upstream().await;
+    let running = net::start(bnc_config(up, url)).await.expect("start");
+    let bnc = running.bnc_addr.expect("bnc bound");
+    let mut sock = tokio::net::TcpStream::connect(bnc).await.unwrap();
+    sock.write_all(
+        b"CAP LS 302\r\nCAP REQ :sasl\r\nNICK alice/up\r\nUSER x 0 * :x\r\nAUTHENTICATE PLAIN\r\n",
+    )
+    .await
+    .unwrap();
+    let mut b = [0u8; 2048];
+    let mut acc = String::new();
+    while !acc.contains("AUTHENTICATE +") {
+        let n = sock.read(&mut b).await.unwrap();
+        assert!(n > 0, "closed before AUTHENTICATE +");
+        acc.push_str(&String::from_utf8_lossy(&b[..n]));
+    }
+    let payload = e6irc_proto::base64::encode(b"\0alice\0pw");
+    sock.write_all(format!("AUTHENTICATE {payload}\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut verdict = String::new();
+    tokio::time::timeout(deadline::HANG, async {
+        while !verdict.contains(" 904 ") && !verdict.contains(" 903 ") {
+            let n = sock.read(&mut b).await.unwrap();
+            assert!(n > 0, "closed before the verdict: {verdict}");
+            verdict.push_str(&String::from_utf8_lossy(&b[..n]));
+        }
+    })
+    .await
+    .expect("timed out waiting for the SASL verdict");
+    assert!(
+        verdict.contains(" 904 * :Too many failed login attempts"),
+        "{verdict}"
+    );
 }
