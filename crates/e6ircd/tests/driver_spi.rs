@@ -111,6 +111,7 @@ async fn attach_relays_over_the_loopback_driver() {
     tokio::spawn(async move {
         attach(
             server,
+            e6ircd::bouncer::ClientInput::default(),
             &attach_handle,
             Default::default(),
             "attacher",

@@ -1688,7 +1688,13 @@ above the trait, provides for every network kind:
   echo synthesized when the line is written. Either way the originator
   receives its echo only when it negotiated `echo-message` on attach, the same
   contract a real server has, and a NickServ command that can carry a secret
-  is redacted in the upstream's echo exactly as in a synthesized one.
+  is redacted in the upstream's echo exactly as in a synthesized one. A bridge
+  holds to the same rule: the provider's copy of a post the bridge made is
+  dropped, and each target the provider accepted is echoed once instead —
+  under the bridge account's IRC identity, the prefix that copy would have
+  carried — while a refused one is answered by its undelivered notice alone.
+  The `local` driver's synthesized echo shows the session as the core does,
+  the `USER` name verbatim.
   Synthesized echoes retain only
   validated client-only tags and mint their own `time` provenance; a downstream
   cannot forge or duplicate server `time`/`msgid` tags in persisted history.
@@ -1737,7 +1743,9 @@ above the trait, provides for every network kind:
   Stored timestamps are validated and canonicalized before they become sort
   keys, and replay emits that same canonical `time=` value. `batch` is optional:
   a client that negotiated it receives the applicable batch envelope and tags;
-  otherwise the same bounded page is emitted directly. `message-tags`,
+  otherwise the same bounded page is emitted directly. Every line inside a
+  batch carries its `batch=` tag (merged into the line's own tags), as the
+  core's replies do. `message-tags`,
   `server-time`, and `account-tag` independently gate their own replay metadata,
   and `message-tags` also scopes *which rows the page is cut from* (§11.2).
 - **A notice is retained only if it will still be true.** A `*bnc*` notice
@@ -1865,7 +1873,11 @@ upstream's.
   *after* the welcome (Atheme's ENFORCE moving an unidentified nick to
   `Guest12345`) is tracked, as it must be, and announced: `renamed_by_upstream`
   in the runtime snapshot with the diagnostic "upstream renamed this session
-  from X to Y", and one `*bnc*` notice into the backlog. The `USER`
+  from X to Y", and one `*bnc*` notice into the backlog. A rename an attached
+  client asked for with `NICK` is the owner's own choice: its confirmation is
+  tracked the same way but is neither recorded as a failure nor announced
+  (the driver remembers the last few names requested, since one the upstream
+  refuses is never confirmed). The `USER`
   name is configured, never derived. It used to be the first ten bytes of the
   nickname, so a legal nickname such as `_bot` registered as `USER _bot`, which
   Solanum-family servers answer by closing the link. `UpstreamUsername` admits
@@ -2014,6 +2026,10 @@ PLAIN accepts an empty authorization identity or the same RFC1459-folded
 identity as its authentication identity; it cannot authenticate one account
 while requesting authorization as another. The web client and REST API address
 networks explicitly by id.
+A client need not wait for the welcome before it sends: whatever arrives after
+the line that completes registration (`CAP END`, typically) — whole lines, and
+the start of one — is handed with the handshake's framing to the attached
+session and handled there, after the replay, never refused by the handshake.
 
 ### 10.5 Bridges: `matrix` / `discord` / `slack` drivers
 
@@ -2101,8 +2117,15 @@ Design constraints recorded now:
   `m.emote` becomes a CTCP ACTION, `m.notice` a NOTICE, media its body plus the
   spec's `/_matrix/media/v3/download` link (homeservers that enforce
   authenticated media will not open it), `m.location` its body plus a geo URI;
-  any other msgtype produces one bounded "not relayed" notice.
-- Discord keeps its gateway session per driver and RESUMEs on
+  any other msgtype produces one bounded "not relayed" notice. Timeline events
+  are decoded one at a time: a redacted `m.room.message` (empty content) or a
+  malformed event (no sender, msgtype or body, or not an event at all) is one
+  such notice in its channel, and the rest of the sync is relayed and its
+  position kept. Decoded as a whole, one such event failed every sync from that
+  position, and the bridge stalled on it forever.
+- Discord learns the bot's own account from `GET /users/@me` before it opens
+  the gateway, so the bot's posts are recognised, and echoes named, from the
+  first frame on. It keeps its gateway session per driver and RESUMEs on
   `resume_gateway_url` after a drop, so the gap is replayed and the daily
   IDENTIFY budget is not spent; op 9 (invalid session) ends the session — it
   used to be ignored while the gateway kept ACKing heartbeats, leaving the

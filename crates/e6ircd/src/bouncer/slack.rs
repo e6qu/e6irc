@@ -146,6 +146,8 @@ fn open_next(config: &SlackConfig, http: &super::BridgeHttp, base: &str) -> Open
 /// are its echo, while every other bot's are relayed.
 #[derive(serde::Deserialize)]
 struct Identity {
+    /// The bot user's name: each delivered message is echoed under it.
+    user: String,
     user_id: String,
     #[serde(default)]
     bot_id: Option<String>,
@@ -179,6 +181,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
         Ok(identity) => identity,
         Err(error) => return slack_failure("auth.test failed", &error),
     };
+    let echo_identity = super::bridged_identity("slack", &identity.user);
 
     let (id_to_channel, channel_to_id) = match super::resolve_bridge_channels(
         "slack",
@@ -371,7 +374,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                         async move { post_message(&http, &base, &token, &id, &text).await }
                     }
                 };
-                if super::queue_channel_command(ends, cmd, &channel_to_id, "Slack", &mut deliveries, deliver)
+                if super::queue_channel_command(ends, cmd, &channel_to_id, &echo_identity, "Slack", &mut deliveries, deliver)
                     .is_none()
                 {
                     return super::SessionOutcome::Stopped;
@@ -439,7 +442,12 @@ fn render_message(
         Content::Action(text) => super::Inbound::new(super::InboundKind::Action, &decode(text)),
         Content::Edited(text) => super::Inbound::message(&format!("* {}", decode(text))),
         Content::Unrelayed(subtype) => {
-            return vec![super::unrelayed_notice("slack", channel, subtype, &sender)];
+            return vec![super::unrelayed_notice(
+                "slack",
+                channel,
+                subtype,
+                Some(&sender),
+            )];
         }
     };
     super::render_bridged("slack", &sender, channel, &inbound)
@@ -1309,6 +1317,7 @@ mod tests {
         assert_eq!(m.content, Content::Unrelayed("huddle_thread".into()));
         // Our own posts are recognised whichever way Slack marks them.
         let identity = Identity {
+            user: "e6ircbot".into(),
             user_id: "UBOT".into(),
             bot_id: Some("BBOT".into()),
         };
@@ -1471,18 +1480,20 @@ mod tests {
         use crate::bouncer::{BridgeText, RouteResult, route_privmsg};
         assert_eq!(
             route_privmsg("PRIVMSG #general :hello", &map),
-            vec![RouteResult::Deliver(
-                "C1".to_string(),
-                BridgeText::Text("hello".to_string())
-            )]
+            vec![RouteResult::Deliver {
+                id: "C1".to_string(),
+                target: "#general".to_string(),
+                text: BridgeText::Text("hello".to_string())
+            }]
         );
         // Case-insensitive routing.
         assert_eq!(
             route_privmsg("PRIVMSG #GENERAL :hi", &map),
-            vec![RouteResult::Deliver(
-                "C1".to_string(),
-                BridgeText::Text("hi".to_string())
-            )]
+            vec![RouteResult::Deliver {
+                id: "C1".to_string(),
+                target: "#GENERAL".to_string(),
+                text: BridgeText::Text("hi".to_string())
+            }]
         );
         // A PRIVMSG to a non-bridged channel is surfaced, not silently dropped.
         assert_eq!(

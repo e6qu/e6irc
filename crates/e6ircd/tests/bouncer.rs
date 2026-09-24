@@ -1959,6 +1959,55 @@ async fn driver_tracks_forced_upstream_nick_change() {
     assert!(echo.contains(":renamed!~bncbot@up PRIVMSG"), "{echo}");
 }
 
+/// A nick change an attached client asked for is the owner's choice: the
+/// upstream's confirmation is tracked like any rename, but it is not recorded
+/// as a failure or announced as a name nobody chose.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_requested_nick_change_is_not_a_forced_rename() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut session = fake_accept(&listener).await;
+        session.complete_registration("bncbot").await;
+        loop {
+            let line = session.read_line().await;
+            if line == "NICK chosen" {
+                session.send(":bncbot!~bncbot@up NICK :chosen").await;
+            }
+        }
+    });
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".parse().expect("test nickname"),
+        internal_upstreams: InternalUpstreams::Allow,
+        ..NetworkConfig::default()
+    });
+    let mut events = handle.subscribe();
+    wait_connected(&handle, &mut events).await;
+    assert_eq!(handle.send_from(7, "NICK chosen"), SendOutcome::Sent);
+    tokio::time::timeout(deadline::HANG, async {
+        while handle
+            .irc_session_snapshot()
+            .is_none_or(|session| session.nick != "chosen")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the confirmed nick is tracked");
+    let runtime = handle.runtime_snapshot();
+    assert_eq!(runtime.last_error, None, "{runtime:?}");
+    assert_eq!(runtime.errors, 0, "{runtime:?}");
+    assert!(
+        !handle
+            .buffer_snapshot()
+            .iter()
+            .any(|line| line.contains("renamed")),
+        "{:?}",
+        handle.buffer_snapshot()
+    );
+}
+
 /// Start a driver against a scripted upstream that offers `echo-message` and
 /// answers the first `PRIVMSG` it reads with `answer` (its lines, `{line}`
 /// replaced by what it read).
@@ -3064,28 +3113,30 @@ async fn bnc_listener_serves_chathistory_and_markread() {
         .unwrap();
     let open = client.next_message().await.unwrap().expect("batch open");
     assert_eq!(open.command, "BATCH", "{open:?}");
-    assert!(
-        open.params
-            .first()
-            .map(String::as_str)
-            .unwrap_or("")
-            .starts_with('+'),
-        "{open:?}"
-    );
+    let reference = open
+        .params
+        .first()
+        .and_then(|param| param.strip_prefix('+'))
+        .unwrap_or_else(|| panic!("the batch opens with +<ref>: {open:?}"))
+        .to_string();
     let mut msgs = Vec::new();
     loop {
         let m = client.next_message().await.unwrap().expect("batch body");
         if m.command == "BATCH" {
-            assert!(
-                m.params
-                    .first()
-                    .map(String::as_str)
-                    .unwrap_or("")
-                    .starts_with('-'),
-                "{m:?}"
+            assert_eq!(
+                m.params.first().map(String::as_str),
+                Some(format!("-{reference}").as_str()),
+                "the batch that closes is the one that opened: {m:?}"
             );
             break;
         }
+        // Each line of the page names its batch, or the client does not
+        // read it as part of one.
+        assert_eq!(
+            m.tag("batch"),
+            Some(reference.as_str()),
+            "a line inside the batch carries its reference: {m:?}"
+        );
         msgs.push(m);
     }
     assert_eq!(msgs.len(), 5, "expected the five buffered messages");
@@ -3211,6 +3262,13 @@ async fn bnc_listener_serves_chathistory_and_markread() {
     let target_line = client.next_message().await.unwrap().expect("targets body");
     assert_eq!(target_line.command, "CHATHISTORY", "{target_line:?}");
     assert_eq!(
+        target_line.tag("batch"),
+        open.params
+            .first()
+            .and_then(|param| param.strip_prefix('+')),
+        "a TARGETS line carries its batch reference: {target_line:?}"
+    );
+    assert_eq!(
         target_line.params.first().map(String::as_str),
         Some("TARGETS"),
         "{target_line:?}"
@@ -3224,6 +3282,116 @@ async fn bnc_listener_serves_chathistory_and_markread() {
         target_line.params.get(2).is_some(),
         "targets carry a resume timestamp: {target_line:?}"
     );
+    drop(running);
+}
+
+/// A client need not wait for the welcome: what it sends in the same write as
+/// `CAP END` — whole lines, and the start of one it finishes later — is the
+/// attached session's input. The handshake used to answer those lines `421`
+/// and drop the half line when the attached session began its own framing.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn lines_sent_with_cap_end_reach_the_attached_session() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let url = bnc_account_db(
+        "lines_sent_with_cap_end_reach_the_attached_session",
+        "alice",
+        "s3cr3t",
+    )
+    .await;
+    let up = upstream().await;
+    let running = net::start(bnc_config(up, url)).await.expect("start");
+    let bnc = running.bnc_addr.expect("bnc bound");
+
+    let mut peer = e6irc_client::Connection::connect(&up.to_string())
+        .await
+        .unwrap();
+    peer.register(&e6irc_client::Identity {
+        nick: "uppeer",
+        username: "uppeer",
+        realname: "peer",
+        server_password: None,
+    })
+    .await
+    .unwrap();
+    peer.send_line("JOIN #lobby").await.unwrap();
+    loop {
+        if peer.next_message().await.unwrap().unwrap().command == "366" {
+            break;
+        }
+    }
+    // The driver is in #lobby once its JOIN reaches the peer.
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let message = peer.next_message().await.unwrap().unwrap();
+            if message.command == "JOIN"
+                && message
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source.starts_with("bncnick!"))
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or(());
+
+    let stream = tokio::net::TcpStream::connect(bnc)
+        .await
+        .expect("bnc connect");
+    let (read, mut write) = stream.into_split();
+    let payload = e6irc_proto::base64::encode(b"\0alice\0s3cr3t");
+    write
+        .write_all(
+            format!(
+                "CAP LS 302\r\nCAP REQ :sasl\r\nNICK alice/up\r\nUSER alice 0 * :Me\r\n\
+                 AUTHENTICATE PLAIN\r\nAUTHENTICATE {payload}\r\nCAP END\r\n\
+                 PRIVMSG #lobby :early\r\nPRIVMSG #lobby :sp"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("one write through CAP END");
+    let mut replies = tokio::io::BufReader::new(read).lines();
+    let mut seen = Vec::new();
+    tokio::time::timeout(deadline::HANG, async {
+        while let Some(line) = replies.next_line().await.expect("bnc read") {
+            let welcomed = line.contains(" 001 ");
+            seen.push(line);
+            if welcomed {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("never welcomed");
+    write
+        .write_all(b"lit\r\n")
+        .await
+        .expect("the rest of the line");
+
+    let mut heard = Vec::new();
+    tokio::time::timeout(deadline::HANG, async {
+        while heard.len() < 2 {
+            let message = peer.next_message().await.unwrap().unwrap();
+            if message.command == "PRIVMSG" {
+                heard.push(message.params[1].clone());
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the peer heard only {heard:?}"));
+    assert_eq!(heard, ["early", "split"]);
+
+    // Nothing the client sent was refused along the way.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        while let Ok(Some(line)) = replies.next_line().await {
+            seen.push(line);
+        }
+    })
+    .await;
+    assert!(!seen.iter().any(|line| line.contains(" 421 ")), "{seen:#?}");
     drop(running);
 }
 

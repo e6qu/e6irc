@@ -211,6 +211,7 @@ pub async fn start_with(provider: Provider, options: Options) -> Oracle {
         user_lookup_failed: Arc::new(AtomicBool::new(false)),
     };
     let router = Router::new()
+        .route("/users/@me", get(discord_me))
         .route("/channels/{id}", get(discord_channel))
         .route("/channels/{id}/messages", post(discord_post))
         .route("/gateway", get(discord_gateway))
@@ -328,6 +329,37 @@ pub async fn verify_round_trip(
         }
         (_, event) => panic!("wrong provider REST event: {event:?}"),
     }
+    // The accepted post is echoed once, under the bot's own name — the line
+    // its dropped gateway copy would have been.
+    let host = match provider {
+        Provider::Discord => "discord",
+        Provider::Slack => "slack",
+    };
+    let echo = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match driver_events.recv().await.expect("driver events") {
+                super::DriverEvent::Echo { line, origin } => return (line.line, origin),
+                super::DriverEvent::Line(line) => {
+                    assert!(
+                        !line.line.contains("hello from IRC"),
+                        "the post is relayed as an ordinary line: {}",
+                        line.line
+                    );
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the delivered post was never echoed");
+    assert_eq!(echo.1, 0, "sent through the untracked handle");
+    assert!(
+        echo.0.ends_with(&format!(
+            " :{BOT_NAME}!{BOT_NAME}@{host} PRIVMSG #general :hello from IRC"
+        )),
+        "{}",
+        echo.0
+    );
 
     handle.shutdown();
     assert!(matches!(
@@ -408,6 +440,22 @@ pub fn slack_envelope(envelope_id: &str, event: serde_json::Value) -> serde_json
 pub fn slack_message(text: &str) -> serde_json::Value {
     json!({ "type": "message", "channel": "C1", "user": "U1", "text": text })
 }
+
+/// The bot's own account, under the name its posts are echoed as.
+async fn discord_me(State(state): State<OracleState>, headers: HeaderMap) -> impl IntoResponse {
+    if !matches!(state.provider, Provider::Discord) || bearer(&headers) != Some("Bot discord-token")
+    {
+        return (StatusCode::UNAUTHORIZED, axum::Json(json!({}))).into_response();
+    }
+    (
+        StatusCode::OK,
+        axum::Json(json!({ "id": "bot", "username": BOT_NAME })),
+    )
+        .into_response()
+}
+
+/// The name both providers give the bridge's own account.
+pub const BOT_NAME: &str = "e6ircbot";
 
 async fn discord_channel(
     State(state): State<OracleState>,
@@ -499,7 +547,8 @@ async fn slack_auth_test(
     if !slack_authorized(&state, &headers) {
         return slack_refused();
     }
-    axum::Json(json!({ "ok": true, "user_id": "UBOT", "bot_id": "BBOT" })).into_response()
+    axum::Json(json!({ "ok": true, "user": BOT_NAME, "user_id": "UBOT", "bot_id": "BBOT" }))
+        .into_response()
 }
 
 async fn slack_channel(

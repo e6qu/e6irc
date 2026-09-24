@@ -616,6 +616,27 @@ Exercised rather than inspected, and sound: the `e6irc` CLI against both the
 core listener and the attach listener -- `send`, `history`, `raw` (including
 its nonzero exit on a refused line) and `api` -- and the TUI over a pty.
 
+A sweep of the bouncer found, and this change fixes:
+
+- **Bridges echoed nothing a client sent.** Discord, Slack and Matrix drop the
+  provider's copy of their own posts and emitted no echo in its place, so a
+  message sent through a bridge reached neither the other attached clients nor
+  the backlog. Each target the provider accepted is now echoed once, under the
+  bridge account's IRC identity; a refused one still gets only its notice.
+- **One unreadable Matrix event stalled the bridge.** A redacted or malformed
+  `m.room.message` failed the whole sync, whose position then never advanced.
+  Events are decoded one at a time; such an event is one "not relayed" notice.
+- **CHATHISTORY batches whose lines did not say so.** Lines inside a `BATCH`
+  on the attach listener lacked their `batch=` tag.
+- **A nick change the owner asked for was reported as forced.** The upstream's
+  confirmation of a client's own `NICK` counted as `renamed_by_upstream`.
+- **The local driver.** A stop during registration left the half-registered
+  core session to the reaper, and its synthesized echo showed `~nick` where
+  the core shows the `USER` name.
+- **Lines sent with `CAP END` were refused.** The attach handshake answered
+  lines arriving in the same read as `CAP END` with 421, and dropped the half
+  of a line it had framed; both now reach the attached session.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each
