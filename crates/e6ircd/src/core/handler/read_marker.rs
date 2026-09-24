@@ -8,15 +8,11 @@ pub(super) fn markread_fail(
     state: &mut ServerState,
     conn: ConnId,
     target: &str,
-    code: &str,
+    code: HistoryFail,
     detail: &str,
 ) {
-    let server = state.config.server_name.clone();
-    let target = clip_echo(target);
-    state.send(
-        conn,
-        &format!(":{server} FAIL MARKREAD {code} {target} :{detail}"),
-    );
+    let line = code.line(&state.config.server_name, "MARKREAD", &[target], detail);
+    state.send(conn, &line);
 }
 
 /// Send `conn` the current read marker for `key` (displayed as `display`),
@@ -58,7 +54,7 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             state,
             conn,
             "*",
-            "NEED_MORE_PARAMS",
+            HistoryFail::NeedMoreParams,
             "Not enough parameters",
         );
         return;
@@ -69,7 +65,13 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     if !crate::sanitize::valid_channel_name(target)
         && !crate::sanitize::valid_nick(target, state.config.nicklen)
     {
-        markread_fail(state, conn, target, "INVALID_PARAMS", "Invalid target");
+        markread_fail(
+            state,
+            conn,
+            target,
+            HistoryFail::InvalidParams,
+            "Invalid target",
+        );
         return;
     }
     // A logged-in client's markers are account-keyed (shared across the
@@ -95,7 +97,7 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 state,
                 conn,
                 target,
-                "TEMPORARILY_UNAVAILABLE",
+                HistoryFail::TemporarilyUnavailable,
                 "Read marker update in progress",
             );
             return;
@@ -106,13 +108,25 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 
     // Set form: MARKREAD <target> timestamp=<iso>
     let Some(ts) = arg.strip_prefix("timestamp=") else {
-        markread_fail(state, conn, target, "INVALID_PARAMS", "Expected timestamp=");
+        markread_fail(
+            state,
+            conn,
+            target,
+            HistoryFail::InvalidParams,
+            "Expected timestamp=",
+        );
         return;
     };
     // Millisecond precision: a marker must round-trip its `.mmm` fraction, so
     // parse to millis (not seconds) and store that.
     let Some(new_ms) = e6irc_proto::time::parse_server_time_millis(ts) else {
-        markread_fail(state, conn, target, "INVALID_PARAMS", "Malformed timestamp");
+        markread_fail(
+            state,
+            conn,
+            target,
+            HistoryFail::InvalidParams,
+            "Malformed timestamp",
+        );
         return;
     };
     let Some(account) = account else {
@@ -128,7 +142,7 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 state,
                 conn,
                 target,
-                "INVALID_PARAMS",
+                HistoryFail::InvalidParams,
                 "Too many read markers",
             );
             return;
@@ -164,7 +178,7 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             state,
             conn,
             target,
-            "INVALID_PARAMS",
+            HistoryFail::InvalidParams,
             "Too many read markers",
         );
         return;
@@ -202,7 +216,7 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             state,
             conn,
             target,
-            "TEMPORARILY_UNAVAILABLE",
+            HistoryFail::TemporarilyUnavailable,
             "Read marker could not be persisted",
         );
         return;
@@ -311,7 +325,7 @@ pub(super) fn read_marker_refused(
     state: &mut ServerState,
     conn: ConnId,
     refusal: ReadMarkerRefusal,
-    code: &'static str,
+    code: HistoryFail,
     description: &'static str,
 ) {
     let ReadMarkerRefusal {

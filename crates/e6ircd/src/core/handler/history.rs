@@ -92,7 +92,7 @@ pub(super) enum ChathistorySub {
 
 impl ChathistorySub {
     /// Parse a subcommand token (case-insensitive). `None` is an unknown
-    /// subcommand (→ INVALID_PARAMS).
+    /// subcommand (→ UNKNOWN_COMMAND).
     pub(super) fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_uppercase().as_str() {
             "LATEST" => Some(Self::Latest),
@@ -127,19 +127,11 @@ impl ChathistorySub {
 pub(super) fn chathistory_fail(
     state: &mut ServerState,
     conn: ConnId,
-    code: &str,
+    code: HistoryFail,
     context: &[&str],
     detail: &str,
 ) {
-    let server = state.config.server_name.clone();
-    // Context params echo the client's own subcommand/target for
-    // attribution; clipped so the FAIL explaining an error is never itself
-    // discarded for length.
-    let clipped: Vec<&str> = context
-        .iter()
-        .map(|p| crate::core::handler::clip_echo(p))
-        .collect();
-    let line = super::fail_line(&server, "CHATHISTORY", code, &clipped, detail);
+    let line = code.line(&state.config.server_name, "CHATHISTORY", context, detail);
     state.send(conn, &line);
 }
 
@@ -164,7 +156,13 @@ fn chathistory(state: &mut ServerState, conn: ConnId, p: &[&str], account: Optio
         return;
     };
     if !caps.chathistory {
-        chathistory_fail(state, conn, "NEED_CAPS", &[], "draft/chathistory required");
+        chathistory_fail(
+            state,
+            conn,
+            HistoryFail::NeedCaps,
+            &[],
+            "draft/chathistory required",
+        );
         return;
     }
     // TARGETS enumerates buffers, not a single channel — handle it before
@@ -173,12 +171,27 @@ fn chathistory(state: &mut ServerState, conn: ConnId, p: &[&str], account: Optio
         chathistory_targets(state, conn, p);
         return;
     }
-    let (Some(&sub), Some(&target)) = (p.first(), p.get(1)) else {
-        let sub = p.first().copied().unwrap_or("*");
+    // The subcommand is judged before anything about the target: an unknown
+    // one is UNKNOWN_COMMAND whatever the target (spec error list), and a
+    // missing parameter is NEED_MORE_PARAMS, not INVALID_PARAMS.
+    let sub = p.first().copied().unwrap_or("*");
+    let Some(parsed_sub) = ChathistorySub::parse(sub) else {
+        let (code, detail) = if p.is_empty() {
+            (HistoryFail::NeedMoreParams, "Missing parameters")
+        } else {
+            (HistoryFail::UnknownCommand, "Unknown subcommand")
+        };
+        chathistory_fail(state, conn, code, &[sub], detail);
+        return;
+    };
+    // BETWEEN takes two selectors then the limit; the others take one.
+    let is_between = parsed_sub.takes_two_selectors();
+    let expected_params = if is_between { 5 } else { 4 };
+    let Some(&target) = p.get(1).filter(|_| p.len() >= expected_params) else {
         chathistory_fail(
             state,
             conn,
-            "NEED_MORE_PARAMS",
+            HistoryFail::NeedMoreParams,
             &[sub],
             "Missing parameters",
         );
@@ -221,7 +234,7 @@ fn chathistory(state: &mut ServerState, conn: ConnId, p: &[&str], account: Optio
             chathistory_fail(
                 state,
                 conn,
-                "INVALID_TARGET",
+                HistoryFail::InvalidTarget,
                 &[sub, target],
                 "You are not on that channel",
             );
@@ -234,7 +247,7 @@ fn chathistory(state: &mut ServerState, conn: ConnId, p: &[&str], account: Optio
             chathistory_fail(
                 state,
                 conn,
-                "INVALID_TARGET",
+                HistoryFail::InvalidTarget,
                 &[sub, target],
                 "You are not registered",
             );
@@ -249,28 +262,15 @@ fn chathistory(state: &mut ServerState, conn: ConnId, p: &[&str], account: Optio
         let stored = !me.starts_with('~') && !peer.starts_with('~');
         (key, stored, crate::core::HistoryFloor::Whole)
     };
-    // Parse the subcommand once into a typed value: the ring resolver and the DB
-    // query builder both consume it, so they can no longer enumerate the
-    // subcommands differently (the ring-vs-DB `msgid=` divergence a prior sweep
-    // had to fix). An unknown subcommand is INVALID_PARAMS.
-    let Some(parsed_sub) = ChathistorySub::parse(sub) else {
-        chathistory_fail(
-            state,
-            conn,
-            "INVALID_PARAMS",
-            &[sub, target],
-            &format!("Unknown subcommand {sub}"),
-        );
-        return;
-    };
-    // BETWEEN takes two selectors then the limit; the others take one.
-    let is_between = parsed_sub.takes_two_selectors();
-    let expected_params = if is_between { 5 } else { 4 };
+    // The subcommand was parsed once, above, into a typed value: the ring
+    // resolver and the DB query builder both consume it, so they can no longer
+    // enumerate the subcommands differently. Too few parameters were refused
+    // there; too many are INVALID_PARAMS.
     if p.len() != expected_params {
         chathistory_fail(
             state,
             conn,
-            "INVALID_PARAMS",
+            HistoryFail::InvalidParams,
             &[sub, target],
             if is_between {
                 "Expected exactly <target> <selector> <selector> <limit>"
@@ -301,7 +301,7 @@ fn chathistory(state: &mut ServerState, conn: ConnId, p: &[&str], account: Optio
         chathistory_fail(
             state,
             conn,
-            "INVALID_MSGREFTYPE",
+            HistoryFail::InvalidMsgRefType,
             &[sub, target],
             "Unknown message reference type",
         );
@@ -322,7 +322,7 @@ fn chathistory(state: &mut ServerState, conn: ConnId, p: &[&str], account: Optio
         chathistory_fail(
             state,
             conn,
-            "INVALID_PARAMS",
+            HistoryFail::InvalidParams,
             &[sub, target],
             "* is only a valid selector for LATEST",
         );
@@ -333,7 +333,7 @@ fn chathistory(state: &mut ServerState, conn: ConnId, p: &[&str], account: Optio
         chathistory_fail(
             state,
             conn,
-            "INVALID_PARAMS",
+            HistoryFail::InvalidParams,
             &[sub, target],
             "Malformed message reference selector",
         );
@@ -349,7 +349,7 @@ fn chathistory(state: &mut ServerState, conn: ConnId, p: &[&str], account: Optio
             chathistory_fail(
                 state,
                 conn,
-                "INVALID_PARAMS",
+                HistoryFail::InvalidParams,
                 &[sub, target],
                 "limit must be between 1 and 500",
             );
@@ -500,7 +500,7 @@ fn too_many_history_requests(state: &mut ServerState, conn: ConnId, context: &[&
     chathistory_fail(
         state,
         conn,
-        "MESSAGE_ERROR",
+        HistoryFail::MessageError,
         context,
         "Too many history requests in flight",
     );
@@ -526,7 +526,7 @@ fn queue_history_request(
         chathistory_fail(
             state,
             conn,
-            "MESSAGE_ERROR",
+            HistoryFail::MessageError,
             context,
             "History temporarily unavailable",
         );
@@ -597,10 +597,15 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
         return;
     };
     if p.len() != 4 {
+        let code = if p.len() < 4 {
+            HistoryFail::NeedMoreParams
+        } else {
+            HistoryFail::InvalidParams
+        };
         chathistory_fail(
             state,
             conn,
-            "INVALID_PARAMS",
+            code,
             &["TARGETS"],
             "Expected exactly two timestamp= bounds and a limit",
         );
@@ -615,7 +620,7 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
         chathistory_fail(
             state,
             conn,
-            "INVALID_PARAMS",
+            HistoryFail::InvalidParams,
             &["TARGETS"],
             "Expected two timestamp= bounds",
         );
@@ -628,7 +633,7 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
             chathistory_fail(
                 state,
                 conn,
-                "INVALID_PARAMS",
+                HistoryFail::InvalidParams,
                 &["TARGETS"],
                 "limit must be between 1 and 500",
             );
@@ -784,12 +789,10 @@ fn unknown_msgid_fail(
     subcommand: &str,
     target: &str,
 ) {
-    let context = [subcommand, crate::core::handler::clip_echo(target)];
-    let line = super::fail_line(
+    let line = HistoryFail::MessageError.line(
         &state.config.server_name,
         "CHATHISTORY",
-        "MESSAGE_ERROR",
-        &context,
+        &[subcommand, target],
         "unknown msgid",
     );
     state.send(conn, &with_label(label, line));
@@ -802,13 +805,15 @@ fn chathistory_store_fault(
     state: &mut ServerState,
     conn: ConnId,
     label: Option<&str>,
-    middle: &str,
+    context: &[&str],
 ) {
     let line = with_label(
         label,
-        format!(
-            ":{} FAIL CHATHISTORY MESSAGE_ERROR {middle} :History temporarily unavailable",
-            state.config.server_name,
+        HistoryFail::MessageError.line(
+            &state.config.server_name,
+            "CHATHISTORY",
+            context,
+            "History temporarily unavailable",
         ),
     );
     state.send(conn, &line);
@@ -830,7 +835,7 @@ pub(crate) fn targets_page(
     // for the reasoning (an empty page is indistinguishable from "no buffers").
     let targets = match targets {
         Ok(targets) => targets,
-        Err(()) => return chathistory_store_fault(state, conn, label, "TARGETS"),
+        Err(()) => return chathistory_store_fault(state, conn, label, &["TARGETS"]),
     };
     let server = state.config.server_name.clone();
     // `label` is set only on the async DB path (produced outside the
@@ -1077,13 +1082,10 @@ pub(crate) fn history_page(
     // same MESSAGE_ERROR.
     let rows = match rows {
         Ok(rows) => rows,
-        Err(crate::core::HistoryFault::Unavailable) => {
-            return chathistory_store_fault(
-                state,
-                conn,
-                label,
-                crate::core::handler::clip_echo(display),
-            );
+        // The spec's `MESSAGE_ERROR <subcommand> <target>`: both name the
+        // request the fault answers.
+        Err(crate::core::HistoryFault::Unavailable { subcommand }) => {
+            return chathistory_store_fault(state, conn, label, &[subcommand, display]);
         }
         Err(crate::core::HistoryFault::UnknownMsgid { subcommand }) => {
             return unknown_msgid_fail(state, conn, label, subcommand, display);

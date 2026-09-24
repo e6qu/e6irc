@@ -9,6 +9,7 @@
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::{AttachCaps, NetworkHandle, NetworkHistory};
+use crate::core::HistoryFail;
 use crate::db::{BncHistoryPaging as Paging, BncHistorySelector as HistorySelector};
 
 /// The largest page a client may ask for in one CHATHISTORY reply. Bounded so
@@ -23,18 +24,44 @@ pub(crate) async fn handle_chathistory(
     caps: AttachCaps,
     params: &[&str],
 ) -> std::io::Result<()> {
+    // The same codes, in the same order of precedence, as the core's
+    // CHATHISTORY: the subcommand is judged first, then the parameter count.
     let Some(sub) = params.first() else {
-        return fail(write, "INVALID_PARAMS", "missing subcommand").await;
+        return fail(
+            write,
+            HistoryFail::NeedMoreParams,
+            &["*"],
+            "Missing parameters",
+        )
+        .await;
     };
-    match sub.to_ascii_uppercase().as_str() {
-        "LATEST" => paged(handle, write, caps, Paging::Latest, params).await,
-        "BEFORE" => paged(handle, write, caps, Paging::Before, params).await,
-        "AFTER" => paged(handle, write, caps, Paging::After, params).await,
-        "AROUND" => paged(handle, write, caps, Paging::Around, params).await,
-        "BETWEEN" => paged(handle, write, caps, Paging::Between, params).await,
-        "TARGETS" => targets(handle, write, caps, params).await,
-        _ => fail(write, "INVALID_PARAMS", "unknown subcommand").await,
-    }
+    let upper = sub.to_ascii_uppercase();
+    let paging = match upper.as_str() {
+        "LATEST" => Paging::Latest,
+        "BEFORE" => Paging::Before,
+        "AFTER" => Paging::After,
+        "AROUND" => Paging::Around,
+        "BETWEEN" => Paging::Between,
+        "TARGETS" => return targets(handle, write, caps, params).await,
+        _ => {
+            let detail = "Unknown subcommand";
+            return fail(write, HistoryFail::UnknownCommand, &[sub], detail).await;
+        }
+    };
+    paged(handle, write, caps, paging, &upper, params).await
+}
+
+/// `CHATHISTORY` refused because the client did not negotiate the cap.
+pub(crate) async fn refuse_without_cap(
+    write: &mut (impl AsyncWrite + Unpin),
+) -> std::io::Result<()> {
+    fail(
+        write,
+        HistoryFail::NeedCaps,
+        &[],
+        "draft/chathistory required",
+    )
+    .await
 }
 
 /// Serve a `MARKREAD` command from an attached client. `account` is the
@@ -47,59 +74,51 @@ pub(crate) async fn handle_markread(
     origin: u64,
     params: &[&str],
 ) -> std::io::Result<()> {
-    if params.len() > 2 {
-        return fail_command(
+    // The core's MARKREAD codes and context: the target (or `*` when none
+    // was given) always rides the FAIL.
+    let Some(&target) = params.first() else {
+        return fail_markread(
             write,
-            "MARKREAD",
-            "INVALID_PARAMS",
+            HistoryFail::NeedMoreParams,
+            "*",
+            "Not enough parameters",
+        )
+        .await;
+    };
+    if params.len() > 2 {
+        return fail_markread(
+            write,
+            HistoryFail::InvalidParams,
+            target,
             "expected <target> [timestamp]",
         )
         .await;
     }
-    let Some(&target) = params.first() else {
-        return fail_command(write, "MARKREAD", "INVALID_PARAMS", "missing target").await;
-    };
     if !valid_target(target) {
-        return fail_command(write, "MARKREAD", "INVALID_PARAMS", "invalid target").await;
+        return fail_markread(write, HistoryFail::InvalidParams, target, "Invalid target").await;
     }
-    let history = match handle.history() {
-        Some(h) => h,
-        None => {
-            return fail_command(
-                write,
-                "MARKREAD",
-                "UNAVAILABLE",
-                "read markers are not configured",
-            )
-            .await;
-        }
+    let Some(history) = handle.history() else {
+        return fail_markread(
+            write,
+            HistoryFail::TemporarilyUnavailable,
+            target,
+            "read markers are not configured",
+        )
+        .await;
     };
     let (network, pool) = (&history.network, &history.pool);
     match params.get(1) {
         // `MARKREAD <target>` queries one marker.
-        None => match crate::db::get_bnc_read_marker(pool, account, network, target).await {
-            Ok(Some(ts)) => write_marker(write, target, &ts).await?,
-            Ok(None) => write_marker(write, target, "*").await?,
-            Err(e) => {
-                eprintln!("bnc: read marker query failed for {account}/{network}: {e}");
-                return fail_command(
-                    write,
-                    "MARKREAD",
-                    "TEMPORARY_FAILURE",
-                    "read markers unavailable",
-                )
-                .await;
-            }
-        },
+        None => send_read_marker(write, &history, account, target).await?,
         // `MARKREAD <target> <timestamp>` sets the position and acknowledges.
         Some(raw) => {
             let timestamp = match normalize_timestamp(raw) {
                 Some(ts) => ts,
                 None => {
-                    return fail_command(
+                    return fail_markread(
                         write,
-                        "MARKREAD",
-                        "INVALID_PARAMS",
+                        HistoryFail::InvalidParams,
+                        target,
                         "malformed timestamp",
                     )
                     .await;
@@ -111,20 +130,20 @@ pub(crate) async fn handle_markread(
                 {
                     Ok(crate::db::BncReadMarkerWrite::Stored(stored)) => stored,
                     Ok(crate::db::BncReadMarkerWrite::LimitReached) => {
-                        return fail_command(
+                        return fail_markread(
                             write,
-                            "MARKREAD",
-                            "INVALID_PARAMS",
+                            HistoryFail::InvalidParams,
+                            target,
                             "too many read marker targets",
                         )
                         .await;
                     }
                     Err(e) => {
                         eprintln!("bnc: read marker write failed for {account}/{network}: {e}");
-                        return fail_command(
+                        return fail_markread(
                             write,
-                            "MARKREAD",
-                            "TEMPORARY_FAILURE",
+                            HistoryFail::TemporarilyUnavailable,
+                            target,
                             "read markers unavailable",
                         )
                         .await;
@@ -138,17 +157,53 @@ pub(crate) async fn handle_markread(
     Ok(())
 }
 
+/// Send `target`'s current read marker (`*` when none is set), or the
+/// `TEMPORARILY_UNAVAILABLE` FAIL when the store cannot answer. The MARKREAD
+/// query form and the replay after a JOIN both answer through here.
+pub(crate) async fn send_read_marker(
+    write: &mut (impl AsyncWrite + Unpin),
+    history: &NetworkHistory,
+    account: &str,
+    target: &str,
+) -> std::io::Result<()> {
+    match crate::db::get_bnc_read_marker(&history.pool, account, &history.network, target).await {
+        Ok(Some(ts)) => write_marker(write, target, &ts).await,
+        Ok(None) => write_marker(write, target, "*").await,
+        Err(e) => {
+            eprintln!(
+                "bnc: read marker query failed for {account}/{}/{target}: {e}",
+                history.network
+            );
+            fail_markread(
+                write,
+                HistoryFail::TemporarilyUnavailable,
+                target,
+                "read markers unavailable",
+            )
+            .await
+        }
+    }
+}
+
 /// The persisted history store for a network, or a loud `FAIL` and `None` when
 /// the network has none configured (paging a store-less network must not look
-/// like an empty backlog — DESIGN §2: no silent fallbacks).
+/// like an empty backlog — DESIGN §2: no silent fallbacks). `context` is the
+/// request the FAIL answers.
 async fn require_history(
     handle: &NetworkHandle,
     write: &mut (impl AsyncWrite + Unpin),
+    context: &[&str],
 ) -> std::io::Result<Option<NetworkHistory>> {
     match handle.history() {
         Some(h) => Ok(Some(h)),
         None => {
-            fail(write, "UNAVAILABLE", "history store not configured").await?;
+            fail(
+                write,
+                HistoryFail::MessageError,
+                context,
+                "history store not configured",
+            )
+            .await?;
             Ok(None)
         }
     }
@@ -160,14 +215,27 @@ async fn paged(
     write: &mut (impl AsyncWrite + Unpin),
     caps: AttachCaps,
     paging: Paging,
+    sub: &str,
     params: &[&str],
 ) -> std::io::Result<()> {
     let between = matches!(paging, Paging::Between);
     let expected = if between { 5 } else { 4 };
-    if params.len() != expected {
+    if params.len() < expected {
         return fail(
             write,
-            "INVALID_PARAMS",
+            HistoryFail::NeedMoreParams,
+            &[sub],
+            "Missing parameters",
+        )
+        .await;
+    }
+    let target = params[1];
+    let context = [sub, target];
+    if params.len() > expected {
+        return fail(
+            write,
+            HistoryFail::InvalidParams,
+            &context,
             if between {
                 "expected exactly <target> <selector> <selector> <limit>"
             } else {
@@ -176,18 +244,23 @@ async fn paged(
         )
         .await;
     }
-    let target = params[1];
     if !valid_target(target) {
-        return fail(write, "INVALID_PARAMS", "invalid target").await;
+        return fail(
+            write,
+            HistoryFail::InvalidTarget,
+            &context,
+            "invalid target",
+        )
+        .await;
     }
     let selector = match HistorySelector::parse(params[2]) {
         Ok(selector) => selector,
-        Err(reason) => return fail(write, "INVALID_PARAMS", reason).await,
+        Err((code, reason)) => return fail(write, code, &context, reason).await,
     };
     let selector2 = if between {
         match HistorySelector::parse(params[3]) {
             Ok(selector) => selector,
-            Err(reason) => return fail(write, "INVALID_PARAMS", reason).await,
+            Err((code, reason)) => return fail(write, code, &context, reason).await,
         }
     } else {
         HistorySelector::Star
@@ -198,16 +271,23 @@ async fn paged(
     {
         return fail(
             write,
-            "INVALID_PARAMS",
+            HistoryFail::InvalidParams,
+            &context,
             "* is only a valid selector for LATEST",
         )
         .await;
     }
     let limit_raw = params[if between { 4 } else { 3 }];
     let Some(limit) = parse_limit(limit_raw) else {
-        return fail(write, "INVALID_PARAMS", "limit must be between 1 and 500").await;
+        return fail(
+            write,
+            HistoryFail::InvalidParams,
+            &context,
+            "limit must be between 1 and 500",
+        )
+        .await;
     };
-    let Some(history) = require_history(handle, write).await? else {
+    let Some(history) = require_history(handle, write, &context).await? else {
         return Ok(());
     };
     match crate::db::bnc_history_window(
@@ -230,43 +310,36 @@ async fn paged(
         // position is gone". (A timestamp always names a position, so one that
         // matches nothing is a genuinely empty page.)
         Ok(Err(crate::db::UnknownBncMsgid)) => {
-            write
-                .write_all(unknown_msgid_reply(params[0], target).as_bytes())
-                .await?;
-            write.flush().await
+            fail(write, HistoryFail::MessageError, &context, "unknown msgid").await
         }
-        Err(e) => db_error(write, e).await,
+        Err(e) => db_error(write, &context, e).await,
     }
-}
-
-/// The spec's `MESSAGE_ERROR the_given_command the_given_target`. `target` has
-/// passed [`valid_target`], so it is one bounded parameter.
-fn unknown_msgid_reply(subcommand: &str, target: &str) -> String {
-    format!(
-        ":*bnc* FAIL CHATHISTORY MESSAGE_ERROR {} {target} :unknown msgid\r\n",
-        subcommand.to_ascii_uppercase()
-    )
 }
 
 impl HistorySelector {
     /// Parse a client's selector into a validated position: a well-formed
     /// message id, or a timestamp canonicalized to the stored representation.
-    fn parse(raw: &str) -> Result<Self, &'static str> {
+    /// A reference type other than `msgid`/`timestamp` is INVALID_MSGREFTYPE,
+    /// a malformed value of a known one INVALID_PARAMS — as in the core.
+    fn parse(raw: &str) -> Result<Self, (HistoryFail, &'static str)> {
         if raw == "*" {
             return Ok(Self::Star);
         }
         if let Some(msgid) = raw.strip_prefix("msgid=") {
             return e6irc_proto::message::valid_message_id(msgid)
                 .then(|| Self::Msgid(msgid.to_string()))
-                .ok_or("invalid msgid selector");
+                .ok_or((HistoryFail::InvalidParams, "invalid msgid selector"));
         }
         if let Some(timestamp) = raw.strip_prefix("timestamp=") {
             return e6irc_proto::time::parse_server_time_millis(timestamp)
                 .map(e6irc_proto::time::server_time)
                 .map(Self::Timestamp)
-                .ok_or("invalid timestamp selector");
+                .ok_or((HistoryFail::InvalidParams, "invalid timestamp selector"));
         }
-        Err("selector must be *, msgid=..., or timestamp=...")
+        Err((
+            HistoryFail::InvalidMsgRefType,
+            "selector must be *, msgid=..., or timestamp=...",
+        ))
     }
 }
 
@@ -278,17 +351,21 @@ async fn targets(
     caps: AttachCaps,
     params: &[&str],
 ) -> std::io::Result<()> {
+    const CONTEXT: &[&str] = &["TARGETS"];
     if params.len() != 4 {
+        let code = if params.len() < 4 {
+            HistoryFail::NeedMoreParams
+        } else {
+            HistoryFail::InvalidParams
+        };
         return fail(
             write,
-            "INVALID_PARAMS",
+            code,
+            CONTEXT,
             "expected exactly <timestamp> <timestamp> <target-count>",
         )
         .await;
     }
-    let Some(history) = require_history(handle, write).await? else {
-        return Ok(());
-    };
     let parse_timestamp = |raw: &str| {
         raw.strip_prefix("timestamp=")
             .and_then(e6irc_proto::time::parse_server_time_millis)
@@ -296,7 +373,13 @@ async fn targets(
     };
     let (Some(first), Some(second)) = (parse_timestamp(params[1]), parse_timestamp(params[2]))
     else {
-        return fail(write, "INVALID_PARAMS", "expected two timestamp= bounds").await;
+        return fail(
+            write,
+            HistoryFail::InvalidParams,
+            CONTEXT,
+            "expected two timestamp= bounds",
+        )
+        .await;
     };
     let (minimum, maximum) = if first <= second {
         (first, second)
@@ -309,11 +392,15 @@ async fn targets(
         None => {
             return fail(
                 write,
-                "INVALID_PARAMS",
+                HistoryFail::InvalidParams,
+                CONTEXT,
                 "target count must be between 1 and 500",
             )
             .await;
         }
+    };
+    let Some(history) = require_history(handle, write, CONTEXT).await? else {
+        return Ok(());
     };
     let rows = match crate::db::bnc_history_targets(
         &history.pool,
@@ -327,7 +414,7 @@ async fn targets(
     .await
     {
         Ok(rows) => rows,
-        Err(e) => return db_error(write, e).await,
+        Err(e) => return db_error(write, CONTEXT, e).await,
     };
 
     // The inner lines carry the per-target newest timestamp so a client can
@@ -471,38 +558,57 @@ async fn write_marker(
         .await
 }
 
-/// A `FAIL <command> <code> :<message>` error reply, shared by CHATHISTORY
-/// and MARKREAD.
+/// A `FAIL <command> <code> <context..> :<message>` error reply, rendered by
+/// the core's own [`HistoryFail`] so the two surfaces speak one code set.
 async fn fail_command(
     write: &mut (impl AsyncWrite + Unpin),
     command: &str,
-    code: &str,
+    code: HistoryFail,
+    context: &[&str],
     message: &str,
 ) -> std::io::Result<()> {
-    write
-        .write_all(format!(":*bnc* FAIL {command} {code} :{message}\r\n").as_bytes())
-        .await?;
+    let line = code.line("*bnc*", command, context, message);
+    write.write_all(format!("{line}\r\n").as_bytes()).await?;
     write.flush().await?;
     Ok(())
 }
 
-/// A `FAIL CHATHISTORY <code> :<message>` error reply.
+/// A `FAIL CHATHISTORY` error reply.
 async fn fail(
     write: &mut (impl AsyncWrite + Unpin),
-    code: &str,
+    code: HistoryFail,
+    context: &[&str],
     message: &str,
 ) -> std::io::Result<()> {
-    fail_command(write, "CHATHISTORY", code, message).await
+    fail_command(write, "CHATHISTORY", code, context, message).await
+}
+
+/// A `FAIL MARKREAD <code> <target>` error reply.
+async fn fail_markread(
+    write: &mut (impl AsyncWrite + Unpin),
+    code: HistoryFail,
+    target: &str,
+    message: &str,
+) -> std::io::Result<()> {
+    fail_command(write, "MARKREAD", code, &[target], message).await
 }
 
 /// Surface a history-store query failure as a loud FAIL, never a silent empty
-/// page (DESIGN §2: no silent fallbacks).
+/// page (DESIGN §2: no silent fallbacks): the spec's `MESSAGE_ERROR`, naming
+/// the request it answers.
 async fn db_error(
     write: &mut (impl AsyncWrite + Unpin),
+    context: &[&str],
     e: crate::db::DbError,
 ) -> std::io::Result<()> {
     eprintln!("bnc: chathistory query failed: {e}");
-    fail(write, "TEMPORARY_FAILURE", "history store unavailable").await
+    fail(
+        write,
+        HistoryFail::MessageError,
+        context,
+        "history store unavailable",
+    )
+    .await
 }
 
 /// Parse a positive page limit.
@@ -590,15 +696,73 @@ mod tests {
         server.shutdown().await.expect("close server half");
         let mut reply = String::new();
         client.read_to_string(&mut reply).await.expect("read reply");
-        assert!(reply.contains("FAIL CHATHISTORY UNAVAILABLE"), "{reply}");
-        assert!(!reply.contains("NEED_CAPS"), "{reply}");
+        assert_eq!(
+            reply,
+            ":*bnc* FAIL CHATHISTORY MESSAGE_ERROR LATEST #room :history store not configured\r\n"
+        );
     }
 
-    #[test]
-    fn unknown_msgid_is_the_specified_error_reply() {
+    /// The bouncer answers with the core's codes and context parameters, and
+    /// validation precedes storage (none is configured here, and only the
+    /// well-formed MARKREAD query reaches the store check).
+    #[tokio::test]
+    async fn chathistory_and_markread_failures_use_the_core_code_set() {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let (handle, _ends) = NetworkHandle::channels(4);
+        let caps = AttachCaps {
+            chathistory: true,
+            ..AttachCaps::default()
+        };
+        for params in [
+            vec!["FROB", "#room"],
+            vec![],
+            vec!["latest", "#room", "*"],
+            vec![
+                "BEFORE",
+                "bad,target",
+                "timestamp=2026-01-01T00:00:00.000Z",
+                "5",
+            ],
+            vec!["BEFORE", "#room", "nonsense=1", "5"],
+            vec!["TARGETS", "timestamp=2026-01-01T00:00:00.000Z"],
+            vec!["LATEST", "#room", "*", "501"],
+            vec!["LATEST", "#room", "*", "10", "extra"],
+        ] {
+            handle_chathistory(&handle, &mut server, caps, &params)
+                .await
+                .expect("history rejection");
+        }
+        for params in [
+            vec![],
+            vec!["#room", "timestamp=2026-01-01T00:00:00.000Z", "extra"],
+            vec!["#room"],
+        ] {
+            handle_markread(&handle, &mut server, "alice", 0, &params)
+                .await
+                .expect("markread rejection");
+        }
+        server.shutdown().await.expect("close server half");
+        let mut replies = String::new();
+        client
+            .read_to_string(&mut replies)
+            .await
+            .expect("read replies");
+        let lines: Vec<&str> = replies.split("\r\n").filter(|l| !l.is_empty()).collect();
         assert_eq!(
-            unknown_msgid_reply("AFTER", "#room"),
-            ":*bnc* FAIL CHATHISTORY MESSAGE_ERROR AFTER #room :unknown msgid\r\n"
+            lines,
+            [
+                ":*bnc* FAIL CHATHISTORY UNKNOWN_COMMAND FROB :Unknown subcommand",
+                ":*bnc* FAIL CHATHISTORY NEED_MORE_PARAMS * :Missing parameters",
+                ":*bnc* FAIL CHATHISTORY NEED_MORE_PARAMS LATEST :Missing parameters",
+                ":*bnc* FAIL CHATHISTORY INVALID_TARGET BEFORE bad,target :invalid target",
+                ":*bnc* FAIL CHATHISTORY INVALID_MSGREFTYPE BEFORE #room :selector must be *, msgid=..., or timestamp=...",
+                ":*bnc* FAIL CHATHISTORY NEED_MORE_PARAMS TARGETS :expected exactly <timestamp> <timestamp> <target-count>",
+                ":*bnc* FAIL CHATHISTORY INVALID_PARAMS LATEST #room :limit must be between 1 and 500",
+                ":*bnc* FAIL CHATHISTORY INVALID_PARAMS LATEST #room :expected exactly <target> <selector> <limit>",
+                ":*bnc* FAIL MARKREAD NEED_MORE_PARAMS * :Not enough parameters",
+                ":*bnc* FAIL MARKREAD INVALID_PARAMS #room :expected <target> [timestamp]",
+                ":*bnc* FAIL MARKREAD TEMPORARILY_UNAVAILABLE #room :read markers are not configured",
+            ]
         );
     }
 
@@ -681,54 +845,6 @@ mod tests {
             line.matches("time=").count(),
             1,
             "history must never emit duplicate time tags"
-        );
-    }
-
-    #[tokio::test]
-    async fn malformed_history_commands_fail_before_storage() {
-        let (mut client, mut server) = tokio::io::duplex(4096);
-        let (handle, _ends) = NetworkHandle::channels(4);
-        for params in [
-            vec!["LATEST", "#room", "*", "501"],
-            vec!["LATEST", "#room", "*", "10", "extra"],
-            vec!["TARGETS", "*"],
-        ] {
-            handle_chathistory(
-                &handle,
-                &mut server,
-                AttachCaps {
-                    batch: true,
-                    chathistory: true,
-                    ..AttachCaps::default()
-                },
-                &params,
-            )
-            .await
-            .expect("history rejection");
-        }
-        handle_markread(
-            &handle,
-            &mut server,
-            "alice",
-            0,
-            &["#room", "timestamp=2026-01-01T00:00:00.000Z", "extra"],
-        )
-        .await
-        .expect("MARKREAD rejection");
-        server.shutdown().await.expect("close server half");
-        let mut replies = String::new();
-        client
-            .read_to_string(&mut replies)
-            .await
-            .expect("read replies");
-        assert_eq!(
-            replies.matches("FAIL CHATHISTORY INVALID_PARAMS").count(),
-            3
-        );
-        assert!(replies.contains("FAIL MARKREAD INVALID_PARAMS"));
-        assert!(
-            !replies.contains("UNAVAILABLE"),
-            "validation must precede storage"
         );
     }
 

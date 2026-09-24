@@ -1003,15 +1003,21 @@ fn set_host(
 
     // Announce with the old prefix so clients can match, to every
     // chghost-capable peer (including the target), then to extended-monitor
-    // watchers of the target's nick.
-    let chghost = format!(":{old_prefix} CHGHOST {user} {newhost}");
-    notify_event(
-        state,
-        target,
-        &chghost,
-        crate::core::state::UserEventAudience::Chghost,
-        state.sessions[&target].caps.chghost,
-    );
+    // watchers of the target's nick. A channel peer without `chghost` sees the
+    // user quit and rejoin under the new hostmask instead (chghost spec's
+    // fallback), or it would keep matching the old one.
+    let chghost = state.user_line(target, format!(":{old_prefix} CHGHOST {user} {newhost}"));
+    let session = &state.sessions[&target];
+    let fallback = crate::core::state::HostChangeFallback {
+        quit: chghost.with_body(format!(":{old_prefix} QUIT :Changing host")),
+        prefix: session.prefix(),
+        nick: nick.clone(),
+        account: session.account().map(str::to_owned),
+        realname: session.realname().unwrap_or_default().to_string(),
+        away: session.away.clone(),
+    };
+    let include_self = session.caps.chghost;
+    state.notify_host_change(target, &chghost, include_self, fallback);
     // A chghost-capable target learned of the change from the CHGHOST above; a
     // client without the cap would otherwise never be told its own host moved.
     // Fill that gap with RPL_VISIBLEHOST so every target learns its new visible
@@ -1049,7 +1055,7 @@ pub(super) fn cmd_wallops(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // Relayed under the oper's prefix, so fit like every other client-text relay.
     let head = format!(":{prefix} WALLOPS :");
     let text = crate::core::handler::fit_trailing(&head, text);
-    let line = format!("{head}{text}");
+    let line = state.user_line(conn, format!("{head}{text}"));
     let recipients: Vec<_> = state
         .registered_users()
         .into_iter()
@@ -1057,6 +1063,6 @@ pub(super) fn cmd_wallops(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .map(|user| user.recipient)
         .collect();
     for recipient in recipients {
-        state.send_timed_recipient(recipient, &line);
+        state.send_event_recipient(recipient, &line);
     }
 }

@@ -952,6 +952,42 @@ Every message — single-line or batched — resolves its target through one pla
 so `+m`, `+n`, `+C`, bans and quiets cannot be evaded by splitting text across a
 batch, and permission checks see the whole message rather than each fragment.
 
+#### 7.5.2 Tags on every event, negotiation details
+
+A user's identity tags ride **every** line the user originates, not only its
+messages: JOIN, PART, QUIT, NICK, KICK, TOPIC, MODE, AWAY, SETNAME, CHGHOST,
+ACCOUNT and INVITE carry `account` (account-tag) and `bot` (bot-mode, with
+`message-tags`) exactly as PRIVMSG does, and every recipient's copy of one
+event carries the same `time`. The event delivery helpers
+(`send_event`, `broadcast_channel`, the user-event fan-out) take an
+`EventLine` — the body, its one timestamp, and its originator — never a bare
+string, and an `EventLine` is built only by naming who originated it (a user's
+`Originator`, or the server), so a user's line cannot reach a recipient without
+its tags. One renderer, `event_tags`, produces `msgid`/`time`/`account`/`bot`
+for the message paths and the event paths alike.
+
+A host change (oper `SETHOST`) is a CHGHOST to peers that negotiated
+`chghost`. A channel peer without it cannot parse CHGHOST and would keep the
+old hostmask, so it is shown the user quitting (`QUIT :Changing host`) and
+rejoining each shared channel under the new mask — the JOIN in its
+extended-join form where negotiated, the user's AWAY for away-notify peers, and
+a server MODE restoring the user's op/voice there — as the chghost spec
+prescribes. The QUIT is delivered once per peer, before the first rejoin,
+however many channel-owning shards report the peer.
+
+`CAP LS` with any numeric version of 302 or later is the 302 negotiation
+(values, multi-line replies) and implies `cap-notify`, which CAP LIST then
+reports and `-cap-notify` does not switch off. CAP LS and CAP LIST replies are
+split to fit the 512-byte line — with the `*` continuation marker for a 302
+client, and as complete lines for an older one, which does not know the
+marker — never truncated. The bouncer's attach listener negotiates through the
+same version rule and splitter. A SASL exchange left unfinished
+(`AUTHENTICATE PLAIN` with no payload) when registration completes is aborted
+with 906 and the client registered without an account. A line that is not
+UTF-8 (`UTF8ONLY`) is refused with `FAIL <command> INVALID_UTF8`, naming the
+command read from a lossy decoding of the line (`*` when none is readable), on
+the core and the attach listener alike.
+
 This is a **superset of Libera's advertised set** (Libera does not offer
 chathistory/multiline); the Libera-compat contract (§7.7) governs the shared
 subset's exact behavior.
@@ -2133,6 +2169,16 @@ A client need not wait for the welcome before it sends: whatever arrives after
 the line that completes registration (`CAP END`, typically) — whole lines, and
 the start of one — is handed with the handshake's framing to the attached
 session and handled there, after the replay, never refused by the handshake.
+Attach SASL advertises its mechanism list (`sasl=PLAIN`) to a 302 client,
+answers an unsupported mechanism with 908 before 904, and logs in with 900
+naming the client's nick and `nick!user@address` mask.
+The welcome is a full 001–004 plus ISUPPORT: the network's own 004 mode lists
+and 005 tokens as its registration burst reported them (the local network's
+are the core's, read the same way; bounded in number and length, `-TOKEN`
+honoured), or a bridge's fixed set when the network has reported none. The
+bouncer adds only what it serves itself — `CHATHISTORY` and `MSGREFTYPES`, and
+only when the network has a history store — replacing the network's own, whose
+limits say nothing about paging the bouncer's store.
 
 ### 10.5 Bridges: `matrix` / `discord` / `slack` drivers
 
@@ -2321,7 +2367,14 @@ Design constraints recorded now:
   shared by live delivery, the hot ring and the `messages` row — `server-time`
   is specified to milliseconds and CHATHISTORY pages by timestamp, so a coarser
   or twice-read clock makes messages unorderable or replays them bearing a
-  different time than they were delivered with.
+  different time than they were delivered with. A msgid is
+  `<ms>-<shard>-<boot>-<counter>`: the shard that stamped it, a random value
+  drawn once per process, and that shard's counter. The `messages` table keys
+  on the msgid and keeps the first of two rows sharing one, so ids that two
+  shards (each counting from zero) or a restart under a stepped-back clock
+  could repeat would silently lose history; naming the shard and the boot makes
+  a repeat impossible by construction. Every reader — CHATHISTORY pivots, the
+  bouncer, clients — treats the id as opaque.
 - **11.1.1 Conversations**: a direct message is stored **once**, under a key
   built from both participants' *identities* sorted and joined by `!`. Sorting
   makes the key symmetric, so both sides read the same thread from the single
@@ -2395,7 +2448,14 @@ Design constraints recorded now:
   :unknown msgid`, never an empty page: a client resuming from a vanished msgid
   would read "nothing newer" as "up to date". A timestamp that matches nothing
   is a real position and stays an empty page. The bouncer's CHATHISTORY emits
-  the same line. A page is cut by the database in the *client's* scope: a
+  the same line. Failures follow the spec's list, in one precedence: an
+  unknown subcommand is `UNKNOWN_COMMAND <subcommand>` (before anything about
+  the target), too few parameters `NEED_MORE_PARAMS <subcommand>`, too many or
+  a malformed value `INVALID_PARAMS <subcommand> <target>`, a store fault
+  `MESSAGE_ERROR <subcommand> <target>`; MARKREAD's store fault is
+  `TEMPORARILY_UNAVAILABLE <target>`. The core and the bouncer render them
+  through one closed `HistoryFail` code set, so neither can answer with a code
+  the other (and the spec) does not have. A page is cut by the database in the *client's* scope: a
   stored `TAGMSG` is nothing but tags, so a client that did not negotiate
   `message-tags` cannot receive one at all, and excluding those rows after the
   `LIMIT` returned fewer lines than asked for — indistinguishable from the end

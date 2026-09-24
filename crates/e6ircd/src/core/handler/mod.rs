@@ -7,7 +7,8 @@ use super::ConnId;
 use super::state::{
     BanKind, CAP_NAMES, ChanKey, Channel, ChannelActor, ChannelJoinResult, ChannelMessage,
     ChannelMessageResult, ChannelMultiline, ChannelMultilineResult, ChannelPartResult,
-    ChannelTagmsg, ChannelTagmsgResult, MemberModes, Recipient, ServerBan, ServerState, Topic,
+    ChannelTagmsg, ChannelTagmsgResult, EventLine, MemberModes, Recipient, ServerBan, ServerState,
+    Topic,
 };
 
 pub(crate) mod admin;
@@ -311,16 +312,35 @@ pub(crate) fn channel_tagmsg_result(
     message::emit_tagmsg_result(state, conn, result, label);
 }
 
+/// The refusal of a line that is not UTF-8: `FAIL <command> INVALID_UTF8`,
+/// naming the command the line carried (UTF8ONLY spec) so a client can tell
+/// which of its messages was dropped. The command is read from a lossy decoding
+/// of the line — past the tags and source, if any — and is `*` when no plain
+/// command word can be found there (the invalid bytes may be the command).
+pub(crate) fn invalid_utf8_fail(source: &str, line: &[u8]) -> String {
+    let text = String::from_utf8_lossy(line);
+    let command = text
+        .split(' ')
+        .filter(|word| !word.is_empty())
+        .find(|word| !word.starts_with('@') && !word.starts_with(':'))
+        .filter(|word| word.len() <= 32 && word.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .map_or_else(|| "*".to_string(), str::to_ascii_uppercase);
+    fail_line(
+        source,
+        &command,
+        "INVALID_UTF8",
+        &[],
+        "Message rejected, not valid UTF-8",
+    )
+}
+
 pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {
     if !state.sessions.contains_key(&conn) {
         return; // line raced a close; session already gone
     }
     let server = state.config.server_name.clone();
     let Ok(text) = std::str::from_utf8(line) else {
-        state.send(
-            conn,
-            &format!(":{server} FAIL * INVALID_UTF8 :Message rejected, not valid UTF-8"),
-        );
+        state.send(conn, &invalid_utf8_fail(&server, line));
         return;
     };
     if !e6irc_proto::message::client_frame_fits(text.as_bytes()) {
@@ -392,6 +412,58 @@ pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {
 /// recipient's framing discards an over-long line whole.
 pub(crate) fn fit_trailing<'a>(head: &str, text: &'a str) -> &'a str {
     e6irc_proto::message::truncate_on_char_boundary(text, 510usize.saturating_sub(head.len()))
+}
+
+/// Whether a `CAP LS` version argument selects the 302 behaviour: any numeric
+/// version of 302 or later does (a client speaking a newer negotiation is owed
+/// everything 302 brings — values, multi-line replies, implied cap-notify), so
+/// `CAP LS 303` is not quietly downgraded to the 3.1 form.
+pub(crate) fn cap_version_302(version: Option<&str>) -> bool {
+    version
+        .and_then(|version| version.parse::<u32>().ok())
+        .is_some_and(|version| version >= 302)
+}
+
+/// The lines of a `CAP <target> LS|LIST` reply carrying `tokens`, each inside
+/// the 512-byte wire limit — a single over-long line would be discarded whole
+/// by the client's framing, taking every capability with it. A 302 client is
+/// told more lines follow by a `*` before all but the last (capability
+/// negotiation 3.2); an older client, for whom `*` means nothing, gets the
+/// same split with every line complete in itself. A token never splits.
+pub(crate) fn cap_reply_lines(
+    source: &str,
+    target: &str,
+    verb: &str,
+    tokens: &[String],
+    v302: bool,
+) -> Vec<String> {
+    let continued = |more: bool| if more && v302 { "* " } else { "" };
+    // Budget every line as if it carried the `* ` marker, so the last line
+    // (which drops it) can never be the one that overflows.
+    let budget = 510usize.saturating_sub(format!(":{source} CAP {target} {verb} * :").len());
+    let mut chunks: Vec<String> = vec![String::new()];
+    for token in tokens {
+        let current = chunks.last_mut().expect("never empty");
+        if !current.is_empty() && current.len() + 1 + token.len() > budget {
+            chunks.push(token.clone());
+            continue;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(token);
+    }
+    let last = chunks.len() - 1;
+    chunks
+        .iter()
+        .enumerate()
+        .map(|(at, chunk)| {
+            format!(
+                ":{source} CAP {target} {verb} {}:{chunk}",
+                continued(at != last)
+            )
+        })
+        .collect()
 }
 
 /// `head` followed by `text` cut by [`fit_trailing`] — the whole relayed line,
@@ -476,6 +548,53 @@ pub(super) fn fail_line(
     line.push_str(" :");
     line.push_str(detail);
     line
+}
+
+/// The standard-reply codes history surfaces (CHATHISTORY, MARKREAD) answer
+/// with: one closed set, shared by the core and the bouncer's attach listener,
+/// so the two cannot drift into private spellings a client has never heard of
+/// (the bouncer once answered `UNAVAILABLE` and `TEMPORARY_FAILURE`, codes in
+/// neither spec). A store fault is `MessageError` for CHATHISTORY and
+/// `TemporarilyUnavailable` for MARKREAD, as each spec lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryFail {
+    NeedCaps,
+    NeedMoreParams,
+    UnknownCommand,
+    InvalidParams,
+    InvalidTarget,
+    InvalidMsgRefType,
+    MessageError,
+    TemporarilyUnavailable,
+}
+
+impl HistoryFail {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::NeedCaps => "NEED_CAPS",
+            Self::NeedMoreParams => "NEED_MORE_PARAMS",
+            Self::UnknownCommand => "UNKNOWN_COMMAND",
+            Self::InvalidParams => "INVALID_PARAMS",
+            Self::InvalidTarget => "INVALID_TARGET",
+            Self::InvalidMsgRefType => "INVALID_MSGREFTYPE",
+            Self::MessageError => "MESSAGE_ERROR",
+            Self::TemporarilyUnavailable => "TEMPORARILY_UNAVAILABLE",
+        }
+    }
+
+    /// `:{source} FAIL {command} {code} {context..} :{detail}`, each context
+    /// parameter (the client's own subcommand/target, echoed for attribution)
+    /// clipped so the line explaining an error is never discarded for length.
+    pub(crate) fn line(
+        self,
+        source: &str,
+        command: &str,
+        context: &[&str],
+        detail: &str,
+    ) -> String {
+        let clipped: Vec<&str> = context.iter().map(|p| clip_echo(p)).collect();
+        fail_line(source, command, self.code(), &clipped, detail)
+    }
 }
 
 /// Answer a query against a `+s` channel the requester can't see: report it as
@@ -920,6 +1039,67 @@ mod tests {
         // otherwise `!@` would match nothing and silently no-op the ban.
         assert_eq!(normalize_ban_mask("!@"), "*!*@*");
         assert_eq!(normalize_ban_mask("nick!@host"), "nick!*@host");
+    }
+
+    #[test]
+    fn cap_replies_split_inside_the_wire_limit() {
+        let tokens: Vec<String> = (0..60)
+            .map(|i| format!("vendor.example/cap-{i:02}"))
+            .collect();
+        let lines = cap_reply_lines("irc.example", "*", "LS", &tokens, true);
+        assert!(lines.len() > 1, "{lines:#?}");
+        assert!(lines.iter().all(|line| line.len() + 2 <= 512), "{lines:#?}");
+        // 302: every line but the last announces a continuation.
+        let (last, rest) = lines.split_last().expect("lines");
+        assert!(
+            rest.iter()
+                .all(|line| line.starts_with(":irc.example CAP * LS * :"))
+        );
+        assert!(last.starts_with(":irc.example CAP * LS :vendor"));
+        // Nothing lost, nothing split mid-token.
+        let rejoined: Vec<&str> = lines
+            .iter()
+            .flat_map(|line| line.split_once(" :").expect("trailing").1.split(' '))
+            .collect();
+        assert_eq!(
+            rejoined,
+            tokens.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        // A pre-302 client gets whole lines with no marker it cannot parse.
+        let legacy = cap_reply_lines("irc.example", "*", "LS", &tokens, false);
+        assert!(legacy.iter().all(|line| !line.contains(" LS * :")));
+        assert_eq!(legacy.len(), lines.len());
+        // A short list is one line.
+        assert_eq!(
+            cap_reply_lines("s", "n", "LIST", &["a".into(), "b".into()], true),
+            [":s CAP n LIST :a b"]
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_is_refused_under_the_command_it_carried() {
+        assert_eq!(
+            invalid_utf8_fail("s", b"@label=x :me!u@h privmsg #c :caf\xe9"),
+            ":s FAIL PRIVMSG INVALID_UTF8 :Message rejected, not valid UTF-8"
+        );
+        assert_eq!(
+            invalid_utf8_fail("s", b"PRIV\xffMSG #c :x"),
+            ":s FAIL * INVALID_UTF8 :Message rejected, not valid UTF-8"
+        );
+        assert_eq!(
+            invalid_utf8_fail("s", b"\xff"),
+            ":s FAIL * INVALID_UTF8 :Message rejected, not valid UTF-8"
+        );
+    }
+
+    #[test]
+    fn any_numeric_cap_version_from_302_is_302() {
+        assert!(cap_version_302(Some("302")));
+        assert!(cap_version_302(Some("303")));
+        assert!(cap_version_302(Some("999")));
+        assert!(!cap_version_302(Some("301")));
+        assert!(!cap_version_302(Some("v302")));
+        assert!(!cap_version_302(None));
     }
 
     #[test]

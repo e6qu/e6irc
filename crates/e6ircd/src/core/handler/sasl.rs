@@ -589,7 +589,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     display,
                     label,
                 },
-                "TEMPORARILY_UNAVAILABLE",
+                HistoryFail::TemporarilyUnavailable,
                 "Read marker could not be persisted",
             );
         }
@@ -608,7 +608,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     display,
                     label,
                 },
-                "INVALID_PARAMS",
+                HistoryFail::InvalidParams,
                 "Too many read markers",
             );
         }
@@ -630,7 +630,7 @@ pub(super) fn notify_account_change(state: &mut ServerState, conn: ConnId, accou
         return; // pre-registration SASL: peers cannot exist yet
     }
     let prefix = state.sessions[&conn].prefix();
-    let line = format!(":{prefix} ACCOUNT {account}");
+    let line = state.user_line(conn, format!(":{prefix} ACCOUNT {account}"));
     notify_event(
         state,
         conn,
