@@ -2348,11 +2348,14 @@ impl JoinRefusal {
     /// refusal too: the server joined some other channel on its own initiative,
     /// and the 366 that follows names that one, never `channel`.
     fn from_reply(channel: &str, reply: &OwnedMessage) -> Option<Self> {
+        if !is_join_refusal(channel, reply) {
+            return None;
+        }
         let forwarded_to = (reply.command == "470")
             .then(|| reply.params.get(2))
             .flatten()
             .map(|forward| bounded_diagnostic(forward));
-        (forwarded_to.is_some() || is_join_refusal(&reply.command)).then(|| Self {
+        Some(Self {
             channel: channel.to_owned(),
             forwarded_to,
             diagnostic: registration_diagnostic(reply),
@@ -2387,15 +2390,40 @@ pub fn is_channel_target(target: &str) -> bool {
     target.starts_with(['#', '&'])
 }
 
-/// The JOIN-refusal numerics: the replies that mean the 366 a join waits for
-/// will never come. Every client joins through [`Connection::join_with_history`]
-/// or its sibling, so this is read in exactly one place
-/// ([`JoinRefusal::from_reply`]).
-fn is_join_refusal(command: &str) -> bool {
-    matches!(
-        command,
-        "403" | "405" | "471" | "473" | "474" | "475" | "476" | "477" | "480"
-    )
+/// Whether `reply` refuses a `JOIN` of `channel`: the replies that mean the 366
+/// a join waits for will never come. Every client joins through
+/// [`Connection::join_with_history`] or its sibling, so this is read in exactly
+/// one place ([`JoinRefusal::from_reply`]).
+///
+/// There is no allow-list of numerics. Servers keep inventing their own join
+/// refusals (479 bad name, 489 TLS-only, 520 operators-only, ...), and one this
+/// client did not know about would otherwise leave the join waiting out its
+/// deadline and the caller retrying forever. Any [`is_refusal`] reply about
+/// `channel` is its refusal: an error numeric whose subject is `channel`, or a
+/// `FAIL JOIN` whose context names `channel` or names nothing at all.
+fn is_join_refusal(channel: &str, reply: &OwnedMessage) -> bool {
+    let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
+    if !is_refusal(reply) {
+        return false;
+    }
+    if reply.command == "FAIL" {
+        // FAIL <command> <code> [<context>...] <description>
+        return reply
+            .params
+            .first()
+            .is_some_and(|command| command.eq_ignore_ascii_case("JOIN"))
+            && match reply.params.get(2..reply.params.len().saturating_sub(1)) {
+                Some(context) if !context.is_empty() => {
+                    context.iter().any(|subject| casemap.eq(subject, channel))
+                }
+                _ => true,
+            };
+    }
+    // An error numeric: <client> <channel> [...] :<reason>
+    reply
+        .params
+        .get(1)
+        .is_some_and(|subject| casemap.eq(subject, channel))
 }
 
 /// Map a registration-refusal numeric to a terminal error, if it is one. These
@@ -4572,6 +4600,52 @@ mod tests {
         assert_eq!(refusal.channel(), "#room");
         assert_eq!(refusal.forwarded_to(), Some("#overflow"));
         assert!(error.to_string().contains("#overflow"), "{error}");
+    }
+
+    /// A refusal numeric this client never heard of still ends the join loudly
+    /// with the server's reason: an allow-list left 479/489/520 and `FAIL JOIN`
+    /// waiting out the deadline, and the TUI reconnecting forever.
+    #[tokio::test]
+    async fn any_error_reply_about_the_channel_is_a_refusal_with_its_reason() {
+        let replies: [&'static [u8]; 6] = [
+            b":srv 479 nick #room :Illegal channel name\r\n",
+            b":srv 489 nick #ROOM :Cannot join channel (+z)\r\n",
+            b":srv 520 nick #room :Only IRC operators may join\r\n",
+            b":srv 599 nick #room :Some future refusal\r\n",
+            b":srv FAIL JOIN CHANNEL_CLOSED #room :Some future refusal\r\n",
+            b":srv FAIL JOIN UNKNOWN_ERROR :Some future refusal\r\n",
+        ];
+        for reply in replies {
+            let error = join_answered_with(reply)
+                .await
+                .expect_err("a refusal ends the join");
+            let refusal = JoinRefusal::from_error(&error).expect("a typed join refusal");
+            assert_eq!(refusal.channel(), "#room");
+            assert_eq!(refusal.forwarded_to(), None);
+            let text = error.to_string();
+            assert!(
+                text.contains("Illegal channel name")
+                    || text.contains("(+z)")
+                    || text.contains("IRC operators")
+                    || text.contains("future refusal"),
+                "the server's reason is carried: {text}"
+            );
+        }
+    }
+
+    /// An error about some other channel, or a `FAIL` for some other command,
+    /// is not this join's refusal.
+    #[tokio::test]
+    async fn an_error_about_another_subject_does_not_end_the_join() {
+        let events = join_answered_with(
+            b":srv 404 nick #other :Cannot send to channel\r\n\
+              :srv FAIL JOIN CHANNEL_CLOSED #other :closed\r\n\
+              :srv FAIL CHATHISTORY INVALID_TARGET #room :no\r\n\
+              :srv 366 nick #room :End of NAMES\r\n",
+        )
+        .await
+        .expect("errors about other subjects do not refuse #room");
+        assert_eq!(messages_of(&events).len(), 4);
     }
 
     #[tokio::test]

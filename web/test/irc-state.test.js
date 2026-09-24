@@ -8,6 +8,8 @@ import {
   asMessage,
   channelModesFrom,
   chatMessageRoute,
+  clearTranscript,
+  existingChannelBuffer,
   fold,
   isPrefixMode,
   kickPairs,
@@ -293,3 +295,32 @@ test("a malformed ISUPPORT token is reported and leaves the table alone", () => 
 });
 
 
+
+test("a topic or NAMES reply finds an open channel buffer and never makes one", () => {
+  const channel = { key: "#chat", kind: "channel" };
+  const buffers = new Map([["#chat", channel], ["alice", { key: "alice", kind: "dm" }]]);
+  assert.equal(existingChannelBuffer(buffers, "#CHAT"), channel);
+  assert.equal(existingChannelBuffer(buffers, "#elsewhere"), null);
+  assert.equal(existingChannelBuffer(buffers, "*"), null);
+  assert.equal(existingChannelBuffer(buffers, "alice"), null);
+  assert.equal(existingChannelBuffer(buffers, undefined), null);
+  assert.equal(buffers.size, 2);
+});
+
+test("a replay clears a transcript and offers its earlier history again", () => {
+  const buffer = {
+    lines: [{ text: "old" }],
+    unread: 3,
+    mentions: 1,
+    pendingVisibleMessages: 2,
+    historyLoaded: true,
+  };
+  clearTranscript(buffer);
+  assert.deepEqual(buffer, {
+    lines: [],
+    unread: 0,
+    mentions: 0,
+    pendingVisibleMessages: 0,
+    historyLoaded: false,
+  });
+});

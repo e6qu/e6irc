@@ -6,7 +6,7 @@ mod http;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use e6irc_client::credentials::{
     CredentialArguments, SecretSources, process_environment, resolve_server_password,
 };
@@ -159,7 +159,8 @@ struct Cli {
     /// Seconds the server may take to finish registration, and afterwards to
     /// answer each request a command waits on — a JOIN, a history request,
     /// the verdict on a sent message, closing the connection after QUIT —
-    /// before the command fails.
+    /// before the command fails. For `api` and `login`, the bound on each HTTP
+    /// request.
     #[arg(
         long,
         global = true,
@@ -231,8 +232,60 @@ enum Command {
     },
 }
 
+/// The global options the HTTP-only commands (`api`, `login`) read. Every
+/// other global option configures an IRC connection those commands never open,
+/// so giving one to them is refused rather than silently ignored — and a global
+/// option added later is refused there too until it is listed here.
+const HTTP_GLOBAL_ARGUMENTS: [&str; 3] = [
+    "token_file",
+    "allow_cleartext_credentials",
+    "response_timeout",
+];
+
+/// Refuse IRC-only global options given to an HTTP-only command.
+fn reject_irc_only_arguments(cli: &Cli, matches: &ArgMatches) -> Result<(), clap::Error> {
+    let subcommand = match cli.command {
+        Command::Api { .. } => "api",
+        Command::Login { .. } => "login",
+        Command::Send { .. } | Command::Tail { .. } | Command::Raw | Command::History { .. } => {
+            return Ok(());
+        }
+    };
+    let mut command = Cli::command();
+    let given: Vec<String> = command
+        .get_arguments()
+        .filter(|argument| argument.is_global_set())
+        .filter(|argument| !HTTP_GLOBAL_ARGUMENTS.contains(&argument.get_id().as_str()))
+        .filter(|argument| {
+            matches.value_source(argument.get_id().as_str())
+                == Some(clap::parser::ValueSource::CommandLine)
+        })
+        .map(|argument| match argument.get_long() {
+            Some(long) => format!("--{long}"),
+            None => argument.get_id().to_string(),
+        })
+        .collect();
+    if given.is_empty() {
+        return Ok(());
+    }
+    Err(command.error(
+        clap::error::ErrorKind::ArgumentConflict,
+        format!(
+            "`e6irc {subcommand}` opens no IRC connection, so these IRC options would do nothing: {}",
+            given.join(", ")
+        ),
+    ))
+}
+
+fn parse_arguments() -> Result<Cli, clap::Error> {
+    let matches = Cli::command().try_get_matches()?;
+    let cli = Cli::from_arg_matches(&matches)?;
+    reject_irc_only_arguments(&cli, &matches)?;
+    Ok(cli)
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = parse_arguments().unwrap_or_else(|error| error.exit());
     // One TLS stack for the process: the IRC transport and the HTTP client
     // both take this provider.
     e6irc_client::install_crypto_provider();
@@ -259,7 +312,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
     // HTTP-only commands run before any IRC transport is opened.
     if let Command::Login { base } = &cli.command {
         let cache_path = token_path(cli.token_file.as_deref())?;
-        return http::login(base, &cache_path, cleartext_credentials(&cli)).await;
+        return http::login(base, &cache_path, http_transport(&cli)).await;
     }
     if let Command::Api {
         method,
@@ -282,7 +335,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             token,
             body.clone(),
             cli.token_file.as_deref(),
-            cleartext_credentials(&cli),
+            http_transport(&cli),
         )
         .await;
     }
@@ -664,6 +717,13 @@ async fn raw(conn: &mut Connection, out: &mut impl std::io::Write) -> std::io::R
     }
 }
 
+fn http_transport(cli: &Cli) -> http::Transport {
+    http::Transport {
+        cleartext: cleartext_credentials(cli),
+        response_timeout: std::time::Duration::from_secs(cli.response_timeout),
+    }
+}
+
 fn cleartext_credentials(cli: &Cli) -> CleartextCredentials {
     if cli.allow_cleartext_credentials {
         CleartextCredentials::Allow
@@ -905,6 +965,66 @@ mod tests {
         assert_eq!(irc_nick(Some("alice")).unwrap(), "alice");
         assert!(irc_nick(None).is_err());
         assert!(irc_nick(Some(" ")).is_err());
+    }
+
+    /// Whether `arguments` parse and pass the IRC-only-option check.
+    fn accepted(arguments: &[&str]) -> Result<(), String> {
+        let matches = Cli::command()
+            .try_get_matches_from(arguments)
+            .map_err(|error| error.to_string())?;
+        let cli = Cli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
+        reject_irc_only_arguments(&cli, &matches).map_err(|error| error.to_string())
+    }
+
+    /// `api` and `login` open no IRC connection: an IRC option given to them
+    /// is refused by name, wherever it sits on the line, instead of being
+    /// accepted and ignored. The options they do read stay accepted.
+    #[test]
+    fn http_commands_refuse_irc_only_options() {
+        for command in [
+            &["api", "GET", "/api/v1/me"][..],
+            &["login", "--base", "https://irc.example"][..],
+        ] {
+            let with = |options: &[&str], after: bool| {
+                let mut line = vec!["e6irc"];
+                if after {
+                    line.extend(command);
+                    line.extend(options);
+                } else {
+                    line.extend(options);
+                    line.extend(command);
+                }
+                accepted(&line)
+            };
+            for after in [false, true] {
+                with(
+                    &[
+                        "--token-file",
+                        "t.json",
+                        "--allow-cleartext-credentials",
+                        "--response-timeout",
+                        "5",
+                    ],
+                    after,
+                )
+                .expect("the options HTTP commands read");
+                for irc_only in [
+                    &["--server", "irc.example:6697"][..],
+                    &["--nick", "alice"],
+                    &["--account", "alice"],
+                    &["--password", "secret"],
+                    &["--oauth-from-cache"],
+                    &["--tls"],
+                    &["--server-password-file", "pw"],
+                ] {
+                    let error = with(irc_only, after).expect_err("an IRC-only option");
+                    assert!(error.contains(irc_only[0]), "{error}");
+                    assert!(error.contains(command[0]), "{error}");
+                }
+            }
+        }
+        // IRC commands still take every global option.
+        accepted(&["e6irc", "--server", "s:1", "--tls", "send", "n", "m"]).unwrap();
     }
 
     #[test]

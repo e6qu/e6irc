@@ -328,9 +328,16 @@ struct Campaign {
     output: PathBuf,
     workload: Measurements,
     budgets: Measurements,
-    probe: Option<PathBuf>,
+    probe: Option<ProbeCommand>,
     credentials: Vec<CredentialEnv>,
-    probe_args: Vec<OsString>,
+}
+
+/// An external probe and the arguments given after `--`. They are one value so
+/// that arguments can only exist for a campaign that runs a probe to take them.
+#[derive(Debug)]
+struct ProbeCommand {
+    path: PathBuf,
+    arguments: Vec<OsString>,
 }
 
 fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Campaign, String> {
@@ -441,14 +448,20 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Campaign,
             "--executable is only valid for scale".into()
         });
     }
-    if kind.rejects_oracle_endpoint() {
-        return Err("external campaigns cannot set a local oracle endpoint".into());
-    }
     if kind.uses_native_campaign() && probe.is_some() {
         return Err(format!(
             "{} uses its built-in adapter; --probe is invalid",
             kind.name()
         ));
+    }
+    if kind.uses_native_campaign() && !probe_args.is_empty() {
+        return Err(format!(
+            "{} uses its built-in adapter; arguments after -- are for a probe and are invalid",
+            kind.name()
+        ));
+    }
+    if kind.rejects_oracle_endpoint() {
+        return Err("external campaigns cannot set a local oracle endpoint".into());
     }
     let probe = if kind.uses_native_campaign() {
         None
@@ -460,7 +473,10 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Campaign,
                 probe.display()
             ));
         }
-        Some(probe)
+        Some(ProbeCommand {
+            path: probe,
+            arguments: probe_args,
+        })
     };
     for name in kind.required_environment() {
         let credential = CredentialEnv::parse((*name).to_string())?;
@@ -485,7 +501,6 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Campaign,
         budgets: Measurements::parse(budgets, "--budget")?,
         probe,
         credentials,
-        probe_args,
     })
 }
 
@@ -1027,7 +1042,7 @@ fn run(args: Campaign) -> ExitCode {
         CampaignResult::Report(ProbeReport::not_run(args.kind))
     } else if args.kind.uses_native_campaign() {
         CampaignResult::Report(native::run(args.kind, args.target.as_str()))
-    } else if let Some(probe) = args.probe.as_deref() {
+    } else if let Some(probe) = args.probe.as_ref() {
         run_probe(&args, probe, &probe_report_path, &challenge)
     } else {
         CampaignResult::FailedBeforePhase
@@ -1116,9 +1131,14 @@ enum CampaignResult {
     FailedBeforePhase,
 }
 
-fn run_probe(args: &Campaign, probe: &Path, report_path: &Path, challenge: &str) -> CampaignResult {
-    let status = Command::new(probe)
-        .args(&args.probe_args)
+fn run_probe(
+    args: &Campaign,
+    probe: &ProbeCommand,
+    report_path: &Path,
+    challenge: &str,
+) -> CampaignResult {
+    let status = Command::new(&probe.path)
+        .args(&probe.arguments)
         .env("E6IRC_QUALIFICATION_KIND", args.kind.name())
         .env("E6IRC_QUALIFICATION_TARGET", args.target.as_str())
         .env("E6IRC_QUALIFICATION_PROBE_REPORT", report_path)
@@ -1233,6 +1253,25 @@ mod tests {
             Measurements::parse(vec!["clients=1".into(), "clients=2".into()], "--workload")
                 .is_err()
         );
+    }
+
+    /// A native campaign runs no probe, so arguments for one would be
+    /// accepted and dropped: they are refused like `--probe` itself.
+    #[test]
+    fn native_campaigns_refuse_probe_arguments() {
+        let output = std::env::temp_dir().join(format!(
+            "e6irc-qualification-never-written-{}",
+            std::process::id()
+        ));
+        for kind in ["discord", "slack", "oidc"] {
+            let error = parse_args(
+                [kind, "--output", output.to_str().unwrap(), "--", "--flag"]
+                    .into_iter()
+                    .map(OsString::from),
+            )
+            .expect_err("probe arguments without a probe");
+            assert!(error.contains("arguments after --"), "{error}");
+        }
     }
 
     #[test]
