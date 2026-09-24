@@ -362,11 +362,17 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   };
   // A visible control inside the label that names it: the caption first, or,
   // for a checkbox, after the box.
+  // The control is named by its caption alone (aria-labelledby), so whatever
+  // else later joins the label -- a Show/Hide button, a hint -- never becomes
+  // part of its accessible name.
+  let captionSequence = 0;
   const labelledControl = (tag, name, text, className = "field") => {
     const control = document.createElement(tag);
     control.name = name;
     if (tag === "input" && className === "check") control.type = "checkbox";
     const caption = element("span", "", text);
+    caption.id = `control-caption-${++captionSequence}`;
+    control.setAttribute("aria-labelledby", caption.id);
     const label = element("label", className);
     if (className === "check") label.append(control, caption);
     else label.append(caption, control);
@@ -407,6 +413,12 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   const addRevealControl = (field) => {
     if (field.dataset.noReveal !== undefined || field.parentElement?.classList.contains("secret-input")) return;
     if (!field.parentNode) throw new Error(`Password field ${field.name} has no place for its reveal control.`);
+    // The button joins the field's label; pin the field's name to the label's
+    // text first, or "Show password" would become part of it.
+    const owner = field.closest("label");
+    if (owner && !field.hasAttribute("aria-labelledby") && !field.hasAttribute("aria-label")) {
+      ariaName(field, owner.textContent.replace(/\s+/g, " ").trim());
+    }
     const button = document.createElement("button");
     button.type = "button";
     button.className = "reveal";
