@@ -350,6 +350,25 @@ export function mergeTimeline(history, live, limit) {
   return [...prependReversed, ...live].slice(-limit);
 }
 
+// What a buffer's action button does: "leave" a joined channel, "close" a
+// past channel or a conversation, or nothing (null) for the console. A
+// bridge's channels are its configuration -- the provider account, not the
+// person, is in them (`membershipIsIrc` false) -- so a joined bridge channel
+// has nothing to leave, and a PART would only be refused.
+export function bufferAction(buffer, membershipIsIrc) {
+  if (!buffer || buffer.kind === "server") return null;
+  if (buffer.kind === "channel" && buffer.joined) return membershipIsIrc ? "leave" : null;
+  return "close";
+}
+
+// The nick a network's stored configuration gives before the server names
+// one. A bridge stores none (an empty string); an empty nick is no nick, or
+// every line with a leading or trailing non-nick character would read as a
+// mention of it.
+export function seededNick(configured) {
+  return typeof configured === "string" && configured.length > 0 ? configured : null;
+}
+
 // Reconcile channel buffers against an authoritative BNC session snapshot.
 // Detached replay is bounded history and cannot answer current membership.
 export function reconcileChannelSnapshot(current, joined) {

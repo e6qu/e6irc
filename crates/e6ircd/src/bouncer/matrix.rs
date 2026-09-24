@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use super::{ConnectionEvent, DriverEnds, NetworkDriver, NetworkHandle};
+use super::{DriverEnds, NetworkDriver, NetworkHandle};
 
 /// The Matrix device one bouncer network is. See [`MatrixConfig::device`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +70,14 @@ struct Session {
     token: String,
     user_id: String,
     rooms: Rooms,
+}
+
+impl Session {
+    /// The logged-in account as IRC shows it: the session's nick, and the
+    /// prefix of every echo.
+    fn identity(&self) -> super::irc_driver::SelfIdentity {
+        super::bridged_identity("matrix", matrix_localpart(&self.user_id))
+    }
 }
 
 /// The joined rooms, by the three names a session needs: the folded IRC
@@ -288,7 +296,11 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
             }
         },
     };
-    ends.emit(ConnectionEvent::Connected);
+    if let Err(outcome) =
+        ends.begin_bridge_session(&session.identity(), session.rooms.room_to_channel.values())
+    {
+        return outcome;
+    }
 
     // `None` until the first sync of a fresh start, which only establishes a
     // position: its timeline is discarded. A resumed session has one already.
@@ -365,9 +377,6 @@ fn relay_batch(
         }
     }
     for m in batch.messages {
-        if m.sender() == Some(session.user_id.as_str()) {
-            continue;
-        }
         let Some(channel) = session.rooms.room_to_channel.get(&m.room_id) else {
             continue;
         };
@@ -661,13 +670,6 @@ const REDACTED: &str = "redacted";
 const MALFORMED: &str = "malformed";
 
 impl Incoming {
-    fn sender(&self) -> Option<&str> {
-        match &self.content {
-            IncomingContent::Relay { sender, .. } => Some(sender),
-            IncomingContent::Unrelayed { sender, .. } => sender.as_deref(),
-        }
-    }
-
     /// The IRC lines this message is in `channel`.
     fn lines(&self, channel: &str) -> Vec<String> {
         match &self.content {
@@ -745,6 +747,12 @@ struct Unsigned {
     /// Present when the event was redacted; its content is then gone.
     #[serde(default)]
     redacted_because: Option<serde::de::IgnoredAny>,
+    /// The transaction id the event was sent under. The homeserver includes
+    /// it only for the device (the access token) that sent the event — that
+    /// is, only in this bridge's own sends, which were echoed when the
+    /// homeserver accepted them.
+    #[serde(default)]
+    transaction_id: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -852,6 +860,11 @@ fn message_content(
 /// What one timeline event is to the bridge.
 enum TimelineItem {
     Message(IncomingContent),
+    /// The bridge's own send, come back: it was echoed when the homeserver
+    /// accepted it, and relaying it too would show it twice. Only the sending
+    /// device sees an event's transaction id, so this is never a post from the
+    /// same account's other devices — those are relayed like anyone's.
+    OwnSend,
     /// The room is (now) end-to-end encrypted.
     Encrypted,
     /// Nothing the bridge relays.
@@ -868,6 +881,9 @@ fn timeline_event(homeserver: &str, room_id: &str, raw: serde_json::Value) -> Ti
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
     match serde_json::from_value::<TimelineEvent>(raw) {
+        Ok(TimelineEvent::Message { unsigned, .. }) if unsigned.transaction_id.is_some() => {
+            TimelineItem::OwnSend
+        }
         Ok(TimelineEvent::Message {
             sender,
             content,
@@ -913,7 +929,7 @@ fn collect_sync_messages(homeserver: &str, body: SyncResponse) -> Result<SyncBat
                         encrypted.push(room_id.clone());
                     }
                 }
-                TimelineItem::Other => {}
+                TimelineItem::OwnSend | TimelineItem::Other => {}
             }
         }
     }
@@ -978,7 +994,7 @@ async fn handle_command(
     ends: &super::DriverEnds,
     command: &super::ClientCommand,
 ) {
-    let identity = super::bridged_identity("matrix", matrix_localpart(&s.user_id));
+    let identity = s.identity();
     let targets = &s.rooms.channel_to_room;
     super::relay_routed(
         ends,
@@ -1246,6 +1262,47 @@ mod tests {
             lines(&mut events)
                 .iter()
                 .any(|line| line == ":alice!alice@matrix PRIVMSG #room :said during the outage"),
+        );
+    }
+
+    /// The bridge's own sends come back carrying the transaction id they were
+    /// sent under, and were echoed when the homeserver accepted them: they are
+    /// not relayed again. What the same account says from another device (a
+    /// phone, another client) carries none, and is relayed like anyone's —
+    /// under the account's nick, which is the session's.
+    #[tokio::test]
+    async fn only_the_bridges_own_sends_are_dropped_not_the_accounts_other_devices() {
+        let (server, base) = Homeserver::start().await;
+        server.script([timeline(
+            "s2",
+            serde_json::json!([
+                { "type": "m.room.message", "sender": "@bot:hs.example",
+                  "content": { "msgtype": "m.text", "body": "sent through the bridge" },
+                  "unsigned": { "transaction_id": "e6irc-1" } },
+                { "type": "m.room.message", "sender": "@bot:hs.example",
+                  "content": { "msgtype": "m.text", "body": "sent from my phone" } },
+            ]),
+        )]);
+        let shared = Shared::new(config(&base, &["#room:hs.example"]));
+        let (handle, mut ends) = NetworkHandle::bridge_channels(8);
+        let mut events = handle.subscribe();
+        session_once(&shared, &mut ends).await;
+        let relayed: Vec<String> = lines(&mut events)
+            .into_iter()
+            .filter(|line| line.contains("PRIVMSG"))
+            .collect();
+        assert_eq!(
+            relayed,
+            [":bot!bot@matrix PRIVMSG #room :sent from my phone"],
+            "exactly the other device's post is relayed"
+        );
+        // The session is the logged-in account, in the bridged room.
+        assert_eq!(
+            handle.irc_session_snapshot(),
+            Some(crate::bouncer::IrcSessionSnapshot {
+                nick: "bot".into(),
+                channels: vec!["#room".into()],
+            })
         );
     }
 

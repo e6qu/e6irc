@@ -1142,6 +1142,43 @@ async fn cli_send_without_echo_message_says_delivery_cannot_be_confirmed() {
     );
 }
 
+/// Through a bridge attach the client is the provider account: e6irc
+/// welcomes it under the account's nick, not the one it asked for, re-states
+/// its membership of a bridged channel when it joins, and echoes its message
+/// under that nick. `send` takes its own nick from the welcome, so it knows
+/// the echo as its own — the lines here are the bouncer's, byte for byte.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_send_over_a_bridge_confirms_the_echo_under_the_account_nick() {
+    let (address, served) = scripted_server(
+        "echo-message",
+        &[
+            (
+                "CAP END",
+                ":srv 001 e6ircbot :Welcome to e6irc BNC, attached to 'team'",
+            ),
+            (
+                "JOIN #general",
+                ":e6ircbot!~bnc@e6irc JOIN #general\r\n\
+                 :*bnc* 353 e6ircbot = #general :e6ircbot\r\n\
+                 :*bnc* 366 e6ircbot #general :End of /NAMES list",
+            ),
+            (
+                "PRIVMSG #general ",
+                ":e6ircbot!e6ircbot@discord PRIVMSG #general :hi",
+            ),
+        ],
+        None,
+    )
+    .await;
+    let output = run_cli(address, &["--nick", "alice", "send", "#general", "hi"], "").await;
+    let seen = served.await.unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the echo under the account's nick was not taken as ours; sent {seen:?}; stderr {stderr}"
+    );
+}
+
 /// Register an observer on `address` as `nick`, and join `channel` (so it
 /// holds channel operator status there).
 async fn observer_in(address: &str, nick: &'static str, channel: &str) -> Connection {

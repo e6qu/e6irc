@@ -260,6 +260,19 @@ pub async fn verify_round_trip(
         assert_eq!(identify.d.properties.device, "e6irc");
     }
 
+    // The session begins under the bot's own name, in the bridged channel,
+    // before the bridge says it is connected: an attached client is welcomed
+    // under that nick, the one its echoes carry.
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), driver_events.recv())
+            .await
+            .expect("session timeout")
+            .expect("session event"),
+        super::DriverEvent::Session(super::IrcSessionSnapshot {
+            nick: BOT_NAME.to_string(),
+            channels: vec!["#general".to_string()],
+        })
+    );
     assert_eq!(
         tokio::time::timeout(std::time::Duration::from_secs(2), driver_events.recv())
             .await
@@ -364,6 +377,158 @@ pub async fn verify_round_trip(
     handle.shutdown();
     assert!(matches!(
         tokio::time::timeout(std::time::Duration::from_secs(2), session)
+            .await
+            .expect("session shutdown timeout")
+            .expect("session task"),
+        super::SessionOutcome::Stopped
+    ));
+}
+
+/// An echo-message client attached to a bridge is the bridge's own account:
+/// it is welcomed under the account's nick, joined to the bridged channel,
+/// and the echo of what it sends names that same nick — so it recognises the
+/// echo as its own, as `e6irc send` must. Its `NICK` and `JOIN` are answered
+/// by the attach layer, since neither can change a provider-owned session.
+///
+/// `handle` is a bridge network (built with
+/// [`super::NetworkHandle::bridge_channels`]) whose `session` is connecting to
+/// the scripted oracle.
+pub async fn verify_attached_client(
+    handle: super::NetworkHandle,
+    session: tokio::task::JoinHandle<super::SessionOutcome>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    const WAIT: Duration = Duration::from_secs(5);
+
+    tokio::time::timeout(WAIT, async {
+        while handle.irc_session_snapshot().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the bridge never began its session");
+    let (nick, burst) = super::serve::welcome("e6irc.test", "team", &handle, "alice".into());
+    assert_eq!(
+        nick, BOT_NAME,
+        "welcomed under the requested nick, not the account's"
+    );
+    assert!(
+        burst[0].starts_with(&format!(":e6irc.test 001 {BOT_NAME} :")),
+        "{}",
+        burst[0]
+    );
+
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let attached = tokio::spawn(async move {
+        let end = super::attach(
+            server,
+            super::ClientInput::default(),
+            &handle,
+            super::AttachCaps {
+                echo_message: true,
+                ..super::AttachCaps::default()
+            },
+            "alice",
+            &nick,
+            super::ATTACH_LIVENESS_INTERVAL,
+        )
+        .await;
+        (handle, end)
+    });
+    let (read, mut write) = tokio::io::split(client);
+    let mut lines = tokio::io::BufReader::new(read).lines();
+    // The next line for this client, past what the provider says meanwhile
+    // (the oracle's own conversation) and the bouncer's status notices.
+    let mut next = async || {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let line = lines
+                    .next_line()
+                    .await
+                    .expect("attach read")
+                    .expect("attach closed");
+                let theirs =
+                    line.ends_with(" :hello from Discord") || line.ends_with(" :hello from Slack");
+                if !theirs && !line.starts_with(":*bnc* NOTICE") {
+                    return line;
+                }
+            }
+        })
+        .await
+        .expect("attach went silent")
+    };
+
+    let own = format!("{BOT_NAME}!~bnc@e6irc");
+    assert_eq!(next().await, format!(":{own} JOIN #general"));
+    assert_eq!(
+        next().await,
+        format!(":*bnc* 353 {BOT_NAME} = #general :{BOT_NAME}")
+    );
+    assert_eq!(
+        next().await,
+        format!(":*bnc* 366 {BOT_NAME} #general :End of /NAMES list")
+    );
+
+    write
+        .write_all(b"PRIVMSG #general :hello from IRC\r\n")
+        .await
+        .expect("send");
+    let echo = loop {
+        let line = next().await;
+        if line.contains("PRIVMSG #general :hello from IRC") {
+            break line;
+        }
+    };
+    let echo = e6irc_proto::message::Message::parse(&echo).expect("the echo is IRC");
+    assert_eq!(
+        echo.source.map(|source| source.name),
+        Some(BOT_NAME),
+        "the echo names the nick the client was welcomed under"
+    );
+
+    // A nick of its own is refused to this client; its own nick is no change.
+    write.write_all(b"NICK other\r\n").await.expect("send");
+    let refused = next().await;
+    assert!(
+        refused.starts_with(&format!(":*bnc* 447 {BOT_NAME} :Cannot change nickname")),
+        "{refused}"
+    );
+    write
+        .write_all(
+            format!(
+                "NICK {}\r\nJOIN #GENERAL,#nowhere\r\n",
+                BOT_NAME.to_uppercase()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("send");
+    // A bridged channel's membership is re-stated; any other is no channel.
+    assert_eq!(next().await, format!(":{own} JOIN #general"));
+    assert_eq!(
+        next().await,
+        format!(":*bnc* 353 {BOT_NAME} = #general :{BOT_NAME}")
+    );
+    assert_eq!(
+        next().await,
+        format!(":*bnc* 366 {BOT_NAME} #general :End of /NAMES list")
+    );
+    let unknown = next().await;
+    assert!(
+        unknown.starts_with(&format!(":*bnc* 403 {BOT_NAME} #nowhere :")),
+        "{unknown}"
+    );
+
+    drop(write);
+    drop(lines);
+    let (handle, end) = tokio::time::timeout(WAIT, attached)
+        .await
+        .expect("attach did not end")
+        .expect("attach task");
+    assert!(matches!(end, Ok(super::AttachEnd::ClientClosed)), "{end:?}");
+    handle.shutdown();
+    assert!(matches!(
+        tokio::time::timeout(WAIT, session)
             .await
             .expect("session shutdown timeout")
             .expect("session task"),

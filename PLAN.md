@@ -636,6 +636,21 @@ A sweep of the bouncer found, and this change fixes:
 - **Lines sent with `CAP END` were refused.** The attach handshake answered
   lines arriving in the same read as `CAP END` with 421, and dropped the half
   of a line it had framed; both now reach the attached session.
+- **A bridge's echo named someone the client was not.** A client attached to
+  a bridge was welcomed under the nick it asked for, while its echo named the
+  provider account, so echo-message clients did not recognise their own lines
+  and `e6irc send` waited for an echo that never came. A bridge now begins
+  its session under the account's nick, in its mapped channels, before it
+  reports connected; the attach layer answers `NICK` (447) and `JOIN`
+  (re-stated, or 403) on a bridge itself, and the web composer refuses
+  `NICK`, `JOIN` and `PART` there. The web client marks the bridge's channels
+  joined from the session (it had refused to send into them), offers no Leave
+  for them, and no longer takes a bridge's empty configured nick for a nick
+  that every trailing punctuation mark mentioned.
+- **Matrix dropped the account's other devices.** Every event from the
+  logged-in account was dropped as the bridge's own; now only events carrying
+  a transaction id (which the homeserver shows only to the sending device)
+  are, and posts from the account's other devices are relayed.
 
 ## Remaining qualification
 
