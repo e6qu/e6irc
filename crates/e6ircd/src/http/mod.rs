@@ -1075,8 +1075,8 @@ mod problem_contract_tests {
         assert_eq!(occurrences(concat!("Path", "<")), vec![("oidc.rs", 1)]);
     }
 
-    /// `retry_later` is the one builder of a `429`, so none leaves without
-    /// `Retry-After`.
+    /// `too_many_requests` (and `retry_later` through it) is the one builder
+    /// of a `429`, so none leaves without `Retry-After`.
     #[test]
     fn only_retry_later_builds_a_too_many_requests_answer() {
         assert_eq!(
@@ -2650,17 +2650,16 @@ mod pages {
                         "web: login refused for account {:?}: attempt limit reached",
                         form.account
                     );
-                    let mut response = login_response(
-                        &state,
-                        form.account,
-                        Some(retry_after.explanation()),
-                        StatusCode::TOO_MANY_REQUESTS,
+                    // The sign-in page again, with the reason, as a 429.
+                    return super::oidc::too_many_requests(
+                        login_response(
+                            &state,
+                            form.account,
+                            Some(retry_after.explanation()),
+                            StatusCode::UNAUTHORIZED,
+                        ),
+                        retry_after.seconds(),
                     );
-                    response.headers_mut().insert(
-                        header::RETRY_AFTER,
-                        header::HeaderValue::from(retry_after.seconds()),
-                    );
-                    return response;
                 }
                 Err(error) => {
                     eprintln!("local login: credential verification failed: {error}");

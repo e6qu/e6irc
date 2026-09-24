@@ -1690,7 +1690,19 @@ pub(super) fn retry_after_seconds(wait: std::time::Duration) -> u64 {
 /// A `429` problem carrying the seconds after which the same request can
 /// succeed.
 pub(super) fn retry_later(title: &str, detail: &str, retry_after: u64) -> Response {
-    let mut response = problem(StatusCode::TOO_MANY_REQUESTS, title, Some(detail));
+    too_many_requests(
+        problem(RETRY_LATER_STATUS, title, Some(detail)),
+        retry_after,
+    )
+}
+
+const RETRY_LATER_STATUS: StatusCode = StatusCode::TOO_MANY_REQUESTS;
+
+/// Turn `response` into a `429` that says when to retry: the one place a
+/// `429` is made, so none leaves without `Retry-After`. [`retry_later`] is the
+/// problem-document form; a page (the sign-in form) passes its own document.
+pub(super) fn too_many_requests(mut response: Response, retry_after: u64) -> Response {
+    *response.status_mut() = RETRY_LATER_STATUS;
     response.headers_mut().insert(
         header::RETRY_AFTER,
         retry_after
