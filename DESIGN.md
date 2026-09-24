@@ -334,15 +334,17 @@ These are project-wide rules, enforced in review and (where possible) CI:
   - The registered-session count is maintained at the transitions, in the one
     function that can register a session, and debug-asserted against a full
     scan; it used to be recounted over every session after every event.
-  - `require_form_actor` — the one precondition shared by every
-    server-rendered mutation: resolve the cookie account and verify the
-    submitted session-bound CSRF token before returning an actor. Forms carry
-    the token in their body, so standard browser submissions work without a
-    feature-gated client runtime.
-  - `FormBody<T>` — URL-encoded form rejection is an extractor contract, not
-    handler boilerplate. A server-rendered mutation that asks for a form gets
-    the same problem response for malformed input before its body runs, so a
-    new handler cannot forget or invent a different parse-failure path.
+  - Server-rendered form posts have no form extractor of their own. Each
+    handler takes `Result<axum::Form<T>, FormRejection>`, so a malformed body
+    reaches the handler rather than axum's plain-text rejection, and matches it
+    by hand: `parse_form` (`http/mod.rs`) turns the rejection into a 400
+    problem for `bootstrap_submit`, `local_login` and
+    `accept_account_invitation`, which then bind the post to its page with
+    `browser_state_matches` (a per-form state cookie, since no session exists
+    yet). The one cookie-authenticated form mutation, `approve_device_form`,
+    resolves the account with `page_actor` and checks the body's `csrf` field
+    inline with `AppState::csrf_valid`; the token rides in the body, so a
+    standard browser submission works without a client runtime.
   - `RateLimited` — a request that has spent one token from the per-IP
     auth-rate budget, as a `FromRequestParts` extractor. Every unauthenticated,
     work-inducing route declares the throttle by asking for `_: RateLimited`
@@ -353,9 +355,8 @@ These are project-wide rules, enforced in review and (where possible) CI:
     other extractors, for the throttle rather than the auth check.
   - `escape_tag_value` — the tag-value escaper's output is wire-safe *by
     construction*: `;`/space/`\`/CR/LF get their escapes and a NUL (which has no
-    tag escape and cannot ride a wire line) is dropped, so a caller that reaches
-    the escaper directly — bypassing `Message::to_line`, which also rejects NUL —
-    cannot put a raw NUL on the wire and truncate the line. The single choke
+    tag escape and cannot ride a wire line) is dropped, so no line this system
+    tags can carry a raw NUL onto the wire and truncate it. The single choke
     point for tag-value wire safety, rather than a guard one call path can skip.
   - *No argon2 on the serial DB-worker loop* — both credential-verifying and
     account-creating requests are intercepted in `run_worker` and spawned under
@@ -490,7 +491,7 @@ implemented once, above the drivers.
 e6irc/
 ├── Cargo.toml                # workspace
 ├── crates/
-│   ├── e6irc-proto/          # IRC message model, parser/serializer, casemapping,
+│   ├── e6irc-proto/          # IRC message model, parser, tag escaping, casemapping,
 │   │                         #   numerics, ISUPPORT, CAP/SASL state machines (no I/O)
 │   ├── e6irc-queue/          # custom bounded queue: the core↔DB and SendQ
 │   │                         #   communication primitive (§7.3); loom-verified,
@@ -623,12 +624,12 @@ strip = "symbols"
 - Zero-copy parse: a received line is kept as one `Bytes` buffer; the parsed
   `Message` borrows slices into it. Tag escaping/unescaping per the
   message-tags spec (https://ircv3.net/specs/extensions/message-tags).
-  Serialization (`to_line`) fails loudly rather than emitting a byte it cannot
-  represent: keys, source parts, and params reject any illegal byte, and a tag
-  value is rejected (`SerializeError::BadTagValue`) if it holds a NUL — the one
-  byte the value escaping has no encoding for. The four field positions share
-  one contract so the "silently emit a raw control byte" class is closed
-  symmetrically instead of per-field.
+  There is no general `Message` serializer: outbound lines are formatted at
+  their send funnels from already-validated parts, and the one reusable wire
+  primitive is `escape_tag_value` (§2), which drops the NUL it has no escape
+  for. The `parse_message` fuzz target pins the parser's structural promises
+  (no CR/LF/NUL in any field, single-token middle parameters, a delimiter-free
+  source name) that every reader of a parsed `Message` relies on.
 - Limits: 512-byte traditional message body; tags budget per spec (8191
   bytes total for tags on server→client, 4096 client→server as advertised
   by us); oversized input is rejected with `FAIL`/`ERR_INPUTTOOLONG`, never
@@ -732,12 +733,15 @@ which gives:
 - **Single-writer correctness**: each piece of state has exactly one
   owner; per-queue total order makes "who mutated what, when" a linear,
   replayable log rather than an interleaving of lock acquisitions.
-- **Step-by-step debuggability**: in test/sim builds a `Stepper` freezes
-  the world and advances one event at a time across chosen queues;
-  event traces can be recorded and replayed deterministically.
-- **Deterministic simulation testing**: the whole core (workers + queues,
-  I/O mocked at the edges) runs single-threaded under a seeded scheduler —
-  interleaving bugs become reproducible test failures, not heisenbugs.
+- **Step-by-step debuggability**: `e6irc-queue`'s nonblocking
+  `Receiver::try_pop` is a manual-step primitive. In test builds
+  `CoreScheduler` (`core/mod.rs`) uses it to advance the core's shard queues
+  one event at a time, round-robin, recording each step's shard and queue
+  sequence; `replay_step` re-runs a recorded trace and fails on any sequence
+  that differs (`scheduler_trace_replays_the_same_shard_sequences`). Schedules
+  are fixed, not seeded: there is no whole-core randomized simulation.
+  Interleavings of the queue itself are covered by loom model-checking (below),
+  and interleaved client input by the `core_multi` fuzz target (§7.1).
 
 **`e6irc-queue` (custom, in-repo — for the core↔DB and SendQ paths; the
 driver/attach layer of §10 uses tokio `broadcast`/`mpsc`):**
@@ -790,7 +794,7 @@ driver/attach layer of §10 uses tokio `broadcast`/`mpsc`):**
   each network driver — all the same pattern: one loop, one queue in.
 - Timers (PING, idle, throttle decay) are events too: a timer-wheel worker
   enqueues ticks, so even time-driven mutations flow through queues (and
-  are injectable in simulation).
+  are injectable in tests).
 
 ### 7.4 Performance engineering (cross-cutting)
 
@@ -984,16 +988,26 @@ Concretely:
      Libera's actual 005 burst (`vendor/tests/libera-snapshot/`): every
      shared token must match, exceptions whitelisted with a reason.
   3. Opt-in, **light-touch live interop** tests
-     (`crates/e6ircd/tests/live_compat.rs`): our client makes one brief
-     TLS connection to Libera, OFTC, and Ergo and reads their greeting —
-     `#[ignore]`d so they never run in normal CI or load public services.
+     (`crates/e6ircd/tests/live_compat.rs`): our client makes two brief
+     TLS registrations to Libera, OFTC, or Ergo and checks the greeting and
+     the ISUPPORT tokens consumers read — `#[ignore]`d so they never run in
+     normal CI or load public services. The public-IRC qualification
+     campaign (`tools/qualification/public-irc-probe.sh`) runs them per
+     target alongside the BNC driver's live probe.
   4. Optional differential **oracle**: a pinned Solanum built in Docker
      under `vendor/tests/external-oracles/` for deeper scripted-session
      cross-checks (divergences fixed or whitelisted). Never built or run
      by the default build/CI.
-- The BNC `irc` driver (§10.3) treats Libera as its primary interop target:
-  SASL to Atheme, Solanum cap set, its throttles/quirks are all exercised in
-  integration tests against the same dockerized stack.
+- The BNC `irc` driver (§10.3) treats Libera as its primary interop target.
+  No Atheme or Solanum runs in any automated suite; what stands in for them:
+  SASL PLAIN end to end against e6ircd's own SASL server
+  (`tests/bouncer.rs` `driver_authenticates_to_sasl_upstream`); SCRAM,
+  mechanism discovery, and the 902–908 verdict numerics against scripted
+  upstreams in `e6irc-client`'s unit tests; throttle, ban, and
+  pre-welcome `ERROR` answers against scripted upstreams (`tests/bouncer.rs`
+  `a_connection_throttle_is_outlasted_never_parked` and its siblings); and a
+  live, unauthenticated registration against Libera itself in the qualification
+  probe above.
 
 Where "modern IRC" (chathistory, multiline, …) goes beyond Libera, we extend;
 we never *diverge* on surface Libera defines.
@@ -3016,15 +3030,14 @@ Given/When/Then scenario DSL.
 
 Layers, bottom to top:
 
-1. **Unit/property**: proto crate (parser round-trips, casemapping,
+1. **Unit/property**: proto crate (parser, tag escaping, casemapping,
    CAP/SASL state machines), multiplexer buffer logic; **loom
    model-checking** of `e6irc-queue`'s concurrency core.
 2. **Fuzzing**: CI smoke runs every declared cargo-fuzz target, including
-   parser/tag input, serialization, single- and multi-client stateful core
+   parser/tag input, single- and multi-client stateful core
    command streams, and arbitrary server output into the TUI model.
    `e6irc-queue::Receiver::try_pop` supplies a manual-step primitive; fixed
-   multi-queue schedules record and replay their shard/sequence steps. A seeded
-   whole-core multi-worker simulation remains part of the N>1 evidence.
+   multi-queue schedules record and replay their shard/sequence steps (§7.3).
    A separate all-feature coverage job combines the portable workspace suite
    with the real PostgreSQL database and HTTP lifecycle suites, then rejects
    line coverage below 80%; the floor is a regression ratchet. Provider/browser

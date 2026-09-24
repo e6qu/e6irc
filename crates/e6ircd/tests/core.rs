@@ -989,7 +989,12 @@ fn overlong_channel_key_is_clipped_not_a_wire_overflow() {
     }
     // The mode query (RPL_CHANNELMODEIS) also fits, since the stored key is bounded.
     s.line(alice, "MODE #x");
-    for l in &s.drain(alice) {
+    let query = s.drain(alice);
+    assert!(
+        query.iter().any(|l| l.contains(" 324 ")),
+        "the mode query must answer RPL_CHANNELMODEIS: {query:#?}"
+    );
+    for l in &query {
         assert!(
             l.trim_end_matches(['\r', '\n']).len() <= 512,
             "324 over-length: {l}"
@@ -11948,6 +11953,7 @@ fn a_conversation_with_an_unauthenticated_party_never_touches_the_database() {
         stranger,
         "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:01.000Z timestamp=2999-01-01T00:00:00.000Z 10",
     );
+    let mut targets_queries = 0;
     for request in s.db_requests() {
         match request {
             e6ircd::core::DbRequest::QueryHistory { target, .. } => {
@@ -11956,12 +11962,17 @@ fn a_conversation_with_an_unauthenticated_party_never_touches_the_database() {
             e6ircd::core::DbRequest::QueryTargets {
                 me, session_only, ..
             } => {
+                targets_queries += 1;
                 assert_eq!(me, None, "a `~` identity must not be searched for");
                 assert!(session_only.is_empty(), "{session_only:?}");
             }
             _ => {}
         }
     }
+    assert_eq!(
+        targets_queries, 1,
+        "CHATHISTORY TARGETS must issue exactly one targets query"
+    );
 }
 
 /// What a channel knows about a member is a copy of the session's public

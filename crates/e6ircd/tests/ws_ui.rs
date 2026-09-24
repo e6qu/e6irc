@@ -14,6 +14,8 @@ mod support;
 
 #[path = "support/deadline.rs"]
 mod deadline;
+#[path = "support/membership.rs"]
+mod membership;
 
 /// A full-access personal access token with the default lifetime, minted the
 /// way the REST endpoint mints one.
@@ -107,8 +109,7 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
     let running = net::start(config).await.expect("start");
     let http = running.http_addr.expect("http bound");
 
-    // let the driver connect + join upstream
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    membership::wait_joined(up, "alicebnc", "#lobby").await;
 
     // a peer on the upstream
     let mut peer = e6irc_client::Connection::connect(&up.to_string())
@@ -423,7 +424,7 @@ async fn ws_ui_resumes_after_a_cursor_and_says_when_it_cannot() {
     };
     let running = net::start(config).await.expect("start");
     let http = running.http_addr.expect("http bound");
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    membership::wait_joined(up, "alicebnc", "#lobby").await;
 
     let mut peer = e6irc_client::Connection::connect(&up.to_string())
         .await
@@ -482,18 +483,27 @@ async fn ws_ui_resumes_after_a_cursor_and_says_when_it_cannot() {
     let cursor = one["cursor"].as_str().expect("every line carries a cursor");
     drop(first);
     peer.send_line("PRIVMSG #lobby :two").await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // Resume: only what came after the cursor, and no reset.
-    let mut resumed = attach(format!("&after={cursor}")).await;
-    let events = events_until_snapshot(&mut resumed).await;
+    // Resume: only what came after the cursor, and no reset. Nothing is
+    // attached while `two` travels to the driver, so resume until the replay
+    // includes it (an earlier resume, before it arrived, replays nothing new).
+    let (resumed, events) = tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let mut resumed = attach(format!("&after={cursor}")).await;
+            let events = events_until_snapshot(&mut resumed).await;
+            if line_values(&events)
+                .iter()
+                .any(|line| line.contains("PRIVMSG #lobby :two"))
+            {
+                return (resumed, events);
+            }
+            drop(resumed);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the line after the cursor is never replayed");
     let lines = line_values(&events);
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.contains("PRIVMSG #lobby :two")),
-        "the line after the cursor is replayed: {lines:?}"
-    );
     assert!(
         !lines
             .iter()
@@ -668,7 +678,6 @@ async fn ws_ui_detaches_when_its_network_is_removed() {
     )
     .await;
     assert_eq!(status, 201, "network create");
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     // Attach the web UI to it.
     let mut req = format!("ws://{http}/ws/ui?network=up")
@@ -679,8 +688,9 @@ async fn ws_ui_detaches_when_its_network_is_removed() {
     let (mut ws, _) = tokio_tungstenite::connect_async(req)
         .await
         .expect("ws/ui connect");
-    // Drain the initial status/backlog event.
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(300), ws.next()).await;
+    // Read through the attach's replay boundary, so every event after it is
+    // caused by the removal below.
+    events_until_snapshot(&mut ws).await;
 
     // Remove the network.
     let (status, _) = http_req(
