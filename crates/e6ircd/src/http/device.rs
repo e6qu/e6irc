@@ -2554,9 +2554,9 @@ mod token_request_tests {
     }
 
     #[test]
-    fn logout_query_rejects_unknown_fields() {
+    fn csrf_query_rejects_unknown_fields() {
         let uri = "/?extra=1".parse().expect("query URI");
-        assert!(axum::extract::Query::<LogoutQuery>::try_from_uri(&uri).is_err());
+        assert!(axum::extract::Query::<CsrfQuery>::try_from_uri(&uri).is_err());
     }
 }
 
@@ -2658,15 +2658,26 @@ pub(super) async fn logout(
 /// upstream SSO session active.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct LogoutQuery {
+pub(super) struct CsrfQuery {
     #[serde(default)]
     pub(super) csrf: Option<String>,
+}
+
+impl CsrfQuery {
+    /// Whether the query carries `session`'s CSRF value — the gate for a
+    /// cookie-authenticated GET that must be a top-level navigation (a
+    /// provider redirect) and therefore cannot carry the CSRF header.
+    pub(super) fn admits(&self, state: &AppState, session: &str) -> bool {
+        self.csrf
+            .as_deref()
+            .is_some_and(|csrf| state.csrf_valid(session, csrf))
+    }
 }
 
 pub(super) async fn logout_sso(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-    QueryParams(query): QueryParams<LogoutQuery>,
+    QueryParams(query): QueryParams<CsrfQuery>,
 ) -> Response {
     let clear = clear_session_cookie(state.secure_cookies);
     let pool = require_pool!(state);
@@ -2681,11 +2692,7 @@ pub(super) async fn logout_sso(
             .into_response();
     };
     // Require CSRF for this destructive GET; OIDC logout uses query parameters.
-    if !query
-        .csrf
-        .as_deref()
-        .is_some_and(|c| state.csrf_valid(&token, c))
-    {
+    if !query.admits(&state, &token) {
         return csrf_refusal();
     }
     let crate::db::SessionLogoutHint { id_token, provider } =

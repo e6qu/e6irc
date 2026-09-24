@@ -1157,27 +1157,28 @@ fn operations() -> serde_json::Value {
             },
             "/api/v1/auth/oidc/{provider}/start": {
                 "get": { "summary": "Begin interactive OIDC login (redirects to the provider)",
-                    "description": "Redirects the browser to the provider's authorization endpoint (code flow + PKCE) and sets a state-binding cookie the callback requires.",
+                    "description": "Redirects the browser to the provider's authorization endpoint (code flow + PKCE) and sets an HttpOnly cookie carrying the sealed, ten-minute flow the callback requires. The server keeps no per-flow state.",
                     "parameters": [{ "name": "provider", "in": "path", "required": true,
                         "schema": { "type": "string" } }],
                     "responses": { "307": { "description": "redirect into the provider" },
-                        "404": { "description": "unknown provider" } } }
+                        "404": { "description": "unknown provider" },
+                        "429": { "description": "the client's authentication rate limit is spent" },
+                        "502": { "description": "the provider is unreachable or its discovery document is unusable" } } }
             },
             "/api/v1/auth/oidc/{provider}/callback": {
                 "get": { "summary": "OIDC redirect-back: exchange the code and establish the session",
-                    "description": "Verifies the state-binding cookie, exchanges the authorization code (with PKCE) for tokens, validates the ID token, provisions or logs into the account, and sets the session cookie. A first login provisions an account named exactly by the provider's configured claim; a name already in use or retired is refused with 409 (the server never picks a different name for a person). The query is a closed set: exactly these parameters are accepted, and `session_state` (sent by Keycloak and Microsoft Entra) is admitted but not acted on.",
+                    "description": "Opens the sealed flow in the state cookie and requires its state to equal the returned one, for this provider, within ten minutes; exchanges the authorization code (with PKCE) for tokens, validates the ID token, provisions or logs into the account, and sets the session cookie. Every response to a callback that proved the browser's flow clears the state cookie, so a flow is answered once; the authorization code itself is single-use at the provider. A first login provisions an account named exactly by the provider's configured claim; a name already in use or retired is refused with 409 (the server never picks a different name for a person). As RFC 6749 §4.1.2 requires, response parameters other than these (Google's `authuser`, `hd` and `prompt`, Keycloak's and Microsoft Entra's `session_state`, a granted `scope`) are ignored: what is trusted is the verified ID token.",
                     "parameters": [
                         { "name": "provider", "in": "path", "required": true, "schema": { "type": "string" } },
                         { "name": "code", "in": "query", "required": false, "schema": { "type": "string" } },
                         { "name": "state", "in": "query", "required": false, "schema": { "type": "string" } },
-                        { "name": "error", "in": "query", "required": false, "schema": { "type": "string" }, "description": "The provider's refusal (RFC 6749 §4.1.2.1); a silent probe's login_required bounces to /?sso=none." },
-                        { "name": "scope", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Must equal the requested scope set when present." },
-                        { "name": "iss", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Must equal the provider's issuer when present (RFC 9207)." },
-                        { "name": "session_state", "in": "query", "required": false, "schema": { "type": "string" }, "description": "OpenID Connect Session Management value some providers append; accepted and ignored." }
+                        { "name": "error", "in": "query", "required": false, "schema": { "type": "string" }, "description": "The provider's refusal (RFC 6749 §4.1.2.1); a silent probe's login_required bounces to /?sso=none, and its consent_required begins an ordinary authorization request." },
+                        { "name": "iss", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Must equal the provider's issuer when present (RFC 9207)." }
                     ],
                     "responses": { "303": { "description": "logged in and session cookie set; or identity linked (to /?linked=1); or a silent probe found no provider session (to /?sso=none)" },
-                        "400": { "description": "the query has an unknown parameter, or is missing code or state" },
-                        "401": { "description": "state/code/token validation failed, the provider refused, or no usable account claim" },
+                        "307": { "description": "a silent probe answered consent_required: redirect into an ordinary authorization request" },
+                        "400": { "description": "the query is malformed, or is missing code or state" },
+                        "401": { "description": "the flow cookie is missing, expired, for another provider, or bound to a different state; code or token validation failed, the provider refused, or no usable account claim" },
                         "403": { "description": "the identity is outside the provider's allowed email domains, or the account cannot start a session or gain an identity" },
                         "404": { "description": "unknown provider" },
                         "409": { "description": "first login: the claim's account name is already taken or retired; or link: identity already linked to another account" },
@@ -1190,7 +1191,9 @@ fn operations() -> serde_json::Value {
                     "parameters": [{ "name": "provider", "in": "path", "required": true,
                         "schema": { "type": "string" } }],
                     "responses": { "307": { "description": "redirect into the provider" },
-                        "404": { "description": "unknown provider" } } }
+                        "404": { "description": "unknown provider" },
+                        "429": { "description": "the client's authentication rate limit is spent" },
+                        "502": { "description": "the provider is unreachable or its discovery document is unusable" } } }
             },
             "/api/v1/auth/logout": {
                 "get": { "summary": "RP-initiated logout: end the local and provider SSO sessions",
@@ -1244,13 +1247,20 @@ fn operations() -> serde_json::Value {
             },
             "/api/v1/auth/oidc/{provider}/link": {
                 "get": { "summary": "Link an OIDC identity to your account (redirects to the provider)",
-                    "description": "Requires a cookie-authenticated browser session: whoever completes the flow at the provider becomes a login identity of the account, so a bearer cannot start it.",
+                    "description": "Requires a cookie-authenticated browser session: whoever completes the flow at the provider becomes a login identity of the account, so a bearer cannot start it. Because it is a top-level navigation it cannot carry the X-E6IRC-CSRF header, so the session's CSRF value is required as the `csrf` query parameter instead; without it any site could start a link in the owner's browser.",
                     "security": browser_session_only,
                     "parameters": [{ "name": "provider", "in": "path", "required": true,
+                        "schema": { "type": "string" } },
+                        { "name": "csrf", "in": "query", "required": true,
                         "schema": { "type": "string" } }],
                     "responses": { "307": { "description": "redirect into the provider" },
+                        "400": { "description": "the query has an unknown parameter" },
+                        "401": { "description": "browser session required" },
+                        "403": { "description": "invalid or missing CSRF token" },
                         "404": { "description": "unknown provider" },
-                        "409": { "description": "identity already linked to another account (on return)" } } }
+                        "409": { "description": "identity already linked to another account (on return)" },
+                        "429": { "description": "the client's authentication rate limit is spent" },
+                        "502": { "description": "the provider is unreachable or its discovery document is unusable" } } }
             },
             "/api/v1/me/identities": {
                 "get": { "summary": "List OIDC identities linked to your account and available link providers",

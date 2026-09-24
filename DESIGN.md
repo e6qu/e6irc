@@ -1286,6 +1286,25 @@ provider-verified email claim.
   auto-provisions an account (nick derived from `preferred_username`,
   conflict → user picks). Subsequent logins match on (issuer, subject),
   never on email.
+- An in-flight OIDC authorization is held by the browser, not the server:
+  `/start`, `/sso`, and `/link` seal the provider, OAuth `state`, PKCE
+  verifier, nonce, ten-minute expiry, link target, and silent flag into the
+  `HttpOnly; SameSite=Lax` state cookie with ChaCha20-Poly1305 under a
+  per-startup key and a flow-specific associated-data context (the same
+  lifetime and reason as the CSRF key: short-lived browser state that must not
+  depend on the optional at-rest secret key). The callback admits only the
+  sealed flow whose `state` equals the returned one (constant-time), for that
+  provider, before its expiry. An anonymous flood of starts therefore holds no
+  server capacity a real login needs — the earlier bounded in-memory table
+  refused every login with a 503 once 4096 anonymous starts filled it.
+  Replay is bounded without server state: the authorization code is
+  single-use at the provider and bound to the flow's PKCE verifier, every
+  callback that proves the binding clears the cookie, and a restart ends
+  every flow. A refused callback leaves the cookie alone, so an attacker who
+  learns a victim's `state` cannot burn the victim's login.
+- Linking an identity is a cookie-authenticated top-level GET (a provider
+  redirect cannot carry the CSRF header), so it requires the session-bound
+  CSRF value as its `csrf` query parameter, as RP-initiated logout does.
 - Local-account login form (argon2id verify) for accounts without OIDC. It
   accepts only the primary password, not an IRC app password, is covered by the
   per-IP authentication rate limit, bounds every credential field before
@@ -2238,8 +2257,14 @@ Design constraints recorded now:
 
 Versioned under `/api/v1`; JSON; errors use RFC 9457 problem+json shape.
 Every URL query and form is closed: unknown fields are rejected before a
-handler runs. OIDC callback issuers, when returned, must exactly match the
-configured provider.
+handler runs. The one exception is the OIDC callback, whose query is the
+provider's authorization response rather than this server's API: RFC 6749
+§4.1.2 requires a client to ignore unrecognized response parameters (Google
+appends `authuser`, `hd` and `prompt`; Keycloak and Microsoft Entra
+`session_state`), and §3.3 lets a provider grant a scope set other than the
+one requested, so the returned `scope` is not acted on either — the verified
+ID token is what is trusted. OIDC callback issuers, when returned, must
+exactly match the configured provider.
 Surface (initial):
 
 - `auth`: OIDC start/callback, device-flow bootstrap, logout
@@ -2263,11 +2288,11 @@ Surface (initial):
 - A first OpenID Connect login provisions an account named exactly by the
   provider's configured claim; a name already in use or retired is a
   `409 Account name already taken` naming the claim — the server never
-  suffixes or invents a name for a person. The callback query is a closed set:
-  `session_state` (Keycloak, Microsoft Entra) is admitted and ignored, and any
-  other unknown parameter is a problem-document 400, as is every other
-  handler's query (`QueryParams`). Linking an identity requires an active
-  account.
+  suffixes or invents a name for a person. The callback ignores response
+  parameters it does not act on (see above); every other handler's query is
+  closed, an unknown parameter being a problem-document 400 (`QueryParams`).
+  Linking an identity requires an active account and the session's CSRF
+  value.
 - `channels`: owner-scoped registered-channel inventory and management at
   `/me/channels` (live-operator registration, retained topic, KEEPTOPIC,
   canonical MLOCK, access flags, founder transfer, unregister)

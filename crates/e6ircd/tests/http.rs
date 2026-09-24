@@ -2463,7 +2463,7 @@ async fn openapi_spec_is_served() {
         v["paths"]["/api/v1/auth/oidc/{provider}/callback"]["get"]["parameters"]
             .as_array()
             .expect("callback parameters");
-    for name in ["code", "state", "error", "scope", "iss", "session_state"] {
+    for name in ["code", "state", "error", "iss"] {
         assert!(
             callback_parameters
                 .iter()
@@ -2471,13 +2471,39 @@ async fn openapi_spec_is_served() {
             "OpenAPI OIDC callback query is missing {name}"
         );
     }
-    for status in ["400", "403", "409", "503"] {
+    for status in ["307", "400", "401", "403", "409", "502", "503"] {
         assert!(
             v["paths"]["/api/v1/auth/oidc/{provider}/callback"]["get"]["responses"][status]
                 .is_object(),
             "OIDC callback lacks {status}"
         );
     }
+    for path in [
+        "/api/v1/auth/oidc/{provider}/start",
+        "/api/v1/auth/oidc/{provider}/sso",
+        "/api/v1/auth/oidc/{provider}/link",
+    ] {
+        let responses = &v["paths"][path]["get"]["responses"];
+        assert!(responses["502"].is_object(), "{path} lacks 502");
+        assert!(responses["429"].is_object(), "{path} lacks 429");
+    }
+    for path in [
+        "/api/v1/auth/oidc/{provider}/start",
+        "/api/v1/auth/oidc/{provider}/sso",
+    ] {
+        assert!(
+            v["paths"][path]["get"]["responses"]["503"].is_null(),
+            "{path}: no server-held login capacity exists to run out of"
+        );
+    }
+    assert!(
+        v["paths"]["/api/v1/auth/oidc/{provider}/link"]["get"]["parameters"]
+            .as_array()
+            .expect("link parameters")
+            .iter()
+            .any(|parameter| parameter["name"] == "csrf" && parameter["required"] == true),
+        "linking documents its required CSRF query value"
+    );
     assert_eq!(
         v["paths"]["/api/v1/me/networks/{name}/buffer"]["get"]["parameters"][1]["schema"]["default"],
         200
@@ -8991,6 +9017,33 @@ async fn bearer_cannot_install_a_password_or_change_login_identities() {
 
     // The owner's browser session keeps every one of those abilities.
     let owner = session_headers(http, &session).await;
+    // Linking is a top-level navigation and cannot carry the CSRF header, so
+    // the session's value rides the query. The owner's cookie alone — all a
+    // cross-site link sends — is refused before any flow begins.
+    let cookie_only = format!("Cookie: e6irc_session={session}\r\n");
+    let (status, _, body) = request(
+        http,
+        &api_request("GET", "/api/v1/auth/oidc/any/link", &cookie_only, None),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("Invalid or missing CSRF token"), "{body}");
+    let csrf = owner
+        .split("X-E6IRC-CSRF: ")
+        .nth(1)
+        .expect("CSRF header")
+        .trim_end();
+    let (status, _, body) = request(
+        http,
+        &api_request(
+            "GET",
+            &format!("/api/v1/auth/oidc/any/link?csrf={csrf}"),
+            &cookie_only,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, 404, "the checked link reaches the provider: {body}");
     let (status, _, body) = request(
         http,
         &api_request("PUT", "/api/v1/me/password", &owner, Some(password)),
@@ -9198,76 +9251,6 @@ async fn recover_administrator_subcommand_is_honoured_by_a_running_daemon() {
     assert_eq!(
         status, 200,
         "the running daemon honours the recovered authority without a restart: {body}"
-    );
-}
-
-/// The provider's redirect back is a closed query: an unknown parameter is a
-/// problem document, and `session_state` — which Keycloak and Entra append —
-/// is inside the set.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn oidc_callback_query_is_closed_and_admits_session_state() {
-    let url = support::test_db("oidc_callback_query_is_closed_and_admits_session_state").await;
-    let config = Config {
-        server_name: "irc.callback.example".into(),
-        network_name: "CallbackNet".into(),
-        listeners: vec![ListenerConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            tls: None,
-            websocket: false,
-        }],
-        http: Some(HttpConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            public_url: Some("http://chat.example".into()),
-            secure_cookies: false,
-            admin_accounts: vec![],
-            hsts_include_subdomains: false,
-        }),
-        database: Some(DatabaseConfig {
-            url,
-            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
-            max_connections: None,
-        }),
-        oidc_providers: vec![e6ircd::config::OidcProviderConfig {
-            name: "corp".into(),
-            issuer_url: "https://auth.example".into(),
-            client_id: "e6irc".into(),
-            client_secret: "x".repeat(32),
-            account_claim: e6ircd::config::OidcAccountClaim::PreferredUsername,
-            scopes: vec![],
-            allowed_email_domains: vec![],
-            end_session_endpoint: None,
-            token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
-        }],
-        ..Config::default()
-    };
-    let http = net::start(config)
-        .await
-        .expect("start")
-        .http_addr
-        .expect("http");
-
-    let (status, headers, body) =
-        request(http, &get("/api/v1/auth/oidc/corp/callback?unexpected=1")).await;
-    assert_eq!(status, 400, "{body}");
-    assert!(
-        headers
-            .to_ascii_lowercase()
-            .contains("application/problem+json"),
-        "{headers}"
-    );
-    assert!(body.contains("Invalid query"), "{body}");
-    assert!(body.contains("unexpected"), "names the parameter: {body}");
-
-    let (status, _, body) = request(
-        http,
-        &get("/api/v1/auth/oidc/corp/callback?session_state=abc123"),
-    )
-    .await;
-    assert_eq!(status, 400, "{body}");
-    assert!(
-        body.contains("Missing code or state"),
-        "session_state passed the query and the flow refused on its merits: {body}"
     );
 }
 
@@ -9671,9 +9654,10 @@ async fn logout_post_requires_the_session_csrf_value() {
     assert_eq!(status, 204, "{body}");
 }
 
-/// An identity provider whose discovery document omits `token_endpoint`, which
-/// OpenID Connect Discovery allows for implicit-flow-only providers.
-async fn identity_provider_without_a_token_endpoint() -> std::net::SocketAddr {
+/// An identity provider that serves only its discovery document (and an empty
+/// key set). Without `token_endpoint` it is what OpenID Connect Discovery
+/// allows for an implicit-flow-only provider.
+async fn discovery_only_identity_provider(token_endpoint: bool) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("identity provider");
@@ -9688,14 +9672,18 @@ async fn identity_provider_without_a_token_endpoint() -> std::net::SocketAddr {
                 let read = stream.read(&mut head).await.unwrap_or(0);
                 let head = String::from_utf8_lossy(&head[..read]).to_string();
                 let body = if head.starts_with("GET /.well-known/openid-configuration ") {
-                    serde_json::json!({
+                    let mut document = serde_json::json!({
                         "issuer": format!("http://{addr}"),
                         "authorization_endpoint": format!("http://{addr}/authorize"),
                         "jwks_uri": format!("http://{addr}/jwks"),
                         "response_types_supported": ["code"],
                         "subject_types_supported": ["public"],
                         "id_token_signing_alg_values_supported": ["RS256"],
-                    })
+                    });
+                    if token_endpoint {
+                        document["token_endpoint"] = format!("http://{addr}/token").into();
+                    }
+                    document
                 } else {
                     serde_json::json!({ "keys": [] })
                 }
@@ -9715,7 +9703,7 @@ async fn identity_provider_without_a_token_endpoint() -> std::net::SocketAddr {
 /// is refused where it starts — not by a handler panic when the browser returns.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_provider_without_a_token_endpoint_is_a_bad_gateway() {
-    let provider = identity_provider_without_a_token_endpoint().await;
+    let provider = discovery_only_identity_provider(false).await;
     let mut config = test_config();
     config.http.as_mut().expect("http").public_url = Some("http://e6irc.example".into());
     config.oidc_providers = vec![e6ircd::config::OidcProviderConfig {
@@ -9743,6 +9731,146 @@ async fn a_provider_without_a_token_endpoint_is_a_bad_gateway() {
         "{headers}"
     );
     assert!(body.contains("OIDC provider unavailable"), "{body}");
+}
+
+/// An in-flight OpenID Connect login is carried by the browser, sealed into its
+/// state cookie; the server holds nothing per flow. So no number of anonymous
+/// starts crowds out a real login, only the browser that began a flow can
+/// finish it, and every callback that proves the binding spends the flow.
+#[tokio::test(flavor = "multi_thread")]
+async fn oidc_login_state_is_sealed_into_the_browser() {
+    let provider = discovery_only_identity_provider(true).await;
+    let mut config = test_config();
+    config.http.as_mut().expect("http").public_url = Some("http://e6irc.example".into());
+    config.oidc_providers = vec![e6ircd::config::OidcProviderConfig {
+        name: "corp".into(),
+        issuer_url: format!("http://{provider}"),
+        client_id: "e6irc".into(),
+        client_secret: "x".repeat(32),
+        account_claim: e6ircd::config::OidcAccountClaim::PreferredUsername,
+        scopes: vec![],
+        allowed_email_domains: vec![],
+        end_session_endpoint: None,
+        token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
+    }];
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    async fn begin(http: std::net::SocketAddr, path: &str) -> (String, String) {
+        let (status, headers, body) = request(http, &get(path)).await;
+        assert_eq!(status, 307, "{headers}\n{body}");
+        let cookie = response_header(&headers, "set-cookie")
+            .and_then(|value| value.split(';').next())
+            .expect("flow cookie")
+            .to_string();
+        let state = response_header(&headers, "location")
+            .expect("location")
+            .split(['?', '&'])
+            .find_map(|parameter| parameter.strip_prefix("state="))
+            .expect("state parameter")
+            .to_string();
+        (cookie, state)
+    }
+    fn callback(query: &str, cookie: &str) -> String {
+        format!(
+            "GET /api/v1/auth/oidc/corp/callback?{query} HTTP/1.1\r\nHost: t\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+        )
+    }
+    let spent = Some("e6irc_oidc_state=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
+
+    // Well past the 4096 flows the server once held before refusing every
+    // login with a 503.
+    for _ in 0..4200 {
+        begin(http, "/api/v1/auth/oidc/corp/start").await;
+    }
+
+    let (cookie, state) = begin(http, "/api/v1/auth/oidc/corp/start").await;
+    assert!(cookie.starts_with("e6irc_oidc_state=enc:v2:"), "{cookie}");
+    assert!(!cookie.contains(&state), "the flow is sealed: {cookie}");
+
+    // Another login's response (an attacker's own) is not this browser's, and
+    // does not spend its flow; nor does this flow's state without its cookie.
+    let (status, headers, body) = request(http, &callback("code=c&state=forged", &cookie)).await;
+    assert_eq!(status, 401, "{body}");
+    assert!(
+        body.contains("Login state not bound to this browser"),
+        "{body}"
+    );
+    assert_eq!(response_header(&headers, "set-cookie"), None, "{headers}");
+    let (status, _, body) = request(
+        http,
+        &get(&format!(
+            "/api/v1/auth/oidc/corp/callback?code=c&state={state}"
+        )),
+    )
+    .await;
+    assert_eq!(status, 401, "{body}");
+    let (status, headers, body) =
+        request(http, &callback("error=access_denied&state=forged", &cookie)).await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(response_header(&headers, "set-cookie"), None, "{headers}");
+
+    // The browser's own response is admitted with what Google appends and a
+    // granted scope other than the one requested (RFC 6749 §4.1.2, §3.3).
+    // This server has no database, so the admitted flow ends at account
+    // storage, and is spent.
+    let query = format!(
+        "code=c&state={state}&scope=email%20openid&authuser=0&hd=example.com&prompt=consent&session_state=abc"
+    );
+    let (status, headers, body) = request(http, &callback(&query, &cookie)).await;
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("No database configured"), "{body}");
+    assert_eq!(response_header(&headers, "set-cookie"), spent, "{headers}");
+
+    let (status, _, body) = request(
+        http,
+        &callback("authuser=0&session_state=abc", "e6irc_oidc_state=x"),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("Missing code or state"), "{body}");
+
+    // The provider's refusal of this browser's flow spends it too.
+    let (cookie, state) = begin(http, "/api/v1/auth/oidc/corp/start").await;
+    let (status, headers, body) = request(
+        http,
+        &callback(&format!("error=access_denied&state={state}"), &cookie),
+    )
+    .await;
+    assert_eq!(status, 401, "{body}");
+    assert!(body.contains("OIDC login refused"), "{body}");
+    assert_eq!(response_header(&headers, "set-cookie"), spent, "{headers}");
+
+    // The sealed flow remembers it was a silent probe: no provider session
+    // bounces to interactive sign-in, and missing consent begins an ordinary
+    // authorization request with a fresh flow.
+    let (cookie, state) = begin(http, "/api/v1/auth/oidc/corp/sso").await;
+    let (status, headers, _) = request(
+        http,
+        &callback(&format!("error=login_required&state={state}"), &cookie),
+    )
+    .await;
+    assert_eq!(status, 303, "{headers}");
+    assert_eq!(response_header(&headers, "location"), Some("/?sso=none"));
+    assert_eq!(response_header(&headers, "set-cookie"), spent, "{headers}");
+    let (cookie, state) = begin(http, "/api/v1/auth/oidc/corp/sso").await;
+    let (status, headers, _) = request(
+        http,
+        &callback(&format!("error=consent_required&state={state}"), &cookie),
+    )
+    .await;
+    assert_eq!(status, 307, "{headers}");
+    let fresh = response_header(&headers, "set-cookie").expect("a fresh flow");
+    assert!(fresh.starts_with("e6irc_oidc_state=enc:v2:"), "{fresh}");
+    assert!(
+        !response_header(&headers, "location")
+            .expect("location")
+            .contains("prompt=none"),
+        "{headers}"
+    );
 }
 
 /// A running network's driver holds the configured nickname, so a connection

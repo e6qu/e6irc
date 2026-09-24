@@ -1918,7 +1918,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
         const actions = element("div", "provider-actions");
         for (const provider of providers) {
           const link = element("a", "button-link secondary-link", `Link ${provider}`);
-          link.href = `/api/v1/auth/oidc/${encodeURIComponent(provider)}/link`;
+          link.href = `/api/v1/auth/oidc/${encodeURIComponent(provider)}/link?csrf=${encodeURIComponent(csrf)}`;
           actions.append(link);
         }
         linkProviders.append(actions);
