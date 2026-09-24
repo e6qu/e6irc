@@ -9695,9 +9695,11 @@ async fn storage_refuses_to_delete_a_channel_founder() {
         .execute(&pool)
         .await
         .expect_err("deleting a founder must fail");
+    // Named by constraint, not SQLSTATE: PostgreSQL 18 reports a RESTRICT
+    // violation as 23001 (restrict_violation) where earlier releases say 23503.
     assert_eq!(
-        error.as_database_error().and_then(|e| e.code()).as_deref(),
-        Some("23503"),
+        error.as_database_error().and_then(|e| e.constraint()),
+        Some("channels_founder_account_id_fkey"),
         "{error}"
     );
     let channels: i64 = sqlx::query_scalar("SELECT count(*) FROM channels")
