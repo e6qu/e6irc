@@ -150,9 +150,9 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 
 | CI job | Product risk addressed |
 |---|---|
-| `lint` | formatting, warnings, all-feature and per-bridge compilation, frontend unit tests/build; shell syntax of every script; the backup/restore, load-sweep, qualification, migration-integrity, and no-deferral guard contracts; no-op/dead-code/dead-public/duplication/no-deferral/fuzz-lock/journey/client-capability/template-accessibility/API-first guards |
+| `lint` | formatting, warnings, all-feature, default, and per-feature compilation, frontend unit tests/build; shell syntax of every script; the backup/restore, load-sweep, qualification, migration-integrity, no-deferral, and dead-public guard contracts; no-op/dead-code/dead-public/duplication/no-deferral/fuzz-lock/journey/client-capability/template-accessibility/API-first guards |
 | `deny` | licenses, advisories, bans (including one version of each network stack), and dependency-source policy, for the workspace and for the separate `fuzz/` package |
-| `test` | all-feature workspace behavior on six OS/architecture cells |
+| `test` | all-feature workspace behavior, plus the default-feature HTTP suite, on six OS/architecture cells |
 | `coverage` | all-feature workspace line-coverage regression floor |
 | `db-tests` | real PostgreSQL storage/all-feature HTTP bridge management/OIDC/browser/BNC/`ws_ui`/`ws_scope`/CLI journeys |
 | `cross-browser` | the complete OIDC, console, network, and chat browser journey repeated in Firefox and WebKit against the real daemon, PostgreSQL, and a local live upstream |
@@ -165,7 +165,7 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 | `irctest`, `irctest-services` | IRC and services conformance |
 | `matrix-bridge` | bidirectional live bridge behavior |
 | `loom` | queue concurrency interleavings |
-| `fuzz-smoke` | parser, serializer, stateful core, multi-client core, and hostile TUI server output |
+| `fuzz-smoke` | parser, tag escaping, stateful core, multi-client core, and hostile TUI server output |
 | `size-report` | informational release binary-size visibility |
 | `ci-ok` | the single required check: it needs every job above and fails unless each one succeeded, so a failed, cancelled, or skipped job cannot merge green; the release workflow publishes only from a `main` commit whose CI run concluded successfully |
 

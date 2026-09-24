@@ -7959,7 +7959,25 @@ async fn concurrent_mutual_demotion_keeps_one_administrator() {
     };
     let alice_demotes_bob = demote(bob_id, "Alice");
     let bob_demotes_alice = demote(alice_id, "Bob");
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Release only once both are queued on the held rows; before that, one
+    // could simply run after the other.
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("lock waiters");
+            if waiting >= 2 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both demotions never queued on the held rows");
     gate.commit().await.expect("release");
 
     let outcomes = [

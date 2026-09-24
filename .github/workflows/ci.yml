@@ -62,6 +62,7 @@ jobs:
       - run: tools/test-qualification.sh
       - run: tools/test-check-migration-integrity.sh
       - run: tools/test-check-no-defer.sh
+      - run: tools/test-check-dead-pub.sh
       # fuzz/Cargo.lock resolves on its own; keep it on the workspace's versions.
       - run: python3 tools/check-fuzz-lock.py
       - name: Migration integrity
@@ -74,15 +75,19 @@ jobs:
       - run: cargo fmt --all --check
       - run: rustfmt --edition 2024 --check crates/e6irc-qualification/tests/support/native.rs
       - run: cargo clippy --locked --workspace --all-targets --all-features
-      # `--all-features` is the union, so it never compiles a bridge on its
+      # `--all-features` is the union, so it never compiles a feature on its
       # own. Code behind `cfg(feature = "discord")` that happens to depend on
       # something `matrix` pulls in builds there and breaks for the deployment
-      # that enables one bridge, which is the normal case.
-      - name: Each bridge feature on its own
-        # clippy, not just check: a clippy lint that fires only under one bridge
-        # (not in the --all-features union above) would otherwise ship unseen.
+      # that enables one bridge, which is the normal case; and code behind
+      # `cfg(not(feature = ..))` compiles only when that feature is off. The
+      # empty entry is the default build, the one most deployments ship.
+      # (embed-web needs web/dist, built above.)
+      - name: Default features and each feature on its own
+        # clippy, not just check: a clippy lint that fires only in one
+        # configuration (not in the --all-features union above) would
+        # otherwise ship unseen.
         run: |
-          for feature in discord matrix slack; do
+          for feature in "" embed-web discord matrix slack; do
             cargo clippy --locked -p e6ircd --all-targets --features "$feature"
           done
       # No-op guard (AGENTS.md / DESIGN §2): shipped source must carry no
@@ -92,7 +97,8 @@ jobs:
       # with -D warnings, so code kept alive solely by tests is caught as dead.
       - run: tools/check-dead-code.sh
       # Dead-pub guard: the cross-crate case the compiler can't see — a `pub`
-      # item referenced only by an integration test (a separate crate).
+      # item referenced only by an integration test (a separate crate) or by
+      # inline `#[cfg(test)]` code.
       - run: tools/check-dead-pub.sh
       # Copy-paste guard: fail if duplicated Rust source exceeds the ratchet.
       - run: tools/check-duplication.sh
@@ -157,6 +163,10 @@ jobs:
       # --all-features includes embed-web, which embeds web/dist.
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       - run: cargo test --locked --workspace --all-features --target ${{ matrix.target }}
+      # The union above never compiles a `cfg(not(feature = "embed-web"))`
+      # test (the API-only build that serves no `/`), so run the HTTP suite
+      # once more in the default build.
+      - run: cargo test --locked -p e6ircd --test http --target ${{ matrix.target }}
 
   # Coverage is a ratchet, not a claim that one percentage proves the product.
   # Combine the portable all-feature suite with the real PostgreSQL database
@@ -641,8 +651,7 @@ jobs:
         working-directory: fuzz
         # Enumerate targets from cargo-fuzz itself (the Cargo.toml [[bin]] set)
         # rather than a hand-maintained list, so a newly-added target can never
-        # silently go un-fuzzed — serialize_message did exactly that under the
-        # old hardcoded list.
+        # silently go un-fuzzed, as one did under the old hardcoded list.
         # `fuzz/seeds/<target>/` holds hand-written, tracked seeds (regression
         # inputs the fuzzer would otherwise have to rediscover: repeated list
         # targets, multiline BATCH deviations, an over-long PING). They are

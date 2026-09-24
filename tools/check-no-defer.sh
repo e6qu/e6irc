@@ -6,16 +6,25 @@ cd "$(dirname "$0")/.."
 
 fail=0
 
-# BUGS.md is a tripwire, not a backlog. A tripwire that is gone or unreadable
-# has not been checked, so that is a failure too, not a clean result.
-open_entry='^[[:space:]]*-[[:space:]]*\[[[:space:]]\]'
+# BUGS.md is a tripwire, not a backlog: it holds exactly this header and
+# nothing else. Any addition fails — an open checkbox, a ticked one kept "for
+# the record", a bare bullet or a paragraph are all the same backlog. A
+# tripwire that is gone or unreadable has not been checked, so that is a
+# failure too, not a clean result.
+bugs_header='# e6irc — Known bugs
+
+This file is a tripwire, not a backlog. It must stay empty.
+
+Fix a defect in the current change or ask the human to decide. The no-defer
+gate fails if this file gains anything beyond this header.'
 if [ ! -f BUGS.md ] || [ ! -r BUGS.md ]; then
   echo "no-defer guard: BUGS.md is missing or unreadable — the tripwire must exist"
   echo "                (and stay empty) for this guard to mean anything."
   fail=1
-elif grep -nE "$open_entry" BUGS.md; then
-  echo "no-defer guard: BUGS.md has the open bug entries above — fix them, or put"
-  echo "                the decision to the human. BUGS.md is a tripwire, not a backlog."
+elif ! printf '%s\n' "$bugs_header" | diff -u - BUGS.md; then
+  echo "no-defer guard: BUGS.md differs from its fixed header (diff above) — fix"
+  echo "                the defect, or put the decision to the human. BUGS.md is"
+  echo "                a tripwire, not a backlog."
   fail=1
 fi
 
@@ -29,7 +38,7 @@ if ! git rev-parse --verify -q "$base^{commit}" >/dev/null; then
 fi
 plan_diff="$(git diff "$base" -- PLAN.md)"
 added="$(printf '%s\n' "$plan_diff" | grep '^+' | grep -v '^+++' || true)"
-banned='surfaced, not (done|changed)|deferred to a (dedicated|future) (pass|sweep)|noted for a (dedicated|future) (pass|sweep)|left (for|to) a (later|future) (pass|sweep)|considered non-change|gold-plat'
+banned='surfaced, not (done|changed)|deferred to a (dedicated|future|later) (pass|sweep)|noted for a (dedicated|future|later) (pass|sweep)|left (for|to) a (later|future) (pass|sweep)|considered non-change|gold-plat'
 hits="$(printf '%s\n' "$added" | grep -niE "$banned" || true)"
 if [ -n "$hits" ]; then
   echo "no-defer guard: this change adds a deferral idiom to PLAN.md. Address the"

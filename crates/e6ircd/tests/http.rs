@@ -1310,8 +1310,20 @@ async fn bnc_network_management_lifecycle() {
     assert_eq!(v["networks"][0]["name"], "work");
     assert_eq!(v["networks"][0]["has_sasl_password"], false);
 
-    // the driver started: alice can attach to it via the BNC port
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // the driver started: once the listing reports it connected, alice can
+    // attach to it via the BNC port
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let (_, _, body) = request(http, &list_req).await;
+            let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+            if v["networks"][0]["runtime"]["state"] == "connected" {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the created network's driver never connected");
     let mut client = e6irc_client::Connection::connect(&bnc.to_string())
         .await
         .unwrap();

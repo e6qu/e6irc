@@ -110,35 +110,50 @@ async fn matrix_bridge_relays_both_ways() {
     .await
     .expect("timeout");
     assert!(connected, "bridge never connected/logged in");
-    tokio::time::sleep(Duration::from_millis(500)).await; // sync loop running
 
-    // Matrix -> IRC: alice sends; the bridge emits a PRIVMSG line.
-    http.put(format!(
-        "{base}/_matrix/client/v3/rooms/{}/send/m.room.message/t1",
-        enc(&room_id)
-    ))
-    .bearer_auth(&alice_token)
-    .json(&serde_json::json!({ "msgtype": "m.text", "body": "hello from matrix" }))
-    .send()
-    .await
-    .expect("alice send");
-
+    // Matrix -> IRC: alice sends; the bridge emits a PRIVMSG line. A fresh
+    // bridge's first sync only establishes its position and discards that
+    // timeline, and nothing outside the bridge says when it has returned, so
+    // alice sends again until one message is bridged.
     let line = tokio::time::timeout(deadline::HANG, async {
+        let mut attempt = 0u32;
         loop {
-            match events.recv().await {
-                Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine { line: l, .. }))
-                    if l.contains("hello from matrix") =>
-                {
-                    return Some(l);
+            http.put(format!(
+                "{base}/_matrix/client/v3/rooms/{}/send/m.room.message/t{attempt}",
+                enc(&room_id)
+            ))
+            .bearer_auth(&alice_token)
+            .json(&serde_json::json!({
+                "msgtype": "m.text",
+                "body": format!("hello from matrix {attempt}"),
+            }))
+            .send()
+            .await
+            .expect("alice send");
+            let bridged = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match events.recv().await {
+                        Ok(DriverEvent::Line(e6ircd::bouncer::BufferedLine {
+                            line: l, ..
+                        })) if l.contains("hello from matrix") => {
+                            return l;
+                        }
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            panic!("the bridge's event stream closed")
+                        }
+                    }
                 }
-                Ok(_) => {}
-                Err(_) => return None,
+            })
+            .await;
+            if let Ok(line) = bridged {
+                return line;
             }
+            attempt += 1;
         }
     })
     .await
-    .expect("timeout")
-    .expect("no bridged line");
+    .expect("no Matrix message was ever bridged");
     assert!(line.contains(&format!("PRIVMSG #{room_local}")), "{line}");
     assert!(
         line.starts_with(&format!(":{alice}!")),

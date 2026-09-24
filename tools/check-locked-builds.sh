@@ -21,7 +21,13 @@ done < <(find .github/workflows -name '*.yml' -type f; find tools -type f \( -na
 
 unlocked=0
 for file in "${files[@]}"; do
-  [ -f "$file" ] || continue
+  # The named files are listed by hand; one that moved or was renamed would
+  # otherwise drop out of the check without a word.
+  if [ ! -f "$file" ]; then
+    echo "$file: listed for the --locked check but not found; update this script" >&2
+    unlocked=1
+    continue
+  fi
   [ "$file" = tools/check-locked-builds.sh ] && continue
   while IFS=: read -r line text; do
     case "$text" in

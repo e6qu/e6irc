@@ -35,6 +35,23 @@ const WHITELIST: &[&str] = &[
     "CHANMODES",
 ];
 
+/// Floor on the tokens our own burst carries (25 today). A ratchet: dropping
+/// a token is a decision to make here, not a silent narrowing of the check.
+const MIN_OURS: usize = 25;
+/// Floor on the shared, non-whitelisted tokens actually compared (14 today).
+const MIN_CHECKED: usize = 14;
+/// Tokens clients key on that both sides advertise; each must be compared.
+const MUST_COMPARE: &[&str] = &[
+    "CASEMAPPING",
+    "CHANTYPES",
+    "PREFIX",
+    "NICKLEN",
+    "CHANNELLEN",
+    "CHANLIMIT",
+    "STATUSMSG",
+    "MAXLIST",
+];
+
 fn isupport_tokens(lines: impl Iterator<Item = String>) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for line in lines {
@@ -120,15 +137,25 @@ fn advertised_isupport_matches_libera_where_shared() {
         libera.len()
     );
     let ours = our_isupport();
+    // An empty or truncated burst of ours would compare nothing and pass.
+    assert!(
+        ours.len() >= MIN_OURS,
+        "our ISUPPORT burst looks truncated: {} tokens ({:?})",
+        ours.len(),
+        ours.keys().collect::<Vec<_>>()
+    );
     let mut diverged = Vec::new();
+    let mut checked = Vec::new();
     for (name, our_value) in &ours {
         // NETWORK is deployment-specific by nature.
         if name == "NETWORK" || WHITELIST.contains(&name.as_str()) {
             continue;
         }
-        if let Some(libera_value) = libera.get(name)
-            && libera_value != our_value
-        {
+        let Some(libera_value) = libera.get(name) else {
+            continue;
+        };
+        checked.push(name.as_str());
+        if libera_value != our_value {
             diverged.push(format!(
                 "{name}: ours={our_value:?} libera={libera_value:?}"
             ));
@@ -138,6 +165,21 @@ fn advertised_isupport_matches_libera_where_shared() {
         diverged.is_empty(),
         "ISUPPORT divergence from Libera:\n{}",
         diverged.join("\n")
+    );
+    // The contract means something only if it compared the tokens clients
+    // key on; losing one from either side must fail here, not pass vacuously.
+    for name in MUST_COMPARE {
+        assert!(
+            checked.contains(name),
+            "{name} was not compared (ours: {:?}, Libera has it: {})",
+            ours.get(*name),
+            libera.contains_key(*name)
+        );
+    }
+    assert!(
+        checked.len() >= MIN_CHECKED,
+        "only {} shared tokens compared: {checked:?}",
+        checked.len()
     );
 }
 

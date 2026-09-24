@@ -379,7 +379,7 @@ core worker's requests, keeping slow I/O off the core.
 **`e6irc-queue`** — the custom bounded MPSC queue connecting the workers,
 with backpressure so a full core queue pauses socket reads.
 
-**`e6irc-proto`** — the protocol crate: message model, parser/serializer,
+**`e6irc-proto`** — the protocol crate: message model, parser, tag escaping,
 casemapping, numerics, and time formatting.
 
 **CLI / TUI** — the command-line client (`e6irc-cli`) and the terminal user

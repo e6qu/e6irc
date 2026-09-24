@@ -14,6 +14,9 @@ mod support;
 
 #[path = "support/deadline.rs"]
 mod deadline;
+#[path = "support/membership.rs"]
+mod membership;
+use membership::{wait_joined, whois_until};
 
 async fn upstream() -> std::net::SocketAddr {
     let config = Config {
@@ -34,6 +37,12 @@ async fn upstream() -> std::net::SocketAddr {
         ..Config::default()
     };
     net::start(config).await.expect("start").addrs[0]
+}
+
+/// Wait until `nick` has left `server` entirely — a stopped driver's session
+/// is gone upstream, so the next start's cannot be mistaken for it.
+async fn wait_gone(server: std::net::SocketAddr, nick: &str) {
+    whois_until(server, nick, "left", Option::is_none).await;
 }
 
 /// Poll the sticky lifecycle until the driver reaches `expected`.
@@ -482,9 +491,7 @@ async fn bnc_listener_authenticates_and_routes_client_to_network() {
     let up = upstream().await;
     let running = net::start(bnc_config(up, url)).await.expect("start");
     let bnc = running.bnc_addr.expect("bnc bound");
-
-    // give the driver a moment to connect + join upstream
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    wait_joined(up, "bncnick", "#lobby").await;
 
     // a peer on the upstream will exchange messages
     let mut peer = e6irc_client::Connection::connect(&up.to_string())
@@ -589,7 +596,7 @@ async fn bnc_listener_attaches_over_tls() {
     config.bnc.as_mut().expect("bnc").tls = Some(tls);
     let running = net::start(config).await.expect("start");
     let bnc = running.bnc_addr.expect("bnc bound");
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    wait_joined(up, "bncnick", "#lobby").await;
 
     let mut roots = rustls::RootCertStore::empty();
     roots
@@ -644,7 +651,9 @@ async fn bnc_listener_rejects_unauthenticated_and_wrong_password() {
     let up = upstream().await;
     let running = net::start(bnc_config(up, url)).await.expect("start");
     let bnc = running.bnc_addr.expect("bnc bound");
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // With alice's own network live upstream, the refusals below are about the
+    // credentials and the owner, never a network that has not started yet.
+    wait_joined(up, "bncnick", "#lobby").await;
 
     // No SASL at all: plain registration is refused (connection closes
     // before 001).
@@ -727,7 +736,7 @@ async fn a_network_is_selected_by_the_sasl_user_name_or_the_nickname() {
     let up = upstream().await;
     let running = net::start(bnc_config(up, url)).await.expect("start");
     let bnc = running.bnc_addr.expect("bnc bound");
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    wait_joined(up, "bncnick", "#lobby").await;
 
     // `nick`, `user name`: what the client sends; `expect`: what it must read.
     async fn attach(bnc: std::net::SocketAddr, nick: &str, user_name: &str) -> String {
@@ -811,7 +820,7 @@ async fn bnc_listener_accepts_chunked_sasl_plain() {
     let up = upstream().await;
     let running = net::start(bnc_config(up, url)).await.expect("start");
     let bnc = running.bnc_addr.expect("bnc bound");
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    wait_joined(up, "bncnick", "#lobby").await;
 
     let mut sock = tokio::net::TcpStream::connect(bnc).await.unwrap();
     sock.write_all(
@@ -1000,7 +1009,7 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
     let running_a = net::start(bnc_config(up, url.clone()))
         .await
         .expect("start A");
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    wait_joined(up, "bncnick", "#lobby").await;
 
     // A peer posts a line the driver receives, buffers, and persists.
     let mut peer = e6irc_client::Connection::connect(&up.to_string())
@@ -1083,8 +1092,9 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
     };
     let running_b = net::start(config_b).await.expect("start B");
     let bnc = running_b.bnc_addr.expect("bnc bound");
-    // Let the persistence task restore the backlog into the buffer.
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    // No wait for the restore: an attach is held until the network's persisted
+    // backlog has been loaded (`history_restored`), so the replay below cannot
+    // race it.
 
     let mut client = e6irc_client::Connection::connect(&bnc.to_string())
         .await
@@ -1174,8 +1184,7 @@ async fn local_driver_presents_the_in_process_network() {
     let irc = running.addrs[0];
     let bnc = running.bnc_addr.expect("bnc bound");
 
-    // Let the local driver register in-process and join #local.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    wait_joined(irc, "alicelocal", "#local").await;
 
     // A normal client on the main listener joins #local and speaks.
     let mut peer = e6irc_client::Connection::connect(&irc.to_string())
@@ -1260,7 +1269,7 @@ async fn persisted_bnc_buffer_is_trimmed_by_its_own_traffic() {
     let running = net::start(bnc_config(up, url.clone()))
         .await
         .expect("start");
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    wait_joined(up, "bncnick", "#lobby").await;
 
     let mut peer = e6irc_client::Connection::connect(&up.to_string())
         .await
@@ -1360,7 +1369,7 @@ async fn buffered_upstream_lines_keep_their_wire_form() {
     let running = net::start(bnc_config(up, url.clone()))
         .await
         .expect("start");
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    wait_joined(up, "bncnick", "#lobby").await;
 
     let mut peer = e6irc_client::Connection::connect(&up.to_string())
         .await
@@ -2927,7 +2936,7 @@ async fn self_echo_is_persisted_to_the_backlog() {
         .await
         .expect("start");
     let bnc = running.bnc_addr.expect("bnc bound");
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    wait_joined(up, "bncnick", "#lobby").await;
 
     let mut client = e6irc_client::Connection::connect(&bnc.to_string())
         .await
@@ -3060,10 +3069,11 @@ async fn bnc_listener_serves_chathistory_and_markread() {
     )
     .await;
     let up = upstream().await;
-    let running = net::start(bnc_config(up, url)).await.expect("start");
+    let running = net::start(bnc_config(up, url.clone()))
+        .await
+        .expect("start");
     let bnc = running.bnc_addr.expect("bnc bound");
-    // give the driver a moment to connect + join upstream
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    wait_joined(up, "bncnick", "#lobby").await;
 
     let mut peer = e6irc_client::Connection::connect(&up.to_string())
         .await
@@ -3088,8 +3098,21 @@ async fn bnc_listener_serves_chathistory_and_markread() {
             .await
             .unwrap();
     }
-    // Let the persistence task drain the backlog before paging.
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    // The persistence task must have drained the backlog before paging.
+    let pool = observer_pool(&url).await;
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            let lines = e6ircd::db::recent_bnc_lines(&pool, "alice", "up", 100)
+                .await
+                .expect("read");
+            if lines.iter().any(|l| l.contains("buffered msg 4")) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the backlog was never persisted");
 
     let mut client = bnc_attach_with_history(bnc, "alice/up", "alice", "s3cr3t").await;
 
@@ -3919,8 +3942,8 @@ async fn the_backlog_cap_holds_across_restarts() {
         })
         .await
         .unwrap_or_else(|_| panic!("the {batch} start left the backlog over the cap"));
-        // Wait until the driver has joined and persists the peer's lines.
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        // The driver must have joined before the peer's lines can reach it.
+        wait_joined(up, "bncnick", "#lobby").await;
         for n in 0..600 {
             peer.send_line(&format!("PRIVMSG #lobby :{batch} {n}"))
                 .await
@@ -3937,6 +3960,7 @@ async fn the_backlog_cap_holds_across_restarts() {
         .await
         .unwrap_or_else(|_| panic!("the {batch} batch was never fully persisted"));
         running.shutdown.run().await;
+        wait_gone(up, "bncnick").await;
     }
     // A third start trims again.
     let before = newest_id().await;
