@@ -212,9 +212,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   // failed (reported through `report`) or the form was already submitting. A
   // helper that returned the body made "no content" read as "failed", and a
   // revoked invitation was reported as nothing at all.
-  const submitMutation = (form, operation, body, report, trigger) => runFormSubmission(form, async () => {
+  const submitMutation = (form, method, url, body, report, trigger) => runFormSubmission(form, async () => {
     try {
-      return { value: await apiRequest(form, operation, body) };
+      return { value: await apiRequest(form, apiMutation(method, url), body) };
     } catch (error) {
       report(error);
       return null;
@@ -1827,7 +1827,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
 
   const mutateAccount = (form, method, body, failure) => submitMutation(
     form,
-    apiMutation(method, form.action),
+    method,
+    form.action,
     body,
     (error) => setAccountResult(error instanceof Error ? error.message : failure, false),
   );
@@ -2219,7 +2220,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   };
   const mutateAdminAccount = (form, method, body, failure) => submitMutation(
     form,
-    apiMutation(method, form.action),
+    method,
+    form.action,
     body,
     (error) => setAdminAccountResult(error instanceof Error ? error.message : failure, false),
   );
@@ -2516,7 +2518,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
   const mutateOwnerNetwork = async (form, url, method, body) => {
     const result = await submitMutation(
       form,
-      apiMutation(method, url),
+      method,
+      url,
       body,
       (error) => showOwnerNetworkFailure(form, error),
       form.querySelector('button[type="submit"]'),

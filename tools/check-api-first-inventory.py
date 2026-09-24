@@ -87,13 +87,10 @@ UNRESOLVED_CALL_SITES = {
     '"DELETE", url': (1, "the body of mutateSession; see FIXED_METHOD_WRAPPERS"),
     "method, url": (
         4,
-        "the bodies of mutateConfiguration, mutateBan, mutateOwnerNetwork and "
-        "mutateChannel; each caller's literal URL and method are checked as a pair",
-    ),
-    "method, form.action": (
-        2,
-        "the bodies of mutateAccount and mutateAdminAccount; the URL is a "
-        "template form action, which is checked against the mutating routes",
+        "the bodies of mutateConfiguration, mutateBan, mutateChannel and "
+        "submitMutation; each caller's literal URL and method are checked as a "
+        "pair, and submitMutation's callers mutateAccount and mutateAdminAccount "
+        "pass a template form action, which is checked against the mutating routes",
     ),
     '"PATCH", form.action': (
         1,
