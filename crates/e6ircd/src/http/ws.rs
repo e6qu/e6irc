@@ -17,35 +17,12 @@ const MAX_IRC_WS_FRAME: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN;
 /// before deserialization while admitting every wire-sized composer command.
 const MAX_UI_WS_FRAME: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN * 6 + 512;
 
-/// How long one outbound frame may wait for the peer to take it.
-const SOCKET_SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+use crate::peer_write::{PEER_WRITE_DEADLINE, SendFailure, within_send_deadline};
 
-/// Why an outbound frame was not delivered. Either way the connection is over.
-#[derive(Debug)]
-enum SendFailure {
-    Transport,
-    Stalled,
-}
-
-/// Write one frame, giving up on a peer that has stopped reading.
-///
-/// A peer that keeps the connection open but advertises a zero receive window
-/// parks a bare `send` forever. The task would then never observe its network
-/// being removed or its send queue being closed, and would hold the network
-/// handle and the per-IP connection slot for as long as the peer liked.
+/// Write one frame, giving up on a peer that has stopped reading
+/// ([`crate::peer_write`]).
 async fn send_frame(socket: &mut WebSocket, frame: WsMessage) -> Result<(), SendFailure> {
-    within_send_deadline(SOCKET_SEND_DEADLINE, socket.send(frame)).await
-}
-
-async fn within_send_deadline<E>(
-    deadline: std::time::Duration,
-    send: impl Future<Output = Result<(), E>>,
-) -> Result<(), SendFailure> {
-    match tokio::time::timeout(deadline, send).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => Err(SendFailure::Transport),
-        Err(_) => Err(SendFailure::Stalled),
-    }
+    within_send_deadline(PEER_WRITE_DEADLINE, socket.send(frame)).await
 }
 
 /// Outbound WebSocket frame discipline, fixed for the connection by ircv3
@@ -1486,23 +1463,6 @@ mod tests {
         assert_eq!(rejected["t"], "send-error");
         assert_eq!(rejected["v"], "a2");
         assert_eq!(rejected["message"], "not sent");
-    }
-}
-
-#[cfg(test)]
-mod send_deadline_tests {
-    use super::{SendFailure, within_send_deadline};
-
-    #[tokio::test]
-    async fn a_peer_that_never_takes_the_frame_ends_the_send() {
-        let deadline = std::time::Duration::from_millis(20);
-        let stalled =
-            within_send_deadline(deadline, std::future::pending::<Result<(), ()>>()).await;
-        assert!(matches!(stalled, Err(SendFailure::Stalled)));
-        let delivered = within_send_deadline(deadline, async { Ok::<(), ()>(()) }).await;
-        assert!(delivered.is_ok());
-        let failed = within_send_deadline(deadline, async { Err::<(), ()>(()) }).await;
-        assert!(matches!(failed, Err(SendFailure::Transport)));
     }
 }
 

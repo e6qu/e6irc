@@ -30,6 +30,7 @@ mod sessions;
 mod ws;
 
 use channels::*;
+pub(crate) use credentials::AccountExportSlots;
 use credentials::*;
 use device::*;
 use history::*;
@@ -155,6 +156,8 @@ pub struct AppState {
     pub(crate) preflight_limiter: Arc<PreflightLimiter>,
     /// Live chat sockets open per account.
     pub(crate) ui_sockets: Arc<UiSocketLimiter>,
+    /// Account exports running at once.
+    pub(crate) account_exports: AccountExportSlots,
     /// The per-IP connection cap, shared with the TCP listeners so IRC sessions
     /// opened over `/ws/irc` count against the same budget as raw-socket ones.
     pub(crate) conn_limiter: crate::net::ConnLimiter,
@@ -569,22 +572,65 @@ fn account_mutation_pool(
     ))
 }
 
+/// A change to an account's lifecycle.
+#[derive(Clone, Copy)]
+enum AccountLifecycle {
+    Suspension { suspended: bool },
+    Deletion { allow_self: bool },
+}
+
+/// Apply `change` to the account — its database state, its networks and the
+/// live core — as one unit on the registry mutation lane. Account state and
+/// network CRUD share that lane, so an already-authorized network create
+/// cannot commit between the owner-wide stop and credential revocation and
+/// leave a suspended account's new driver running; and the unit runs to
+/// completion even if the request is abandoned, so a suspension or deletion
+/// that committed always reaches the core and the registry.
+async fn mutate_account_lifecycle(
+    state: &Arc<AppState>,
+    actor: &str,
+    account_id: i64,
+    change: AccountLifecycle,
+) -> Result<String, (StatusCode, String)> {
+    account_mutation_pool(state, account_id)?;
+    let registry = state.bnc_registry.clone().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Network registry unavailable".into(),
+    ))?;
+    let (state, actor) = (state.clone(), actor.to_owned());
+    registry
+        .mutate(move |lane| async move {
+            match change {
+                AccountLifecycle::Suspension { suspended } => {
+                    account_suspension_in_lane(&state, &lane, &actor, account_id, suspended).await
+                }
+                AccountLifecycle::Deletion { allow_self } => {
+                    delete_account_in_lane(&state, &lane, &actor, account_id, allow_self).await
+                }
+            }
+        })
+        .await
+}
+
+/// Suspend or reactivate an account ([`mutate_account_lifecycle`]).
 pub(super) async fn mutate_account_suspension(
+    state: &Arc<AppState>,
+    actor: &str,
+    account_id: i64,
+    suspended: bool,
+) -> Result<String, (StatusCode, String)> {
+    let change = AccountLifecycle::Suspension { suspended };
+    mutate_account_lifecycle(state, actor, account_id, change).await
+}
+
+async fn account_suspension_in_lane(
     state: &AppState,
+    lane: &crate::bouncer::MutationLane,
     actor: &str,
     account_id: i64,
     suspended: bool,
 ) -> Result<String, (StatusCode, String)> {
     let pool = account_mutation_pool(state, account_id)?;
-    let registry = state.bnc_registry.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Network registry unavailable".into(),
-    ))?;
-    // Account state and network CRUD share one mutation lane. Without this
-    // guard, an already-authorized network create could commit between the
-    // owner-wide stop and credential revocation, leaving a suspended
-    // account's new driver running.
-    let _network_mutation = registry.mutation_guard().await;
     let target_name = crate::db::account_name_by_id(pool, account_id)
         .await
         .map_err(|error| {
@@ -645,7 +691,9 @@ pub(super) async fn mutate_account_suspension(
     .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
 
     if suspended {
-        let stopped_networks = registry.remove_owner(&change.folded).await;
+        let stopped_networks = lane
+            .remove_owner(&change.folded, crate::bouncer::UnwrittenLines::Store)
+            .await;
         core_action(
             state,
             crate::core::AdminRequest::SetAccountSuspended {
@@ -687,8 +735,7 @@ pub(super) async fn mutate_account_suspension(
         })?;
         let started_networks = prepared_networks.len();
         for (name, driver) in prepared_networks {
-            registry
-                .ensure_running(Some(&change.folded), &name, driver)
+            lane.ensure_running(Some(&change.folded), &name, driver)
                 .await;
         }
         Ok(format!(
@@ -790,18 +837,26 @@ fn account_invitation_url(public_url: &str, token: &str) -> String {
     format!("{}{path}", public_url.trim_end_matches('/'))
 }
 
+/// Delete an account permanently — the live gate, its networks and its rows
+/// ([`mutate_account_lifecycle`]).
 pub(super) async fn delete_account_lifecycle(
+    state: &Arc<AppState>,
+    actor: &str,
+    account_id: i64,
+    allow_self: bool,
+) -> Result<String, (StatusCode, String)> {
+    let change = AccountLifecycle::Deletion { allow_self };
+    mutate_account_lifecycle(state, actor, account_id, change).await
+}
+
+async fn delete_account_in_lane(
     state: &AppState,
+    registry: &crate::bouncer::MutationLane,
     actor: &str,
     account_id: i64,
     allow_self: bool,
 ) -> Result<String, (StatusCode, String)> {
     let pool = account_mutation_pool(state, account_id)?;
-    let registry = state.bnc_registry.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Network registry unavailable".into(),
-    ))?;
-    let _network_mutation = registry.mutation_guard().await;
     let configured_administrators: Vec<String> =
         state.configured_admin_accounts.iter().cloned().collect();
     let target = crate::db::account_deletion_target(pool, account_id, &configured_administrators)
@@ -839,7 +894,9 @@ pub(super) async fn delete_account_lifecycle(
     // network's row no longer satisfies). Drivers for the running networks are
     // built first, so a deletion the database refuses restarts exactly them.
     let restart = owner_network_restart(state, pool, registry, &target).await;
-    let stopped_networks = registry.remove_owner(&target.folded).await;
+    let stopped_networks = registry
+        .remove_owner(&target.folded, crate::bouncer::UnwrittenLines::Discard)
+        .await;
     let deleted = match crate::db::delete_account_permanently(
         pool,
         account_id,

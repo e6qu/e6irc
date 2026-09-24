@@ -423,6 +423,16 @@ These are project-wide rules, enforced in review and (where possible) CI:
     role, purpose-specific accessible name, and keyboard focus in one
     constructor. Refresh code cannot overwrite a neighboring table's identity
     after rendering.
+  - `peer_write` — every write to a peer (IRC client socket, attach client,
+    WebSocket frame, bridge gateway frame, streamed download) goes through
+    `DeadlineWriter` or `within_send_deadline`, so a peer that stops reading
+    ends its connection at the deadline instead of parking the task that owns
+    it — and every resource that task holds — forever.
+  - `MutationLane` — the registry's transitions (replace, ensure running,
+    remove, remove an owner's networks) exist only on the lane
+    `Registry::mutate` hands to a unit of work it runs as its own task, so a
+    control-plane change cannot be cancelled half made by an abandoned
+    request.
   - The wire-length **runtime** invariant (§7.1): where a *type* is
     impractical (every outbound line is a `String`), a debug-build assertion
     at the one send funnel makes the class machine-checked by the test and
@@ -690,6 +700,17 @@ strip = "symbols"
   through a **bounded** per-connection queue of `Bytes` (SendQ). Queue-full →
   the classic ircd answer: kill the slow client with a "SendQ exceeded" quit.
   No unbounded buffering, no silent drops.
+- Every write to a peer is bounded (`peer_write`): a write, flush or shutdown
+  that makes no progress for 30 s fails, so a client with a shut receive
+  window is closed ("Write timeout") instead of parking its writer forever —
+  which used to leak the socket, the task and the per-IP slot of every client
+  the core had already killed. The same bound covers the attach listener
+  (§10.4), `/ws/irc` and `/ws/ui` frames, and bridge gateway sockets; slow but
+  steady readers are never cut off, since progress resets it.
+- A client that half-closes (`nc -N`, a scripted client sending its whole
+  session and then EOF) still reads every reply to what it sent — its welcome,
+  its `ERROR` — for up to 5 s after its EOF, before the connection is torn
+  down.
 - RecvQ/flood control: a token bucket per connection, on by default with
   Solanum's shape (`limits.command_burst = 40` tokens, `limits.command_rate =
   20` per second; a registered non-oper session spends one per command, PING
@@ -1456,7 +1477,7 @@ durable/configuration sources, and suspension posture.
 change exactly one durable authority or suspension state by immutable account
 ID. Self-suspension, self-demotion, and suspending/demoting the last active
 durable administrator are conflicts. Account-state
-and network CRUD share one mutation guard. After the durable transaction,
+and network CRUD share one mutation lane. After the durable transaction,
 suspension installs a case-folded deny key on the ordered core thread before
 disconnecting every authenticated IRC session, then stops every active network
 owned by that account. A password verdict already in flight is therefore
@@ -1486,7 +1507,11 @@ URL is an authenticated redirect to this canonical page.
 
 The same page presents the account's newest security activity, with stable
 cursor pagination at `/api/v1/me/security-activity`, and downloads a versioned
-non-cacheable JSON attachment at `/api/v1/me/export`. The export is built from
+non-cacheable JSON attachment at `/api/v1/me/export`. At most two exports run
+at once process-wide (each holds a pooled connection in a `REPEATABLE READ`
+transaction while its client reads); a third is refused `429` with
+`Retry-After`, and a download whose client reads nothing for 30 s is abandoned
+and its transaction released. The export is built from
 one PostgreSQL statement snapshot and includes retained personal content and
 secret-free configuration/posture; password hashes, bearer/session/invitation
 digests, plaintext bearer values, provider identity tokens/session IDs, device
@@ -1644,10 +1669,19 @@ Create, edit, and enable construct the prospective driver before mutating
 PostgreSQL, so a missing key or factory rejection cannot leave durable state
 claiming a driver configuration that never entered the live registry.
 Create, edit, enable/disable, and delete also hold one asynchronous registry
-mutation gate across their database and live-registry transitions. Concurrent
+mutation lane across their database and live-registry transitions. Concurrent
 control-plane requests therefore have a single order and cannot resurrect a
 deleted driver, publish an older edit after a newer one, or leave storage and
-the running registry representing different operations.
+the running registry representing different operations. Each such unit of
+work — account suspension, reactivation and deletion included, with their core
+deny-key step — runs as its own task that the request only awaits
+(`Registry::mutate`), and the registry's transitions exist only on the lane it
+hands out: a request abandoned at the 30 s deadline abandons the wait, never a
+transition half made (a driver stopped whose replacement never starts, a
+suspension committed that the core never heard about). An account's drivers
+stop concurrently. A stopping network's persistence task writes the lines its
+driver said last (its goodbye among them) unless the network's rows are about
+to be deleted.
 The registry refuses to register over a live driver *before* the second driver
 starts, so two upstream sessions can never race for one network, and each
 caller states what it means: create and edit **supersede** (stop the
@@ -1715,7 +1749,12 @@ above the trait, provides for every network kind:
   `ATTACH_LIVENESS_INTERVAL` (120 s) is sent `PING`; one silent for a second
   interval is detached as unresponsive. `attach` returns a typed `AttachEnd`
   (client closed, quit, too slow, unresponsive; network removed; driver
-  stopped), and the listener logs that reason for every detachment.
+  stopped), and the listener logs that reason for every detachment. The
+  opposite half-open case — a client that stops *reading* — is caught by the
+  peer write bound (§7.2): every write of the registration handshake, the
+  welcome and the attached session fails after 30 s without progress, and the
+  attachment ends as too slow, where a parked write used to hide the network's
+  removal and the client's silence from the relay for good.
 - **Detached buffering**: events accumulate in a per-network ring persisted
   to PostgreSQL. A lifecycle notice is buffered and persisted once per
   *transition* (lifecycle plus failure code); repeats are delivered live only.

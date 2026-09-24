@@ -924,6 +924,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             api_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
             preflight_limiter: crate::http::PreflightLimiter::new(),
             ui_sockets: crate::http::UiSocketLimiter::new(),
+            account_exports: crate::http::AccountExportSlots::new(),
             conn_limiter: limiter.clone(),
             request_admission: Arc::new(crate::http::RequestAdmission::new(
                 trusted_proxies.clone(),
@@ -1671,7 +1672,7 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
                             peer,
                             crate::core::ConnectionTransport::Tls,
                             core_tx,
-                            sendq,
+                            Outbound::with_sendq(sendq),
                             telemetry,
                         )
                         .await
@@ -1693,7 +1694,7 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
                     peer,
                     crate::core::ConnectionTransport::Tcp,
                     core_tx,
-                    sendq,
+                    Outbound::with_sendq(sendq),
                     telemetry,
                 )
                 .await
@@ -1702,13 +1703,29 @@ fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &Acc
     });
 }
 
+/// The bounds on what a connection is sent: its SendQ capacity, and how long
+/// one write may wait for a client that has stopped reading.
+struct Outbound {
+    sendq: usize,
+    write_deadline: std::time::Duration,
+}
+
+impl Outbound {
+    fn with_sendq(sendq: usize) -> Self {
+        Self {
+            sendq,
+            write_deadline: crate::peer_write::PEER_WRITE_DEADLINE,
+        }
+    }
+}
+
 async fn serve_conn<S>(
     stream: S,
     conn: ConnId,
     peer: SocketAddr,
     transport: crate::core::ConnectionTransport,
     core_tx: CoreIngress,
-    sendq: usize,
+    outbound: Outbound,
     telemetry: Arc<Telemetry>,
 ) where
     S: AsyncRead + AsyncWrite + Send + 'static,
@@ -1716,7 +1733,7 @@ async fn serve_conn<S>(
     let (read_half, write_half) = tokio::io::split(stream);
     let (out_tx, out_rx) = queue::<Output>(e6irc_queue::Config {
         name: "sendq",
-        capacity: sendq,
+        capacity: outbound.sendq,
         policy: Policy::Fifo,
     });
     if core_tx
@@ -1733,36 +1750,45 @@ async fn serve_conn<S>(
     {
         return; // core gone: shutting down
     }
+    let write_half = crate::peer_write::DeadlineWriter::new(write_half, outbound.write_deadline);
     let mut writer = tokio::spawn(write_loop(write_half, out_rx, telemetry.clone()));
-    tokio::select! {
-        // The client closed/errored, or the core queue is gone: the read side
-        // is done — stop the (possibly parked) writer.
-        () = read_loop(read_half, conn, &core_tx, &telemetry) => writer.abort(),
-        // The writer returned. Two causes: the core dropped this session's
-        // `Sender<Output>` (session already gone core-side), OR a *write error*
-        // on a still-present session (broken pipe / RST while output was queued).
-        // Cancelling the read future frees a dead peer's read task and per-IP
-        // ConnGuard now rather than at the OS TCP timeout — but it also cancels
-        // the only other path that would push `Input::Closed`, so we must push it
-        // here. `close` is idempotent, so the already-gone case is a harmless
-        // no-op; the write-error case is cleaned up now instead of lingering as a
-        // ghost session (silently black-holing messages sent to it) until the
-        // reaper collects it ~180s later.
-        reason = &mut writer => {
-            let reason = reason.unwrap_or("Write task panicked");
-            // Queue closure means the core has already removed all connection
-            // state, so there is no remaining observer for this close event.
-            drop(
-                core_tx
-                    .push(Input::Closed {
-                        conn,
-                        reason: reason.to_string(),
-                    })
-                    .await,
-            );
+    let reason = tokio::select! {
+        // The client closed its sending side (or errored), or the core queue is
+        // gone. `read_loop` has told the core, which answers what the client
+        // sent before closing — a pipelined `NICK`/`USER`/`QUIT` from a
+        // half-closing client is owed its welcome and its `ERROR` — and then
+        // drops this session's sendq. The writer delivers all of that and
+        // returns; it is aborted only if that takes longer than
+        // `HALF_CLOSE_DRAIN`.
+        () = read_loop(read_half, conn, &core_tx, &telemetry) => {
+            if tokio::time::timeout(HALF_CLOSE_DRAIN, &mut writer).await.is_err() {
+                writer.abort();
+            }
+            return;
         }
-    }
+        // The writer returned. Two causes: the core dropped this session's
+        // `Sender<Output>` (session already gone core-side), OR a write error
+        // or stall on a still-present session. Cancelling the read future frees
+        // the peer's read task and per-IP ConnGuard now, so the core must be
+        // told here; `close` is idempotent, so the already-gone case is a
+        // harmless no-op.
+        reason = &mut writer => reason.unwrap_or("Write task panicked"),
+    };
+    // Queue closure means the core has already removed all connection state,
+    // so there is no remaining observer for this close event.
+    drop(
+        core_tx
+            .push(Input::Closed {
+                conn,
+                reason: reason.to_string(),
+            })
+            .await,
+    );
 }
+
+/// How long a client that closed its sending side waits for the replies to
+/// what it sent before its connection is torn down regardless.
+const HALF_CLOSE_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn read_loop<R>(mut read_half: R, conn: ConnId, core_tx: &CoreIngress, telemetry: &Telemetry)
 where
@@ -1817,13 +1843,19 @@ where
         while let Some(e) = rx.try_pop() {
             batch.push(e.payload.0);
         }
-        if write_all_vectored(&mut write_half, &batch).await.is_err() {
+        let written = match write_all_vectored(&mut write_half, &batch).await {
+            Ok(()) => write_half.flush().await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = written {
             telemetry.record_error(ErrorKind::Write);
-            return "Write error"; // broken pipe / RST: the session is still live
-        }
-        if write_half.flush().await.is_err() {
-            telemetry.record_error(ErrorKind::Write);
-            return "Write error";
+            // The session is still live core-side: a broken pipe / RST, or a
+            // peer that stopped reading while output was queued for it.
+            return if crate::peer_write::is_stalled(&error) {
+                "Write timeout"
+            } else {
+                "Write error"
+            };
         }
     }
 }
@@ -2257,10 +2289,72 @@ mod tests {
             peer,
             crate::core::ConnectionTransport::Tcp,
             CoreIngress::single(core_tx),
-            8,
+            Outbound::with_sendq(8),
             Arc::new(Telemetry::new()),
         ));
         (core_rx, served)
+    }
+
+    /// A client whose receive window is shut — it never reads — and whose
+    /// session the core has already ended (SendQ, KILL, KLINE) is torn down at
+    /// the write deadline. The writer used to park in the socket write forever,
+    /// never seeing its sendq close, and the socket, the task and the per-IP
+    /// slot leaked with it.
+    #[tokio::test]
+    async fn a_client_that_never_reads_is_torn_down_after_the_core_drops_it() {
+        // Fixed small buffers (an explicit size also stops the kernel growing
+        // them), inherited by the accepted socket.
+        let listening = tokio::net::TcpSocket::new_v4().expect("socket");
+        listening
+            .set_send_buffer_size(1024)
+            .expect("small send buffer");
+        listening
+            .bind("127.0.0.1:0".parse().unwrap())
+            .expect("bind");
+        let listener = listening.listen(1).expect("listen");
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket.set_recv_buffer_size(1024).expect("small window");
+        let client = socket
+            .connect(listener.local_addr().expect("address"))
+            .await
+            .expect("connect");
+        let (server, peer) = listener.accept().await.expect("accept");
+        let (core_tx, mut core_rx) = test_core_channel();
+        let served = tokio::spawn(serve_conn(
+            server,
+            ConnId(1),
+            peer,
+            crate::core::ConnectionTransport::Tcp,
+            CoreIngress::single(core_tx),
+            Outbound {
+                sendq: 4096,
+                write_deadline: std::time::Duration::from_millis(300),
+            },
+            Arc::new(Telemetry::new()),
+        ));
+        let Input::Open { tx, .. } = core_rx.pop().await.expect("Open event").payload else {
+            panic!("expected Open");
+        };
+        // Far more than both kernel buffers hold: the writer parks mid-write.
+        let line = bytes::Bytes::from(format!("NOTICE * :{}\r\n", "x".repeat(400)));
+        for _ in 0..4096 {
+            if tx.try_push(Output(line.clone())).is_err() {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The core ends the session: its sender goes.
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), served)
+            .await
+            .expect("a connection the core dropped must not outlive the write deadline")
+            .expect("serve_conn task");
+        let Input::Closed { reason, .. } = core_rx.pop().await.expect("Closed event").payload
+        else {
+            panic!("expected Closed");
+        };
+        assert_eq!(reason, "Write timeout");
+        drop(client);
     }
 
     #[tokio::test]

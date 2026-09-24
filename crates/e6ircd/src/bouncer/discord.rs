@@ -7,7 +7,7 @@ use super::BoundedJson;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use tokio_tungstenite::tungstenite::Message as Ws;
 
 use super::{DriverEnds, NetworkDriver, NetworkHandle};
@@ -50,8 +50,7 @@ async fn send_gateway<T: serde::Serialize>(
         eprintln!("discord: could not encode {what}: {error}");
         Dropped(NetworkFailure::UpstreamProtocolFailed)
     })?;
-    write
-        .send(frame)
+    super::bridge_ws_send(write, frame)
         .await
         .map_err(|_| Dropped(NetworkFailure::UpstreamWriteFailed))
 }

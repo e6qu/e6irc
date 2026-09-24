@@ -41,6 +41,7 @@ pub use irc_driver::{
 pub use local_driver::{CoreHandles, LocalDriver};
 #[cfg(feature = "matrix")]
 pub use matrix::{MatrixConfig, MatrixDevice, MatrixDriver};
+pub(crate) use serve::{MutationLane, UnwrittenLines};
 pub use serve::{NetworkStatus, Registry, bnc_serve};
 #[cfg(feature = "slack")]
 pub use slack::{SlackConfig, SlackDriver};
@@ -1792,6 +1793,23 @@ pub(crate) enum BridgeRead {
 /// Read the next frame from a bridge gateway socket: answer pings, skip
 /// non-text frames, and bound idle time. Shared by the two WebSocket bridges
 /// so the ping/idle discipline is written once, not kept in step by hand.
+/// Send one frame on a bridge's gateway socket, bounded like every other
+/// write to a peer ([`crate::peer_write`]): a gateway that stops reading fails
+/// the send instead of parking the session, which then could not see its stop
+/// signal or its heartbeat going unanswered.
+#[cfg(any(feature = "discord", feature = "slack"))]
+pub(crate) async fn bridge_ws_send(
+    write: &mut futures_util::stream::SplitSink<BridgeWs, tokio_tungstenite::tungstenite::Message>,
+    frame: tokio_tungstenite::tungstenite::Message,
+) -> Result<(), crate::peer_write::SendFailure> {
+    use futures_util::SinkExt;
+    crate::peer_write::within_send_deadline(
+        crate::peer_write::PEER_WRITE_DEADLINE,
+        write.send(frame),
+    )
+    .await
+}
+
 #[cfg(any(feature = "discord", feature = "slack"))]
 pub(crate) async fn next_bridge_frame(
     read: &mut futures_util::stream::SplitStream<BridgeWs>,
@@ -1800,7 +1818,7 @@ pub(crate) async fn next_bridge_frame(
     tag: &str,
     transport: &str,
 ) -> BridgeRead {
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::Message as Ws;
     let Some(frame) = silence.bound(read.next()).await else {
         eprintln!("{tag}: {transport} idle past timeout; reconnecting");
@@ -1810,7 +1828,7 @@ pub(crate) async fn next_bridge_frame(
     match frame {
         Some(Ok(Ws::Text(t))) => BridgeRead::Text(t.as_str().to_string()),
         Some(Ok(Ws::Ping(p))) => {
-            if write.send(Ws::Pong(p)).await.is_err() {
+            if bridge_ws_send(write, Ws::Pong(p)).await.is_err() {
                 BridgeRead::WriteFailed
             } else {
                 BridgeRead::Skip
@@ -4771,7 +4789,8 @@ pub enum AttachEnd {
     ClientClosed,
     /// The client sent `QUIT`.
     ClientQuit,
-    /// The client fell too far behind the live stream to be resynchronised.
+    /// The client fell too far behind the live stream to be resynchronised,
+    /// or stopped taking what was written to it.
     ClientTooSlow,
     /// The client answered nothing for two liveness intervals.
     ClientUnresponsive,
@@ -4795,8 +4814,44 @@ pub enum AttachEnd {
 /// `liveness` is how long the client may stay silent before it is pinged, and
 /// then again before it is given up on ([`ATTACH_LIVENESS_INTERVAL`] in
 /// production).
+///
+/// Every write to the client is bounded by [`crate::peer_write`]: a client
+/// that stops reading ends its attachment as [`AttachEnd::ClientTooSlow`]
+/// rather than parking the relay, where it would see neither the network's
+/// removal nor its own silence.
 pub async fn attach<S>(
     stream: S,
+    input: ClientInput,
+    handle: &NetworkHandle,
+    caps: AttachCaps,
+    account: &str,
+    downstream_nick: &str,
+    liveness: std::time::Duration,
+) -> std::io::Result<AttachEnd>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let stream =
+        crate::peer_write::DeadlineWriter::new(stream, crate::peer_write::PEER_WRITE_DEADLINE);
+    match relay_attached(
+        stream,
+        input,
+        handle,
+        caps,
+        account,
+        downstream_nick,
+        liveness,
+    )
+    .await
+    {
+        Err(error) if crate::peer_write::is_stalled(&error) => Ok(AttachEnd::ClientTooSlow),
+        ended => ended,
+    }
+}
+
+/// [`attach`]'s relay, over a stream whose writes are already bounded.
+async fn relay_attached<S>(
+    stream: crate::peer_write::DeadlineWriter<S>,
     input: ClientInput,
     handle: &NetworkHandle,
     mut caps: AttachCaps,
@@ -6219,6 +6274,42 @@ mod tests {
             String::from_utf8_lossy(&buf[..n]).contains("network removed"),
             "the client gets a detach notice"
         );
+    }
+
+    /// An attached client that stops reading ends its attachment as too slow
+    /// at the write deadline. The relay used to park in the write, never seeing
+    /// the network's removal or the client's silence, and held the network
+    /// handle, its attached count and the connection slot for as long as the
+    /// client liked.
+    #[tokio::test(start_paused = true)]
+    async fn an_attached_client_that_stops_reading_is_detached_as_too_slow() {
+        let (handle, ends) = NetworkHandle::channels(16);
+        let (_client_side, server_side) = tokio::io::duplex(64);
+        let attached = attach(
+            server_side,
+            ClientInput::default(),
+            &handle,
+            AttachCaps::default(),
+            "testuser",
+            "testuser",
+            ATTACH_LIVENESS_INTERVAL,
+        );
+        let feed = async {
+            for n in 0..4 {
+                tokio::task::yield_now().await;
+                ends.emit_line(format!(":peer PRIVMSG #room :line {n} {}", "x".repeat(80)));
+            }
+            std::future::pending::<()>().await
+        };
+        let end = tokio::select! {
+            end = attached => end,
+            () = feed => unreachable!("the feed never ends"),
+        };
+        assert_eq!(
+            end.expect("a stall is an ending, not an error"),
+            AttachEnd::ClientTooSlow
+        );
+        assert_eq!(handle.runtime_snapshot().attached_clients, 0);
     }
 
     /// A multi-target line surfaces EVERY target's outcome, not just the last.

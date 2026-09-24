@@ -1070,8 +1070,9 @@ fn operations() -> serde_json::Value {
                     "description": "Includes profile, non-secret credential metadata, identities, browser-session provenance, network configuration without sealed passwords, read markers, founded channels, messages, BNC buffer, and security activity. Secret digests, hashes, bearer values, identity tokens, and sealed upstream passwords are excluded.",
                     "security": authenticated,
                     "responses": {
-                        "200": { "description": "attachment containing the account export" },
+                        "200": { "description": "attachment containing the account export; the download is abandoned if the client reads nothing for 30 seconds" },
                         "404": { "description": "account no longer exists" },
+                        "429": { "description": "the account's request budget is spent, or the server is producing as many account exports as it allows at once (two); Retry-After gives the seconds to wait" },
                         "503": { "description": "database unavailable" }
                     }
                 }
