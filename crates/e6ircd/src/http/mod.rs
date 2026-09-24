@@ -144,7 +144,7 @@ pub struct AppState {
     /// auth rate limiting. The bucket refills to full over 60 seconds.
     pub auth_rate_burst: Option<usize>,
     /// Per-client-IP auth token buckets: `(tokens, last_refill)`.
-    pub(crate) auth_buckets: Mutex<HashMap<crate::net::ClientIp, (f64, std::time::Instant)>>,
+    pub(crate) auth_buckets: Mutex<HashMap<crate::net::PeerLimitKey, (f64, std::time::Instant)>>,
     /// Per-account ordinary/administrator API token buckets. The boolean key
     /// distinguishes the smaller administrator budget.
     pub api_rate_burst: usize,
@@ -736,6 +736,20 @@ pub(super) async fn mutate_account_administrator(
     })
 }
 
+/// Why an account-creation surface refused a configured administrator's name.
+pub(super) const RESERVED_ACCOUNT_NAME_DETAIL: &str = "The name is a configured administrator account; only OIDC sign-in or the \
+     bootstrap/recovery flows can create it.";
+
+impl AppState {
+    /// Whether `account` is a configured administrator's name, which only OIDC
+    /// provisioning and the bootstrap/recovery flows may create (see
+    /// [`crate::identity::ReservedAccountNames`]).
+    pub(super) fn account_name_reserved(&self, account: &str) -> bool {
+        self.configured_admin_accounts
+            .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account))
+    }
+}
+
 pub(super) async fn create_account_lifecycle(
     state: &AppState,
     actor: &str,
@@ -752,6 +766,9 @@ pub(super) async fn create_account_lifecycle(
     }
     if let Some(detail) = password_input_error(password) {
         return Err((StatusCode::BAD_REQUEST, detail.into()));
+    }
+    if state.account_name_reserved(account) {
+        return Err((StatusCode::CONFLICT, RESERVED_ACCOUNT_NAME_DETAIL.into()));
     }
     let contact_email = contact_email
         .map(crate::identity::ContactEmail::parse)
@@ -1548,13 +1565,15 @@ const MAX_CONCURRENT_REQUESTS: usize = 1024;
 /// How long the service works on one request before answering `408`.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 
-/// The per-address in-flight request count, keyed by the client address the
-/// request resolves to ([`client_ip`]: the socket peer, or the forwarded client
-/// behind a trusted proxy).
+/// The per-address in-flight request count, keyed by the [`PeerLimitKey`] of
+/// the client address the request resolves to ([`client_ip`]: the socket peer,
+/// or the forwarded client behind a trusted proxy).
+///
+/// [`PeerLimitKey`]: crate::net::PeerLimitKey
 pub(crate) struct RequestAdmission {
     trusted_proxies: Vec<ipnet::IpNet>,
     limit: usize,
-    in_flight: Mutex<HashMap<crate::net::ClientIp, usize>>,
+    in_flight: Mutex<HashMap<crate::net::PeerLimitKey, usize>>,
 }
 
 impl RequestAdmission {
@@ -1567,6 +1586,7 @@ impl RequestAdmission {
     }
 
     fn admit(self: &Arc<Self>, client: crate::net::ClientIp) -> Option<InFlightRequest> {
+        let client = client.limit_key();
         let mut in_flight = self.in_flight.lock().expect("request admission lock");
         let count = in_flight.entry(client).or_insert(0);
         if *count >= self.limit {
@@ -1583,7 +1603,7 @@ impl RequestAdmission {
 /// One admitted request; its slot is released when the response is returned.
 struct InFlightRequest {
     admission: Arc<RequestAdmission>,
-    client: crate::net::ClientIp,
+    client: crate::net::PeerLimitKey,
 }
 
 impl Drop for InFlightRequest {
@@ -2500,6 +2520,23 @@ mod pages {
                         Some("Invalid account or password.".into()),
                         StatusCode::UNAUTHORIZED,
                     );
+                }
+                Err(crate::db::DbError::LoginThrottled(retry_after)) => {
+                    eprintln!(
+                        "web: login refused for account {:?}: attempt limit reached",
+                        form.account
+                    );
+                    let mut response = login_response(
+                        &state,
+                        form.account,
+                        Some(retry_after.explanation()),
+                        StatusCode::TOO_MANY_REQUESTS,
+                    );
+                    response.headers_mut().insert(
+                        header::RETRY_AFTER,
+                        header::HeaderValue::from(retry_after.seconds()),
+                    );
+                    return response;
                 }
                 Err(error) => {
                     eprintln!("local login: credential verification failed: {error}");
@@ -3750,6 +3787,17 @@ mod invitation_url_tests {
 mod client_ip_tests {
     use super::client_ip;
     use crate::net::ClientIp;
+
+    /// The in-flight request bound charges a client's whole IPv6 `/64`.
+    #[test]
+    fn request_admission_counts_an_ipv6_slash_64_as_one_client() {
+        let admission = std::sync::Arc::new(super::RequestAdmission::new(Vec::new(), 1));
+        let _held = admission
+            .admit(client("2001:db8::1"))
+            .expect("the first request");
+        assert!(admission.admit(client("2001:db8::2")).is_none());
+        assert!(admission.admit(client("2001:db8:0:1::1")).is_some());
+    }
 
     fn xff(value: &str) -> axum::http::HeaderMap {
         let mut h = axum::http::HeaderMap::new();

@@ -1016,6 +1016,17 @@ where
                                         );
                                         reject_sasl(write, server_name).await?;
                                     }
+                                    PlainVerification::Throttled(retry_after) => {
+                                        write
+                                            .write_all(
+                                                format!(
+                                                    ":{server_name} 904 * :{}\r\n",
+                                                    retry_after.explanation()
+                                                )
+                                                .as_bytes(),
+                                            )
+                                            .await?;
+                                    }
                                     PlainVerification::Unavailable => {
                                         write
                                             .write_all(
@@ -1380,6 +1391,8 @@ enum PlainVerification {
     /// (soju's `<account>/<network>`), if it carried one.
     Accepted(String, Option<String>),
     Rejected,
+    /// The account name has spent its password attempts for the window.
+    Throttled(crate::db::LoginRetryAfter),
     Unavailable,
     AttemptsExhausted,
 }
@@ -1414,6 +1427,9 @@ async fn verify_plain(
     match crate::db::verify_credentials(pool, account, &credentials.password).await {
         Ok(Some(name)) => PlainVerification::Accepted(name, network),
         Ok(None) => PlainVerification::Rejected,
+        Err(crate::db::DbError::LoginThrottled(retry_after)) => {
+            PlainVerification::Throttled(retry_after)
+        }
         Err(e) => {
             eprintln!("bnc: credential check failed (database error): {e}");
             PlainVerification::Unavailable

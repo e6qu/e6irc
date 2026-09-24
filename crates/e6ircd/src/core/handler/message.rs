@@ -335,7 +335,14 @@ pub(super) fn deliver_one_message(
         // framed as its response like any other echo.
         if state.sessions[&conn].caps.echo_message {
             let prefix = state.sessions[&conn].prefix();
-            let text = fit_relayed_text(&prefix, kind.wire(), target, text);
+            // A password or token sent to a service is not repeated back: the
+            // echo lands in whatever the client logs or buffers.
+            let shown = if crate::sanitize::sensitive_service_command(target, text) {
+                crate::sanitize::SENSITIVE_SERVICE_COMMAND_REDACTED
+            } else {
+                text
+            };
+            let text = fit_relayed_text(&prefix, kind.wire(), target, shown);
             let line = format!(":{prefix} {} {target} :{text}", kind.wire());
             let sender_account = state.sessions[&conn].account().map(str::to_owned);
             let sender_is_bot = state.sessions[&conn].bot;

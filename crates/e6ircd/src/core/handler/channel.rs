@@ -359,7 +359,7 @@ pub(super) fn join_on_owner(
                 topic_ops_only: true,
                 ..Default::default()
             },
-            now.as_secs(),
+            now,
         )
     });
     if chan.is_member(conn) {
@@ -1542,7 +1542,7 @@ pub(super) fn mode_query_on_owner(
         modes: chan
             .modes
             .to_string_with_args(chan.is_member(actor.recipient.conn())),
-        created: chan.created_at_secs.to_string(),
+        created: chan.created_at.as_secs().to_string(),
     }
 }
 
@@ -1997,7 +1997,7 @@ fn channel_mode_with_prefix(
 
     if rest.is_empty() {
         let modes = chan.modes.to_string_with_args(is_member);
-        let created = chan.created_at_secs.to_string();
+        let created = chan.created_at.as_secs().to_string();
         state.numeric(conn, RPL_CHANNELMODEIS, &[&display, &modes], None);
         state.numeric(conn, RPL_CREATIONTIME, &[&display, &created], None);
         return;

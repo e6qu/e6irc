@@ -1012,6 +1012,12 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 .map_err(io::Error::other)?,
         ),
         registration_burst: config.limits.registration_burst,
+        reserved_account_names: crate::identity::ReservedAccountNames::new(
+            config
+                .http
+                .iter()
+                .flat_map(|http| http.admin_accounts.iter().map(String::as_str)),
+        ),
     };
     let shard_count = core_tx.shard_count();
     let mut cores = (0..shard_count.len())
@@ -1058,6 +1064,20 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         let suspended = crate::db::list_suspended_accounts(pool)
             .await
             .map_err(io::Error::other)?;
+        let configured_administrators = config
+            .http
+            .as_ref()
+            .map_or(&[][..], |http| http.admin_accounts.as_slice());
+        for name in crate::db::unclaimed_account_names(pool, configured_administrators)
+            .await
+            .map_err(io::Error::other)?
+        {
+            eprintln!(
+                "e6ircd: configured administrator {name:?} has no account yet; only OIDC sign-in \
+                 or the bootstrap/recovery flows can create it (NickServ REGISTER and \
+                 invitations refuse the name)"
+            );
+        }
         for core in &mut cores {
             core.preload_founders(founders.clone());
             core.preload_topics(topics.clone());
@@ -1369,12 +1389,69 @@ impl ClientIp {
     pub(crate) fn ip(self) -> std::net::IpAddr {
         self.0
     }
+
+    /// The slot every per-address limiter charges this client to; see
+    /// [`PeerLimitKey`].
+    pub(crate) fn limit_key(self) -> PeerLimitKey {
+        PeerLimitKey::of(self.0)
+    }
 }
 
 impl std::fmt::Display for ClientIp {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)
     }
+}
+
+/// What a per-address limit counts against: an IPv4 address, or the IPv6
+/// `/64` an address belongs to. One subscriber is routinely handed a whole
+/// `/64` (and SLAAC privacy addresses rotate through it), so a limiter keyed by
+/// the full 128 bits gives each client 2^64 fresh budgets for the asking. Every
+/// limiter — the per-address connection cap, the in-flight HTTP request bound,
+/// the HTTP authentication bucket, and the core's account-creation bucket —
+/// takes this type, and its only constructor applies the prefix, so no limiter
+/// can be keyed by a raw address. The raw [`ClientIp`] stays what is logged,
+/// shown, and matched by bans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PeerLimitKey(std::net::IpAddr);
+
+impl PeerLimitKey {
+    /// Leading IPv6 bits a limiter treats as one client.
+    pub(crate) const IPV6_PREFIX_BITS: u32 = 64;
+
+    fn of(address: std::net::IpAddr) -> Self {
+        match address.to_canonical() {
+            std::net::IpAddr::V4(v4) => Self(std::net::IpAddr::V4(v4)),
+            std::net::IpAddr::V6(v6) => {
+                let mask = u128::MAX << (128 - Self::IPV6_PREFIX_BITS);
+                Self(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                    u128::from(v6) & mask,
+                )))
+            }
+        }
+    }
+
+    /// The key for a session opened with `host`: the host is the canonical
+    /// address text the listeners pass the core ([`ClientIp`]'s spelling), or
+    /// a name for an in-process session, which has no address and is counted
+    /// under its name.
+    pub(crate) fn for_session_host(host: &str) -> SessionLimitKey {
+        match host.parse::<std::net::IpAddr>() {
+            Ok(address) => SessionLimitKey::Address(Self::of(address)),
+            Err(_) => SessionLimitKey::InProcess(host.to_string()),
+        }
+    }
+}
+
+/// Where a core session's per-address limits are charged, fixed when it opens:
+/// a later `SETHOST` changes what the session shows, never what it is counted
+/// against.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum SessionLimitKey {
+    Address(PeerLimitKey),
+    /// A session opened in-process (the bouncer's `local` driver) under a name
+    /// rather than an address.
+    InProcess(String),
 }
 
 /// Per-IP concurrent-connection cap. When `max_per_ip` is `None` the
@@ -1507,7 +1584,7 @@ impl PeerRefusalLog {
 
 #[derive(Clone)]
 pub(crate) struct ConnLimiter {
-    counts: Arc<std::sync::Mutex<std::collections::HashMap<ClientIp, usize>>>,
+    counts: Arc<std::sync::Mutex<std::collections::HashMap<PeerLimitKey, usize>>>,
     max_per_ip: Option<usize>,
     /// Per-peer admission failures are summarised here rather than logged one
     /// line per attempt; it travels with the limiter because every listener
@@ -1529,8 +1606,10 @@ impl ConnLimiter {
         &self.refusals
     }
 
-    /// Reserve a slot for `ip`, or `None` if it is already at the cap.
-    pub(crate) fn try_acquire(&self, ip: ClientIp) -> Option<ConnGuard> {
+    /// Reserve a slot for `client`'s [`PeerLimitKey`], or `None` if that key
+    /// is already at the cap.
+    pub(crate) fn try_acquire(&self, client: ClientIp) -> Option<ConnGuard> {
+        let ip = client.limit_key();
         let Some(max) = self.max_per_ip else {
             return Some(ConnGuard { limiter: None, ip });
         };
@@ -1546,7 +1625,7 @@ impl ConnLimiter {
         })
     }
 
-    fn release(&self, ip: ClientIp) {
+    fn release(&self, ip: PeerLimitKey) {
         let mut counts = self.counts.lock().expect("conn limiter poisoned");
         if let Some(c) = counts.get_mut(&ip) {
             *c -= 1;
@@ -1560,7 +1639,7 @@ impl ConnLimiter {
 /// Releases its per-IP slot when the connection ends (on drop).
 pub(crate) struct ConnGuard {
     limiter: Option<ConnLimiter>,
-    ip: ClientIp,
+    ip: PeerLimitKey,
 }
 
 impl Drop for ConnGuard {
@@ -1889,6 +1968,46 @@ mod tests {
     use crate::core::Input;
     use e6irc_queue::Sender;
     use std::pin::Pin;
+
+    /// One subscriber's IPv6 `/64` is one client to every per-address limit;
+    /// IPv4 addresses, and an IPv4 client however the listener spells it, are
+    /// counted one address each.
+    #[test]
+    fn per_address_limits_count_an_ipv6_slash_64_as_one_client() {
+        let client = |text: &str| ClientIp::new(text.parse().unwrap());
+        let limiter = ConnLimiter::new(Some(1));
+        let _held = limiter
+            .try_acquire(client("2001:db8:1:2::1"))
+            .expect("the first connection");
+        assert!(
+            limiter
+                .try_acquire(client("2001:db8:1:2:ffff::2"))
+                .is_none(),
+            "another address in the same /64 shares the budget"
+        );
+        let _other = limiter
+            .try_acquire(client("2001:db8:1:3::1"))
+            .expect("the next /64 is another client");
+        let _v4 = limiter
+            .try_acquire(client("192.0.2.1"))
+            .expect("an IPv4 client");
+        assert!(limiter.try_acquire(client("::ffff:192.0.2.1")).is_none());
+        let _neighbour = limiter
+            .try_acquire(client("192.0.2.2"))
+            .expect("each IPv4 address is its own client");
+        assert_eq!(
+            client("2001:db8:1:2:aaaa:bbbb:cccc:dddd").limit_key(),
+            client("2001:db8:1:2::").limit_key()
+        );
+        assert_eq!(
+            PeerLimitKey::for_session_host("2001:db8:1:2::9"),
+            SessionLimitKey::Address(client("2001:db8:1:2::1").limit_key())
+        );
+        assert_eq!(
+            PeerLimitKey::for_session_host("local"),
+            SessionLimitKey::InProcess("local".to_string())
+        );
+    }
 
     #[test]
     fn peer_refusals_log_once_per_window_with_the_suppressed_count() {
@@ -2341,6 +2460,7 @@ mod tests {
             mono_clock,
             command_flood: None,
             registration_burst: None,
+            reserved_account_names: crate::identity::ReservedAccountNames::default(),
         }
     }
 

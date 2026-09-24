@@ -1047,6 +1047,7 @@ pub(super) async fn oidc_backchannel_logout(
 
 pub(super) async fn oidc_frontchannel_logout(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     // Unlike the signed back-channel path, this endpoint has no token to verify —
     // it revokes a session by a guessable `sid`. Rate-limit per client IP so it
     // can't be used to brute-force sids and force-logout victims.
@@ -1073,29 +1074,45 @@ pub(super) async fn oidc_frontchannel_logout(
             None,
         );
     };
-    if let Err(error) =
-        crate::db::revoke_oidc_frontchannel_sessions(pool, &query.iss, &query.sid).await
+    let presented = session_token(&headers, state.secure_cookies);
+    let revocation = match crate::db::revoke_oidc_frontchannel_sessions(
+        pool,
+        &query.iss,
+        &query.sid,
+        presented.as_deref(),
+    )
+    .await
     {
-        eprintln!("oidc: front-channel session revocation failed: {error}");
-        return problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Session storage failed",
-            None,
-        );
-    }
-    (
+        Ok(revocation) => revocation,
+        Err(error) => {
+            eprintln!("oidc: front-channel session revocation failed: {error}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Session storage failed",
+                None,
+            );
+        }
+    };
+    let mut response = (
         StatusCode::OK,
         [
             (header::CACHE_CONTROL, "no-store".to_string()),
             (header::CONTENT_SECURITY_POLICY, frame_policy),
-            (
-                header::SET_COOKIE,
-                clear_session_cookie(state.secure_cookies),
-            ),
         ],
         "",
     )
-        .into_response()
+        .into_response();
+    // The cookie is cleared only when it named a session this logout revoked;
+    // a visitor whose own session the issuer/sid does not name keeps it.
+    if revocation.presented_session_revoked {
+        response.headers_mut().insert(
+            header::SET_COOKIE,
+            clear_session_cookie(state.secure_cookies)
+                .parse()
+                .expect("generated cookie is a valid header"),
+        );
+    }
+    response
 }
 
 /// The front-channel logout answer's policy: nothing may load, and only the
@@ -1622,6 +1639,17 @@ pub(super) fn retry_later(title: &str, detail: &str, retry_after: u64) -> Respon
     response
 }
 
+/// A password check refused because the account name has spent its attempts
+/// for the window ([`crate::db::DbError::LoginThrottled`]): the same `429` and
+/// `Retry-After` from every endpoint that checks a password.
+pub(super) fn login_throttled(retry_after: crate::db::LoginRetryAfter) -> Response {
+    retry_later(
+        "Too many login attempts",
+        &retry_after.explanation(),
+        retry_after.seconds(),
+    )
+}
+
 /// The account and its durable posture, refused when suspended or gone.
 async fn require_active_account(
     pool: &sqlx::PgPool,
@@ -1713,15 +1741,18 @@ fn parse_forwarded_ip(entry: &str) -> Option<crate::net::ClientIp> {
 /// all — the map would otherwise grow to ~request-rate × 60s. This cap bounds it.
 const MAX_AUTH_BUCKETS: usize = 4096;
 
-/// Spend one token from `ip`'s auth bucket. Returns `false` (rate-limited) when
-/// the bucket is empty; always `true` when `auth_rate_burst` is unset. The
+/// Spend one token from `client`'s auth bucket, keyed by its
+/// [`PeerLimitKey`](crate::net::PeerLimitKey) (an IPv6 client's whole `/64`).
+/// Returns `false` (rate-limited) when the bucket is empty; always `true` when
+/// `auth_rate_burst` is unset. The
 /// bucket refills to full over 60s; fully-refilled entries are pruned, and the
 /// map is hard-capped at `MAX_AUTH_BUCKETS` so it can't grow without bound even
 /// under a distinct-IP flood.
-pub(super) fn auth_rate_ok(state: &AppState, ip: crate::net::ClientIp) -> bool {
+pub(super) fn auth_rate_ok(state: &AppState, client: crate::net::ClientIp) -> bool {
     let Some(burst) = state.auth_rate_burst else {
         return true;
     };
+    let ip = client.limit_key();
     let burst = burst as f64;
     let refill_per_sec = burst / 60.0;
     let now = std::time::Instant::now();

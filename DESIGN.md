@@ -139,6 +139,15 @@ These are project-wide rules, enforced in review and (where possible) CI:
     asserted against.
   - `ComposerResult` — a web-composer response is either `Sent` or `Rejected`;
     success cannot carry an error and rejection always has one.
+  - `PeerLimitKey` — every per-address limiter is keyed by it, and its only
+    constructor folds an IPv6 address to its `/64`, so no limiter can be keyed
+    by a raw address a subscriber rotates through (§15).
+  - `HistoryFloor` — every history read (the core's ring and database paths,
+    TARGETS, REST) takes the oldest position its reader may see, so none can
+    forget the channel-incarnation bound (§11.2).
+  - `BridgedSenders` — a bridged sender's IRC identity comes from one
+    per-session directory keyed by the provider's account id, which never
+    hands the owner's nick to anyone else (§10.5).
   - `CredentialAttemptBudget` — IRC registration, services, OPER, and BNC attach
     consume the same closed per-connection authentication budget. Valid and
     malformed completed SASL payloads spend a slot, exhaustion is permanent,
@@ -1327,9 +1336,10 @@ provider-verified email claim.
   CSRF value as its `csrf` query parameter, as RP-initiated logout does.
 - Local-account login form (argon2id verify) for accounts without OIDC. It
   accepts only the primary password, not an IRC app password, is covered by the
-  per-IP authentication rate limit, bounds every credential field before
-  Argon2, and binds each form to a short-lived `HttpOnly; SameSite=Strict`
-  browser cookie to prevent login CSRF/session planting.
+  per-IP authentication rate limit and the per-account attempt limit (§15),
+  bounds every credential field before Argon2, and binds each form to a
+  short-lived `HttpOnly; SameSite=Strict` browser cookie to prevent login
+  CSRF/session planting.
 - Session: opaque random token, hash stored server-side (`web_sessions`),
   `HttpOnly; Secure; SameSite=Lax` cookie. CSRF: state-changing
   server-rendered forms carry a per-session HMAC token in the request body and
@@ -1353,7 +1363,10 @@ provider-verified email claim.
   token, client ID, and registered post-logout URI. The provider called
   `POST /api/v1/auth/oidc/backchannel-logout` with a signed logout token, or
   loaded `GET /api/v1/auth/oidc/frontchannel-logout?iss=…&sid=…`; both paths
-  revoked the correlated durable sessions. Back-channel token signatures,
+  revoked the correlated durable sessions. Anyone can make a browser load the
+  front-channel URL with some `sid`, so its answer clears the session cookie
+  only when the request's own cookie named one of the sessions that logout
+  revoked; a visitor whose session it does not name keeps it (no logout CSRF). Back-channel token signatures,
   issuer, audience, event object, nonce absence, time, `sid`/`sub`, and `jti` were verified, and
   consumed token IDs were retained until expiry to reject replay. The
   recommended `logout+jwt` type, the generic `JWT` type emitted by existing
@@ -1823,10 +1836,15 @@ upstream's.
   or `396` reveals the real user and host — and rebuild their traditional body
   within the 512-byte wire allowance, preserving valid client-only tags and cutting
   trailing UTF-8 only at a character boundary; malformed message commands do
-  not manufacture an echo the upstream would never send. NickServ commands
-  that can contain a password, email address, verification code, recovery
-  token, or replacement credential synthesize only a redacted trailing field,
-  while the exact command is still sent upstream.
+  not manufacture an echo the upstream would never send. Account-services
+  commands that can contain a password, email address, verification code,
+  recovery or reset token, or replacement credential (NickServ/`NS`
+  `REGISTER`, `IDENTIFY`, `SETPASS`, `RESETPASS`, `SET PASSWORD`, …, and the
+  `AUTH`/`LOGIN` of QuakeNet's `Q`, Undernet's `X` and GameSurge's `AuthServ`)
+  synthesize only a redacted trailing field, while the exact command is still
+  sent upstream. The list is one (`sanitize::sensitive_service_command`), read
+  by the bouncer's synthesized and reflected echoes and by the core's
+  echo-message of a line to its own services.
 - Auto-reconnect has two schedules, because a lost packet and a refusal are
   different events. A transient drop retries with exponential backoff from
   200ms to a 30s cap, with jitter of 0–25% of the delay drawn per driver from
@@ -2171,8 +2189,24 @@ Design constraints recorded now:
   produces a bounded notice. A failed name lookup is not cached. The
   display-name cache is bounded at 4096 upstream ids; overflow clears it,
   counted and logged.
+- Who a bridged line is from is decided by one per-session directory,
+  `BridgedSenders`, keyed by the provider's own stable account id (the full
+  Matrix user id, the Slack user or bot id, the Discord user id) — never by a
+  name, which is not an identity: a Matrix localpart is unique only on its
+  homeserver, and Slack display names and Discord webhook usernames are free
+  text anyone sets, the bridge account's own included. The prefix is
+  `name!user@host` with the Matrix user shown as `localpart!localpart@homeserver`,
+  and Slack and Discord accounts as `name!<account id>@slack|discord`. The
+  owner's account (the login) is shown as the owner — the session's nick and
+  every echo come from the same directory entry — and no other account is
+  ever given the owner's nick: an account whose name would fold to it, or to a
+  nick another account currently shown holds, gets the first free `name|N`.
+  An account keeps its nick while its name is unchanged; a renamed one gets a
+  nick for the new name. The directory remembers 4096 accounts per session,
+  least recently seen forgotten first (a forgotten account's nick may later go
+  to another account; the owner's never does).
 - A bridge's IRC session is its provider account. It begins, before the
-  bridge reports connected, under the account's nick (`bridged_identity`:
+  bridge reports connected, under the account's nick (`BridgedSenders::own`:
   Discord's `GET /users/@me` name, Slack's `auth.test` user, the Matrix
   login's localpart) and in the channels the bridge maps, through one call
   (`DriverEnds::begin_bridge_session`) — so the nick a client is welcomed
@@ -2271,7 +2305,17 @@ Design constraints recorded now:
   there is nothing to bypass. Both derive that key from one function, since two
   implementations that must agree is how a privacy boundary drifts. A REST
   conversation is addressed by account name, so conversations with an
-  unauthenticated party are not reachable there. The REST API pages by time
+  unauthenticated party are not reachable there.
+  A channel's name outlives its occupants: when the last member leaves the
+  channel is gone, and whoever joins the name next creates a new
+  *incarnation*. Over CHATHISTORY (single-target and TARGETS, ring and
+  database alike) a member reads only what was said since the current
+  incarnation was created (`Channel::created_at`, stamped on the same wall
+  clock as the messages and published to every shard); the founder and
+  access list of a registered channel read the whole record, the rule REST
+  applies. A restart ends every incarnation — channels are re-created on
+  first join — so the same bound holds across it. A msgid pivot from before
+  the bound is unknown, like one from another buffer. The REST API pages by time
   only — a message id is not an accepted position, so the unknown-msgid case of
   §11.3 cannot arise there — and every refusal names the parameter at fault
   (`field`: `target`, `limit`, `before` or `after`).
@@ -2909,9 +2953,33 @@ but the CLI, TUI, and BNC must surface the rejection.
   it, as IRC `VERSION` does). Concurrent password verification is bounded
   process-wide by the Argon2 permits, which is what bounds a distributed login
   flood's CPU cost; the per-address auth buckets bound a single source.
-- Rate limits: per-IP connection/registration throttle, per-session command
-  token bucket, per-account API limits (tower middleware), SASL attempt
+- Rate limits: per-address connection/registration throttle, per-session
+  command token bucket, per-account API limits (tower middleware), SASL attempt
   limits with backoff.
+- Every per-address limit — the connection cap on the IRC, WebSocket, HTTP and
+  attach listeners, the in-flight HTTP request bound, the HTTP authentication
+  bucket, and the core's account-creation bucket — is keyed by one type,
+  `PeerLimitKey`: an IPv4 address, or the IPv6 `/64` an address belongs to
+  (one subscriber is routinely given a whole `/64`, so keying the full 128
+  bits handed each client 2^64 budgets). Its only constructor applies the
+  prefix, so no limiter can be keyed by a raw address; the raw address stays
+  what is logged, shown and matched by bans. A core session's key is fixed
+  from the address it opened with — a later SETHOST changes what it shows,
+  never what it is counted against.
+- Password guessing is bounded per account name, whatever the source
+  addresses: every password check — web login, the app-password exchange, a
+  password change's current password, SASL PLAIN and NickServ IDENTIFY in the
+  core, and the attach listener's SASL — passes one gate in the store
+  (`throttled_password_check`, table `login_attempts`, migration 0074) that
+  reserves an attempt *before* the password is checked. Past 10 attempts in a
+  15-minute window (from the first) every check of that name, the correct
+  password included, is refused unverified until the window ends; a verified
+  password clears the window. The name is keyed whether or not an account
+  holds it, so a refusal is not an existence oracle. The refusal is the same
+  everywhere: HTTP `429` with `Retry-After`, IRC `904` (core and attach
+  listener) or a NickServ notice, each saying how long to wait. The price is
+  that someone guessing at an account can keep its password login shut for
+  the window; OIDC sign-in, existing sessions, and tokens are unaffected.
 - IRC network protections: kline/dline/xline equivalents managed by opers
   and via admin API, all audit-logged.
 - Every HTTP response receives a fresh server-generated 128-bit correlation
@@ -3150,6 +3218,14 @@ Layers, bottom to top:
   Every `http.admin_accounts` entry must be a valid account name (an IRC
   nickname of at most 64 bytes; `"alice, bob"` is refused naming `" bob"`), and
   `secure_cookies` and the `public_url` scheme must agree in both directions.
+- A name in `http.admin_accounts` / `E6IRC_ADMIN_ACCOUNTS` is administrator
+  authority for whichever account holds it, so it can be created only by OIDC
+  provisioning or the bootstrap/recovery flows. NickServ `REGISTER` refuses
+  it with a notice, the IRCv3 `REGISTER` command with `FAIL REGISTER
+  BAD_ACCOUNT_NAME`, and the administrator account-creation and invitation
+  endpoints with `409`; an invitation issued for the name before it was
+  configured is unavailable when used. At startup each configured
+  administrator no account holds yet is named on stderr.
 - `internal_upstreams` (`refuse` by default, `allow`) is the server's policy on
   bouncer upstreams inside its own network (§10.3). It is bootstrap
   configuration, not a console setting, and the environment-stated

@@ -123,7 +123,10 @@ pub(super) async fn history(
     } else {
         crate::core::dm_conversation_key(&account_folded, &target_folded).0
     };
-    let rows = match crate::db::query_history(pool, &target_folded, query).await {
+    // REST reads a channel only for its founder and access list (above), who
+    // keep the whole record; a conversation's key is derived from the caller.
+    let floor = crate::core::HistoryFloor::Whole;
+    let rows = match crate::db::query_history(pool, &target_folded, floor, query).await {
         Ok(rows) => rows,
         Err(e) => {
             eprintln!("http: history query failed: {e}");

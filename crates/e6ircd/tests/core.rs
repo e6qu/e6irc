@@ -70,32 +70,45 @@ impl TestServer {
         server_name: &str,
         nicklen: usize,
     ) -> Self {
+        Self::configured(sasl_enabled, clock, |config| {
+            config.sendq = sendq;
+            config.server_name = server_name.into();
+            config.nicklen = nicklen;
+        })
+    }
+
+    /// The default test configuration, adjusted by `adjust`.
+    fn configured(
+        sasl_enabled: bool,
+        clock: fn() -> Millis,
+        adjust: impl FnOnce(&mut CoreConfig),
+    ) -> Self {
         let (db_tx, db_rx) = queue(Config {
             name: "test-db",
             capacity: 64,
             policy: Policy::Fifo,
         });
+        let mut config = CoreConfig {
+            server_name: "irc.test.example".into(),
+            network_name: "TestNet".into(),
+            description: "test server".into(),
+            registration_before_connect: false,
+            registration_require_email: false,
+            sendq: 256,
+            motd: vec!["Welcome to the test net".into()],
+            nicklen: 16,
+            sasl_enabled,
+            max_hot_channels: 8192,
+            opers: vec![("god".into(), "letmein".into())],
+            clock,
+            mono_clock: test_mono,
+            command_flood: None,
+            registration_burst: None,
+            reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
+        };
+        adjust(&mut config);
         Self {
-            core: Core::new(
-                CoreConfig {
-                    server_name: server_name.into(),
-                    network_name: "TestNet".into(),
-                    description: "test server".into(),
-                    registration_before_connect: false,
-                    registration_require_email: false,
-                    sendq,
-                    motd: vec!["Welcome to the test net".into()],
-                    nicklen,
-                    sasl_enabled,
-                    max_hot_channels: 8192,
-                    opers: vec![("god".into(), "letmein".into())],
-                    clock,
-                    mono_clock: test_mono,
-                    command_flood: None,
-                    registration_burst: None,
-                },
-                db_tx,
-            ),
+            core: Core::new(config, db_tx),
             conns: Vec::new(),
             db_rx,
             channel_service_route: None,
@@ -5898,6 +5911,7 @@ fn fresh_session_flood_bucket_starts_full_regardless_of_uptime() {
             mono_clock: early_mono,
             command_flood: Some(CommandFlood::new(10, 1).expect("valid bucket")),
             registration_burst: None,
+            reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
         },
         db_tx,
     );
@@ -5984,6 +5998,7 @@ fn default_flood_bucket_admits_a_burst_of_forty_then_kills_and_exempts_keepalive
                 mono_clock: ticking_mono,
                 command_flood: Some(flood),
                 registration_burst: None,
+                reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
             },
             db_tx,
         );
@@ -6113,6 +6128,7 @@ fn account_creation_is_rate_limited_per_ip() {
             mono_clock: test_mono,
             command_flood: None,
             registration_burst: Some(1),
+            reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
         },
         db_tx,
     );
@@ -6187,6 +6203,7 @@ fn hot_history_ring_is_lru_evicted() {
             mono_clock: test_mono,
             command_flood: None,
             registration_burst: None,
+            reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
         },
         db_tx,
     );
@@ -6659,8 +6676,9 @@ fn chathistory_targets_enumerates_buffers() {
                 batch_ref,
                 ..
             } => {
+                let names: Vec<&str> = channels.iter().map(|(name, _)| name.as_str()).collect();
                 assert!(
-                    channels.contains(&"#a".to_string()) && channels.contains(&"#b".to_string()),
+                    names.contains(&"#a") && names.contains(&"#b"),
                     "channels: {channels:?}"
                 );
                 assert_eq!(limit, 10);
@@ -8249,6 +8267,7 @@ fn history_logmessage_gated_on_database() {
                 mono_clock: test_mono,
                 command_flood: None,
                 registration_burst: None,
+                reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
             },
             db_tx,
         );
@@ -12749,4 +12768,253 @@ fn read_markers_expired_by_maintenance_free_their_slots_in_the_mirror() {
     s.line(alice, "MARKREAD #new timestamp=2026-07-18T12:00:00.000Z");
     let request = take_read_marker_request(&mut s);
     assert_eq!(request.target, "#new", "the freed slot admits a new target");
+}
+
+// ---- per-address limits, reserved names, throttled logins, history floors --
+
+fn created_accounts(s: &mut TestServer) -> Vec<String> {
+    s.db_requests()
+        .into_iter()
+        .filter_map(|request| match request {
+            e6ircd::core::DbRequest::CreateAccount { name, .. } => Some(name),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A subscriber is handed a whole IPv6 `/64`: the account-creation limit
+/// counts it as one address, and charges a session to the address it
+/// connected from even after an operator gives it another host.
+#[test]
+fn account_creation_limit_counts_an_ipv6_slash_64_as_one_address() {
+    let mut s = TestServer::configured(
+        true,
+        || Millis::from_millis(1_000_000_000),
+        |config| config.registration_burst = Some(1),
+    );
+    let tcp = e6ircd::core::ConnectionTransport::Tcp;
+    let op = s.register(9, "op");
+    s.line(op, "OPER god letmein");
+    let first = s.connect_from(1, "2001:db8:1:2::10", tcp);
+    let neighbour = s.connect_from(2, "2001:db8:1:2:ffff::20", tcp);
+    let elsewhere = s.connect_from(3, "2001:db8:1:3::10", tcp);
+    for (conn, nick) in [(first, "alice"), (neighbour, "bob"), (elsewhere, "carol")] {
+        s.line(conn, &format!("NICK {nick}"));
+        s.line(conn, &format!("USER {nick} 0 * :{nick}"));
+        s.drain(conn);
+    }
+    s.line(op, "SETHOST alice cloaked.example");
+    s.db_requests();
+    for conn in [first, neighbour, elsewhere] {
+        s.line(conn, "PRIVMSG NickServ :REGISTER pw");
+    }
+    assert_eq!(created_accounts(&mut s), ["alice", "carol"]);
+    assert!(
+        s.drain(neighbour)
+            .iter()
+            .any(|line| line.contains("Too many account registrations")),
+        "the second address in the /64 is told why"
+    );
+}
+
+/// A configured administrator's name is created only by OIDC provisioning or
+/// the bootstrap/recovery flows; neither registration command may claim it.
+#[test]
+fn configured_administrator_names_cannot_be_registered_over_irc() {
+    let mut s = TestServer::configured(
+        true,
+        || Millis::from_millis(1_000_000_000),
+        |config| {
+            config.reserved_account_names = e6ircd::identity::ReservedAccountNames::new(["Root"]);
+        },
+    );
+    let root = s.register(1, "rOOt");
+    s.line(root, "PRIVMSG NickServ :REGISTER pw");
+    let out = s.drain(root);
+    assert!(
+        out.iter()
+            .any(|line| line.starts_with(":NickServ!") && line.contains("reserved")),
+        "{out:#?}"
+    );
+    s.line(root, "REGISTER * * pw");
+    let out = s.drain(root);
+    assert!(
+        out.iter()
+            .any(|line| line.contains("FAIL REGISTER BAD_ACCOUNT_NAME rOOt")),
+        "{out:#?}"
+    );
+    assert!(created_accounts(&mut s).is_empty());
+    // Any other name registers as before.
+    let alice = s.register(2, "alice");
+    s.line(alice, "PRIVMSG NickServ :REGISTER pw");
+    assert_eq!(created_accounts(&mut s), ["alice"]);
+}
+
+/// An account name that has spent its password attempts is refused over SASL
+/// with the protocol's 904 and over NickServ with a notice, both saying how
+/// long to wait.
+#[test]
+fn a_throttled_login_is_refused_with_the_wait() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "CAP LS 302");
+    s.line(c, "CAP REQ :sasl");
+    s.line(c, "AUTHENTICATE PLAIN");
+    s.drain(c);
+    s.line(c, &format!("AUTHENTICATE {}", b64("\0alice\0guess")));
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: c,
+        reply: e6ircd::core::DbReply::PasswordThrottled {
+            origin: e6ircd::core::CredentialOrigin::Sasl,
+            retry_after: e6ircd::db::LoginRetryAfter::new(90),
+        },
+    });
+    let out = s.drain(c);
+    assert!(
+        out.iter().any(|line| line.contains(" 904 ")
+            && line.contains("Too many failed login attempts")
+            && line.contains("90 seconds")),
+        "{out:#?}"
+    );
+
+    let bob = s.register(2, "bob");
+    s.line(bob, "PRIVMSG NickServ :IDENTIFY bob guess");
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: bob,
+        reply: e6ircd::core::DbReply::PasswordThrottled {
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+            retry_after: e6ircd::db::LoginRetryAfter::new(90),
+        },
+    });
+    let out = s.drain(bob);
+    assert!(
+        out.iter().any(|line| line.starts_with(":NickServ!")
+            && line.contains("Too many failed login attempts")),
+        "{out:#?}"
+    );
+}
+
+/// A password sent to a service is never repeated back by echo-message.
+#[test]
+fn echo_message_never_repeats_a_services_secret() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "echo-message");
+    for line in [
+        "PRIVMSG NickServ :IDENTIFY alice hunter2",
+        "PRIVMSG NickServ :SETPASS alice reset-code hunter2",
+        "PRIVMSG NickServ :SET PASSWORD hunter2",
+    ] {
+        s.line(alice, line);
+        s.db_requests();
+        let out = s.drain(alice);
+        let echo = out
+            .iter()
+            .find(|line| line.starts_with(":alice!") && line.contains("PRIVMSG NickServ"))
+            .expect("the line is echoed");
+        assert!(
+            echo.ends_with(":[sensitive services command redacted]"),
+            "{echo}"
+        );
+        assert!(!out.iter().any(|line| line.contains("hunter2")), "{out:#?}");
+    }
+    s.line(alice, "PRIVMSG NickServ :HELP");
+    assert!(
+        s.drain(alice)
+            .iter()
+            .any(|line| line.ends_with("PRIVMSG NickServ :HELP")),
+        "an ordinary services command is echoed as sent"
+    );
+}
+
+fn advancing_clock() -> Millis {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NOW_MS: AtomicU64 = AtomicU64::new(1_000_000_000);
+    Millis::from_millis(NOW_MS.fetch_add(1_000, Ordering::Relaxed))
+}
+
+/// The floor of the database history query a CHATHISTORY queued.
+fn queued_history_floor(s: &mut TestServer) -> e6ircd::core::HistoryFloor {
+    s.db_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            e6ircd::core::DbRequest::QueryHistory { floor, .. } => Some(floor),
+            _ => None,
+        })
+        .expect("a database history query")
+}
+
+/// Whoever creates a channel after it emptied reads only the new
+/// incarnation's history, not the conversation of those who left.
+#[test]
+fn channel_history_begins_with_the_current_incarnation() {
+    let mut s = TestServer::configured(true, advancing_clock, |_| {});
+    let alice = register_with_caps(&mut s, 1, "alice", "batch draft/chathistory");
+    s.line(alice, "JOIN #h");
+    s.drain(alice);
+    s.line(alice, "CHATHISTORY LATEST #h * 10");
+    let e6ircd::core::HistoryFloor::Since(first) = queued_history_floor(&mut s) else {
+        panic!("an unregistered channel's history is bounded")
+    };
+    s.line(alice, "PART #h");
+    let bob = register_with_caps(&mut s, 2, "bob", "batch draft/chathistory");
+    s.line(bob, "JOIN #h");
+    s.drain(bob);
+    s.line(bob, "CHATHISTORY LATEST #h * 10");
+    let e6ircd::core::HistoryFloor::Since(second) = queued_history_floor(&mut s) else {
+        panic!("an unregistered channel's history is bounded")
+    };
+    assert!(
+        second > first,
+        "the re-created channel starts a new record: {first:?} then {second:?}"
+    );
+}
+
+/// A registered channel's founder and access list keep its whole record, as
+/// over REST; any other member reads from the current incarnation, in a
+/// single-target read and in TARGETS alike.
+#[test]
+fn founder_and_access_list_keep_a_registered_channels_whole_history() {
+    let mut s = TestServer::configured(true, advancing_clock, |_| {});
+    s.core
+        .preload_founders(vec![("#reg".to_string(), "boss".to_string())]);
+    s.core.preload_access(vec![(
+        "#reg".to_string(),
+        "helper".to_string(),
+        "v".to_string(),
+    )]);
+    let caps = "batch draft/chathistory";
+    let boss = register_with_caps(&mut s, 1, "boss", caps);
+    let helper = register_with_caps(&mut s, 2, "helper", caps);
+    let guest = register_with_caps(&mut s, 3, "guest", caps);
+    identify(&mut s, boss, "boss");
+    identify(&mut s, helper, "helper");
+    for conn in [boss, helper, guest] {
+        s.line(conn, "JOIN #reg");
+        s.drain(conn);
+    }
+    for (conn, whole) in [(boss, true), (helper, true), (guest, false)] {
+        s.line(conn, "CHATHISTORY LATEST #reg * 10");
+        let floor = queued_history_floor(&mut s);
+        assert_eq!(
+            floor == e6ircd::core::HistoryFloor::Whole,
+            whole,
+            "{conn:?}: {floor:?}"
+        );
+        s.line(
+            conn,
+            "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:00.000Z \
+             timestamp=2999-01-01T00:00:00.000Z 10",
+        );
+        let channels = s
+            .db_requests()
+            .into_iter()
+            .find_map(|request| match request {
+                e6ircd::core::DbRequest::QueryTargets { channels, .. } => Some(channels),
+                _ => None,
+            })
+            .expect("a targets query");
+        assert_eq!(channels, [("#reg".to_string(), floor)], "{conn:?}");
+    }
 }

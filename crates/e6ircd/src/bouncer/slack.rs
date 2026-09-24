@@ -181,7 +181,10 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
         Ok(identity) => identity,
         Err(error) => return slack_failure("auth.test failed", &error),
     };
-    let echo_identity = super::bridged_identity("slack", &identity.user);
+    // Senders are keyed by their user or bot id: a display name is free text,
+    // and anyone may pick the bot's own.
+    let mut senders = super::BridgedSenders::new(slack_account(&identity.user_id, &identity.user));
+    let echo_identity = senders.own().clone();
 
     let (id_to_channel, channel_to_id) = match super::resolve_bridge_channels(
         "slack",
@@ -362,7 +365,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                 }
                 if let Some(channel) = id_to_channel.get(&resolved.message.channel) {
                     let names = names.lock().expect("slack name cache");
-                    for line in render_message(&resolved.message, channel, &names, &id_to_channel) {
+                    for line in render_message(&resolved.message, channel, &names, &id_to_channel, &mut senders) {
                         ends.emit_line(line);
                     }
                 }
@@ -433,10 +436,14 @@ fn render_message(
     channel: &str,
     names: &UserNames,
     channels: &HashMap<String, String>,
+    senders: &mut super::BridgedSenders,
 ) -> Vec<String> {
-    let sender = match &message.sender {
-        Sender::User(user) => names.get(user).cloned().unwrap_or_else(|| user.clone()),
-        Sender::Bot { name, .. } => name.clone(),
+    let who = match &message.sender {
+        Sender::User(user) => senders.identity(slack_account(
+            user,
+            names.get(user).map_or(user.as_str(), String::as_str),
+        )),
+        Sender::Bot { bot_id, name } => senders.identity(slack_account(bot_id, name)),
     };
     let decode = |text: &str| decode_markup(text, names, channels);
     let inbound = match &message.content {
@@ -448,11 +455,22 @@ fn render_message(
                 "slack",
                 channel,
                 subtype,
-                Some(&sender),
+                Some(&who.nick),
             )];
         }
     };
-    super::render_bridged("slack", &sender, channel, &inbound)
+    super::render_bridged(&who, channel, &inbound)
+}
+
+/// A Slack user or bot as a bridge shows it: keyed and addressed by its id,
+/// named by the name it posts under.
+fn slack_account<'a>(id: &'a str, name: &'a str) -> super::ProviderAccount<'a> {
+    super::ProviderAccount {
+        id,
+        name,
+        user: id,
+        host: "slack",
+    }
 }
 
 /// The user ids of the `<@U…>` mentions in `text` that carry no label.
@@ -1470,8 +1488,8 @@ mod tests {
     fn renders_and_routes() {
         assert_eq!(
             crate::bouncer::render_bridged(
-                "slack",
-                "U1",
+                &crate::bouncer::BridgedSenders::new(slack_account("U0", "bot"))
+                    .identity(slack_account("U1", "U1")),
                 "#general",
                 &crate::bouncer::Inbound::message("hi")
             ),
@@ -1646,7 +1664,7 @@ mod tests {
             acked(&mut b.oracle, 0, "env-1").await;
             assert_eq!(
                 line(&mut b.events).await,
-                ":Alice!Alice@slack PRIVMSG #general :one"
+                ":Alice!U1@slack PRIVMSG #general :one"
             );
             b.oracle
                 .send(0, json!({ "type": "disconnect", "reason": "warning" }));
@@ -1791,7 +1809,7 @@ mod tests {
                     break relayed;
                 }
             };
-            assert_eq!(relayed, ":Alice!Alice@slack PRIVMSG #general :two");
+            assert_eq!(relayed, ":Alice!U1@slack PRIVMSG #general :two");
             let mut lookups = 0;
             while let Ok(event) = b.oracle.events.try_recv() {
                 if matches!(event, OracleEvent::UserLookup(ref user) if user == "U1") {
@@ -1842,7 +1860,7 @@ mod tests {
             );
             assert_eq!(
                 line(&mut b.events).await,
-                ":Alice!Alice@slack PRIVMSG #general :@Bob see #general & site \
+                ":Alice!U1@slack PRIVMSG #general :@Bob see #general & site \
                  (https://x.example) <3 @here"
             );
         }
@@ -1869,7 +1887,25 @@ mod tests {
             );
             assert_eq!(
                 line(&mut b.events).await,
-                ":deploybot!deploybot@slack PRIVMSG #general :deployed"
+                ":deploybot!BOTHER@slack PRIVMSG #general :deployed"
+            );
+            // Another integration posting under the bridge account's own name
+            // is someone else, and is never shown under the session's nick.
+            b.oracle.send(
+                0,
+                slack_envelope(
+                    "env-3",
+                    json!({ "type": "message", "subtype": "bot_message", "channel": "C1",
+                            "bot_id": "BIMPOSTOR", "username": crate::bouncer::bridge_oracle::BOT_NAME,
+                            "text": "I am the owner" }),
+                ),
+            );
+            assert_eq!(
+                line(&mut b.events).await,
+                format!(
+                    ":{}|2!BIMPOSTOR@slack PRIVMSG #general :I am the owner",
+                    crate::bouncer::bridge_oracle::BOT_NAME
+                )
             );
         }
 
@@ -1887,7 +1923,7 @@ mod tests {
             );
             assert_eq!(
                 line(&mut b.events).await,
-                ":Alice!Alice@slack PRIVMSG #general :\u{1}ACTION waves\u{1}"
+                ":Alice!U1@slack PRIVMSG #general :\u{1}ACTION waves\u{1}"
             );
         }
 

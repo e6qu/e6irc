@@ -19,6 +19,10 @@ use std::future::Future;
 
 #[cfg(all(test, feature = "discord", feature = "slack"))]
 mod bridge_oracle;
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+mod bridged_senders;
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) use bridged_senders::{BridgedSenders, ProviderAccount};
 mod chathistory;
 #[cfg(feature = "discord")]
 mod discord;
@@ -3613,8 +3617,9 @@ fn rejected_bridge_command_notice(platform: &str, rejection: BridgeCommandReject
 }
 
 /// Render a bridged message as one or more IRC lines — `PRIVMSG`, a CTCP
-/// `ACTION`, or a `NOTICE`, as the [`Inbound`] says: the sender is reduced to
-/// a safe nick token and the body is split to fit the line limit.
+/// `ACTION`, or a `NOTICE`, as the [`Inbound`] says: the sender is shown as
+/// `who` (from the session's [`BridgedSenders`]) and the body is split to fit
+/// the line limit.
 ///
 /// The body is free-form remote text of arbitrary length — Slack alone allows
 /// 40,000 characters — while an IRC line is [`MAX_LINE_LEN`] bytes including
@@ -3632,13 +3637,11 @@ fn rejected_bridge_command_notice(platform: &str, rejection: BridgeCommandReject
 /// about it would be the silent drop this exists to prevent.
 #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
 pub(crate) fn render_bridged(
-    host: &str,
-    sender: &str,
+    who: &irc_driver::SelfIdentity,
     channel: &str,
     message: &Inbound,
 ) -> Vec<String> {
     use e6irc_proto::message::MAX_LINE_LEN;
-    let who = bridged_identity(host, sender);
     let (command, open, close) = match message.kind {
         InboundKind::Message => ("PRIVMSG", "", ""),
         #[cfg(any(feature = "matrix", feature = "slack"))]
@@ -3650,7 +3653,7 @@ pub(crate) fn render_bridged(
         ":{}!{}@{} {command} {channel} :{open}",
         who.nick, who.user, who.host
     );
-    // `nick_token` bounds the nick and `host` is one of three literals, so only
+    // The nick, user and host are bounded tokens (see `BridgedSenders`), so only
     // a pathologically long configured channel name can exhaust the line. The
     // floor keeps the split making progress if one ever does; the resulting
     // lines would still be over-long, which is a configuration error and not
@@ -3683,20 +3686,6 @@ pub(crate) fn render_bridged(
         }
     }
     out
-}
-
-/// How a bridge shows a provider account on IRC: `nick!nick@<platform>`, the
-/// nick reduced to a safe token. Every relayed post is prefixed from it, and so
-/// is the echo of our own — the line the provider's copy of the post would have
-/// been — so the two can never disagree about who the bridge's account is.
-#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-pub(crate) fn bridged_identity(host: &str, name: &str) -> irc_driver::SelfIdentity {
-    let nick = crate::sanitize::nick_token(name);
-    irc_driver::SelfIdentity {
-        user: nick.clone(),
-        nick,
-        host: host.to_string(),
-    }
 }
 
 /// A `*bnc*` NOTICE to `channel` saying a message from `sender` of a kind the
@@ -4207,7 +4196,7 @@ impl DriverEnds {
 
     /// Begin a bridge's session and report the bridge connected, in one step:
     /// the session's nick is the provider account's, as `identity` (from
-    /// [`bridged_identity`]) names it, and its channels are the ones the
+    /// [`BridgedSenders::own`]) names it, and its channels are the ones the
     /// bridge maps. An attached client is welcomed under the session's nick
     /// and the echo of what it sends names `identity`, so the two are the same
     /// nick by construction — a client recognises its own echoes, and a
@@ -5541,6 +5530,24 @@ where
 mod tests {
     use super::*;
 
+    /// A bridged account shown as `name!name@host`: the first account a fresh
+    /// session sees under a name no one else holds.
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    fn shown(host: &str, name: &str) -> irc_driver::SelfIdentity {
+        BridgedSenders::new(ProviderAccount {
+            id: "the owner",
+            name: "the owner",
+            user: "the owner",
+            host,
+        })
+        .identity(ProviderAccount {
+            id: name,
+            name,
+            user: name,
+            host,
+        })
+    }
+
     fn driver_factory_error(
         kind: crate::config::NetworkKind,
         addr: &str,
@@ -6724,7 +6731,7 @@ mod tests {
     fn a_bridge_session_is_the_account_in_its_channels_or_nothing() {
         let (handle, ends) = NetworkHandle::bridge_channels(4);
         let mut events = handle.subscribe();
-        let identity = bridged_identity("test", "my bot");
+        let identity = shown("test", "my bot");
         let refused = ends.begin_bridge_session(
             &identity,
             [&"#ok".to_string(), &"no spaces allowed".to_string()],
@@ -6782,7 +6789,7 @@ mod tests {
             origin: 9,
             line: "PRIVMSG #a,#b,#c :hi".to_string(),
         };
-        let identity = bridged_identity("test", "me");
+        let identity = shown("test", "me");
         let mut events = handle.subscribe();
         relay_routed(
             &ends,
@@ -6923,8 +6930,7 @@ mod tests {
         // client's framing discards it whole and the message is simply gone.
         let body = "x".repeat(40_000);
         let lines = render_bridged(
-            "slack",
-            "U1",
+            &shown("slack", "U1"),
             "#general",
             &Inbound::new(InboundKind::Message, &body),
         );
@@ -6991,8 +6997,7 @@ mod tests {
     fn inbound_text_drops_controls_and_wraps_actions() {
         assert_eq!(
             render_bridged(
-                "slack",
-                "U1",
+                &shown("slack", "U1"),
                 "#c",
                 &Inbound::new(InboundKind::Message, "\u{1}VERSION\u{1}\u{2}\t!")
             ),
@@ -7000,8 +7005,7 @@ mod tests {
         );
         assert_eq!(
             render_bridged(
-                "matrix",
-                "u",
+                &shown("matrix", "u"),
                 "#c",
                 &Inbound::new(InboundKind::Action, "waves\u{1}")
             ),
@@ -7009,8 +7013,7 @@ mod tests {
         );
         assert_eq!(
             render_bridged(
-                "matrix",
-                "u",
+                &shown("matrix", "u"),
                 "#c",
                 &Inbound::new(InboundKind::Notice, "a bot")
             ),
@@ -7018,8 +7021,7 @@ mod tests {
         );
         let long = "y".repeat(2_000);
         let lines = render_bridged(
-            "matrix",
-            "u",
+            &shown("matrix", "u"),
             "#c",
             &Inbound::new(InboundKind::Action, &long),
         );
@@ -7165,8 +7167,7 @@ mod tests {
         // A newline is a line break in the source medium. Left in, it is
         // flattened to a space downstream and the message reads as a run-on.
         let lines = render_bridged(
-            "discord",
-            "bob",
+            &shown("discord", "bob"),
             "#c",
             &Inbound::new(InboundKind::Message, "one\ntwo\r\nthree"),
         );
@@ -7193,8 +7194,7 @@ mod tests {
             };
             let body: String = std::iter::repeat_n(ch, 40_000).collect();
             let lines = render_bridged(
-                "matrix",
-                "u",
+                &shown("matrix", "u"),
                 "#c",
                 &Inbound::new(InboundKind::Message, &body),
             );
@@ -7213,7 +7213,11 @@ mod tests {
         // A message was sent. Emitting nothing would be the silent drop this
         // whole function exists to prevent.
         assert_eq!(
-            render_bridged("slack", "U1", "#c", &Inbound::new(InboundKind::Message, "")),
+            render_bridged(
+                &shown("slack", "U1"),
+                "#c",
+                &Inbound::new(InboundKind::Message, "")
+            ),
             vec![":U1!U1@slack PRIVMSG #c :"]
         );
     }

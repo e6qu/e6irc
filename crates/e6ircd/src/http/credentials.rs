@@ -409,6 +409,7 @@ fn app_password_issue_response(
             "Invalid account or password",
             None,
         ),
+        Err(crate::db::DbError::LoginThrottled(retry_after)) => login_throttled(retry_after),
         Err(crate::db::DbError::TooManyCredentials) => problem(
             StatusCode::CONFLICT,
             "Too many app passwords",
@@ -511,6 +512,7 @@ pub(super) async fn change_password(
             "Current password is incorrect",
             None,
         ),
+        Err(crate::db::DbError::LoginThrottled(retry_after)) => login_throttled(retry_after),
         Err(crate::db::DbError::LocalPasswordExists) => problem(
             StatusCode::CONFLICT,
             "Current password is required",
