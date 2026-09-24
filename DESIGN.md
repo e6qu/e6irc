@@ -2413,8 +2413,13 @@ ring's lifetime and the line's position); a reconnecting socket presents it as
 honour — another lifetime after a restart or a replaced driver, an evicted
 position, or text that is not a cursor — is answered with
 `{"t":"replay","v":"full"}` followed by the whole ring, and the client resets
-its transcripts with one "history reloaded" note. The client keeps no
-de-duplication heuristic. Before each transport retry the
+its transcripts with one "history reloaded" note (and offers "Load earlier"
+again, since the loaded history went with them). The cursor is the open
+network's: adding a network while another is open, or leaving one, runs the
+single `resetNetworkState()`, which drops the cursor with the buffers, the
+mode table, the pending joins and the rest of that network's state. A topic or
+NAMES reply updates a channel buffer that is already open and never opens one.
+The client keeps no de-duplication heuristic. Before each transport retry the
 client checks the session; a 401 ends the retry loop and offers sign-in once.
 A message typed into a channel the session no longer holds is refused with a
 one-click rejoin; only slash commands pass. The composer sends
@@ -2519,7 +2524,11 @@ reader that goes away (a broken pipe) ends `tail`/`history` output cleanly.
 `&` channels are joined like `#` ones. Every wait on the server — connecting
 and registering, a capability request, a join with its history, and every
 wait after `QUIT` — is bounded by `--response-timeout` (30 s by default), so
-a peer that holds the socket open with irrelevant lines cannot hang a script.
+a peer that holds the socket open with irrelevant lines cannot hang a script;
+it bounds each HTTP request of `api` and `login` too. Those two open no IRC
+connection, so an IRC-only global option given to them (`--server`, `--nick`,
+`--tls`, the SASL and server-password options, ...) is an argument error
+naming it, not a silently ignored flag.
 `send` confirms delivery: it requires `echo-message` and, without it, fails
 with "delivery cannot be confirmed" before sending anything; it gets past the
 registration burst with a PING round trip and exits 0 only on its own echo,
@@ -2612,7 +2621,12 @@ two-second loop: rejected credentials, a rejected server password, and a ban
 are never retried (the client stops with a final status, as the bouncer's
 driver parks), and any other failure backs off exponentially from
 `--reconnect-delay` to five minutes. A refused channel is dropped from the
-session with a status line instead of failing the whole connect. The client
+session with a status line instead of failing the whole connect. A refusal is
+any error numeric or `FAIL JOIN` about that channel, not a list of known
+numerics: one this client never heard of (479, 489, 520, ...) would otherwise
+leave the join waiting out its deadline and the client reconnecting forever.
+Messages to a STATUSMSG target (`@#chan`, `+#chan`, with the sigils the
+server's `005 STATUSMSG` declares) are shown in the channel's buffer. The client
 adopts the nickname the server confirmed — a BNC's welcome carries the real
 upstream nick, which may differ from `--nick` — and follows its own NICK
 changes, so direct messages and its own JOIN/PART are recognised. Every error

@@ -130,10 +130,10 @@ async fn bounded_body(mut response: Response, limit: usize) -> io::Result<Vec<u8
 /// bearer token included — without the cleartext rule ever being asked about
 /// it. When the plaintext decision was made by address, the origin's host is
 /// pinned to exactly the addresses that were vetted.
-fn client(pinned: Option<&Pinned>) -> io::Result<Client> {
+fn client(pinned: Option<&Pinned>, response_timeout: Duration) -> io::Result<Client> {
     let mut builder = Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(15).min(response_timeout))
+        .timeout(response_timeout)
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy();
     if let Some(pinned) = pinned {
@@ -142,21 +142,26 @@ fn client(pinned: Option<&Pinned>) -> io::Result<Client> {
     builder.build().map_err(transport_error)
 }
 
+/// How each HTTP request of one command may go: whether a bearer token may
+/// cross plaintext HTTP to another machine, and how long one request may take
+/// (the global `--response-timeout`, which bounds IRC requests the same way).
+#[derive(Clone, Copy, Debug)]
+pub struct Transport {
+    pub cleartext: CleartextCredentials,
+    pub response_timeout: Duration,
+}
+
 /// A plaintext origin's host and the loopback addresses it was vetted to.
 struct Pinned {
     host: String,
     addresses: Vec<std::net::SocketAddr>,
 }
 
-pub async fn login(
-    base: &str,
-    cache_path: &Path,
-    cleartext: CleartextCredentials,
-) -> io::Result<()> {
+pub async fn login(base: &str, cache_path: &Path, transport: Transport) -> io::Result<()> {
     let base = normalized_base(base)?;
     // The whole exchange exists to obtain a token, so it is decided up front.
-    let pinned = token_may_cross(&base, true, cleartext).await?;
-    let client = client(pinned.as_ref())?;
+    let pinned = token_may_cross(&base, true, transport.cleartext).await?;
+    let client = client(pinned.as_ref(), transport.response_timeout)?;
     let start_response = client
         .post(endpoint(&base, "/api/v1/auth/device/start")?)
         .header(reqwest::header::ACCEPT, "application/json")
@@ -294,7 +299,7 @@ pub async fn api(
     explicit_token: Option<String>,
     body: Option<String>,
     cache_path: Option<&Path>,
-    cleartext: CleartextCredentials,
+    transport: Transport,
 ) -> io::Result<()> {
     let cached = if explicit_token.is_none() {
         let resolved_cache;
@@ -326,9 +331,10 @@ pub async fn api(
         }
         (None, None) => None,
     };
-    let pinned = token_may_cross(&base, token.is_some(), cleartext).await?;
+    let pinned = token_may_cross(&base, token.is_some(), transport.cleartext).await?;
     let method = Method::from_bytes(method.as_bytes()).map_err(invalid_input)?;
-    let mut request = client(pinned.as_ref())?.request(method, endpoint(&base, path)?);
+    let mut request = client(pinned.as_ref(), transport.response_timeout)?
+        .request(method, endpoint(&base, path)?);
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
@@ -446,7 +452,7 @@ mod tests {
         let cache = std::env::temp_dir().join("e6irc-cli-never-written-token.json");
         let remote = "http://192.0.2.1";
         for error in [
-            refused(login(remote, &cache, CleartextCredentials::Refuse)).await,
+            refused(login(remote, &cache, REFUSE_CLEARTEXT)).await,
             refused(api(
                 "GET",
                 "/api/v1/me",
@@ -454,7 +460,7 @@ mod tests {
                 Some("secret-token".into()),
                 None,
                 None,
-                CleartextCredentials::Refuse,
+                REFUSE_CLEARTEXT,
             ))
             .await,
         ] {
@@ -582,6 +588,51 @@ mod tests {
         assert!(api_base(None, None).is_err());
     }
 
+    const REFUSE_CLEARTEXT: Transport = Transport {
+        cleartext: CleartextCredentials::Refuse,
+        response_timeout: Duration::from_secs(30),
+    };
+
+    /// `--response-timeout` bounds each HTTP request, as it bounds each IRC
+    /// one: a server that accepts and never answers fails the command at the
+    /// bound the user chose, not at a fixed one.
+    #[tokio::test]
+    async fn http_requests_give_up_at_the_response_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let held = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let bound = Transport {
+            response_timeout: Duration::from_millis(300),
+            ..REFUSE_CLEARTEXT
+        };
+        let cache = std::env::temp_dir().join("e6irc-cli-timeout-never-written.json");
+        for call in [
+            Box::pin(api(
+                "GET",
+                "/healthz",
+                Some(&base),
+                Some("t".into()),
+                None,
+                None,
+                bound,
+            )) as std::pin::Pin<Box<dyn Future<Output = io::Result<()>>>>,
+            Box::pin(login(&base, &cache, bound)),
+        ] {
+            let error = tokio::time::timeout(Duration::from_secs(5), call)
+                .await
+                .expect("the request outlived the response timeout")
+                .expect_err("a silent server is a failed request");
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        }
+        assert!(!cache.exists());
+        held.abort();
+    }
+
     #[tokio::test]
     async fn device_login_polls_and_persists_the_issued_token() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -619,13 +670,9 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("e6irc-device-login-test-{}", std::process::id()));
         let path = directory.join("token.json");
-        login(
-            &format!("http://{address}"),
-            &path,
-            CleartextCredentials::Refuse,
-        )
-        .await
-        .expect("plaintext to this machine is never refused");
+        login(&format!("http://{address}"), &path, REFUSE_CLEARTEXT)
+            .await
+            .expect("plaintext to this machine is never refused");
         server.await.unwrap();
         let cached = load_token(&path).unwrap().unwrap();
         assert_eq!(cached.base_url(), format!("http://{address}"));

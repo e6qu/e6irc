@@ -1083,10 +1083,26 @@ fn conversation_rail_text(app: &App) -> String {
     format!(" CONVERSATIONS  {}", labels.join("  "))
 }
 
+/// The composer's horizontal scroll and the cursor's column within it, both in
+/// display columns. The scroll always lands on a character boundary: scrolled
+/// into the middle of a wide character, ratatui keeps the whole character and
+/// shifts the rest of the line by a column, so the cursor would sit one column
+/// off the text it edits.
 fn composer_view(input: &str, cursor: usize, width: u16) -> (u16, u16) {
-    let input_width = UnicodeWidthStr::width(&input[..cursor]);
+    let before_cursor = &input[..cursor];
+    let input_width = UnicodeWidthStr::width(before_cursor);
     let visible_width = usize::from(width).saturating_sub(1);
-    let horizontal_scroll = input_width.saturating_sub(visible_width);
+    let needed_scroll = input_width.saturating_sub(visible_width);
+    let horizontal_scroll = before_cursor
+        .chars()
+        .scan(0, |column, character| {
+            *column += character.width().unwrap_or(0);
+            Some(*column)
+        })
+        .chain(std::iter::once(input_width))
+        .find(|&boundary| boundary >= needed_scroll)
+        .filter(|_| needed_scroll > 0)
+        .unwrap_or(0);
     let cursor_column = input_width.saturating_sub(horizontal_scroll);
     (
         u16::try_from(horizontal_scroll).unwrap_or(u16::MAX),
@@ -1203,6 +1219,28 @@ mod tests {
         assert_eq!(composer_view("abcdef", 2, 4), (0, 2));
         assert_eq!(composer_view("界x", 4, 4), (0, 3));
         assert_eq!(composer_view("界x", 4, 0), (3, 0));
+        // Scrolling 2 columns would split the first 界: round up past it.
+        assert_eq!(composer_view("a界界", 7, 4), (3, 2));
+    }
+
+    /// Whatever the scroll, the cell just left of the cursor holds the
+    /// character just before it: the cursor is never a column off the text.
+    #[test]
+    fn the_composer_cursor_follows_its_text_across_wide_characters() {
+        let mut app = App::new("#home".into(), "me".into());
+        for character in "a界界界".chars() {
+            app.on_char(character);
+        }
+        for width in 5..=12 {
+            let backend = TestBackend::new(width, 10);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            let position = terminal.get_cursor_position().unwrap();
+            let buffer = terminal.backend().buffer();
+            // A wide character occupies two cells; its symbol is in the first.
+            let symbol = buffer[(position.x - 2, position.y)].symbol().to_owned();
+            assert_eq!(symbol, "界", "terminal width {width}");
+        }
     }
 
     #[test]

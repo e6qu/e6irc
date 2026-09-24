@@ -38,6 +38,8 @@ import {
   asMessage,
   channelModesFrom,
   chatMessageRoute,
+  clearTranscript,
+  existingChannelBuffer,
   fold,
   isChannel,
   isPrefixMode,
@@ -484,7 +486,8 @@ function ensureBuffer(name, kind) {
 
 // The network's channel-mode table: which modes rank a member, their sigils,
 // and which consume a MODE parameter. The default applies until the network's
-// 005 replaces it; the page is one network, so it is kept across reconnects.
+// 005 replaces it. It is kept across reconnects to the same network and goes
+// with the rest of that network's state (resetNetworkState).
 let channelModes = DEFAULT_CHANNEL_MODES;
 
 // ---- rendering ----------------------------------------------------------
@@ -878,8 +881,8 @@ const addEvent = (chan, text) => addLine(chan, "event", "channel", null, text);
 function addNick(chan, nick, render = true) {
   const { name, modes } = splitSigil(nick, channelModes);
   if (!name) return;
-  const b = ensureBuffer(chan, "channel");
-  if (b.kind !== "channel") return;
+  const b = existingChannelBuffer(buffers, chan);
+  if (!b) return;
   const key = fold(name);
   if (b.nicks.size >= MAX_NICKS && !b.nicks.has(key)) {
     b.membersTruncated = true;
@@ -953,8 +956,8 @@ function renameNick(from, to) {
 }
 
 function setTopic(chan, topic) {
-  const b = ensureBuffer(chan, "channel");
-  if (b.kind !== "channel") return;
+  const b = existingChannelBuffer(buffers, chan);
+  if (!b) return;
   b.topic = stripFormatting(topic);
   if (b.key === active) buftopicEl.textContent = b.topic;
 }
@@ -1151,8 +1154,8 @@ function handleLine(raw) {
       if (!chan) {
         break;
       }
-      const buffer = ensureBuffer(chan, "channel");
-      if (buffer.kind !== "channel") break;
+      const buffer = existingChannelBuffer(buffers, chan);
+      if (!buffer) break;
       if (!namesSnapshots.has(buffer.key)) {
         namesSnapshots.add(buffer.key);
         buffer.nicks.clear();
@@ -1307,12 +1310,7 @@ async function reconcileUnavailableNetwork() {
 let replayCursor = null;
 
 function resetTranscripts() {
-  for (const b of buffers.values()) {
-    b.lines.length = 0;
-    b.unread = 0;
-    b.mentions = 0;
-    b.pendingVisibleMessages = 0;
-  }
+  for (const b of buffers.values()) clearTranscript(b);
   renderActive();
   renderBufferList();
   addServer("history reloaded: the server could not continue from where this page stopped, so it replayed everything it holds");
@@ -2034,7 +2032,10 @@ if (networkForm) {
       networkDialog.close();
       if (!editing) {
         // A network was added to be used: open it rather than asking the
-        // person to find the row that just appeared.
+        // person to find the row that just appeared. Whatever network was
+        // open is left first, or its conversations and replay cursor would
+        // be carried into the new one.
+        resetNetworkState();
         network = name;
         window.history.replaceState(null, "", `/?network=${encodeURIComponent(name)}`);
         let networks = [];
@@ -2232,21 +2233,41 @@ function stopLiveConnection() {
   }
 }
 
-async function leaveOpenNetwork() {
+// Forget everything the open network owns, so the next network (or none)
+// starts clean: its connection and retry, its conversations, the replay cursor
+// (sent to another network it names lines that network never had), its mode
+// table, the joins asked for, and the once-per-page view choice. Every way of
+// leaving a network runs this one function, so none of them misses a piece.
+// web/test/network-state.test.js holds each piece of page state to either
+// being reset here or being named there as the page's own.
+function resetNetworkState() {
   stopLiveConnection();
-  network = null;
-  window.history.replaceState(null, "", "/");
+  rejectAllPendingSends("the network was changed");
+  reconnectDelay = 0;
+  reconnectAttempt = 0;
   buffers.clear();
   namesSnapshots.clear();
   namesRequested.clear();
+  requestedJoins.clear();
   active = null;
-  upstreamConnected = false;
   myNick = null;
+  upstreamConnected = false;
+  snapshotComplete = false;
+  memberTracking = true;
+  channelModes = DEFAULT_CHANNEL_MODES;
+  initialViewSettled = false;
+  replayCursor = null;
   clearAlert("network-unavailable");
   clearAlert("socket");
   setComposerAvailable(false);
   renderBufferList();
-  renderNickList();
+  renderActive();
+}
+
+async function leaveOpenNetwork() {
+  resetNetworkState();
+  network = null;
+  window.history.replaceState(null, "", "/");
   let networks = [];
   let failure = null;
   try {
