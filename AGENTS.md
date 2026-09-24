@@ -187,6 +187,10 @@ mistake, before a single line changes.
       an integration test — the cross-crate case the compiler can't see).
 - [ ] `tools/check-duplication.sh` clean (copy-paste under the ratchet; the
       fix is to extract shared logic, never to raise the threshold).
+- [ ] The fuzz targets type-check: `RUSTFLAGS="--cfg fuzzing" cargo check
+      --manifest-path fuzz/Cargo.toml --bins` (stable is enough; CI's
+      `fuzz-smoke` builds them on nightly, and a struct gaining a field breaks
+      every target that builds it field by field).
 - [ ] `tools/check-no-defer.sh` clean (no deferral vehicle in use — see the
       No-Deferral Rule above: `BUGS.md` empty, no new "surfaced, not
       done"-style note in `PLAN.md`).
