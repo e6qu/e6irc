@@ -491,6 +491,7 @@ fn spawn_bnc_listener(
                                             registry,
                                             &pool,
                                             &server_name,
+                                            &peer.ip().to_string(),
                                         )
                                         .await
                                     }
@@ -515,8 +516,14 @@ fn spawn_bnc_listener(
                                 }
                             }
                             None => {
-                                crate::bouncer::bnc_serve(stream, registry, &pool, &server_name)
-                                    .await
+                                crate::bouncer::bnc_serve(
+                                    stream,
+                                    registry,
+                                    &pool,
+                                    &server_name,
+                                    &peer.ip().to_string(),
+                                )
+                                .await
                             }
                         };
                         if let Err(e) = served {

@@ -915,7 +915,10 @@ pub(crate) fn channel_control_result(
                         channel_state.topic = live_topic.clone();
                         let display = channel_state.name.clone();
                         let text = live_topic.as_ref().map_or("", |topic| topic.text.as_str());
-                        let line = format!(":{} TOPIC {display} :{text}", state.config.server_name);
+                        let line = state.server_line(format!(
+                            ":{} TOPIC {display} :{text}",
+                            state.config.server_name
+                        ));
                         state.broadcast_channel(&key, &line, None);
                     }
                     format!("Updated the retained topic for {}", key.as_str())

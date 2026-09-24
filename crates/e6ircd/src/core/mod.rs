@@ -12,7 +12,9 @@ mod handler;
 mod state;
 mod timer;
 
-pub(crate) use handler::fit_trailing;
+pub(crate) use handler::{
+    HistoryFail, cap_reply_lines, cap_version_302, fit_trailing, invalid_utf8_fail,
+};
 pub(crate) use timer::TimerWheel;
 
 pub use state::{
@@ -1250,6 +1252,7 @@ pub enum ChannelTopicPersistence {
         channel: String,
         display: String,
         prefix: String,
+        origin: state::Originator,
         topic: Option<(String, String, u64)>,
         revision: u64,
         retained: bool,
@@ -1478,6 +1481,8 @@ pub enum DbRequest {
         display: String,
         /// Prefix captured when the command was authorized.
         prefix: String,
+        /// The setter's originator tags, for the TOPIC line's tags.
+        origin: state::Originator,
         topic: Option<(String, String, u64)>,
         revision: u64,
         label: Option<String>,
@@ -1608,7 +1613,7 @@ pub enum CredentialOrigin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryFault {
     /// The store failed; the window may well exist.
-    Unavailable,
+    Unavailable { subcommand: &'static str },
     /// The store answered, and holds no message with this id in the requested
     /// buffer. Not an empty page: a client resuming from a msgid that is gone
     /// would read "nothing newer" as "up to date".
@@ -3616,7 +3621,8 @@ mod ingress_tests {
             session: SessionOwner::new(ConnId(2), CoreShardId(0)),
             event: crate::core::state::ChannelSessionEvent::Invitation {
                 inviter_prefix: "alice!alice@host.test".into(),
-                inviter_account: None,
+                inviter: Default::default(),
+                ts: e6irc_proto::time::Millis::from_millis(0),
                 channel: "#chat".into(),
             },
         });
@@ -4299,6 +4305,34 @@ mod ingress_tests {
         assert_eq!(lines_with(&shards.drain(1), " NICK alicia").len(), 1);
         shards.line(2, "QUIT :bye");
         assert_eq!(lines_with(&shards.drain(1), " QUIT :").len(), 1);
+    }
+
+    /// A peer without `chghost` sharing channels owned by both shards is told
+    /// of a host change by one QUIT, then one rejoin per shared channel — the
+    /// QUIT first, whichever shard's report arrives first.
+    #[test]
+    fn a_host_change_rejoins_every_shared_channel_after_one_quit() {
+        let mut shards = alice_and_bob("");
+        let [here, there] = shards.owned;
+        for conn in [2, 1] {
+            shards.line(conn, &format!("JOIN {here},{there}"));
+        }
+        shards.drain(1);
+        shards.line(1, "OPER root secret");
+        shards.drain(1);
+        shards.line(1, "SETHOST alice cloak.test");
+        let out = shards.drain(1);
+        let quits = lines_with(&out, " QUIT :Changing host");
+        assert_eq!(quits.len(), 1, "{out:#?}");
+        let quit_at = out
+            .iter()
+            .position(|line| line.contains(" QUIT :Changing host"));
+        for channel in [here, there] {
+            let join = format!("@cloak.test JOIN {channel}");
+            assert_eq!(lines_with(&out, &join).len(), 1, "{out:#?}");
+            let join_at = out.iter().position(|line| line.contains(&join));
+            assert!(quit_at < join_at, "the QUIT must come first: {out:#?}");
+        }
     }
 
     #[test]

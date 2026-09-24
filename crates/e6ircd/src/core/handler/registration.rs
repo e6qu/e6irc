@@ -90,15 +90,11 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 
     if registered {
         let previous_prefix = prefix.expect("registered");
-        let line = format!(":{previous_prefix} NICK {nick}");
-        // Route through send_timed (self and each peer) so server-time clients
-        // get an @time= tag, like every other membership event — a raw
-        // send_bytes loop would silently omit it for NICK alone.
-        state.send_timed(conn, &line);
-        state.sync_channel_member(
-            conn,
-            crate::core::state::ChannelMemberChange::Nick { previous_prefix },
-        );
+        // One event line, to self and to each peer, so everyone gets the same
+        // `time`/`account` tags — like every other membership event.
+        let line = state.user_line(conn, format!(":{previous_prefix} NICK {nick}"));
+        state.send_event(conn, &line);
+        state.sync_channel_member(conn, crate::core::state::ChannelMemberChange::Nick { line });
         if !case_change_only {
             if let Some(old_nick) = old_nick_display {
                 // The old nick is free for anyone to take, and `~oldnick` with
@@ -460,7 +456,16 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     match sub.as_str() {
         "LS" => {
             mark_negotiating(state, conn);
-            let v302 = p.get(1).is_some_and(|v| *v == "302");
+            let v302 = crate::core::cap_version_302(p.get(1).copied());
+            if v302 {
+                // CAP LS 302 implies cap-notify (capability negotiation 3.2):
+                // the client is registered for CAP NEW/DEL from here on, and
+                // CAP LIST says so.
+                let session = state.sessions.get_mut(&conn).expect("checked");
+                session.cap_302 = true;
+                session.caps.cap_notify = true;
+                state.refresh_recipient(conn);
+            }
             let mut names: Vec<String> = CAP_NAMES.iter().map(|(n, _)| n.to_string()).collect();
             // The value-carrying caps advertise from the shared registry, so LS
             // can't offer a cap REQ/LIST don't know about (or vice versa).
@@ -469,10 +474,9 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     .iter()
                     .filter_map(|vc| (vc.ls_token)(state, v302)),
             );
-            state.send(
-                conn,
-                &format!(":{server} CAP {target} LS :{}", names.join(" ")),
-            );
+            for line in crate::core::cap_reply_lines(&server, &target, "LS", &names, v302) {
+                state.send(conn, &line);
+            }
         }
         "LIST" => {
             let mut caps = state.sessions[&conn].caps;
@@ -490,10 +494,11 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     .filter(|vc| *(vc.accessor)(&mut caps))
                     .map(|vc| vc.name),
             );
-            state.send(
-                conn,
-                &format!(":{server} CAP {target} LIST :{}", active.join(" ")),
-            );
+            let active: Vec<String> = active.into_iter().map(str::to_string).collect();
+            let v302 = state.sessions[&conn].cap_302;
+            for line in crate::core::cap_reply_lines(&server, &target, "LIST", &active, v302) {
+                state.send(conn, &line);
+            }
         }
         "REQ" => {
             let request = p.get(1).copied().unwrap_or("");
@@ -501,12 +506,19 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             // All-or-nothing: apply to a copy, commit only if every
             // token is known.
             let mut caps = state.sessions[&conn].caps;
+            let cap_302 = state.sessions[&conn].cap_302;
             let mut all_known = !request.is_empty();
             for token in request.split(' ').filter(|t| !t.is_empty()) {
                 let (name, enable) = match token.strip_prefix('-') {
                     Some(n) => (n, false),
                     None => (token, true),
                 };
+                // A 302 client's cap-notify is implied, not requested, and
+                // cannot be switched off: `-cap-notify` is accepted and has
+                // no effect (capability negotiation 3.2).
+                if cap_302 && name == "cap-notify" {
+                    continue;
+                }
                 // A value-cap is acceptable iff it is currently offered (its
                 // `ls_token` yields Some) — the same gate LS advertises on, so a
                 // cap can never be REQ-able but unadvertised. A recognised name

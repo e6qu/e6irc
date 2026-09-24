@@ -1513,6 +1513,79 @@ fn sasl_abort_then_reauth_does_not_cross_wire_the_stale_verify() {
     );
 }
 
+/// `CAP LS 302` (or any later version) implies cap-notify: CAP LIST reports
+/// it, and the client cannot turn it off. A later numeric version gets the
+/// 302 reply — values included — not the 3.1 downgrade.
+#[test]
+fn cap_ls_302_implies_cap_notify_and_later_versions_are_302() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "CAP LS 303");
+    let ls = s.drain(c);
+    assert!(
+        ls.iter().any(|l| l.contains("sasl=PLAIN,OAUTHBEARER")),
+        "CAP LS 303 must be answered like 302: {ls:#?}"
+    );
+    assert!(ls.iter().all(|l| l.len() + 2 <= 512), "{ls:#?}");
+    s.line(c, "CAP LIST");
+    let list = s.drain(c);
+    assert!(
+        list.iter().any(|l| l
+            .split(' ')
+            .any(|w| w.trim_start_matches(':') == "cap-notify")),
+        "{list:#?}"
+    );
+    s.line(c, "CAP REQ :-cap-notify");
+    assert!(s.drain(c).iter().any(|l| l.contains(" ACK ")));
+    s.line(c, "CAP LIST");
+    let list = s.drain(c);
+    assert!(
+        list.iter().any(|l| l
+            .split(' ')
+            .any(|w| w.trim_start_matches(':') == "cap-notify")),
+        "a 302 client's cap-notify cannot be disabled: {list:#?}"
+    );
+
+    // A 3.1 client has neither.
+    let old = s.connect(2);
+    s.line(old, "CAP LS");
+    assert!(
+        s.drain(old).iter().all(|l| !l.contains('=')),
+        "no values for a pre-302 client"
+    );
+    s.line(old, "CAP LIST");
+    assert!(s.drain(old).iter().all(|l| !l.contains("cap-notify")));
+}
+
+/// A client that starts `AUTHENTICATE PLAIN` and then ends registration
+/// without sending the payload has its exchange aborted (906) and is
+/// registered without an account — a payload arriving afterwards cannot log in
+/// a session already welcomed as anonymous.
+#[test]
+fn registration_aborts_an_unfinished_sasl_exchange() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "CAP LS 302");
+    s.line(c, "CAP REQ :sasl");
+    s.line(c, "NICK alice");
+    s.line(c, "USER alice 0 * :Alice");
+    s.line(c, "AUTHENTICATE PLAIN");
+    s.drain(c);
+    s.line(c, "CAP END");
+    let out = s.drain(c);
+    let aborted = out.iter().position(|l| l.contains(" 906 "));
+    let welcome = out.iter().position(|l| l.contains(" 001 "));
+    assert!(
+        aborted.is_some() && welcome.is_some() && aborted < welcome,
+        "906 must precede the welcome: {out:#?}"
+    );
+    s.line(c, &format!("AUTHENTICATE {}", b64("\0alice\0pw")));
+    assert!(
+        s.db_requests().is_empty(),
+        "a payload after the abort must not start a verify"
+    );
+}
+
 #[test]
 fn cap_list_enumerates_multiline_when_enabled() {
     // CAP LIST must report *every* enabled capability, including the ones
@@ -4115,12 +4188,72 @@ fn account_notify_and_tag() {
         },
     });
     s.drain(bob);
-    assert_eq!(s.drain(alice), vec![":bob!bob@host2.example ACCOUNT bob"]);
+    // The ACCOUNT line is bob's own event: it bears his (new) account.
+    assert_eq!(
+        s.drain(alice),
+        vec!["@account=bob :bob!bob@host2.example ACCOUNT bob"]
+    );
     // bob's messages now carry account-tag for alice
     s.line(bob, "PRIVMSG #acct :tagged?");
     assert_eq!(
         s.drain(alice),
         vec!["@account=bob :bob!bob@host2.example PRIVMSG #acct :tagged?"]
+    );
+    // ...and so does every other line bob originates, not only messages
+    // (account-tag spec: the tag goes on any message a user sends).
+    for (command, seen) in [
+        ("PART #acct :bye", ":bob!bob@host2.example PART #acct :bye"),
+        ("JOIN #acct", ":bob!bob@host2.example JOIN #acct"),
+        ("AWAY :gone", ":bob!bob@host2.example AWAY :gone"),
+        ("AWAY", ":bob!bob@host2.example AWAY"),
+        ("NICK bobby", ":bob!bob@host2.example NICK bobby"),
+        ("QUIT :done", ":bobby!bob@host2.example QUIT :Quit: done"),
+    ] {
+        s.line(bob, command);
+        let got = s.drain(alice);
+        // AWAY reaches alice only with away-notify, which she lacks.
+        if command.starts_with("AWAY") {
+            assert_eq!(got, Vec::<String>::new(), "{command}");
+            continue;
+        }
+        assert_eq!(got, vec![format!("@account=bob {seen}")], "{command}");
+    }
+}
+
+/// Server-originated lines never borrow a user's account tag, while a user's
+/// MODE and KICK carry it.
+#[test]
+fn account_tag_on_mode_and_kick_but_not_server_lines() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "account-tag");
+    let bob = s.register(2, "bob");
+    s.line(bob, "JOIN #acct");
+    s.line(alice, "JOIN #acct");
+    s.line(bob, "PRIVMSG NickServ :IDENTIFY pw");
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: bob,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "bob".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+        },
+    });
+    s.drain(bob);
+    s.drain(alice);
+    s.line(bob, "TOPIC #acct :hello");
+    assert_eq!(
+        s.drain(alice),
+        vec!["@account=bob :bob!bob@host2.example TOPIC #acct :hello"]
+    );
+    s.line(bob, "MODE #acct +v alice");
+    assert_eq!(
+        s.drain(alice),
+        vec!["@account=bob :bob!bob@host2.example MODE #acct +v alice"]
+    );
+    s.line(bob, "KICK #acct alice :out");
+    assert_eq!(
+        s.drain(alice),
+        vec!["@account=bob :bob!bob@host2.example KICK #acct alice :out"]
     );
 }
 
@@ -4541,6 +4674,52 @@ fn chathistory_requires_caps_and_membership() {
     s.line(carol, "CHATHISTORY LATEST #h2 * 10");
     let out = s.drain(carol);
     assert!(out[0].contains("FAIL CHATHISTORY"), "{out:#?}");
+}
+
+/// The chathistory spec's error list: an unknown subcommand is
+/// `UNKNOWN_COMMAND <subcommand>` — judged before the target, so even a
+/// channel the requester is not on gets it — and a request missing parameters
+/// is `NEED_MORE_PARAMS <subcommand>`, not INVALID_PARAMS.
+#[test]
+fn chathistory_unknown_subcommand_and_missing_parameters() {
+    let mut s = TestServer::new_no_persistence();
+    let bob = register_with_caps(&mut s, 2, "bob", "batch draft/chathistory");
+    s.line(bob, "CHATHISTORY FROBNICATE #nowhere * 5");
+    assert_eq!(
+        s.drain(bob),
+        vec![":irc.test.example FAIL CHATHISTORY UNKNOWN_COMMAND FROBNICATE :Unknown subcommand"]
+    );
+    s.line(bob, "JOIN #here");
+    s.drain(bob);
+    for (request, sub) in [
+        ("CHATHISTORY LATEST", "LATEST"),
+        ("CHATHISTORY LATEST #here *", "LATEST"),
+        (
+            "CHATHISTORY BETWEEN #here timestamp=2020-01-01T00:00:00.000Z 5",
+            "BETWEEN",
+        ),
+        (
+            "CHATHISTORY TARGETS timestamp=2020-01-01T00:00:00.000Z 5",
+            "TARGETS",
+        ),
+    ] {
+        s.line(bob, request);
+        assert_eq!(
+            s.drain(bob),
+            vec![format!(
+                ":irc.test.example FAIL CHATHISTORY NEED_MORE_PARAMS {sub} :{}",
+                if sub == "TARGETS" {
+                    "Expected exactly two timestamp= bounds and a limit"
+                } else {
+                    "Missing parameters"
+                }
+            )],
+            "{request}"
+        );
+    }
+    // Too many parameters are still INVALID_PARAMS.
+    s.line(bob, "CHATHISTORY LATEST #here * 5 extra");
+    assert!(s.drain(bob)[0].contains("FAIL CHATHISTORY INVALID_PARAMS LATEST #here"),);
 }
 
 #[test]
@@ -6527,13 +6706,16 @@ fn chathistory_db_error_fails_rather_than_empty_batch() {
             batch: true,
             ..Default::default()
         },
-        rows: Err(e6ircd::core::HistoryFault::Unavailable),
+        rows: Err(e6ircd::core::HistoryFault::Unavailable {
+            subcommand: "BEFORE",
+        }),
         label: None,
     });
     let out = s.drain(alice);
+    // The spec's MESSAGE_ERROR names the subcommand and target it answers.
     assert!(
         out.iter()
-            .any(|l| l.contains("FAIL CHATHISTORY MESSAGE_ERROR")),
+            .any(|l| l.contains("FAIL CHATHISTORY MESSAGE_ERROR BEFORE #h :")),
         "a store fault must FAIL, not send an empty batch: {out:#?}"
     );
     assert!(
@@ -7098,6 +7280,7 @@ fn registered_channel_topic_persisted_on_set() {
             channel: "#reg".into(),
             display: "#reg".into(),
             prefix: "boss!u@127.0.0.1".into(),
+            origin: Default::default(),
             topic: Some(("new topic".into(), "boss!u@127.0.0.1".into(), 1)),
             revision,
             retained: true,
@@ -7240,6 +7423,7 @@ fn committed_registered_topic_survives_the_live_channel_becoming_empty() {
             channel: "#reg".into(),
             display: "#reg".into(),
             prefix: "boss!u@127.0.0.1".into(),
+            origin: Default::default(),
             topic: Some(("durable after empty".into(), "boss!u@127.0.0.1".into(), 1)),
             revision,
             retained: true,
@@ -7372,6 +7556,7 @@ fn chanserv_set_keeptopic_off_stops_topic_retention() {
             channel: "#reg".into(),
             display: "#reg".into(),
             prefix: "boss!u@127.0.0.1".into(),
+            origin: Default::default(),
             topic: Some(("while off".into(), "boss!u@127.0.0.1".into(), 1)),
             revision: 1,
             retained: false,
@@ -7448,6 +7633,7 @@ fn chanserv_set_keeptopic_on_recaptures_the_live_topic() {
             channel: "#reg".into(),
             display: "#reg".into(),
             prefix: "boss!u@127.0.0.1".into(),
+            origin: Default::default(),
             topic: Some(("the live topic".into(), "boss!u@127.0.0.1".into(), 1)),
             revision: 1,
             retained: false,
@@ -9774,6 +9960,66 @@ fn oper_sethost_changes_host_and_chghosts() {
     );
 }
 
+/// A peer without `chghost` cannot parse CHGHOST, so it is shown the user
+/// quitting and rejoining each shared channel under the new hostmask — away
+/// state and channel status restored — the chghost spec's fallback. Without
+/// it the peer would keep the old hostmask forever.
+#[test]
+fn sethost_without_chghost_is_shown_as_quit_and_rejoin() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    let target = s.register(3, "user");
+    let plain = s.register(2, "plain");
+    let extended = register_with_caps(&mut s, 4, "ext", "extended-join away-notify");
+    for c in [target, plain, extended] {
+        s.line(c, "JOIN #room");
+        s.line(c, "JOIN #hall");
+    }
+    s.line(target, "AWAY :lunch");
+    for c in [op, target, plain, extended] {
+        s.drain(c);
+    }
+
+    s.line(op, "SETHOST user cloak.example");
+    // One QUIT first, however many channels are shared; then each channel's
+    // JOIN under the new host, followed by the op status the target (the
+    // channels' founder) holds there.
+    let plain_out = s.drain(plain);
+    assert_eq!(
+        plain_out.first().map(String::as_str),
+        Some(":user!user@host3.example QUIT :Changing host"),
+        "{plain_out:#?}"
+    );
+    assert_eq!(plain_out.len(), 5, "{plain_out:#?}");
+    for channel in ["#room", "#hall"] {
+        let join = format!(":user!user@cloak.example JOIN {channel}");
+        let mode = format!(":irc.test.example MODE {channel} +o user");
+        let join_at = plain_out.iter().position(|l| *l == join);
+        let mode_at = plain_out.iter().position(|l| *l == mode);
+        assert!(
+            join_at.is_some() && mode_at == join_at.map(|at| at + 1),
+            "{channel}: {plain_out:#?}"
+        );
+    }
+    // extended-join and away-notify shape the rejoin as a real join would.
+    let ext_out = s.drain(extended);
+    assert!(
+        ext_out
+            .iter()
+            .any(|l| l.starts_with(":user!user@cloak.example JOIN #room * :")),
+        "{ext_out:#?}"
+    );
+    assert_eq!(
+        ext_out
+            .iter()
+            .filter(|l| *l == ":user!user@cloak.example AWAY :lunch")
+            .count(),
+        2,
+        "{ext_out:#?}"
+    );
+}
+
 /// A chghost-capable target already learns of the host change from CHGHOST, so
 /// it must not also get a redundant RPL_VISIBLEHOST.
 #[test]
@@ -10369,22 +10615,32 @@ fn chathistory_rejects_bad_limit() {
     let a = register_with_caps(&mut s, 1, "alice", "batch draft/chathistory");
     s.line(a, "JOIN #h");
     s.drain(a);
-    for bad in [
-        "CHATHISTORY LATEST #h * notanumber",
-        "CHATHISTORY LATEST #h * 0",
-        "CHATHISTORY LATEST #h * 501",
-        "CHATHISTORY LATEST #h *",
-        "CHATHISTORY LATEST #h * 10 extra",
-        "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:00.000Z timestamp=2262-01-01T00:00:00.000Z",
-        "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:00.000Z timestamp=2262-01-01T00:00:00.000Z 501",
-        "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:00.000Z timestamp=2262-01-01T00:00:00.000Z 10 extra",
+    // A missing limit is NEED_MORE_PARAMS; a bad or extra one INVALID_PARAMS.
+    for (bad, code) in [
+        ("CHATHISTORY LATEST #h * notanumber", "INVALID_PARAMS"),
+        ("CHATHISTORY LATEST #h * 0", "INVALID_PARAMS"),
+        ("CHATHISTORY LATEST #h * 501", "INVALID_PARAMS"),
+        ("CHATHISTORY LATEST #h *", "NEED_MORE_PARAMS"),
+        ("CHATHISTORY LATEST #h * 10 extra", "INVALID_PARAMS"),
+        (
+            "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:00.000Z timestamp=2262-01-01T00:00:00.000Z",
+            "NEED_MORE_PARAMS",
+        ),
+        (
+            "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:00.000Z timestamp=2262-01-01T00:00:00.000Z 501",
+            "INVALID_PARAMS",
+        ),
+        (
+            "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:00.000Z timestamp=2262-01-01T00:00:00.000Z 10 extra",
+            "INVALID_PARAMS",
+        ),
     ] {
         s.line(a, bad);
         let out = s.drain(a);
         assert!(
             out.iter()
-                .any(|l| l.contains("FAIL CHATHISTORY INVALID_PARAMS")),
-            "'{bad}' must FAIL INVALID_PARAMS, not silently default: {out:#?}"
+                .any(|l| l.contains(&format!("FAIL CHATHISTORY {code}"))),
+            "'{bad}' must FAIL {code}, not silently default: {out:#?}"
         );
     }
 }

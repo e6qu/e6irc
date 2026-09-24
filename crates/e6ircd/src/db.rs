@@ -3207,7 +3207,9 @@ async fn handle_request(
                 // it failed so it can FAIL the CHATHISTORY rather than reply
                 // with a misleading empty page.
                 eprintln!("db: history query failed: {e}");
-                Err(crate::core::HistoryFault::Unavailable)
+                Err(crate::core::HistoryFault::Unavailable {
+                    subcommand: query.subcommand(),
+                })
             });
             core_tx
                 .push(Input::HistoryPage {
@@ -3298,6 +3300,7 @@ async fn handle_request(
             channel,
             display,
             prefix,
+            origin,
             topic,
             revision,
             label,
@@ -3307,6 +3310,7 @@ async fn handle_request(
                     channel,
                     display,
                     prefix,
+                    origin,
                     topic,
                     revision,
                     retained,

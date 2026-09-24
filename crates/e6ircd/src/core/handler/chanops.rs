@@ -130,6 +130,7 @@ pub(super) fn kick_on_owner(
             actor.identity.prefix, actor.identity.nick
         ),
     };
+    let line = actor.line((state.config.clock)(), line);
     state.broadcast_channel(&key, &line, None);
     let chan = state.channels.get_mut(&key).expect("checked");
     chan.remove_member(victim);
@@ -266,18 +267,22 @@ pub(super) fn invite_on_owner(
         }
         invited.insert(invitee.owner().conn());
     }
-    for recipient in recipients {
-        let body = format!(
+    let now = (state.config.clock)();
+    let line = actor.line(
+        now,
+        format!(
             ":{} INVITE {} :{display}",
             actor.identity.prefix,
             invitee.requested_nick()
-        );
-        let line = invite_tags(state, recipient, &actor.account, &body);
-        state.send_recipient_uncaptured(recipient, bytes::Bytes::from(format!("{line}\r\n")));
+        ),
+    );
+    for recipient in recipients {
+        state.send_event_recipient(recipient, &line);
     }
     let event = crate::core::state::ChannelSessionEvent::Invitation {
+        inviter: actor.originator(),
         inviter_prefix: actor.identity.prefix,
-        inviter_account: actor.account,
+        ts: now,
         channel: display.clone(),
     };
     if state.owns_session(invitee.owner()) {
@@ -291,31 +296,6 @@ pub(super) fn invite_on_owner(
     }
 }
 
-pub(super) fn invite_tags(
-    state: &ServerState,
-    recipient: crate::core::state::Recipient,
-    account: &Option<String>,
-    body: &str,
-) -> String {
-    let mut tags = Vec::new();
-    if recipient.caps().server_time {
-        tags.push(format!("time={}", state.time_tag()));
-    }
-    if recipient.caps().account_tag
-        && let Some(account) = account
-    {
-        tags.push(format!(
-            "account={}",
-            e6irc_proto::message::escape_tag_value(account)
-        ));
-    }
-    if tags.is_empty() {
-        body.into()
-    } else {
-        format!("@{} {body}", tags.join(";"))
-    }
-}
-
 pub(super) fn emit_invitation(
     state: &mut ServerState,
     conn: ConnId,
@@ -323,7 +303,8 @@ pub(super) fn emit_invitation(
 ) {
     let crate::core::state::ChannelSessionEvent::Invitation {
         inviter_prefix,
-        inviter_account,
+        inviter,
+        ts,
         channel,
     } = event;
     // The invitee was online when the INVITE was accepted, but the invitation
@@ -332,10 +313,12 @@ pub(super) fn emit_invitation(
         return;
     };
     let nick = session.nick().unwrap_or("*");
-    let body = format!(":{inviter_prefix} INVITE {nick} :{channel}");
-    let recipient = state.local_recipient(conn);
-    let line = invite_tags(state, recipient, &inviter_account, &body);
-    state.send(conn, &line);
+    let line = EventLine::by(
+        inviter,
+        ts,
+        format!(":{inviter_prefix} INVITE {nick} :{channel}"),
+    );
+    state.send_event(conn, &line);
 }
 
 pub(super) fn emit_invite_result_now(
@@ -378,10 +361,13 @@ pub(super) fn cmd_away(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .filter(|m| !m.is_empty())
         .map(|m| truncate_chars(m, AWAYLEN).to_string());
     let prefix = state.sessions[&conn].prefix();
-    let notify = match &message {
-        Some(m) => fitted_line(format!(":{prefix} AWAY :"), m),
-        None => format!(":{prefix} AWAY"),
-    };
+    let notify = state.user_line(
+        conn,
+        match &message {
+            Some(m) => fitted_line(format!(":{prefix} AWAY :"), m),
+            None => format!(":{prefix} AWAY"),
+        },
+    );
     let is_away = message.is_some();
     let session = state.sessions.get_mut(&conn).expect("checked");
     // Announce only a real transition (state or message): re-declaring the
@@ -700,7 +686,8 @@ pub(super) fn knock_on_owner(
             display,
             actor.identity.prefix,
         );
-        state.send_timed_recipient(recipient, &line);
+        let line = state.server_line(line);
+        state.send_event_recipient(recipient, &line);
     }
     crate::core::state::ChannelKnockResult::KnockDelivered { display }
 }

@@ -765,12 +765,11 @@ pub(crate) fn chanserv_op_on_owner(
         };
     }
     member.op = true;
-    let server = state.config.server_name.clone();
-    state.broadcast_channel(
-        &key,
-        &format!(":{server} MODE {display} +o {target_nick}"),
-        None,
-    );
+    let line = state.server_line(format!(
+        ":{} MODE {display} +o {target_nick}",
+        state.config.server_name
+    ));
+    state.broadcast_channel(&key, &line, None);
     crate::core::state::ChanServOpResult::Opped {
         target: target_nick,
         channel: display,
@@ -1392,6 +1391,25 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
         {
             return;
         }
+    }
+    // A SASL exchange the client started but never finished (it sent
+    // `AUTHENTICATE PLAIN` and then CAP END) cannot hold registration open
+    // forever: the SASL spec has the server abort it with 906 and register the
+    // client without an account, so a payload arriving later cannot log in a
+    // session that has already been welcomed as anonymous.
+    if matches!(
+        state.sessions[&conn].sasl,
+        crate::core::state::SaslState::PlainPending | crate::core::state::SaslState::BearerPending
+    ) {
+        let session = state.sessions.get_mut(&conn).expect("checked above");
+        session.sasl = crate::core::state::SaslState::Idle;
+        session.sasl_buf.clear();
+        state.numeric(
+            conn,
+            ERR_SASLABORTED,
+            &[],
+            Some("SASL authentication aborted"),
+        );
     }
     // Server-ban enforcement: refuse a banned session (K/D/X-line) before
     // completing registration.

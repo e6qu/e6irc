@@ -1013,6 +1013,167 @@ pub(crate) struct Caps {
     pub multiline: bool,
 }
 
+/// Who originated an event, as far as a recipient's tags are concerned: the
+/// `account` (account-tag) and `bot` (bot-mode) the line carries. A JOIN, a
+/// NICK, a MODE a user set bears these exactly as a PRIVMSG does — the
+/// account-tag spec puts the tag on *every* message a user originates, not
+/// only on messages.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Originator {
+    pub(crate) account: Option<String>,
+    pub(crate) bot: bool,
+}
+
+/// Every tag the server itself attaches to a line, for one recipient: `msgid`
+/// (a message's only), `time`, the originator's `account` and `bot` — in that
+/// order, each gated on the recipient's capabilities. The one renderer, shared
+/// by the message paths (PRIVMSG/NOTICE/TAGMSG/multiline/INVITE) and every
+/// other event line ([`EventLine`]), so no delivery path can omit a tag another
+/// path carries.
+pub(crate) fn event_tags(
+    caps: Caps,
+    ts: e6irc_proto::time::Millis,
+    msgid: Option<&str>,
+    account: Option<&str>,
+    bot: bool,
+) -> Vec<String> {
+    let mut tags = Vec::new();
+    if caps.message_tags
+        && let Some(msgid) = msgid
+    {
+        tags.push(format!("msgid={msgid}"));
+    }
+    if caps.server_time {
+        tags.push(format!("time={}", e6irc_proto::time::server_time(ts)));
+    }
+    if caps.account_tag
+        && let Some(account) = account
+    {
+        // An account name can hold `\` (a legal nick char), an escape
+        // introducer in a tag value: escape it so a client decodes the account
+        // that actually spoke.
+        tags.push(format!(
+            "account={}",
+            e6irc_proto::message::escape_tag_value(account)
+        ));
+    }
+    if caps.message_tags && bot {
+        tags.push("bot".to_string());
+    }
+    tags
+}
+
+/// A line reporting an event — a JOIN, a NICK, a MODE, a QUIT — with what
+/// each recipient's tags are rendered from: the event's single timestamp and
+/// who originated it. Every event delivery helper takes one of these rather
+/// than a bare string, and the only ways to build one name the originator
+/// ([`EventLine::by`]) or declare the server the source
+/// ([`EventLine::by_server`]), so a user's line can no longer reach a
+/// recipient without its `account`/`bot` tags.
+#[derive(Debug, Clone)]
+pub struct EventLine {
+    body: Arc<str>,
+    ts: e6irc_proto::time::Millis,
+    origin: Option<Originator>,
+}
+
+impl EventLine {
+    /// A line a user originated.
+    pub(crate) fn by(
+        origin: Originator,
+        ts: e6irc_proto::time::Millis,
+        body: impl Into<Arc<str>>,
+    ) -> Self {
+        Self {
+            body: body.into(),
+            ts,
+            origin: Some(origin),
+        }
+    }
+
+    /// A line the server (or a services pseudo-client) originated.
+    pub(crate) fn by_server(ts: e6irc_proto::time::Millis, body: impl Into<Arc<str>>) -> Self {
+        Self {
+            body: body.into(),
+            ts,
+            origin: None,
+        }
+    }
+
+    pub(crate) fn ts(&self) -> e6irc_proto::time::Millis {
+        self.ts
+    }
+
+    /// The same event with another body (the extended-join form of a JOIN).
+    pub(crate) fn with_body(&self, body: impl Into<Arc<str>>) -> Self {
+        Self {
+            body: body.into(),
+            ts: self.ts,
+            origin: self.origin.clone(),
+        }
+    }
+
+    /// The wire form for a recipient with `caps`, CRLF included.
+    pub(crate) fn render(&self, caps: Caps) -> Bytes {
+        let (account, bot) = self.origin.as_ref().map_or((None, false), |origin| {
+            (origin.account.as_deref(), origin.bot)
+        });
+        let tags = event_tags(caps, self.ts, None, account, bot);
+        if tags.is_empty() {
+            Bytes::from(format!("{}\r\n", self.body))
+        } else {
+            Bytes::from(format!("@{} {}\r\n", tags.join(";"), self.body))
+        }
+    }
+
+    /// Which of `caps` change the rendered form: recipients agreeing on these
+    /// receive identical bytes, so a broadcast renders once per variant.
+    fn variant(&self, caps: Caps) -> usize {
+        usize::from(caps.server_time)
+            | usize::from(caps.account_tag) << 1
+            | usize::from(caps.message_tags) << 2
+    }
+}
+
+/// A shard's source of message ids: unique across the shards of one process
+/// (each id names its shard) and across restarts (each names a random
+/// per-process boot value), so no two messages ever share one. The `messages`
+/// table keys on the msgid and keeps the first row of a duplicate, so an id
+/// shared by two messages — two shards counting from zero in the same
+/// millisecond, or a restart whose clock stepped back — silently loses the
+/// second from history. The id is opaque to every reader (CHATHISTORY pivots,
+/// the bouncer, clients all compare it whole); the leading millisecond only
+/// keeps ids roughly time-ordered for a human reading them.
+#[derive(Debug)]
+struct MsgidSource {
+    /// `{shard}-{boot}-`, fixed for the process.
+    stem: String,
+    counter: u64,
+}
+
+impl MsgidSource {
+    fn new(shard: CoreShardId) -> Self {
+        use aws_lc_rs::rand::SecureRandom;
+        let mut boot = [0u8; 8];
+        aws_lc_rs::rand::SystemRandom::new()
+            .fill(&mut boot)
+            .expect("the system RNG must seed message-id uniqueness across restarts");
+        Self::with_boot(shard, u64::from_le_bytes(boot))
+    }
+
+    fn with_boot(shard: CoreShardId, boot: u64) -> Self {
+        Self {
+            stem: format!("{}-{boot:016x}-", shard.0),
+            counter: 0,
+        }
+    }
+
+    fn next(&mut self, now: e6irc_proto::time::Millis) -> String {
+        self.counter += 1;
+        format!("{}-{}{}", now.as_millis(), self.stem, self.counter)
+    }
+}
+
 /// Field accessor into [`Caps`], used by the CAP REQ machinery.
 pub(crate) type CapAccessor = fn(&mut Caps) -> &mut bool;
 
@@ -1086,6 +1247,9 @@ pub(crate) struct Session {
     reg: Registration,
     /// Mid-CAP-negotiation: registration is held until CAP END.
     pub cap_negotiating: bool,
+    /// The client sent `CAP LS 302` (or later): it gets capability values,
+    /// multi-line CAP replies, and `cap-notify` it cannot turn off.
+    pub cap_302: bool,
     pub caps: Caps,
     /// Services account this connection is authenticated to. Written only by
     /// [`ServerState::set_account`] and [`ServerState::clear_account`]: a
@@ -1620,6 +1784,16 @@ impl ChannelMemberProfile {
     }
 }
 
+impl ChannelMemberProfile {
+    /// The member's originator tags, as its channel owner knows them.
+    pub(crate) fn originator(&self) -> Originator {
+        Originator {
+            account: self.account.clone(),
+            bot: self.bot,
+        }
+    }
+}
+
 impl MemberIdentity {
     pub(crate) fn new(nick: String, prefix: String, invisible: bool) -> Self {
         Self {
@@ -1646,6 +1820,19 @@ impl ChannelActor {
     pub(crate) fn session_owner(&self) -> SessionOwner {
         self.recipient.owner
     }
+
+    pub(crate) fn originator(&self) -> Originator {
+        self.profile.originator()
+    }
+
+    /// A line this actor originated, stamped at `ts`.
+    pub(crate) fn line(
+        &self,
+        ts: e6irc_proto::time::Millis,
+        body: impl Into<Arc<str>>,
+    ) -> EventLine {
+        EventLine::by(self.originator(), ts, body)
+    }
 }
 
 /// A channel owner's complete answer to a JOIN request.
@@ -1654,7 +1841,7 @@ impl ChannelActor {
 /// access to another shard's session table.
 #[derive(Debug, Clone)]
 pub enum ChannelJoinResult {
-    Joined(ChannelJoinSuccess),
+    Joined(Box<ChannelJoinSuccess>),
     /// The session was a member already: nothing changed, nothing is sent
     /// (Solanum / Modern). Distinct from `Joined` so the no-op cannot be
     /// answered with a JOIN echo and a NAMES replay.
@@ -1669,8 +1856,8 @@ pub struct ChannelJoinSuccess {
     pub(crate) topic: Option<Topic>,
     pub(crate) secret: bool,
     pub(crate) members: Vec<(MemberModes, MemberIdentity)>,
-    pub(crate) own_join: String,
-    pub(crate) own_mode: Option<String>,
+    pub(crate) own_join: EventLine,
+    pub(crate) own_mode: Option<EventLine>,
 }
 
 #[derive(Debug, Clone)]
@@ -1684,15 +1871,17 @@ pub enum ChannelJoinFailure {
 
 #[derive(Debug, Clone)]
 pub enum ChannelPartResult {
-    Parted { key: ChanKey, line: String },
+    Parted { key: ChanKey, line: EventLine },
     NotOnChannel { name: String },
 }
 
 /// Everyone who shares a channel with one user, each counted once: the
-/// audience of a change to the user rather than to any one channel.
+/// audience of a change to the user rather than to any one channel. A peer
+/// told of a host change by quit-and-rejoin (it lacks `chghost`) also
+/// collects the rejoin lines of each shared channel this reporter owns.
 struct Peers {
     subject: ConnId,
-    recipients: HashMap<ConnId, Recipient>,
+    recipients: HashMap<ConnId, (Recipient, Vec<EventLine>)>,
 }
 
 impl Peers {
@@ -1707,9 +1896,92 @@ impl Peers {
     fn extend(&mut self, members: &[Recipient], audience: UserEventAudience) {
         for recipient in members {
             if recipient.conn() != self.subject && audience.admits(&recipient.caps()) {
-                self.recipients.insert(recipient.conn(), *recipient);
+                self.recipients
+                    .entry(recipient.conn())
+                    .or_insert((*recipient, Vec::new()));
             }
         }
+    }
+
+    /// Add `channel`'s members the event is for; with a host-change
+    /// fallback, those it is not for (no `chghost`) are added too, owed this
+    /// channel's rejoin.
+    fn extend_channel(&mut self, channel: &Channel, event: &UserEvent, server_name: &str) {
+        let members = channel.recipients();
+        self.extend(&members, event.audience);
+        let Some(fallback) = &event.host_change else {
+            return;
+        };
+        let modes = channel.member(self.subject).cloned().unwrap_or_default();
+        for recipient in members.iter() {
+            if recipient.conn() == self.subject || event.audience.admits(&recipient.caps()) {
+                continue;
+            }
+            let rejoin = fallback.rejoin(&channel.name, &modes, recipient.caps(), server_name);
+            self.recipients
+                .entry(recipient.conn())
+                .or_insert((*recipient, Vec::new()))
+                .1
+                .extend(rejoin);
+        }
+    }
+}
+
+/// How a peer without `chghost` learns that a user's host changed: the user
+/// appears to quit and rejoin each shared channel under the new hostmask (with
+/// its away state and channel status restored), the fallback the chghost spec
+/// prescribes. Without it such a peer keeps matching the old hostmask forever.
+#[derive(Debug, Clone)]
+pub(crate) struct HostChangeFallback {
+    pub(crate) quit: EventLine,
+    /// The user's new `nick!user@host`.
+    pub(crate) prefix: String,
+    pub(crate) nick: String,
+    pub(crate) account: Option<String>,
+    pub(crate) realname: String,
+    pub(crate) away: Option<String>,
+}
+
+impl HostChangeFallback {
+    /// The lines re-introducing the user to `channel` for a peer with `caps`.
+    fn rejoin(
+        &self,
+        channel: &str,
+        modes: &MemberModes,
+        caps: Caps,
+        server_name: &str,
+    ) -> Vec<EventLine> {
+        let prefix = &self.prefix;
+        let join = if caps.extended_join {
+            let account = self.account.as_deref().unwrap_or("*");
+            crate::core::handler::fitted_line(
+                format!(":{prefix} JOIN {channel} {account} :"),
+                &self.realname,
+            )
+        } else {
+            format!(":{prefix} JOIN {channel}")
+        };
+        let mut lines = vec![self.quit.with_body(join)];
+        if caps.away_notify
+            && let Some(away) = &self.away
+        {
+            lines.push(self.quit.with_body(crate::core::handler::fitted_line(
+                format!(":{prefix} AWAY :"),
+                away,
+            )));
+        }
+        let letters: String = [(modes.op, 'o'), (modes.voice, 'v')]
+            .iter()
+            .filter_map(|(set, letter)| set.then_some(*letter))
+            .collect();
+        if !letters.is_empty() {
+            let nicks = vec![self.nick.as_str(); letters.len()].join(" ");
+            lines.push(EventLine::by_server(
+                self.quit.ts(),
+                format!(":{server_name} MODE {channel} +{letters} {nicks}"),
+            ));
+        }
+        lines
     }
 }
 
@@ -1767,8 +2039,10 @@ impl UserEventAudience {
 pub struct UserEvent {
     id: (CoreShardId, u64),
     subject: ConnId,
-    line: Arc<str>,
+    line: EventLine,
     audience: UserEventAudience,
+    /// For a host change: what a peer outside `audience` is told instead.
+    host_change: Option<Arc<HostChangeFallback>>,
     /// How many parts each shard will receive. With one, nothing can repeat.
     parts: usize,
 }
@@ -1778,7 +2052,8 @@ pub struct UserEvent {
 pub struct UserEventPart {
     shard: CoreShardId,
     event: UserEvent,
-    recipients: Vec<Recipient>,
+    /// Each recipient, with the rejoin lines it is owed besides the event.
+    recipients: Vec<(Recipient, Vec<EventLine>)>,
 }
 
 impl UserEventPart {
@@ -2112,7 +2387,9 @@ pub struct ChannelModeList {
 pub enum ChannelSessionEvent {
     Invitation {
         inviter_prefix: String,
-        inviter_account: Option<String>,
+        inviter: Originator,
+        /// When the INVITE was accepted: the invitee's copy bears this time.
+        ts: e6irc_proto::time::Millis,
         channel: String,
     },
 }
@@ -2131,7 +2408,10 @@ pub struct ChannelMemberUpdate {
 #[derive(Debug, Clone)]
 pub enum ChannelMemberChange {
     Identity,
-    Nick { previous_prefix: String },
+    /// The session changed nick; `line` is its NICK, relayed to every peer.
+    Nick {
+        line: EventLine,
+    },
 }
 
 impl ChannelMemberUpdate {
@@ -2178,7 +2458,7 @@ pub enum ChannelTopicResult {
         topic: Option<Topic>,
     },
     Set {
-        line: String,
+        line: EventLine,
     },
     NotOnChannel {
         target: String,
@@ -3144,8 +3424,8 @@ pub(crate) struct ServerState {
     /// Wall-clock millisecond the server state was created (STATS u uptime,
     /// which reports the difference in whole seconds).
     pub started_at: e6irc_proto::time::Millis,
-    /// Monotonic per-process counter for msgid uniqueness.
-    pub msgid_counter: u64,
+    /// Where this shard's message ids come from.
+    msgids: MsgidSource,
     /// MONITOR: watched nick → watching connections, on every shard.
     pub(crate) monitors: MonitorDirectory,
     user_event_sequence: u64,
@@ -3721,12 +4001,9 @@ impl ServerState {
         let owners = self.session_channels_by_shard(conn);
         let event = match change {
             ChannelMemberChange::Identity => None,
-            ChannelMemberChange::Nick { previous_prefix } => Some(self.user_event(
-                conn,
-                &format!(":{previous_prefix} NICK {}", user.nick),
-                UserEventAudience::Everyone,
-                owners.len(),
-            )),
+            ChannelMemberChange::Nick { line } => {
+                Some(self.user_event(conn, line, UserEventAudience::Everyone, owners.len()))
+            }
         };
         for channels in owners {
             let update = ChannelMemberUpdate::new(
@@ -3838,7 +4115,7 @@ impl ServerState {
     fn user_event(
         &mut self,
         subject: ConnId,
-        line: &str,
+        line: EventLine,
         audience: UserEventAudience,
         reporters: usize,
     ) -> UserEvent {
@@ -3846,8 +4123,9 @@ impl ServerState {
         UserEvent {
             id: (self.shard, self.user_event_sequence),
             subject,
-            line: line.into(),
+            line,
             audience,
+            host_change: None,
             parts: reporters,
         }
     }
@@ -3859,13 +4137,43 @@ impl ServerState {
     pub(crate) fn notify_user_event(
         &mut self,
         subject: ConnId,
-        line: &str,
+        line: &EventLine,
         audience: UserEventAudience,
         include_self: bool,
     ) {
+        self.notify_user_event_with(subject, line, audience, include_self, None);
+    }
+
+    /// [`Self::notify_user_event`] for a host change: peers outside the
+    /// `chghost` audience are told by `fallback`'s quit-and-rejoin instead.
+    pub(crate) fn notify_host_change(
+        &mut self,
+        subject: ConnId,
+        line: &EventLine,
+        include_self: bool,
+        fallback: HostChangeFallback,
+    ) {
+        self.notify_user_event_with(
+            subject,
+            line,
+            UserEventAudience::Chghost,
+            include_self,
+            Some(Arc::new(fallback)),
+        );
+    }
+
+    fn notify_user_event_with(
+        &mut self,
+        subject: ConnId,
+        line: &EventLine,
+        audience: UserEventAudience,
+        include_self: bool,
+        host_change: Option<Arc<HostChangeFallback>>,
+    ) {
         let owners = self.session_channels_by_shard(subject);
         // The watchers are one more reporter, alongside each channel owner.
-        let event = self.user_event(subject, line, audience, owners.len() + 1);
+        let mut event = self.user_event(subject, line.clone(), audience, owners.len() + 1);
+        event.host_change = host_change;
         for channels in owners {
             let report = ChannelUserEvent {
                 channels,
@@ -3890,7 +4198,7 @@ impl ServerState {
         }
         self.send_user_event_parts(&event, watchers);
         if include_self {
-            self.send_timed(subject, line);
+            self.send_event(subject, line);
         }
     }
 
@@ -3900,7 +4208,7 @@ impl ServerState {
         let mut peers = Peers::of(report.event.subject);
         for key in report.channels.keys() {
             if let Some(channel) = self.channels.get(key) {
-                peers.extend(&channel.recipients(), report.event.audience);
+                peers.extend_channel(channel, &report.event, &self.config.server_name);
             }
         }
         self.send_user_event_parts(&report.event, peers);
@@ -3910,9 +4218,10 @@ impl ServerState {
     /// reporters exist every shard gets a part, even an empty one: a shard
     /// forgets an event once it has heard from all of them.
     fn send_user_event_parts(&mut self, event: &UserEvent, peers: Peers) {
-        let mut by_shard: Vec<Vec<Recipient>> = vec![Vec::new(); self.channels.shard_count()];
-        for recipient in peers.recipients.into_values() {
-            by_shard[recipient.shard().0].push(recipient);
+        let mut by_shard: Vec<Vec<(Recipient, Vec<EventLine>)>> =
+            vec![Vec::new(); self.channels.shard_count()];
+        for (recipient, rejoin) in peers.recipients.into_values() {
+            by_shard[recipient.shard().0].push((recipient, rejoin));
         }
         for (shard, recipients) in by_shard.into_iter().enumerate() {
             if event.parts == 1 && recipients.is_empty() {
@@ -3940,21 +4249,46 @@ impl ServerState {
         let UserEventPart {
             event, recipients, ..
         } = part;
-        let fresh: Vec<Recipient> = if event.parts == 1 {
-            recipients
-        } else {
-            let pending = self.user_events_in_progress.entry(event.id).or_default();
+        // With several reporters, who has been told lives across parts.
+        let mut pending = (event.parts > 1).then(|| {
+            let mut pending = self
+                .user_events_in_progress
+                .remove(&event.id)
+                .unwrap_or_default();
             pending.parts_heard += 1;
-            let fresh = recipients
-                .into_iter()
-                .filter(|recipient| pending.told.insert(recipient.conn()))
-                .collect();
-            if pending.parts_heard == event.parts {
-                self.user_events_in_progress.remove(&event.id);
+            pending
+        });
+        let mut told = Vec::new();
+        for (recipient, rejoin) in recipients {
+            let fresh = pending
+                .as_mut()
+                .is_none_or(|pending| pending.told.insert(recipient.conn()));
+            if rejoin.is_empty() {
+                if fresh {
+                    told.push(recipient);
+                }
+                continue;
             }
-            fresh
-        };
-        self.broadcast_recipients(fresh, &event.line);
+            // A peer outside the event's audience, told by quit-and-rejoin:
+            // the QUIT once, before the first rejoin; each reporter's rejoins.
+            let quit = &event
+                .host_change
+                .as_ref()
+                .expect("only a host change owes rejoins")
+                .quit;
+            if fresh {
+                self.send_event_recipient(recipient, quit);
+            }
+            for line in &rejoin {
+                self.send_event_recipient(recipient, line);
+            }
+        }
+        if let Some(pending) = pending
+            && pending.parts_heard != event.parts
+        {
+            self.user_events_in_progress.insert(event.id, pending);
+        }
+        self.broadcast_recipients(told, &event.line);
     }
 
     pub(crate) fn take_effects(&mut self) -> Vec<CoreEffect> {
@@ -4037,7 +4371,7 @@ impl ServerState {
             suspended_accounts: HashSet::new(),
             db_tx,
             started_at,
-            msgid_counter: 0,
+            msgids: MsgidSource::new(shard),
             monitors: directories.monitors,
             user_event_sequence: 0,
             user_events_in_progress: HashMap::new(),
@@ -4799,6 +5133,7 @@ impl ServerState {
                     realname: None,
                 },
                 cap_negotiating: false,
+                cap_302: false,
                 caps: Caps::default(),
                 account: None,
                 sasl: SaslState::default(),
@@ -5098,14 +5433,21 @@ impl ServerState {
         let Some(channel) = self.channels.get_mut(key) else {
             return;
         };
-        let Some(prefix) = channel
-            .member_identities()
-            .find_map(|(member, _, identity)| (member == conn).then(|| identity.prefix.clone()))
+        let Some((prefix, origin)) =
+            channel
+                .member_profiles()
+                .find_map(|(member, _, identity, profile)| {
+                    (member == conn).then(|| (identity.prefix.clone(), profile.originator()))
+                })
         else {
             return;
         };
         channel.remove_member(conn);
-        let line = format!(":{prefix} PART {}", channel.name);
+        let line = EventLine::by(
+            origin,
+            (self.config.clock)(),
+            format!(":{prefix} PART {}", channel.name),
+        );
         self.memberships.part(conn, key);
         self.broadcast_channel(key, &line, None);
         if !self.channels[key].has_members() {
@@ -5378,8 +5720,7 @@ impl ServerState {
     /// for the same message is exactly the bug this exists to prevent.
     pub fn stamp(&mut self) -> (e6irc_proto::time::Millis, String) {
         let now = (self.config.clock)();
-        self.msgid_counter += 1;
-        (now, format!("{}-{}", now.as_millis(), self.msgid_counter))
+        (now, self.msgids.next(now))
     }
 
     /// Unique reference for a batch (no associated event timestamp).
@@ -5387,35 +5728,48 @@ impl ServerState {
         self.stamp().1
     }
 
-    /// The `@time=` tag value for events emitted now.
-    pub fn time_tag(&self) -> String {
-        e6irc_proto::time::server_time((self.config.clock)())
-    }
-
-    /// Send a line to one recipient, honoring its `server-time` cap.
-    pub fn send_timed(&mut self, conn: ConnId, line: &str) {
-        let tagged = self.sessions.get(&conn).is_some_and(|s| s.caps.server_time);
-        if tagged {
-            let line = format!("@time={} {line}", self.time_tag());
-            self.send(conn, &line);
-        } else {
-            self.send(conn, line);
+    /// The originator tags of `conn`'s session as it is now.
+    pub(crate) fn originator(&self, conn: ConnId) -> Originator {
+        let session = &self.sessions[&conn];
+        Originator {
+            account: session.account.clone(),
+            bot: session.bot,
         }
     }
 
-    pub fn send_timed_recipient(&mut self, recipient: Recipient, line: &str) {
-        let tagged = recipient.caps().server_time;
-        if tagged {
-            let line = format!("@time={} {line}", self.time_tag());
-            self.send_recipient_uncaptured(recipient, Bytes::from(format!("{line}\r\n")));
-        } else {
-            self.send_recipient_uncaptured(recipient, Bytes::from(format!("{line}\r\n")));
-        }
+    /// A line `conn` originated, stamped now.
+    pub(crate) fn user_line(&self, conn: ConnId, body: impl Into<Arc<str>>) -> EventLine {
+        EventLine::by(self.originator(conn), (self.config.clock)(), body)
+    }
+
+    /// A line the server originated, stamped now.
+    pub(crate) fn server_line(&self, body: impl Into<Arc<str>>) -> EventLine {
+        EventLine::by_server((self.config.clock)(), body)
+    }
+
+    /// Send an event line to one local session (labeled-response capture
+    /// applies: this is the session's own answer).
+    pub(crate) fn send_event(&mut self, conn: ConnId, line: &EventLine) {
+        let Some(caps) = self.reply_caps(conn) else {
+            return;
+        };
+        self.send_bytes(conn, line.render(caps));
+    }
+
+    /// Deliver an event line to one recipient on any shard (a delivery, not a
+    /// response: labeled-response capture does not apply).
+    pub(crate) fn send_event_recipient(&mut self, recipient: Recipient, line: &EventLine) {
+        self.send_recipient_uncaptured(recipient, line.render(recipient.caps()));
     }
 
     /// Serialize once per capability variant, deliver to every member of
     /// a channel except `except`.
-    pub fn broadcast_channel(&mut self, chan_key: &ChanKey, line: &str, except: Option<ConnId>) {
+    pub(crate) fn broadcast_channel(
+        &mut self,
+        chan_key: &ChanKey,
+        line: &EventLine,
+        except: Option<ConnId>,
+    ) {
         let Some(chan) = self.channels.get(chan_key) else {
             return;
         };
@@ -5434,21 +5788,14 @@ impl ServerState {
     fn broadcast_recipients(
         &mut self,
         recipients: impl IntoIterator<Item = Recipient>,
-        line: &str,
+        line: &EventLine,
     ) {
-        let plain = Bytes::from(format!("{line}\r\n"));
-        // Built lazily: an audience with no server-time member pays nothing.
-        let mut timed: Option<Bytes> = None;
+        // Built lazily: a variant no recipient needs is never rendered.
+        let mut rendered: [Option<Bytes>; 8] = Default::default();
         for recipient in recipients {
-            let bytes = if recipient.caps().server_time {
-                timed
-                    .get_or_insert_with(|| {
-                        Bytes::from(format!("@time={} {line}\r\n", self.time_tag()))
-                    })
-                    .clone()
-            } else {
-                plain.clone()
-            };
+            let bytes = rendered[line.variant(recipient.caps())]
+                .get_or_insert_with(|| line.render(recipient.caps()))
+                .clone();
             if recipient.shard() != self.shard {
                 self.effects.push(CoreEffect::Delivery {
                     owner: recipient.owner,
@@ -5512,7 +5859,8 @@ impl ServerState {
             format!(":{service}!{service}@{host} NOTICE {nick} :"),
             text,
         );
-        self.send_timed(conn, &line);
+        let line = self.server_line(line);
+        self.send_event(conn, &line);
     }
 
     // ---- teardown -------------------------------------------------------
@@ -5560,11 +5908,11 @@ impl ServerState {
             // so the line survives every recipient's framing.
             let head = format!(":{} QUIT :", session.prefix());
             let reason = crate::core::handler::fit_trailing(&head, reason);
-            format!("{head}{reason}")
+            self.user_line(conn, format!("{head}{reason}"))
         });
         if let Some(line) = quit_line {
             let owners = self.session_channels_by_shard(conn);
-            let event = self.user_event(conn, &line, UserEventAudience::Everyone, owners.len());
+            let event = self.user_event(conn, line, UserEventAudience::Everyone, owners.len());
             for channels in owners {
                 let quit = ChannelQuit::new(channels, event.clone());
                 if quit.shard() == self.shard {
@@ -5686,7 +6034,7 @@ impl ServerState {
             if removed.is_none() {
                 continue;
             }
-            peers.extend(&self.channels[key].recipients(), quit.event.audience);
+            peers.extend_channel(&self.channels[key], &quit.event, &self.config.server_name);
             if !self.channels[key].has_members() {
                 self.remove_channel(key);
             }
@@ -6128,6 +6476,7 @@ mod session_store_tests {
                 owner: SessionOwner::new(ConnId(9), CoreShardId(1)),
                 caps: Caps {
                     server_time: true,
+                    account_tag: true,
                     ..Caps::default()
                 },
             },
@@ -6137,7 +6486,16 @@ mod session_store_tests {
         );
         state.channels.entry(key.clone()).or_insert(channel);
 
-        state.broadcast_channel(&key, ":nick PRIVMSG #chat :hello", None);
+        let origin = Originator {
+            account: Some("nickacct".into()),
+            bot: false,
+        };
+        let line = EventLine::by(
+            origin,
+            e6irc_proto::time::Millis::from_millis(0),
+            ":nick JOIN #chat",
+        );
+        state.broadcast_channel(&key, &line, None);
 
         let effects = state.take_effects();
         assert_eq!(effects.len(), 1);
@@ -6145,8 +6503,76 @@ mod session_store_tests {
             panic!("expected delivery effect");
         };
         assert_eq!(*owner, SessionOwner::new(ConnId(9), CoreShardId(1)));
-        assert!(line.starts_with(b"@time="));
-        assert!(line.ends_with(b":nick PRIVMSG #chat :hello\r\n"));
+        assert_eq!(
+            &line[..],
+            b"@time=1970-01-01T00:00:00.000Z;account=nickacct :nick JOIN #chat\r\n"
+        );
+    }
+
+    #[test]
+    fn msgids_differ_across_shards_and_restarts_at_the_same_instant() {
+        let now = e6irc_proto::time::Millis::from_millis(1_000);
+        let mut first = MsgidSource::with_boot(CoreShardId(0), 7);
+        let mut other_shard = MsgidSource::with_boot(CoreShardId(1), 7);
+        let mut restarted = MsgidSource::with_boot(CoreShardId(0), 8);
+        let ids = [
+            first.next(now),
+            other_shard.next(now),
+            restarted.next(now),
+            first.next(now),
+        ];
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "{ids:?}");
+        // Tag-safe: no character that needs escaping in a tag value.
+        assert!(
+            ids.iter()
+                .all(|id| id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
+        );
+        // Two real sources (random boot values) never agree either.
+        assert_ne!(
+            MsgidSource::new(CoreShardId(0)).next(now),
+            MsgidSource::new(CoreShardId(0)).next(now)
+        );
+    }
+
+    #[test]
+    fn event_tags_render_every_originator_tag_the_recipient_negotiated() {
+        let origin = Originator {
+            account: Some("a\\b".into()),
+            bot: true,
+        };
+        let line = EventLine::by(
+            origin,
+            e6irc_proto::time::Millis::from_millis(0),
+            ":n MODE #c +o x",
+        );
+        let everything = Caps {
+            server_time: true,
+            account_tag: true,
+            message_tags: true,
+            ..Caps::default()
+        };
+        assert_eq!(
+            &line.render(everything)[..],
+            b"@time=1970-01-01T00:00:00.000Z;account=a\\\\b;bot :n MODE #c +o x\r\n"
+        );
+        // `bot` rides message-tags; `account` needs only account-tag.
+        let account_only = Caps {
+            account_tag: true,
+            ..Caps::default()
+        };
+        assert_eq!(
+            &line.render(account_only)[..],
+            b"@account=a\\\\b :n MODE #c +o x\r\n"
+        );
+        assert_eq!(&line.render(Caps::default())[..], b":n MODE #c +o x\r\n");
+        // A server-originated line carries no originator tags at all.
+        let server =
+            EventLine::by_server(e6irc_proto::time::Millis::from_millis(0), ":s MODE #c +o x");
+        assert_eq!(
+            &server.render(everything)[..],
+            b"@time=1970-01-01T00:00:00.000Z :s MODE #c +o x\r\n"
+        );
     }
 
     #[test]

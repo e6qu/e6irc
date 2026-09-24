@@ -2344,6 +2344,11 @@ pub struct AttachCaps {
     /// draft/read-marker: the client wants to set/query per-target read
     /// positions via MARKREAD.
     pub read_marker: bool,
+    /// cap-notify: implied by `CAP LS 302`, and then not switched off.
+    pub cap_notify: bool,
+    /// The client sent `CAP LS 302` (or later): capability values and
+    /// multi-line CAP replies are its to receive.
+    pub cap_302: bool,
 }
 
 /// Filter one serialized line to what the recipient negotiated. `TAGMSG` is
@@ -2562,16 +2567,65 @@ impl SessionChange {
     }
 }
 
+/// Most ISUPPORT tokens kept from one upstream, and the longest kept: the
+/// tokens are the upstream's to choose and are repeated to every attaching
+/// client, so a hostile upstream must not grow them without bound. Real
+/// networks advertise a few dozen short tokens.
+const MAX_UPSTREAM_ISUPPORT_TOKENS: usize = 128;
+const MAX_UPSTREAM_ISUPPORT_TOKEN_LEN: usize = 200;
+
+/// What the network told this session about itself in its registration burst:
+/// the `RPL_MYINFO` (004) mode lists and the `RPL_ISUPPORT` (005) tokens. An
+/// attaching client is welcomed with these, so it parses the network it is
+/// actually talking to — its prefixes, channel types, casemapping — rather
+/// than a fixed guess.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UpstreamFeatures {
+    /// 004's parameters after the server name and version: user modes,
+    /// channel modes, and (optionally) channel modes taking a parameter.
+    pub myinfo_modes: Option<Vec<String>>,
+    /// 005 tokens in the order first advertised, the latest value of each.
+    pub isupport: Vec<String>,
+}
+
+impl UpstreamFeatures {
+    fn observe_isupport(&mut self, tokens: &[&str]) {
+        let key = |token: &str| token.split('=').next().unwrap_or(token).to_string();
+        for token in tokens {
+            if token.is_empty()
+                || token.starts_with(':')
+                || token.len() > MAX_UPSTREAM_ISUPPORT_TOKEN_LEN
+            {
+                continue;
+            }
+            // `-TOKEN` withdraws an earlier advertisement.
+            if let Some(withdrawn) = token.strip_prefix('-') {
+                self.isupport.retain(|kept| key(kept) != withdrawn);
+                continue;
+            }
+            let name = key(token);
+            let full = self.isupport.len() >= MAX_UPSTREAM_ISUPPORT_TOKENS;
+            match self.isupport.iter_mut().find(|kept| key(kept) == name) {
+                Some(kept) => *kept = (*token).to_string(),
+                None if !full => self.isupport.push((*token).to_string()),
+                None => {}
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct IrcSessionState {
     nick: Option<String>,
     channels: std::collections::HashMap<String, upstream_identity::ConfirmedChannel>,
+    features: UpstreamFeatures,
 }
 
 impl IrcSessionState {
     fn begin(&mut self, nick: String) -> IrcSessionSnapshot {
         self.nick = Some(nick);
         self.channels.clear();
+        self.features = UpstreamFeatures::default();
         self.snapshot().expect("a begun IRC session has a nick")
     }
 
@@ -2672,6 +2726,22 @@ impl IrcSessionState {
                 }
             }
             "QUIT" if is_us(source_nick) => self.channels.clear(),
+            // RPL_MYINFO: `004 <nick> <server> <version> <umodes> <cmodes> [<cmodes with param>]`.
+            "004" if is_us(message.params.first().copied()) && message.params.len() >= 5 => {
+                self.features.myinfo_modes = Some(
+                    message.params[3..]
+                        .iter()
+                        .take(3)
+                        .filter(|modes| !modes.is_empty() && !modes.starts_with(':'))
+                        .map(|modes| (*modes).to_string())
+                        .collect(),
+                );
+            }
+            // RPL_ISUPPORT: `005 <nick> <token>... :are supported by this server`.
+            "005" if is_us(message.params.first().copied()) && message.params.len() >= 3 => {
+                let tokens = &message.params[1..message.params.len() - 1];
+                self.features.observe_isupport(tokens);
+            }
             _ => {}
         }
         Ok(change)
@@ -3866,6 +3936,16 @@ impl NetworkHandle {
             .lock()
             .expect("IRC session state poisoned")
             .snapshot()
+    }
+
+    /// What the network's registration burst said about it (004/005), as of
+    /// the current session; empty before one has begun, or for a bridge.
+    pub fn upstream_features(&self) -> UpstreamFeatures {
+        self.irc_session
+            .lock()
+            .expect("IRC session state poisoned")
+            .features
+            .clone()
     }
 
     /// Prepend older (oldest-first) lines to the front of the buffer,
@@ -5196,14 +5276,7 @@ where
                         chathistory::handle_chathistory(attachment.handle, write, *caps, &params)
                             .await?;
                     }
-                    "CHATHISTORY" => {
-                        write
-                            .write_all(
-                                b":*bnc* FAIL CHATHISTORY NEED_CAPS :draft/chathistory required\r\n",
-                            )
-                            .await?;
-                        write.flush().await?;
-                    }
+                    "CHATHISTORY" => chathistory::refuse_without_cap(write).await?,
                     "MARKREAD" if caps.read_marker => {
                         chathistory::handle_markread(
                             attachment.handle,
@@ -5276,12 +5349,11 @@ where
                 }
             }
             // This relay is UTF-8, like the core ingest
-            // path; reject a non-UTF-8 line loudly rather
-            // than swallowing it.
-            Err(_) => {
-                write
-                    .write_all(b":*bnc* NOTICE * :input was not valid UTF-8; not sent upstream\r\n")
-                    .await?;
+            // path; reject a non-UTF-8 line loudly, with the
+            // same FAIL the core and the handshake answer.
+            Err(error) => {
+                let fail = crate::core::invalid_utf8_fail("*bnc*", error.as_bytes());
+                write.write_all(format!("{fail}\r\n").as_bytes()).await?;
                 write.flush().await?;
             }
         },
@@ -5541,45 +5613,17 @@ where
         .await?;
     if caps.read_marker {
         match handle.history() {
-            Some(history) => match crate::db::get_bnc_read_marker(
-                &history.pool,
-                account,
-                &history.network,
-                channel,
-            )
-            .await
-            {
-                Ok(Some(timestamp)) => {
-                    write
-                        .write_all(
-                            format!(":*bnc* MARKREAD {channel} timestamp={timestamp}\r\n")
-                                .as_bytes(),
-                        )
-                        .await?;
-                }
-                Ok(None) => {
-                    write
-                        .write_all(format!(":*bnc* MARKREAD {channel} *\r\n").as_bytes())
-                        .await?;
-                }
-                Err(error) => {
-                    eprintln!(
-                        "bnc: read marker query failed for {account}/{}/{channel}: {error}",
-                        history.network
-                    );
-                    write
-                        .write_all(
-                            b":*bnc* FAIL MARKREAD TEMPORARY_FAILURE :read markers unavailable\r\n",
-                        )
-                        .await?;
-                }
-            },
+            Some(history) => {
+                chathistory::send_read_marker(write, &history, account, channel).await?;
+            }
             None => {
-                write
-                    .write_all(
-                        b":*bnc* FAIL MARKREAD UNAVAILABLE :read markers are not configured\r\n",
-                    )
-                    .await?;
+                let line = crate::core::HistoryFail::TemporarilyUnavailable.line(
+                    "*bnc*",
+                    "MARKREAD",
+                    &[channel],
+                    "read markers are not configured",
+                );
+                write.write_all(format!("{line}\r\n").as_bytes()).await?;
             }
         }
     }
@@ -7356,6 +7400,45 @@ mod tests {
             "restored line still carries a break: {}",
             snapshot[0]
         );
+    }
+
+    /// An attaching client is welcomed with the network's own registration
+    /// burst facts — its 004 mode lists and 005 tokens as the upstream sent
+    /// them — plus only what the bouncer serves itself, and a complete
+    /// 001-004 so it knows it is registered.
+    #[test]
+    fn welcome_reflects_the_attached_networks_isupport() {
+        let (handle, ends) = NetworkHandle::channels(8);
+        // Before any session: the bridge defaults, no CHATHISTORY (no store).
+        let (_, burst) = serve::welcome("bnc.test", "net", &handle, "alice".into());
+        let numerics: Vec<&str> = burst
+            .iter()
+            .map(|line| line.split(' ').nth(1).expect("numeric"))
+            .collect();
+        assert_eq!(numerics, ["001", "002", "003", "004", "005", "422"]);
+        assert!(burst[4].contains(" PREFIX=(qaohv)~&@%+ "), "{burst:#?}");
+        assert!(!burst[4].contains("CHATHISTORY"), "{burst:#?}");
+
+        ends.begin_irc_session("alice".to_string());
+        for line in [
+            ":up.example 004 alice up.example solanum-1 DQRSZaghilopsuwz CFILMPQSTbcefgijklmnopqrstuvz bkloveqjfI",
+            ":up.example 005 alice CASEMAPPING=ascii CHANTYPES=# PREFIX=(ov)@+ CHATHISTORY=50 :are supported by this server",
+            ":up.example 005 alice NETWORK=Up -CHANTYPES :are supported by this server",
+        ] {
+            ends.emit_session_line(line.to_string()).expect("tracked");
+        }
+        let (_, burst) = serve::welcome("bnc.test", "net", &handle, "alice".into());
+        assert_eq!(
+            burst[3],
+            ":bnc.test 004 alice bnc.test e6irc-bnc-".to_string()
+                + env!("CARGO_PKG_VERSION")
+                + " DQRSZaghilopsuwz CFILMPQSTbcefgijklmnopqrstuvz bkloveqjfI"
+        );
+        assert_eq!(
+            burst[4],
+            ":bnc.test 005 alice CASEMAPPING=ascii PREFIX=(ov)@+ NETWORK=Up :are supported by this server"
+        );
+        assert!(burst.iter().all(|line| line.len() + 2 <= 512));
     }
 
     #[test]
