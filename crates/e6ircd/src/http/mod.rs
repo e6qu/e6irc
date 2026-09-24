@@ -80,21 +80,6 @@ macro_rules! require_managed_config {
     };
 }
 
-/// One in-flight OIDC authorization (state → verifier/nonce), expiring
-/// after ten minutes.
-pub struct PendingAuth {
-    provider: String,
-    pkce_verifier: String,
-    nonce: openidconnect::Nonce,
-    started: Instant,
-    /// When set, the callback links the resulting identity to this account
-    /// instead of logging in / auto-provisioning.
-    link_account: Option<String>,
-    /// A silent (`prompt=none`) SSO probe: on `login_required` the callback
-    /// bounces to `/?sso=none` instead of returning an error.
-    silent: bool,
-}
-
 pub struct AppState {
     pub server_name: String,
     pub network_name: String,
@@ -115,7 +100,12 @@ pub struct AppState {
     /// SHA-256 of the deployment-owned token for the machine-readable
     /// application observation endpoint. The plaintext is never retained.
     pub(crate) monitoring_token_digest: Option<[u8; 32]>,
-    pub pending_auth: Mutex<HashMap<String, PendingAuth>>,
+    /// Per-startup key sealing each in-flight OpenID Connect authorization
+    /// into the browser's own state cookie, so the server holds no per-flow
+    /// state an anonymous flood could exhaust. Like `csrf_key`, it protects
+    /// only short-lived browser state and is not derived from the optional
+    /// at-rest `secret_key`: a restart ends flows begun before it.
+    pub oidc_flow_key: crate::secret::SecretKey,
     /// Inbound queue to the IRC core, for the ws-irc bridge.
     pub core_tx: crate::core::CoreIngress,
     /// Shared connection-id allocator (with every other ingress transport).
@@ -281,10 +271,6 @@ impl AppState {
             hsts_include_subdomains: self.hsts_include_subdomains,
             internal_upstreams: self.internal_upstreams,
         }
-    }
-
-    pub fn no_pending_auth() -> Mutex<HashMap<String, PendingAuth>> {
-        Mutex::new(HashMap::new())
     }
 
     /// A CSRF token bound to a web session: `HMAC(csrf_key, session)`.

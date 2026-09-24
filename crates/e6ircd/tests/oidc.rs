@@ -58,8 +58,8 @@ fn browser() -> reqwest::Client {
 }
 
 /// Start a dex login at `base`, follow dex's redirects (the mock connector
-/// auto-approves) back to the callback, and return the callback's response.
-async fn complete_dex_login(client: &reqwest::Client, base: &str) -> reqwest::Response {
+/// auto-approves) back to the callback; return its response and the callback URL.
+async fn complete_dex_login(client: &reqwest::Client, base: &str) -> (reqwest::Response, String) {
     // 1. start → redirect into dex
     let resp = client
         .get(format!("{base}/api/v1/auth/oidc/dex/start"))
@@ -106,8 +106,12 @@ async fn complete_dex_login(client: &reqwest::Client, base: &str) -> reqwest::Re
         "never returned to callback: {location}"
     );
 
-    // 3. our callback
-    client.get(&location).send().await.expect("callback")
+    // 3. our callback, carrying the extension parameters Google appends and a
+    // granted scope other than the one requested — RFC 6749 §4.1.2 and §3.3
+    // say the client ignores both.
+    let callback = format!("{location}&authuser=0&hd=kilgore.trout&prompt=consent&scope=openid");
+    let response = client.get(&callback).send().await.expect("callback");
+    (response, callback)
 }
 
 #[tokio::test]
@@ -132,7 +136,7 @@ async fn full_oidc_login_provisions_account_and_session() {
         .await
         .expect("start");
     let base = format!("http://{}", running.http_addr.expect("http"));
-    let resp = complete_dex_login(&browser(), &base).await;
+    let (resp, _) = complete_dex_login(&browser(), &base).await;
     assert_eq!(resp.status(), 409);
     assert_eq!(
         resp.headers()
@@ -164,13 +168,21 @@ async fn full_oidc_login_provisions_account_and_session() {
     let client = browser();
 
     // The callback: session cookie + redirect home.
-    let resp = complete_dex_login(&client, &base).await;
+    let (resp, callback) = complete_dex_login(&client, &base).await;
     assert_eq!(
         resp.status(),
         303,
         "{}",
         resp.text().await.unwrap_or_default()
     );
+
+    // The answered callback spent the flow cookie: replaying the same callback
+    // in the same browser is not bound to any flow (and its code is spent at
+    // the provider regardless).
+    let replay = client.get(&callback).send().await.expect("replay");
+    assert_eq!(replay.status(), 401);
+    let refusal: serde_json::Value = replay.json().await.expect("problem document");
+    assert_eq!(refusal["title"], "Login state not bound to this browser");
 
     // 4. /me sees the provisioned account (mock connector's user)
     let me: serde_json::Value = client
@@ -366,8 +378,28 @@ async fn oidc_identity_link_flow_and_conflict() {
             .build()
             .expect("client");
         let cookie = format!("e6irc_session={session}");
+        // Without the session's CSRF value the link is refused: a cross-site
+        // navigation carries the cookie but cannot know it.
         let resp = client
             .get(format!("{base}/api/v1/auth/oidc/dex/link"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .expect("link start without csrf");
+        assert_eq!(resp.status(), 403, "link start without csrf");
+        let me: serde_json::Value = client
+            .get(format!("{base}/api/v1/me"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .expect("me")
+            .json()
+            .await
+            .expect("me json");
+        let csrf = me["csrf_token"].as_str().expect("session CSRF value");
+        let resp = client
+            .get(format!("{base}/api/v1/auth/oidc/dex/link"))
+            .query(&[("csrf", csrf)])
             .header("cookie", &cookie)
             .send()
             .await
@@ -407,7 +439,7 @@ async fn oidc_identity_link_flow_and_conflict() {
             location.starts_with(base),
             "never returned to callback: {location}"
         );
-        // The callback carries no auth of its own — the pending state does.
+        // The callback carries no auth of its own — the sealed flow cookie does.
         client
             .get(&location)
             .send()

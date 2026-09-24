@@ -179,8 +179,8 @@ pub(super) async fn discover_metadata(
 
 pub(super) async fn oidc_start(
     State(state): State<Arc<AppState>>,
-    // Each login start forces an outbound discovery fetch and grows
-    // `pending_auth`, so throttle the unauthenticated flood per client IP.
+    // Each login start forces an outbound discovery fetch, so throttle the
+    // unauthenticated flood per client IP.
     _rl: RateLimited,
     Path(provider_name): Path<String>,
 ) -> Response {
@@ -204,30 +204,177 @@ pub(super) async fn oidc_sso_start(
 
 /// Begin an OIDC flow that *links* the resulting identity to the
 /// authenticated caller's account rather than logging in. The account is
-/// remembered in the pending-auth entry; the shared callback attaches the
-/// identity when the provider returns.
+/// sealed into the flow cookie; the shared callback attaches the identity when
+/// the provider returns.
 pub(super) async fn oidc_link_start(
     State(state): State<Arc<AppState>>,
     // Authenticated, so not an unauthenticated vector, but each call forces a
-    // discovery fetch and grows `pending_auth` — gated for parity with its
-    // siblings.
+    // discovery fetch — gated for parity with its siblings.
     _rl: RateLimited,
     // Whoever finishes this flow at the provider becomes a login identity of
     // the account. A bearer admitted here could link its holder's own identity
     // and sign in as the owner, with nothing more than the `read` scope.
-    BrowserSession(account, _): BrowserSession,
+    BrowserSession(account, session): BrowserSession,
     Path(provider_name): Path<String>,
+    // A cross-site top-level navigation carries the SameSite=Lax session
+    // cookie, so without the session-bound value any page could start a link
+    // flow in the owner's browser and, at a provider that auto-approves, attach
+    // whichever provider identity that browser is signed in to.
+    QueryParams(query): QueryParams<CsrfQuery>,
 ) -> Response {
+    if !query.admits(&state, &session) {
+        return csrf_refusal();
+    }
     oidc_authorize(&state, &provider_name, Some(account), false).await
+}
+
+/// How long a browser may take between leaving for the provider and coming
+/// back to the callback.
+const OIDC_FLOW_TTL: Duration = Duration::from_secs(600);
+
+/// The AEAD associated data every flow cookie is sealed under: a flow cookie
+/// cannot be opened as any other sealed value, nor another value as a flow.
+const OIDC_FLOW_CONTEXT: &[u8] = b"oidc-authorization-flow";
+
+/// An authorization-code flow a browser is in the middle of, carried *by that
+/// browser* in its HttpOnly state cookie, sealed with the process's flow key
+/// ([`AppState::oidc_flow_key`]). The server keeps nothing per flow, so no
+/// number of anonymous `/start` requests can exhaust anything a real login
+/// needs.
+///
+/// Sealing makes every field authentic and secret: the browser cannot read
+/// the PKCE verifier or nonce, nor rewrite the provider, the account a link
+/// attaches to, or the expiry. Replay is bounded without server state: the
+/// authorization code a callback exchanges is single-use at the provider and
+/// bound to this flow's PKCE verifier, every callback that proves the binding
+/// clears the cookie, and a cookie outlives neither [`OIDC_FLOW_TTL`] nor the
+/// process (the key is regenerated at startup).
+#[derive(Serialize, Deserialize)]
+struct OidcFlow {
+    provider: String,
+    /// The OAuth `state` the provider echoes back; the callback admits only a
+    /// response whose `state` equals it.
+    state: String,
+    pkce_verifier: String,
+    nonce: String,
+    /// Seconds since the Unix epoch after which the flow is refused.
+    expires_at: u64,
+    /// When set, the callback links the resulting identity to this account
+    /// instead of logging in / auto-provisioning.
+    link_account: Option<String>,
+    /// A silent (`prompt=none`) SSO probe: on `login_required` the callback
+    /// bounces to `/?sso=none` instead of returning an error.
+    silent: bool,
+}
+
+/// Why a callback's flow cookie was not admitted.
+#[derive(Debug, PartialEq, Eq)]
+enum FlowRefusal {
+    /// No cookie, a cookie this process did not seal, or one whose `state`
+    /// differs from the callback's: the response is not this browser's.
+    Unbound,
+    Expired,
+    WrongProvider,
+}
+
+impl FlowRefusal {
+    fn response(&self) -> Response {
+        let title = match self {
+            Self::Unbound => "Login state not bound to this browser",
+            Self::Expired => "Unknown or expired login state",
+            Self::WrongProvider => "Login state mismatch",
+        };
+        problem(StatusCode::UNAUTHORIZED, title, None)
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the Unix epoch")
+        .as_secs()
+}
+
+impl OidcFlow {
+    fn seal(&self, key: &crate::secret::SecretKey) -> String {
+        key.seal(
+            &serde_json::to_string(self).expect("a flow serializes"),
+            OIDC_FLOW_CONTEXT,
+        )
+    }
+
+    /// The flow this browser started, admitted only when it is authentic, its
+    /// `state` equals the one the provider returned (constant-time), it is for
+    /// this provider, and it has not expired.
+    fn open(
+        key: &crate::secret::SecretKey,
+        cookie: Option<&str>,
+        provider: &str,
+        returned_state: &str,
+        now: u64,
+    ) -> Result<Self, FlowRefusal> {
+        let flow: Self = cookie
+            .and_then(|sealed| key.open(sealed, OIDC_FLOW_CONTEXT).ok())
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .ok_or(FlowRefusal::Unbound)?;
+        if aws_lc_rs::constant_time::verify_slices_are_equal(
+            flow.state.as_bytes(),
+            returned_state.as_bytes(),
+        )
+        .is_err()
+        {
+            return Err(FlowRefusal::Unbound);
+        }
+        if flow.provider != provider {
+            return Err(FlowRefusal::WrongProvider);
+        }
+        if now >= flow.expires_at {
+            return Err(FlowRefusal::Expired);
+        }
+        Ok(flow)
+    }
+
+    /// The browser's flow for this callback, read from its state cookie.
+    fn from_callback(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        provider: &str,
+        returned_state: &str,
+    ) -> Result<Self, FlowRefusal> {
+        Self::open(
+            &state.oidc_flow_key,
+            cookie_value(headers, oidc_state_cookie_name(state.secure_cookies)).as_deref(),
+            provider,
+            returned_state,
+            unix_now(),
+        )
+    }
+}
+
+/// The `Set-Cookie` value that ends a flow: sent by every callback that proved
+/// the browser's binding, so a flow cookie is spent once it has been answered.
+fn clear_flow_cookie(secure_cookies: bool) -> String {
+    let secure = if secure_cookies { "; Secure" } else { "" };
+    format!(
+        "{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure}",
+        oidc_state_cookie_name(secure_cookies)
+    )
+}
+
+/// `response` with the flow cookie cleared.
+fn spending_flow(state: &AppState, mut response: Response) -> Response {
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        clear_flow_cookie(state.secure_cookies)
+            .parse()
+            .expect("cookie header value"),
+    );
+    response
 }
 
 /// Shared authorization-request builder for login, link, and silent-SSO
 /// flows. `silent` adds `prompt=none` so the provider returns without any
 /// UI (used for the SSO-session probe).
-/// Cap on in-flight OIDC login flows, bounding the `pending_auth` map against
-/// an unauthenticated flood of login initiations.
-pub(super) const MAX_PENDING_AUTH: usize = 4096;
-
 pub(super) async fn oidc_authorize(
     state: &AppState,
     provider_name: &str,
@@ -264,34 +411,20 @@ pub(super) async fn oidc_authorize(
         request = request.add_extra_param("prompt", "none");
     }
     let (auth_url, csrf, nonce) = request.url();
-    let mut pending = state.pending_auth.lock().expect("poisoned");
-    pending.retain(|_, p| p.started.elapsed() < Duration::from_secs(600));
-    // Bound the map so an unauthenticated flood of /start (each entry lives up
-    // to 10 minutes) cannot grow it without limit.
-    if pending.len() >= MAX_PENDING_AUTH {
-        return problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Too many pending logins; retry shortly",
-            None,
-        );
-    }
-    pending.insert(
-        csrf.secret().clone(),
-        PendingAuth {
-            provider: provider.name.clone(),
-            pkce_verifier: pkce_verifier.secret().clone(),
-            nonce,
-            started: Instant::now(),
-            link_account,
-            silent,
-        },
-    );
-    drop(pending);
-    // Bind the flow to this browser: an HttpOnly cookie equal to the OAuth
-    // `state`. The callback requires it, so a login response captured by an
-    // attacker cannot be replayed into a victim's browser to plant the
-    // attacker's session (login CSRF / session fixation). SameSite=Lax still
-    // rides the top-level redirect back from the provider.
+    let flow = OidcFlow {
+        provider: provider.name.clone(),
+        state: csrf.secret().clone(),
+        pkce_verifier: pkce_verifier.secret().clone(),
+        nonce: nonce.secret().clone(),
+        expires_at: unix_now() + OIDC_FLOW_TTL.as_secs(),
+        link_account,
+        silent,
+    };
+    // Bind the flow to this browser: the callback admits only a response whose
+    // `state` matches the sealed flow in this cookie, so a login response
+    // captured by an attacker cannot be replayed into a victim's browser to
+    // plant the attacker's session (login CSRF / session fixation).
+    // SameSite=Lax still rides the top-level redirect back from the provider.
     let secure = if state.secure_cookies { "; Secure" } else { "" };
     (
         StatusCode::TEMPORARY_REDIRECT,
@@ -300,9 +433,10 @@ pub(super) async fn oidc_authorize(
             (
                 header::SET_COOKIE,
                 format!(
-                    "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600{secure}",
+                    "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{secure}",
                     oidc_state_cookie_name(state.secure_cookies),
-                    csrf.secret()
+                    flow.seal(&state.oidc_flow_key),
+                    OIDC_FLOW_TTL.as_secs(),
                 ),
             ),
         ],
@@ -318,34 +452,21 @@ fn requested_scopes(provider: &OidcProviderConfig) -> Vec<String> {
     }
 }
 
-fn callback_scope_matches(provider: &OidcProviderConfig, scope: &str) -> bool {
-    let returned = scope
-        .split_ascii_whitespace()
-        .collect::<std::collections::BTreeSet<_>>();
-    let expected = requested_scopes(provider)
-        .into_iter()
-        .chain(std::iter::once("openid".into()))
-        .collect::<std::collections::BTreeSet<_>>();
-    returned == expected.iter().map(String::as_str).collect()
-}
-
-/// The provider's redirect back. The set is closed: a parameter this server
-/// does not act on is refused, so a provider cannot smuggle meaning past the
-/// handler. `session_state` is the one parameter admitted without being acted
-/// on — Keycloak and Microsoft Entra append it to every authorization response
-/// (OpenID Connect Session Management) and there is nothing for this server to
-/// do with it; without the field those providers' every login was a `400`.
+/// The provider's redirect back: the parameters this server acts on. Unlike
+/// every other query, the set is open. The authorization response is the
+/// provider's vocabulary, not this server's, and RFC 6749 §4.1.2 requires a
+/// client to ignore parameters it does not recognize — Google appends
+/// `authuser`, `prompt` and `hd`, Keycloak and Microsoft Entra
+/// `session_state`. A granted `scope` is likewise not acted on: §3.3 lets a
+/// provider grant a different set than was requested, and what is trusted is
+/// the ID token, whose signature, issuer, audience and nonce are verified.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct CallbackQuery {
     pub(super) code: Option<String>,
     pub(super) state: Option<String>,
     pub(super) error: Option<String>,
-    pub(super) scope: Option<String>,
     #[serde(rename = "iss")]
     pub(super) issuer: Option<String>,
-    #[serde(rename = "session_state")]
-    pub(super) _session_state: Option<String>,
 }
 
 /// How the callback answers a provisioning refusal: the provider's claim named
@@ -370,46 +491,37 @@ pub(super) async fn oidc_callback(
     headers: axum::http::HeaderMap,
     QueryParams(query): QueryParams<CallbackQuery>,
 ) -> Response {
-    use openidconnect::{AuthorizationCode, PkceCodeVerifier, TokenResponse};
-    if query.issuer.as_deref().is_some_and(|issuer| {
-        !state
-            .oidc_providers
-            .iter()
-            .any(|provider| provider.name == provider_name && provider.issuer_url == issuer)
-    }) {
+    let Some(provider) = state
+        .oidc_providers
+        .iter()
+        .find(|p| p.name == provider_name)
+        .cloned()
+    else {
+        return problem(StatusCode::NOT_FOUND, "Unknown OIDC provider", None);
+    };
+    if query
+        .issuer
+        .as_deref()
+        .is_some_and(|issuer| provider.issuer_url != issuer)
+    {
         return problem(StatusCode::UNAUTHORIZED, "OIDC issuer mismatch", None);
     }
-    if query.scope.as_deref().is_some_and(|scope| {
-        !state
-            .oidc_providers
-            .iter()
-            .find(|provider| provider.name == provider_name)
-            .is_some_and(|provider| callback_scope_matches(provider, scope))
-    }) {
-        return problem(StatusCode::UNAUTHORIZED, "OIDC scope mismatch", None);
-    }
     if let Some(err) = query.error.as_deref() {
-        // Consuming the pending entry requires the browser to present the
-        // binding cookie, constant-time-equal to the returned `state` — the
-        // same guard the success path applies below, and for the same reason:
-        // an attacker who learns a victim's in-flight `state` but lacks the
-        // cookie must not be able to race the callback with `?error=…&state=…`
-        // and burn the victim's still-pending login (a login-DoS). An unbound
-        // error callback still gets the honest refusal response; it just does
-        // not get to delete anyone's pending entry.
-        let bound_state = query.state.as_ref().filter(|s| {
-            cookie_value(&headers, oidc_state_cookie_name(state.secure_cookies)).is_some_and(|c| {
-                aws_lc_rs::constant_time::verify_slices_are_equal(c.as_bytes(), s.as_bytes())
-                    .is_ok()
-            })
-        });
+        // Only a callback that proves this browser's binding — the sealed flow
+        // cookie whose `state` equals the returned one — spends the cookie or
+        // learns the flow was silent. An attacker who learns a victim's
+        // in-flight `state` cannot race the callback with `?error=…&state=…`
+        // and burn the victim's still-pending login (a login-DoS); an unbound
+        // error callback still gets the honest refusal response.
+        let Some(flow) = query.state.as_deref().and_then(|returned| {
+            OidcFlow::from_callback(&state, &headers, &provider_name, returned).ok()
+        }) else {
+            return problem(StatusCode::UNAUTHORIZED, "OIDC login refused", Some(err));
+        };
         // A silent SSO probe (`prompt=none`) with no upstream session comes
-        // back as `login_required`; that is expected — clear the pending
-        // entry and bounce to interactive login rather than erroring.
-        let was_silent = bound_state
-            .and_then(|s| state.pending_auth.lock().expect("poisoned").remove(s))
-            .is_some_and(|p| p.silent);
-        if was_silent {
+        // back as `login_required`; that is expected — bounce to interactive
+        // login rather than erroring.
+        if flow.silent {
             // `consent_required` is not `login_required`: the browser *does*
             // have a provider session, it has simply never authorized this
             // client. OpenID Connect answers a silent probe that way on a
@@ -418,53 +530,46 @@ pub(super) async fn oidc_callback(
             // the provider grants that without any interaction, so single
             // sign-on stays seamless; treating it as "not signed in" would
             // strand a signed-in user on the sign-in page forever, because the
-            // consent that is missing can never be recorded by probing.
+            // consent that is missing can never be recorded by probing. The
+            // new flow's cookie replaces this one.
             if err == "consent_required" {
                 return oidc_authorize(&state, &provider_name, None, false).await;
             }
-            return Redirect::to("/?sso=none").into_response();
+            return spending_flow(&state, Redirect::to("/?sso=none").into_response());
         }
-        return problem(StatusCode::UNAUTHORIZED, "OIDC login refused", Some(err));
+        return spending_flow(
+            &state,
+            problem(StatusCode::UNAUTHORIZED, "OIDC login refused", Some(err)),
+        );
     }
-    let (Some(code), Some(csrf_state)) = (query.code, query.state) else {
+    let (Some(code), Some(returned_state)) = (query.code, query.state) else {
         return problem(StatusCode::BAD_REQUEST, "Missing code or state", None);
     };
-    // Require the browser to present the binding cookie set at authorize time,
-    // constant-time-equal to the returned `state`. Without this, an attacker
-    // who completed their own login could feed the resulting callback URL to a
-    // victim and plant the attacker's session in the victim's browser.
-    //
-    // This check comes *before* the pending entry is consumed: an attacker who
-    // learns a victim's in-flight `state` but lacks the browser cookie must be
-    // turned away without burning the victim's login, or they could DoS every
-    // in-flight sign-in by racing the callback.
-    let bound =
-        cookie_value(&headers, oidc_state_cookie_name(state.secure_cookies)).is_some_and(|c| {
-            aws_lc_rs::constant_time::verify_slices_are_equal(c.as_bytes(), csrf_state.as_bytes())
-                .is_ok()
-        });
-    if !bound {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "Login state not bound to this browser",
-            None,
-        );
-    }
-    let Some(pending) = state
-        .pending_auth
-        .lock()
-        .expect("poisoned")
-        .remove(&csrf_state)
-    else {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "Unknown or expired login state",
-            None,
-        );
+    // Require this browser's sealed flow for the returned `state`. Without it,
+    // an attacker who completed their own login could feed the resulting
+    // callback URL to a victim and plant the attacker's session in the
+    // victim's browser. A refused callback leaves the cookie alone, so an
+    // attacker who learns a victim's in-flight `state` cannot burn the login.
+    let flow = match OidcFlow::from_callback(&state, &headers, &provider_name, &returned_state) {
+        Ok(flow) => flow,
+        Err(refusal) => return refusal.response(),
     };
-    if pending.provider != provider_name || pending.started.elapsed() > Duration::from_secs(600) {
-        return problem(StatusCode::UNAUTHORIZED, "Login state mismatch", None);
-    }
+    spending_flow(
+        &state,
+        complete_flow(&state, &provider, flow, code, &headers).await,
+    )
+}
+
+/// Finish an admitted flow: exchange the code, verify the ID token, and link
+/// the identity or establish the session.
+async fn complete_flow(
+    state: &AppState,
+    provider: &OidcProviderConfig,
+    flow: OidcFlow,
+    code: String,
+    headers: &axum::http::HeaderMap,
+) -> Response {
+    use openidconnect::{AuthorizationCode, Nonce, PkceCodeVerifier, TokenResponse};
     let Some(pool) = state.pool.clone() else {
         return problem(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -472,19 +577,13 @@ pub(super) async fn oidc_callback(
             None,
         );
     };
-    let provider = state
-        .oidc_providers
-        .iter()
-        .find(|p| p.name == provider_name)
-        .cloned()
-        .expect("pending auth references a configured provider");
-    let client = match discover_client_or_bad_gateway(&state, &provider).await {
+    let client = match discover_client_or_bad_gateway(state, provider).await {
         Ok(c) => c,
         Err(resp) => return resp.into(),
     };
     let token_response = match client
         .exchange_code(AuthorizationCode::new(code))
-        .set_pkce_verifier(PkceCodeVerifier::new(pending.pkce_verifier))
+        .set_pkce_verifier(PkceCodeVerifier::new(flow.pkce_verifier))
         .request_async(&oidc_http_client())
         .await
     {
@@ -497,7 +596,7 @@ pub(super) async fn oidc_callback(
     let Some(id_token) = token_response.id_token() else {
         return problem(StatusCode::UNAUTHORIZED, "Provider sent no ID token", None);
     };
-    let claims = match id_token.claims(&client.id_token_verifier(), &pending.nonce) {
+    let claims = match id_token.claims(&client.id_token_verifier(), &Nonce::new(flow.nonce)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("oidc: id token rejected: {e}");
@@ -508,7 +607,7 @@ pub(super) async fn oidc_callback(
     let subject = claims.subject().as_str();
     let email = claims.email().map(|value| value.as_str().to_string());
     if !email_domain_admitted(
-        &provider,
+        provider,
         email.as_deref(),
         claims.email_verified() == Some(true),
     ) {
@@ -533,27 +632,13 @@ pub(super) async fn oidc_callback(
         }
     };
     let sid = token_claims.as_ref().and_then(|claims| claims.sid.clone());
-    // The state-binding cookie has done its job (the pending entry was
-    // consumed above); every completed flow expires it now rather than leaving
-    // it in the browser until its Max-Age. Defense-in-depth — no stray auth
-    // state.
-    let secure = if state.secure_cookies { "; Secure" } else { "" };
-    let clear_state_cookie = format!(
-        "{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure}",
-        oidc_state_cookie_name(state.secure_cookies)
-    );
     // Link flow: attach this identity to the account that started it,
     // rather than logging in / provisioning a new account.
-    if let Some(account) = &pending.link_account {
+    if let Some(account) = &flow.link_account {
         return match crate::db::link_oidc_identity(&pool, account, issuer, subject).await {
-            Ok(crate::db::LinkOutcome::Linked | crate::db::LinkOutcome::AlreadyYours) => (
-                StatusCode::SEE_OTHER,
-                [
-                    (header::LOCATION, "/?linked=1".to_string()),
-                    (header::SET_COOKIE, clear_state_cookie),
-                ],
-            )
-                .into_response(),
+            Ok(crate::db::LinkOutcome::Linked | crate::db::LinkOutcome::AlreadyYours) => {
+                (StatusCode::SEE_OTHER, [(header::LOCATION, "/?linked=1")]).into_response()
+            }
             Ok(crate::db::LinkOutcome::Conflict) => problem(
                 StatusCode::CONFLICT,
                 "Identity already linked to another account",
@@ -603,7 +688,7 @@ pub(super) async fn oidc_callback(
         .and_then(Role::from_claim);
     let verified_shauth_identity =
         email.is_some() && claims.email_verified() == Some(true) && role.is_some();
-    if pending.provider == "shauth" && !verified_shauth_identity {
+    if flow.provider == "shauth" && !verified_shauth_identity {
         return problem(
             StatusCode::UNAUTHORIZED,
             "Shauth identity claims are incomplete",
@@ -626,13 +711,13 @@ pub(super) async fn oidc_callback(
     // Record the id token + provider so logout can end the provider's SSO
     // session (RP-initiated logout), not just the local e6irc session.
     let id_token_raw = id_token.to_string();
-    let user_agent = session_user_agent(&headers);
+    let user_agent = session_user_agent(headers);
     let token = match crate::db::create_web_session_with_identity(
         &pool,
         &account,
         crate::db::OidcSessionIdentity {
             id_token: Some(&id_token_raw),
-            provider: Some(&pending.provider),
+            provider: Some(&flow.provider),
             issuer: Some(issuer),
             subject: Some(subject),
             sid: sid.as_deref(),
@@ -660,21 +745,15 @@ pub(super) async fn oidc_callback(
             );
         }
     };
-    // `AppendHeaders`, not a plain array: two `Set-Cookie` values with the same
-    // header name must *append*, not overwrite. A plain `[(SET_COOKIE, ..),
-    // (SET_COOKIE, ..)]` inserts, so the second (the state-cookie clear) would
-    // drop the session cookie entirely — logging the user out of the login they
-    // just completed.
     (
         StatusCode::SEE_OTHER,
-        axum::response::AppendHeaders([
+        [
             (header::LOCATION, "/".to_string()),
             (
                 header::SET_COOKIE,
                 session_cookie(&token, state.secure_cookies),
             ),
-            (header::SET_COOKIE, clear_state_cookie),
-        ]),
+        ],
     )
         .into_response()
 }
@@ -1880,10 +1959,101 @@ mod domain_policy_tests {
     }
 
     #[test]
-    fn logout_and_callback_queries_reject_unknown_fields() {
+    fn frontchannel_logout_query_rejects_unknown_fields() {
         let uri = "/?extra=1".parse().expect("query URI");
-        assert!(axum::extract::Query::<CallbackQuery>::try_from_uri(&uri).is_err());
         assert!(axum::extract::Query::<FrontchannelLogoutQuery>::try_from_uri(&uri).is_err());
+    }
+
+    /// RFC 6749 §4.1.2: the client ignores response parameters it does not
+    /// recognize. These are what Google, Keycloak and Entra actually append,
+    /// including a granted `scope` spelled differently from the request.
+    #[test]
+    fn callback_query_ignores_provider_extension_parameters() {
+        let uri = "/?state=s&code=c&scope=email%20openid%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fuserinfo.email&authuser=0&hd=example.com&prompt=consent&session_state=abc"
+            .parse()
+            .expect("query URI");
+        let query = axum::extract::Query::<CallbackQuery>::try_from_uri(&uri)
+            .expect("provider extension parameters are ignored");
+        assert_eq!(query.state.as_deref(), Some("s"));
+        assert_eq!(query.code.as_deref(), Some("c"));
+    }
+
+    fn flow(expires_at: u64) -> OidcFlow {
+        OidcFlow {
+            provider: "corp".into(),
+            state: "returned-state".into(),
+            pkce_verifier: "verifier".into(),
+            nonce: "nonce".into(),
+            expires_at,
+            link_account: Some("alice".into()),
+            silent: true,
+        }
+    }
+
+    #[test]
+    fn a_sealed_flow_opens_only_for_its_state_provider_and_lifetime() {
+        let key = crate::secret::SecretKey::generate();
+        let sealed = flow(1_000).seal(&key);
+        assert!(!sealed.contains("verifier") && !sealed.contains("alice"));
+
+        let opened = OidcFlow::open(&key, Some(&sealed), "corp", "returned-state", 999)
+            .expect("the browser's own flow");
+        assert_eq!(opened.pkce_verifier, "verifier");
+        assert_eq!(opened.nonce, "nonce");
+        assert_eq!(opened.link_account.as_deref(), Some("alice"));
+        assert!(opened.silent);
+
+        let open = |cookie: Option<&str>, provider: &str, state: &str, now: u64| {
+            OidcFlow::open(&key, cookie, provider, state, now).err()
+        };
+        assert_eq!(
+            open(Some(&sealed), "corp", "another-state", 999),
+            Some(FlowRefusal::Unbound)
+        );
+        assert_eq!(
+            open(None, "corp", "returned-state", 999),
+            Some(FlowRefusal::Unbound)
+        );
+        assert_eq!(
+            open(Some("returned-state"), "corp", "returned-state", 999),
+            Some(FlowRefusal::Unbound),
+            "the pre-sealing plain-state cookie is not a flow"
+        );
+        assert_eq!(
+            open(Some(&sealed), "other", "returned-state", 999),
+            Some(FlowRefusal::WrongProvider)
+        );
+        assert_eq!(
+            open(Some(&sealed), "corp", "returned-state", 1_000),
+            Some(FlowRefusal::Expired)
+        );
+    }
+
+    #[test]
+    fn a_flow_cannot_be_forged_or_carried_across_keys_or_contexts() {
+        let key = crate::secret::SecretKey::generate();
+        let sealed = flow(1_000).seal(&key);
+        let other = crate::secret::SecretKey::generate();
+        assert_eq!(
+            OidcFlow::open(&other, Some(&sealed), "corp", "returned-state", 0).err(),
+            Some(FlowRefusal::Unbound),
+            "a flow from before a restart (or another process) is refused"
+        );
+        let mut tampered = sealed.clone().into_bytes();
+        let last = tampered.len() - 3;
+        tampered[last] = if tampered[last] == b'A' { b'B' } else { b'A' };
+        let tampered = String::from_utf8(tampered).expect("ascii");
+        assert_eq!(
+            OidcFlow::open(&key, Some(&tampered), "corp", "returned-state", 0).err(),
+            Some(FlowRefusal::Unbound)
+        );
+        let json = serde_json::to_string(&flow(1_000)).expect("json");
+        let foreign_context = key.seal(&json, crate::secret::CONFIG_CONTEXT);
+        assert_eq!(
+            OidcFlow::open(&key, Some(&foreign_context), "corp", "returned-state", 0).err(),
+            Some(FlowRefusal::Unbound),
+            "a value sealed for another purpose is not a flow"
+        );
     }
 
     #[test]
@@ -1894,13 +2064,6 @@ mod domain_policy_tests {
         let query = axum::extract::Query::<CallbackQuery>::try_from_uri(&uri)
             .expect("standard issuer parameter");
         assert_eq!(query.issuer.as_deref(), Some("https://identity.example"));
-    }
-
-    #[test]
-    fn callback_scope_must_match_the_requested_scopes() {
-        let provider = provider(&[]);
-        assert!(callback_scope_matches(&provider, "openid profile email"));
-        assert!(!callback_scope_matches(&provider, "openid profile"));
     }
 
     #[test]

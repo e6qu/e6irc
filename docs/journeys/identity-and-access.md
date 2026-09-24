@@ -58,10 +58,13 @@ registration, PostgreSQL is ready, and cookies are correctly configured.
 
 1. The user chooses a provider from `/login` or uses the provider-specific
    direct/silent-single-sign-on entry point.
-2. `/api/v1/auth/oidc/{provider}/start` creates bounded, expiring state and a
-   PKCE verifier, then redirects to the provider.
-3. The callback validates state, issuer, signature, audience, nonce, and code
-   exchange before trusting the subject.
+2. `/api/v1/auth/oidc/{provider}/start` seals the state, PKCE verifier,
+   nonce, and a ten-minute expiry into the browser's HttpOnly state cookie,
+   then redirects to the provider. The server keeps nothing per flow.
+3. The callback validates state (against the sealed cookie), issuer,
+   signature, audience, nonce, and code exchange before trusting the subject.
+   Response parameters it does not use (Google's `authuser`/`hd`/`prompt`, a
+   granted `scope`) are ignored, as RFC 6749 requires.
 4. When the provider has an allowed-domain policy, the callback additionally
    requires a provider-verified, syntactically valid email whose canonical
    domain exactly matches one configured domain.
@@ -80,8 +83,11 @@ and signed-out pages remain reload-safe. A valid provider result for a
 suspended account ends with an explicit account-unavailable response and no
 browser session.
 
-**Security and observability.** State is one-time and expiring; PKCE binds the
-authorization code; identities are globally unique. Email-domain admission is
+**Security and observability.** State is expiring and answered once: every
+callback that proves the browser's flow clears its cookie, and the
+authorization code is single-use at the provider and bound by PKCE. Anonymous
+starts hold no server capacity, so they cannot crowd out a real login.
+Identities are globally unique. Email-domain admission is
 a typed exact-match policy over a verified provider claim, not suffix matching.
 Front-channel and back-channel logout use correlation rather than trusting
 browser-supplied account data.
@@ -89,7 +95,8 @@ browser-supplied account data.
 **Evidence.** Proven against a real e6ircd, PostgreSQL, Dex, and Chromium by
 `full_oidc_login_provisions_account_and_session`,
 `oidc_silent_sso_reuses_provider_session`, and
-`tools/test-oidc-browser.mjs`. Exact Shauth launch and coordinated logout are
+`tools/test-oidc-browser.mjs`; state sealing, binding, and spending by
+`oidc_login_state_is_sealed_into_the_browser`. Exact Shauth launch and coordinated logout are
 also exercised by the `shauth-sso` CI job.
 
 ## Link or unlink an OpenID Connect identity
@@ -104,7 +111,9 @@ after an unlink.
 **Flow.**
 
 1. **Account & access** lists linked identities without provider secrets.
-2. **Link** starts a fresh provider flow marked as a link operation.
+2. **Link** starts a fresh provider flow marked as a link operation. The
+   navigation carries the session's CSRF value as its `csrf` query parameter;
+   a cross-site link, which carries only the cookie, is refused.
 3. The callback applies the provider's verified exact-email-domain policy,
    then attaches the validated `(issuer, subject)` to the initiating account
    only if no other account owns it.
