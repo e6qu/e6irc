@@ -963,7 +963,7 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     let Some(target) = state.registered_user(&state.nick_key(nick)) else {
-        state.err_nosuchnick(conn, clip_echo(nick));
+        state.err_nosuchnick(conn, nick);
         return;
     };
     let operator = operator_name(state, conn);

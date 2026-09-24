@@ -19,14 +19,21 @@
 //! (`truncate_chars`, `fit_trailing`, `fit_relayed_text`) over
 //! `e6irc_proto::message::truncate_on_char_boundary`.
 
-/// Validate a username for the `nick!user@host` source prefix.
+/// Validate a username for the `nick!user@host` source prefix, cut to at most
+/// `max_len` bytes on a char boundary.
+///
+/// Length and content are different kinds of fault. An over-long username is
+/// truncated, never refused: Modern IRC says a server *MUST* truncate it, and
+/// clients (and `USER $USER …` scripts) send whatever the local login is —
+/// refusing would block registration outright. A prefix-breaking character
+/// anywhere in the input (`!`, `@`, space, a control) is still refused, even
+/// past the cut: the client asked for a name the server cannot represent.
 pub(crate) fn username(raw: &str, max_len: usize) -> Option<String> {
-    (!raw.is_empty()
-        && raw.len() <= max_len
-        && raw
-            .chars()
-            .all(|c| !matches!(c, '!' | '@' | ' ') && !c.is_control()))
-    .then(|| raw.to_string())
+    let valid = raw
+        .chars()
+        .all(|c| !matches!(c, '!' | '@' | ' ') && !c.is_control());
+    let kept = e6irc_proto::message::truncate_on_char_boundary(raw, max_len);
+    (valid && !kept.is_empty()).then(|| kept.to_string())
 }
 
 /// A provider-supplied name reduced to a nick-like account name: ASCII
@@ -247,6 +254,21 @@ mod tests {
     }
 
     #[test]
+    fn username_over_the_cap_is_truncated_not_refused() {
+        assert_eq!(
+            username("averyverylongname", 10),
+            Some("averyveryl".to_string())
+        );
+        // Cut on a char boundary: `é` is two bytes and would straddle byte 10.
+        assert_eq!(
+            username("abcdefghi\u{e9}xyz", 10),
+            Some("abcdefghi".to_string())
+        );
+        // A prefix-breaking char is refused even when it lies past the cut.
+        assert_eq!(username("abcdefghijklm@x", 10), None);
+    }
+
+    #[test]
     fn valid_client_tag_key_matches_the_spec_charset() {
         assert!(valid_client_tag_key("+example.com/reply"));
         assert!(valid_client_tag_key("+typing"));
@@ -283,10 +305,11 @@ mod tests {
     #[test]
     fn username_is_prefix_safe_or_rejected() {
         each_input(|raw| {
-            let Some(out) = username(raw, 8) else {
+            let Some(out) = username(raw, 2) else {
                 return;
             };
-            assert!(out.len() <= 8, "username over budget: {out:?}");
+            // A 2-byte budget under 3-char inputs exercises the truncation too.
+            assert!(out.len() <= 2, "username over budget: {out:?}");
             for c in out.chars() {
                 assert!(
                     !matches!(c, '!' | '@' | ' ') && !c.is_control(),

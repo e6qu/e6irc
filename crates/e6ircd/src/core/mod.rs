@@ -3604,6 +3604,9 @@ mod ingress_tests {
         let channel = channel_on_second(&second);
         second.preload_founders(vec![(channel.into(), "founder".into())]);
         let (alice, mut alice_rx) = register_on_first(&mut first, "alice");
+        // alice is the founder: arriving first in a registered channel opens
+        // no ops, so only the founder can set its (+t) topic.
+        first.state.set_account(alice, "founder".into());
         first.handle(Input::Line {
             conn: alice,
             line: format!("JOIN {channel}").into_bytes(),
@@ -4057,6 +4060,34 @@ mod ingress_tests {
         shards.client(2, "alice", caps);
         shards.client(1, "bob", caps);
         shards
+    }
+
+    /// A ban set on the shard that owns the channel stops a member whose
+    /// session lives on the other shard from renaming out from under it.
+    #[test]
+    fn a_ban_on_another_shard_refuses_the_members_nick_change() {
+        let mut shards = alice_and_bob("");
+        let there = shards.owned[0];
+        assert_ne!(shards.shard_of(1), 0, "bob's session is not the owner's");
+        shards.line(2, &format!("JOIN {there}"));
+        shards.line(1, &format!("JOIN {there}"));
+        shards.line(2, &format!("MODE {there} +b bob!*@*"));
+        shards.drain(1);
+        shards.line(1, "NICK bobby");
+        let out = shards.drain(1);
+        assert_eq!(
+            lines_with(
+                &out,
+                &format!(" 435 bob bobby {there} :Cannot change nickname while banned on channel")
+            )
+            .len(),
+            1,
+            "{out:#?}"
+        );
+        shards.line(2, &format!("MODE {there} -b bob!*@*"));
+        shards.drain(1);
+        shards.line(1, "NICK bobby");
+        assert_eq!(lines_with(&shards.drain(1), " NICK bobby").len(), 1);
     }
 
     #[test]
@@ -5049,7 +5080,7 @@ mod ingress_tests {
             result
                 .payload
                 .0
-                .ends_with(b" 711 bob :Your KNOCK has been delivered\r\n")
+                .ends_with(b" 711 bob #chat :Your KNOCK has been delivered\r\n")
         );
         first_tx
             .try_push(Input::Line {

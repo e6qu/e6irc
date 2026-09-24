@@ -18,7 +18,7 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(
             conn,
             ERR_ERRONEUSNICKNAME,
-            &[nick],
+            &[clip_echo(nick)],
             Some("Erroneous nickname"),
         );
         return;
@@ -31,7 +31,7 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(
             conn,
             ERR_ERRONEUSNICKNAME,
-            &[nick],
+            &[clip_echo(nick)],
             Some("Nickname is reserved"),
         );
         return;
@@ -49,6 +49,20 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // casefold) is a no-op: no rename, no broadcast, no reply. A case change
     // (alice→Alice) is a real change and falls through.
     if registered && old_nick_display.as_deref() == Some(nick) {
+        return;
+    }
+    // A plain member banned or quieted in a channel may not change nick: the
+    // new nick would no longer match a `nick!*@*` ban or quiet, so renaming
+    // would be a way out of it to speak again (Solanum ERR_BANNICKCHANGE).
+    // Checked across every shard's channels through the published membership
+    // directory, since the session's channels need not live on this shard.
+    if registered && let Some(channel) = state.silenced_in(conn) {
+        state.numeric(
+            conn,
+            ERR_BANNICKCHANGE,
+            &[nick, &channel],
+            Some("Cannot change nickname while banned on channel"),
+        );
         return;
     }
     if !state.claim_nick(key.clone(), conn) {

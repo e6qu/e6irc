@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use e6irc_proto::casemap::CaseMapping;
 use e6irc_proto::numerics::{
-    ERR_NEEDMOREPARAMS, ERR_NOSUCHCHANNEL, ERR_NOSUCHNICK, ERR_NOTONCHANNEL,
+    ERR_NEEDMOREPARAMS, ERR_NOSUCHCHANNEL, ERR_NOSUCHNICK, ERR_NOTONCHANNEL, ERR_USERNOTINCHANNEL,
 };
 use e6irc_queue::Sender;
 
@@ -127,6 +127,27 @@ pub(crate) struct PublicChannel {
     /// ring lives with the channel's owner; with no database it is the whole
     /// record, and CHATHISTORY TARGETS is answered from this on every shard.
     latest_message: Option<e6irc_proto::time::Millis>,
+    /// The masks that silence a plain member, so the shard holding a session
+    /// can refuse its NICK while it is banned or quieted in a channel another
+    /// shard owns (ERR_BANNICKCHANGE) without a round trip.
+    silencing: SilencingMasks,
+}
+
+/// A channel's `+b`, `+q` and `+e` lists, as published for [`PublicChannel`].
+struct SilencingMasks {
+    bans: Vec<MaskKey>,
+    quiets: Vec<MaskKey>,
+    exceptions: Vec<MaskKey>,
+}
+
+impl SilencingMasks {
+    /// Whether `prefix` is banned or quieted here — [`Channel::is_banned`] or
+    /// [`Channel::is_quieted`], which share the ban-exception list.
+    fn silences(&self, casemap: CaseMapping, prefix: &str) -> bool {
+        (Channel::any_match(casemap, &self.bans, prefix)
+            || Channel::any_match(casemap, &self.quiets, prefix))
+            && !Channel::any_match(casemap, &self.exceptions, prefix)
+    }
 }
 
 impl MembershipDirectory {
@@ -177,6 +198,37 @@ impl MembershipDirectory {
             .collect();
         shown.sort();
         shown
+    }
+
+    /// The display name of a channel `conn` is in where it holds neither op
+    /// nor voice and its hostmask `prefix` is banned or quieted — the channel a
+    /// NICK must be refused for (Solanum: a banned member cannot change nick,
+    /// or it could escape the ban and speak). `None` when there is none.
+    pub(crate) fn silenced_in(
+        &self,
+        conn: ConnId,
+        casemap: CaseMapping,
+        prefix: &str,
+    ) -> Option<String> {
+        let by_conn = self.by_conn.lock().expect("membership directory poisoned");
+        let channels = self.channels.lock().expect("membership directory poisoned");
+        let mut silenced: Vec<&str> = by_conn
+            .get(&conn)
+            .into_iter()
+            .flatten()
+            .filter_map(|key| channels.get(key))
+            .filter(|channel| {
+                !channel
+                    .ranks
+                    .get(&conn)
+                    .is_some_and(|modes| modes.op || modes.voice)
+                    && channel.silencing.silences(casemap, prefix)
+            })
+            .map(|channel| channel.name.as_str())
+            .collect();
+        // The set iterates in hash order; name the same channel every time.
+        silenced.sort_unstable();
+        silenced.first().map(|name| name.to_string())
     }
 
     pub(crate) fn join(&self, conn: ConnId, key: ChanKey) {
@@ -1988,7 +2040,7 @@ pub enum ChannelHistoryResult {
 
 #[derive(Debug)]
 pub enum ChannelKnockResult {
-    KnockDelivered,
+    KnockDelivered { display: String },
     NoSuchChannel { target: String },
     Hidden { target: String, proof: Hidden },
     AlreadyOnChannel { display: String },
@@ -3714,6 +3766,11 @@ impl ServerState {
                     .history
                     .get(&HistoryKey::from(&key))
                     .and_then(|ring| ring.entries.iter().map(|entry| entry.ts).max()),
+                silencing: SilencingMasks {
+                    bans: channel.bans.clone(),
+                    quiets: channel.quiets.clone(),
+                    exceptions: channel.ban_exceptions.clone(),
+                },
             });
             self.memberships.publish_channel(&key, published);
         }
@@ -4588,6 +4645,14 @@ impl ServerState {
         self.memberships.whois_channels(target, requester)
     }
 
+    /// A channel, on any shard, where `conn` is a plain member banned or
+    /// quieted under its current hostmask — see
+    /// [`MembershipDirectory::silenced_in`].
+    pub(crate) fn silenced_in(&self, conn: ConnId) -> Option<String> {
+        let prefix = self.sessions[&conn].prefix();
+        self.memberships.silenced_in(conn, self.casemap, &prefix)
+    }
+
     /// Where `conn`'s session lives, whether or not it is this shard.
     pub(crate) fn session_shard(&self, conn: ConnId) -> SessionOwner {
         self.shards.session_owner(conn)
@@ -5187,22 +5252,43 @@ impl ServerState {
     }
 
     /// `ERR_NOSUCHNICK (<nick>) :No such nick/channel`.
+    ///
+    /// This and the two helpers below echo a name the *client* typed, so each
+    /// renders it through [`clip_echo`](crate::core::handler::clip_echo) itself:
+    /// no call site can forget to, and a trailing-form token with a space
+    /// (`INVITE x :a b`) cannot split the reply's parameters.
     pub fn err_nosuchnick(&mut self, conn: ConnId, nick: &str) {
+        let nick = crate::core::handler::clip_echo(nick);
         self.numeric(conn, ERR_NOSUCHNICK, &[nick], Some("No such nick/channel"));
     }
 
     /// `ERR_NOSUCHCHANNEL (<chan>) :No such channel`.
     pub fn err_nosuchchannel(&mut self, conn: ConnId, chan: &str) {
+        let chan = crate::core::handler::clip_echo(chan);
         self.numeric(conn, ERR_NOSUCHCHANNEL, &[chan], Some("No such channel"));
     }
 
     /// `ERR_NOTONCHANNEL (<chan>) :You're not on that channel`.
     pub fn err_notonchannel(&mut self, conn: ConnId, chan: &str) {
+        let chan = crate::core::handler::clip_echo(chan);
         self.numeric(
             conn,
             ERR_NOTONCHANNEL,
             &[chan],
             Some("You're not on that channel"),
+        );
+    }
+
+    /// `ERR_USERNOTINCHANNEL (<nick> <chan>) :They aren't on that channel`.
+    /// `nick` is the client's token, rendered through
+    /// [`clip_echo`](crate::core::handler::clip_echo) like the helpers above.
+    pub fn err_usernotinchannel(&mut self, conn: ConnId, nick: &str, chan: &str) {
+        let nick = crate::core::handler::clip_echo(nick);
+        self.numeric(
+            conn,
+            ERR_USERNOTINCHANNEL,
+            &[nick, chan],
+            Some("They aren't on that channel"),
         );
     }
 
@@ -5396,7 +5482,12 @@ impl ServerState {
             .and_then(|s| s.nick().map(String::from))
             .unwrap_or_else(|| "*".into());
         let host = format!("services.{}", self.config.server_name);
-        let line = format!(":{service}!{service}@{host} NOTICE {nick} :{text}");
+        // The text can quote the user's own input back (an unknown flag, a
+        // channel name), so it is fitted like any other relayed trailing.
+        let line = crate::core::handler::fitted_line(
+            format!(":{service}!{service}@{host} NOTICE {nick} :"),
+            text,
+        );
         self.send_timed(conn, &line);
     }
 
