@@ -563,17 +563,33 @@ pub struct StorageMaintenanceReport {
 }
 
 impl StorageMaintenanceReport {
+    /// Destructures `other` exhaustively, so a counter added to the report
+    /// fails to compile here until it is summed too.
     fn add(&mut self, other: &Self) {
-        self.messages += other.messages;
-        self.bnc_buffer += other.bnc_buffer;
-        self.audit_events += other.audit_events;
-        self.web_sessions += other.web_sessions;
-        self.api_tokens += other.api_tokens;
-        self.device_grants += other.device_grants;
-        self.logout_tokens += other.logout_tokens;
-        self.account_invitations += other.account_invitations;
-        self.observability_samples += other.observability_samples;
-        self.saturated = other.saturated;
+        let Self {
+            messages,
+            bnc_buffer,
+            audit_events,
+            web_sessions,
+            api_tokens,
+            device_grants,
+            logout_tokens,
+            account_invitations,
+            observability_samples,
+            read_markers,
+            saturated,
+        } = *other;
+        self.messages += messages;
+        self.bnc_buffer += bnc_buffer;
+        self.audit_events += audit_events;
+        self.web_sessions += web_sessions;
+        self.api_tokens += api_tokens;
+        self.device_grants += device_grants;
+        self.logout_tokens += logout_tokens;
+        self.account_invitations += account_invitations;
+        self.observability_samples += observability_samples;
+        self.read_markers += read_markers;
+        self.saturated = saturated;
     }
 
     fn slot(&mut self, collection: MaintenanceCollection) -> &mut u64 {
@@ -7471,16 +7487,15 @@ pub async fn find_or_create_oidc_account(
     subject: &str,
     account_name: &str,
 ) -> Result<String, DbError> {
-    let existing: Option<String> = sqlx::query_scalar(
-        "SELECT a.name FROM accounts a
+    const LINKED_ACCOUNT: &str = "SELECT a.name FROM accounts a
          JOIN oidc_identities o ON o.account_id = a.id
-         WHERE o.issuer = $1 AND o.subject = $2",
-    )
-    .bind(issuer)
-    .bind(subject)
-    .fetch_optional(pool)
-    .await
-    .map_err(query_error)?;
+         WHERE o.issuer = $1 AND o.subject = $2";
+    let existing: Option<String> = sqlx::query_scalar(LINKED_ACCOUNT)
+        .bind(issuer)
+        .bind(subject)
+        .fetch_optional(pool)
+        .await
+        .map_err(query_error)?;
     if let Some(name) = existing {
         return Ok(name);
     }
@@ -7488,6 +7503,18 @@ pub async fn find_or_create_oidc_account(
     let folded = CaseMapping::Rfc1459.casefold(account_name);
     let mut tx = pool.begin().await.map_err(query_error)?;
     lock_account_name(&mut tx, &folded).await?;
+    // A concurrent first login for the same person claims the same name, so it
+    // waited on that lock and the winner has committed by now: look again
+    // before the name reads as taken, or the loser is refused its own account.
+    let linked: Option<String> = sqlx::query_scalar(LINKED_ACCOUNT)
+        .bind(issuer)
+        .bind(subject)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(query_error)?;
+    if let Some(name) = linked {
+        return Ok(name);
+    }
     if account_name_is_retired(&mut tx, &folded).await? {
         return Err(DbError::DuplicateAccount(account_name.to_string()));
     }
@@ -7513,21 +7540,19 @@ pub async fn find_or_create_oidc_account(
     .await
     .map_err(query_error)?;
     if inserted.rows_affected() == 0 {
-        // A concurrent first-login for the same (issuer, subject) committed
-        // first. Return the winner's account rather than a spurious 503, and do
+        // A concurrent first login for the same (issuer, subject) that claimed
+        // a different name (the provider's claim changed between the two), so
+        // the name lock above did not serialize it, committed first. Return the winner's account rather than a spurious 503, and do
         // NOT commit our transaction — dropping it rolls back the extra account
         // this racer just created, so the identity is provisioned exactly once.
         // (PostgreSQL blocks our ON CONFLICT until the winner's tx resolves, so
         // by here the winner is committed and visible on a fresh connection.)
-        let winner: String = sqlx::query_scalar(
-            "SELECT a.name FROM oidc_identities o JOIN accounts a ON a.id = o.account_id
-             WHERE o.issuer = $1 AND o.subject = $2",
-        )
-        .bind(issuer)
-        .bind(subject)
-        .fetch_one(pool)
-        .await
-        .map_err(query_error)?;
+        let winner: String = sqlx::query_scalar(LINKED_ACCOUNT)
+            .bind(issuer)
+            .bind(subject)
+            .fetch_one(pool)
+            .await
+            .map_err(query_error)?;
         return Ok(winner);
     }
     insert_audit_log_with(

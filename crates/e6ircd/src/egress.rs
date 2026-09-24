@@ -15,7 +15,7 @@
 //! literal an account typed: a hostname that resolves — now or after a DNS
 //! rebind — to a refused address is refused at connect time.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// The server-level policy on upstream addresses inside the host's own network.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -55,6 +55,24 @@ impl UpstreamRefusal {
     }
 }
 
+/// The IPv4 address a V6 address reaches when the V6 form carries it at a fixed
+/// place, so the V4 rules judge it: the well-known NAT64 prefix `64:ff9b::/96`
+/// (RFC 6052), 6to4 `2002::/16` (RFC 3056), and the deprecated IPv4-compatible
+/// `::a.b.c.d` (RFC 4291). On a host with NAT64 or a 6to4 relay each of these
+/// connects to the embedded V4 address, internal ones included.
+fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let [.., a, b, c, d] = v6.octets();
+    match v6.segments() {
+        [0x0064, 0xff9b, 0, 0, 0, 0, _, _] => Some(Ipv4Addr::new(a, b, c, d)),
+        [0x2002, high, low, ..] => Some(Ipv4Addr::from((u32::from(high) << 16) | u32::from(low))),
+        // `::` and `::1` are V6's own unspecified and loopback addresses.
+        [0, 0, 0, 0, 0, 0, _, _] if !v6.is_unspecified() && !v6.is_loopback() => {
+            Some(Ipv4Addr::new(a, b, c, d))
+        }
+        _ => None,
+    }
+}
+
 impl InternalUpstreams {
     /// Why `ip` may not be dialled under this policy, or `None` when it may.
     ///
@@ -63,6 +81,11 @@ impl InternalUpstreams {
     /// it is classified by the V4 rules.
     pub fn refusal(self, ip: IpAddr) -> Option<UpstreamRefusal> {
         let ip = ip.to_canonical();
+        if let IpAddr::V6(v6) = ip
+            && let Some(v4) = embedded_ipv4(v6)
+        {
+            return self.refusal(IpAddr::V4(v4));
+        }
         if ip.is_unspecified() || ip.is_multicast() {
             return Some(UpstreamRefusal::NeverAnUpstream);
         }
@@ -71,15 +94,19 @@ impl InternalUpstreams {
                 v4.is_link_local() || v4.is_broadcast() || v4.is_documentation(),
                 v4.is_loopback() || v4.is_private() || is_carrier_grade_nat(v4),
             ),
-            // `to_canonical` has already mapped any V4-in-V6 form to V4, so
-            // what reaches here is a genuine V6 address.
+            // `to_canonical` and `embedded_ipv4` have already mapped every
+            // V4-in-V6 form with a fixed place for the V4 address to V4.
             IpAddr::V6(v6) => {
-                let [first, second, ..] = v6.segments();
+                let [first, second, third, ..] = v6.segments();
                 (
                     // Link-local, and the documentation prefix 2001:db8::/32.
                     (first & 0xffc0) == 0xfe80 || (first == 0x2001 && second == 0x0db8),
-                    // Loopback, and unique-local fc00::/7.
-                    v6.is_loopback() || (first & 0xfe00) == 0xfc00,
+                    // Loopback, unique-local fc00::/7, and the local-use NAT64
+                    // prefix 64:ff9b:1::/48 (RFC 8215), which translates to
+                    // IPv4 at a site-chosen offset and so is judged whole.
+                    v6.is_loopback()
+                        || (first & 0xfe00) == 0xfc00
+                        || (first == 0x0064 && second == 0xff9b && third == 0x0001),
                 )
             }
         };
@@ -280,6 +307,11 @@ mod tests {
             "[::ffff:169.254.169.254]:80",
             "[::ffff:0.0.0.0]:6667",
             "[2001:db8::1]:6697", // v6 documentation
+            // The metadata endpoint inside NAT64, 6to4, and IPv4-compatible
+            // forms, which reach it at the kernel on a host that routes them.
+            "[64:ff9b::a9fe:a9fe]:80",
+            "[2002:a9fe:a9fe::]:80",
+            "[::169.254.169.254]:80",
             "http://169.254.169.254",
             "https://[fe80::1]/api",
             // The metadata endpoint as one decimal number, and in hex: what
@@ -311,6 +343,10 @@ mod tests {
             "[fd12::1]:6697",
             "[::ffff:127.0.0.1]:6667",
             "[::ffff:10.0.0.5]:6667",
+            "[64:ff9b::a00:5]:5432", // NAT64 of 10.0.0.5
+            "[64:ff9b:1::1]:5432",   // local-use NAT64
+            "[2002:7f00:1::]:6667",  // 6to4 of 127.0.0.1
+            "[::10.0.0.5]:6667",     // IPv4-compatible
             "http://127.0.0.1:8008",
             "http://192.168.1.10:8008",
             // Loopback in every spelling the URL parser canonicalizes: one
@@ -340,6 +376,7 @@ mod tests {
         for addr in [
             "93.184.216.34:6697",
             "[2606:4700::1111]:6697",
+            "[64:ff9b::5db8:d822]:6697", // NAT64 of a public address
             "irc.libera.chat:6697",
             "https://matrix.org",
             "100.128.0.1:6667", // just past the CGNAT block

@@ -75,9 +75,16 @@ fn healthcheck(args: &[String]) -> ExitCode {
             _ => return usage_error(),
         }
     }
-    let configured = addr
-        .or_else(|| std::env::var(environment_config::HTTP_ADDR_VARIABLE).ok())
-        .unwrap_or_else(|| environment_config::DEFAULT_HTTP_ADDR.to_string());
+    let configured = match addr {
+        Some(addr) => addr,
+        None => match environment_config::http_addr(&environment_config::process_environment) {
+            Ok(addr) => addr,
+            Err(error) => {
+                eprintln!("e6ircd healthcheck: {error}");
+                return ExitCode::from(2);
+            }
+        },
+    };
     let Ok(listener) = configured.parse::<std::net::SocketAddr>() else {
         eprintln!("e6ircd healthcheck: {configured:?} is not an ip:port address");
         return ExitCode::from(2);
@@ -146,11 +153,15 @@ fn probe(
             Err(error) => return Err(format!("no answer: {}", error.kind())),
         }
     }
-    match std::str::from_utf8(&head) {
-        Ok(line) if line.starts_with("HTTP/1.") && &line[8..9] == " " => match &line[9..12] {
-            "200" => Ok(()),
-            status => Err(format!("status {status}")),
-        },
+    // Compared as bytes: the answer is untrusted, and slicing it as text at a
+    // fixed offset would panic on a multi-byte character across that offset.
+    match head.split_at(9) {
+        (version, status) if version.starts_with(b"HTTP/1.") && version[8] == b' ' => {
+            match status {
+                b"200" => Ok(()),
+                status => Err(format!("status {}", String::from_utf8_lossy(status))),
+            }
+        }
         _ => Err("the answer is not HTTP".into()),
     }
 }
@@ -551,6 +562,15 @@ mod tests {
         );
         assert_eq!(
             probe(answering(b"SSH-2.0-OpenSSH_9\r\n"), "/healthz", second),
+            Err("the answer is not HTTP".to_string())
+        );
+        // 'é' straddles byte 8, where a text slice at a fixed offset panics.
+        assert_eq!(
+            probe(
+                answering("HTTP/1.é 200\r\n\r\n".as_bytes()),
+                "/healthz",
+                second
+            ),
             Err("the answer is not HTTP".to_string())
         );
         assert_eq!(

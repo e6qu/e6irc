@@ -167,6 +167,25 @@ impl<E: Fn(&str) -> Lookup> Environment<'_, E> {
     }
 }
 
+/// The address the HTTP listener binds, by the rule [`configuration_table`]
+/// applies: `e6ircd healthcheck` reads it here so a set-but-empty variable
+/// means the default to both, not the default to one and an error to the other.
+pub fn http_addr(environment: &impl Fn(&str) -> Lookup) -> Result<String, EnvironmentConfigError> {
+    Ok(Environment(environment)
+        .optional(HTTP_ADDR_VARIABLE)?
+        .unwrap_or_else(|| DEFAULT_HTTP_ADDR.to_owned()))
+}
+
+/// Every OIDC setting that means something only beside `E6IRC_OIDC_ISSUER`.
+const OIDC_DEPENDENTS: [&str; 6] = [
+    "E6IRC_OIDC_NAME",
+    "E6IRC_OIDC_CLIENT_ID",
+    "E6IRC_OIDC_CLIENT_SECRET",
+    "E6IRC_OIDC_ACCOUNT_CLAIM",
+    "E6IRC_OIDC_TOKEN_AUTH",
+    "E6IRC_OIDC_END_SESSION",
+];
+
 /// The configuration document the environment states, ready for the same
 /// parser a configuration file goes through.
 pub fn configuration_table(
@@ -204,10 +223,7 @@ pub fn configuration_table(
     );
 
     let mut http = Table::new();
-    http.insert(
-        "addr".into(),
-        environment.or_default(HTTP_ADDR_VARIABLE, DEFAULT_HTTP_ADDR)?,
-    );
+    http.insert("addr".into(), Value::String(http_addr(environment.0)?));
     http.insert(
         "public_url".into(),
         environment.required("E6IRC_PUBLIC_URL", None)?,
@@ -298,6 +314,17 @@ pub fn configuration_table(
             environment.required("E6IRC_OIDC_END_SESSION", Some(ISSUER))?,
         );
         root.insert("oidc".into(), Value::Array(vec![Value::Table(provider)]));
+    } else {
+        // Without the issuer the rest configure nothing; starting with sign-in
+        // off while they sit set would be a silent no-op (a misspelt issuer).
+        for dependent in OIDC_DEPENDENTS {
+            if environment.optional(dependent)?.is_some() {
+                return Err(EnvironmentConfigError::Missing {
+                    variable: ISSUER,
+                    because_of: Some(dependent),
+                });
+            }
+        }
     }
 
     Ok(root)
@@ -414,6 +441,36 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn an_oidc_setting_without_the_issuer_is_refused_rather_than_ignored() {
+        for dependent in OIDC_DEPENDENTS {
+            assert_eq!(
+                table(&with(minimal(), &[(dependent, "stated")])),
+                Err(EnvironmentConfigError::Missing {
+                    variable: "E6IRC_OIDC_ISSUER",
+                    because_of: Some(dependent),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn the_healthcheck_reads_an_empty_http_address_as_the_default_like_the_server() {
+        let lookup = |value: &'static str| {
+            move |variable: &str| Ok((variable == HTTP_ADDR_VARIABLE).then(|| value.to_owned()))
+        };
+        assert_eq!(http_addr(&lookup("")), Ok(DEFAULT_HTTP_ADDR.to_owned()));
+        assert_eq!(
+            http_addr(&lookup("127.0.0.1:9")),
+            Ok("127.0.0.1:9".to_owned())
+        );
+        let empty = with(minimal(), &[(HTTP_ADDR_VARIABLE, "")]);
+        assert_eq!(
+            table(&empty).unwrap()["http"]["addr"].as_str(),
+            Some(DEFAULT_HTTP_ADDR)
+        );
     }
 
     #[test]
