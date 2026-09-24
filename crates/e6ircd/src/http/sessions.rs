@@ -66,7 +66,7 @@ pub(super) async fn list_browser_sessions(
 pub(super) async fn revoke_browser_session(
     State(state): State<Arc<AppState>>,
     Authenticated(account, credential): Authenticated,
-    Path(id): Path<i64>,
+    PathParams(id): PathParams<i64>,
 ) -> Response {
     match crate::db::delete_web_session_by_id(
         pool_of(&state),
@@ -449,7 +449,7 @@ async fn validated_disconnect(
 pub(super) async fn admin_disconnect_connection(
     State(state): State<Arc<AppState>>,
     AdminAccount(actor): AdminAccount,
-    Path(connection_id): Path<u64>,
+    PathParams(connection_id): PathParams<u64>,
     QueryParams(params): QueryParams<DisconnectConnectionQuery>,
 ) -> Response {
     validated_disconnect(&state, connection_id, params, |connection_id, reason| {
@@ -465,7 +465,7 @@ pub(super) async fn admin_disconnect_connection(
 pub(super) async fn me_disconnect_connection(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Path(connection_id): Path<u64>,
+    PathParams(connection_id): PathParams<u64>,
     QueryParams(params): QueryParams<DisconnectConnectionQuery>,
 ) -> Response {
     validated_disconnect(&state, connection_id, params, |connection_id, reason| {

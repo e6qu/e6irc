@@ -3764,6 +3764,17 @@ impl NetworkHandle {
         self.send_from(0, line)
     }
 
+    /// How long after a [`SendOutcome::Full`] the same send can be expected to
+    /// find room: a connected driver drains the queue or declares the upstream
+    /// dead within [`UPSTREAM_WRITE_DEADLINE`]; a reconnecting one drains
+    /// nothing before its next attempt, so that wait comes first.
+    pub fn full_queue_retry_after(&self) -> std::time::Duration {
+        let until_next_attempt = self.runtime_snapshot().next_retry_at.map_or(0, |at| {
+            at.as_millis().saturating_sub(epoch_millis().as_millis())
+        });
+        std::time::Duration::from_millis(until_next_attempt) + UPSTREAM_WRITE_DEADLINE
+    }
+
     /// As [`NetworkHandle::send`], but the command carries the sending
     /// attachment's id so its synthesized echo can be routed correctly. The
     /// shared boundary rejects malformed or over-budget IRC lines before they
@@ -5754,6 +5765,28 @@ mod tests {
         .err()
         .expect("stored IRC network without realname should fail");
         assert!(error.contains("no realname"), "{error}");
+    }
+
+    #[test]
+    fn a_full_queue_retry_waits_for_the_next_attempt_and_the_write_deadline() {
+        let (handle, ends) = NetworkHandle::channels(16);
+        ends.begin_attempt();
+        ends.emit(ConnectionEvent::Connected);
+        assert_eq!(handle.full_queue_retry_after(), UPSTREAM_WRITE_DEADLINE);
+
+        handle.runtime.failed(
+            FailureDisposition::Retry {
+                next_attempt_in: Some(std::time::Duration::from_secs(20)),
+            },
+            NetworkFailure::ConnectionLost,
+            None,
+        );
+        let wait = handle.full_queue_retry_after();
+        assert!(
+            wait > UPSTREAM_WRITE_DEADLINE + std::time::Duration::from_secs(19)
+                && wait <= UPSTREAM_WRITE_DEADLINE + std::time::Duration::from_secs(20),
+            "{wait:?}"
+        );
     }
 
     #[test]

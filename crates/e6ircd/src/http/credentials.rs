@@ -584,7 +584,7 @@ pub(super) async fn me_identities(
 pub(super) async fn me_identity_unlink(
     State(state): State<Arc<AppState>>,
     SessionMutation(account, session): SessionMutation,
-    Path(id): Path<i64>,
+    PathParams(id): PathParams<i64>,
 ) -> Response {
     let pool = pool_of(&state);
     match crate::db::unlink_oidc_identity(pool, &account, id).await {
@@ -664,7 +664,7 @@ pub(super) async fn me_tokens_list(
 pub(super) async fn me_tokens_revoke(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Path(id): Path<i64>,
+    PathParams(id): PathParams<i64>,
 ) -> Response {
     delete_owner_item(
         &state,
@@ -681,7 +681,7 @@ pub(super) async fn me_tokens_revoke(
 pub(super) async fn revoke_credential(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
-    Path(id): Path<i64>,
+    PathParams(id): PathParams<i64>,
 ) -> Response {
     delete_owner_item(
         &state,

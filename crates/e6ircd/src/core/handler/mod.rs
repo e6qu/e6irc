@@ -785,7 +785,7 @@ fn cmd_ping(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 }
 
 /// Deadline for an unregistered connection to complete registration.
-const REGISTRATION_TIMEOUT_MS: u64 = 30_000;
+pub(crate) const REGISTRATION_TIMEOUT_MS: u64 = 30_000;
 /// Idle duration after which a registered client is sent a liveness PING.
 const IDLE_PING_INTERVAL_MS: u64 = 120_000;
 /// How long the client then has to PONG before the connection is closed.

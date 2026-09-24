@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::extract::{Form, Path, Query, State};
+use axum::extract::{Form, Query, State};
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -960,6 +960,66 @@ async fn undo_account_deletion_gate(
     })
 }
 
+/// The refusals axum would answer in its own shape are each given ours in one
+/// place; these tests keep them from being bypassed.
+#[cfg(test)]
+mod problem_contract_tests {
+    use super::*;
+
+    /// Every HTTP source file, read at build time so the guard sees what ships.
+    const SOURCES: &[(&str, &str)] = &[
+        ("channels.rs", include_str!("channels.rs")),
+        ("credentials.rs", include_str!("credentials.rs")),
+        ("device.rs", include_str!("device.rs")),
+        ("history.rs", include_str!("history.rs")),
+        ("mod.rs", include_str!("mod.rs")),
+        ("networks.rs", include_str!("networks.rs")),
+        ("observation.rs", include_str!("observation.rs")),
+        ("oidc.rs", include_str!("oidc.rs")),
+        ("openapi.rs", include_str!("openapi.rs")),
+        ("preflight.rs", include_str!("preflight.rs")),
+        ("sessions.rs", include_str!("sessions.rs")),
+        ("ws.rs", include_str!("ws.rs")),
+    ];
+
+    fn occurrences(needle: &str) -> Vec<(&'static str, usize)> {
+        SOURCES
+            .iter()
+            .map(|(name, source)| (*name, source.matches(needle).count()))
+            .filter(|(_, count)| *count > 0)
+            .collect()
+    }
+
+    /// A handler taking axum's `Path` answers a malformed segment in plain
+    /// text; only `PathParams`, which wraps it, may name it.
+    #[test]
+    fn only_path_params_names_the_raw_path_extractor() {
+        let needle = concat!("axum::extract::", "Path");
+        assert_eq!(occurrences(needle), vec![("oidc.rs", 3)]);
+        // However it is imported, taking it as a handler argument names its
+        // generic type.
+        assert_eq!(occurrences(concat!("Path", "<")), vec![("oidc.rs", 1)]);
+    }
+
+    /// `retry_later` is the one builder of a `429`, so none leaves without
+    /// `Retry-After`.
+    #[test]
+    fn only_retry_later_builds_a_too_many_requests_answer() {
+        assert_eq!(
+            occurrences(concat!("TOO_MANY", "_REQUESTS")),
+            vec![("oidc.rs", 1)]
+        );
+    }
+
+    #[test]
+    fn retry_after_seconds_round_up_and_are_never_zero() {
+        assert_eq!(retry_after_seconds(Duration::ZERO), 1);
+        assert_eq!(retry_after_seconds(Duration::from_millis(1)), 1);
+        assert_eq!(retry_after_seconds(Duration::from_secs(10)), 10);
+        assert_eq!(retry_after_seconds(Duration::from_millis(10_001)), 11);
+    }
+}
+
 #[cfg(test)]
 mod query_limit_tests {
     use super::*;
@@ -1463,14 +1523,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(web::index))
         .route("/favicon.ico", get(web::favicon))
         .route("/assets/{*path}", get(web::asset));
-    let router = router.fallback(async || problem(StatusCode::NOT_FOUND, "Not Found", None));
+    // Both refusals of an unrouted request are problem documents like every
+    // other answer; axum's defaults are an empty 405 and a plain-text 404.
+    let router = router
+        .fallback(async || problem(StatusCode::NOT_FOUND, "Not Found", None))
+        .method_not_allowed_fallback(method_not_allowed);
     let router = admit_requests(
         router,
         state.request_admission.clone(),
         MAX_CONCURRENT_REQUESTS,
     );
     // Added after the admission bounds, so they bypass them.
-    let router = add_probe_routes(router);
+    // The fallback applies only to routes registered before it is set, so the
+    // probes added here are given it again.
+    let router = add_probe_routes(router).method_not_allowed_fallback(method_not_allowed);
     observed(
         bound_request(router, REQUEST_DEADLINE).layer(axum::middleware::from_fn(baseline_headers)),
         state.observation.clone(),
@@ -1713,6 +1779,7 @@ pub fn ws_irc_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(ws_irc))
         .fallback(async || problem(StatusCode::NOT_FOUND, "Not Found", None))
+        .method_not_allowed_fallback(method_not_allowed)
         .layer(axum::middleware::from_fn(baseline_headers))
         .with_state(state)
 }
@@ -1794,7 +1861,7 @@ mod web {
         }
     }
 
-    pub async fn asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    pub async fn asset(PathParams(path): PathParams<String>) -> Response {
         serve(&format!("assets/{path}"))
     }
 
@@ -2285,7 +2352,7 @@ mod pages {
 
     pub async fn account_invitation(
         State(state): State<Arc<AppState>>,
-        Path(token): Path<String>,
+        PathParams(token): PathParams<String>,
     ) -> Response {
         if !valid_invitation_token(&token) {
             return problem(StatusCode::NOT_FOUND, "Invitation unavailable", None);
@@ -2317,7 +2384,7 @@ mod pages {
         State(state): State<Arc<AppState>>,
         _rate_limited: RateLimited,
         headers: axum::http::HeaderMap,
-        Path(token): Path<String>,
+        PathParams(token): PathParams<String>,
         form: Result<
             axum::Form<AccountInvitationAcceptanceForm>,
             axum::extract::rejection::FormRejection,
@@ -3176,7 +3243,7 @@ mod pages {
     pub async fn console_network_detail(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
-        Path(name): Path<String>,
+        PathParams(name): PathParams<String>,
     ) -> Response {
         let actor = match page_actor(&state, &headers, false).await {
             Ok(actor) => actor,
@@ -3194,7 +3261,7 @@ mod pages {
     pub async fn owner_network_operations(
         State(state): State<Arc<AppState>>,
         Authenticated(account, _): Authenticated,
-        Path(name): Path<String>,
+        PathParams(name): PathParams<String>,
     ) -> Response {
         let network = match crate::db::get_bnc_network(pool_of(&state), &account, &name).await {
             Ok(Some(network)) => network,
@@ -3384,7 +3451,7 @@ mod pages {
     /// resource before populating its typed provider fields.
     pub async fn console_edit_bridge(
         AdminPageActor(actor): AdminPageActor,
-        Path(name): Path<String>,
+        PathParams(name): PathParams<String>,
     ) -> Response {
         render_private(ConsoleBridgeEdit {
             shell: console_shell(actor, "integrations"),

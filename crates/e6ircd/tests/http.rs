@@ -909,6 +909,150 @@ async fn unknown_route_is_problem_json_404() {
     assert!(v["title"].as_str().is_some());
 }
 
+/// The problem document every refusal shares: its content type, and a body
+/// whose `status` member repeats the status line.
+fn assert_problem(status: u16, head: &str, body: &str, expected: u16) -> serde_json::Value {
+    assert_eq!(status, expected, "{head}\n{body}");
+    assert!(
+        head.to_lowercase()
+            .contains("content-type: application/problem+json"),
+        "{head}"
+    );
+    let v: serde_json::Value = serde_json::from_str(body).expect("problem json");
+    assert_eq!(v["status"], expected, "{body}");
+    v
+}
+
+/// The seconds a `429` asks the client to wait, required to be present.
+fn retry_after(head: &str) -> u64 {
+    response_header(head, "retry-after")
+        .unwrap_or_else(|| panic!("a 429 without Retry-After: {head}"))
+        .parse()
+        .expect("numeric Retry-After")
+}
+
+#[tokio::test]
+async fn an_unserved_method_is_a_problem_json_405_that_keeps_allow() {
+    let running = net::start(test_config()).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    for (req, allow) in [
+        // A documented API route, a console page, and a probe — the probes
+        // are routed apart from the rest and must not escape the contract.
+        (
+            "DELETE /api/v1/server HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+            "GET,HEAD",
+        ),
+        (
+            "PUT /console HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "GET,HEAD",
+        ),
+        (
+            "POST /healthz HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "GET,HEAD",
+        ),
+    ] {
+        let (status, head, body) = request(http, req).await;
+        assert_problem(status, &head, &body, 405);
+        assert_eq!(
+            response_header(&head, "allow").map(|value| value.replace(' ', "")),
+            Some(allow.to_string()),
+            "{head}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_path_parameter_is_a_problem_json_400() {
+    let running = net::start(test_config()).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    // `%FF` is not UTF-8, so no `String` path parameter can hold it.
+    let (status, head, body) = request(http, &get("/api/v1/auth/oidc/%FF/start")).await;
+    let v = assert_problem(status, &head, &body, 400);
+    assert_eq!(v["title"], "Invalid path parameter", "{body}");
+}
+
+#[tokio::test]
+async fn a_plain_get_of_the_websocket_endpoint_is_a_problem_document() {
+    let running = net::start(test_config()).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    let (status, head, body) = request(http, &get("/ws/irc")).await;
+    assert!((400..500).contains(&status), "{head}");
+    let v = assert_problem(status, &head, &body, status);
+    assert_eq!(v["title"], "Invalid WebSocket upgrade", "{body}");
+}
+
+#[tokio::test]
+async fn the_per_address_authentication_budget_says_when_to_retry() {
+    let mut config = test_config();
+    config.limits.auth_rate_burst = Some(1);
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    let body = r#"{"account":"a","password":"p","label":"test"}"#;
+    let req = format!(
+        "POST /api/v1/auth/app-passwords HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    // The one token is spent on a refusal for want of a database.
+    let (status, _, _) = request(http, &req).await;
+    assert_eq!(status, 503);
+    let (status, head, body) = request(http, &req).await;
+    assert_problem(status, &head, &body, 429);
+    // One token refills over a sixty-second window at a burst of one.
+    let wait = retry_after(&head);
+    assert!((1..=60).contains(&wait), "{head}");
+}
+
+/// Send a WebSocket upgrade for `/ws/irc` and read only the response head, so
+/// an accepted connection stays open and keeps its per-address slot.
+async fn open_irc_websocket(addr: std::net::SocketAddr) -> (TcpStream, u16, String, String) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    stream
+        .write_all(
+            b"GET /ws/irc HTTP/1.1\r\nHost: t\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+              Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .expect("write");
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).await.expect("response head");
+        buf.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&buf).to_string();
+    let status = head
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("status code");
+    let length = response_header(&head, "content-length").map_or(0, |value| {
+        value.parse::<usize>().expect("numeric Content-Length")
+    });
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).await.expect("response body");
+    (
+        stream,
+        status,
+        head,
+        String::from_utf8_lossy(&body).to_string(),
+    )
+}
+
+#[tokio::test]
+async fn the_websocket_connection_cap_says_when_to_retry() {
+    let mut config = test_config();
+    config.limits.max_connections_per_ip = Some(1);
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    let (_held, status, head, _) = open_irc_websocket(http).await;
+    assert_eq!(status, 101, "{head}");
+    let (_, status, head, body) = open_irc_websocket(http).await;
+    assert_problem(status, &head, &body, 429);
+    // The soonest a slot is certain to free: the registration timeout.
+    assert_eq!(retry_after(&head), 30, "{head}");
+}
+
 #[tokio::test]
 async fn app_password_requires_database() {
     // Without a configured database the endpoint must fail loudly, not
@@ -1419,6 +1563,37 @@ async fn bnc_network_management_lifecycle() {
         "an omitted credential action must not silently preserve or clear"
     );
 
+    // PUT replaces the whole configuration, so an omitted autojoin list is
+    // refused rather than read as "none" -- which silently cleared it.
+    let no_autojoin = format!(
+        r#"{{"addr":"{up}","tls":false,"nick":"alice_updated","username":"alice_upda","realname":"Alice","credentials":{{"action":"keep"}},"server_password":{{"action":"keep"}}}}"#
+    );
+    let no_autojoin_req = format!(
+        "PUT /api/v1/me/networks/work HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{no_autojoin}",
+        no_autojoin.len()
+    );
+    let (status, head, body) = request(http, &no_autojoin_req).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        head.to_lowercase().contains("application/problem+json"),
+        "{head}"
+    );
+    assert!(body.contains("autojoin"), "{body}");
+    let (status, _, detail) = request(http, &detail_req).await;
+    assert_eq!(status, 200, "{detail}");
+    let detail: serde_json::Value = serde_json::from_str(&detail).expect("detail json");
+    assert_eq!(detail["autojoin"], serde_json::json!(["#other"]));
+
+    // An integer ID that is not one is the same problem document as every
+    // other refusal, not axum's plain-text rejection.
+    let bad_id = format!(
+        "DELETE /api/v1/me/tokens/not-a-number HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, head, body) = request(http, &bad_id).await;
+    let v = assert_problem(status, &head, &body, 400);
+    assert_eq!(v["title"], "Invalid path parameter", "{body}");
+
     // disable it: the flag flips and the driver stops (no live handle, so
     // `connected` is null), while the config row survives.
     let patch = |enabled: bool| {
@@ -1647,7 +1822,7 @@ async fn bnc_network_upstream_secret_requires_master_key() {
         "must refuse to store a server password unsealed"
     );
 
-    let remove = r#"{"addr":"up.example:6697","tls":true,"nick":"alice_","username":"alice_","realname":"Alice","credentials":{"action":"remove"},"server_password":{"action":"keep"}}"#;
+    let remove = r#"{"addr":"up.example:6697","tls":true,"nick":"alice_","username":"alice_","realname":"Alice","autojoin":[],"credentials":{"action":"remove"},"server_password":{"action":"keep"}}"#;
     let remove_req = format!(
         "PUT /api/v1/me/networks/stored-secret HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{remove}",

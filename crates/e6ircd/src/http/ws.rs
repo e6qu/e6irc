@@ -63,11 +63,27 @@ pub(super) enum WsFrameMode {
     Auto,
 }
 
+/// A WebSocket upgrade request, rejected as a problem document rather than
+/// axum's plain-text default: a plain `GET /ws/irc` is a `400` (or `426` for a
+/// wrong version) in the same shape as every other refusal.
+pub(super) struct UpgradeRequest(WebSocketUpgrade);
+
+problem_extractor!(
+    UpgradeRequest => WebSocketUpgrade,
+    [],
+    |upgrade| UpgradeRequest(upgrade),
+    |rejection: &axum::extract::ws::rejection::WebSocketUpgradeRejection| problem(
+        rejection.status(),
+        "Invalid WebSocket upgrade",
+        Some(&rejection.body_text()),
+    ),
+);
+
 pub(super) async fn ws_irc(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
-    ws: WebSocketUpgrade,
+    UpgradeRequest(ws): UpgradeRequest,
 ) -> Response {
     // Enforce the same per-IP connection cap the raw IRC listeners apply,
     // keyed on the real client IP (X-Forwarded-For behind a trusted proxy) so
@@ -76,10 +92,13 @@ pub(super) async fn ws_irc(
     let ip = client_ip(peer.ip(), &headers, &state.trusted_proxies);
     let Some(guard) = state.conn_limiter.try_acquire(ip) else {
         state.telemetry.record_connection_rejected();
-        return problem(
-            StatusCode::TOO_MANY_REQUESTS,
+        // A slot frees only when a connection closes, which nothing here can
+        // predict; the registration timeout is the soonest one held by a
+        // connection that never registered is reclaimed.
+        return retry_later(
             "Per-IP connection limit reached",
-            None,
+            "Close another connection from this address, or retry after the interval in the Retry-After header.",
+            retry_after_seconds(crate::core::REGISTRATION_TIMEOUT),
         );
     };
     // ircv3 WebSocket subprotocol negotiation: pick the client's first-offered
@@ -405,7 +424,7 @@ pub(super) async fn ws_ui(
     headers: axum::http::HeaderMap,
     Authenticated(account, credential): Authenticated,
     QueryParams(params): QueryParams<UiParams>,
-    ws: WebSocketUpgrade,
+    UpgradeRequest(ws): UpgradeRequest,
 ) -> Response {
     if let Err(refusal) = require_same_origin_upgrade(&state, &headers) {
         return refusal.into();
