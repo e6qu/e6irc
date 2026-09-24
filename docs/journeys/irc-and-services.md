@@ -14,8 +14,7 @@ trusts the configured TLS endpoint when TLS is used.
 
 **Flow.**
 
-1. Open a configured plaintext or TLS listener. A trusted load balancer may
-   supply PROXY protocol v2 only where that listener explicitly permits it.
+1. Open a configured plaintext or TLS listener.
 2. Frame input at the IRC line limit and check the message-tag and traditional
    body allowances independently; invalid or overlong input receives a
    protocol error or disconnect instead of truncation. IRC-over-WebSocket
@@ -39,9 +38,8 @@ share one permanent per-connection attempt budget. Input and output queues
 remain bounded. A second SASL exchange after success receives 907 and cannot
 replace the connection's authenticated account.
 
-**Security and observability.** PROXY metadata is accepted only from configured
-trusted peers, credentials are never logged, and registration policy is
-applied before the session becomes visible. Connection lifecycle, traffic,
+**Security and observability.** Credentials are never logged, and registration
+policy is applied before the session becomes visible. Connection lifecycle, traffic,
 latency, and fixed failure categories feed the live directories and metrics.
 
 **Evidence.** Proven over real sockets across core/e2e/DB tests, TLS tests,

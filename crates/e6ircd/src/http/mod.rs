@@ -203,12 +203,13 @@ fn monitoring_token_digest(token: &str) -> Result<[u8; 32], String> {
 }
 
 pub(crate) fn monitoring_token_digest_from_env() -> Result<Option<[u8; 32]>, String> {
-    let token = match std::env::var("E6IRC_MONITORING_TOKEN") {
-        Ok(token) => token,
-        Err(std::env::VarError::NotPresent) => return Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err("E6IRC_MONITORING_TOKEN is not valid UTF-8".into());
-        }
+    let Some(token) = crate::environment_config::optional(
+        &crate::environment_config::process_environment,
+        "E6IRC_MONITORING_TOKEN",
+    )
+    .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
     };
     monitoring_token_digest(&token).map(Some)
 }
@@ -864,7 +865,7 @@ pub(super) async fn delete_account_lifecycle(
         Ok(Some(deleted)) => deleted,
         // The account is already gone: nothing of it may run again.
         Ok(None) => {
-            undo_account_deletion_gate(state, &target.folded, actor).await?;
+            undo_account_deletion_gate(state, &target, actor).await?;
             return Err((StatusCode::NOT_FOUND, "No such account".into()));
         }
         Err(error) => {
@@ -873,7 +874,7 @@ pub(super) async fn delete_account_lifecycle(
                     .ensure_running(Some(&target.folded), &name, driver)
                     .await;
             }
-            undo_account_deletion_gate(state, &target.folded, actor).await?;
+            undo_account_deletion_gate(state, &target, actor).await?;
             return Err(account_deletion_error(error));
         }
     };
@@ -942,15 +943,20 @@ fn account_deletion_error(error: crate::db::DbError) -> (StatusCode, String) {
     }
 }
 
+/// Lift the live gate a deletion that did not commit installed, unless the
+/// account was already suspended: that suspension stands.
 async fn undo_account_deletion_gate(
     state: &AppState,
-    account: &str,
+    target: &crate::db::AccountDeletionTarget,
     actor: &str,
 ) -> Result<(), (StatusCode, String)> {
+    if target.suspended {
+        return Ok(());
+    }
     core_action(
         state,
         crate::core::AdminRequest::SetAccountSuspended {
-            account: account.to_string(),
+            account: target.folded.clone(),
             suspended: false,
             reason: "Account deletion did not commit".into(),
             actor: actor.to_string(),
@@ -2418,9 +2424,19 @@ mod pages {
                 );
             }
         };
+        // The console overview is administrators' only; anyone else would land
+        // on "Admin only" as the first page of their new account.
+        let administrator = preview.administrator
+            || state
+                .configured_admin_accounts
+                .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account));
         authenticated_redirect(
             &session,
-            "/console",
+            if administrator {
+                "/console"
+            } else {
+                "/console/account"
+            },
             invitation_state_cookie_name(state.secure_cookies),
             state.secure_cookies,
         )

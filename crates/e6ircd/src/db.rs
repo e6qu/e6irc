@@ -1800,6 +1800,9 @@ pub struct AccountDeletionTarget {
     pub id: i64,
     pub name: String,
     pub folded: String,
+    /// Suspended before the deletion began: a deletion that does not commit
+    /// must leave the live suspension gate up rather than lift it.
+    pub suspended: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1847,6 +1850,7 @@ pub async fn account_deletion_target(
         id: account_id,
         name,
         folded,
+        suspended: flags & ACCOUNT_FLAG_SUSPENDED != 0,
     }))
 }
 
@@ -1977,6 +1981,7 @@ pub async fn delete_account_permanently(
         id: account_id,
         name,
         folded,
+        suspended: flags & ACCOUNT_FLAG_SUSPENDED != 0,
     }))
 }
 

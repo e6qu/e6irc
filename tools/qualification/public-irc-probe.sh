@@ -15,7 +15,7 @@ case "$E6IRC_QUALIFICATION_TARGET" in
 esac
 
 root="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)"
-if (cd "$root" && cargo test -p e6ircd --lib "$test" -- --ignored --nocapture); then
+if (cd "$root" && cargo test --locked -p e6ircd --lib "$test" -- --ignored --nocapture); then
   write_probe_report passed not_applicable passed passed not_applicable
 else
   exit 1

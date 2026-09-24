@@ -15,7 +15,8 @@ suffix="$$-$(date +%s)"
 network="e6irc-image-test-$suffix"
 database="e6irc-image-test-pg-$suffix"
 server="e6irc-image-test-$suffix"
-postgres_image="${E6IRC_TEST_POSTGRES_IMAGE:-postgres:18-alpine}"
+# The same digest ci.yml pins its PostgreSQL service to.
+postgres_image="${E6IRC_TEST_POSTGRES_IMAGE:-postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873}"
 
 cleanup() {
   status=$?

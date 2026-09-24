@@ -5150,9 +5150,11 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
     );
     let (status, accept_headers, body) = request(http, &accept_request).await;
     assert_eq!(status, 303, "{body}");
+    // Bob was invited without administration, so his first page is his own
+    // account page, not the administrators' overview.
     assert_eq!(
         response_header(&accept_headers, "location"),
-        Some("/console")
+        Some("/console/account")
     );
     let bob_session_cookie = accept_headers
         .lines()
@@ -5163,6 +5165,12 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
         .and_then(|value| value.split(';').next())
         .expect("Bob session cookie")
         .to_string();
+    let first_page = format!(
+        "GET /console/account HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={bob_session_cookie}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &first_page).await;
+    assert_eq!(status, 200, "{body}");
     assert_eq!(
         e6ircd::db::verify_local_password(&pool, "Bob", "bob-password")
             .await

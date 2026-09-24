@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # e6irc server image. The daemon reads its configuration from the environment
-# itself (`--config-from-environment`; the deployment injects DATABASE_URL and
+# itself (`--config-from-environment`; the deployment injects E6IRC_DATABASE_URL and
 # the Shauth OIDC client secret from AWS Secrets Manager), in memory, so the
 # runtime image is distroless: no shell, no package manager, no script, and no
 # secrets-bearing file. The frontend is built and embedded in the server

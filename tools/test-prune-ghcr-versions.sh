@@ -2,10 +2,13 @@
 set -euo pipefail
 
 filter="$(dirname "${BASH_SOURCE[0]}")/prune-ghcr-versions-selection.jq"
+# Release aaaa's per-architecture images and their attestation (10) are pushed
+# before its generic index (1) is created from them; all of them are kept.
 fixture='[
   {"id":1,"created_at":"2026-01-03T00:00:00Z","metadata":{"container":{"tags":["aaaaaaaaaaaa"]}}},
-  {"id":2,"created_at":"2026-01-03T00:00:00Z","metadata":{"container":{"tags":["aaaaaaaaaaaa-arm64"]}}},
-  {"id":3,"created_at":"2026-01-03T00:00:00Z","metadata":{"container":{"tags":["aaaaaaaaaaaa-amd64"]}}},
+  {"id":2,"created_at":"2026-01-02T12:00:00Z","metadata":{"container":{"tags":["aaaaaaaaaaaa-arm64"]}}},
+  {"id":3,"created_at":"2026-01-02T12:00:00Z","metadata":{"container":{"tags":["aaaaaaaaaaaa-amd64"]}}},
+  {"id":10,"created_at":"2026-01-02T12:00:01Z","metadata":{"container":{"tags":[]}}},
   {"id":4,"created_at":"2026-01-02T00:00:00Z","metadata":{"container":{"tags":["bbbbbbbbbbbb"]}}},
   {"id":5,"created_at":"2026-01-02T00:00:00Z","metadata":{"container":{"tags":["bbbbbbbbbbbb-arm64"]}}},
   {"id":6,"created_at":"2026-01-02T00:00:00Z","metadata":{"container":{"tags":["bbbbbbbbbbbb-amd64"]}}},

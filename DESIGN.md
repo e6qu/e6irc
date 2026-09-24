@@ -685,8 +685,7 @@ strip = "symbols"
 
 ### 7.2 Connection lifecycle
 
-- Listeners: plaintext (default 6667) and TLS (6697, rustls); optional
-  PROXY-protocol v2 support for LB deployments (config-gated).
+- Listeners: plaintext (default 6667) and TLS (6697, rustls).
 - One tokio task per connection owning the socket; outbound traffic goes
   through a **bounded** per-connection queue of `Bytes` (SendQ). Queue-full →
   the classic ircd answer: kill the slow client with a "SendQ exceeded" quit.

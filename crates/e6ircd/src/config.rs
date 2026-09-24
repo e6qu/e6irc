@@ -608,7 +608,7 @@ impl EnvironmentSecretKeys {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkEntry {
     /// Selector used by clients (the /network suffix on the nick).
@@ -1111,7 +1111,7 @@ pub struct BncConfig {
     pub tls: Option<TlsConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OperConfig {
     pub name: String,
@@ -1142,7 +1142,7 @@ pub struct HttpConfig {
     pub hsts_include_subdomains: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BootstrapConfig {
     /// High-entropy one-time secret entered in the first-run browser form.
@@ -1155,7 +1155,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OidcProviderConfig {
     /// URL path segment and display name, e.g. "corp".
@@ -1206,7 +1206,7 @@ pub enum TokenEndpointAuthMethod {
     ClientSecretPost,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     pub url: String,
@@ -1233,6 +1233,116 @@ impl DatabaseConfig {
     pub fn pool_size(&self) -> crate::db::DatabasePoolSize {
         self.max_connections
             .unwrap_or_else(crate::db::DatabasePoolSize::for_this_host)
+    }
+}
+
+/// What a secret-bearing configuration value shows in `Debug` output.
+///
+/// After `resolve_secrets` these structures hold opened plaintext, so their
+/// `Debug` is written by hand to show only whether a secret is set. Each impl
+/// destructures its struct exhaustively: a field added later fails to compile
+/// until it is placed, redacted or not, rather than appearing by default.
+const REDACTED: &str = "<redacted>";
+
+fn redacted_option(value: &Option<String>) -> Option<&'static str> {
+    value.as_ref().map(|_| REDACTED)
+}
+
+impl std::fmt::Debug for NetworkEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            name,
+            kind,
+            owner,
+            addr,
+            tls,
+            nick,
+            username,
+            realname,
+            autojoin,
+            buffer_cap,
+            sasl_account,
+            sasl_password,
+            server_password,
+        } = self;
+        f.debug_struct("NetworkEntry")
+            .field("name", name)
+            .field("kind", kind)
+            .field("owner", owner)
+            .field("addr", addr)
+            .field("tls", tls)
+            .field("nick", nick)
+            .field("username", username)
+            .field("realname", realname)
+            .field("autojoin", autojoin)
+            .field("buffer_cap", buffer_cap)
+            // A Slack bot token for a Slack entry.
+            .field("sasl_account", &redacted_option(sasl_account))
+            .field("sasl_password", &redacted_option(sasl_password))
+            .field("server_password", &redacted_option(server_password))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for OperConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { name, password: _ } = self;
+        f.debug_struct("OperConfig")
+            .field("name", name)
+            .field("password", &REDACTED)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for BootstrapConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { token: _ } = self;
+        f.debug_struct("BootstrapConfig")
+            .field("token", &REDACTED)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for OidcProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            name,
+            issuer_url,
+            client_id,
+            client_secret: _,
+            account_claim,
+            scopes,
+            allowed_email_domains,
+            end_session_endpoint,
+            token_endpoint_auth_method,
+        } = self;
+        f.debug_struct("OidcProviderConfig")
+            .field("name", name)
+            .field("issuer_url", issuer_url)
+            .field("client_id", client_id)
+            .field("client_secret", &REDACTED)
+            .field("account_claim", account_claim)
+            .field("scopes", scopes)
+            .field("allowed_email_domains", allowed_email_domains)
+            .field("end_session_endpoint", end_session_endpoint)
+            .field("token_endpoint_auth_method", token_endpoint_auth_method)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            url: _,
+            startup_wait_seconds,
+            max_connections,
+        } = self;
+        // The URL carries the database password.
+        f.debug_struct("DatabaseConfig")
+            .field("url", &REDACTED)
+            .field("startup_wait_seconds", startup_wait_seconds)
+            .field("max_connections", max_connections)
+            .finish()
     }
 }
 
@@ -2081,6 +2191,58 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_never_carries_a_secret() {
+        let database: DatabaseConfig =
+            toml::from_str(r#"url = "postgres://e6irc:db-hunter2@db.example.test/e6irc""#)
+                .expect("database");
+        let bootstrap: BootstrapConfig =
+            toml::from_str(r#"token = "bootstrap-hunter2""#).expect("bootstrap");
+        let oper: OperConfig =
+            toml::from_str("name = \"root\"\npassword = \"oper-hunter2\"").expect("oper");
+        for rendered in [
+            format!("{database:?}"),
+            format!("{bootstrap:?}"),
+            format!("{oper:?}"),
+        ] {
+            assert!(!rendered.contains("hunter2"), "{rendered}");
+        }
+        let oidc = OidcProviderConfig {
+            name: "corp".into(),
+            issuer_url: "https://id.example.test".into(),
+            client_id: "e6irc".into(),
+            client_secret: "oidc-hunter2".into(),
+            account_claim: OidcAccountClaim::PreferredUsername,
+            scopes: Vec::new(),
+            allowed_email_domains: Vec::new(),
+            end_session_endpoint: None,
+            token_endpoint_auth_method: TokenEndpointAuthMethod::ClientSecretPost,
+        };
+        let rendered = format!("{oidc:?}");
+        assert!(
+            !rendered.contains("hunter2") && rendered.contains("corp"),
+            "{rendered}"
+        );
+        let network: NetworkEntry = toml::from_str(
+            r#"
+            name = "libera"
+            kind = "irc"
+            addr = "irc.libera.chat:6697"
+            tls = true
+            nick = "alice"
+            sasl_account = "alice"
+            sasl_password = "sasl-hunter2"
+            server_password = "pass-hunter2"
+            "#,
+        )
+        .expect("network");
+        let rendered = format!("{network:?}");
+        assert!(
+            !rendered.contains("hunter2") && rendered.contains("libera"),
+            "{rendered}"
+        );
+    }
 
     fn listening_config() -> Config {
         Config {

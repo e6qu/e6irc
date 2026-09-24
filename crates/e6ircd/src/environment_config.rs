@@ -167,13 +167,21 @@ impl<E: Fn(&str) -> Lookup> Environment<'_, E> {
     }
 }
 
-/// The address the HTTP listener binds, by the rule [`configuration_table`]
-/// applies: `e6ircd healthcheck` reads it here so a set-but-empty variable
-/// means the default to both, not the default to one and an error to the other.
+/// One variable read outside [`configuration_table`] by the same rule it
+/// applies: set-but-empty is unset, and a control character is refused by
+/// name. Every environment read goes through this rule, so a value cannot mean
+/// "unset" to one reader and an error or a different value to another.
+pub fn optional(
+    environment: &impl Fn(&str) -> Lookup,
+    variable: &'static str,
+) -> Result<Option<String>, EnvironmentConfigError> {
+    Environment(environment).optional(variable)
+}
+
+/// The address the HTTP listener binds, as [`configuration_table`] states it;
+/// `e6ircd healthcheck` probes the same address the server bound.
 pub fn http_addr(environment: &impl Fn(&str) -> Lookup) -> Result<String, EnvironmentConfigError> {
-    Ok(Environment(environment)
-        .optional(HTTP_ADDR_VARIABLE)?
-        .unwrap_or_else(|| DEFAULT_HTTP_ADDR.to_owned()))
+    Ok(optional(environment, HTTP_ADDR_VARIABLE)?.unwrap_or_else(|| DEFAULT_HTTP_ADDR.to_owned()))
 }
 
 /// Every OIDC setting that means something only beside `E6IRC_OIDC_ISSUER`.
