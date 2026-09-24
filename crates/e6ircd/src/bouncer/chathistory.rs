@@ -365,7 +365,7 @@ async fn write_batch(
         };
         write.write_all(head.as_bytes()).await?;
         for line in inner {
-            write.write_all(line.as_bytes()).await?;
+            write.write_all(in_batch(&tag, line).as_bytes()).await?;
         }
         write
             .write_all(format!(":*bnc* BATCH -{tag}\r\n").as_bytes())
@@ -377,6 +377,16 @@ async fn write_batch(
     }
     write.flush().await?;
     Ok(())
+}
+
+/// `line` as a member of batch `tag`: the `batch=` tag leads its tag section,
+/// merged into the tags the line already carries. A line inside a `BATCH`
+/// without it is, to the client, not part of the batch at all.
+fn in_batch(tag: &str, line: &str) -> String {
+    match line.strip_prefix('@') {
+        Some(tagged) => format!("@batch={tag};{tagged}"),
+        None => format!("@batch={tag} {line}"),
+    }
 }
 
 /// Emit one CHATHISTORY page: a `BATCH chathistory <target>` wrapper when the
@@ -607,6 +617,43 @@ mod tests {
         let mut reply = String::new();
         client.read_to_string(&mut reply).await.expect("read batch");
         assert!(reply.contains(" draft/chathistory-targets\r\n"));
+    }
+
+    /// Every line inside a batch names it: merged into a tag section the line
+    /// already has, or opening one.
+    #[tokio::test]
+    async fn each_line_inside_a_batch_carries_its_reference() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        write_batch(
+            &mut server,
+            true,
+            HistoryBatch::Messages("#room"),
+            &[
+                "@time=2026-01-01T00:00:00.000Z :a!a@h PRIVMSG #room :tagged\r\n".into(),
+                ":b!b@h PRIVMSG #room :untagged\r\n".into(),
+            ],
+        )
+        .await
+        .expect("write batch");
+        server.shutdown().await.expect("close server half");
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.expect("read batch");
+        let lines: Vec<&str> = reply.split("\r\n").filter(|l| !l.is_empty()).collect();
+        let reference = lines[0]
+            .strip_prefix(":*bnc* BATCH +")
+            .and_then(|rest| rest.split_once(' '))
+            .map(|(reference, _)| reference)
+            .unwrap_or_else(|| panic!("batch open: {reply}"));
+        assert_eq!(
+            lines[1..],
+            [
+                format!(
+                    "@batch={reference};time=2026-01-01T00:00:00.000Z :a!a@h PRIVMSG #room :tagged"
+                ),
+                format!("@batch={reference} :b!b@h PRIVMSG #room :untagged"),
+                format!(":*bnc* BATCH -{reference}"),
+            ]
+        );
     }
 
     #[test]

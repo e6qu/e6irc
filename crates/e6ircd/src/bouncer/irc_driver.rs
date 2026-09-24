@@ -652,6 +652,7 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
     // the driver synthesizes the echo when it writes the line.
     let upstream_echoes = conn.enabled("echo-message");
     let mut pending_echoes = PendingEchoes::default();
+    let mut requested_nicks = RequestedNicks::default();
 
     // Keepalive: `connect_once` bounds connect + registration, but the
     // steady-state read below would otherwise block forever on a half-open
@@ -764,16 +765,20 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                             identity.host = shown.host;
                         }
                         if let Some(nick) = change.nick.take() {
-                            // Tracked, so the session goes on under it — and
-                            // announced, because it is a name the owner did
-                            // not choose (a services enforcer, typically).
-                            ends.record_error_with_upstream_detail(
-                                super::NetworkFailure::RenamedByUpstream,
-                                &format!(
-                                    "upstream renamed this session from {} to {nick}",
-                                    identity.nick
-                                ),
-                            );
+                            // Tracked, so the session goes on under it. A name
+                            // an attached client asked for is the owner's own
+                            // choice, confirmed; any other is announced, because
+                            // the owner did not choose it (a services enforcer,
+                            // typically).
+                            if !requested_nicks.confirms(&nick) {
+                                ends.record_error_with_upstream_detail(
+                                    super::NetworkFailure::RenamedByUpstream,
+                                    &format!(
+                                        "upstream renamed this session from {} to {nick}",
+                                        identity.nick
+                                    ),
+                                );
+                            }
                             identity.nick = nick;
                         }
                         shared.joined.apply(change)
@@ -828,6 +833,7 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                     // waited for — a refused line then has no echo, and the
                     // refusal is the verdict; one that does not echo gets
                     // the echo manufactured here.
+                    requested_nicks.observe(&cmd.line);
                     if upstream_echoes {
                         if let Some(key) = EchoKey::of_client_line(&cmd.line) {
                             pending_echoes.push(key, cmd.origin);
@@ -856,11 +862,11 @@ fn dropped(failure: super::NetworkFailure) -> super::SessionOutcome {
 /// user and host from its own echoes. Until an echo reveals them, the user is
 /// the configured one behind a `~` and the host is the server's name.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SelfIdentity {
-    pub(super) nick: String,
+pub(crate) struct SelfIdentity {
+    pub(crate) nick: String,
     /// Verbatim, tilde included.
-    pub(super) user: String,
-    pub(super) host: String,
+    pub(crate) user: String,
+    pub(crate) host: String,
 }
 
 /// The widest `JOIN` line the wire allows: 512 bytes less the CRLF.
@@ -902,6 +908,20 @@ pub(super) fn join_lines(channels: &[String]) -> Vec<String> {
 /// when the bouncer accepted the line so backlog playback orders it against
 /// upstream traffic.
 pub(super) fn self_echo(line: &str, identity: &SelfIdentity) -> Option<String> {
+    echo_of(line, None, identity)
+}
+
+/// [`self_echo`] of a message as delivered to one `target` of its list: a
+/// bridge delivers each target separately, and echoes each delivery that the
+/// provider accepted on its own.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(super) fn self_echo_to(line: &str, target: &str, identity: &SelfIdentity) -> Option<String> {
+    echo_of(line, Some(target), identity)
+}
+
+/// The echo of `line`, to `to` in place of the targets the line names when
+/// given.
+fn echo_of(line: &str, to: Option<&str>, identity: &SelfIdentity) -> Option<String> {
     let parsed = e6irc_proto::message::Message::parse(line).ok()?;
     let prefix = format!(":{}!{}@{}", identity.nick, identity.user, identity.host);
     let body = match parsed.command.to_ascii_uppercase().as_str() {
@@ -909,6 +929,7 @@ pub(super) fn self_echo(line: &str, identity: &SelfIdentity) -> Option<String> {
             let [target, text] = parsed.params.as_slice() else {
                 return None;
             };
+            let target = to.unwrap_or(target);
             if target.is_empty() || text.is_empty() {
                 return None;
             }
@@ -924,6 +945,7 @@ pub(super) fn self_echo(line: &str, identity: &SelfIdentity) -> Option<String> {
             let [target] = parsed.params.as_slice() else {
                 return None;
             };
+            let target = to.unwrap_or(target);
             if target.is_empty() {
                 return None;
             }
@@ -1013,6 +1035,53 @@ impl PendingEchoes {
     fn take(&mut self, key: &EchoKey) -> Option<u64> {
         let position = self.0.iter().position(|(pending, _)| pending == key)?;
         self.0.remove(position).map(|(_, origin)| origin)
+    }
+}
+
+/// Most nick changes an attached client may have asked for that the upstream
+/// has not confirmed. One it refuses (433, 432) is never confirmed, so the
+/// oldest is dropped past this bound.
+const MAX_REQUESTED_NICKS: usize = 8;
+
+/// The nicknames attached clients asked this session for with `NICK`, oldest
+/// first. The upstream's confirmation of one is the owner's own choice taking
+/// effect; a rename to any other name was not asked for.
+#[derive(Default)]
+struct RequestedNicks(std::collections::VecDeque<String>);
+
+impl RequestedNicks {
+    /// Remember the nickname `line` asks for, when it is a `NICK`.
+    fn observe(&mut self, line: &str) {
+        let Ok(parsed) = e6irc_proto::message::Message::parse(line) else {
+            return;
+        };
+        if !parsed.command.eq_ignore_ascii_case("NICK") {
+            return;
+        }
+        let Some(nick) = parsed.params.first().filter(|nick| !nick.is_empty()) else {
+            return;
+        };
+        if self.0.len() == MAX_REQUESTED_NICKS {
+            self.0.pop_front();
+        }
+        self.0.push_back(nick.to_string());
+    }
+
+    /// Whether the upstream renaming this session to `nick` confirms a
+    /// request. The request is consumed, with every older one it supersedes.
+    fn confirms(&mut self, nick: &str) -> bool {
+        let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
+        match self
+            .0
+            .iter()
+            .position(|requested| casemap.eq(requested, nick))
+        {
+            Some(position) => {
+                self.0.drain(..=position);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -1559,6 +1628,26 @@ mod tests {
         assert!(self_echo("PRIVMSG #room :", &alice()).is_none());
         assert!(self_echo("TAGMSG", &alice()).is_none());
         assert!(self_echo("PING :token", &alice()).is_none());
+    }
+
+    #[test]
+    fn only_a_requested_nick_is_a_confirmation() {
+        let mut requested = RequestedNicks::default();
+        requested.observe("PRIVMSG #room :NICK chosen");
+        assert!(!requested.confirms("chosen"), "not a NICK command");
+        requested.observe("nick First");
+        requested.observe("NICK :second");
+        assert!(requested.confirms("SECOND"), "casefolded, either form");
+        assert!(
+            !requested.confirms("first"),
+            "an older request is superseded by the one confirmed after it"
+        );
+        assert!(!requested.confirms("enforced"), "never asked for");
+        for n in 0..=MAX_REQUESTED_NICKS {
+            requested.observe(&format!("NICK refused{n}"));
+        }
+        assert!(!requested.confirms("refused0"), "the oldest is dropped");
+        assert!(requested.confirms(&format!("refused{MAX_REQUESTED_NICKS}")));
     }
 
     async fn assert_live_driver(network: &str, addr: &str, autojoin: &[&str]) {

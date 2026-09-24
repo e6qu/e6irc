@@ -1249,8 +1249,13 @@ impl Inbound {
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RouteResult {
-    /// A PRIVMSG mapped to `(upstream_id, text)`; deliver it.
-    Deliver(String, BridgeText),
+    /// A PRIVMSG to `target` (as the client named it, less any STATUSMSG
+    /// prefix), mapped to the upstream `id`; deliver `text` there.
+    Deliver {
+        id: String,
+        target: String,
+        text: BridgeText,
+    },
     /// A PRIVMSG to `target` that maps to no bridged channel — surface loss.
     Unmapped(String),
     /// The bridge cannot execute this command; surface a fixed safe reason.
@@ -1310,7 +1315,11 @@ pub(crate) fn route_privmsg(
         .map(|t| {
             let bare = conversation_target(t);
             match targets.get(&casemap.casefold(bare)) {
-                Some(id) => RouteResult::Deliver(id.clone(), text.clone()),
+                Some(id) => RouteResult::Deliver {
+                    id: id.clone(),
+                    target: bare.to_string(),
+                    text: text.clone(),
+                },
                 None => RouteResult::Unmapped(bare.to_string()),
             }
         })
@@ -1329,11 +1338,38 @@ pub(crate) fn route_privmsg(
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 pub(crate) const RATE_LIMIT_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The echo of one routed delivery: the line an attached client sent, as the
+/// bridge's own account says it on IRC, to the one target delivered. Emitted
+/// only once the provider accepted the message — a refused one is answered by
+/// its undelivered notice alone, as a real server answers with its refusal.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+#[derive(Debug)]
+pub(crate) struct PendingEcho {
+    line: String,
+    origin: u64,
+}
+
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+impl PendingEcho {
+    /// The echo of `command` delivered to `target`, or `None` for a line with
+    /// no echo (see [`irc_driver::self_echo`]).
+    fn of(
+        command: &ClientCommand,
+        target: &str,
+        identity: &irc_driver::SelfIdentity,
+    ) -> Option<Self> {
+        irc_driver::self_echo_to(&command.line, target, identity).map(|line| Self {
+            line,
+            origin: command.origin,
+        })
+    }
+}
+
 /// How one routed delivery ended, for [`report_delivery`].
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 #[derive(Debug)]
 pub(crate) enum DeliveryOutcome {
-    Delivered,
+    Delivered(Option<PendingEcho>),
     Failed {
         id: String,
         detail: String,
@@ -1354,6 +1390,7 @@ pub(crate) async fn deliver_with_retry<F, Fut>(
     mut deliver: F,
     id: String,
     text: BridgeText,
+    echo: Option<PendingEcho>,
 ) -> DeliveryOutcome
 where
     F: FnMut(String, BridgeText) -> Fut,
@@ -1364,11 +1401,11 @@ where
         BridgeFailure::Failed(detail) => DeliveryOutcome::Failed { id, detail },
     };
     match deliver(id.clone(), text.clone()).await {
-        Ok(()) => DeliveryOutcome::Delivered,
+        Ok(()) => DeliveryOutcome::Delivered(echo),
         Err(BridgeFailure::RateLimited(wait)) if wait <= RATE_LIMIT_WAIT_CAP => {
             tokio::time::sleep(wait).await;
             match deliver(id.clone(), text).await {
-                Ok(()) => DeliveryOutcome::Delivered,
+                Ok(()) => DeliveryOutcome::Delivered(echo),
                 Err(failure) => failed(id, failure),
             }
         }
@@ -1376,7 +1413,7 @@ where
     }
 }
 
-/// Say what became of one delivery: nothing for a delivered message, and for
+/// Say what became of one delivery: its echo for a delivered message, and for
 /// a lost one a counted failure plus a `*bnc*` notice naming the target (and
 /// the limit, when it was a rate limit) — never a silent drop (DESIGN §2).
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
@@ -1387,7 +1424,11 @@ pub(crate) fn report_delivery(
     outcome: DeliveryOutcome,
 ) {
     match outcome {
-        DeliveryOutcome::Delivered => {}
+        DeliveryOutcome::Delivered(echo) => {
+            if let Some(PendingEcho { line, origin }) = echo {
+                ends.emit_echo(line, origin);
+            }
+        }
         DeliveryOutcome::Failed { id, detail } => {
             eprintln!("{platform}: send to {id} failed: {detail}");
             ends.record_error(NetworkFailure::UpstreamWriteFailed);
@@ -1401,12 +1442,13 @@ pub(crate) fn report_delivery(
     }
 }
 
-/// Deliver one already-routed batch of PRIVMSG targets and surface the outcome
-/// of **each** one to the attached client. `route_privmsg` yields one
-/// `RouteResult` per comma-separated target; this consumes the whole list, so a
-/// mapped target that fails to send and an unmapped target both produce their
-/// own `*bnc*` NOTICE — a multi-target line can't have all-but-one target's
-/// non-delivery silently dropped. That fold-N-outcomes-into-one silent drop
+/// Route one client command to its bridged targets, deliver each, and surface
+/// the outcome of **each** one to the attached client. `route_privmsg` yields
+/// one `RouteResult` per comma-separated target; this consumes the whole list,
+/// so a mapped target that fails to send and an unmapped target both produce
+/// their own `*bnc*` NOTICE — a multi-target line can't have all-but-one
+/// target's non-delivery silently dropped — and each delivered target gets its
+/// own echo, as `identity` says it. That fold-N-outcomes-into-one silent drop
 /// (DESIGN §2) is exactly what the Matrix bridge did before this was shared:
 /// every bridge now routes its per-target outcome through one definition that
 /// cannot collapse the list. `deliver` performs the platform's upstream send for
@@ -1418,7 +1460,9 @@ pub(crate) fn report_delivery(
 #[cfg(feature = "matrix")]
 pub(crate) async fn relay_routed<F, Fut>(
     ends: &DriverEnds,
-    routed: Vec<RouteResult>,
+    command: &ClientCommand,
+    targets: &std::collections::HashMap<String, String>,
+    identity: &irc_driver::SelfIdentity,
     platform: &str,
     kind: &str,
     mut deliver: F,
@@ -1426,10 +1470,11 @@ pub(crate) async fn relay_routed<F, Fut>(
     F: FnMut(String, BridgeText) -> Fut,
     Fut: std::future::Future<Output = Result<(), BridgeFailure>>,
 {
-    for routed in routed {
+    for routed in route_privmsg(&command.line, targets) {
         match routed {
-            RouteResult::Deliver(id, text) => {
-                let outcome = deliver_with_retry(&mut deliver, id, text).await;
+            RouteResult::Deliver { id, target, text } => {
+                let echo = PendingEcho::of(command, &target, identity);
+                let outcome = deliver_with_retry(&mut deliver, id, text, echo).await;
                 report_delivery(ends, platform, kind, outcome);
             }
             RouteResult::Unmapped(target) => {
@@ -2176,13 +2221,14 @@ pub(crate) async fn bridge_send_credentials(
 /// delivery on `queue` — never awaited here, so the socket keeps being read.
 /// `None` means every handle was dropped (or the network was shut down) and
 /// the session must stop. Discord and Slack differ only in how one message is
-/// sent, which is `deliver`; the loop reports each finished delivery with
-/// [`report_delivery`].
+/// sent, which is `deliver`; the loop reports each finished delivery — and
+/// emits its echo, as `identity` says it — with [`report_delivery`].
 #[cfg(any(feature = "discord", feature = "slack"))]
 pub(crate) fn queue_channel_command<F, Fut>(
     ends: &DriverEnds,
     command: Option<ClientCommand>,
     channel_to_id: &HashMap<String, String>,
+    identity: &irc_driver::SelfIdentity,
     platform: &str,
     queue: &mut DeliveryQueue,
     deliver: F,
@@ -2191,10 +2237,12 @@ where
     F: FnMut(String, BridgeText) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<(), BridgeFailure>> + Send + 'static,
 {
-    for routed in route_privmsg(&command?.line, channel_to_id) {
+    let command = command?;
+    for routed in route_privmsg(&command.line, channel_to_id) {
         match routed {
-            RouteResult::Deliver(id, text) => {
-                let work = deliver_with_retry(deliver.clone(), id.clone(), text);
+            RouteResult::Deliver { id, target, text } => {
+                let echo = PendingEcho::of(&command, &target, identity);
+                let work = deliver_with_retry(deliver.clone(), id.clone(), text, echo);
                 if queue.push(work).is_err() {
                     eprintln!(
                         "{platform}: {DELIVERY_QUEUE_CAPACITY} sends in flight; refused one to {id}"
@@ -2266,9 +2314,10 @@ pub struct AttachCaps {
     pub server_time: bool,
     pub message_tags: bool,
     pub account_tag: bool,
-    /// echo-message: the attaching client wants its own messages echoed back
-    /// (synthesized by the driver — the upstream is never asked for
-    /// echo-message, so there is exactly one echo, never two).
+    /// echo-message: the attaching client wants its own messages echoed back.
+    /// The driver emits exactly one echo per delivered line — the upstream's
+    /// own when it echoes, else one it synthesizes — and this decides only
+    /// whether the originator is sent it.
     pub echo_message: bool,
     /// batch: the client can receive BATCH-wrapped responses (CHATHISTORY).
     pub batch: bool,
@@ -3573,7 +3622,7 @@ pub(crate) fn render_bridged(
     message: &Inbound,
 ) -> Vec<String> {
     use e6irc_proto::message::MAX_LINE_LEN;
-    let nick = crate::sanitize::nick_token(sender);
+    let who = bridged_identity(host, sender);
     let (command, open, close) = match message.kind {
         InboundKind::Message => ("PRIVMSG", "", ""),
         #[cfg(any(feature = "matrix", feature = "slack"))]
@@ -3581,7 +3630,10 @@ pub(crate) fn render_bridged(
         #[cfg(feature = "matrix")]
         InboundKind::Notice => ("NOTICE", "", ""),
     };
-    let prefix = format!(":{nick}!{nick}@{host} {command} {channel} :{open}");
+    let prefix = format!(
+        ":{}!{}@{} {command} {channel} :{open}",
+        who.nick, who.user, who.host
+    );
     // `nick_token` bounds the nick and `host` is one of three literals, so only
     // a pathologically long configured channel name can exhaust the line. The
     // floor keeps the split making progress if one ever does; the resulting
@@ -3617,12 +3669,33 @@ pub(crate) fn render_bridged(
     out
 }
 
+/// How a bridge shows a provider account on IRC: `nick!nick@<platform>`, the
+/// nick reduced to a safe token. Every relayed post is prefixed from it, and so
+/// is the echo of our own — the line the provider's copy of the post would have
+/// been — so the two can never disagree about who the bridge's account is.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) fn bridged_identity(host: &str, name: &str) -> irc_driver::SelfIdentity {
+    let nick = crate::sanitize::nick_token(name);
+    irc_driver::SelfIdentity {
+        user: nick.clone(),
+        nick,
+        host: host.to_string(),
+    }
+}
+
 /// A `*bnc*` NOTICE to `channel` saying a message from `sender` of a kind the
 /// bridge cannot show (`what`, the provider's own type name) was not relayed.
 /// `what` is upstream text: it is reduced to a bounded token of type-name
 /// characters, so it can carry neither controls nor a line's worth of bytes.
+/// A message too malformed to name its sender is said to be from an unknown
+/// one rather than dropped.
 #[cfg(any(feature = "matrix", feature = "slack"))]
-pub(crate) fn unrelayed_notice(platform: &str, channel: &str, what: &str, sender: &str) -> String {
+pub(crate) fn unrelayed_notice(
+    platform: &str,
+    channel: &str,
+    what: &str,
+    sender: Option<&str>,
+) -> String {
     let what: String = what
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
@@ -3633,7 +3706,10 @@ pub(crate) fn unrelayed_notice(platform: &str, channel: &str, what: &str, sender
     } else {
         what.as_str()
     };
-    let sender = crate::sanitize::nick_token(sender);
+    let sender = sender.map_or_else(
+        || "an unknown sender".to_string(),
+        crate::sanitize::nick_token,
+    );
     format!(":*bnc* NOTICE {channel} :{platform}: a {what} message from {sender} was not relayed")
 }
 
@@ -4622,6 +4698,9 @@ pub enum AttachEnd {
 /// closes. This is the session multiplexer's core operation, serving
 /// every driver kind (`irc`, `local`, and the bridges) uniformly.
 ///
+/// `input` is what the client already sent on `stream` that nothing handled
+/// (see [`ClientInput`]); it is handled first, after the replay, as the
+/// attached session's own input.
 /// `account` is the authenticated account, used to key the BNC-local
 /// per-target read markers (shared networks keep per-account positions).
 /// `liveness` is how long the client may stay silent before it is pinged, and
@@ -4629,6 +4708,7 @@ pub enum AttachEnd {
 /// production).
 pub async fn attach<S>(
     stream: S,
+    input: ClientInput,
     handle: &NetworkHandle,
     mut caps: AttachCaps,
     account: &str,
@@ -4638,7 +4718,6 @@ pub async fn attach<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    use e6irc_proto::framing::{LineBuffer, LineEvent};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (mut read, mut write) = tokio::io::split(stream);
@@ -4711,7 +4790,29 @@ where
     }
     write.flush().await?;
 
-    let mut framing = LineBuffer::new(e6irc_proto::message::MAX_CLIENT_FRAME_LEN);
+    let attachment = Attachment {
+        handle,
+        account,
+        id: attach_id,
+        nick: downstream_nick,
+    };
+    let ClientInput {
+        mut framing,
+        pending,
+    } = input;
+    for event in pending {
+        if let Some(end) = client_event(
+            &mut write,
+            event,
+            &attachment,
+            &mut caps,
+            &downstream_session,
+        )
+        .await?
+        {
+            return Ok(end);
+        }
+    }
     let mut read_buf = vec![0u8; 8192];
     let mut parsed = Vec::new();
     // Anything the client sends shows it is there; only its silence is timed,
@@ -4819,168 +4920,8 @@ where
                     client_silence.restart();
                     framing.feed(&read_buf[..n], &mut parsed);
                     for event in parsed.drain(..) {
-                        match event {
-                            LineEvent::Line(line) => match String::from_utf8(line) {
-                                Ok(text) => {
-                                    let msg = match parse_client_line(&text) {
-                                        Ok(msg) => msg,
-                                        Err(error) => {
-                                            write_client_line_error(&mut write, error).await?;
-                                            continue;
-                                        }
-                                    };
-                                    // Attach-local protocol state must never be
-                                    // forwarded onto the account's shared
-                                    // upstream connection. CAP mutates only
-                                    // this downstream's view; SASL is already
-                                    // complete; history and markers belong to
-                                    // the BNC store; liveness and QUIT concern
-                                    // this one downstream transport, while the
-                                    // upstream session outlives every client.
-                                    let mut handled = true;
-                                    let cmd = msg.command.to_ascii_uppercase();
-                                    let params: Vec<&str> = msg.params.to_vec();
-                                    match cmd.as_str() {
-                                        "PING" => match params.first() {
-                                            Some(token) => {
-                                                write
-                                                    .write_all(attach_pong(token).as_bytes())
-                                                    .await?;
-                                                write.flush().await?;
-                                            }
-                                            None => {
-                                                write_attach_numeric(
-                                                    &mut write,
-                                                    downstream_nick,
-                                                    409,
-                                                    None,
-                                                    "No origin specified",
-                                                )
-                                                .await?;
-                                            }
-                                        },
-                                        // A reply, never a request: it answers
-                                        // nothing the upstream asked this client.
-                                        "PONG" => {}
-                                        "QUIT" => {
-                                            write.write_all(ATTACH_QUIT_REPLY).await?;
-                                            write.flush().await?;
-                                            return Ok(AttachEnd::ClientQuit);
-                                        }
-                                        "CAP" => {
-                                            let target = downstream_session
-                                                .snapshot()
-                                                .map(|session| session.nick)
-                                                .unwrap_or_else(|| downstream_nick.to_string());
-                                            let mut cap_open = false;
-                                            serve::handle_cap(
-                                                &mut write,
-                                                "*bnc*",
-                                                &target,
-                                                &msg,
-                                                true,
-                                                &mut cap_open,
-                                                &mut caps,
-                                            )
-                                            .await?;
-                                        }
-                                        "AUTHENTICATE" => {
-                                            write_attach_numeric(
-                                                &mut write,
-                                                downstream_nick,
-                                                907,
-                                                None,
-                                                "You have already authenticated",
-                                            )
-                                            .await?;
-                                        }
-                                        "CHATHISTORY" if caps.chathistory => {
-                                            chathistory::handle_chathistory(
-                                                handle, &mut write, caps, &params,
-                                            )
-                                            .await?;
-                                        }
-                                        "CHATHISTORY" => {
-                                            write
-                                                .write_all(
-                                                    b":*bnc* FAIL CHATHISTORY NEED_CAPS :draft/chathistory required\r\n",
-                                                )
-                                                .await?;
-                                            write.flush().await?;
-                                        }
-                                        "MARKREAD" if caps.read_marker => {
-                                            chathistory::handle_markread(
-                                                handle, &mut write, account, attach_id, &params,
-                                            )
-                                            .await?;
-                                        }
-                                        "MARKREAD" => {
-                                            write_attach_numeric(
-                                                &mut write,
-                                                downstream_nick,
-                                                421,
-                                                Some("MARKREAD"),
-                                                "Unknown command",
-                                            )
-                                            .await?;
-                                        }
-                                        _ => handled = false,
-                                    }
-                                    if !handled {
-                                        match handle.send_from(attach_id, &text) {
-                                            SendOutcome::Sent => {}
-                                            // Full: the upstream is congested/reconnecting.
-                                            // Drop this line loudly rather than block —
-                                            // blocking here would stall every other client
-                                            // sharing this network's queue. Never silent.
-                                            SendOutcome::Full => {
-                                                write
-                                                    .write_all(
-                                                        b":*bnc* NOTICE * :upstream busy; line not sent, try again\r\n",
-                                                    )
-                                                    .await?;
-                                                write.flush().await?;
-                                            }
-                                            SendOutcome::Closed => {
-                                                return Ok(AttachEnd::DriverStopped);
-                                            }
-                                            SendOutcome::Unavailable => {
-                                                write
-                                                    .write_all(
-                                                        b":*bnc* NOTICE * :upstream registration is parked; reconfigure the network before sending\r\n",
-                                                    )
-                                                    .await?;
-                                                write.flush().await?;
-                                            }
-                                            SendOutcome::Rejected(error) => {
-                                                // The attach path validates before handling
-                                                // local commands. Keep the shared queue
-                                                // boundary authoritative as well, so future
-                                                // callers cannot bypass the same contract.
-                                                write_client_line_error(&mut write, error).await?;
-                                            }
-                                        }
-                                    }
-                                }
-                                // This relay is UTF-8, like the core ingest
-                                // path; reject a non-UTF-8 line loudly rather
-                                // than swallowing it.
-                                Err(_) => {
-                                    write
-                                        .write_all(
-                                            b":*bnc* NOTICE * :input was not valid UTF-8; not sent upstream\r\n",
-                                        )
-                                        .await?;
-                                    write.flush().await?;
-                                }
-                            },
-                            // The framing contract forbids silently dropping an
-                            // over-long line; tell the client its line was not
-                            // relayed rather than swallowing it.
-                            LineEvent::TooLong => {
-                                write_client_line_error(&mut write, ClientLineError::TooLong)
-                                    .await?;
-                            }
+                        if let Some(end) = client_event(&mut write, event, &attachment, &mut caps, &downstream_session).await? {
+                            return Ok(end);
                         }
                     }
                 }
@@ -4988,6 +4929,209 @@ where
             },
         }
     }
+}
+
+/// What a client sent on its stream before [`attach`] took it that nothing
+/// has handled yet: the lines already framed, and the start of one still
+/// arriving. The attach listener's registration handshake frames the same
+/// stream first, and a client need not wait for the welcome before sending —
+/// the lines that arrived in the same read as its `CAP END`, and half of the
+/// next, belong to the attached session. A fresh stream has none.
+pub struct ClientInput {
+    framing: e6irc_proto::framing::LineBuffer,
+    pending: Vec<e6irc_proto::framing::LineEvent>,
+}
+
+impl Default for ClientInput {
+    fn default() -> Self {
+        Self {
+            framing: e6irc_proto::framing::LineBuffer::new(
+                e6irc_proto::message::MAX_CLIENT_FRAME_LEN,
+            ),
+            pending: Vec::new(),
+        }
+    }
+}
+
+/// Who an attachment is, for [`client_event`]: the network it is attached to,
+/// the account it authenticated as, its id among the network's attachments,
+/// and the nick it was welcomed under.
+struct Attachment<'a> {
+    handle: &'a NetworkHandle,
+    account: &'a str,
+    id: u64,
+    nick: &'a str,
+}
+
+/// Handle one framed line from an attached client: answer what belongs to the
+/// attachment itself, and send the rest to the network. `Some` ends the
+/// attachment.
+async fn client_event<W>(
+    write: &mut W,
+    event: e6irc_proto::framing::LineEvent,
+    attachment: &Attachment<'_>,
+    caps: &mut AttachCaps,
+    downstream_session: &IrcSessionState,
+) -> std::io::Result<Option<AttachEnd>>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use e6irc_proto::framing::LineEvent;
+    use tokio::io::AsyncWriteExt;
+
+    match event {
+        LineEvent::Line(line) => match String::from_utf8(line) {
+            Ok(text) => {
+                let msg = match parse_client_line(&text) {
+                    Ok(msg) => msg,
+                    Err(error) => {
+                        write_client_line_error(write, error).await?;
+                        return Ok(None);
+                    }
+                };
+                // Attach-local protocol state must never be
+                // forwarded onto the account's shared
+                // upstream connection. CAP mutates only
+                // this downstream's view; SASL is already
+                // complete; history and markers belong to
+                // the BNC store; liveness and QUIT concern
+                // this one downstream transport, while the
+                // upstream session outlives every client.
+                let mut handled = true;
+                let cmd = msg.command.to_ascii_uppercase();
+                let params: Vec<&str> = msg.params.to_vec();
+                match cmd.as_str() {
+                    "PING" => match params.first() {
+                        Some(token) => {
+                            write.write_all(attach_pong(token).as_bytes()).await?;
+                            write.flush().await?;
+                        }
+                        None => {
+                            write_attach_numeric(
+                                write,
+                                attachment.nick,
+                                409,
+                                None,
+                                "No origin specified",
+                            )
+                            .await?;
+                        }
+                    },
+                    // A reply, never a request: it answers
+                    // nothing the upstream asked this client.
+                    "PONG" => {}
+                    "QUIT" => {
+                        write.write_all(ATTACH_QUIT_REPLY).await?;
+                        write.flush().await?;
+                        return Ok(Some(AttachEnd::ClientQuit));
+                    }
+                    "CAP" => {
+                        let target = downstream_session
+                            .snapshot()
+                            .map(|session| session.nick)
+                            .unwrap_or_else(|| attachment.nick.to_string());
+                        let mut cap_open = false;
+                        serve::handle_cap(write, "*bnc*", &target, &msg, true, &mut cap_open, caps)
+                            .await?;
+                    }
+                    "AUTHENTICATE" => {
+                        write_attach_numeric(
+                            write,
+                            attachment.nick,
+                            907,
+                            None,
+                            "You have already authenticated",
+                        )
+                        .await?;
+                    }
+                    "CHATHISTORY" if caps.chathistory => {
+                        chathistory::handle_chathistory(attachment.handle, write, *caps, &params)
+                            .await?;
+                    }
+                    "CHATHISTORY" => {
+                        write
+                            .write_all(
+                                b":*bnc* FAIL CHATHISTORY NEED_CAPS :draft/chathistory required\r\n",
+                            )
+                            .await?;
+                        write.flush().await?;
+                    }
+                    "MARKREAD" if caps.read_marker => {
+                        chathistory::handle_markread(
+                            attachment.handle,
+                            write,
+                            attachment.account,
+                            attachment.id,
+                            &params,
+                        )
+                        .await?;
+                    }
+                    "MARKREAD" => {
+                        write_attach_numeric(
+                            write,
+                            attachment.nick,
+                            421,
+                            Some("MARKREAD"),
+                            "Unknown command",
+                        )
+                        .await?;
+                    }
+                    _ => handled = false,
+                }
+                if !handled {
+                    match attachment.handle.send_from(attachment.id, &text) {
+                        SendOutcome::Sent => {}
+                        // Full: the upstream is congested/reconnecting.
+                        // Drop this line loudly rather than block —
+                        // blocking here would stall every other client
+                        // sharing this network's queue. Never silent.
+                        SendOutcome::Full => {
+                            write
+                                .write_all(
+                                    b":*bnc* NOTICE * :upstream busy; line not sent, try again\r\n",
+                                )
+                                .await?;
+                            write.flush().await?;
+                        }
+                        SendOutcome::Closed => {
+                            return Ok(Some(AttachEnd::DriverStopped));
+                        }
+                        SendOutcome::Unavailable => {
+                            write
+                                .write_all(
+                                    b":*bnc* NOTICE * :upstream registration is parked; reconfigure the network before sending\r\n",
+                                )
+                                .await?;
+                            write.flush().await?;
+                        }
+                        SendOutcome::Rejected(error) => {
+                            // The attach path validates before handling
+                            // local commands. Keep the shared queue
+                            // boundary authoritative as well, so future
+                            // callers cannot bypass the same contract.
+                            write_client_line_error(write, error).await?;
+                        }
+                    }
+                }
+            }
+            // This relay is UTF-8, like the core ingest
+            // path; reject a non-UTF-8 line loudly rather
+            // than swallowing it.
+            Err(_) => {
+                write
+                    .write_all(b":*bnc* NOTICE * :input was not valid UTF-8; not sent upstream\r\n")
+                    .await?;
+                write.flush().await?;
+            }
+        },
+        // The framing contract forbids silently dropping an
+        // over-long line; tell the client its line was not
+        // relayed rather than swallowing it.
+        LineEvent::TooLong => {
+            write_client_line_error(write, ClientLineError::TooLong).await?;
+        }
+    }
+    Ok(None)
 }
 
 /// The bouncer's own liveness check of an attached client. Its `PONG` is
@@ -5840,6 +5984,7 @@ mod tests {
             std::time::Duration::from_secs(5),
             attach(
                 server_side,
+                ClientInput::default(),
                 &handle,
                 AttachCaps::default(),
                 "testuser",
@@ -6365,18 +6510,45 @@ mod tests {
         map.insert("#a".to_string(), "id_a".to_string());
         map.insert("#b".to_string(), "id_b".to_string());
         // #c is deliberately absent from the map (unmapped).
-        let routed = route_privmsg("PRIVMSG #a,#b,#c :hi", &map);
-        relay_routed(&ends, routed, "Test", "channel", |id, _text| {
-            let failed = id == "id_b"; // #b's upstream send fails; #a succeeds.
-            async move {
-                if failed {
-                    Err(BridgeFailure::Failed("boom".to_string()))
-                } else {
-                    Ok(())
+        let command = ClientCommand {
+            origin: 9,
+            line: "PRIVMSG #a,#b,#c :hi".to_string(),
+        };
+        let identity = bridged_identity("test", "me");
+        let mut events = handle.subscribe();
+        relay_routed(
+            &ends,
+            &command,
+            &map,
+            &identity,
+            "Test",
+            "channel",
+            |id, _text| {
+                let failed = id == "id_b"; // #b's upstream send fails; #a succeeds.
+                async move {
+                    if failed {
+                        Err(BridgeFailure::Failed("boom".to_string()))
+                    } else {
+                        Ok(())
+                    }
                 }
-            }
-        })
+            },
+        )
         .await;
+        // Only the delivered target is echoed, to the attachment that sent it.
+        let mut echoes = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let DriverEvent::Echo { line, origin } = event {
+                echoes.push((line.line, origin));
+            }
+        }
+        assert_eq!(echoes.len(), 1, "{echoes:?}");
+        assert_eq!(echoes[0].1, 9);
+        assert!(
+            echoes[0].0.ends_with(" :me!me@test PRIVMSG #a :hi"),
+            "{}",
+            echoes[0].0
+        );
         let runtime = handle.runtime_snapshot();
         assert_eq!(runtime.errors, 1, "{runtime:?}");
         assert!(runtime.last_error_at.is_some(), "{runtime:?}");
@@ -6417,10 +6589,19 @@ mod tests {
             "the component diagnostic is retained: {lines:#?}"
         );
 
-        let routed = route_privmsg("JOIN #a", &map);
-        relay_routed(&ends, routed, "Test", "channel", |_id, _text| async {
-            Ok(())
-        })
+        let command = ClientCommand {
+            origin: 9,
+            line: "JOIN #a".to_string(),
+        };
+        relay_routed(
+            &ends,
+            &command,
+            &map,
+            &identity,
+            "Test",
+            "channel",
+            |_id, _text| async { Ok(()) },
+        )
         .await;
         assert!(
             handle
@@ -6591,7 +6772,7 @@ mod tests {
             "matrix",
             "#c",
             "m.\u{1}evil type ".repeat(40).as_str(),
-            "bob",
+            Some("bob"),
         );
         assert!(
             notice.starts_with(":*bnc* NOTICE #c :matrix: a m.eviltypem.eviltype"),
@@ -7040,6 +7221,7 @@ mod tests {
         let attach = tokio::spawn(async move {
             attach(
                 server,
+                ClientInput::default(),
                 &handle,
                 AttachCaps::default(),
                 "alice",
@@ -7098,6 +7280,7 @@ mod tests {
         let attach = tokio::spawn(async move {
             attach(
                 server,
+                ClientInput::default(),
                 &handle,
                 AttachCaps::default(),
                 "alice",

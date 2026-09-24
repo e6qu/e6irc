@@ -321,7 +321,7 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
                 Err(error) => return sync_failed(shared, resumed, error).await,
             },
             cmd = ends.next_command() => match cmd {
-                Some(cmd) => handle_command(&mut session, shared, ends, &cmd.line).await,
+                Some(cmd) => handle_command(&mut session, shared, ends, &cmd).await,
                 None => return super::SessionOutcome::Stopped, // every handle dropped
             },
         }
@@ -365,22 +365,14 @@ fn relay_batch(
         }
     }
     for m in batch.messages {
-        if m.sender == session.user_id {
+        if m.sender() == Some(session.user_id.as_str()) {
             continue;
         }
         let Some(channel) = session.rooms.room_to_channel.get(&m.room_id) else {
             continue;
         };
-        let sender = matrix_localpart(&m.sender);
-        match m.content {
-            IncomingContent::Relay(message) => {
-                for line in super::render_bridged("matrix", sender, channel, &message) {
-                    ends.emit_line(line);
-                }
-            }
-            IncomingContent::Unrelayed(msgtype) => {
-                ends.emit_line(super::unrelayed_notice("matrix", channel, &msgtype, sender));
-            }
+        for line in m.lines(channel) {
+            ends.emit_line(line);
         }
     }
     let room_id = batch
@@ -643,14 +635,53 @@ impl<'a> MatrixMessageRequest<'a> {
 
 struct Incoming {
     room_id: String,
-    sender: String,
     content: IncomingContent,
 }
 
 enum IncomingContent {
-    Relay(super::Inbound),
-    /// A message type the bridge cannot show, by its name: said, not dropped.
-    Unrelayed(String),
+    /// A message the bridge shows, from the sender it names.
+    Relay {
+        sender: String,
+        message: super::Inbound,
+    },
+    /// A message the bridge cannot show, by what it is — the provider's type
+    /// name, or [`REDACTED`] / [`MALFORMED`]: said, not dropped. An event too
+    /// malformed to name its sender has none.
+    Unrelayed {
+        sender: Option<String>,
+        what: String,
+    },
+}
+
+/// What an `m.room.message` redacted before the bridge saw it is called: the
+/// redaction left it no content to show.
+const REDACTED: &str = "redacted";
+
+/// What an event the bridge cannot read is called.
+const MALFORMED: &str = "malformed";
+
+impl Incoming {
+    fn sender(&self) -> Option<&str> {
+        match &self.content {
+            IncomingContent::Relay { sender, .. } => Some(sender),
+            IncomingContent::Unrelayed { sender, .. } => sender.as_deref(),
+        }
+    }
+
+    /// The IRC lines this message is in `channel`.
+    fn lines(&self, channel: &str) -> Vec<String> {
+        match &self.content {
+            IncomingContent::Relay { sender, message } => {
+                super::render_bridged("matrix", matrix_localpart(sender), channel, message)
+            }
+            IncomingContent::Unrelayed { sender, what } => vec![super::unrelayed_notice(
+                "matrix",
+                channel,
+                what,
+                sender.as_deref().map(matrix_localpart),
+            )],
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -675,8 +706,10 @@ struct JoinedRoom {
 
 #[derive(Default, serde::Deserialize)]
 struct Timeline {
+    /// Each read on its own by [`timeline_event`], so one event the bridge
+    /// cannot read never fails the sync that carries it.
     #[serde(default)]
-    events: Vec<TimelineEvent>,
+    events: Vec<serde_json::Value>,
     /// The homeserver had more events than the filter's limit and sent only
     /// the newest.
     #[serde(default)]
@@ -690,7 +723,11 @@ enum TimelineEvent {
     Message {
         #[serde(default)]
         sender: Option<String>,
+        /// Empty once the event is redacted.
+        #[serde(default)]
         content: MessageContent,
+        #[serde(default)]
+        unsigned: Unsigned,
     },
     /// A message the bridge cannot decrypt.
     #[serde(rename = "m.room.encrypted")]
@@ -702,9 +739,19 @@ enum TimelineEvent {
     Other,
 }
 
-#[derive(serde::Deserialize)]
+/// The part of an event's `unsigned` data the bridge reads.
+#[derive(Default, serde::Deserialize)]
+struct Unsigned {
+    /// Present when the event was redacted; its content is then gone.
+    #[serde(default)]
+    redacted_because: Option<serde::de::IgnoredAny>,
+}
+
+#[derive(Default, serde::Deserialize)]
 struct MessageContent {
-    msgtype: String,
+    /// Absent from a redacted (or malformed) message.
+    #[serde(default)]
+    msgtype: Option<String>,
     #[serde(default)]
     body: Option<String>,
     /// Media (`m.image`, `m.file`, `m.audio`, `m.video`): the `mxc://` URI.
@@ -744,48 +791,104 @@ fn media_download_url(homeserver: &str, mxc: &str) -> Option<String> {
 /// What one `m.room.message` shows on IRC, by `msgtype`: text as a message,
 /// `m.emote` as an ACTION, `m.notice` as a NOTICE, media as its body and a
 /// download link, `m.location` as its body and `geo:` URI. Any other type —
-/// or media without a usable link — is named as unrelayed.
+/// or media without a usable link — is named as unrelayed, and so is a message
+/// that was redacted or lacks what its type needs (a sender, a body).
 fn message_content(
     homeserver: &str,
     room_id: &str,
+    sender: Option<String>,
     content: MessageContent,
-) -> Result<IncomingContent, String> {
+    redacted: bool,
+) -> IncomingContent {
     use super::{Inbound, InboundKind};
-    let body = |content: &MessageContent| {
-        content
-            .body
-            .clone()
-            .ok_or_else(|| format!("{} event in {room_id} had no body", content.msgtype))
+    let unrelayed = |sender: Option<String>, what: &str| IncomingContent::Unrelayed {
+        sender,
+        what: what.to_string(),
     };
-    let relay = |kind: InboundKind, text: String| IncomingContent::Relay(Inbound::new(kind, &text));
-    Ok(match content.msgtype.as_str() {
-        "m.text" => relay(InboundKind::Message, body(&content)?),
-        "m.emote" => relay(InboundKind::Action, body(&content)?),
-        "m.notice" => relay(InboundKind::Notice, body(&content)?),
+    let Some(msgtype) = content.msgtype else {
+        if !redacted {
+            eprintln!("matrix: an m.room.message in {room_id} had no msgtype");
+        }
+        return unrelayed(sender, if redacted { REDACTED } else { MALFORMED });
+    };
+    let Some(sender) = sender else {
+        eprintln!("matrix: a {msgtype} event in {room_id} had no sender");
+        return unrelayed(None, MALFORMED);
+    };
+    let (kind, suffix) = match msgtype.as_str() {
+        "m.text" => (InboundKind::Message, None),
+        "m.emote" => (InboundKind::Action, None),
+        "m.notice" => (InboundKind::Notice, None),
         "m.image" | "m.file" | "m.audio" | "m.video" => {
-            let text = body(&content)?;
             match content
                 .url
                 .as_deref()
                 .and_then(|mxc| media_download_url(homeserver, mxc))
             {
-                Some(link) => relay(InboundKind::Message, format!("{text} <{link}>")),
-                None => IncomingContent::Unrelayed(content.msgtype),
+                Some(link) => (InboundKind::Message, Some(link)),
+                None => return unrelayed(Some(sender), &msgtype),
             }
         }
-        "m.location" => {
-            let text = body(&content)?;
-            match content
-                .geo_uri
-                .as_deref()
-                .filter(|geo| geo.starts_with("geo:"))
-            {
-                Some(geo) => relay(InboundKind::Message, format!("{text} <{geo}>")),
-                None => IncomingContent::Unrelayed(content.msgtype),
-            }
+        "m.location" => match content.geo_uri.filter(|geo| geo.starts_with("geo:")) {
+            Some(geo) => (InboundKind::Message, Some(geo)),
+            None => return unrelayed(Some(sender), &msgtype),
+        },
+        _ => return unrelayed(Some(sender), &msgtype),
+    };
+    let Some(body) = content.body else {
+        eprintln!("matrix: a {msgtype} event in {room_id} had no body");
+        return unrelayed(Some(sender), MALFORMED);
+    };
+    let text = match suffix {
+        Some(suffix) => format!("{body} <{suffix}>"),
+        None => body,
+    };
+    IncomingContent::Relay {
+        sender,
+        message: Inbound::new(kind, &text),
+    }
+}
+
+/// What one timeline event is to the bridge.
+enum TimelineItem {
+    Message(IncomingContent),
+    /// The room is (now) end-to-end encrypted.
+    Encrypted,
+    /// Nothing the bridge relays.
+    Other,
+}
+
+/// One timeline event, read on its own. An event the bridge cannot read is one
+/// unrelayed notice in its channel and never fails the sync around it: a sync
+/// that failed on one event would never advance past it, and the bridge would
+/// ask for the same batch — and fail on it — forever.
+fn timeline_event(homeserver: &str, room_id: &str, raw: serde_json::Value) -> TimelineItem {
+    let sender = raw
+        .get("sender")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    match serde_json::from_value::<TimelineEvent>(raw) {
+        Ok(TimelineEvent::Message {
+            sender,
+            content,
+            unsigned,
+        }) => TimelineItem::Message(message_content(
+            homeserver,
+            room_id,
+            sender,
+            content,
+            unsigned.redacted_because.is_some(),
+        )),
+        Ok(TimelineEvent::Encrypted | TimelineEvent::EncryptionEnabled) => TimelineItem::Encrypted,
+        Ok(TimelineEvent::Other) => TimelineItem::Other,
+        Err(error) => {
+            eprintln!("matrix: an event in {room_id} could not be read: {error}");
+            TimelineItem::Message(IncomingContent::Unrelayed {
+                sender,
+                what: MALFORMED.to_string(),
+            })
         }
-        _ => IncomingContent::Unrelayed(content.msgtype),
-    })
+    }
 }
 
 fn collect_sync_messages(homeserver: &str, body: SyncResponse) -> Result<SyncBatch, String> {
@@ -799,24 +902,19 @@ fn collect_sync_messages(homeserver: &str, body: SyncResponse) -> Result<SyncBat
         if room.timeline.limited {
             truncated.push(room_id.clone());
         }
-        for event in room.timeline.events {
-            let (sender, content) = match event {
-                TimelineEvent::Message { sender, content } => (sender, content),
-                TimelineEvent::Encrypted | TimelineEvent::EncryptionEnabled => {
+        for raw in room.timeline.events {
+            match timeline_event(homeserver, &room_id, raw) {
+                TimelineItem::Message(content) => messages.push(Incoming {
+                    room_id: room_id.clone(),
+                    content,
+                }),
+                TimelineItem::Encrypted => {
                     if !encrypted.contains(&room_id) {
                         encrypted.push(room_id.clone());
                     }
-                    continue;
                 }
-                TimelineEvent::Other => continue,
-            };
-            let sender = sender
-                .ok_or_else(|| format!("{} event in {room_id} had no sender", content.msgtype))?;
-            messages.push(Incoming {
-                room_id: room_id.clone(),
-                sender,
-                content: message_content(homeserver, &room_id, content)?,
-            });
+                TimelineItem::Other => {}
+            }
         }
     }
     Ok(SyncBatch {
@@ -874,23 +972,37 @@ async fn sync(s: &Session, since: Option<&str>) -> Result<SyncBatch, RequestErro
     Ok(collect_sync_messages(&s.base, body)?)
 }
 
-async fn handle_command(s: &mut Session, shared: &Shared, ends: &super::DriverEnds, line: &str) {
-    let routed = super::route_privmsg(line, &s.rooms.channel_to_room);
-    super::relay_routed(ends, routed, "Matrix", "room", |room_id, text| {
-        // A retry after a rate limit takes a new transaction id: the
-        // homeserver refused the first, so it stored nothing under it.
-        let url = format!(
-            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
-            s.base,
-            urlencode(&room_id),
-            shared.transactions.next(),
-        );
-        let req = s.http.put(&url).map(|req| {
-            req.bearer_auth(&s.token)
-                .json(&MatrixMessageRequest::new(&text))
-        });
-        async move { super::bridge_send(req?).await.map(|_| ()) }
-    })
+async fn handle_command(
+    s: &mut Session,
+    shared: &Shared,
+    ends: &super::DriverEnds,
+    command: &super::ClientCommand,
+) {
+    let identity = super::bridged_identity("matrix", matrix_localpart(&s.user_id));
+    let targets = &s.rooms.channel_to_room;
+    super::relay_routed(
+        ends,
+        command,
+        targets,
+        &identity,
+        "Matrix",
+        "room",
+        |room_id, text| {
+            // A retry after a rate limit takes a new transaction id: the
+            // homeserver refused the first, so it stored nothing under it.
+            let url = format!(
+                "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+                s.base,
+                urlencode(&room_id),
+                shared.transactions.next(),
+            );
+            let req = s.http.put(&url).map(|req| {
+                req.bearer_auth(&s.token)
+                    .json(&MatrixMessageRequest::new(&text))
+            });
+            async move { super::bridge_send(req?).await.map(|_| ()) }
+        },
+    )
     .await;
 }
 
@@ -1218,6 +1330,13 @@ mod tests {
         assert_eq!(notices.len(), 1, "{notices:?}");
     }
 
+    fn command(line: &str) -> crate::bouncer::ClientCommand {
+        crate::bouncer::ClientCommand {
+            origin: 5,
+            line: line.to_string(),
+        }
+    }
+
     /// An IRC `/me` is an `m.emote`, and IRC formatting stays behind.
     #[tokio::test]
     async fn an_action_is_sent_as_an_emote_without_irc_formatting() {
@@ -1229,7 +1348,7 @@ mod tests {
             "PRIVMSG #room :\u{1}ACTION waves\u{1}",
             "PRIVMSG #room :\u{2}bold\u{2}",
         ] {
-            handle_command(&mut session, &shared, &ends, line).await;
+            handle_command(&mut session, &shared, &ends, &command(line)).await;
         }
         assert_eq!(
             server.0.lock().unwrap().sent_messages,
@@ -1238,6 +1357,67 @@ mod tests {
                 serde_json::json!({ "msgtype": "m.text", "body": "bold" }),
             ]
         );
+    }
+
+    /// A message the homeserver accepted is echoed once, under the bridge's
+    /// own account and to the attachment that sent it; the homeserver's copy
+    /// of it is not relayed a second time, and a refused one is not echoed.
+    #[tokio::test]
+    async fn a_delivered_message_is_echoed_once_and_a_refused_one_not_at_all() {
+        let (_server, base) = Homeserver::start().await;
+        let shared = Shared::new(config(&base, &["#room:hs.example"]));
+        let (handle, ends) = NetworkHandle::channels(8);
+        let mut events = handle.subscribe();
+        let mut session = connect(&shared).await.unwrap_or_else(|_| panic!("connect"));
+        handle_command(
+            &mut session,
+            &shared,
+            &ends,
+            &command("@+draft/reply=x PRIVMSG #ROOM,#nowhere :hello"),
+        )
+        .await;
+        let mut echoes = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let crate::bouncer::DriverEvent::Echo { line, origin } = event {
+                echoes.push((line.line, origin));
+            }
+        }
+        assert_eq!(echoes.len(), 1, "{echoes:?}");
+        let (line, origin) = &echoes[0];
+        assert_eq!(*origin, 5);
+        let echo = e6irc_proto::message::Message::parse(line).expect("the echo is IRC");
+        assert!(echo.tag("time").is_some(), "{line}");
+        assert!(echo.tag("+draft/reply").is_some(), "{line}");
+        assert!(
+            line.ends_with(" :bot!bot@matrix PRIVMSG #ROOM :hello"),
+            "{line}"
+        );
+        assert_eq!(
+            handle
+                .buffer_snapshot()
+                .iter()
+                .filter(|buffered| buffered.contains("PRIVMSG #ROOM :hello"))
+                .count(),
+            1,
+            "the backlog holds the message once"
+        );
+
+        // The homeserver refuses the next send: its undelivered notice is the
+        // whole answer.
+        session.base = "http://127.0.0.1:9".to_string();
+        handle_command(
+            &mut session,
+            &shared,
+            &ends,
+            &command("PRIVMSG #room :lost"),
+        )
+        .await;
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, crate::bouncer::DriverEvent::Echo { .. }),
+                "a refused message was echoed: {event:?}"
+            );
+        }
     }
 
     fn config(homeserver: &str, rooms: &[&str]) -> MatrixConfig {
@@ -1375,7 +1555,7 @@ mod tests {
                 &mut session,
                 &shared,
                 &ends,
-                &format!("PRIVMSG #room :{text}"),
+                &command(&format!("PRIVMSG #room :{text}")),
             )
             .await;
         }
@@ -1503,26 +1683,13 @@ mod tests {
     fn relayed_lines(batch: SyncBatch) -> Vec<String> {
         batch
             .messages
-            .into_iter()
-            .flat_map(|m| match m.content {
-                IncomingContent::Relay(message) => super::super::render_bridged(
-                    "matrix",
-                    matrix_localpart(&m.sender),
-                    "#room",
-                    &message,
-                ),
-                IncomingContent::Unrelayed(msgtype) => vec![super::super::unrelayed_notice(
-                    "matrix",
-                    "#room",
-                    &msgtype,
-                    matrix_localpart(&m.sender),
-                )],
-            })
+            .iter()
+            .flat_map(|m| m.lines("#room"))
             .collect()
     }
 
     #[test]
-    fn sync_parser_renders_every_msgtype_and_rejects_malformed_messages() {
+    fn sync_parser_renders_every_msgtype_and_names_what_it_cannot_read() {
         let response: SyncResponse = serde_json::from_str(
             r#"{"next_batch":"s1","rooms":{"join":{"!room:example":{"timeline":{"events":[
                 {"type":"m.reaction","sender":"@bob:example","content":{}},
@@ -1590,22 +1757,50 @@ mod tests {
         assert_eq!(batch.truncated, ["!busy:example"]);
         assert_eq!(batch.encrypted, ["!secret:example"]);
 
-        for malformed in [
+        // An event the bridge cannot read — redacted to an empty content, or
+        // missing its sender, msgtype or body, or not an event at all — is one
+        // notice in its channel. It never fails the sync around it: the rest
+        // of the batch is relayed, and the position advances past it.
+        let response: SyncResponse = serde_json::from_str(
             r#"{"next_batch":"s2","rooms":{"join":{"!room:example":{"timeline":{"events":[
-                {"type":"m.room.message","content":{"msgtype":"m.text","body":"hello"}}
-            ]}}}}}"#,
-            r#"{"next_batch":"s2","rooms":{"join":{"!room:example":{"timeline":{"events":[
+                {"type":"m.room.message","sender":"@alice:example","content":{},
+                 "unsigned":{"redacted_because":{"type":"m.room.redaction"}}},
+                {"type":"m.room.message","sender":"@alice:example","content":{}},
+                {"type":"m.room.message","content":{"msgtype":"m.text","body":"hello"}},
                 {"type":"m.room.message","sender":"@alice:example",
-                 "content":{"msgtype":"m.text"}}
-            ]}}}}}"#,
-            r#"{"next_batch":"s2","rooms":{"join":{"!room:example":{"timeline":{"events":[
+                 "content":{"msgtype":"m.text"}},
                 {"type":"m.room.message","sender":"@alice:example",
-                 "content":{"msgtype":"m.emote"}}
+                 "content":{"msgtype":"m.emote"}},
+                {"type":"m.room.message","sender":"@alice:example","content":"text"},
+                {"type":"m.room.message","sender":7,
+                 "content":{"msgtype":"m.text","body":"hello"}},
+                {"sender":"@alice:example","content":{"msgtype":"m.text","body":"typeless"}},
+                "not an event",
+                {"type":"m.room.message","sender":"@bob:example",
+                 "content":{"msgtype":"m.text","body":"still relayed"}}
             ]}}}}}"#,
-        ] {
-            let response: SyncResponse =
-                serde_json::from_str(malformed).expect("outer sync response");
-            assert!(collect_sync_messages("https://hs.example", response).is_err());
-        }
+        )
+        .expect("a sync with unreadable events is still a sync");
+        let batch = collect_sync_messages("https://hs.example", response)
+            .expect("unreadable events do not fail the sync");
+        assert_eq!(batch.next, "s2", "the position advances past them");
+        assert_eq!(
+            relayed_lines(batch),
+            [
+                ":*bnc* NOTICE #room :matrix: a redacted message from alice was not relayed",
+                ":*bnc* NOTICE #room :matrix: a malformed message from alice was not relayed",
+                ":*bnc* NOTICE #room :matrix: a malformed message from an unknown sender was \
+                 not relayed",
+                ":*bnc* NOTICE #room :matrix: a malformed message from alice was not relayed",
+                ":*bnc* NOTICE #room :matrix: a malformed message from alice was not relayed",
+                ":*bnc* NOTICE #room :matrix: a malformed message from alice was not relayed",
+                ":*bnc* NOTICE #room :matrix: a malformed message from an unknown sender was \
+                 not relayed",
+                ":*bnc* NOTICE #room :matrix: a malformed message from alice was not relayed",
+                ":*bnc* NOTICE #room :matrix: a malformed message from an unknown sender was \
+                 not relayed",
+                ":bob!bob@matrix PRIVMSG #room :still relayed",
+            ]
+        );
     }
 }
