@@ -15,5 +15,6 @@ pub mod http;
 pub mod identity;
 pub mod net;
 pub(crate) mod observability;
+pub(crate) mod peer_write;
 pub(crate) mod sanitize;
 pub mod secret;

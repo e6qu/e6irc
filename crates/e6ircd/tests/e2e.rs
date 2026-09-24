@@ -206,6 +206,31 @@ async fn quit_closes_the_socket() {
     assert!(eof.is_ok(), "socket not closed after QUIT");
 }
 
+/// A client that sends its whole session and then closes its sending side
+/// (`nc -N`, a scripted client) still reads every reply: the welcome and the
+/// closing `ERROR`. The connection used to be torn down the moment the read
+/// side saw EOF, discarding whatever the core had not yet written.
+#[tokio::test]
+async fn a_half_closing_client_reads_every_reply_to_what_it_sent() {
+    use tokio::io::AsyncReadExt;
+    let running = net::start(test_config()).await.expect("start");
+    let mut stream = TcpStream::connect(running.addrs[0]).await.expect("connect");
+    stream
+        .write_all(b"NICK halfclose\r\nUSER halfclose 0 * :half\r\nQUIT :bye\r\n")
+        .await
+        .expect("write");
+    stream.shutdown().await.expect("half-close");
+    let mut received = Vec::new();
+    timeout(Duration::from_secs(10), stream.read_to_end(&mut received))
+        .await
+        .expect("the server closes once it has answered")
+        .expect("read");
+    let received = String::from_utf8_lossy(&received);
+    assert!(received.contains(" 001 halfclose "), "{received}");
+    assert!(received.contains(" 376 halfclose "), "{received}");
+    assert!(received.contains("ERROR :Closing Link"), "{received}");
+}
+
 #[tokio::test]
 async fn overlong_line_gets_417_and_connection_survives() {
     let running = net::start(test_config()).await.expect("start");

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_tungstenite::tungstenite::Message as Ws;
 
@@ -258,7 +258,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                             return Dropped(NetworkFailure::UpstreamProtocolFailed);
                         }
                     };
-                    if sockets[index].write.send(ack).await.is_err() {
+                    if super::bridge_ws_send(&mut sockets[index].write, ack).await.is_err() {
                         if retiring {
                             sockets.remove(index);
                             continue;
@@ -350,7 +350,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
             }
             _ = ping.tick() => {
                 for socket in &mut sockets {
-                    if socket.write.send(Ws::Ping(Vec::new().into())).await.is_err() && socket.retiring.is_none() {
+                    if super::bridge_ws_send(&mut socket.write, Ws::Ping(Vec::new().into())).await.is_err() && socket.retiring.is_none() {
                         return Dropped(NetworkFailure::UpstreamWriteFailed);
                     }
                 }

@@ -190,6 +190,35 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
     {
         return Stopped; // core shutting down
     }
+    let outcome = drive_session(session, ends, conn, &mut out_rx).await;
+    // The one way out of an opened core session, whatever ended it: close it
+    // rather than leave it — holding the nickname — for the core's liveness
+    // reaper. Queue closure here already means the core is gone.
+    let reason = match outcome {
+        Stopped => "local driver stopped",
+        _ => "local driver session ended",
+    };
+    drop(
+        session
+            .core
+            .core_tx
+            .push(Input::Closed {
+                conn,
+                reason: reason.into(),
+            })
+            .await,
+    );
+    outcome
+}
+
+/// Register the opened core session `conn` and relay it until it ends.
+async fn drive_session(
+    session: &LocalSession,
+    ends: &mut DriverEnds,
+    conn: ConnId,
+    out_rx: &mut Receiver<Output>,
+) -> super::SessionOutcome {
+    use super::SessionOutcome::Stopped;
     let core = &session.core.core_tx;
     // Register in-process. Queueing NICK and USER is only a request: the core
     // answers like any server, and it is the welcome that makes a session.
@@ -205,25 +234,14 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
         _ = ends.stop_signal() => Err(Stopped),
         welcome = tokio::time::timeout(
             WELCOME_DEADLINE,
-            await_welcome(session, conn, &mut out_rx, ends),
+            await_welcome(session, conn, out_rx, ends),
         ) => welcome.unwrap_or(Err(super::SessionOutcome::Dropped(
             super::NetworkFailure::RegistrationTimedOut,
         ))),
     };
     let welcome = match welcomed {
         Ok(welcome) => welcome,
-        Err(outcome) => {
-            // Whatever the core made of the attempt is closed here rather than
-            // left for its liveness reaper; a closed core queue changes nothing.
-            drop(
-                core.push(Input::Closed {
-                    conn,
-                    reason: "local driver registration ended".into(),
-                })
-                .await,
-            );
-            return outcome;
-        }
+        Err(outcome) => return outcome,
     };
     // Comma-joined within the wire limit, as the IRC driver joins upstream:
     // the in-process session is a registered non-oper client of the core, so
@@ -314,23 +332,9 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
                         ends.emit_echo(echo, cmd.origin);
                     }
                 }
-                None => {
-                    // Every handle dropped: close our core session and stop for
-                    // good (no reconnect — the network was removed).
-                    // Queue closure here already means the core is gone; either
-                    // way the driver's requested terminal state is reached.
-                    drop(
-                        session
-                            .core
-                            .core_tx
-                            .push(Input::Closed {
-                                conn,
-                                reason: "local driver stopped".into(),
-                            })
-                            .await,
-                    );
-                    return Stopped;
-                }
+                // Every handle dropped: stop for good (no reconnect — the
+                // network was removed).
+                None => return Stopped,
             },
         }
     }
@@ -564,6 +568,28 @@ mod tests {
         assert!(matches!(
             stopped(task).await,
             super::super::SessionOutcome::Stopped
+        ));
+        assert!(matches!(
+            core_rx.pop().await.expect("close").payload,
+            Input::Closed { .. }
+        ));
+    }
+
+    /// A session that ends because the core put it in more channels than
+    /// the bouncer tracks is closed in the core like every other ending. It
+    /// used to be left open, holding the nickname, until the liveness reaper
+    /// found it, so the reconnect met its own ghost.
+    #[tokio::test]
+    async fn a_session_past_the_channel_limit_closes_its_core_session() {
+        let (mut core_rx, _handle, _events, task, out_tx) = connected_session().await;
+        for n in 0..=super::super::MAX_TRACKED_CHANNELS {
+            core_says(&out_tx, &format!(":alice!ident@local JOIN #c{n}")).await;
+        }
+        assert!(matches!(
+            stopped(task).await,
+            super::super::SessionOutcome::Dropped(
+                super::super::NetworkFailure::ChannelLimitExceeded
+            )
         ));
         assert!(matches!(
             core_rx.pop().await.expect("close").payload,

@@ -142,11 +142,43 @@ pub(super) async fn update_me_profile(
     }
 }
 
+/// Account exports produced at once, process-wide. Each holds one pooled
+/// database connection in a `REPEATABLE READ` transaction for as long as its
+/// client takes to read the document.
+const MAX_CONCURRENT_ACCOUNT_EXPORTS: usize = 2;
+
+/// Seconds a refused export is told to wait before retrying.
+const EXPORT_BUSY_RETRY_AFTER_SECONDS: u64 = 10;
+
+/// Admission for account exports ([`MAX_CONCURRENT_ACCOUNT_EXPORTS`]).
+pub(crate) struct AccountExportSlots(Arc<tokio::sync::Semaphore>);
+
+impl AccountExportSlots {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(
+            MAX_CONCURRENT_ACCOUNT_EXPORTS,
+        )))
+    }
+
+    /// A slot held for as long as one export runs, or `None` when every slot
+    /// is taken.
+    fn admit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.0.clone().try_acquire_owned().ok()
+    }
+}
+
 pub(super) async fn export_me(
     State(state): State<Arc<AppState>>,
     Authenticated(account, _): Authenticated,
 ) -> Response {
-    let mut export = match crate::db::begin_account_export(pool_of(&state), &account).await {
+    let Some(slot) = state.account_exports.admit() else {
+        return retry_later(
+            "Account exports are busy",
+            "The server is producing as many account exports as it allows at once.",
+            EXPORT_BUSY_RETRY_AFTER_SECONDS,
+        );
+    };
+    let export = match crate::db::begin_account_export(pool_of(&state), &account).await {
         Ok(Some(export)) => export,
         Ok(None) => return problem(StatusCode::NOT_FOUND, "No such account", None),
         Err(error) => return database_unavailable("account export", error),
@@ -156,20 +188,8 @@ pub(super) async fn export_me(
     // broken download rather than a document that looks complete.
     let (chunks, body) = tokio::sync::mpsc::channel(4);
     tokio::spawn(async move {
-        loop {
-            let next = match export.next_chunk().await {
-                Ok(Some(chunk)) => Ok(bytes::Bytes::from(chunk)),
-                Ok(None) => return,
-                Err(error) => {
-                    eprintln!("http: account export failed part-way: {error}");
-                    Err(std::io::Error::other("account export failed part-way"))
-                }
-            };
-            let failed = next.is_err();
-            if chunks.send(next).await.is_err() || failed {
-                return;
-            }
-        }
+        let _slot = slot;
+        pump_export(export, chunks, crate::peer_write::PEER_WRITE_DEADLINE).await;
     });
     let mut response = (
         [
@@ -184,6 +204,55 @@ pub(super) async fn export_me(
         .into_response();
     no_store(response.headers_mut());
     response
+}
+
+/// Where an export's pages come from: the database transaction, or a test's
+/// stand-in.
+trait ExportPages: Send {
+    fn next_page(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Option<String>, crate::db::DbError>> + Send;
+}
+
+impl ExportPages for crate::db::AccountExport {
+    fn next_page(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Option<String>, crate::db::DbError>> + Send {
+        self.next_chunk()
+    }
+}
+
+/// Hand an export's pages to its response body until the document ends, the
+/// client goes, or the client stops reading for `deadline`. The export — and
+/// the database transaction it holds — is released when this returns.
+async fn pump_export(
+    mut export: impl ExportPages,
+    chunks: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    deadline: std::time::Duration,
+) {
+    loop {
+        let next = match export.next_page().await {
+            Ok(Some(chunk)) => Ok(bytes::Bytes::from(chunk)),
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("http: account export failed part-way: {error}");
+                Err(std::io::Error::other("account export failed part-way"))
+            }
+        };
+        let failed = next.is_err();
+        match crate::peer_write::within_send_deadline(deadline, chunks.send(next)).await {
+            Ok(()) if !failed => {}
+            // Ended with its error, or the client went away.
+            Ok(()) | Err(crate::peer_write::SendFailure::Transport) => return,
+            Err(crate::peer_write::SendFailure::Stalled) => {
+                eprintln!(
+                    "http: account export abandoned: the client read nothing for {}s",
+                    deadline.as_secs()
+                );
+                return;
+            }
+        }
+    }
 }
 
 /// A response body read from a channel of chunks: each `Err` ends the body
@@ -316,6 +385,56 @@ pub(super) struct AppPasswordRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An export whose pages never end, and which says when it is dropped —
+    /// which is when its database transaction would be released.
+    struct EndlessPages(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl ExportPages for EndlessPages {
+        async fn next_page(&mut self) -> Result<Option<String>, crate::db::DbError> {
+            Ok(Some("x".repeat(1024)))
+        }
+    }
+
+    impl Drop for EndlessPages {
+        fn drop(&mut self) {
+            if let Some(released) = self.0.take() {
+                released.send(()).expect("the test awaits the release");
+            }
+        }
+    }
+
+    /// A client that stops reading its download releases the export — and
+    /// with it the pooled connection and its transaction — at the deadline.
+    /// The export task used to park on a full channel for as long as the
+    /// client held the connection open, and enough such clients starved the
+    /// pool.
+    #[tokio::test(start_paused = true)]
+    async fn an_export_whose_client_stops_reading_is_released_at_the_deadline() {
+        let (released_tx, released) = tokio::sync::oneshot::channel();
+        let (chunks, _unread_body) = tokio::sync::mpsc::channel(4);
+        let pump = tokio::spawn(pump_export(
+            EndlessPages(Some(released_tx)),
+            chunks,
+            std::time::Duration::from_secs(30),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(60), released)
+            .await
+            .expect("the export is released once the client has read nothing for the deadline")
+            .expect("released signal");
+        pump.await.expect("pump task");
+    }
+
+    #[test]
+    fn account_exports_past_the_bound_are_refused_until_one_ends() {
+        let slots = AccountExportSlots::new();
+        let held: Vec<_> = (0..MAX_CONCURRENT_ACCOUNT_EXPORTS)
+            .map(|_| slots.admit().expect("a free slot"))
+            .collect();
+        assert!(slots.admit().is_none(), "every slot is taken");
+        drop(held);
+        assert!(slots.admit().is_some(), "an ended export frees its slot");
+    }
 
     #[test]
     fn app_password_request_rejects_unknown_fields() {
