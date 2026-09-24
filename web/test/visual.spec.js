@@ -189,7 +189,11 @@ async function mountConsoleRuntime(page, body, styles = "", apiResponses = {}) {
         window.consoleApiRequests ??= [];
         window.consoleApiRequests.push(url);
         window.consoleApiMutations ??= [];
-        if (method !== "GET") window.consoleApiMutations.push({ method, url, json: options?.json });
+        if (method !== "GET") {
+          window.consoleApiMutations.push({ method, url, json: options?.json });
+          // Kept across a same-origin navigation the mutation itself causes.
+          sessionStorage.setItem("consoleApiMutations", JSON.stringify(window.consoleApiMutations));
+        }
         if (window.consoleApiGate) await window.consoleApiGate;
         const match = Object.entries(responses).find(([prefix]) => url.startsWith(prefix));
         return match ? match[1] : {};
@@ -550,10 +554,17 @@ test("a background refresh never pulls a page out from under a pending confirmat
   // Longer than the refresh interval.
   await page.waitForTimeout(6_500);
   expect(await reads()).toBe(before);
+  // A removed network has no page left to show: removing it from its own page
+  // goes to the network list.
+  await page.route("**/console/networks", (route) => route.fulfill({
+    contentType: "text/html",
+    body: "<!doctype html><title>Networks</title>",
+  }));
   // The dialog's action carries the wording of the button that opened it.
   await dialog.getByRole("button", { name: "Remove network", exact: true }).click();
-  await expect.poll(() => page.evaluate(() => window.consoleApiMutations)).toEqual([
-    { method: "DELETE", url: "/api/v1/me/networks/libera", json: undefined },
+  await page.waitForURL("**/console/networks");
+  expect(await page.evaluate(() => JSON.parse(sessionStorage.getItem("consoleApiMutations")))).toEqual([
+    { method: "DELETE", url: "/api/v1/me/networks/libera" },
   ]);
 });
 
