@@ -932,8 +932,23 @@ subset's exact behavior.
   (+o) and `+` (+v) only — **no halfop**, matching Libera. The authoritative
   mode-by-mode behavior list is pinned from Solanum's documentation/help
   files (with provenance) as a vendored compat reference, and verified by
-  the differential harness (§7.7).
-- User modes: Solanum-compatible core (`+i +w +Z +R …`) plus oper modes.
+  the differential harness (§7.7). RPL_MYINFO's mode lists and ISUPPORT
+  `CHANMODES`/`PREFIX` are derived from one set of mode tables in the core, so
+  the advertisements cannot disagree. A `+k` key or list-mode mask that could
+  not stand as a middle parameter (a leading `:`, a space or control byte, and
+  for a key a `,`, which would split JOIN's key list) is refused, not rewritten.
+- A plain member (no op or voice) banned or quieted in any channel it is in
+  cannot change nick (Solanum `ERR_BANNICKCHANGE` 435) — renaming would escape a
+  `nick!*@*` mask. The check spans core shards through the published channel
+  directory.
+- The first joiner of an unregistered channel creates it and is opped. A
+  *registered* channel recreated after it emptied opens no ops by arrival:
+  only the founder or an access holder is opped on join (Atheme semantics).
+- User modes: Solanum-compatible core (`+i +w +Z +R …`) plus oper modes. A
+  user MODE reports only the net change (nothing when nothing changed), and
+  `MODE <nick>` for a nick nobody holds is `ERR_NOSUCHNICK`, not 502.
+- An over-long `USER` name is truncated to `USERLEN`, never refused (Modern
+  IRC); only a character the source prefix cannot carry is refused (468).
 - Oper system: config-defined opers, privileges (kline/dline/xline-style
   bans, SETHOST, global notices), all actions audit-logged.
 - **Integrated services** (no separate Atheme process): `NickServ` and

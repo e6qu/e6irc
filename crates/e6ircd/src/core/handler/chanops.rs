@@ -55,7 +55,7 @@ pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             state.numeric(
                 conn,
                 ERR_TOOMANYTARGETS,
-                &[who],
+                &[clip_echo(who)],
                 Some("Too many targets; not kicked"),
             );
             break;
@@ -165,7 +165,7 @@ fn emit_kick_result_now(
     match result {
         crate::core::state::ChannelKickResult::Kicked => {}
         crate::core::state::ChannelKickResult::NoSuchChannel { target } => {
-            state.err_nosuchchannel(conn, clip_echo(&target))
+            state.err_nosuchchannel(conn, &target)
         }
         crate::core::state::ChannelKickResult::Hidden { target, proof } => {
             deny_hidden(state, conn, &target, proof)
@@ -179,13 +179,9 @@ fn emit_kick_result_now(
             &[&target],
             Some("You're not a channel operator"),
         ),
-        crate::core::state::ChannelKickResult::UserNotInChannel { victim, channel } => state
-            .numeric(
-                conn,
-                ERR_USERNOTINCHANNEL,
-                &[&victim, &channel],
-                Some("They aren't on that channel"),
-            ),
+        crate::core::state::ChannelKickResult::UserNotInChannel { victim, channel } => {
+            state.err_usernotinchannel(conn, &victim, &channel)
+        }
     }
 }
 
@@ -195,7 +191,7 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     let Some(invitee) = state.registered_nick_owner(&state.nick_key(who)) else {
-        state.err_nosuchnick(conn, clip_echo(who));
+        state.err_nosuchnick(conn, who);
         return;
     };
     let owner = state.channel_owner(target);
@@ -352,7 +348,7 @@ pub(super) fn emit_invite_result_now(
             state.numeric(conn, RPL_INVITING, &[&invitee, &channel], None)
         }
         crate::core::state::ChannelInviteResult::NoSuchChannel { target } => {
-            state.err_nosuchchannel(conn, clip_echo(&target))
+            state.err_nosuchchannel(conn, &target)
         }
         crate::core::state::ChannelInviteResult::Hidden { target, proof } => {
             deny_hidden(state, conn, &target, proof)
@@ -383,7 +379,7 @@ pub(super) fn cmd_away(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .map(|m| truncate_chars(m, AWAYLEN).to_string());
     let prefix = state.sessions[&conn].prefix();
     let notify = match &message {
-        Some(m) => format!(":{prefix} AWAY :{m}"),
+        Some(m) => fitted_line(format!(":{prefix} AWAY :"), m),
         None => format!(":{prefix} AWAY"),
     };
     let is_away = message.is_some();
@@ -706,7 +702,7 @@ pub(super) fn knock_on_owner(
         );
         state.send_timed_recipient(recipient, &line);
     }
-    crate::core::state::ChannelKnockResult::KnockDelivered
+    crate::core::state::ChannelKnockResult::KnockDelivered { display }
 }
 
 pub(super) fn emit_knock_result(
@@ -726,14 +722,14 @@ fn emit_knock_result_now(
     result: crate::core::state::ChannelKnockResult,
 ) {
     match result {
-        crate::core::state::ChannelKnockResult::KnockDelivered => state.numeric(
+        crate::core::state::ChannelKnockResult::KnockDelivered { display } => state.numeric(
             conn,
             RPL_KNOCKDLVR,
-            &[],
+            &[&display],
             Some("Your KNOCK has been delivered"),
         ),
         crate::core::state::ChannelKnockResult::NoSuchChannel { target } => {
-            state.err_nosuchchannel(conn, clip_echo(&target));
+            state.err_nosuchchannel(conn, &target);
         }
         crate::core::state::ChannelKnockResult::Hidden { target, proof } => {
             deny_hidden(state, conn, &target, proof);

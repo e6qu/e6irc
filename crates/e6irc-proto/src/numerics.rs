@@ -104,6 +104,8 @@ numerics! {
     ERR_NONICKNAMEGIVEN = 431,
     ERR_ERRONEUSNICKNAME = 432,
     ERR_NICKNAMEINUSE = 433,
+    // Solanum: a member banned or quieted in a channel cannot change nick.
+    ERR_BANNICKCHANGE = 435,
     ERR_USERNOTINCHANNEL = 441,
     ERR_NOTONCHANNEL = 442,
     ERR_USERONCHANNEL = 443,

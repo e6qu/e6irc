@@ -53,7 +53,9 @@ loaded at boot.
    the listener accepts normal traffic.
 2. The founder joins an absent/empty channel.
 3. Founder operator status, retained topic, and mode lock are applied.
-4. Later joins and mutations use the same registered access state.
+4. Later joins and mutations use the same registered access state. Anyone
+   else who recreates the channel is not opped for arriving first; only the
+   founder or an access holder is.
 
 **Visible failures and recovery.** The server does not claim registered behavior if its
 database-backed state could not be loaded. A failed persistence mutation does

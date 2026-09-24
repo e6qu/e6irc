@@ -196,6 +196,16 @@ impl TestServer {
         id: u64,
         transport: e6ircd::core::ConnectionTransport,
     ) -> ConnId {
+        self.connect_from(id, &format!("host{id}.example"), transport)
+    }
+
+    /// Connect as connection `id` from `host` (a long reverse-DNS name, say).
+    fn connect_from(
+        &mut self,
+        id: u64,
+        host: &str,
+        transport: e6ircd::core::ConnectionTransport,
+    ) -> ConnId {
         let conn = ConnId(id);
         let (tx, rx) = queue(Config {
             name: "test-sendq",
@@ -205,7 +215,7 @@ impl TestServer {
         self.core.handle(Input::Open {
             conn,
             tx,
-            host: format!("host{id}.example"),
+            host: host.to_string(),
             transport,
         });
         self.conns.push((conn, rx));
@@ -6272,7 +6282,9 @@ fn preloaded_founder_is_opped_on_join() {
     s.core
         .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
 
-    // A non-founder arrives first and is opped as the first joiner.
+    // A non-founder arrives first and, the channel being registered, is *not*
+    // opped for arriving first (Atheme: a registered channel belongs to its
+    // founder, not to whoever recreates it).
     let alice = s.register(1, "alice");
     s.line(alice, "JOIN #chan");
     let names = s
@@ -6281,8 +6293,8 @@ fn preloaded_founder_is_opped_on_join() {
         .find(|l| l.contains(" 353 "))
         .expect("353");
     assert!(
-        names.ends_with(":@alice"),
-        "first joiner not opped: {names}"
+        names.ends_with(":alice"),
+        "first joiner of a registered channel opped: {names}"
     );
 
     s.drain(alice);
@@ -6342,7 +6354,8 @@ fn registration_records_founder_for_later_rejoin() {
     s.line(boss, "PART #room");
     s.drain(boss);
 
-    // Someone else recreates it and is opped as the first joiner.
+    // Someone else recreates it: being first grants nothing in a registered
+    // channel, so they are an ordinary member (Atheme semantics, DESIGN §7.6).
     let dave = s.register(2, "dave");
     s.line(dave, "JOIN #room");
     let names = s
@@ -6350,7 +6363,15 @@ fn registration_records_founder_for_later_rejoin() {
         .into_iter()
         .find(|l| l.contains(" 353 "))
         .expect("353");
-    assert!(names.ends_with(":@dave"), "recreator not opped: {names}");
+    assert!(
+        names.ends_with(":dave"),
+        "recreator of a registered channel opped: {names}"
+    );
+    s.line(dave, "MODE #room +i");
+    assert!(
+        s.drain(dave).iter().any(|l| l.contains(" 482 ")),
+        "the recreator must not hold channel-operator privileges"
+    );
 
     // The founder rejoins and is re-opped despite not being first.
     s.line(boss, "JOIN #room");
@@ -7044,7 +7065,8 @@ fn registered_channel_topic_persisted_on_set() {
     s.core
         .preload_founders(vec![("#reg".to_string(), "boss".to_string())]);
     let boss = s.register(1, "boss");
-    s.line(boss, "JOIN #reg"); // first joiner → op
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #reg"); // the founder → op
     s.drain(boss);
     s.db_requests();
 
@@ -7109,7 +7131,8 @@ fn registered_topic_failed_verdicts_are_loud_labeled_and_non_mutating() {
         1,
     )]);
     let boss = register_with_caps(&mut s, 1, "boss", "batch labeled-response");
-    s.line(boss, "JOIN #reg");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #reg"); // the founder → op
     s.drain(boss);
     s.db_requests();
 
@@ -12318,4 +12341,360 @@ fn multiline_valueless_batch_tag_is_an_unknown_batch() {
     s.line(alice, "BATCH +7 draft/multiline #m");
     s.line(alice, "@batch PRIVMSG #m :where do I belong");
     assert_multiline_fail_delivers_nothing(&mut s, alice, bob, "MULTILINE_INVALID");
+}
+
+// ---- bug sweep: NICK under a ban, USER truncation, wire fitting, mode tables
+
+/// A plain member banned or quieted in a channel cannot NICK out from under
+/// the ban (Solanum ERR_BANNICKCHANGE 435): the new nick would stop matching a
+/// `nick!*@*` mask and the member could speak again.
+#[test]
+fn a_banned_or_quieted_member_cannot_change_nick() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    s.line(alice, "JOIN #c");
+    s.line(bob, "JOIN #c");
+    s.drain(alice);
+    s.drain(bob);
+
+    for (set, clear) in [("+b bob!*@*", "-b bob!*@*"), ("+q bob!*@*", "-q bob!*@*")] {
+        s.line(alice, &format!("MODE #c {set}"));
+        s.drain(alice);
+        s.drain(bob);
+        s.line(bob, "NICK bobby");
+        let out = s.drain(bob);
+        assert!(
+            out.iter().any(|l| l
+                .ends_with(" 435 bob bobby #c :Cannot change nickname while banned on channel")),
+            "{set}: the rename must be refused with 435: {out:#?}"
+        );
+        assert!(
+            !out.iter().any(|l| l.contains(" NICK ")) && s.drain(alice).is_empty(),
+            "{set}: a refused rename must not happen"
+        );
+        s.line(alice, &format!("MODE #c {clear}"));
+        s.drain(alice);
+        s.drain(bob);
+    }
+
+    // A ban exception, or voice, lifts the restriction (as it lifts the ban on
+    // speaking).
+    s.line(alice, "MODE #c +be bob!*@* bob!*@*");
+    s.drain(bob);
+    s.line(bob, "NICK bobby");
+    assert!(
+        s.drain(bob).iter().any(|l| l.contains(" NICK bobby")),
+        "an excepted member may rename"
+    );
+    s.line(alice, "MODE #c -e bob!*@*");
+    s.line(alice, "MODE #c +b bobby!*@*");
+    s.line(alice, "MODE #c +v bobby");
+    s.drain(bob);
+    s.line(bob, "NICK bob");
+    assert!(
+        s.drain(bob).iter().any(|l| l.contains(" NICK bob")),
+        "a voiced member may rename"
+    );
+}
+
+/// A username longer than USERLEN is truncated, never refused: refusing it
+/// blocked registration for anyone whose login name is long.
+#[test]
+fn an_over_long_username_is_truncated_and_registration_completes() {
+    let mut s = TestServer::new();
+    let alice = s.connect(1);
+    s.line(alice, "NICK alice");
+    s.line(alice, "USER averyverylongusername 0 * :real");
+    let out = s.drain(alice);
+    assert!(
+        has_numeric(&out, "001"),
+        "registration must complete: {out:#?}"
+    );
+    assert!(!has_numeric(&out, "468"), "{out:#?}");
+    s.line(alice, "WHOIS alice");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.contains(" 311 alice alice averyveryl ")),
+        "the username is cut to USERLEN (10): {out:#?}"
+    );
+}
+
+/// AWAY (and the away-notify line that follows a JOIN) relays a user's
+/// trailing text under a source prefix it did not write. A long host pushes it
+/// past the wire limit unless fitted; the debug wire check panics on a miss.
+#[test]
+fn away_relays_fit_the_wire_under_a_long_source_prefix() {
+    let mut s = TestServer::new();
+    let host = format!("{}.example", "h".repeat(240));
+    let alice = register_with_caps(&mut s, 1, "alice", "away-notify extended-join");
+    let bob = s.connect_from(2, &host, e6ircd::core::ConnectionTransport::Tcp);
+    s.line(bob, "NICK bob");
+    s.line(bob, &format!("USER bob 0 * :{}", "r".repeat(150)));
+    s.drain(bob);
+    s.line(alice, "JOIN #c");
+    s.line(bob, "JOIN #c");
+    s.drain(alice);
+    s.drain(bob);
+
+    let away = "a".repeat(390);
+    s.line(bob, &format!("AWAY :{away}"));
+    let out = s.drain(alice);
+    let line = out
+        .iter()
+        .find(|l| l.contains(" AWAY :"))
+        .expect("away-notify relayed");
+    assert!(line.len() + 2 <= 512, "AWAY is {} bytes", line.len() + 2);
+
+    // Rejoining while away: the JOIN's away-notify line and the extended JOIN
+    // (realname trailing) both fit.
+    s.line(bob, "PART #c");
+    s.drain(alice);
+    s.line(bob, "JOIN #c");
+    let out = s.drain(alice);
+    assert!(out.iter().any(|l| l.contains(" JOIN #c ")), "{out:#?}");
+    assert!(out.iter().any(|l| l.contains(" AWAY :")), "{out:#?}");
+    for line in &out {
+        assert!(line.len() + 2 <= 512, "{} bytes: {line}", line.len() + 2);
+    }
+}
+
+/// A services notice that quotes the user's input back is fitted too.
+#[test]
+fn a_services_notice_quoting_long_input_fits_the_wire() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    identify(&mut s, alice, "alice");
+    s.line(
+        alice,
+        &format!("PRIVMSG NickServ :GHOST {}", "n".repeat(480)),
+    );
+    let out = s.drain(alice);
+    let notice = out
+        .iter()
+        .find(|l| l.contains("You do not own"))
+        .expect("GHOST refusal");
+    assert!(notice.len() + 2 <= 512, "{} bytes", notice.len() + 2);
+}
+
+/// A `+k` key must survive as a middle parameter and as one entry of JOIN's
+/// comma-separated key list; a list-mode mask must not open a trailing.
+#[test]
+fn malformed_keys_and_colon_masks_are_refused() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #k");
+    s.drain(alice);
+    for bad in ["MODE #k +k a,b", "MODE #k +k ::x", "MODE #k +k a\tb"] {
+        s.line(alice, bad);
+        let out = s.drain(alice);
+        assert!(has_numeric(&out, "525"), "{bad:?}: {out:#?}");
+        assert!(!out.iter().any(|l| l.contains("MODE #k +k")), "{out:#?}");
+    }
+    for mode in ['b', 'q', 'e', 'I'] {
+        s.line(alice, &format!("MODE #k +{mode} ::evil"));
+        let out = s.drain(alice);
+        assert!(has_numeric(&out, "696"), "+{mode} ::evil: {out:#?}");
+        assert!(!out.iter().any(|l| l.contains(" MODE #k ")), "{out:#?}");
+    }
+    // A well-formed key still works.
+    s.line(alice, "MODE #k +k good");
+    assert!(
+        s.drain(alice)
+            .iter()
+            .any(|l| l.ends_with("MODE #k +k good"))
+    );
+}
+
+/// RPL_MYINFO lists every channel mode (list and prefix modes included) and the
+/// ones taking a parameter, consistent with ISUPPORT CHANMODES and PREFIX.
+#[test]
+fn myinfo_mode_lists_agree_with_isupport() {
+    let mut s = TestServer::new();
+    let alice = s.connect(1);
+    s.line(alice, "NICK alice");
+    s.line(alice, "USER alice 0 * :real");
+    let out = s.drain(alice);
+    let myinfo: Vec<&str> = out
+        .iter()
+        .find(|l| l.split(' ').nth(1) == Some("004"))
+        .expect("004")
+        .split(' ')
+        .collect();
+    let token = |name: &str| -> String {
+        out.iter()
+            .filter(|l| l.split(' ').nth(1) == Some("005"))
+            .flat_map(|l| l.split(' '))
+            .find_map(|t| t.strip_prefix(&format!("{name}=")).map(str::to_string))
+            .unwrap_or_else(|| panic!("005 {name}"))
+    };
+    let chanmodes = token("CHANMODES");
+    let groups: Vec<&str> = chanmodes.split(',').collect();
+    let prefix = token("PREFIX");
+    let prefix_modes = prefix
+        .strip_prefix('(')
+        .and_then(|p| p.split(')').next())
+        .expect("PREFIX=(modes)sigils");
+    let sorted = |s: &str| {
+        let mut v: Vec<char> = s.chars().collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(myinfo[5], "iowB", "user modes");
+    assert_eq!(
+        sorted(myinfo[6]),
+        sorted(&format!("{}{prefix_modes}", groups.concat())),
+        "every channel mode: {myinfo:?}"
+    );
+    assert_eq!(
+        sorted(myinfo[7]),
+        sorted(&format!(
+            "{}{}{}{prefix_modes}",
+            groups[0], groups[1], groups[2]
+        )),
+        "channel modes with a parameter: {myinfo:?}"
+    );
+    assert_eq!(sorted(myinfo[6]), sorted("beIqimnstklCov"));
+    assert_eq!(sorted(myinfo[7]), sorted("beIqklov"));
+}
+
+/// RPL_KNOCKDLVR names the channel knocked on.
+#[test]
+fn knock_delivered_names_the_channel() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    s.line(alice, "JOIN #inv");
+    s.line(alice, "MODE #inv +i");
+    s.drain(alice);
+    s.line(bob, "KNOCK #inv");
+    let out = s.drain(bob);
+    assert!(
+        out.iter()
+            .any(|l| l.ends_with(" 711 bob #inv :Your KNOCK has been delivered")),
+        "{out:#?}"
+    );
+}
+
+/// A target list with no non-empty entry names no recipient: 411 for PRIVMSG
+/// and TAGMSG, silence for NOTICE.
+#[test]
+fn a_comma_only_target_list_is_no_recipient() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "message-tags");
+    s.line(alice, "PRIVMSG ,, :hello");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.ends_with(" 411 alice :No recipient given (PRIVMSG)")),
+        "{out:#?}"
+    );
+    s.line(alice, "@+typing=active TAGMSG ,");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.ends_with(" 411 alice :No recipient given (TAGMSG)")),
+        "{out:#?}"
+    );
+    s.line(alice, "NOTICE , :hello");
+    assert!(s.drain(alice).is_empty(), "NOTICE never answers");
+}
+
+/// A client token with a space (the trailing form of a last parameter) is
+/// echoed as `*`, never split into two reply parameters.
+#[test]
+fn an_echoed_token_with_a_space_stays_one_parameter() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #c");
+    s.drain(alice);
+    s.line(alice, "KICK #c :a b");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.ends_with(" 441 alice * #c :They aren't on that channel")),
+        "{out:#?}"
+    );
+    s.line(alice, "INVITE alice :a b");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.ends_with(" 403 alice * :No such channel")),
+        "{out:#?}"
+    );
+    s.line(alice, "NICK :a b");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.ends_with(" 432 alice * :Erroneous nickname")),
+        "{out:#?}"
+    );
+}
+
+/// User MODE reports only real changes, sends nothing when nothing changed,
+/// and tells a missing nick (401) from somebody else's (502).
+#[test]
+fn user_mode_reports_only_real_changes() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let _bob = s.register(2, "bob");
+    s.line(alice, "MODE alice +i");
+    assert!(s.drain(alice).iter().any(|l| l.ends_with("MODE alice :+i")));
+    s.line(alice, "MODE alice +i");
+    assert!(s.drain(alice).is_empty(), "+i while +i is no change");
+    s.line(alice, "MODE alice -o");
+    assert!(s.drain(alice).is_empty(), "-o by a non-oper is no change");
+    s.line(alice, "MODE alice +w-w");
+    assert!(s.drain(alice).is_empty(), "+w-w nets to nothing");
+    s.line(alice, "MODE alice +iw-i");
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|l| l.ends_with("MODE alice :+w-i")),
+        "only the net change: {out:#?}"
+    );
+    s.line(alice, "MODE nosuchnick +i");
+    let out = s.drain(alice);
+    assert!(
+        has_numeric(&out, "401") && !has_numeric(&out, "502"),
+        "{out:#?}"
+    );
+    s.line(alice, "MODE bob +i");
+    let out = s.drain(alice);
+    assert!(has_numeric(&out, "502"), "{out:#?}");
+    // Every advertised user mode (RPL_MYINFO's first mode list) is one the
+    // server can hold and report.
+    s.line(alice, "OPER god letmein");
+    s.line(alice, "MODE alice +iB");
+    s.drain(alice);
+    s.line(alice, "MODE alice");
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|l| l.ends_with(" 221 alice +iowB")),
+        "{out:#?}"
+    );
+}
+
+/// Recreating a registered channel grants no ops by arriving first; an
+/// unregistered channel still ops its creator.
+#[test]
+fn only_an_unregistered_channel_ops_its_first_joiner() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#reg".to_string(), "boss".to_string())]);
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #reg");
+    let names = s
+        .drain(alice)
+        .into_iter()
+        .find(|l| l.contains(" 353 "))
+        .expect("353");
+    assert!(names.ends_with(":alice"), "{names}");
+    s.line(alice, "JOIN #mine");
+    let names = s
+        .drain(alice)
+        .into_iter()
+        .find(|l| l.contains(" 353 "))
+        .expect("353");
+    assert!(names.ends_with(":@alice"), "{names}");
 }

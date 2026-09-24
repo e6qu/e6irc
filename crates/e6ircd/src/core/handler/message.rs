@@ -46,6 +46,18 @@ pub(super) fn unique_targets_indexed(
         .filter(move |(_, t)| !t.is_empty() && seen.insert(casemap.casefold(t)))
 }
 
+/// The recipients a message command's target parameter names, deduplicated
+/// by [`unique_targets`]. `None` when it names none — the parameter is missing,
+/// empty, or only commas (`PRIVMSG , :hi`) — so the caller answers
+/// ERR_NORECIPIENT for every one of those shapes alike rather than splitting to
+/// an empty list and silently sending nothing.
+fn message_targets(state: &ServerState, p: &[&str]) -> Option<Vec<String>> {
+    let targets: Vec<String> = unique_targets(p.first()?, state.casemap)
+        .map(str::to_string)
+        .collect();
+    (!targets.is_empty()).then_some(targets)
+}
+
 pub(super) fn cmd_message(
     state: &mut ServerState,
     conn: ConnId,
@@ -62,13 +74,18 @@ pub(super) fn cmd_message(
     if multiline_collect(state, conn, msg, p, kind) {
         return;
     }
-    let Some(&targets) = p.first() else {
+    // A comma-separated target list delivers to each recipient, deduped (by
+    // `unique_targets`) and bounded by TARGMAX (advertised in ISUPPORT). Past the
+    // cap the message is refused loudly rather than silently truncated. A list
+    // with no non-empty entry (`PRIVMSG , :hi`) names no recipient at all —
+    // the same ERR_NORECIPIENT as a missing parameter, never a silent no-op.
+    let Some(ordered) = message_targets(state, p) else {
         if loud {
             state.numeric(
                 conn,
                 ERR_NORECIPIENT,
                 &[],
-                Some("No recipient given (PRIVMSG)"),
+                Some(&format!("No recipient given ({})", kind.wire())),
             );
         }
         return;
@@ -80,19 +97,13 @@ pub(super) fn cmd_message(
         }
         return;
     }
-    // A comma-separated target list delivers to each recipient, deduped (by
-    // `unique_targets`) and bounded by TARGMAX (advertised in ISUPPORT). Past the
-    // cap the message is refused loudly rather than silently truncated.
-    let ordered: Vec<String> = unique_targets(targets, state.casemap)
-        .map(str::to_string)
-        .collect();
     for (delivered, target) in ordered.into_iter().enumerate() {
         if delivered >= TARGMAX {
             if loud {
                 state.numeric(
                     conn,
                     ERR_TOOMANYTARGETS,
-                    &[&target],
+                    &[clip_echo(&target)],
                     Some("Too many targets; message not delivered"),
                 );
             }
@@ -249,7 +260,7 @@ pub(super) fn resolve_message_target(
     let key = state.chan_key(chan_target);
     let Some(chan) = state.channels.get(&key) else {
         if loud {
-            state.err_nosuchchannel(conn, clip_echo(target));
+            state.err_nosuchchannel(conn, target);
         }
         return None;
     };
@@ -515,7 +526,7 @@ pub(super) fn emit_message_result(
         }
         crate::core::state::ChannelMessageResult::NoSuchChannel { target, loud } => {
             if loud {
-                state.err_nosuchchannel(conn, clip_echo(&target));
+                state.err_nosuchchannel(conn, &target);
             }
         }
         crate::core::state::ChannelMessageResult::CannotSend {
@@ -566,7 +577,12 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
         );
         return;
     }
-    let Some(&targets) = p.first() else {
+    // A comma-separated target list delivers to each recipient, deduped (by the
+    // shared `message_targets`) and bounded by TARGMAX — exactly as PRIVMSG/NOTICE
+    // do. TAGMSG previously took only the first target, so `TAGMSG #a,#b` failed
+    // with ERR_NOSUCHCHANNEL for the whole (unsplit) string while the identical
+    // PRIVMSG syntax worked; sharing the splitter keeps them from drifting again.
+    let Some(ordered) = message_targets(state, p) else {
         state.numeric(
             conn,
             ERR_NORECIPIENT,
@@ -577,20 +593,12 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
     };
     // Only client-only tags (`+` prefix) are relayed.
     let client_tags = crate::sanitize::client_tag_string(msg);
-    // A comma-separated target list delivers to each recipient, deduped (by the
-    // shared `unique_targets`) and bounded by TARGMAX — exactly as PRIVMSG/NOTICE
-    // do. TAGMSG previously took only the first target, so `TAGMSG #a,#b` failed
-    // with ERR_NOSUCHCHANNEL for the whole (unsplit) string while the identical
-    // PRIVMSG syntax worked; sharing the splitter keeps them from drifting again.
-    let ordered: Vec<String> = unique_targets(targets, state.casemap)
-        .map(str::to_string)
-        .collect();
     for (delivered, target) in ordered.into_iter().enumerate() {
         if delivered >= TARGMAX {
             state.numeric(
                 conn,
                 ERR_TOOMANYTARGETS,
-                &[&target],
+                &[clip_echo(&target)],
                 Some("Too many targets; message not delivered"),
             );
             break;
@@ -656,7 +664,7 @@ fn deliver_one_tagmsg(state: &mut ServerState, conn: ConnId, target: &str, clien
     let recipients: Vec<Recipient> = if chan_target.starts_with('#') {
         let key = state.chan_key(chan_target);
         let Some(chan) = state.channels.get(&key) else {
-            state.err_nosuchchannel(conn, clip_echo(target));
+            state.err_nosuchchannel(conn, target);
             return;
         };
         // The same gate PRIVMSG/NOTICE use, so a banned or quieted member can't
@@ -796,7 +804,7 @@ pub(super) fn emit_tagmsg_result(
             }
         }
         crate::core::state::ChannelTagmsgResult::NoSuchChannel { target } => {
-            state.err_nosuchchannel(conn, clip_echo(&target));
+            state.err_nosuchchannel(conn, &target);
         }
         crate::core::state::ChannelTagmsgResult::CannotSend { target } => {
             state.numeric(
@@ -1500,7 +1508,7 @@ pub(super) fn emit_multiline_result(
             label,
         } => {
             if loud {
-                state.err_nosuchchannel(conn, clip_echo(&target));
+                state.err_nosuchchannel(conn, &target);
             }
             ack_multiline_label(state, conn, label.as_deref());
         }

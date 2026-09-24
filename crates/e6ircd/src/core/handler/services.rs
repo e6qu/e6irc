@@ -1465,12 +1465,12 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
         &[
             &server,
             &format!("e6ircd-{}", version()),
-            // Must match what the server actually implements (RPL_UMODEIS /
-            // CHANMODES): user modes +i/+o/+w/+B, channel modes +imnstkl and
-            // +C (no-CTCP), prefix modes +o/+v.
-            "iowB",
-            "imnstklC",
-            "ov",
+            // Derived from the same mode tables as ISUPPORT CHANMODES/PREFIX, so
+            // the two cannot drift: user modes, every channel mode (list and
+            // prefix modes included), then the channel modes taking a parameter.
+            USER_MODES,
+            &myinfo_channel_modes(),
+            &myinfo_param_channel_modes(),
         ],
         None,
     );
