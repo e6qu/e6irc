@@ -749,24 +749,8 @@ where
 
     // Complete the client's registration burst (welcome, ISUPPORT, and
     // end-of-MOTD) so it considers itself registered, then attach.
-    // The attach selector is registration input, not the client's IRC
-    // identity. Once the upstream session exists, 001 must name its actual nick
-    // so clients classify the following JOIN/NICK traffic as their own.
-    let downstream_nick = handle
-        .irc_session_snapshot()
-        .map_or(requested_nick, |session| session.nick);
-    for line in [
-        format!(
-            ":{server_name} 001 {downstream_nick} :Welcome to e6irc BNC, attached to '{network}'"
-        ),
-        format!(
-            ":{server_name} 005 {downstream_nick} CASEMAPPING=rfc1459 CHANTYPES=#& \
-             CHANNELLEN=64 NICKLEN=30 PREFIX=(qaohv)~&@%+ CHATHISTORY={} \
-             MSGREFTYPES=timestamp,msgid :are supported by this server",
-            super::chathistory::CHATHISTORY_LIMIT_MAX,
-        ),
-        format!(":{server_name} 422 {downstream_nick} :MOTD is on the upstream network"),
-    ] {
+    let (downstream_nick, burst) = welcome(server_name, &network, &handle, requested_nick);
+    for line in burst {
         write.write_all(line.as_bytes()).await?;
         write.write_all(b"\r\n").await?;
     }
@@ -787,6 +771,35 @@ where
     // answering" are different stories to whoever reads this log.
     eprintln!("bnc: {account} detached from '{network}': {end}");
     Ok(())
+}
+
+/// The nick an attaching client is welcomed under, and its registration
+/// burst: welcome, ISUPPORT and end-of-MOTD. The attach selector is
+/// registration input, not the client's IRC identity: once the network has a
+/// session, 001 names the session's nick — an IRC upstream's, or a bridge's
+/// provider account — so the client classifies the JOIN, NICK and echoed
+/// traffic that follows as its own. Before then it is the nick the client
+/// asked for, and the session's arrives as a NICK when it begins.
+pub(super) fn welcome(
+    server_name: &str,
+    network: &str,
+    handle: &NetworkHandle,
+    requested_nick: String,
+) -> (String, [String; 3]) {
+    let nick = handle
+        .irc_session_snapshot()
+        .map_or(requested_nick, |session| session.nick);
+    let burst = [
+        format!(":{server_name} 001 {nick} :Welcome to e6irc BNC, attached to '{network}'"),
+        format!(
+            ":{server_name} 005 {nick} CASEMAPPING=rfc1459 CHANTYPES=#& \
+             CHANNELLEN=64 NICKLEN=30 PREFIX=(qaohv)~&@%+ CHATHISTORY={} \
+             MSGREFTYPES=timestamp,msgid :are supported by this server",
+            super::chathistory::CHATHISTORY_LIMIT_MAX,
+        ),
+        format!(":{server_name} 422 {nick} :MOTD is on the upstream network"),
+    ];
+    (nick, burst)
 }
 
 /// Drive registration to a `Registered` verdict. Requires a successful

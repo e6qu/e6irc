@@ -2017,8 +2017,9 @@ the account name, so it fails as the bad credential it is rather than as a bad
 network.
 The selector's nick and network components are independently validated; the
 slash-bearing selector is routing input, never the downstream IRC identity.
-Registration and later session reconciliation use the actual upstream nick (or
-the validated nick component while no upstream session exists). Off loopback
+Registration and later session reconciliation use the actual upstream nick — a
+bridge's is its provider account's (§10.5) — or the validated nick component
+while no upstream session exists. Off loopback
 the attach listener requires `[bnc].tls` (console: `bnc_tls`), because
 attaching clients send their account password; the configuration file and
 every console save refuse a cleartext non-loopback bind. Attach SASL
@@ -2150,6 +2151,32 @@ Design constraints recorded now:
   produces a bounded notice. A failed name lookup is not cached. The
   display-name cache is bounded at 4096 upstream ids; overflow clears it,
   counted and logged.
+- A bridge's IRC session is its provider account. It begins, before the
+  bridge reports connected, under the account's nick (`bridged_identity`:
+  Discord's `GET /users/@me` name, Slack's `auth.test` user, the Matrix
+  login's localpart) and in the channels the bridge maps, through one call
+  (`DriverEnds::begin_bridge_session`) — so the nick a client is welcomed
+  under (`001` names the session's nick once there is one, §10.4) is the nick
+  every echo carries, and echo-message clients and `e6irc send` recognise
+  their own lines. The session is `SessionAuthority::Provider`: only the
+  provider (a rename) or the owner (a reconfiguration) changes it, so the
+  attach layer answers a client's `NICK` and `JOIN` itself and never relays
+  them. `NICK` to the current nick is no change, as on any server; any other
+  nick is refused with `447` to that client. `JOIN` of a bridged channel
+  re-states the membership (`JOIN`, `353`, `366`) — a client that joins
+  before it speaks gets the confirmation it waits for — and any other channel
+  is `403` (`437` before the bridge first connects, when its channels are not
+  yet known). The web composer refuses `NICK`, `JOIN` and `PART` on a bridge
+  with a typed rejection; the browser takes the nick and the joined channels
+  from the session event, shows no member list and offers no Leave for a
+  bridge channel. A mapped channel no IRC client could be joined to, or more
+  than the tracked-channel bound, is a `ChannelMappingFailed` configuration
+  refusal, and no session is begun.
+- Matrix drops a timeline event as the bridge's own send only when it carries
+  `unsigned.transaction_id`, which the homeserver includes only for the
+  device that sent it — those were echoed when the homeserver accepted them.
+  A post by the same account from any other device carries none and is
+  relayed like anyone's, under the account's nick.
 - Reverse bridge delivery accepts `PRIVMSG` only. A CTCP ACTION becomes the
   provider's emote (Matrix `m.emote`, Discord/Slack italics) and any other CTCP
   is refused; IRC formatting is stripped outbound; inbound provider text loses

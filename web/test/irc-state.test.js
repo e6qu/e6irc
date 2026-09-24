@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   DEFAULT_CHANNEL_MODES,
   asMessage,
+  bufferAction,
   channelModesFrom,
   chatMessageRoute,
   clearTranscript,
@@ -22,6 +23,7 @@ import {
   nickPrefix,
   parseIrc,
   reconcileChannelSnapshot,
+  seededNick,
   splitSigil,
   stripFormatting,
   tagValue,
@@ -323,4 +325,32 @@ test("a replay clears a transcript and offers its earlier history again", () => 
     pendingVisibleMessages: 0,
     historyLoaded: false,
   });
+});
+
+test("a joined bridge channel has nothing to leave; its past and conversations still close", () => {
+  const channel = (joined) => ({ kind: "channel", joined });
+  // An IRC network: a joined channel is left, a past one closed.
+  assert.equal(bufferAction(channel(true), true), "leave");
+  assert.equal(bufferAction(channel(false), true), "close");
+  assert.equal(bufferAction({ kind: "dm", joined: null }, true), "close");
+  // A bridge: the provider account is in its channels, not the person.
+  assert.equal(bufferAction(channel(true), false), null);
+  assert.equal(bufferAction(channel(false), false), "close");
+  assert.equal(bufferAction({ kind: "dm", joined: null }, false), "close");
+  // The console has no action anywhere.
+  assert.equal(bufferAction({ kind: "server", joined: null }, true), null);
+  assert.equal(bufferAction(undefined, true), null);
+});
+
+test("a bridge's session snapshot joins its channels under the provider account's nick", () => {
+  // A bridge stores no nick; the session names it.
+  assert.equal(seededNick(""), null);
+  assert.equal(seededNick(undefined), null);
+  assert.equal(seededNick("alice"), "alice");
+  // Buffers opened by relayed messages before the session are archived until
+  // the snapshot names them; then they are joined, and none is removed.
+  const reconciliation = reconcileChannelSnapshot(["#general"], ["#General", "#random"]);
+  assert.deepEqual(reconciliation.removed, []);
+  assert.deepEqual(reconciliation.added, ["#random"]);
+  assert.deepEqual(reconciliation.joined, ["#General", "#random"]);
 });

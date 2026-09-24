@@ -36,6 +36,7 @@ import { parseUiEvent } from "./ui-event.js";
 import {
   DEFAULT_CHANNEL_MODES,
   asMessage,
+  bufferAction,
   channelModesFrom,
   chatMessageRoute,
   clearTranscript,
@@ -52,6 +53,7 @@ import {
   nickPrefix,
   parseIrc,
   reconcileChannelSnapshot,
+  seededNick,
   splitSigil,
   stripFormatting,
   stripSigil,
@@ -617,15 +619,14 @@ function renderActive({ atLatest = true } = {}) {
   routeNetworkEl.textContent = network || "";
   bufnameEl.textContent = !b || b.key === SERVER ? CONSOLE_NAME : b.display;
   buftopicEl.textContent = b ? b.topic : "";
-  if (!b || b.kind === "server") {
-    bufferActionEl.hidden = true;
-  } else {
-    bufferActionEl.hidden = false;
-    const canLeave = b.kind === "channel" && b.joined;
+  const action = bufferAction(b, memberTracking);
+  bufferActionEl.hidden = action === null;
+  if (action !== null) {
+    const canLeave = action === "leave";
     bufferActionEl.textContent = canLeave ? "Leave" : "Close";
-    const action = canLeave ? `Leave ${b.display}` : `Close conversation with ${b.display}`;
-    bufferActionEl.title = action;
-    bufferActionEl.setAttribute("aria-label", action);
+    const label = canLeave ? `Leave ${b.display}` : `Close conversation with ${b.display}`;
+    bufferActionEl.title = label;
+    bufferActionEl.setAttribute("aria-label", label);
   }
   // "Load earlier" is offered for a real conversation buffer (channel/DM) whose
   // persisted backlog hasn't been pulled yet, and only when attached (network set).
@@ -794,8 +795,9 @@ function closeBuffer(name) {
 
 bufferActionEl.addEventListener("click", () => {
   const buffer = buffers.get(active);
-  if (!buffer || buffer.kind === "server") return;
-  if (buffer.kind === "dm" || !buffer.joined) {
+  const action = buffer ? bufferAction(buffer, memberTracking) : null;
+  if (action === null) return;
+  if (action === "close") {
     closeBuffer(buffer.key);
     return;
   }
@@ -967,14 +969,14 @@ function setTopic(chan, topic) {
 // Is this our own nick? Compared under the casefold, since the upstream may
 // echo a different casing than our configured nick.
 function isMe(nick) {
-  return nick != null && myNick != null && fold(nick) === fold(myNick);
+  return nick != null && !!myNick && fold(nick) === fold(myNick);
 }
 
 // Does `text` mention our nick as a whole token (casefolded)? Splits on runs of
 // non-nick characters (an IRC nick is letters/digits and `[]{}\|^`_-`), so
 // "hey alice!" highlights but "alicexyz" does not.
 function mentionsMe(text) {
-  if (myNick == null || typeof text !== "string") return false;
+  if (!myNick || typeof text !== "string") return false;
   const me = fold(myNick);
   return fold(text)
     .split(/[^a-z0-9{}[\]\\^`_|-]+/)
@@ -2663,8 +2665,10 @@ function openChosenNetwork(networks, networkFailure) {
       addServer(`${reason} The live socket was not opened.`);
       return;
     }
-    // Seed our nick from the stored configuration (overridden by 001/NICK).
-    if (typeof selected.nick === "string") myNick = selected.nick;
+    // Seed our nick from the stored configuration (overridden by 001/NICK and
+    // the session snapshot). A bridge stores none: its nick is the provider
+    // account's, and arrives with the session.
+    myNick = seededNick(selected.nick);
     memberTracking =
       typeof selected.kind !== "string" ||
       selected.kind === "irc" ||

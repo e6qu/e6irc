@@ -10,7 +10,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as Ws;
 
-use super::{ConnectionEvent, DriverEnds, NetworkDriver, NetworkHandle};
+use super::{DriverEnds, NetworkDriver, NetworkHandle};
 
 const DEFAULT_API: &str = "https://discord.com/api/v10";
 const INTENTS: u64 = e6irc_proto::provider::DISCORD_GATEWAY_INTENTS;
@@ -290,7 +290,9 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
     if let Err(outcome) = opened {
         return outcome;
     }
-    ends.emit(ConnectionEvent::Connected);
+    if let Err(outcome) = ends.begin_bridge_session(&identity, id_to_channel.values()) {
+        return outcome;
+    }
 
     let mut heartbeat = tokio::time::interval(Duration::from_millis(hb_interval));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1329,32 +1331,51 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    /// The scripted oracle, and a bridge network's session connecting to it,
+    /// with a subscription taken before the session starts.
     #[cfg(feature = "slack")]
-    async fn real_http_and_websocket_transport_bridge_both_directions() {
-        use crate::bouncer::NetworkHandle;
-        use crate::bouncer::bridge_oracle::Provider;
-
-        let mut oracle = crate::bouncer::bridge_oracle::start(Provider::Discord).await;
-        let config = DiscordConfig {
+    async fn scripted_session() -> (
+        crate::bouncer::bridge_oracle::Oracle,
+        crate::bouncer::NetworkHandle,
+        tokio::sync::broadcast::Receiver<crate::bouncer::DriverEvent>,
+        tokio::task::JoinHandle<crate::bouncer::SessionOutcome>,
+    ) {
+        let oracle =
+            crate::bouncer::bridge_oracle::start(crate::bouncer::bridge_oracle::Provider::Discord)
+                .await;
+        let config = Shared::new(DiscordConfig {
             token: "discord-token".into(),
             api_base: oracle.api_base.clone(),
             channels: vec!["42".into()],
             internal_upstreams: crate::egress::InternalUpstreams::Allow,
             buffer_cap: 10,
-        };
-        let (handle, mut ends) = NetworkHandle::channels(10);
+        });
+        let (handle, mut ends) = crate::bouncer::NetworkHandle::bridge_channels(10);
         let driver_events = handle.subscribe();
-        let session =
-            tokio::spawn(async move { session_once(&Shared::new(config), &mut ends).await });
+        let session = tokio::spawn(async move { session_once(&config, &mut ends).await });
+        (oracle, handle, driver_events, session)
+    }
 
+    #[tokio::test]
+    #[cfg(feature = "slack")]
+    async fn real_http_and_websocket_transport_bridge_both_directions() {
+        let (mut oracle, handle, driver_events, session) = scripted_session().await;
         crate::bouncer::bridge_oracle::verify_round_trip(
-            Provider::Discord,
+            crate::bouncer::bridge_oracle::Provider::Discord,
             handle,
             driver_events,
             session,
             &mut oracle,
         )
         .await;
+    }
+
+    /// An attached echo-message client is the bot: welcomed under its name,
+    /// and handed an echo under that same name.
+    #[tokio::test]
+    #[cfg(feature = "slack")]
+    async fn an_attached_client_is_welcomed_as_the_bot_and_knows_its_echo() {
+        let (_oracle, handle, _, session) = scripted_session().await;
+        crate::bouncer::bridge_oracle::verify_attached_client(handle, session).await;
     }
 }

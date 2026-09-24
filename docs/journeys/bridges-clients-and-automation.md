@@ -37,7 +37,13 @@ Inbound identities/channel names are sanitized and validated before entering
 IRC state.
 Reverse delivery supports `PRIVMSG`; malformed messages, unsupported commands,
 unmapped targets, and provider send failures each produce an explicit bounded
-`*bnc*` notice rather than disappearing after queue admission.
+`*bnc*` notice rather than disappearing after queue admission. An attached
+client is the bridge's provider account: it is welcomed under the account's
+nick, joined to the mapped channels, and its delivered messages are echoed
+under that nick. Its `NICK` is refused (`447`) and its `JOIN` answered by the
+attach layer — re-stated for a mapped channel, `403` for any other — and the
+web composer refuses `NICK`, `JOIN` and `PART` there, since only the provider
+or the bridge's configuration changes either.
 
 **Security and observability.** Integration forms are administrator-only and
 CSRF-protected; platform credentials are sealed, write-only, and excluded from
