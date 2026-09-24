@@ -3576,6 +3576,8 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
 /// same real form → validation/sealing → revision/audit → PostgreSQL path.
 /// This protects the controls that a scalar-only configuration test cannot
 /// cover and proves that rendered responses never disclose submitted secrets.
+/// It stores a network of every kind, so it needs every bridge built.
+#[cfg(all(feature = "matrix", feature = "discord", feature = "slack"))]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn console_configuration_manages_every_credential_collection() {

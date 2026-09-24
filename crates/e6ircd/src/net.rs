@@ -1248,8 +1248,11 @@ impl HttpAdmission {
 /// without a timer: hyper then silently drops its header-read timeout, and a
 /// peer that sends half a header block — or holds a kept-alive connection idle
 /// — keeps its socket and task forever. Here every connection has a timer and
-/// [`HTTP_HEADER_READ_TIMEOUT`], and the per-address connection cap is applied
-/// at accept, before any work is spent on the peer.
+/// [`HTTP_HEADER_READ_TIMEOUT`], its writes are bounded by
+/// [`crate::peer_write::PEER_WRITE_DEADLINE`] (so a client that asks for a
+/// large response and stops reading loses the connection instead of holding
+/// it), and the per-address connection cap is applied at accept, before any
+/// work is spent on the peer.
 async fn serve_http(
     listener: TcpListener,
     router: axum::Router,
@@ -1296,6 +1299,7 @@ async fn serve_http(
             guard,
             refusals,
             telemetry.clone(),
+            crate::peer_write::PEER_WRITE_DEADLINE,
         ));
     }
 }
@@ -1307,6 +1311,7 @@ async fn serve_http_connection(
     _guard: Option<ConnGuard>,
     refusals: Arc<PeerRefusalLog>,
     telemetry: Arc<Telemetry>,
+    write_deadline: std::time::Duration,
 ) {
     use tower::ServiceExt;
     let client = ClientIp::new(peer.ip());
@@ -1335,7 +1340,13 @@ async fn serve_http_connection(
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(HTTP_HEADER_READ_TIMEOUT)
         .serve_connection(
-            hyper_util::rt::TokioIo::new(stream),
+            // Every write — a response body, an upgraded WebSocket's frames —
+            // fails once the peer has taken nothing for `write_deadline`,
+            // which ends the connection ([`crate::peer_write`]).
+            hyper_util::rt::TokioIo::new(crate::peer_write::DeadlineWriter::new(
+                stream,
+                write_deadline,
+            )),
             hyper_util::service::TowerToHyperService::new(service),
         )
         .with_upgrades()
@@ -2294,6 +2305,51 @@ mod tests {
             second
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A client that asks for a large response and never reads it held its
+    /// connection (and a slot of its address's connection cap) for as long as
+    /// it liked: nothing bounded a stalled body write. The connection now ends
+    /// once the client has taken nothing for the write deadline.
+    #[tokio::test]
+    async fn an_http_client_that_stops_reading_a_large_response_loses_the_connection() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+        const BODY: usize = 32 * 1024 * 1024;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let client = tokio::net::TcpSocket::new_v4().expect("socket");
+        client.set_recv_buffer_size(4096).expect("receive buffer");
+        let mut client = client.connect(address).await.expect("connect");
+        let (stream, peer) = listener.accept().await.expect("accept");
+        socket2::SockRef::from(&stream)
+            .set_send_buffer_size(4096)
+            .expect("send buffer");
+        let router =
+            axum::Router::new().route("/large", axum::routing::get(|| async { vec![b'x'; BODY] }));
+        let telemetry = Arc::new(Telemetry::new());
+        let served = tokio::spawn(serve_http_connection(
+            stream,
+            peer,
+            router,
+            None,
+            Arc::new(PeerRefusalLog::new(Duration::from_secs(60))),
+            telemetry,
+            Duration::from_millis(200),
+        ));
+        client
+            .write_all(b"GET /large HTTP/1.1\r\nhost: test\r\n\r\n")
+            .await
+            .expect("request");
+        // The client never reads; the server's write stalls within the first
+        // few hundred kilobytes and must give up.
+        tokio::time::timeout(Duration::from_secs(20), served)
+            .await
+            .expect("a stalled response write ends the connection")
+            .expect("the connection task");
+        drop(client);
     }
 
     #[tokio::test]

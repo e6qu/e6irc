@@ -434,8 +434,8 @@ These are project-wide rules, enforced in review and (where possible) CI:
     constructor. Refresh code cannot overwrite a neighboring table's identity
     after rendering.
   - `peer_write` — every write to a peer (IRC client socket, attach client,
-    WebSocket frame, bridge gateway frame, streamed download) goes through
-    `DeadlineWriter` or `within_send_deadline`, so a peer that stops reading
+    HTTP connection, WebSocket frame, bridge gateway frame, streamed
+    download) goes through `DeadlineWriter` or `within_send_deadline`, so a peer that stops reading
     ends its connection at the deadline instead of parking the task that owns
     it — and every resource that task holds — forever.
   - `MutationLane` — the registry's transitions (replace, ensure running,
@@ -1320,7 +1320,9 @@ one transaction-scoped advisory lock first, so two administrators demoting each
 other cannot both commit and leave none. The redacted audit
 event and retirement commit together. On database failure the HTTP boundary
 removes the live deny key before returning the error; success stops owned
-drivers and clears live administrator authority. No shipped creation path—or
+drivers and clears live administrator authority, and the commit is broadcast
+to every core shard, which drops the account's read-marker mirror entries (their
+rows cascaded away; a write still in flight keeps its slot until its reply). No shipped creation path—or
 the account-table trigger—can assign a retired name to somebody else.
 
 The `draft/account-registration` `REGISTER` command creates that same account,
@@ -1451,7 +1453,10 @@ service, not one per route, and a request abandoned at the deadline answers a
 `408` problem document. Connections are served with a timer: a request's
 headers must arrive within 10 s, and the same bound closes an idle kept-alive
 connection (axum's default server has no timer, which silently drops hyper's
-header timeout). Only a connection that never completed a request is logged as
+header timeout). Every write on the connection — a response body, an upgraded
+WebSocket's frames — goes through the shared `DeadlineWriter`, so a client that
+asks for a large response and stops reading loses the connection once it has
+taken nothing for 30 s instead of holding it. Only a connection that never completed a request is logged as
 a refused peer; an idle kept-alive connection closed at the bound is ordinary,
 and a reverse proxy's idle upstream connections used to log a "refused" line
 every ten seconds. One address may hold 128 connections (trusted proxies

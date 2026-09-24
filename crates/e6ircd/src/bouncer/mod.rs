@@ -5596,6 +5596,17 @@ where
 mod tests {
     use super::*;
 
+    /// The rejection an upstream's pre-welcome `line` makes, read by the same
+    /// public table every driver reads.
+    fn refused_by(line: &str) -> e6irc_client::RegistrationRejection {
+        let parsed = e6irc_proto::message::Message::parse(line).expect("a scripted reply parses");
+        e6irc_client::RegistrationRejection::from_reply(
+            &e6irc_client::OwnedMessage::from(&parsed),
+            e6irc_client::ServerPasswordSent::No,
+        )
+        .expect("a scripted refusal")
+    }
+
     /// A bridged account shown as `name!name@host`: the first account a fresh
     /// session sees under a name no one else holds.
     #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
@@ -5919,17 +5930,15 @@ mod tests {
             NetworkLifecycle::AuthenticationFailed
         );
 
-        ends.emit(ConnectionEvent::RegistrationFailed(
-            e6irc_client::RegistrationRejection::without_diagnostic(
-                e6irc_client::RegistrationRefusal::InvalidNickname,
-            ),
-        ));
+        ends.emit(ConnectionEvent::RegistrationFailed(refused_by(
+            ":up 432 * bnc :Erroneous nickname",
+        )));
         let rejected = handle.runtime_snapshot();
         assert_eq!(rejected.lifecycle, NetworkLifecycle::RegistrationFailed);
         assert_eq!(rejected.last_error, Some(NetworkFailure::InvalidNickname));
         assert_eq!(
             rejected.last_error_diagnostic.as_deref(),
-            Some("no detail from upstream")
+            Some("Erroneous nickname")
         );
         assert_eq!(failed.errors, 2);
         assert_eq!(rejected.buffer_lines, 5);
@@ -5940,7 +5949,7 @@ mod tests {
                 ":upstream PRIVMSG #room :hello".to_string(),
                 ":*bnc* NOTICE * :component reconnecting: The established upstream connection was lost. (connection_lost)".to_string(),
                 ":*bnc* NOTICE * :component authentication_failed: The upstream rejected the configured credentials. (authentication_rejected)".to_string(),
-                ":*bnc* NOTICE * :component registration_failed: The upstream rejected the configured nickname. (invalid_nickname); upstream: no detail from upstream".to_string(),
+                ":*bnc* NOTICE * :component registration_failed: The upstream rejected the configured nickname. (invalid_nickname); upstream: Erroneous nickname".to_string(),
             ]
         );
     }
@@ -6110,11 +6119,9 @@ mod tests {
             ":*bnc* NOTICE * :upstream reconnecting: The established upstream connection was lost. (connection_lost)"
         );
 
-        ends.emit(ConnectionEvent::RegistrationFailed(
-            e6irc_client::RegistrationRejection::without_diagnostic(
-                e6irc_client::RegistrationRefusal::InvalidNickname,
-            ),
-        ));
+        ends.emit(ConnectionEvent::RegistrationFailed(refused_by(
+            ":up 432 * bnc :Erroneous nickname",
+        )));
         assert_eq!(
             events.try_recv(),
             Ok(DriverEvent::Status {
@@ -6582,7 +6589,7 @@ mod tests {
     /// One step a scripted driver session takes, for exercising
     /// [`run_with_backoff`] without a socket.
     enum ScriptedStep {
-        Refuse(e6irc_client::RegistrationRefusal),
+        Refuse(e6irc_client::RegistrationRejection),
         /// Hold the session for this long — having reached `Connected` or not —
         /// then drop it.
         Drop {
@@ -6611,9 +6618,9 @@ mod tests {
                 .push(tokio::time::Instant::now());
             let step = script.steps.lock().unwrap().pop_front();
             match step {
-                Some(ScriptedStep::Refuse(refusal)) => SessionOutcome::RegistrationRejected(
-                    e6irc_client::RegistrationRejection::without_diagnostic(refusal),
-                ),
+                Some(ScriptedStep::Refuse(rejection)) => {
+                    SessionOutcome::RegistrationRejected(rejection)
+                }
                 Some(ScriptedStep::Drop {
                     hold_for,
                     connected,
@@ -6653,13 +6660,26 @@ mod tests {
     /// A services outage is a run of refusals that never park. When it ends and
     /// the driver's own ghost still holds the nick, that first 433 is the first
     /// of *its* kind: it gets the refusal schedule, not an instant park.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn refusals_that_never_park_do_not_count_toward_parking_a_later_one() {
         use e6irc_client::RegistrationRefusal;
+        // The outage's refusal, from a real exchange: services gone, the
+        // upstream no longer offers the mechanism the driver speaks.
+        let Err(SessionOutcome::RegistrationRejected(unavailable)) =
+            irc_driver::tests::sasl_outcome_against(&[("CAP LS", ":up CAP * LS :sasl=EXTERNAL")])
+                .await
+        else {
+            panic!("an upstream without the mechanism refuses registration");
+        };
+        assert_eq!(unavailable.refusal(), RegistrationRefusal::SaslUnavailable);
+        // The schedule itself runs on the paused clock.
+        tokio::time::pause();
         let mut steps: Vec<ScriptedStep> = (0..MAX_CONSECUTIVE_REGISTRATION_REJECTIONS)
-            .map(|_| ScriptedStep::Refuse(RegistrationRefusal::SaslUnavailable))
+            .map(|_| ScriptedStep::Refuse(unavailable.clone()))
             .collect();
-        steps.push(ScriptedStep::Refuse(RegistrationRefusal::NicknameInUse));
+        steps.push(ScriptedStep::Refuse(refused_by(
+            ":up 433 * bnc :Nickname is already in use",
+        )));
         steps.push(ScriptedStep::Stop);
         let (_, handle) = run_script(steps).await;
         let snapshot = handle.runtime_snapshot();

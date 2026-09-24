@@ -2494,15 +2494,6 @@ pub struct RegistrationRejection {
 }
 
 impl RegistrationRejection {
-    /// Classify a refusal for which the upstream did not supply a message.
-    // dead-pub-allow: e6ircd's unit tests script refusals of every kind, and a SASL one has no other public constructor
-    pub fn without_diagnostic(refusal: RegistrationRefusal) -> Self {
-        Self {
-            refusal,
-            diagnostic: "no detail from upstream".to_string(),
-        }
-    }
-
     /// The server welcomed the connection, but under a nickname other than the
     /// one requested (a server truncating to its NICKLEN, say). Whether that is
     /// acceptable is the caller's decision — a bouncer's attach listener answers

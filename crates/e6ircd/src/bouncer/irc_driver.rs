@@ -1260,7 +1260,7 @@ pub(crate) fn validate_irc_upstream_addr(addr: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -1400,7 +1400,7 @@ mod tests {
     /// Register the real client, with SASL configured, against an upstream that
     /// answers each expected line prefix with its scripted reply, and return
     /// the driver's reading of how that ended.
-    async fn sasl_outcome_against(
+    pub(in crate::bouncer) async fn sasl_outcome_against(
         script: &'static [(&'static str, &'static str)],
     ) -> Result<String, super::super::SessionOutcome> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
