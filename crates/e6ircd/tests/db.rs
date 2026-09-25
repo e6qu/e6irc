@@ -12303,7 +12303,14 @@ async fn storage_constrains_bnc_names_and_timestamps() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn storage_constraint_migration_normalizes_or_names_existing_rows() {
     let url = support::test_db("storage_constraint_migration_normalizes").await;
-    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    // One connection: a refused migration leaves its session's migration
+    // lock held (a failed start exits and drops it), so the retry below must
+    // be that same session, or it waits on the lock forever.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("connect");
     MIGRATIONS
         .run_to(75, &pool)
         .await
