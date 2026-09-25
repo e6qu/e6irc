@@ -848,6 +848,32 @@ each with a test that failed before:
   redundant `bnc_networks_account_idx` are dropped; DESIGN §8 now matches the
   schema (the `messages` index, canonical `sent_at`, `login_attempts`).
 
+A review of whether the docs, tests, CI and guards tell the truth found, and
+this change fixes:
+
+- **SASL-required mode** was promised by DESIGN §7.2 and did not exist.
+  `limits.require_sasl` and `limits.require_sasl_from` (CIDRs) now refuse an
+  anonymous client at the end of registration as Libera refuses its SASL-only
+  ranges (465, `SASL access only`); both are console-owned and validated.
+- **OIDC provider endpoints are HTTPS under `secure_cookies`**: the
+  end-session endpoint in configuration, and every endpoint a discovery
+  document advertises.
+- **Guards that could be walked around.** The dead-public guard let a
+  same-named definition keep a dead item alive (two were deleted) and never
+  saw `pub mod`/`pub use`; the no-deferral guard missed ordinary rewordings
+  and read PLAN.md alone; the `--locked` guard missed `cargo check`/`run`,
+  toolchain-prefixed commands and most documents, and the fuzz build ran
+  unlocked; two scripts ran service images by tag; irctest skips were never
+  counted; the no-op guard read only Rust and took `panic!("")` as a message;
+  the journey guard took any function as evidence. Each has a contract test.
+- **Tests that could not fail**: a buffer-trim test settled by timing, a
+  secret test that passed when a key was set, an assertion-free test, two
+  `#[should_panic]` tests that took any panic, a contrast test of copied hex
+  values, and an unchecked snapshot checksum.
+- **Docs that disagreed with the code**: when a refused network parks (three
+  documents), DESIGN §5's dependency policy, the default flood limits, the
+  client's SASL mechanisms, and CI's PostgreSQL setup.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each
