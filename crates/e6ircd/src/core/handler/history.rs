@@ -570,11 +570,7 @@ pub(super) fn history_on_owner(
 /// `None` when the key names a channel or a conversation `me` is not part of.
 /// A conversation with oneself yields oneself.
 pub(super) fn dm_correspondent(key: &crate::core::state::HistoryKey, me: &str) -> Option<String> {
-    let raw = key.as_str();
-    if raw.starts_with('#') {
-        return None;
-    }
-    let (lo, hi) = raw.split_once('!')?;
+    let (lo, hi) = key.participants()?;
     if lo == me {
         Some(hi.to_string())
     } else if hi == me {
@@ -656,18 +652,18 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
     let latest_in_window = |state: &ServerState,
                             key: &crate::core::state::HistoryKey|
      -> Option<e6irc_proto::time::Millis> {
-        let latest = state.history.get(key)?.entries.iter().map(|e| e.ts).max()?;
+        let latest = state.history.get(key)?.latest()?;
         (latest > min_ts && latest < max_ts).then_some(latest)
     };
-    // Conversations: every hot key that is not a channel and lists the
-    // requester as a participant. The correspondent is the other participant
+    // Conversations: every hot conversation listing the requester as a
+    // participant, from the store's identity index. The correspondent is the other participant
     // (or the requester, for a conversation with oneself). The raw correspondent
     // *identity* is kept; `targets_page` is the single site that resolves an
     // identity to a display nick, so the ring and the database (which also
     // yields identities) convert identically.
     let mut conversations: Vec<(String, e6irc_proto::time::Millis)> = state
         .history
-        .keys()
+        .conversations_of(&me)
         .filter_map(|key| {
             let peer = dm_correspondent(key, &me)?;
             Some((peer, latest_in_window(state, key)?))

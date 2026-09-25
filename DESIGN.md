@@ -343,6 +343,16 @@ These are project-wide rules, enforced in review and (where possible) CI:
   - The registered-session count is maintained at the transitions, in the one
     function that can register a session, and debug-asserted against a full
     scan; it used to be recounted over every session after every event.
+  - The same rule — an index kept where the state changes, never a scan per
+    event — holds for every per-event question about global state. The user
+    directory keeps its LUSERS counts (users, invisible, operators) and a
+    folded-account → connections index in the two functions that add or drop
+    a record, so a registration's LUSERS and resolving a conversation's
+    account to a nick are lookups, not a copy of every user under the
+    process-wide lock. A channel message republishes only the channel's
+    newest-message time (the channel directory tracks "ring changed"
+    separately from "channel changed"), not its ranks and ban lists. Each such
+    index has a unit test that recounts it after every kind of mutation.
   - Server-rendered form posts have no form extractor of their own. Each
     handler takes `Result<axum::Form<T>, FormRejection>`, so a malformed body
     reaches the handler rather than axum's plain-text rejection, and matches it
@@ -2543,6 +2553,18 @@ Design constraints recorded now:
   upstream sessions — at 100k channels an always-on 500-entry ring per
   channel would be tens of GB, so eviction is load-bearing, not an
   optimization.
+  The store (`core::hot_history::HotHistory`) keeps what each event asks of
+  it as an index updated where a ring comes or goes: the LRU order is a
+  `Recency` (a stamp per touch, stale stamps skipped and periodically
+  compacted — amortized O(1), where a list searched on every message was
+  O(targets)); an identity → conversations index answers "free this `~nick`'s
+  conversations" on every unauthenticated disconnect or nick change, and
+  CHATHISTORY TARGETS' conversation list, without visiting any other ring; and
+  each ring keeps its newest timestamp as a sliding-window maximum (entries
+  arrive in wall-clock order from several clocks, so the back entry is not
+  necessarily the newest). A permanently deleted account's hot copy follows
+  the database purge: its lines and its conversations leave the rings, and
+  its entries leave every channel's access list, on every shard.
 
 ---
 

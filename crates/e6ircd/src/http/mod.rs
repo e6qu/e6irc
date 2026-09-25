@@ -940,9 +940,10 @@ async fn delete_account_in_lane(
             return Err(account_deletion_error(error));
         }
     };
-    // The account's read markers cascaded away with its row; every core
-    // shard's mirror drops them too, or they would count against nothing
-    // until a restart. The live gate stays: the name is retired.
+    // The account's read markers and channel access cascaded away with its
+    // row, and its messages were purged; every core shard's mirror drops them
+    // too, or they would linger until a restart. The live gate stays: the
+    // name is retired.
     if state
         .core_tx
         .broadcast_account_deleted(&target.folded)
@@ -952,7 +953,7 @@ async fn delete_account_in_lane(
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
-                "Permanently deleted {}, but a live core shard is unavailable and still holds its read markers.",
+                "Permanently deleted {}, but a live core shard is unavailable and still mirrors its read markers, history and channel access.",
                 deleted.name
             ),
         ));

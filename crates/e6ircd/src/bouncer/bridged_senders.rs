@@ -11,11 +11,12 @@
 //! stable id and hands out nicks so that no other account is ever shown under
 //! the owner's nick, and no two accounts it is currently showing share one.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use e6irc_proto::casemap::CaseMapping;
 
 use super::irc_driver::SelfIdentity;
+use crate::recency::Recency;
 
 /// Senders one bridge session keeps a nick for. Past it the least recently
 /// seen sender is forgotten; if it posts again it is given a nick afresh. The
@@ -78,8 +79,9 @@ pub(crate) struct BridgedSenders {
     shown: HashMap<String, (String, SelfIdentity)>,
     /// Folded nick → the account id holding it.
     holders: HashMap<String, String>,
-    /// Account ids, least recently seen first.
-    recency: VecDeque<String>,
+    /// The keys of `shown`, least recently seen first — a stamp per relayed
+    /// post, not a search of every shown sender.
+    recency: Recency<String>,
 }
 
 impl BridgedSenders {
@@ -91,7 +93,7 @@ impl BridgedSenders {
             own: own.shown_as(crate::sanitize::nick_token(own.name)),
             shown: HashMap::new(),
             holders: HashMap::new(),
-            recency: VecDeque::new(),
+            recency: Recency::default(),
         }
     }
 
@@ -110,31 +112,35 @@ impl BridgedSenders {
             return self.own.clone();
         }
         let base = crate::sanitize::nick_token(account.name);
-        self.recency.retain(|id| id != account.id);
-        match self.shown.remove(account.id) {
-            Some((named, shown)) if named == base => {
-                self.shown
-                    .insert(account.id.to_string(), (named, shown.clone()));
-                self.recency.push_back(account.id.to_string());
+        let id = account.id.to_string();
+        match self.shown.get(&id) {
+            Some((named, shown)) if *named == base => {
+                let shown = shown.clone();
+                self.recency.touch(&id);
                 return shown;
             }
             Some((_, renamed)) => {
                 self.holders.remove(&fold(&renamed.nick));
+                self.shown.remove(&id);
+                self.recency.remove(&id);
             }
             None => {}
         }
-        if self.shown.len() >= MAX_BRIDGED_SENDERS
-            && let Some(oldest) = self.recency.pop_front()
-            && let Some((_, forgotten)) = self.shown.remove(&oldest)
-        {
+        if self.shown.len() >= MAX_BRIDGED_SENDERS {
+            let oldest = self
+                .recency
+                .pop_oldest()
+                .expect("recency holds every shown sender");
+            let (_, forgotten) = self
+                .shown
+                .remove(&oldest)
+                .expect("recency holds only shown senders");
             self.holders.remove(&fold(&forgotten.nick));
         }
         let shown = account.shown_as(self.free_nick(&base));
-        self.holders
-            .insert(fold(&shown.nick), account.id.to_string());
-        self.shown
-            .insert(account.id.to_string(), (base, shown.clone()));
-        self.recency.push_back(account.id.to_string());
+        self.holders.insert(fold(&shown.nick), id.clone());
+        self.shown.insert(id.clone(), (base, shown.clone()));
+        self.recency.touch(&id);
         shown
     }
 
@@ -242,5 +248,50 @@ mod tests {
         assert_ne!(fold(&late.nick), fold("me"));
         assert!(senders.shown.len() <= MAX_BRIDGED_SENDERS);
         assert_eq!(senders.holders.len(), senders.shown.len());
+        senders.assert_consistent();
+    }
+
+    /// The least recently *seen* sender is the one forgotten: seeing one
+    /// again protects it, and the indexes agree with a recount after every
+    /// kind of change — a new sender, a repeat, a rename, an eviction.
+    #[test]
+    fn eviction_follows_recency_and_indexes_stay_consistent() {
+        let mut senders = BridgedSenders::new(account("U0", "me", "slack"));
+        for index in 0..MAX_BRIDGED_SENDERS {
+            senders.identity(account(
+                &format!("U{index}x"),
+                &format!("n{index}"),
+                "slack",
+            ));
+        }
+        senders.assert_consistent();
+        // Seen again: now the most recent, so U1x is the oldest.
+        senders.identity(account("U0x", "n0", "slack"));
+        senders.assert_consistent();
+        // A rename keeps the sender shown and makes it the most recent.
+        assert_eq!(
+            senders.identity(account("U1x", "renamed", "slack")).nick,
+            "renamed"
+        );
+        senders.assert_consistent();
+        senders.identity(account("new", "fresh", "slack"));
+        senders.assert_consistent();
+        assert!(senders.shown.contains_key("U0x"), "seen again, kept");
+        assert!(senders.shown.contains_key("U1x"), "renamed, kept");
+        assert!(!senders.shown.contains_key("U2x"), "least recently seen");
+        assert!(senders.recency.len() <= MAX_BRIDGED_SENDERS);
+    }
+
+    impl BridgedSenders {
+        fn assert_consistent(&self) {
+            assert_eq!(self.recency.len(), self.shown.len());
+            assert!(self.shown.keys().all(|id| self.recency.contains(id)));
+            let holders: HashMap<String, String> = self
+                .shown
+                .iter()
+                .map(|(id, (_, shown))| (fold(&shown.nick), id.clone()))
+                .collect();
+            assert_eq!(self.holders, holders);
+        }
     }
 }

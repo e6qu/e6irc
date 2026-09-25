@@ -905,10 +905,7 @@ fn wrap_log_line(line: &LogLine, width: usize) -> Vec<Line<'static>> {
 /// to `width`, of which the last `height` rows are shown.
 fn log_rows(buffer: &e6irc_tui::app::Buffer, width: usize, height: usize) -> Vec<Line<'static>> {
     let lines = buffer.visible_rows(height, |line| wrap_log_line(line, width).len());
-    let mut rows: Vec<Line<'static>> = lines
-        .iter()
-        .flat_map(|line| wrap_log_line(line, width))
-        .collect();
+    let mut rows: Vec<Line<'static>> = lines.flat_map(|line| wrap_log_line(line, width)).collect();
     let overflow = rows.len().saturating_sub(height);
     rows.drain(..overflow);
     rows
@@ -1276,7 +1273,7 @@ mod tests {
             ":alice!u@h PRIVMSG #home :{}",
             "界".repeat(10)
         )));
-        let wide = app.current().log.last().expect("a line").clone();
+        let wide = app.current().log.back().expect("a line").clone();
         let rows = wrap_log_line(&wide, 11);
         assert!(rows.len() > 1);
         for row in &rows {
@@ -1497,7 +1494,7 @@ mod tests {
         for refusal in session.refused {
             apply(&mut app, Ev::JoinRefused(refusal));
         }
-        let shown = app.current().log.last().expect("status").text.to_string();
+        let shown = app.current().log.back().expect("status").text.to_string();
         assert_eq!(
             shown,
             "cannot join #closed: Cannot join channel (+i); it will not be rejoined"
