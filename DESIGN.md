@@ -3148,8 +3148,8 @@ but the CLI, TUI, and BNC must surface the rejection.
   removed only after that command commits. A corrupt, plaintext, or unreadable
   value rolls the entire operation back.
 - TLS ≥ 1.2 everywhere (rustls). Server certificates are reloaded on SIGHUP
-  and when their files change (modification and status-change times, length,
-  and inode, so a time-preserving rewrite is still a change); a failed reload
+  and when their files change (judged by a digest of their contents, so a
+  time-preserving rewrite is still a change on every platform); a failed reload
   keeps the served certificate, logs an error once per distinct failure, and
   is retried at every check until it loads, since a fix need not change what a
   stamp can see. A key that does not match its certificate is refused. The

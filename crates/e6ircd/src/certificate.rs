@@ -25,41 +25,32 @@ use crate::config::TlsConfig;
 /// served certificate was read at, and a failing read is retried.
 const CERTIFICATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// What tells one version of a file from another without reading it. The
-/// modification time alone does not: a rewrite within the file system's
-/// timestamp granularity, or a tool that preserves times (`cp -p`, `rsync -t`,
-/// an unpacked archive), keeps it. The length, the inode a rename-into-place
-/// brings, and the status-change time (which no user tool can set back) catch
-/// those.
+/// What tells one version of a file from another. Metadata alone does not:
+/// a rewrite within the file system's timestamp granularity, or a tool that
+/// preserves times (`cp -p`, `rsync -t`, an unpacked archive), keeps the
+/// modification time, and not every platform has an inode or a status-change
+/// time to fall back on. A digest of the contents decides on every platform;
+/// a certificate or key file is a few kilobytes, read once a check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
     modified: SystemTime,
-    length: u64,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    changed: (i64, i64),
+    digest: [u8; 32],
 }
 
 impl FileIdentity {
     fn of(path: &std::path::Path) -> io::Result<Self> {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
         let located =
             |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", path.display()));
-        let metadata = std::fs::metadata(path).map_err(located)?;
-        Ok(Self {
-            modified: metadata.modified().map_err(located)?,
-            length: metadata.len(),
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-            #[cfg(unix)]
-            changed: (metadata.ctime(), metadata.ctime_nsec()),
-        })
+        let modified = std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .map_err(located)?;
+        let contents = std::fs::read(path).map_err(located)?;
+        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &contents);
+        let digest = digest
+            .as_ref()
+            .try_into()
+            .expect("a SHA-256 digest is 32 bytes");
+        Ok(Self { modified, digest })
     }
 }
 
