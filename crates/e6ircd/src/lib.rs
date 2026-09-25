@@ -14,6 +14,7 @@ pub mod egress;
 pub mod environment_config;
 pub mod http;
 pub mod identity;
+pub(crate) mod lingering_close;
 pub mod net;
 pub(crate) mod observability;
 pub(crate) mod peer_write;

@@ -3092,7 +3092,13 @@ own bounds (`408` deadline, `413` body limit, and — except the probes — the
 per-address in-flight `429`); the validator refuses a document that drops
 one. The body limit's refusal is a problem document like every other: the
 limit layer's plain-text answer to a declared oversize length and an
-extractor's to a streamed one pass through one `payload_too_large`. The live
+extractor's to a streamed one pass through one `payload_too_large`. That
+refusal is answered before the client has finished sending, so an HTTP
+connection closes lingering (`lingering_close`): it shuts its write half,
+then reads and discards what the client still sends, for at most 2 s or
+8 MiB, before dropping the socket. Closing on unread input sends a reset,
+and a reset lets the client's stack discard the answer it had not read yet
+(macOS and Windows do), so the client saw a reset instead of the `413`. The live
 chat socket `/ws/ui` is in the contract too, as the `GET` it is (an upgrade
 answered `101`), with its query, its refusals, and its close codes.
 

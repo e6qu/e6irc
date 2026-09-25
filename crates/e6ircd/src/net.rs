@@ -1449,8 +1449,11 @@ async fn serve_http_connection(
             // Every write — a response body, an upgraded WebSocket's frames —
             // fails once the peer has taken nothing for `write_deadline`,
             // which ends the connection ([`crate::peer_write`]).
+            // A refusal answered before the request was read (a body over the
+            // limit) closes without a reset that would discard the answer
+            // ([`crate::lingering_close`]).
             hyper_util::rt::TokioIo::new(crate::peer_write::DeadlineWriter::new(
-                stream,
+                crate::lingering_close::LingeringClose::new(stream),
                 write_deadline,
             )),
             hyper_util::service::TowerToHyperService::new(service),
