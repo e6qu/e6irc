@@ -481,17 +481,31 @@ const GOODBYE_DEADLINE: Duration = Duration::from_secs(2);
 /// schedule behind it — whatever starts from the same settings a moment later:
 /// the connection test's driver, or a reconfigured network's replacement. The
 /// exit is already decided, so a failed or slow goodbye is only logged.
+///
+/// After the `QUIT` the socket is read to its end (a server answers `QUIT`
+/// with `ERROR` and closes): dropping it with that answer unread makes the
+/// kernel send a reset instead of an orderly close, and a reset may discard
+/// the `QUIT` itself before the upstream has read it (macOS does).
 async fn say_goodbye(connection: &mut Connection, reason: &str, who: &str) {
-    match tokio::time::timeout(
-        GOODBYE_DEADLINE,
-        connection.send_line(&format!("QUIT :{reason}")),
-    )
-    .await
+    let deadline = tokio::time::Instant::now() + GOODBYE_DEADLINE;
+    match tokio::time::timeout_at(deadline, connection.send_line(&format!("QUIT :{reason}"))).await
     {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => eprintln!("{who}: quit failed: {error}"),
-        Err(_) => eprintln!("{who}: quit timed out"),
+        Ok(Err(error)) => {
+            eprintln!("{who}: quit failed: {error}");
+            return;
+        }
+        Err(_) => {
+            eprintln!("{who}: quit timed out");
+            return;
+        }
     }
+    // A server that keeps the connection open past the deadline is simply
+    // left: the exit is decided, and what it sent has been read.
+    let _closed = tokio::time::timeout_at(deadline, async {
+        while let Ok(Some(_)) = connection.next_message().await {}
+    })
+    .await;
 }
 
 /// What a stopped driver says on its way out, whether the network was removed
