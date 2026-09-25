@@ -7283,7 +7283,11 @@ mod tests {
         ends.record_error(NetworkFailure::UpstreamRequestFailed);
 
         assert_eq!(
-            handle.buffer_snapshot(),
+            handle
+                .buffer_snapshot()
+                .iter()
+                .map(|line| without_tag(line, "time"))
+                .collect::<Vec<_>>(),
             vec![failure_notice(NetworkFailure::UpstreamRequestFailed)]
         );
     }
@@ -8049,9 +8053,8 @@ mod tests {
             "exactly one delivery notice per problem target: {lines:#?}"
         );
         assert!(
-            lines
-                .iter()
-                .any(|line| line == &failure_notice(NetworkFailure::UpstreamWriteFailed)),
+            lines.iter().any(|line| without_tag(line, "time")
+                == failure_notice(NetworkFailure::UpstreamWriteFailed)),
             "the component diagnostic is retained: {lines:#?}"
         );
 

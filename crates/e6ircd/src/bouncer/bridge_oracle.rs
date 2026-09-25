@@ -295,7 +295,7 @@ pub async fn verify_round_trip(
             .await
             .expect("component-log timeout")
             .expect("component-log event"),
-        super::DriverEvent::Line(super::BufferedLine { line, .. }) if line == ":*bnc* NOTICE * :component connected: unregistered network"
+        super::DriverEvent::Line(super::BufferedLine { line, .. }) if super::without_tag(&line, "time") == ":*bnc* NOTICE * :component connected: unregistered network"
     ));
 
     if matches!(provider, Provider::Slack) {
@@ -315,7 +315,7 @@ pub async fn verify_round_trip(
             .await
             .expect("inbound timeout")
             .expect("inbound event"),
-        super::DriverEvent::Line(super::BufferedLine { line, .. }) if line == expected_line
+        super::DriverEvent::Line(super::BufferedLine { line, .. }) if super::without_tag(&line, "time") == expected_line
     ));
 
     assert_eq!(

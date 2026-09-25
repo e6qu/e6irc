@@ -1288,7 +1288,7 @@ mod tests {
         let mut lines = Vec::new();
         while let Ok(event) = events.try_recv() {
             if let crate::bouncer::DriverEvent::Line(line) = event {
-                lines.push(line.line);
+                lines.push(crate::bouncer::without_tag(&line.line, "time"));
             }
         }
         lines

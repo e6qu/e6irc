@@ -1843,7 +1843,7 @@ mod tests {
                 loop {
                     match events.recv().await.expect("driver events") {
                         DriverEvent::Line(line) if !line.line.contains("component") => {
-                            return line.line;
+                            return crate::bouncer::without_tag(&line.line, "time");
                         }
                         _ => {}
                     }
@@ -2293,7 +2293,7 @@ mod tests {
                 while !(relayed && echoed) {
                     match events.recv().await.expect("driver events") {
                         DriverEvent::Line(line)
-                            if line.line
+                            if crate::bouncer::without_tag(&line.line, "time")
                                 == ":Alice!U1@slack PRIVMSG #general :acked before the drop" =>
                         {
                             relayed = true;
