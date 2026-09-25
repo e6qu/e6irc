@@ -221,6 +221,10 @@ const QUERIES: &[Query] = &[
     },
 ];
 
+/// `RPL_AWAY`: part of a `WHOIS`, and the answer to a message sent to someone
+/// who is away.
+const RPL_AWAY: u16 = 301;
+
 /// Numerics that follow our own `JOIN` of a channel: its state, told to every
 /// attached client, not a reply to whoever asked to join.
 const JOIN_BURST: &[u16] = &[324, 328, 329, 332, 333, 353, 366];
@@ -541,6 +545,12 @@ impl ReplyRouter {
             .pending
             .iter()
             .position(|pending| answers(pending) && about(pending))
+            .or_else(|| {
+                // An away notice also answers a message to that nick.
+                (code == RPL_AWAY)
+                    .then(|| self.pending.iter().position(about))
+                    .flatten()
+            })
             .or_else(|| self.pending.iter().position(answers))
             .or_else(|| {
                 if !is_error(code) {
@@ -770,6 +780,20 @@ mod tests {
         assert_eq!(classify(&mut router, unknown, now), reply(unknown, 3));
         let unasked = ":s 404 me #elsewhere :Cannot send to channel";
         assert_eq!(classify(&mut router, unasked, now), session(unasked));
+    }
+
+    /// An away notice answers whichever command is about that nick: a message
+    /// to it as much as a WHOIS of it.
+    #[test]
+    fn an_away_notice_reaches_the_message_it_answers() {
+        let now = Instant::now();
+        let mut router = ReplyRouter::default();
+        forward(&mut router, 1, "WHOIS someone", now);
+        forward(&mut router, 2, "PRIVMSG Sleeper :are you there", now);
+        let whois_away = ":s 301 me someone :back soon";
+        assert_eq!(classify(&mut router, whois_away, now), reply(whois_away, 1));
+        let away = ":s 301 me sleeper :gone fishing";
+        assert_eq!(classify(&mut router, away, now), reply(away, 2));
     }
 
     /// A command that can end with no reply at all is closed by the answer to

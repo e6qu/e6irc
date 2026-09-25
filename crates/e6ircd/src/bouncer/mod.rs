@@ -4212,9 +4212,16 @@ fn stamp_time(line: String, time: &str) -> String {
         return line;
     }
     let untimed = without_tag(&line, "time");
-    match untimed.strip_prefix('@') {
+    let stamped = match untimed.strip_prefix('@') {
         Some(rest) => format!("@time={time};{rest}"),
         None => format!("@time={time} {untimed}"),
+    };
+    // A tag section the upstream filled to its budget has no room for one
+    // more tag; such a line keeps what it came with.
+    if e6irc_proto::message::server_frame_fits(stamped.as_bytes()) {
+        stamped
+    } else {
+        line
     }
 }
 

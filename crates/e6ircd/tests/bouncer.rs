@@ -4634,13 +4634,10 @@ async fn an_attach_replays_each_conversation_from_its_read_marker() {
 
     let mut client = bnc_attach_with_history(bnc, "alice/up", "alice", "s3cr3t").await;
     let mut replayed = Vec::new();
-    loop {
-        match tokio::time::timeout(std::time::Duration::from_millis(500), client.next_message())
-            .await
-        {
-            Ok(Ok(Some(message))) => replayed.push(message),
-            _ => break,
-        }
+    while let Ok(Ok(Some(message))) =
+        tokio::time::timeout(std::time::Duration::from_millis(500), client.next_message()).await
+    {
+        replayed.push(message);
     }
     let texts: Vec<&str> = replayed
         .iter()
