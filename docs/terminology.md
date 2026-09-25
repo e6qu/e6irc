@@ -329,10 +329,10 @@ fields, never a preset identifier.
 
 **Preflight** — the optional **Test connection** diagnostic
 (`POST /api/v1/me/network-preflight`, `preflight_irc`). It resolves, connects,
-and registers exactly as the always-on IRC driver would, joins the requested
-channels, reports each stage's timing, sends `QUIT`, and stores nothing: no
-network is created and no driver is started. Saving a network never depends
-on it.
+and registers exactly as the always-on IRC driver would, reports each stage's
+timing, sends `QUIT`, and stores nothing: it joins no channel (the requested
+ones are only validated), no network is created and no driver is started.
+Saving a network never depends on it.
 
 **Server password (PASS)** — a network's connection password: the argument of
 the `PASS` line a private IRC server requires before `CAP LS`, `NICK` and
@@ -343,6 +343,14 @@ sealed like the SASL password, reports only whether one is stored
 (`has_server_password`), and tells a missing one (`server_password_required`)
 from a rejected one (`server_password_rejected`); both wait on the refusal
 schedule. IRC networks only; a bridge has no such line.
+
+**Channel key** — the key of a keyed (`+k`) IRC channel: the second `JOIN`
+parameter, without which the server answers `475`. An account network's
+autojoin entry may carry one after its channel (`#staff key`); e6irc stores it
+sealed like the SASL password, reports only which channels have one
+(`autojoin_keyed`), and changes it on a replace only as `autojoin_keys` says.
+Keys the driver learns at runtime (a client's `JOIN`, a `+k`) are kept in
+memory only. IRC networks only; a bridge's rooms have no key.
 
 **Refusal schedule** — the delays before a driver re-dials an upstream that
 refused its registration: 30 seconds, then 1, 2, and 4 minutes, long enough for

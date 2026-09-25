@@ -12,7 +12,7 @@ use e6irc_client::{Connection, NetworkNames, OwnedMessage, RelayEvent};
 
 use super::replies::{Correlation, ReplyRouter, Upstream};
 use super::upstream_identity::{
-    ChannelKey, ConfirmedChannel, UpstreamChannel, UpstreamNick, UpstreamRealname, UpstreamUsername,
+    AutojoinChannel, ChannelKey, ConfirmedChannel, UpstreamNick, UpstreamRealname, UpstreamUsername,
 };
 use super::{ClientTags, ConnectionEvent, DriverEnds, NetworkHandle};
 
@@ -27,8 +27,8 @@ pub struct NetworkConfig {
     /// The `USER` name (ident), exactly as sent. Never derived from the nick.
     pub username: UpstreamUsername,
     pub realname: UpstreamRealname,
-    /// Channels to auto-join after registering.
-    pub autojoin: Vec<UpstreamChannel>,
+    /// Channels to auto-join after registering, keyed ones with their keys.
+    pub autojoin: Vec<AutojoinChannel>,
     /// Detached buffer capacity.
     pub buffer_cap: usize,
     /// SASL PLAIN credentials for the upstream, when it requires auth.
@@ -95,8 +95,9 @@ pub struct IrcNetwork;
 /// casing kept. `connect_once` joins the configured autojoin plus everything
 /// here, so channels joined at runtime (not just the static config) are
 /// restored after a drop — the behaviour ZNC/soju users rely on. In-memory
-/// only, keys included: a process restart legitimately falls back to the
-/// configured autojoin, which is the operator-declared floor.
+/// only, learned keys included: a process restart legitimately falls back to
+/// the configured autojoin, with its configured keys, which is the owner's
+/// declared floor.
 #[derive(Debug, Default)]
 pub struct JoinedChannels(std::sync::Mutex<Intent>);
 
@@ -209,23 +210,27 @@ impl JoinedChannels {
 
     /// The configured autojoin plus every channel the upstream confirmed
     /// before the drop, with the keys they were joined with. Autojoin wins on
-    /// a fold-collision: its casing is the operator's.
-    fn rejoin(&self, autojoin: &[UpstreamChannel]) -> Vec<(String, Option<ChannelKey>)> {
+    /// a fold-collision: its casing is the owner's. A configured channel is
+    /// joined with the key it was last seen with (a `+k` since, or the key a
+    /// client joined it with), and otherwise with its configured key.
+    fn rejoin(&self, autojoin: &[AutojoinChannel]) -> Vec<(String, Option<ChannelKey>)> {
         let intent = self.0.lock().expect("joined set poisoned");
         let names = &intent.names;
         let mut list: Vec<(String, Option<ChannelKey>)> = autojoin
             .iter()
-            .map(|channel| {
+            .map(|configured| {
+                let channel = configured.channel().as_str();
                 let key = intent
                     .channels
-                    .get(&names.fold(channel.as_str()))
-                    .and_then(|intended| intended.key.clone());
+                    .get(&names.fold(channel))
+                    .and_then(|intended| intended.key.clone())
+                    .or_else(|| configured.key().cloned());
                 (channel.to_string(), key)
             })
             .collect();
         let configured: std::collections::HashSet<String> = autojoin
             .iter()
-            .map(|channel| names.fold(channel.as_str()))
+            .map(|configured| names.fold(configured.channel().as_str()))
             .collect();
         list.extend(
             intent
@@ -758,7 +763,7 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
             ":*bnc* NOTICE * :upstream logged in as {account} with SASL {mechanism}"
         ));
     }
-    let mut pending_echoes = PendingEchoes::default();
+    let mut echoes = UpstreamEchoes::default();
     let mut requested_nicks = RequestedNicks::default();
     let mut router = ReplyRouter::default();
 
@@ -881,23 +886,10 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                             if let Some((channel, key)) = key_change(&message, ends) {
                                 shared.joined.set_key(&channel, key);
                             }
-                            // Our own message, echoed by the upstream: the echo
-                            // of the line an attachment sent, routed to it — by
-                            // its label, or by what it says.
-                            let echo = upstream
-                                .echoes
-                                .then(|| EchoKey::of_upstream_echo(&message, &identity.nick, conn.names()))
-                                .flatten();
-                            let emitted = match echo {
-                                Some((key, head)) => {
-                                    let origin = origin.or_else(|| pending_echoes.take(&key, head));
-                                    let line = redact_sensitive_echo(line, &message);
-                                    match origin {
-                                        Some(origin) => ends.emit_session_echo(line, origin),
-                                        None => ends.emit_session_line(line),
-                                    }
-                                }
-                                None => ends.emit_session_line(line),
+                            let emitted = if upstream.echoes {
+                                echoes.publish(ends, &message, line, origin, &identity.nick, conn.names())
+                            } else {
+                                ends.emit_session_line(line)
                             };
                             if track(ends, shared, &mut identity, &mut requested_nicks, emitted).is_err() {
                                 return dropped(super::NetworkFailure::ChannelLimitExceeded);
@@ -972,9 +964,7 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
                     requested_nicks.observe(&line);
                     if upstream.echoes {
                         if upstream.correlation == Correlation::Order {
-                            for key in EchoKey::of_client_line(&line, conn.names()) {
-                                pending_echoes.push(key, cmd.origin);
-                            }
+                            echoes.sent(&line, cmd.origin, conn.names());
                         }
                     } else {
                         for echo in self_echoes(&line, &identity) {
@@ -1457,6 +1447,47 @@ impl PendingEchoes {
     }
 }
 
+/// The echoes of an upstream with `echo-message`: its echo of our own message
+/// is relayed as the one echo of the line, routed to the attachment that sent
+/// it — by its label, or, when replies are told apart by order, by matching it
+/// against the lines awaiting one. The `irc` and `local` drivers route them
+/// here alike.
+#[derive(Default)]
+pub(super) struct UpstreamEchoes(PendingEchoes);
+
+impl UpstreamEchoes {
+    /// Await the echo of `line`, which attachment `origin` sent, once per
+    /// target it names.
+    pub(super) fn sent(&mut self, line: &str, origin: u64, names: &NetworkNames) {
+        for key in EchoKey::of_client_line(line, names) {
+            self.0.push(key, origin);
+        }
+    }
+
+    /// Publish a session line of the upstream, as the echo of an attachment's
+    /// line when it is one (`origin` is its label's attachment, when it had
+    /// one), with a services command that can carry a secret redacted.
+    pub(super) fn publish(
+        &mut self,
+        ends: &DriverEnds,
+        message: &OwnedMessage,
+        line: String,
+        origin: Option<u64>,
+        own_nick: &str,
+        names: &NetworkNames,
+    ) -> Result<super::SessionChange, super::ChannelLimitExceeded> {
+        let Some((key, head)) = EchoKey::of_upstream_echo(message, own_nick, names) else {
+            return ends.emit_session_line(line);
+        };
+        let origin = origin.or_else(|| self.0.take(&key, head));
+        let line = redact_sensitive_echo(line, message);
+        match origin {
+            Some(origin) => ends.emit_session_echo(line, origin),
+            None => ends.emit_session_line(line),
+        }
+    }
+}
+
 /// Most nick changes an attached client may have asked for that the upstream
 /// has not confirmed. One it refuses (433, 432) is never confirmed, so the
 /// oldest is dropped past this bound.
@@ -1889,6 +1920,32 @@ pub(super) mod tests {
                 .iter()
                 .all(|(channel, _)| channel != "#Priv")
         );
+    }
+
+    /// A configured key joins its channel after every connect, including the
+    /// first one after a restart, when nothing was learned yet; a key seen
+    /// since (a `+k`) is the one the channel is rejoined with.
+    #[test]
+    fn a_configured_key_joins_its_channel_until_another_is_seen() {
+        let configured: Vec<AutojoinChannel> = ["#staff hunter2", "#open"]
+            .iter()
+            .map(|entry| entry.parse().expect("an autojoin entry"))
+            .collect();
+        let joined = JoinedChannels::default();
+        let rejoin = joined.rejoin(&configured);
+        assert_eq!(join_lines(&rejoin), ["JOIN #staff,#open hunter2"]);
+        joined
+            .apply(
+                confirmed(&["#staff".into(), "#open".into()]),
+                &NetworkNames::default(),
+            )
+            .expect("fits");
+        joined.set_key("#STAFF", ChannelKey::parse("rotated"));
+        assert_eq!(
+            join_lines(&joined.rejoin(&configured)),
+            ["JOIN #staff,#open rotated"]
+        );
+        assert!(!format!("{configured:?}").contains("hunter2"));
     }
 
     /// A key's place among a MODE line's parameters is decided by which modes

@@ -2673,6 +2673,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       tls: true,
       nick: fieldValue(fields, "nick"),
       autojoin: splitValues(String(fields.get("autojoin") || ""), ","),
+      // A bridge's rooms and channel ids have no keys to keep.
+      autojoin_keys: { keep: [] },
       credentials: account || password
         ? { action: "set", ...(account ? { account } : {}), ...(password ? { password } : {}) }
         : { action: "keep" },
@@ -2800,7 +2802,7 @@ import { loadSettings, saveSetting } from "/console-settings.js";
       const title = ownerNetworkDetail.querySelector("[data-network-title]"); if (title) title.textContent = network.name;
       const kind = ownerNetworkDetail.querySelector("[data-network-kind]"); if (kind) kind.textContent = `${network.kind} network`;
       const provider = network.addr || "Provider API";
-      setField("kind", network.kind); setField("addr", provider); setField("transport", network.tls ? "TLS" : network.addr ? "Plaintext" : "Provider-managed"); setField("nick", network.nick || "Provider account"); setField("username", network.username || "Not used"); setField("realname", network.realname || "Not set"); setField("autojoin", network.autojoin.length ? network.autojoin.join(", ") : "None"); setField("account-credential", network.has_sasl_account ? "Stored" : "Not set"); setField("secret-credential", network.has_sasl_password ? "Stored encrypted" : "Not set"); setField("server-password", network.kind !== "irc" ? "Not used" : network.has_server_password ? "Stored encrypted" : "Not set"); setField("enabled", network.enabled ? "Enabled" : "Disabled");
+      setField("kind", network.kind); setField("addr", provider); setField("transport", network.tls ? "TLS" : network.addr ? "Plaintext" : "Provider-managed"); setField("nick", network.nick || "Provider account"); setField("username", network.username || "Not used"); setField("realname", network.realname || "Not set"); setField("autojoin", network.autojoin.length ? network.autojoin.map((channel) => (network.autojoin_keyed ?? []).includes(channel) ? `${channel} (key stored encrypted)` : channel).join(", ") : "None"); setField("account-credential", network.has_sasl_account ? "Stored" : "Not set"); setField("secret-credential", network.has_sasl_password ? "Stored encrypted" : "Not set"); setField("server-password", network.kind !== "irc" ? "Not used" : network.has_server_password ? "Stored encrypted" : "Not set"); setField("enabled", network.enabled ? "Enabled" : "Disabled");
       // A bridge stores provider tokens and room identifiers in the same fields.
       const bridgeLabels = { nick: "Identity", autojoin: "Rooms / channel IDs", "account-credential": "Account credential", "secret-credential": "Secret credential" };
       if (network.kind !== "irc") for (const [field, label] of Object.entries(bridgeLabels)) { const node = ownerNetworkDetail.querySelector(`[data-network-label="${field}"]`); if (node) node.textContent = label; }

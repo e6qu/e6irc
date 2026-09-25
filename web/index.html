@@ -188,9 +188,18 @@
 
           <label class="field">
             <span>Channels to join <em>optional</em></span>
-            <input id="nf-autojoin" name="autojoin" maxlength="512" placeholder="#e6qu, #rust" />
-            <small>Comma or space separated. Re-joined automatically after a reconnect.</small>
+            <input id="nf-autojoin" name="autojoin" maxlength="512" placeholder="#e6qu, #rust" autocomplete="off" />
+            <small id="nf-autojoin-note">Comma or space separated. Re-joined automatically after a reconnect. For a channel with a key, write the key after it: #staff key. Keys are stored encrypted and never shown again.</small>
           </label>
+
+          <fieldset id="nf-autojoin-keys" hidden>
+            <legend>Stored channel keys</legend>
+            <p class="field-note">
+              These channels keep their stored key. To replace one, write the new
+              key after the channel above.
+            </p>
+            <div id="nf-autojoin-keys-list"></div>
+          </fieldset>
 
           <details id="nf-advanced">
             <summary>Advanced</summary>

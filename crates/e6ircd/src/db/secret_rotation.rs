@@ -126,7 +126,8 @@ pub async fn rotate_database_secrets(
 
     let network_rows = sqlx::query(
         "SELECT n.id, a.name AS owner, n.name, n.kind, n.sasl_account,
-                n.sasl_password_sealed, n.server_password_sealed
+                n.sasl_password_sealed, n.server_password_sealed, n.autojoin,
+                n.autojoin_keys_sealed
          FROM bnc_networks n
          JOIN accounts a ON a.id = n.account_id
          ORDER BY n.id
@@ -145,6 +146,8 @@ pub async fn rotate_database_secrets(
         let mut account: Option<String> = row.get("sasl_account");
         let mut password: Option<String> = row.get("sasl_password_sealed");
         let mut server_password: Option<String> = row.get("server_password_sealed");
+        let channels: Vec<String> = row.get("autojoin");
+        let mut channel_keys: Vec<Option<String>> = row.get("autojoin_keys_sealed");
         if kind.account_is_secret()
             && let Some(value) = &mut account
         {
@@ -171,15 +174,27 @@ pub async fn rotate_database_secrets(
                 &format!("account {owner:?} network {name:?} server password"),
             )? as usize;
         }
+        for (channel, key) in channels.iter().zip(&mut channel_keys) {
+            if let Some(value) = key {
+                account_network_secrets += reseal(
+                    value,
+                    &context,
+                    keys,
+                    &format!("account {owner:?} network {name:?} key of {channel:?}"),
+                )? as usize;
+            }
+        }
         sqlx::query(
             "UPDATE bnc_networks
-             SET sasl_account = $2, sasl_password_sealed = $3, server_password_sealed = $4
+             SET sasl_account = $2, sasl_password_sealed = $3, server_password_sealed = $4,
+                 autojoin_keys_sealed = $5
              WHERE id = $1",
         )
         .bind(id)
         .bind(account)
         .bind(password)
         .bind(server_password)
+        .bind(channel_keys)
         .execute(&mut *transaction)
         .await
         .map_err(super::query_error)?;

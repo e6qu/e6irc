@@ -2080,6 +2080,41 @@ el("nf-clear-server-password")?.addEventListener("change", () => {
   password.disabled = clearing;
 });
 
+// The channels whose key the server holds, each with its own Remove box. A
+// key is write-only, so the list is all the dialog can show of it; which boxes
+// are ticked decides which keys the replace keeps (network-request.js).
+function showStoredChannelKeys(channels) {
+  const list = el("nf-autojoin-keys-list");
+  if (!list) return;
+  list.replaceChildren(...channels.map((channel) => {
+    const row = document.createElement("label");
+    row.className = "check";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.name = "remove_channel_key";
+    box.value = channel;
+    const text = document.createElement("span");
+    const strong = document.createElement("strong");
+    strong.textContent = `Remove the stored key for ${channel}`;
+    const note = document.createElement("small");
+    note.textContent = "The channel is joined without a key.";
+    text.append(strong, note);
+    row.append(box, text);
+    return row;
+  }));
+  el("nf-autojoin-keys").hidden = channels.length === 0;
+}
+
+function storedChannelKeys() {
+  return [...el("nf-autojoin-keys-list").querySelectorAll('input[name="remove_channel_key"]')]
+    .map((box) => box.value);
+}
+
+function removedChannelKeys() {
+  return [...el("nf-autojoin-keys-list").querySelectorAll('input[name="remove_channel_key"]:checked')]
+    .map((box) => box.value);
+}
+
 // Editing shows what is configured but never a stored password: the API does
 // not return one, and this deliberately does not ask it to. Leaving the field
 // empty keeps whatever is already sealed, which is why the note changes.
@@ -2116,6 +2151,10 @@ async function openNetworkDialog(name = null) {
   disarmRemove();
   el("nf-clear-row").hidden = !editing;
   el("nf-clear-server-password-row").hidden = !editing;
+  showStoredChannelKeys([]);
+  el("nf-autojoin-note").textContent = editing
+    ? "Comma or space separated. Re-joined automatically after a reconnect. For a channel with a key, write the key after it: #staff key. A stored key is never shown; it is kept unless you write a new one or remove it below."
+    : "Comma or space separated. Re-joined automatically after a reconnect. For a channel with a key, write the key after it: #staff key. Keys are stored encrypted and never shown again.";
   // Editing shows the whole connection: the server, TLS, and the names sent to
   // it are what a person came here to change, and a closed section reads as
   // "these settings do not exist".
@@ -2162,6 +2201,7 @@ async function openNetworkDialog(name = null) {
       el("nf-username").value = detail.username ?? "";
       el("nf-realname").value = detail.realname ?? "";
       el("nf-autojoin").value = Array.isArray(detail.autojoin) ? detail.autojoin.join(", ") : "";
+      showStoredChannelKeys(Array.isArray(detail.autojoin_keyed) ? detail.autojoin_keyed : []);
       el("nf-sasl-account").value = detail.sasl_account ?? "";
       // What the account box held before editing, so emptying it is refused
       // instead of being sent as `keep`.
@@ -2230,6 +2270,8 @@ if (networkForm) {
       storedAccount: networkForm.dataset.storedAccount ?? "",
       serverPassword: el("nf-server-password").value,
       clearingServerPassword: editing ? el("nf-clear-server-password").checked : false,
+      storedKeyed: editing ? storedChannelKeys() : [],
+      removingKeys: editing ? removedChannelKeys() : [],
     };
 
     // network-request.js owns both shapes and is tested on the difference.

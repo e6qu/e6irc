@@ -2082,8 +2082,12 @@ network's settings have exactly **one** editor, the chat client's dialog
 identity fields (addr, tls, nick, username, realname, autojoin) and write-only
 SASL and server credentials — keep the encrypted password while changing its
 account, replace it, or remove both halves, with typed values under a ticked
-Remove refused rather than silently dropped. The password is never rendered
-back to the browser. The console carried a second editor and a third
+Remove refused rather than silently dropped — and write-only channel keys: a
+key is written after its channel (`#staff key`, as `/join` takes it), a stored
+one is shown only as a per-channel Remove box, and a channel listed without a
+key keeps its stored one unless that box is ticked (a key typed under a ticked
+box is refused). The password and the keys are never rendered back to the
+browser. The console carried a second editor and a third
 credential form whose rules disagreed with it (one trimmed the password, one
 made "keep the stored one" impossible, one discarded what was typed); they are
 gone, and with them the `/console/networks/{name}/edit` and
@@ -2117,13 +2121,27 @@ input, including the resolved preset values. IRC addresses must be a syntactic
 REST, and console creation share that invariant so an invalid endpoint cannot
 be persisted into an endless reconnect loop. The identity a driver puts on the
 wire is parsed, not checked: `UpstreamNick`, `UpstreamRealname`, and
-`UpstreamChannel` are built only by `FromStr` at the one driver factory, so the
+`AutojoinChannel` (an `UpstreamChannel` and, for a keyed channel, its
+`ChannelKey`) are built only by `FromStr` at the one driver factory, so the
 configuration file, a stored row, and the API admit exactly the same values and
 a driver cannot be handed an unchecked one. The grammar is structural — what no
-server could read as one nickname or one channel (`al ice` is a two-parameter
-`NICK`; an autojoin entry of `0` means "leave every channel"; `#a key` supplies
-a key nobody configured) — not a network's nickname policy, which still comes
-back as a loud 432. A refusal names the request field it belongs to in the
+server could read as one nickname, one channel, or one key (`al ice` is a
+two-parameter `NICK`; an autojoin entry of `0` means "leave every channel";
+`#a,#b` is two channels; a key with a space, a comma, or a leading `:` is not
+one `JOIN` parameter) — not a network's nickname policy, which still comes
+back as a loud 432. An account network's autojoin entry is `#channel` or
+`#channel key`; the key is a secret of the channel's members, stored sealed
+under the owner's context in `bnc_networks.autojoin_keys_sealed` (migration
+0087: one entry per `autojoin` channel, NULL for none, held to one length and
+to IRC networks by table constraints), re-sealed by key rotation, opened only
+to build the driver, reported only as `autojoin_keyed` (the channels that have
+one), redacted in every `Debug`, and named in the audit trail as
+`autojoin_keys`. The driver joins a configured channel with the key it last
+saw for it (a `+k` since, or the key a client joined with) and otherwise with
+its configured key, so a keyed channel is rejoined after a restart. A
+server-level network's autojoin is public configuration — the administrator
+API returns it — so it names channels only, and an entry with a key in it is
+refused. A refusal names the request field it belongs to in the
 problem body (`field`), and both network forms mark, reveal, and focus that
 input. A blank real name means the nickname, on edit exactly as on create,
 because the form says so and an IRC network always has one. If no master key is configured,
@@ -2189,7 +2207,8 @@ via the console or REST, persisted, and started by the one feature-gated
 `bouncer::build_driver` factory that every construction site (config-network
 startup, DB-network boot, runtime create, re-enable) shares. Per-kind secrecy:
 the password is always sealed; a kind whose *account* field is a secret (Slack's
-bot token) seals that too, while an IRC `sasl_account` login name stays plaintext.
+bot token) seals that too, while an IRC `sasl_account` login name stays plaintext;
+an IRC channel's key is sealed, and a bridge's rooms and channel ids take none.
 Create, edit, and enable construct the prospective driver before mutating
 PostgreSQL, so a missing key or factory rejection cannot leave durable state
 claiming a driver configuration that never entered the live registry.
@@ -2282,15 +2301,14 @@ above the trait, provides for every network kind:
   dropped, and each target the provider accepted is echoed once instead —
   under the bridge account's IRC identity, the prefix that copy would have
   carried — while a refused one is answered by its undelivered notice alone.
-  The `local` driver's synthesized echo shows the session as the core does,
-  the `USER` name verbatim.
+  The `local` driver negotiates `echo-message` with the core (§10.2), so its
+  echo is the core's, routed the same way.
   Synthesized echoes retain only
   validated client-only tags and mint their own `time` provenance; a downstream
   cannot forge or duplicate server `time`/`msgid` tags in persisted history.
   Attached clients are always offered `message-tags` (the bouncer's own
   CHATHISTORY, read markers and batches ride tags), but a network that cannot
-  carry client-only tags — an IRC upstream without `message-tags`, and the
-  in-process `local` session, which negotiates no capabilities — is described
+  carry client-only tags — an IRC upstream without `message-tags` — is described
   to them with `CLIENTTAGDENY=*` (IRCv3 message-tags; in the welcome, and as a
   live 005 when it changes): the tags are stripped before the line is
   written, since a server that does not parse tags would read the tag section
@@ -2424,7 +2442,19 @@ mean "assumed": the driver waits for the core's 001 (bounded by a 30 s
 `WELCOME_DEADLINE`, so a wedged core is a reported failure rather than a silent
 wait) and treats a refusal — the nickname is held by another session, or the
 welcome names a different one — exactly as the `irc` driver treats an
-upstream's.
+upstream's. Before registering it asks the core, in one all-or-nothing
+`CAP REQ`, for what makes the local network carry what any upstream offering
+them does: `message-tags` (an attached client's client-only tags — typing,
+reactions, replies — and its `TAGMSG` reach the core, and each message comes
+back with the `msgid` a reaction names), `server-time` (the backlog files and
+replays a line at the core's time), `echo-message` (our own message returns with
+the core's `msgid` and time, and only when the core accepted it — a synthesized
+echo had neither, so a reaction to one's own message named a message the
+backlog did not hold) and `account-tag` (offered to attached clients, as the
+`irc` driver asks every upstream for). Replies are told apart by order, which
+the core answers in, so `batch` and `labeled-response` are not asked for. The
+core is this binary: a refusal, or a welcome without the answer, is an
+`upstream_protocol_failed` drop, never a session that silently lacks them.
 
 ### 10.3 `irc` driver — external networks (ZNC/soju-style)
 
@@ -2562,8 +2592,10 @@ upstream's.
   channels first on each line so every key lands on its channel: the key a
   client's `JOIN` offered once the upstream confirms that channel, then any
   `+k`/`-k` the channel sees (read with the network's `CHANMODES` and
-  `PREFIX`). A key is a secret of the channel's members: it is held in memory
-  beside the reconnect intent only, and its `Debug` is redacted. A channel
+  `PREFIX`), and failing both the key the owner configured for an autojoin
+  channel. A key is a secret of the channel's members: a learned one is held
+  in memory beside the reconnect intent only, a configured one is stored
+  sealed (§10, the network manager), and its `Debug` is redacted. A channel
   whose rejoin the upstream refuses (403, 471, 473, 474, 475) is dropped from
   the intent, with a `*bnc*` notice, rather than retried and refused after
   every reconnect; and a client's `PART` of a channel the intent holds but the
@@ -3014,7 +3046,14 @@ Design constraints recorded now:
   mapping — stored before the network said, or before it changed — are
   re-keyed from their spelling by the persistence task before it writes, and
   a restarted network compares names under the mapping its newest rows were
-  keyed with until the network says again. TARGETS names each conversation as
+  keyed with until the network says again. The account's read markers on the
+  network (`bnc_read_markers`) are keyed the same way and keep the same two
+  facts beside the key (the name as MARKREAD spelled it and the mapping it was
+  folded under, migration 0086); every marker read or write names the
+  network's current mapping and first re-keys, under the account's row lock,
+  what was folded under another — two names the new mapping makes one merge at
+  the later position — so an `ascii` network's `#a[` keeps its marker across a
+  mapping change. TARGETS names each conversation as
   spelled, never by its key, which on another mapping can name someone else;
   CHATHISTORY accepts any target structurally (one parameter of at most 200
   bytes), since nick grammar, channel types and lengths are the network's.
@@ -3166,17 +3205,22 @@ Surface (initial):
   `password`, or `remove`; only an IRC network accepts `set` or `remove`);
   create and the connection test take an optional `server_password`, a value
   that cannot travel in one `PASS` line is a 400 naming `server_password`, and
-  responses report `has_server_password`, never the value. The tagged actions
-  refuse stray fields, so a password typed beside `keep` is refused rather than
-  silently dropped. A stored secret never follows the network somewhere else:
-  when the destination changes — the IRC host or port, TLS turned off, a
-  bridge's API base or homeserver moved to another origin — a secret carried
-  over unchanged (by `keep`, or by replacing only the other half of a pair) is
-  a `409` naming `credentials` or `server_password`, so whoever may edit a
-  network cannot point it at their own listener and have the server send them
-  a password the API never reveals. The rule lives in the one function that
-  applies both credential actions, comparing the stored row with the edited
-  one. Both browser clients omit a blank credential field rather
+  responses report `has_server_password`, never the value. Channel keys have a
+  required action too: an autojoin entry `#channel key` sets that channel's
+  key, the channels named in `autojoin_keys.keep` (listed without a new key)
+  keep theirs, and every other channel has none; a keep for a channel that is
+  not listed, has no stored key, or is given a new key beside it is a 400
+  naming `autojoin`, and responses report `autojoin_keyed`, never a key. The
+  tagged actions refuse stray fields, so a password typed beside `keep` is
+  refused rather than silently dropped. A stored secret never follows the
+  network somewhere else: when the destination changes — the IRC host or port,
+  TLS turned off, a bridge's API base or homeserver moved to another origin — a
+  secret carried over unchanged (by `keep`, or by replacing only the other half
+  of a pair) is a `409` naming `credentials`, `server_password`, or `autojoin`,
+  so whoever may edit a network cannot point it at their own listener and have
+  the server send them a password or key the API never reveals. The rule lives
+  in the one function that applies every credential action, comparing the
+  stored row with the edited one. Both browser clients omit a blank credential field rather
   than sending null; an
   account box emptied against a stored account, or a value typed under a
   ticked Remove, is refused at the box rather than resolved one way or the

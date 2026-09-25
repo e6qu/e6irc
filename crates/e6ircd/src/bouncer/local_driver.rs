@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use e6irc_queue::{Config as QueueConfig, Policy, Receiver, queue};
 
+use super::upstream_identity::ChannelKey;
 use super::{ConnectionEvent, DriverEnds, NetworkConfig, NetworkDriver, NetworkHandle};
 use crate::core::{ConnId, ConnectionIdAllocator, CoreIngress, Input, Output};
 
@@ -15,8 +16,31 @@ use crate::core::{ConnId, ConnectionIdAllocator, CoreIngress, Input, Output};
 pub(crate) const LOCAL_NETWORK: &str = "local";
 
 /// The host the in-process session is opened with, and so the host the core
-/// shows in its prefix — the one value the synthesized echo must repeat.
+/// shows in its prefix.
 const LOCAL_SESSION_HOST: &str = LOCAL_NETWORK;
+
+/// The capabilities the in-process session negotiates with the core, in one
+/// all-or-nothing `CAP REQ`, so the local network carries what any upstream
+/// that offers them does:
+///
+/// - `message-tags`: an attached client's client-only tags (`+typing`,
+///   `+draft/react`, `+draft/reply`) and its `TAGMSG` reach the core instead of
+///   being stripped, and each message comes back with the `msgid` a reaction
+///   or reply names.
+/// - `server-time`: every line carries the core's own time, so the backlog
+///   files and replays a message at the time the core gave it, the time the
+///   core's CHATHISTORY and other clients see.
+/// - `echo-message`: our own message comes back from the core with the `msgid`
+///   and time the core gave it — without it the synthesized echo had neither,
+///   so a reaction to one's own message named a message the backlog did not
+///   hold — and only for a line the core accepted, so a refused one is
+///   answered by its refusal alone, as on any upstream that echoes.
+/// - `account-tag`: attached clients are offered it by the bouncer; the sender's
+///   account rides each line, as the `irc` driver asks every upstream for.
+///
+/// Replies are told apart by order (`Correlation::Order`), which the core
+/// answers in; `labeled-response` and `batch` would add nothing here.
+const LOCAL_CAPABILITIES: &str = "account-tag echo-message message-tags server-time";
 
 /// Handles into the core, so the driver can open an in-process session.
 #[derive(Clone)]
@@ -31,7 +55,7 @@ pub struct LocalDriver {
     nick: String,
     username: String,
     realname: String,
-    autojoin: Vec<String>,
+    autojoin: Vec<(String, Option<ChannelKey>)>,
     buffer_cap: usize,
 }
 
@@ -46,7 +70,11 @@ impl LocalDriver {
             nick: config.nick.to_string(),
             username: config.username.to_string(),
             realname: config.realname.as_str().to_string(),
-            autojoin: config.autojoin.iter().map(ToString::to_string).collect(),
+            autojoin: config
+                .autojoin
+                .iter()
+                .map(|entry| (entry.channel().to_string(), entry.key().cloned()))
+                .collect(),
             buffer_cap: config.buffer_cap,
         }
     }
@@ -78,7 +106,8 @@ struct LocalSession {
     nick: String,
     username: String,
     realname: String,
-    autojoin: Vec<String>,
+    /// The channels to join, keyed ones with their keys, as `JOIN` takes them.
+    autojoin: Vec<(String, Option<ChannelKey>)>,
 }
 
 async fn run(session: LocalSession, mut ends: DriverEnds) {
@@ -115,7 +144,7 @@ async fn say(core: &CoreIngress, conn: ConnId, line: String) -> bool {
 }
 
 /// Read the core's replies until it welcomes the session under the configured
-/// nickname. A refusal is read by the same table the IRC driver's registration
+/// nickname, with [`LOCAL_CAPABILITIES`] acknowledged first. A refusal is read by the same table the IRC driver's registration
 /// uses, so it takes the refusal schedule and parks like any other upstream's —
 /// not the transient schedule of a connection that was made and lost. Lines
 /// that are neither are the core talking to its new client, and are relayed.
@@ -126,6 +155,7 @@ async fn await_welcome(
     ends: &DriverEnds,
 ) -> Result<Welcome, super::SessionOutcome> {
     use super::SessionOutcome::{Dropped, RegistrationRejected, Stopped};
+    let mut capabilities_acknowledged = false;
     loop {
         let Some(envelope) = out_rx.pop().await else {
             return Err(Dropped(super::NetworkFailure::ConnectionLost));
@@ -145,6 +175,28 @@ async fn await_welcome(
             return Err(RegistrationRejected(rejection));
         }
         match message.command.as_str() {
+            "CAP" => match message.params.get(1).map(String::as_str) {
+                Some("ACK") => capabilities_acknowledged = true,
+                // The core is this binary: refusing what the driver asks of it
+                // is a defect in one or the other, said as such.
+                _ => {
+                    eprintln!(
+                        "local bouncer session: the core refused {LOCAL_CAPABILITIES}: {line}"
+                    );
+                    return Err(super::SessionOutcome::Dropped(
+                        super::NetworkFailure::UpstreamProtocolFailed,
+                    ));
+                }
+            },
+            "001" if !capabilities_acknowledged => {
+                eprintln!(
+                    "local bouncer session: the core welcomed the session without answering \
+                     CAP REQ :{LOCAL_CAPABILITIES}"
+                );
+                return Err(super::SessionOutcome::Dropped(
+                    super::NetworkFailure::UpstreamProtocolFailed,
+                ));
+            }
             "001" => {
                 let welcomed = message.params.first().cloned().unwrap_or_default();
                 // Before its 005, a network's names compare as RFC 1459 says.
@@ -226,10 +278,14 @@ async fn drive_session(
     use super::SessionOutcome::Stopped;
     let core = &session.core.core_tx;
     // Register in-process. Queueing NICK and USER is only a request: the core
-    // answers like any server, and it is the welcome that makes a session.
+    // answers like any server, and it is the welcome that makes a session. The
+    // capability request holds registration until `CAP END`, so the core has
+    // answered it before it welcomes the session.
     for line in [
+        format!("CAP REQ :{LOCAL_CAPABILITIES}"),
         format!("NICK {}", session.nick),
         format!("USER {} 0 * :{}", session.username, session.realname),
+        "CAP END".to_string(),
     ] {
         if !say(core, conn, line).await {
             return Stopped;
@@ -252,19 +308,14 @@ async fn drive_session(
     // the in-process session is a registered non-oper client of the core, so
     // one JOIN per channel would spend the command-flood burst on a long
     // autojoin list and be closed with Excess Flood before it finished.
-    let autojoin: Vec<(String, Option<super::upstream_identity::ChannelKey>)> = session
-        .autojoin
-        .iter()
-        .map(|channel| (channel.clone(), None))
-        .collect();
-    for line in super::irc_driver::join_lines(&autojoin) {
+    for line in super::irc_driver::join_lines(&session.autojoin) {
         if !say(core, conn, line).await {
             return Stopped;
         }
     }
-    // The in-process session negotiates no capabilities with the core, which
-    // gives a client without `message-tags` no tags and no `TAGMSG`.
-    ends.set_client_tags(super::ClientTags::Denied);
+    // `message-tags` is on: client-only tags are relayed, as to any upstream
+    // that carries them.
+    ends.set_client_tags(super::ClientTags::Relayed);
     ends.begin_irc_session(welcome.nick);
     ends.emit(ConnectionEvent::Connected);
     if ends.emit_session_line(welcome.line).is_err() {
@@ -273,6 +324,7 @@ async fn drive_session(
     // The core answers each attached client's commands on this one session,
     // in order, like any server; see `super::replies`.
     let mut router = super::replies::ReplyRouter::default();
+    let mut echoes = super::irc_driver::UpstreamEchoes::default();
 
     loop {
         tokio::select! {
@@ -284,45 +336,47 @@ async fn drive_session(
                     let line = String::from_utf8_lossy(&env.payload.0)
                         .trim_end_matches(['\r', '\n'])
                         .to_string();
-                    // The in-process session is a real registered session, so the
-                    // liveness reaper PINGs it after ~2 min idle. There is no
-                    // network peer to answer, so answer here — otherwise the
-                    // reaper times out and drops the session every few minutes,
-                    // churning this always-on network (spurious dis/reconnect
-                    // notices, NICK/JOIN replay). The PING is internal keepalive,
-                    // not conversation, so it is not shown in the buffer.
-                    if let Some(token) = line.strip_prefix("PING ") {
-                        let token = token.strip_prefix(':').unwrap_or(token);
-                        if session
-                            .core
-                            .core_tx
-                            .push(Input::Line {
-                                conn,
-                                line: format!("PONG :{token}").into_bytes(),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return Stopped;
-                        }
-                        continue;
-                    }
-                    let classified = match e6irc_proto::message::Message::parse(&line) {
-                        Ok(parsed) => {
-                            let message = e6irc_client::OwnedMessage::from(&parsed);
-                            let own_nick = ends
-                                .irc_session_snapshot()
-                                .map(|snapshot| snapshot.nick)
+                    let message = e6irc_proto::message::Message::parse(&line)
+                        .ok()
+                        .map(|parsed| e6irc_client::OwnedMessage::from(&parsed));
+                    match message.as_ref().map(|message| message.command.as_str()) {
+                        // The in-process session is a real registered session,
+                        // so the liveness reaper PINGs it after ~2 min idle.
+                        // There is no network peer to answer, so answer here —
+                        // otherwise the reaper times out and drops the session
+                        // every few minutes, churning this always-on network
+                        // (spurious dis/reconnect notices, NICK/JOIN replay).
+                        // The PING is internal keepalive, not conversation, so
+                        // it is not shown in the buffer.
+                        Some("PING") => {
+                            let token = message
+                                .as_ref()
+                                .and_then(|message| message.params.first().cloned())
                                 .unwrap_or_default();
-                            router.classify(
-                                &message,
-                                line,
-                                &ends.names(),
-                                &own_nick,
-                                std::time::Instant::now(),
-                            )
+                            if !say(core, conn, format!("PONG :{token}")).await {
+                                return Stopped;
+                            }
+                            continue;
                         }
-                        Err(_) => super::replies::Upstream::Session { line, origin: None },
+                        // Capabilities are this session's negotiation with the
+                        // core; an attached client negotiated its own with the
+                        // bouncer and would act on these against the wrong hop.
+                        Some("CAP") => continue,
+                        _ => {}
+                    }
+                    let own_nick = ends
+                        .irc_session_snapshot()
+                        .map(|snapshot| snapshot.nick)
+                        .unwrap_or_default();
+                    let classified = match &message {
+                        Some(message) => router.classify(
+                            message,
+                            line,
+                            &ends.names(),
+                            &own_nick,
+                            std::time::Instant::now(),
+                        ),
+                        None => super::replies::Upstream::Session { line, origin: None },
                     };
                     match classified {
                         // A correlation PING's answer: the commands sent since
@@ -337,8 +391,21 @@ async fn drive_session(
                         super::replies::Upstream::Reply { line, origin } => {
                             ends.emit_reply(origin, line);
                         }
-                        super::replies::Upstream::Session { line, .. } => {
-                            if ends.emit_session_line(line).is_err() {
+                        super::replies::Upstream::Session { line, origin } => {
+                            // Our own message, echoed by the core: the one echo
+                            // of the line an attachment sent.
+                            let emitted = match &message {
+                                Some(message) => echoes.publish(
+                                    ends,
+                                    message,
+                                    line,
+                                    origin,
+                                    &own_nick,
+                                    &ends.names(),
+                                ),
+                                None => ends.emit_session_line(line),
+                            };
+                            if emitted.is_err() {
                                 return super::SessionOutcome::Dropped(
                                     super::NetworkFailure::ChannelLimitExceeded,
                                 );
@@ -355,22 +422,9 @@ async fn drive_session(
             // Downstream command -> core.
             cmd = ends.next_command() => match cmd {
                 Some(cmd) => {
-                    let Some(line) = super::carriable(&cmd, super::ClientTags::Denied, ends) else {
+                    let Some(line) = super::carriable(&cmd, super::ClientTags::Relayed, ends) else {
                         continue;
                     };
-                    // The core shows this session as it registered it: the
-                    // `USER` name verbatim (there is no identd to answer) at
-                    // the host the session was opened with.
-                    let echoes = ends.irc_session_snapshot().map_or_else(Vec::new, |snapshot| {
-                        super::irc_driver::self_echoes(
-                            &line,
-                            &super::irc_driver::SelfIdentity {
-                                nick: snapshot.nick,
-                                user: session.username.clone(),
-                                host: LOCAL_SESSION_HOST.to_string(),
-                            },
-                        )
-                    });
                     let written = router.forward(
                         cmd.origin,
                         &line,
@@ -383,9 +437,9 @@ async fn drive_session(
                             return Stopped;
                         }
                     }
-                    for echo in echoes {
-                        ends.emit_echo(echo, cmd.origin);
-                    }
+                    // The core echoes what it accepts (`echo-message`); the
+                    // echo is routed back to the attachment that sent it.
+                    echoes.sent(&line, cmd.origin, &ends.names());
                 }
                 // Every handle dropped: stop for good (no reconnect — the
                 // network was removed).
@@ -427,7 +481,10 @@ mod tests {
             nick: "alice".into(),
             username: "ident".into(),
             realname: "Alice".into(),
-            autojoin,
+            autojoin: autojoin
+                .into_iter()
+                .map(|channel| (channel, None))
+                .collect(),
         };
         let (handle, mut ends) = NetworkHandle::channels(8);
         let events = handle.subscribe();
@@ -435,12 +492,19 @@ mod tests {
         (handle, events, task)
     }
 
-    async fn finish_registration(core_rx: &mut Receiver<Input>) -> Sender<Output> {
+    /// Read the session's registration as the core would, up to answering
+    /// its capability request, which the core does before anything else.
+    async fn open_registration(core_rx: &mut Receiver<Input>) -> Sender<Output> {
         let open = core_rx.pop().await.expect("Open event").payload;
         let Input::Open { tx, .. } = open else {
             panic!("expected Open");
         };
-        for expected in ["NICK alice", "USER ident 0 * :Alice"] {
+        for expected in [
+            "CAP REQ :account-tag echo-message message-tags server-time",
+            "NICK alice",
+            "USER ident 0 * :Alice",
+            "CAP END",
+        ] {
             let input = core_rx.pop().await.expect("registration line").payload;
             let Input::Line { line, .. } = input else {
                 panic!("expected registration line");
@@ -448,6 +512,45 @@ mod tests {
             assert_eq!(String::from_utf8(line).unwrap(), expected);
         }
         tx
+    }
+
+    async fn finish_registration(core_rx: &mut Receiver<Input>) -> Sender<Output> {
+        let tx = open_registration(core_rx).await;
+        core_says(
+            &tx,
+            ":e6.example CAP * ACK :account-tag echo-message message-tags server-time",
+        )
+        .await;
+        tx
+    }
+
+    /// The capabilities are the core's to grant, and it is this binary: one it
+    /// refuses, or a welcome that skipped the answer, is a protocol failure,
+    /// never a session that silently lacks them.
+    #[tokio::test]
+    async fn a_refused_capability_request_is_a_protocol_failure() {
+        for answer in [
+            Some(":e6.example CAP * NAK :account-tag echo-message message-tags server-time"),
+            None,
+        ] {
+            let (core_tx, mut core_rx) = core_queue(8);
+            let (handle, _events, task) = spawn_session(core_tx, Vec::new());
+            let out_tx = open_registration(&mut core_rx).await;
+            if let Some(answer) = answer {
+                core_says(&out_tx, answer).await;
+            }
+            core_says(&out_tx, ":e6.example 001 alice :Welcome").await;
+            assert!(
+                matches!(
+                    stopped(task).await,
+                    super::super::SessionOutcome::Dropped(
+                        super::super::NetworkFailure::UpstreamProtocolFailed
+                    )
+                ),
+                "{answer:?}"
+            );
+            assert!(handle.irc_session_snapshot().is_none());
+        }
     }
 
     async fn core_says(out_tx: &Sender<Output>, line: &str) {
@@ -652,16 +755,30 @@ mod tests {
         ));
     }
 
-    /// The synthesized echo shows the session as the core does: the `USER`
-    /// name exactly as sent, at the session's host.
-    #[tokio::test]
-    async fn the_echo_carries_the_user_name_the_core_shows() {
-        let (_core_rx, handle, mut events, _task, _out_tx) = connected_session().await;
-        assert_eq!(
-            handle.send_from(3, "PRIVMSG #room :hello"),
-            super::super::SendOutcome::Sent
-        );
-        let (line, origin) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    /// The next line the session wrote to the core, and the ordering barrier
+    /// its reply router sent after it (`super::super::replies`), which the
+    /// core answers once it has answered the line.
+    async fn core_heard(core_rx: &mut Receiver<Input>) -> (String, String) {
+        let mut heard = Vec::new();
+        while heard.len() < 2 {
+            let Input::Line { line, .. } = core_rx.pop().await.expect("a line").payload else {
+                panic!("expected a line");
+            };
+            heard.push(String::from_utf8(line).expect("UTF-8"));
+        }
+        let barrier = heard.pop().expect("two lines");
+        let token = barrier
+            .strip_prefix("PING :")
+            .unwrap_or_else(|| panic!("expected a barrier, got {barrier}"));
+        let answer = format!(":e6.example PONG e6.example :{token}");
+        (heard.pop().expect("the line"), answer)
+    }
+
+    /// The next echo the session published, with the attachment it is for.
+    async fn next_echo(
+        events: &mut broadcast::Receiver<super::super::DriverEvent>,
+    ) -> (String, u64) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if let Ok(super::super::DriverEvent::Echo { line, origin }) = events.recv().await {
                     return (line.line, origin);
@@ -669,12 +786,63 @@ mod tests {
             }
         })
         .await
-        .expect("the echo");
-        assert_eq!(origin, 3);
-        assert!(
-            line.ends_with(" :alice!ident@local PRIVMSG #room :hello"),
-            "{line}"
+        .expect("the echo")
+    }
+
+    /// The local network carries what makes typing and reactions work: a
+    /// client's tags and its `TAGMSG` reach the core as sent, and the one echo
+    /// of a message is the core's, with the `msgid` and time the core gave it —
+    /// the message a reaction to it names — routed to the attachment that sent
+    /// it. Nothing is synthesized in its place.
+    #[tokio::test]
+    async fn client_tags_reach_the_core_and_the_core_echoes_the_message() {
+        let (mut core_rx, handle, mut events, _task, out_tx) = connected_session().await;
+        for (line, echoed) in [
+            (
+                "@+draft/reply=m0;+draft/react=:+1: TAGMSG #room",
+                "@time=2026-01-01T00:00:01.000Z;msgid=m1;+draft/reply=m0;+draft/react=:+1: \
+                 :alice!ident@local TAGMSG #room",
+            ),
+            (
+                "PRIVMSG #room :hello",
+                "@time=2026-01-01T00:00:02.000Z;msgid=m2 :alice!ident@local PRIVMSG #room :hello",
+            ),
+        ] {
+            assert_eq!(handle.send_from(3, line), super::super::SendOutcome::Sent);
+            let (heard, barrier) = core_heard(&mut core_rx).await;
+            assert_eq!(heard, line);
+            core_says(&out_tx, echoed).await;
+            core_says(&out_tx, &barrier).await;
+            assert_eq!(next_echo(&mut events).await, (echoed.to_string(), 3));
+        }
+        let (_, welcome) =
+            super::super::serve::welcome("bnc.test", LOCAL_NETWORK, &handle, "alice".into());
+        let welcome = welcome.join("\n");
+        assert!(!welcome.contains("CLIENTTAGDENY=*"), "{welcome}");
+    }
+
+    /// A line the core refuses has no echo: its refusal is the whole answer,
+    /// and no echo is made up for a message nobody received.
+    #[tokio::test]
+    async fn a_refused_message_is_not_echoed() {
+        let (mut core_rx, handle, mut events, _task, out_tx) = connected_session().await;
+        assert_eq!(
+            handle.send_from(3, "PRIVMSG #nowhere :hello"),
+            super::super::SendOutcome::Sent
         );
+        let (heard, barrier) = core_heard(&mut core_rx).await;
+        assert_eq!(heard, "PRIVMSG #nowhere :hello");
+        core_says(&out_tx, ":e6.example 403 alice #nowhere :No such channel").await;
+        core_says(&out_tx, &barrier).await;
+        // The next message's echo is the next one published.
+        assert_eq!(
+            handle.send_from(4, "PRIVMSG #room :again"),
+            super::super::SendOutcome::Sent
+        );
+        let echo =
+            "@time=2026-01-01T00:00:03.000Z;msgid=m3 :alice!ident@local PRIVMSG #room :again";
+        core_says(&out_tx, echo).await;
+        assert_eq!(next_echo(&mut events).await, (echo.to_string(), 4));
     }
 
     #[tokio::test]

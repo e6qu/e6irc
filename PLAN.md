@@ -635,7 +635,11 @@ A sweep of the bouncer found, and this change fixes:
   confirmation of a client's own `NICK` counted as `renamed_by_upstream`.
 - **The local driver.** A stop during registration left the half-registered
   core session to the reaper, and its synthesized echo showed `~nick` where
-  the core shows the `USER` name.
+  the core shows the `USER` name. It also negotiated no capabilities with the
+  core, so the local network stripped client-only tags (`CLIENTTAGDENY=*`):
+  no typing indicators, no reactions, and an echo without the core's `msgid`.
+  It now asks the core for `message-tags`, `server-time`, `echo-message` and
+  `account-tag`, and relays the core's own echo.
 - **Lines sent with `CAP END` were refused.** The attach handshake answered
   lines arriving in the same read as `CAP END` with 421, and dropped the half
   of a line it had framed; both now reach the attached session.
@@ -776,7 +780,14 @@ attached clients found, and this change fixes:
   history filing read the network's `CASEMAPPING`, `CHANTYPES` and
   `STATUSMSG`; stored conversations keep their spelling and are keyed and
   re-keyed under the network's mapping (migration 0076), and TARGETS names them
-  as spelled.
+  as spelled. Read markers keep their spelling and mapping too and are re-keyed
+  the same way (migration 0086).
+- **A keyed channel could not be autojoined.** Only a key a client joined with
+  or a `+k` the driver saw was remembered, in memory, so a restart lost it and
+  the channel was answered with 475. An account network's autojoin entry now
+  takes a key (`#staff key`), stored sealed (migration 0087), write-only over
+  the API with an explicit keep action, never carried to a new destination,
+  and edited in the network dialog.
 - **Replay and CHATHISTORY disagreed on time** on networks without
   `server-time`: every line is stamped when it is taken in.
 - **Echoes**: a message to several targets is echoed per target, an echo the
