@@ -1252,6 +1252,107 @@ fn validate_credential_field(value: &str, maximum: usize) -> Result<(), NetworkM
     })
 }
 
+/// Where a network's stored secrets are sent: the IRC server (host, port, and
+/// whether the hop is encrypted) or the bridge provider's origin. Two rows
+/// with the same destination send a secret to the same party.
+#[derive(Debug, PartialEq, Eq)]
+enum SecretDestination {
+    Irc {
+        host: String,
+        port: Option<u16>,
+        tls: bool,
+    },
+    /// A bridge's API base; `None` is the provider default an empty base
+    /// means.
+    Bridge(Option<url::Origin>),
+    /// An address that does not parse, compared as written.
+    Unparsed(String),
+}
+
+impl SecretDestination {
+    fn of(row: &crate::db::BncNetworkRow) -> Self {
+        if row.kind.is_bridge() {
+            if row.addr.is_empty() {
+                return Self::Bridge(None);
+            }
+            return url::Url::parse(&row.addr).map_or_else(
+                |_| Self::Unparsed(row.addr.clone()),
+                |url| Self::Bridge(Some(url.origin())),
+            );
+        }
+        match url::Url::parse(&format!("irc://{}", row.addr)) {
+            Ok(url) if url.host_str().is_some() => Self::Irc {
+                host: url.host_str().unwrap_or_default().to_ascii_lowercase(),
+                port: url.port(),
+                tls: row.tls,
+            },
+            _ => Self::Unparsed(row.addr.clone()),
+        }
+    }
+
+    /// Whether a secret sent to `self` may keep going to `next` without its
+    /// owner entering it again. Encrypting a hop that was cleartext sends it
+    /// to the same party more safely; every other change is a new audience.
+    fn admits(&self, next: &Self) -> bool {
+        match (self, next) {
+            (
+                Self::Irc { host, port, tls },
+                Self::Irc {
+                    host: next_host,
+                    port: next_port,
+                    tls: next_tls,
+                },
+            ) => host == next_host && port == next_port && (*next_tls || !*tls),
+            _ => self == next,
+        }
+    }
+}
+
+/// Apply a replace's two credential actions to `row`, the one place a stored
+/// secret can be carried from `before` into an edited network.
+///
+/// A stored secret is write-only: the API never shows it. Keeping one while
+/// pointing the network somewhere else would send it to whoever answers
+/// there — the plaintext recovered by anyone who may edit the network. So
+/// when the destination changes, every secret must be entered again or
+/// removed: one carried over unchanged (by `keep`, or by replacing only the
+/// other half of a pair) is refused, naming its field.
+fn apply_credential_actions(
+    state: &AppState,
+    owner: &str,
+    before: &crate::db::BncNetworkRow,
+    row: &mut crate::db::BncNetworkRow,
+    credentials: UpdateNetworkCredentials,
+    server_password: UpdateServerPassword,
+) -> Result<(), NetworkMutationError> {
+    apply_network_credentials(state, owner, row, credentials)?;
+    apply_server_password(state, owner, row, server_password)?;
+    if SecretDestination::of(before).admits(&SecretDestination::of(row)) {
+        return Ok(());
+    }
+    let carried =
+        |before: &Option<String>, after: &Option<String>| after.is_some() && before == after;
+    let account_carried =
+        row.kind.account_is_secret() && carried(&before.sasl_account, &row.sasl_account);
+    let field =
+        if account_carried || carried(&before.sasl_password_sealed, &row.sasl_password_sealed) {
+            "credentials"
+        } else if carried(&before.server_password_sealed, &row.server_password_sealed) {
+            "server_password"
+        } else {
+            return Ok(());
+        };
+    Err(network_error(
+        StatusCode::CONFLICT,
+        "Credentials must be entered again",
+        Some(
+            "the network now points somewhere else, and a stored password or token is never \
+             sent to a new destination; set it again or remove it",
+        ),
+    )
+    .with_field(field))
+}
+
 fn apply_network_credentials(
     state: &AppState,
     owner: &str,
@@ -1613,8 +1714,14 @@ async fn update_network_in_lane(
     row.username = username.map(str::to_string);
     row.realname = realname.map(str::to_string);
     row.autojoin = autojoin.to_vec();
-    apply_network_credentials(state, account, &mut row, credentials)?;
-    apply_server_password(state, account, &mut row, server_password)?;
+    apply_credential_actions(
+        state,
+        account,
+        &before,
+        &mut row,
+        credentials,
+        server_password,
+    )?;
     // Judged on the row as it will be stored: a kept credential on a network
     // edited to tls=false is refused like a new one.
     if row.kind == crate::config::NetworkKind::Irc {
@@ -1722,6 +1829,74 @@ fn network_audit_detail(
             fields.join(", ")
         }
     )
+}
+
+#[cfg(test)]
+mod secret_destination_tests {
+    use super::SecretDestination;
+    use crate::config::NetworkKind;
+
+    fn destination(kind: NetworkKind, addr: &str, tls: bool) -> SecretDestination {
+        SecretDestination::of(&crate::db::BncNetworkRow {
+            kind,
+            name: "work".into(),
+            addr: addr.into(),
+            tls,
+            nick: String::new(),
+            username: None,
+            realname: None,
+            autojoin: Vec::new(),
+            sasl_account: None,
+            sasl_password_sealed: None,
+            server_password_sealed: None,
+            enabled: true,
+        })
+    }
+
+    #[test]
+    fn a_secret_follows_only_the_same_server_or_origin() {
+        let irc = |addr, tls| destination(NetworkKind::Irc, addr, tls);
+        let here = irc("irc.example:6697", true);
+        assert!(here.admits(&irc("IRC.Example:6697", true)), "host case");
+        assert!(
+            !here.admits(&irc("irc.attacker.example:6697", true)),
+            "host"
+        );
+        assert!(!here.admits(&irc("irc.example:7000", true)), "port");
+        assert!(!here.admits(&irc("irc.example:6697", false)), "TLS off");
+        assert!(
+            irc("irc.example:6697", false).admits(&irc("irc.example:6697", true)),
+            "encrypting the same hop is not a new audience"
+        );
+        assert!(!here.admits(&irc("[2001:db8::1]:6697", true)));
+
+        for kind in [
+            NetworkKind::Matrix,
+            NetworkKind::Discord,
+            NetworkKind::Slack,
+        ] {
+            let bridge = |addr| destination(kind, addr, true);
+            let here = bridge("https://api.example");
+            assert!(
+                here.admits(&bridge("https://api.example/v10/")),
+                "same origin"
+            );
+            assert!(
+                !here.admits(&bridge("https://api.attacker.example")),
+                "{kind:?}"
+            );
+            assert!(
+                !here.admits(&bridge("https://api.example:8443")),
+                "{kind:?}"
+            );
+            assert!(!here.admits(&bridge("http://api.example")), "{kind:?}");
+            assert!(
+                !here.admits(&bridge("")),
+                "provider default is another origin"
+            );
+            assert!(!bridge("").admits(&here), "{kind:?}");
+        }
+    }
 }
 
 #[cfg(test)]

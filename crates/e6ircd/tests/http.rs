@@ -2096,6 +2096,34 @@ async fn a_server_password_is_sealed_write_only_and_replaced_only_by_an_action()
         secret_key.open(&resealed, &context).unwrap(),
         "rotated-9c1e"
     );
+    // A stored secret never follows the network to a new destination: moving
+    // it while keeping the password is refused at the field, and nothing is
+    // changed; entering the password again moves it.
+    let moved = format!(
+        r#""addr":"127.0.0.1:{}","tls":false,"nick":"alice_","username":"alice_","realname":"Alice""#,
+        up.port() + 1
+    );
+    let put_moved = |server_password: &str| {
+        let body = format!(
+            r#"{{{moved},"autojoin":[],"credentials":{{"action":"keep"}}{server_password}}}"#
+        );
+        format!(
+            "PUT /api/v1/me/networks/private HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let (status, _, body) =
+        request(http, &put_moved(r#","server_password":{"action":"keep"}"#)).await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(problem_field(&body), "server_password", "{body}");
+    assert_eq!(stored().await.as_deref(), Some(resealed.as_str()));
+    let (status, _, body) = request(
+        http,
+        &put_moved(r#","server_password":{"action":"set","password":"rotated-9c1e"}"#),
+    )
+    .await;
+    assert_eq!(status, 204, "{body}");
     let (status, _, body) = request(http, &put(r#","server_password":{"action":"remove"}"#)).await;
     assert_eq!(status, 204, "{body}");
     assert_eq!(stored().await, None);
@@ -2114,9 +2142,9 @@ async fn a_server_password_is_sealed_write_only_and_replaced_only_by_an_action()
     assert!(
         details
             .iter()
-            .filter(|detail| detail.contains("changed: server_password"))
+            .filter(|detail| detail.contains("server_password") && detail.contains("changed: "))
             .count()
-            >= 2,
+            >= 3,
         "{details:?}"
     );
     assert!(

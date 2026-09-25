@@ -1723,7 +1723,7 @@ fn operations() -> serde_json::Value {
                     "responses": { "200": network_response["200"],
                         "404": { "description": "no such network" } } },
                 "put": { "summary": "Replace a BNC network's mutable configuration and restart its driver",
-                    "description": "The stored kind selects the same IRC/Matrix/Discord/Slack field contract documented on create. The credential action is required and explicit: `keep` preserves write-only values; `remove` clears paired IRC SASL and is rejected for bridges; `set` replaces supplied values. IRC requires account and may omit password to preserve it. Matrix/Discord accept only password. Slack accepts account, password, or both and preserves an omitted token. The server-password action is required and explicit too: `keep` preserves the stored value, `remove` clears it, `set` replaces it; only an IRC network accepts `remove` or `set` (400 with field=server_password otherwise).",
+                    "description": "The stored kind selects the same IRC/Matrix/Discord/Slack field contract documented on create. The credential action is required and explicit: `keep` preserves write-only values; `remove` clears paired IRC SASL and is rejected for bridges; `set` replaces supplied values. IRC requires account and may omit password to preserve it. Matrix/Discord accept only password. Slack accepts account, password, or both and preserves an omitted token. The server-password action is required and explicit too: `keep` preserves the stored value, `remove` clears it, `set` replaces it; only an IRC network accepts `remove` or `set` (400 with field=server_password otherwise). A stored secret never follows the network to a new destination: when the IRC host or port changes, TLS is turned off, or a bridge's API base or homeserver moves to another origin, a secret carried over unchanged (by `keep`, or by replacing only the other half of a pair) is a 409 naming `credentials` or `server_password`; enter it again or remove it.",
                     "security": authenticated,
                     "parameters": network_name_parameter,
                     "requestBody": { "required": true, "content": { "application/json": {
@@ -1773,7 +1773,7 @@ fn operations() -> serde_json::Value {
                     "responses": { "204": { "description": "updated and live driver replaced" },
                         "400": { "description": "invalid kind-specific configuration or credential action" },
                         "404": { "description": "no such network" },
-                        "409": { "description": "cannot seal credentials or start replacement driver" } } },
+                        "409": { "description": "cannot seal credentials or start replacement driver, or a stored secret would be sent to a new destination (field names it)" } } },
                 "patch": { "summary": "Enable or disable a BNC network (start/stop its driver)",
                     "security": authenticated,
                     "parameters": network_name_parameter,

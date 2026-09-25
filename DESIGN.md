@@ -2723,7 +2723,15 @@ Surface (initial):
   that cannot travel in one `PASS` line is a 400 naming `server_password`, and
   responses report `has_server_password`, never the value. The tagged actions
   refuse stray fields, so a password typed beside `keep` is refused rather than
-  silently dropped. Both browser clients omit a blank credential field rather
+  silently dropped. A stored secret never follows the network somewhere else:
+  when the destination changes — the IRC host or port, TLS turned off, a
+  bridge's API base or homeserver moved to another origin — a secret carried
+  over unchanged (by `keep`, or by replacing only the other half of a pair) is
+  a `409` naming `credentials` or `server_password`, so whoever may edit a
+  network cannot point it at their own listener and have the server send them
+  a password the API never reveals. The rule lives in the one function that
+  applies both credential actions, comparing the stored row with the edited
+  one. Both browser clients omit a blank credential field rather
   than sending null; an
   account box emptied against a stored account, or a value typed under a
   ticked Remove, is refused at the box rather than resolved one way or the

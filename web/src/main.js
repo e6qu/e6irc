@@ -1968,6 +1968,8 @@ const NETWORK_FIELD_INPUTS = Object.freeze({
   autojoin: "nf-autojoin",
   sasl_account: "nf-sasl-account",
   sasl_password: "nf-sasl-password",
+  // A replace names its credential action, whose secret is this password.
+  credentials: "nf-sasl-password",
   server_password: "nf-server-password",
 });
 
