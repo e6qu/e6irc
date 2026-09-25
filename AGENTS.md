@@ -184,9 +184,10 @@ mistake, before a single line changes.
 - [ ] `tools/check-dead-code.sh` clean (no code kept alive only by tests —
       it builds the shipped artifacts with `cfg(test)` off).
 - [ ] `tools/check-dead-pub.sh` clean (no fully-`pub` item referenced only by
-      tests: an integration test, or inline `#[cfg(test)]` code, which it
-      blanks out before counting — the compiler's dead-code lint sees
-      neither for a `pub` item).
+      tests: an integration test, a fuzz target, or inline `#[cfg(test)]` /
+      `#[cfg(fuzzing)]` code, which it blanks out before counting — the
+      compiler's dead-code lint sees none of them for a `pub` item. A
+      same-named definition elsewhere is not a use).
 - [ ] `tools/check-duplication.sh` clean (copy-paste under the ratchet; the
       fix is to extract shared logic, never to raise the threshold).
 - [ ] The fuzz targets type-check: `RUSTFLAGS="--cfg fuzzing" cargo check
