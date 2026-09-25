@@ -124,6 +124,26 @@ impl std::fmt::Display for ScramError {
     }
 }
 
+impl ScramError {
+    /// Whether this is the server's verdict that the credentials are wrong:
+    /// an RFC 5802 `server-error` of `invalid-proof` (the password), or
+    /// `unknown-user`, `invalid-encoding` or `invalid-username-encoding` (the
+    /// account name or the proof it carried). Retrying the same credentials
+    /// can only get the same answer, and every attempt counts against the
+    /// account upstream. Every other error — including `other-error`, the
+    /// channel-binding errors and `no-resources` — says nothing about them.
+    pub fn rejects_credentials(&self) -> bool {
+        matches!(
+            self,
+            Self::ServerError(error)
+                if matches!(
+                    error.as_str(),
+                    "invalid-proof" | "unknown-user" | "invalid-encoding" | "invalid-username-encoding"
+                )
+        )
+    }
+}
+
 /// A SCRAM exchange in progress, from the client's first message until the
 /// server's signature is verified.
 pub struct ScramClient {
@@ -401,6 +421,22 @@ mod tests {
             awaiting.verify("e=invalid-proof"),
             Err(ScramError::ServerError("invalid-proof".into()))
         );
+    }
+
+    #[test]
+    fn only_credential_server_errors_reject_the_credentials() {
+        for error in [
+            "invalid-proof",
+            "unknown-user",
+            "invalid-encoding",
+            "invalid-username-encoding",
+        ] {
+            assert!(ScramError::ServerError(error.into()).rejects_credentials());
+        }
+        for error in ["other-error", "no-resources", "channel-bindings-dont-match"] {
+            assert!(!ScramError::ServerError(error.into()).rejects_credentials());
+        }
+        assert!(!ScramError::ServerSignatureMismatch.rejects_credentials());
     }
 
     #[test]

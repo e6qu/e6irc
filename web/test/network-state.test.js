@@ -92,5 +92,16 @@ test("topic and NAMES replies never open a conversation", () => {
   }
   const names = source.slice(source.indexOf('case "353": {'), source.indexOf('case "366": {'));
   assert.doesNotMatch(names, /ensureBuffer\(/);
-  assert.match(names, /existingChannelBuffer\(buffers, chan\)/);
+  assert.match(names, /existingChannelBuffer\(buffers, chan, ircNames\)/);
+});
+
+test("the network's CASEMAPPING and CHANTYPES are adopted from the session and from 005", () => {
+  const session = source.slice(source.indexOf("function applySessionSnapshot("), source.indexOf("function adoptNames("));
+  assert.match(session, /adoptNames\(namesFromIsupport\(isupport\)/);
+  const isupport = source.slice(source.indexOf('case "005": {'), source.indexOf('case "MODE": {'));
+  assert.match(isupport, /adoptNames\(namesFrom\(m\.params, ircNames\)\)/);
+  // Every IRC name is keyed under the open network's rules; only e6irc's own
+  // network names compare under the fixed default.
+  assert.match(source, /^const fold = \(name\) => foldUnder\(name, ircNames\);$/m);
+  assert.doesNotMatch(source, /[^.\w]fold\(network\)|fold\(item\.name\)/);
 });

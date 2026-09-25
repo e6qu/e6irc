@@ -13,8 +13,8 @@ use e6irc_client::credentials::{
 use e6irc_client::liveness::{LIVENESS_WINDOW, Liveness};
 use e6irc_client::token_cache::default_token_path;
 use e6irc_client::{
-    CleartextCredentials, ClientEvent, Connection, ConnectionOptions, OwnedMessage, RelayEvent,
-    TerminalSafe, is_channel_target, is_refusal,
+    CleartextCredentials, ClientEvent, Connection, ConnectionOptions, NetworkNames, OwnedMessage,
+    RelayEvent, TerminalSafe, is_refusal,
 };
 use serde::Serialize;
 
@@ -385,6 +385,9 @@ async fn run(cli: Cli) -> std::io::Result<()> {
     let mut stdout = std::io::stdout().lock();
     match cli.command {
         Command::Send { target, message } => {
+            for event in learn_network(&mut conn).await? {
+                reported(event.into());
+            }
             send(&mut conn, &own_nick, &target, &message, response_timeout).await?;
             finish_quietly(&mut conn, response_timeout).await
         }
@@ -393,24 +396,32 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             count,
             json,
         } => {
+            let early = learn_network(&mut conn).await?;
             let tail = Tail {
                 target: &target,
                 wanted: (count != 0).then_some(count),
                 json,
+                names: conn.names().clone(),
             };
-            tail.follow(&mut conn, LIVENESS_WINDOW, &mut stdout).await
+            tail.follow(early, &mut conn, LIVENESS_WINDOW, &mut stdout)
+                .await
         }
         Command::History { target, count } => {
             conn.require_capabilities(&["batch", "draft/chathistory", "server-time"])
                 .await?;
+            for event in learn_network(&mut conn).await? {
+                reported(event.into());
+            }
+            let names = conn.names().clone();
             for event in conn.join_with_latest_history(&target, count).await? {
                 let Some(message) = reported(event) else {
                     continue;
                 };
                 if matches!(message.command.as_str(), "PRIVMSG" | "NOTICE")
-                    && message.params.first().is_some_and(|candidate| {
-                        e6irc_proto::casemap::CaseMapping::Rfc1459.eq(candidate, &target)
-                    })
+                    && message
+                        .params
+                        .first()
+                        .is_some_and(|candidate| names.eq(candidate, &target))
                 {
                     let from = message
                         .source
@@ -437,6 +448,27 @@ async fn run(cli: Cli) -> std::io::Result<()> {
     }
 }
 
+/// Read the rest of the welcome burst, up to a round trip, and return what it
+/// held. The network's 005 is in it, and until it is read nothing can say
+/// which targets are channels on this network or when two names are the same
+/// ([`Connection::names`]).
+async fn learn_network(conn: &mut Connection) -> std::io::Result<Vec<RelayEvent>> {
+    let mut early = Vec::new();
+    conn.round_trip(|event| {
+        early.push(event);
+        Ok(())
+    })
+    .await?;
+    if let Some(mapping) = conn.names().unrecognised_casemapping() {
+        eprintln!(
+            "warning: the server's CASEMAPPING={} is not one this client knows; names are \
+             compared as ascii (letters only)",
+            terminal_safe(mapping)
+        );
+    }
+    Ok(early)
+}
+
 /// Deliver one PRIVMSG and wait for the server's verdict on it.
 ///
 /// The verdict is the echo of the message (echo-message) or a refusal. Without
@@ -461,7 +493,8 @@ async fn send(
     conn.require_capabilities(&["echo-message"]).await?;
     // Channels are +n by default, so join before speaking and wait for the
     // join to be confirmed. A refused or unconfirmed join is an error here.
-    if is_channel_target(target) {
+    let names = conn.names().clone();
+    if names.is_channel(target) {
         for event in conn.join_with_latest_history(target, 0).await? {
             reported(event);
         }
@@ -476,7 +509,6 @@ async fn send(
     .await?;
     conn.send_line(&format!("PRIVMSG {target} :{message}"))
         .await?;
-    let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
     let mut liveness = Liveness::new(LIVENESS_WINDOW);
     let verdict = async {
         loop {
@@ -502,13 +534,13 @@ async fn send(
                 .source
                 .as_deref()
                 .and_then(|source| source.split('!').next())
-                .is_some_and(|nick| casemap.eq(nick, own_nick));
+                .is_some_and(|nick| names.eq(nick, own_nick));
             if reply.command == "PRIVMSG"
                 && from_self
                 && reply
                     .params
                     .first()
-                    .is_some_and(|echoed| casemap.eq(echoed, target))
+                    .is_some_and(|echoed| names.eq(echoed, target))
             {
                 return Ok(());
             }
@@ -558,6 +590,8 @@ struct Tail<'a> {
     /// Stop after this many messages; `None` follows until the server goes.
     wanted: Option<usize>,
     json: bool,
+    /// The network's naming rules, learned before the tail starts.
+    names: NetworkNames,
 }
 
 impl Tail<'_> {
@@ -565,14 +599,23 @@ impl Tail<'_> {
     /// away, or the server does — the last being a failure: a server that
     /// closes, or stays silent through two liveness windows (the first ends
     /// with a PING), ends an unbounded tail that a supervisor must see end.
+    /// `early` is what was read before the tail started, oldest first.
     async fn follow(
         &self,
+        early: Vec<RelayEvent>,
         conn: &mut Connection,
         liveness_window: std::time::Duration,
         out: &mut impl std::io::Write,
     ) -> std::io::Result<()> {
         let mut seen = 0;
-        if is_channel_target(self.target) {
+        for event in early {
+            if let Some(message) = reported(event.into())
+                && let Some(end) = self.print(&message, &mut seen, out)?
+            {
+                return end;
+            }
+        }
+        if self.names.is_channel(self.target) {
             // Messages relayed while the join is confirmed are part of the
             // stream being followed.
             for event in conn.join_with_latest_history(self.target, 0).await? {
@@ -607,13 +650,14 @@ impl Tail<'_> {
         out: &mut impl std::io::Write,
     ) -> std::io::Result<Option<std::io::Result<()>>> {
         // The server relays a channel message with the *sender's* spelling of
-        // the target, so the comparison must fold case under the server's
-        // rfc1459 mapping — a raw equality would silently miss messages sent to
-        // a differently-cased name.
+        // the target, so the comparison must fold case under the network's
+        // CASEMAPPING — a raw equality would silently miss messages sent to a
+        // differently-cased name.
         if message.command != "PRIVMSG"
-            || !message.params.first().is_some_and(|target| {
-                e6irc_proto::casemap::CaseMapping::Rfc1459.eq(target, self.target)
-            })
+            || !message
+                .params
+                .first()
+                .is_some_and(|target| self.names.eq(target, self.target))
         {
             return Ok(None);
         }
@@ -904,12 +948,13 @@ mod tests {
             target: "bob",
             wanted: None,
             json: false,
+            names: NetworkNames::default(),
         };
         let mut out = Vec::new();
         let started = std::time::Instant::now();
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            tail.follow(&mut connection, window, &mut out),
+            tail.follow(Vec::new(), &mut connection, window, &mut out),
         )
         .await
         .expect("tail never gave up on a silent server")

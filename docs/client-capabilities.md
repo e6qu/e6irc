@@ -19,6 +19,12 @@ The BNC requires a negotiated `sasl` capability before it accepts
 `AUTHENTICATE`. A capability request is atomic. `CAP LIST` reports enabled
 capabilities, not the offered list.
 
+The CLI, the TUI and the web chat read which targets are channels and which
+names are the same from the network's `005`: `CHANTYPES` (default `#&`) and
+`CASEMAPPING` (default `rfc1459`). `rfc1459`, `rfc1459-strict` (or
+`strict-rfc1459`) and `ascii` are known; any other mapping (`rfc7613`, …) is
+compared as `ascii` — the letters every mapping folds — and the client says so.
+
 ## Qualification boundary
 
 The server is tested against the Libera-compatible protocol surface, not against
