@@ -35,6 +35,8 @@ import {
 import { parseUiEvent } from "./ui-event.js";
 import {
   DEFAULT_CHANNEL_MODES,
+  DEFAULT_NAMES,
+  SERVER_KEY,
   asMessage,
   bufferAction,
   channelModesFrom,
@@ -43,8 +45,8 @@ import {
   clearTranscript,
   composerRequests,
   existingChannelBuffer,
-  fold,
-  isChannel,
+  fold as foldUnder,
+  isChannel as isChannelUnder,
   isPrefixMode,
   kickPairs,
   memberRank,
@@ -52,12 +54,16 @@ import {
   mergeTimeline,
   messageIdentity,
   modeChanges,
+  namesDiffer,
+  namesFrom,
+  namesFromIsupport,
   nickPrefix,
   oldestRingFloor,
   outgoingChat,
   parseIrc,
   prependHistory,
   reconcileChannelSnapshot,
+  rekeyBuffers,
   seededNick,
   splitSigil,
   stripBidiControls,
@@ -139,7 +145,18 @@ const MAX_LOADED_LINES = 1500;
 const MAX_BUFFERS = 200;
 const MAX_NICKS = 5000;
 const MAX_PENDING_SENDS = 64;
-const SERVER = "*server*";
+const SERVER = SERVER_KEY;
+
+// The open network's naming rules -- its 005 CASEMAPPING and CHANTYPES. Every
+// IRC name (a channel, a nick, a query) is keyed by `fold` and every target
+// classified by `isChannel` under them; `adoptNames` re-keys what is open when
+// they change.
+let ircNames = DEFAULT_NAMES;
+const fold = (name) => foldUnder(name, ircNames);
+const isChannel = (target) => isChannelUnder(target, ircNames);
+// An e6irc network's own name is this server's configuration, not an IRC name
+// on that network: it compares the same way whatever the network declares.
+const foldNetworkName = (name) => foldUnder(name);
 /// What the server buffer is called on screen: it is where every line the
 /// network sends is shown and where a command can be typed by hand.
 const CONSOLE_NAME = "console";
@@ -280,10 +297,10 @@ function echoOutgoing(text, target) {
   const isKnownChannel = (candidate) => buffers.get(fold(candidate))?.kind === "channel";
   for (const to of chat.targets) {
     const message = { nick: myNick, sourceIsUser: true, command: chat.command, params: [to, chat.body] };
-    const route = chatMessageRoute(message, myNick, isKnownChannel);
+    const route = chatMessageRoute(message, myNick, isKnownChannel, ircNames);
     const rendered = asMessage(chat.command === "NOTICE" ? "notice" : "msg", myNick, chat.body);
     const row = { sender: rendered.sender };
-    if (route?.kind === "channel" && existingChannelBuffer(buffers, route.target)) {
+    if (route?.kind === "channel" && existingChannelBuffer(buffers, route.target, ircNames)) {
       addLine(route.target, rendered.kind, "channel", rendered.from, rendered.text, row);
     } else if (route?.kind === "dm") {
       addLine(route.target, rendered.kind, "dm", rendered.from, rendered.text, row);
@@ -463,6 +480,7 @@ function resyncMemberships() {
 let attachSession = null;
 function applySessionSnapshot({ nick, channels, isupport }, { reapplied = false } = {}) {
   myNick = nick;
+  adoptNames(namesFromIsupport(isupport), { quiet: reapplied });
   const { modes, malformed } = channelModesFromIsupport(isupport);
   channelModes = modes;
   if (malformed.length && !reapplied) {
@@ -471,7 +489,7 @@ function applySessionSnapshot({ nick, channels, isupport }, { reapplied = false 
   const current = [...buffers.values()]
     .filter((buffer) => buffer.kind === "channel")
     .map((buffer) => buffer.display);
-  const reconciliation = reconcileChannelSnapshot(current, channels);
+  const reconciliation = reconcileChannelSnapshot(current, channels, ircNames);
   for (const channel of reconciliation.removed) {
     const key = fold(channel);
     const buffer = buffers.get(key);
@@ -489,6 +507,37 @@ function applySessionSnapshot({ nick, channels, isupport }, { reapplied = false 
   for (const channel of reconciliation.joined) {
     const buffer = ensureBuffer(channel, "channel");
     if (buffer.kind === "channel") buffer.joined = true;
+  }
+  renderBufferList();
+  renderActive();
+}
+
+// Adopt the network's naming rules. Buffers, their member lists and the
+// pending-name sets are keyed by `fold`, so a change re-keys them; two
+// conversations the new rules make one name are merged, and the page says so,
+// as it says when the network's case mapping is one this client does not know.
+function adoptNames(next, { quiet = false } = {}) {
+  const previous = ircNames;
+  ircNames = next;
+  if (!quiet && next.unrecognised !== null && next.unrecognised !== previous.unrecognised) {
+    addServer(
+      `The network's CASEMAPPING=${next.unrecognised} is not one this client knows; names are compared as ascii (letters only).`,
+    );
+  }
+  if (!namesDiffer(previous, next)) return;
+  const newKey = new Map([...buffers.values()].map((buffer) => [buffer.key, buffer.key === SERVER ? SERVER : fold(buffer.display)]));
+  const moved = (key) => newKey.get(key) ?? fold(key);
+  const { buffers: rekeyed, merged } = rekeyBuffers(buffers, ircNames);
+  buffers.clear();
+  for (const [key, buffer] of rekeyed) buffers.set(key, buffer);
+  for (const set of [namesSnapshots, namesRequested, requestedJoins]) {
+    const keys = [...set].map(moved);
+    set.clear();
+    for (const key of keys) set.add(key);
+  }
+  if (active !== null) active = moved(active);
+  for (const [kept, into] of merged) {
+    addServer(`Under the network's case mapping ${into} is ${kept}; their conversations were merged.`);
   }
   renderBufferList();
   renderActive();
@@ -854,12 +903,12 @@ function nickListItem() {
 // returns to it. Replay no longer decides the view (it used to leave whichever
 // channel it mentioned last), so something the person chose has to. Storage
 // being unavailable only means there is nothing to return to.
-const openConversationKey = () => `e6irc.conversation.${fold(network)}`;
+const openConversationKey = () => `e6irc.conversation.${foldNetworkName(network)}`;
 function rememberOpenConversation() {
   if (!network) return;
   try {
     if (active === SERVER) window.localStorage.removeItem(openConversationKey());
-    else window.localStorage.setItem(openConversationKey(), active);
+    else window.localStorage.setItem(openConversationKey(), buffers.get(active)?.display ?? active);
   } catch {
     // Already reported by the preferences load; nothing is lost but the memory.
   }
@@ -880,7 +929,7 @@ function settleInitialView() {
     remembered = null;
   }
   const conversations = Array.from(buffers.values()).filter((b) => b.key !== SERVER);
-  const target = (remembered && buffers.get(remembered)) || (conversations.length === 1 ? conversations[0] : null);
+  const target = (remembered && buffers.get(fold(remembered))) || (conversations.length === 1 ? conversations[0] : null);
   if (target) setActive(target.display);
 }
 
@@ -1014,7 +1063,7 @@ const addEvent = (chan, text) => addLine(chan, "event", "channel", null, text);
 function addNick(chan, nick, render = true) {
   const { name, modes } = splitSigil(nick, channelModes);
   if (!name) return;
-  const b = existingChannelBuffer(buffers, chan);
+  const b = existingChannelBuffer(buffers, chan, ircNames);
   if (!b) return;
   const key = fold(name);
   if (b.nicks.size >= MAX_NICKS && !b.nicks.has(key)) {
@@ -1092,7 +1141,7 @@ function renameNick(from, to) {
 }
 
 function setTopic(chan, topic) {
-  const b = existingChannelBuffer(buffers, chan);
+  const b = existingChannelBuffer(buffers, chan, ircNames);
   if (!b) return;
   b.topic = stripBidiControls(stripFormatting(topic));
   if (b.key === active) buftopicEl.textContent = b.topic;
@@ -1164,6 +1213,7 @@ function handleLine(raw) {
         m,
         myNick,
         (candidate) => buffers.get(fold(candidate))?.kind === "channel",
+        ircNames,
       );
       if (!route) {
         break;
@@ -1248,7 +1298,9 @@ function handleLine(raw) {
       break;
     case "005": {
       // RPL_ISUPPORT: the network's own PREFIX and CHANMODES replace the
-      // default table, so MODE arguments and sigils are read its way.
+      // default table, so MODE arguments and sigils are read its way, and its
+      // CASEMAPPING and CHANTYPES decide names.
+      adoptNames(namesFrom(m.params, ircNames));
       const { modes, malformed } = channelModesFrom(m.params, channelModes);
       channelModes = modes;
       if (malformed.length) {
@@ -1290,7 +1342,7 @@ function handleLine(raw) {
       if (!chan) {
         break;
       }
-      const buffer = existingChannelBuffer(buffers, chan);
+      const buffer = existingChannelBuffer(buffers, chan, ircNames);
       if (!buffer) break;
       if (!namesSnapshots.has(buffer.key)) {
         namesSnapshots.add(buffer.key);
@@ -1393,7 +1445,7 @@ async function reconcileUnavailableNetwork() {
       await apiGet("/api/v1/me/networks"),
     );
     renderNetworkList(networks);
-    const replacement = networks.find((item) => fold(item.name) === fold(network));
+    const replacement = networks.find((item) => foldNetworkName(item.name) === foldNetworkName(network));
     if (replacement && replacement.enabled !== false && replacement.runtime != null) {
       terminalSocket = false;
       clearAlert("network-unavailable");
@@ -1785,7 +1837,7 @@ function renderNetworkList(networks, failure = null) {
     const row = document.createElement("li");
     row.className = "network-row";
     row.dataset.network = item.name;
-    if (network !== null && fold(item.name) === fold(network)) row.classList.add("is-active");
+    if (network !== null && foldNetworkName(item.name) === foldNetworkName(network)) row.classList.add("is-active");
 
     const open = document.createElement("a");
     open.className = "network-open";
@@ -2334,7 +2386,7 @@ removeButton?.addEventListener("click", () => {
     // server closes the socket as it deletes, and a close the client has not
     // been told to expect schedules a retry -- which then opens a socket for a
     // network that no longer exists.
-    const wasOpen = Boolean(network) && fold(network) === fold(name);
+    const wasOpen = Boolean(network) && foldNetworkName(network) === foldNetworkName(name);
     if (wasOpen) stopLiveConnection();
     try {
       await apiSend("DELETE", `/api/v1/me/networks/${encodeURIComponent(name)}`);
@@ -2424,6 +2476,7 @@ function resetNetworkState() {
   attachSession = null;
   memberTracking = true;
   channelModes = DEFAULT_CHANNEL_MODES;
+  ircNames = DEFAULT_NAMES;
   initialViewSettled = false;
   replayCursor = null;
   clearAlert("network-unavailable");
@@ -2543,7 +2596,7 @@ async function refreshNetworkList() {
     const networks = networksFrom(await apiGet("/api/v1/me/networks"));
     renderNetworkListKeepingFocus(networks);
     clearAlert("networks");
-    const open = network && networks.find((item) => fold(item.name) === fold(network));
+    const open = network && networks.find((item) => foldNetworkName(item.name) === foldNetworkName(network));
     // Enabled from somewhere else — the console, another browser, an
     // administrator — this client used to sit on "unavailable" until a reload.
     if (terminalSocket && open && open.enabled !== false && open.runtime != null) {
@@ -2634,6 +2687,7 @@ async function loadEarlier() {
       m,
       myNick,
       (candidate) => b.kind === "channel" && fold(candidate) === b.key,
+      ircNames,
     );
     if (!route || route.kind !== b.kind || fold(route.target || "") !== b.key) continue;
     const kind = m.command === "NOTICE" ? "notice" : "msg";
@@ -2813,7 +2867,7 @@ async function boot() {
 // throws away an unsent message and races whatever the person does next.
 function openChosenNetwork(networks, networkFailure) {
   if (!networkFailure) {
-    const selected = networks.find((item) => fold(item.name) === fold(network));
+    const selected = networks.find((item) => foldNetworkName(item.name) === foldNetworkName(network));
     if (!selected) {
       setStatus(`${network} not found`, "error");
       showAlert(

@@ -405,8 +405,10 @@ async fn cli_sasl_login() {
     // PostgreSQL implementation. Approval is the one user action; the test
     // performs it through the same database primitive used by the approval
     // page, then proves the resulting cache authenticates an API request.
+    // The cache is named by a bare file name, relative to the working
+    // directory: its parent is empty, which must mean `.`.
     let device_path = token_directory.join("device-token.json");
-    let device_path_for_child = device_path.clone();
+    let login_directory = token_directory.clone();
     let base = format!("http://{http}");
     let base_for_child = base.clone();
     let (code_sender, code_receiver) = std::sync::mpsc::sync_channel(1);
@@ -415,8 +417,8 @@ async fn cli_sasl_login() {
         use std::process::Stdio;
 
         let mut child = Command::new(bin)
-            .arg("--token-file")
-            .arg(device_path_for_child)
+            .current_dir(login_directory)
+            .args(["--token-file", "device-token.json"])
             .args(["login", "--base", &base_for_child])
             .stderr(Stdio::piped())
             .spawn()
@@ -489,6 +491,38 @@ async fn cli_sasl_login() {
     );
     pool.close().await;
     drop_cli_sasl_database(&admin_url, &database_name).await;
+}
+
+/// A token cache that cannot be written is refused before the device flow
+/// starts: nothing is asked of the server, so the user is never asked to
+/// approve a login whose token would be thrown away.
+#[tokio::test]
+async fn cli_login_refuses_an_unwritable_token_cache_before_the_device_flow() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    let directory = std::env::temp_dir().join(format!("e6irc-cli-login-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("directory");
+    let not_a_directory = directory.join("file");
+    std::fs::write(&not_a_directory, b"x").expect("file");
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_e6irc"))
+            .arg("--token-file")
+            .arg(not_a_directory.join("token.json"))
+            .args(["login", "--base", &base])
+            .output()
+            .expect("run login")
+    })
+    .await
+    .expect("join");
+    listener.set_nonblocking(true).expect("nonblocking");
+    assert!(
+        listener.accept().is_err(),
+        "the device flow must not have started"
+    );
+    std::fs::remove_dir_all(&directory).expect("cleanup");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot store a token at"), "{stderr}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -782,6 +816,7 @@ async fn server_that_drops_after_the_join() -> (String, tokio::task::JoinHandle<
             let reply = match line.split_once(' ') {
                 Some(("CAP", "LS 302")) => ":srv CAP * LS :\r\n".to_string(),
                 Some(("CAP", "END")) => ":srv 001 tailer :Welcome\r\n".to_string(),
+                Some(("PING", token)) => format!(":srv PONG srv {token}\r\n"),
                 Some(("JOIN", channel)) => format!(":srv 366 tailer {channel} :End of NAMES\r\n"),
                 _ => String::new(),
             };
@@ -1177,6 +1212,46 @@ async fn cli_send_over_a_bridge_confirms_the_echo_under_the_account_nick() {
         output.status.success(),
         "the echo under the account's nick was not taken as ours; sent {seen:?}; stderr {stderr}"
     );
+}
+
+/// The network's 005 decides what `send` compares and joins. On an `ascii`
+/// network an echo to `#a{` is not the message sent to `#a[` (under the
+/// rfc1459 default it would be, and the refusal after it would go unread);
+/// with `CHANTYPES=#!` a `!` target is a channel, joined before speaking.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_send_follows_the_networks_casemapping_and_chantypes() {
+    let (address, served) = scripted_server(
+        "echo-message",
+        &[
+            (
+                "CAP END",
+                ":srv 001 sender :Welcome\r\n\
+                 :srv 005 sender CASEMAPPING=ascii CHANTYPES=#! :are supported by this server",
+            ),
+            (
+                "JOIN !a[",
+                ":sender!u@h JOIN !a[\r\n:srv 366 sender !a[ :End of NAMES",
+            ),
+            (
+                "PRIVMSG !a[ ",
+                ":sender!u@h PRIVMSG !a{ :hi\r\n:srv 404 sender !a[ :Cannot send to channel",
+            ),
+        ],
+        None,
+    )
+    .await;
+    let output = run_cli(address, &["--nick", "sender", "send", "!a[", "hi"], "").await;
+    let seen = served.await.unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        seen.iter().any(|line| line == "JOIN !a["),
+        "a CHANTYPES channel is joined first: {seen:?}"
+    );
+    assert!(
+        !output.status.success(),
+        "the echo to another channel was taken as ours; sent {seen:?}; stderr {stderr}"
+    );
+    assert!(stderr.contains("Cannot send to channel"), "{stderr}");
 }
 
 /// Register an observer on `address` as `nick`, and join `channel` (so it

@@ -9,6 +9,7 @@
 
 pub mod credentials;
 pub mod liveness;
+pub mod names;
 mod scram;
 pub mod token_cache;
 
@@ -16,6 +17,7 @@ use std::io;
 
 use e6irc_proto::framing::{LineBuffer, LineEvent};
 use e6irc_proto::message::Message;
+pub use names::NetworkNames;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -83,42 +85,46 @@ impl TerminalSafe {
 }
 
 /// `text` without mIRC formatting codes: bold (`^B`), colour (`^C` with up to
-/// two digits of foreground and an optional comma and two digits of
-/// background), hex colour (`^D` with six hex digits and an optional comma and
-/// six more), reset (`^O`), monospace (`^Q`), reverse (`^V`), italics (`^]`),
-/// strikethrough (`^^`) and underline (`^_`). A colour code's digits belong to
-/// the code, so `^C4hello` is `hello`; a comma not followed by a colour is
-/// text and stays.
+/// two digits of foreground and an optional comma and up to two digits of
+/// background), hex colour (`^D` with exactly six hex digits and an optional
+/// comma and exactly six more), reset (`^O`), monospace (`^Q`), reverse
+/// (`^V`), italics (`^]`), strikethrough (`^^`) and underline (`^_`). A colour
+/// code's digits belong to the code, so `^C4hello` is `hello`; a comma not
+/// followed by a colour is text and stays. A hex colour is all six digits or
+/// nothing: `^D` followed by fewer than six hex digits is a bare `^D` (a
+/// colour reset), so `^DBeef stew` keeps `Beef stew`.
 pub fn strip_formatting(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    // Consume up to `limit` characters that satisfy `accept`.
-    fn take(
-        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-        limit: usize,
-        accept: fn(&char) -> bool,
-    ) -> usize {
-        let mut taken = 0;
-        while taken < limit && chars.next_if(accept).is_some() {
-            taken += 1;
+    /// How many characters at the start of `rest` form one colour of the
+    /// code `code` (`^C` or `^D`): up to two decimal digits for `^C`, exactly
+    /// six hex digits (or none) for `^D`.
+    fn colour_len(code: char, rest: &[char]) -> usize {
+        let run = |limit: usize, accept: fn(&char) -> bool| {
+            rest.iter().take(limit).take_while(|c| accept(c)).count()
+        };
+        if code == '\x03' {
+            run(2, char::is_ascii_digit)
+        } else if run(6, char::is_ascii_hexdigit) == 6 {
+            6
+        } else {
+            0
         }
-        taken
     }
-    while let Some(c) = chars.next() {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while let Some(&c) = chars.get(i) {
+        i += 1;
         match c {
             '\x02' | '\x0f' | '\x11' | '\x16' | '\x1d' | '\x1e' | '\x1f' => {}
             '\x03' | '\x04' => {
-                let (limit, accept): (usize, fn(&char) -> bool) = if c == '\x03' {
-                    (2, char::is_ascii_digit)
-                } else {
-                    (6, char::is_ascii_hexdigit)
-                };
-                if take(&mut chars, limit, accept) > 0 {
-                    // A background only when a comma is followed by a colour.
-                    let mut lookahead = chars.clone();
-                    if lookahead.next() == Some(',') && lookahead.peek().is_some_and(accept) {
-                        chars.next();
-                        take(&mut chars, limit, accept);
+                let foreground = colour_len(c, &chars[i..]);
+                i += foreground;
+                // A background only after a foreground, and only when the
+                // comma is followed by a colour.
+                if foreground > 0 && chars.get(i) == Some(&',') {
+                    let background = colour_len(c, &chars[i + 1..]);
+                    if background > 0 {
+                        i += 1 + background;
                     }
                 }
             }
@@ -206,6 +212,9 @@ pub struct Connection {
     requested_when_offered: Vec<&'static str>,
     /// Those of `requested_when_offered` the server acknowledged.
     enabled_when_offered: Vec<&'static str>,
+    /// The network's `CASEMAPPING` and `CHANTYPES`, from every 005 read on
+    /// this connection (whichever read path read it).
+    names: NetworkNames,
 }
 
 /// Whether what is written to a connection can be read on the path — decided
@@ -1038,6 +1047,7 @@ impl Connection {
             transport,
             requested_when_offered: Vec::new(),
             enabled_when_offered: Vec::new(),
+            names: NetworkNames::default(),
             reader,
             writer,
             framing: LineBuffer::new(e6irc_proto::message::MAX_SERVER_FRAME_LEN),
@@ -1132,7 +1142,9 @@ impl Connection {
                                 format!("server sent an unparseable line: {e:?}"),
                             )
                         })?;
-                        return Ok(Some((OwnedMessage::from(&msg), text.to_string())));
+                        let msg = OwnedMessage::from(&msg);
+                        self.names.adopt_isupport(&msg);
+                        return Ok(Some((msg, text.to_string())));
                     }
                     LineEvent::TooLong => {
                         return Err(io::Error::new(
@@ -1179,6 +1191,9 @@ impl Connection {
                         // Best-effort parse; `None` means "relay only, don't
                         // act on it".
                         let parsed = Message::parse(&text).ok().map(|m| OwnedMessage::from(&m));
+                        if let Some(message) = &parsed {
+                            self.names.adopt_isupport(message);
+                        }
                         return Ok(Some(RelayEvent::Line {
                             message: parsed,
                             raw: text,
@@ -1720,7 +1735,16 @@ impl Connection {
                 "not UTF-8".to_owned(),
             ))
         })?;
-        awaiting.verify(server_final).map_err(failed)?;
+        awaiting.verify(server_final).map_err(|error| {
+            // `e=invalid-proof` and its kin are a verdict on the credentials,
+            // exactly like a 904 answering the proof: never retried.
+            let failure = if error.rejects_credentials() {
+                SaslFailure::Failed
+            } else {
+                SaslFailure::Protocol
+            };
+            SaslRejection::new(failure, &error.to_string()).into_error()
+        })?;
         self.send_line("AUTHENTICATE +").await?;
         Ok(None)
     }
@@ -1910,6 +1934,12 @@ impl Connection {
         .await
     }
 
+    /// The network's naming rules as its 005 lines so far declared them:
+    /// which targets are channels, and when two names are the same.
+    pub fn names(&self) -> &NetworkNames {
+        &self.names
+    }
+
     /// Whether the server advertised `capability` during registration.
     pub fn offers(&self, capability: &str) -> bool {
         self.advertised.offers(capability)
@@ -2087,7 +2117,6 @@ impl Connection {
         target: &str,
         request: HistoryRequest,
     ) -> io::Result<JoinedHistory> {
-        let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
         self.send_line(&format!("JOIN {target}")).await?;
         let mut events = Vec::new();
         let mut read_marker = None;
@@ -2102,16 +2131,18 @@ impl Connection {
             else {
                 continue;
             };
-            if let Some(refusal) = JoinRefusal::from_reply(target, &msg) {
+            // Read after the line: a 005 in this very burst has been adopted.
+            let names = &self.names;
+            if let Some(refusal) = JoinRefusal::from_reply(names, target, &msg) {
                 return Err(io::Error::new(io::ErrorKind::PermissionDenied, refusal));
             }
-            let joined =
-                msg.command == "366" && msg.params.iter().any(|value| casemap.eq(value, target));
+            let joined = msg.command == "366"
+                && numeric_subject(&msg).is_some_and(|channel| names.eq(channel, target));
             if msg.command == "MARKREAD"
                 && msg
                     .params
                     .first()
-                    .is_some_and(|candidate| casemap.eq(candidate, target))
+                    .is_some_and(|candidate| names.eq(candidate, target))
             {
                 read_marker = msg
                     .params
@@ -2346,8 +2377,8 @@ impl JoinRefusal {
     /// Read `reply` as the server's refusal of a `JOIN` of `channel`. 470 is a
     /// refusal too: the server joined some other channel on its own initiative,
     /// and the 366 that follows names that one, never `channel`.
-    fn from_reply(channel: &str, reply: &OwnedMessage) -> Option<Self> {
-        if !is_join_refusal(channel, reply) {
+    fn from_reply(names: &NetworkNames, channel: &str, reply: &OwnedMessage) -> Option<Self> {
+        if !is_join_refusal(names, channel, reply) {
             return None;
         }
         let forwarded_to = (reply.command == "470")
@@ -2382,11 +2413,19 @@ impl std::fmt::Display for JoinRefusal {
 
 impl std::error::Error for JoinRefusal {}
 
-/// Whether a message target names a channel rather than a nickname. `&` marks
-/// a server-local channel and is as much a channel as `#`; the native clients
-/// share this so none of them joins one kind and silently ignores the other.
-pub fn is_channel_target(target: &str) -> bool {
-    target.starts_with(['#', '&'])
+/// Where a numeric reply names what it is about, after the client's own nick
+/// in `params[0]`: `params[1]` for nearly every reply, but `params[2]` for the
+/// ones that put something else first — `353` (`<client> <symbol> <channel>
+/// :<names>`, whose `params[1]` is `=`, `@` or `*`), `341` (`<client> <nick>
+/// <channel>`), `441` and `443` (`<client> <nick> <channel> :<reason>`). The
+/// one table every client routes numerics by, so none of them mistakes a
+/// NAMES symbol or a nickname for the subject.
+pub fn numeric_subject(message: &OwnedMessage) -> Option<&str> {
+    let index = match message.command.as_str() {
+        "341" | "353" | "441" | "443" => 2,
+        _ => 1,
+    };
+    message.params.get(index).map(String::as_str)
 }
 
 /// Whether `reply` refuses a `JOIN` of `channel`: the replies that mean the 366
@@ -2400,8 +2439,7 @@ pub fn is_channel_target(target: &str) -> bool {
 /// deadline and the caller retrying forever. Any [`is_refusal`] reply about
 /// `channel` is its refusal: an error numeric whose subject is `channel`, or a
 /// `FAIL JOIN` whose context names `channel` or names nothing at all.
-fn is_join_refusal(channel: &str, reply: &OwnedMessage) -> bool {
-    let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
+fn is_join_refusal(names: &NetworkNames, channel: &str, reply: &OwnedMessage) -> bool {
     if !is_refusal(reply) {
         return false;
     }
@@ -2413,16 +2451,13 @@ fn is_join_refusal(channel: &str, reply: &OwnedMessage) -> bool {
             .is_some_and(|command| command.eq_ignore_ascii_case("JOIN"))
             && match reply.params.get(2..reply.params.len().saturating_sub(1)) {
                 Some(context) if !context.is_empty() => {
-                    context.iter().any(|subject| casemap.eq(subject, channel))
+                    context.iter().any(|subject| names.eq(subject, channel))
                 }
                 _ => true,
             };
     }
     // An error numeric: <client> <channel> [...] :<reason>
-    reply
-        .params
-        .get(1)
-        .is_some_and(|subject| casemap.eq(subject, channel))
+    numeric_subject(reply).is_some_and(|subject| names.eq(subject, channel))
 }
 
 /// Map a registration-refusal numeric to a terminal error, if it is one. These
@@ -2690,7 +2725,9 @@ pub fn bounded_diagnostic(detail: &str) -> String {
 /// callers must not collapse them into one "authentication failed".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaslFailure {
-    /// 904 for a mechanism the server does offer: the credentials are wrong.
+    /// 904 for a mechanism the server does offer, or a SCRAM server-final
+    /// `e=invalid-proof` / `e=unknown-user` / `e=invalid-encoding` /
+    /// `e=invalid-username-encoding`: the credentials are wrong.
     Failed,
     /// 902: the account is locked, held, or otherwise unavailable.
     NickLocked,
@@ -3175,6 +3212,8 @@ mod tests {
         ForgedSignature,
         /// Reject the proof with 904, as for a wrong password.
         RejectProof,
+        /// Answer the proof with the RFC 5802 server-final `e=<error>`.
+        ServerFinalError(&'static str),
     }
 
     /// A server that advertises `offered`, expects the client to choose
@@ -3291,6 +3330,17 @@ mod tests {
         if mode == ScramServerMode::RejectProof {
             writer
                 .write_all(b":srv 904 nick :SASL authentication failed\r\n")
+                .await
+                .unwrap();
+        } else if let ScramServerMode::ServerFinalError(error) = mode {
+            writer
+                .write_all(
+                    format!(
+                        "AUTHENTICATE {}\r\n",
+                        e6irc_proto::base64::encode(format!("e={error}").as_bytes())
+                    )
+                    .as_bytes(),
+                )
                 .await
                 .unwrap();
         } else {
@@ -3493,6 +3543,46 @@ mod tests {
         assert_eq!(rejection.failure(), SaslFailure::Failed);
         drop(connection);
         server.await.unwrap();
+    }
+
+    /// A SCRAM server-final `e=` naming the credentials is the same verdict
+    /// as a 904: the credentials are rejected (never retried), and nothing
+    /// weaker is offered. Any other `e=` stays a protocol failure.
+    #[tokio::test]
+    async fn a_scram_server_final_error_about_the_credentials_rejects_them() {
+        for (error, expected) in [
+            ("invalid-proof", SaslFailure::Failed),
+            ("unknown-user", SaslFailure::Failed),
+            ("invalid-encoding", SaslFailure::Failed),
+            ("other-error", SaslFailure::Protocol),
+        ] {
+            let (mut connection, server_io) = duplex_connection(16 * 1024);
+            let server = tokio::spawn(scram_server(
+                server_io,
+                "PLAIN,SCRAM-SHA-512",
+                scram::ScramHash::Sha512,
+                ScramServerMode::ServerFinalError(error),
+            ));
+            let failure = connection
+                .register_sasl(&TEST_IDENTITY, "user", "pencil")
+                .await
+                .expect_err("the server-final is an error");
+            let rejection = SaslRejection::from_error(&failure).expect("typed SASL rejection");
+            assert_eq!(rejection.failure(), expected, "{error}");
+            assert!(rejection.diagnostic().contains(error), "{error}");
+            if expected == SaslFailure::Failed {
+                assert!(matches!(
+                    rejection.class(),
+                    SaslRejectionClass::CredentialsRejected(_)
+                ));
+            }
+            drop(connection);
+            assert_eq!(
+                server.await.unwrap(),
+                Vec::<String>::new(),
+                "no fallback was offered after {error}"
+            );
+        }
     }
 
     /// A server that named no mechanisms is offered PLAIN; when its 908 names
@@ -4639,6 +4729,60 @@ mod tests {
         assert_eq!(messages_of(&events).len(), 4);
     }
 
+    /// The network's 005 decides which names are the same: on an `ascii`
+    /// network `#a{` is another channel than `#a[`, so neither its refusal nor
+    /// its end-of-names is this join's, and the 005 is on the connection.
+    #[tokio::test]
+    async fn a_join_matches_replies_under_the_networks_casemapping() {
+        let (mut connection, server_io) = duplex_connection(16 * 1024);
+        let (_reader, mut writer) = tokio::io::split(server_io);
+        writer
+            .write_all(
+                b":srv 005 nick CASEMAPPING=ascii CHANTYPES=# :are supported by this server\r\n\
+                  :srv 474 nick #a{ :Cannot join channel (+b)\r\n\
+                  :srv 366 nick #a{ :End of NAMES\r\n\
+                  :srv 353 nick = #A[ :nick\r\n\
+                  :srv 366 nick #A[ :End of NAMES\r\n",
+            )
+            .await
+            .unwrap();
+        let events = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            connection.join_with_latest_history("#a[", 0),
+        )
+        .await
+        .expect("bounded")
+        .expect("#a{ is not #a[ on an ascii network");
+        assert_eq!(messages_of(&events).len(), 5, "ended at #A['s 366");
+        let names = connection.names();
+        assert!(!names.eq("#a[", "#a{"), "the connection holds the 005");
+        assert!(!names.is_channel("&local"));
+    }
+
+    /// The subject of a numeric is where that numeric puts it: NAMES leads
+    /// with a visibility symbol, INVITING and USERNOTINCHANNEL with a nick.
+    #[test]
+    fn the_numeric_subject_table_skips_symbols_and_nicks() {
+        for (line, subject) in [
+            (":srv 353 me = #chan :a b", "#chan"),
+            (":srv 353 me @ #chan :a b", "#chan"),
+            (":srv 341 me bob #chan", "#chan"),
+            (
+                ":srv 441 me bob #chan :They aren't on that channel",
+                "#chan",
+            ),
+            (":srv 443 me bob #chan :is already on channel", "#chan"),
+            (":srv 366 me #chan :End", "#chan"),
+            (":srv 474 me #chan :Banned", "#chan"),
+        ] {
+            assert_eq!(
+                numeric_subject(&OwnedMessage::from(&Message::parse(line).unwrap())),
+                Some(subject),
+                "{line}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_join_burst_without_end_is_bounded() {
         let (mut connection, server_io) = duplex_connection(1024 * 1024);
@@ -4896,6 +5040,12 @@ mod tests {
                 "italic understrikemonorev",
             ),
             ("\x03999", "9"),
+            // A hex colour is six digits or nothing: a lone ^D is a reset.
+            ("\x04Beef stew", "Beef stew"),
+            ("\x04abcde plain", "abcde plain"),
+            ("\x04ff0000,Beef stew", ",Beef stew"),
+            ("\x04ff0000,00ff0 x", ",00ff0 x"),
+            ("\x04ABCDEF0", "0"),
         ] {
             assert_eq!(strip_formatting(formatted), plain, "{formatted:?}");
         }

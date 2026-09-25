@@ -15,7 +15,7 @@ use e6irc_client::credentials::{
 use e6irc_client::liveness::{Heard, LIVENESS_WINDOW, Liveness};
 use e6irc_client::{
     CleartextCredentials, ClientEvent, Connection, ConnectionOptions, HistoryCoverage, JoinRefusal,
-    OwnedMessage, Registered, TerminalSafe,
+    NetworkNames, OwnedMessage, Registered, TerminalSafe,
 };
 use e6irc_tui::app::{App, LogLine, SCROLLBACK_LINES};
 use e6irc_tui::keys::{self, KeyOutcome};
@@ -276,7 +276,12 @@ async fn async_main(cli: Cli) -> io::Result<()> {
         },
     ));
 
+    // Before the terminal is taken over: from then on a signal ends the UI
+    // the way /quit does, through the teardown below, never mid-draw with the
+    // terminal left raw.
+    let mut signalled = quit_on_signal()?;
     let mut terminal = ratatui::init();
+    restore_paste_on_panic();
     let mut app = App::new(cli.channel, confirmed_nick);
     for refusal in refused {
         apply(&mut app, Ev::JoinRefused(refusal));
@@ -288,7 +293,16 @@ async fn async_main(cli: Cli) -> io::Result<()> {
         apply(&mut app, event);
     }
     let result = match crossterm::execute!(io::stdout(), event::EnableBracketedPaste) {
-        Ok(()) => run_ui(&mut terminal, &mut app, &mut net_rx, &out_tx).await,
+        Ok(()) => {
+            run_ui(
+                &mut terminal,
+                &mut app,
+                &mut net_rx,
+                &out_tx,
+                &mut signalled,
+            )
+            .await
+        }
         Err(error) => Err(error),
     };
     let paste_restored = crossterm::execute!(io::stdout(), event::DisableBracketedPaste);
@@ -308,6 +322,62 @@ async fn async_main(cli: Cli) -> io::Result<()> {
         0 => Ok(()),
         _ => Err(io::Error::other(failures.join("; "))),
     }
+}
+
+/// Watch for the signals that ask a terminal program to end — SIGTERM (a
+/// service manager, `kill`), SIGINT (`kill -INT`; Ctrl-C itself is a key in
+/// raw mode) and SIGHUP (the terminal closing). Their default action kills the
+/// process on the spot, leaving the terminal raw, on the alternate screen and
+/// in bracketed-paste mode, and the server without a QUIT. The receiver
+/// yields the signal's name once one arrives.
+#[cfg(unix)]
+fn quit_on_signal() -> io::Result<tokio::sync::oneshot::Receiver<&'static str>> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let name = tokio::select! {
+            _ = terminate.recv() => "SIGTERM",
+            _ = interrupt.recv() => "SIGINT",
+            _ = hangup.recv() => "SIGHUP",
+        };
+        // The UI may already have gone; then there is nothing left to end.
+        sender.send(name).unwrap_or_default();
+    });
+    Ok(receiver)
+}
+
+/// Where there are no Unix signals, the console's Ctrl-C/Ctrl-Break event is
+/// the request to end.
+#[cfg(not(unix))]
+fn quit_on_signal() -> io::Result<tokio::sync::oneshot::Receiver<&'static str>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            sender.send("Ctrl-C").unwrap_or_default();
+        }
+    });
+    Ok(receiver)
+}
+
+/// Chain a panic hook onto ratatui's (which leaves raw mode and the alternate
+/// screen) that first turns bracketed paste off: ratatui never turned it on,
+/// so its hook leaves it on and every later paste into the shell arrives
+/// wrapped in `ESC[200~`…`ESC[201~`.
+fn restore_paste_on_panic() {
+    let restore_terminal = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Nothing more can be done about a terminal that refuses the write
+        // while the process is already panicking.
+        drop(crossterm::execute!(
+            io::stdout(),
+            event::DisableBracketedPaste
+        ));
+        restore_terminal(info);
+    }));
 }
 
 /// Hand the network task the last read marker, close the writer queue so it
@@ -570,7 +640,7 @@ async fn relay_session(
                     Err(error) => return SessionEnd::Failed(error.to_string()),
                 };
                 if let ClientEvent::Message(message) = &event {
-                    track_own_state(joined_channels, own_nick, message);
+                    track_own_state(joined_channels, own_nick, conn.names(), message);
                 }
                 if net_tx.send(Ev::Net(event)).await.is_err() {
                     return finish(conn, out_rx).await;
@@ -685,17 +755,17 @@ async fn connect_and_join(
 fn track_own_state(
     channels: &mut std::collections::BTreeSet<String>,
     own_nick: &mut String,
+    names: &NetworkNames,
     message: &OwnedMessage,
 ) {
-    let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
     if message.command == "KICK"
         && message
             .params
             .get(1)
-            .is_some_and(|nick| casemap.eq(nick, own_nick))
+            .is_some_and(|nick| names.eq(nick, own_nick))
     {
         if let Some(channel) = message.params.first() {
-            remove_channel(channels, channel);
+            remove_channel(channels, names, channel);
         }
         return;
     }
@@ -703,23 +773,29 @@ fn track_own_state(
         .source
         .as_deref()
         .and_then(|source| source.split('!').next());
-    if !source_nick.is_some_and(|nick| casemap.eq(nick, own_nick)) {
+    if !source_nick.is_some_and(|nick| names.eq(nick, own_nick)) {
         return;
     }
     match (message.command.as_str(), message.params.first()) {
-        ("JOIN", Some(channel)) => {
+        // A JOIN of a channel already held under another spelling is the
+        // same channel: one entry, or a reconnect joins it twice.
+        ("JOIN", Some(channel)) if !channels.iter().any(|held| names.eq(held, channel)) => {
             channels.insert(channel.clone());
         }
-        ("PART", Some(channel)) => remove_channel(channels, channel),
+        ("PART", Some(channel)) => remove_channel(channels, names, channel),
         ("NICK", Some(nick)) => own_nick.clone_from(nick),
         _ => {}
     }
 }
 
-fn remove_channel(channels: &mut std::collections::BTreeSet<String>, channel: &str) {
+fn remove_channel(
+    channels: &mut std::collections::BTreeSet<String>,
+    names: &NetworkNames,
+    channel: &str,
+) {
     let existing = channels
         .iter()
-        .find(|candidate| e6irc_proto::casemap::CaseMapping::Rfc1459.eq(candidate, channel))
+        .find(|candidate| names.eq(candidate, channel))
         .cloned();
     if let Some(existing) = existing {
         channels.remove(&existing);
@@ -731,12 +807,17 @@ async fn run_ui<B: Backend>(
     app: &mut App,
     net_rx: &mut mpsc::Receiver<Ev>,
     out_tx: &mpsc::Sender<Queued>,
+    signalled: &mut tokio::sync::oneshot::Receiver<&'static str>,
 ) -> io::Result<()>
 where
     io::Error: From<B::Error>,
 {
     let mut dirty = true;
     loop {
+        if let Ok(name) = signalled.try_recv() {
+            app.status(format!("{name} received; quitting"));
+            app.should_quit = true;
+        }
         // Drain any pending network events.
         while let Ok(ev) = net_rx.try_recv() {
             dirty = true;
@@ -1409,11 +1490,25 @@ mod tests {
     fn reconnect_channels_track_self_join_part_and_kick_case_insensitively() {
         let mut channels = std::collections::BTreeSet::from(["#Home".to_owned()]);
         let mut nick = "Me".to_owned();
-        track_own_state(&mut channels, &mut nick, &message(":me!u@h JOIN #Other"));
+        let names = NetworkNames::default();
+        track_own_state(
+            &mut channels,
+            &mut nick,
+            &names,
+            &message(":me!u@h JOIN #HOME"),
+        );
+        assert_eq!(channels.len(), 1, "one channel under two spellings");
+        track_own_state(
+            &mut channels,
+            &mut nick,
+            &names,
+            &message(":me!u@h JOIN #Other"),
+        );
         assert!(channels.contains("#Other"));
         track_own_state(
             &mut channels,
             &mut nick,
+            &names,
             &message(":ME!u@h PART #other :bye"),
         );
         assert!(
@@ -1422,24 +1517,65 @@ mod tests {
                 .any(|channel| channel.eq_ignore_ascii_case("#other"))
         );
         // Own joins are only recognisable under the current nickname.
-        track_own_state(&mut channels, &mut nick, &message(":me!u@h NICK Renamed"));
+        track_own_state(
+            &mut channels,
+            &mut nick,
+            &names,
+            &message(":me!u@h NICK Renamed"),
+        );
         assert_eq!(nick, "Renamed");
         track_own_state(
             &mut channels,
             &mut nick,
+            &names,
             &message(":renamed!u@h JOIN #later"),
         );
         assert!(channels.contains("#later"));
-        track_own_state(&mut channels, &mut nick, &message(":me!u@h JOIN #not-ours"));
+        track_own_state(
+            &mut channels,
+            &mut nick,
+            &names,
+            &message(":me!u@h JOIN #not-ours"),
+        );
         assert!(!channels.contains("#not-ours"));
         track_own_state(
             &mut channels,
             &mut nick,
+            &names,
             &message(":op!u@h KICK #home RENAMED :gone"),
         );
         assert_eq!(
             channels,
             std::collections::BTreeSet::from(["#later".to_owned()])
+        );
+    }
+
+    /// On an `ascii` network `#a[` and `#a{` are two channels: parting one
+    /// keeps the other in the set a reconnect rejoins.
+    #[test]
+    fn reconnect_channels_follow_the_networks_casemapping() {
+        let mut names = NetworkNames::default();
+        names.adopt_isupport(&message(
+            ":srv 005 me CASEMAPPING=ascii :are supported by this server",
+        ));
+        let mut channels = std::collections::BTreeSet::from(["#a[".to_owned()]);
+        let mut nick = "me".to_owned();
+        track_own_state(
+            &mut channels,
+            &mut nick,
+            &names,
+            &message(":me!u@h JOIN #a{"),
+        );
+        assert_eq!(channels.len(), 2);
+        track_own_state(
+            &mut channels,
+            &mut nick,
+            &names,
+            &message(":me!u@h PART #a{"),
+        );
+        assert_eq!(
+            channels,
+            std::collections::BTreeSet::from(["#a[".to_owned()])
         );
     }
 

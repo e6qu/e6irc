@@ -2978,8 +2978,14 @@ two seconds) and reports that refusal, not the broken pipe.
 URI and user code, honors the server's polling interval/slow-down/expiry
 contract, and atomically stores the issued bearer token without printing it.
 The shared cache includes the issuing API origin so `api` cannot silently send
-it to a different `--base`; an explicit token or `E6IRC_API_TOKEN` wins without
-requiring a cache path. Unix storage is created with private directory/file
+it to a different `--base`; an explicit token (`--token`,
+`--bearer-token-file`, `E6IRC_API_TOKEN`) is the one sent, and without
+`--base` it goes to the cached login's origin (the cache is read for the origin
+only — its token is never mixed in); with `--base` the cache is not read. The
+cache path is proved writable (its private directory created, a temporary file
+made and removed) before the device flow starts, so a path that cannot hold the
+token fails before the user approves anything; a bare file name
+(`--token-file token.json`) lives in the current directory. Unix storage is created with private directory/file
 modes and refused when group/other-readable. Windows uses the current user's
 local application-data directory and atomic replacement. Both native clients
 can use the same cache for SASL OAUTHBEARER with `--oauth-from-cache`.
@@ -3004,14 +3010,31 @@ with "server stopped responding" and runs the reconnect path; the answer to
 its own probe stays out of the log. Reconnection is not a fixed
 two-second loop: rejected credentials, a rejected server password, and a ban
 are never retried (the client stops with a final status, as the bouncer's
-driver parks), and any other failure backs off exponentially from
+driver parks) — a SCRAM server-final `e=invalid-proof`, `e=unknown-user`,
+`e=invalid-encoding` or `e=invalid-username-encoding` is a credential rejection
+exactly like a 904 answering the proof — and any other failure backs off exponentially from
 `--reconnect-delay` to five minutes. A refused channel is dropped from the
 session with a status line instead of failing the whole connect. A refusal is
 any error numeric or `FAIL JOIN` about that channel, not a list of known
 numerics: one this client never heard of (479, 489, 520, ...) would otherwise
 leave the join waiting out its deadline and the client reconnecting forever.
 Messages to a STATUSMSG target (`@#chan`, `+#chan`, with the sigils the
-server's `005 STATUSMSG` declares) are shown in the channel's buffer. The client
+server's `005 STATUSMSG` declares) are shown in the channel's buffer.
+Which targets are channels and which names are the same are the network's:
+every native client (CLI, TUI, and the `e6irc-client` join/refusal matching)
+reads `005 CASEMAPPING` and `CHANTYPES` through one
+`e6irc_client::NetworkNames`, recorded on the `Connection` from every 005 it
+reads, defaulting to `rfc1459` and `#&` until one arrives. `rfc1459`,
+`rfc1459-strict` (also spelled `strict-rfc1459`) and `ascii` are known; any
+other mapping is compared as `ascii` (the letters every mapping folds) and the
+client says so. On an `ascii` network `#a[` and `#a{` are two channels. The CLI
+reads the welcome burst up to a round trip before it classifies or compares a
+target; the TUI re-reads a 005 mid-session and says when two open buffers
+become one name. The web client does the same from the session event's
+`isupport` and from live 005s, re-keying its buffers (keyed by the fold) and
+merging any two the new rules make one name. The subject of a numeric is read
+where that numeric puts it (`e6irc_client::numeric_subject`: `params[2]` for
+353, 341, 441 and 443), so a NAMES reply is shown beside its channel. The client
 adopts the nickname the server confirmed — a BNC's welcome carries the real
 upstream nick, which may differ from `--nick` — and follows its own NICK
 changes, so direct messages and its own JOIN/PART are recognised. Every error
@@ -3036,7 +3059,11 @@ INVITE, TOPIC and MODE are rendered; `/me` renders as `* nick …` and mIRC
 formatting is stripped; long lines wrap by display width; a resize redraws at
 once. A multi-line bracketed paste is refused whole rather than sent line by
 line. Quitting sends the queued lines and the last read marker, then `QUIT`,
-within five seconds, and says so if it could not. A read marker is never
+within five seconds, and says so if it could not. SIGTERM, SIGINT and SIGHUP
+end the UI the same way (they would otherwise kill it with the terminal raw,
+on the alternate screen and in bracketed-paste mode, and send no `QUIT`), and a
+panic hook chained onto ratatui's turns bracketed paste off before the
+terminal is restored. A read marker is never
 flushed while disconnected, so one that meets a disconnect is sent after
 reconnecting rather than reported as a lost message. Startup failures print
 `e6irc-tui: <message>` and exit 1. While the current
@@ -3052,7 +3079,8 @@ instead of being lost.
 Capability refusal fails visibly rather than degrading into a different
 experience. A pseudo-terminal journey drives the real full-screen binary
 against e6ircd and proves inbound rendering, outbound delivery, clean exit,
-and terminal restoration. “Multi-buffer” means several channels/queries inside
+and terminal restoration — including after SIGTERM, SIGINT and SIGHUP, each of
+which must still send `QUIT`. “Multi-buffer” means several channels/queries inside
 one connection, not several simultaneous networks; the BNC is the
 cross-network multiplexer.
 

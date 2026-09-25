@@ -72,7 +72,9 @@ cannot be prefix-built.
 
 **Casemapping / casefold** — the rule (here `rfc1459`) for treating nicks
 and channels case-insensitively. A *casefolded* key is the canonical form
-used for lookups, so display casing never indexes a table.
+used for lookups, so display casing never indexes a table. The clients use the
+upstream network's own rule from its `005 CASEMAPPING` (and its channel
+prefixes from `CHANTYPES`), through `e6irc_client::NetworkNames`.
 
 **MOTD** — Message of the Day, the banner sent after a client registers.
 

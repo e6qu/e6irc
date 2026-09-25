@@ -48,6 +48,18 @@ impl CaseMapping {
                 .all(|(x, y)| self.lower(x) == self.lower(y))
     }
 
+    /// The mapping an `RPL_ISUPPORT CASEMAPPING=` value names, when it is one
+    /// of these. `strict-rfc1459` is the spelling older servers (hybrid,
+    /// ratbox) advertise for `rfc1459-strict`.
+    pub fn from_isupport_token(value: &str) -> Option<Self> {
+        match value {
+            "rfc1459" => Some(Self::Rfc1459),
+            "rfc1459-strict" | "strict-rfc1459" => Some(Self::Rfc1459Strict),
+            "ascii" => Some(Self::Ascii),
+            _ => None,
+        }
+    }
+
     /// The value advertised in `RPL_ISUPPORT CASEMAPPING=`.
     pub const fn isupport_token(self) -> &'static str {
         match self {
@@ -128,5 +140,16 @@ mod tests {
         assert_eq!(Rfc1459.isupport_token(), "rfc1459");
         assert_eq!(Rfc1459Strict.isupport_token(), "rfc1459-strict");
         assert_eq!(Ascii.isupport_token(), "ascii");
+        for mapping in [Rfc1459, Rfc1459Strict, Ascii] {
+            assert_eq!(
+                super::CaseMapping::from_isupport_token(mapping.isupport_token()),
+                Some(mapping)
+            );
+        }
+        assert_eq!(
+            super::CaseMapping::from_isupport_token("strict-rfc1459"),
+            Some(Rfc1459Strict)
+        );
+        assert_eq!(super::CaseMapping::from_isupport_token("rfc7613"), None);
     }
 }

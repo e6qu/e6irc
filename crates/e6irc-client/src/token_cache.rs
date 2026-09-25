@@ -224,42 +224,78 @@ fn check_private_permissions(
     Ok(())
 }
 
-/// Atomically store a token, creating a private parent directory and file.
-pub fn store_token(path: &Path, token: &CachedToken) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    let Some(parent) = parent else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "token cache path must have a parent directory",
-        ));
-    };
-    create_private_directory(parent)?;
-
-    let bytes = serde_json::to_vec(token)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+/// Where the token file `path` lives: its directory (the current directory
+/// for a bare file name such as `token.json`, whose parent is empty) and its
+/// file name.
+fn token_file_location(path: &Path) -> io::Result<(&Path, &std::ffi::OsStr)> {
     let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "token cache path must end in a file name",
+            format!(
+                "token cache path must end in a file name: {}",
+                path.display()
+            ),
         )
     })?;
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    Ok((parent, file_name))
+}
+
+/// The temporary file a store of `path` writes before renaming it into place.
+fn staging_path(parent: &Path, file_name: &std::ffi::OsStr) -> io::Result<PathBuf> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| io::Error::other(format!("system clock precedes Unix epoch: {error}")))?
         .as_nanos();
-    let temporary = parent.join(format!(
+    Ok(parent.join(format!(
         ".{}.{}.{nonce}.tmp",
         file_name.to_string_lossy(),
         std::process::id(),
-    ));
+    )))
+}
+
+/// Open a new private temporary file for writing.
+fn create_private_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    make_file_private(&mut options);
+    options.open(path)
+}
+
+/// Prove that a token can later be stored at `path`, before anything is
+/// asked of the user: create its private directory and a temporary file in
+/// it, then remove the file. A device login calls this before starting the
+/// flow, so an unusable path fails before the user approves anything rather
+/// than after, when the approved token could only be thrown away.
+pub fn check_token_path_writable(path: &Path) -> io::Result<()> {
+    let (parent, file_name) = token_file_location(path)?;
+    if fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("token cache path is a directory: {}", path.display()),
+        ));
+    }
+    create_private_directory(parent)?;
+    let probe = staging_path(parent, file_name)?;
+    drop(create_private_file(&probe)?);
+    fs::remove_file(&probe)
+}
+
+/// Atomically store a token, creating a private parent directory and file.
+/// A bare file name is stored in the current directory.
+pub fn store_token(path: &Path, token: &CachedToken) -> io::Result<()> {
+    let (parent, file_name) = token_file_location(path)?;
+    create_private_directory(parent)?;
+
+    let bytes = serde_json::to_vec(token)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let temporary = staging_path(parent, file_name)?;
 
     let result = (|| {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        make_file_private(&mut options);
-        let mut file = options.open(&temporary)?;
+        let mut file = create_private_file(&temporary)?;
         file.write_all(&bytes)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
@@ -355,6 +391,42 @@ mod tests {
             "e6irc-token-cache-{}-{sequence}-{name}",
             std::process::id(),
         ))
+    }
+
+    /// A bare file name lives in the current directory; its empty parent is
+    /// `.`, not an error discovered after the user approved a device login.
+    #[test]
+    fn a_bare_file_name_is_stored_in_the_current_directory() {
+        let (parent, file_name) = token_file_location(Path::new("token.json")).unwrap();
+        assert_eq!(parent, Path::new("."));
+        assert_eq!(file_name, "token.json");
+        let (parent, _) = token_file_location(Path::new("dir/token.json")).unwrap();
+        assert_eq!(parent, Path::new("dir"));
+        assert!(token_file_location(Path::new("/")).is_err());
+    }
+
+    /// The pre-flight check fails exactly where a later store would, and
+    /// leaves nothing behind where it succeeds.
+    #[test]
+    fn an_unwritable_token_path_is_refused_before_any_login() {
+        let directory = temporary_path("preflight");
+        let path = directory.join("token.json");
+        check_token_path_writable(&path).unwrap();
+        assert_eq!(
+            fs::read_dir(&directory).unwrap().count(),
+            0,
+            "no probe left"
+        );
+        assert!(
+            check_token_path_writable(&directory).is_err(),
+            "a directory"
+        );
+        fs::write(directory.join("file"), b"x").unwrap();
+        assert!(
+            check_token_path_writable(&directory.join("file").join("token.json")).is_err(),
+            "a parent that is a file"
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

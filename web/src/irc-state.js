@@ -4,29 +4,123 @@
 // Node tests. Keeping protocol-shaped state out of main.js makes the ordering
 // and identity rules testable without a DOM.
 
-// RFC1459 casefold, matching the server's CaseMapping::Rfc1459.
-export function fold(value) {
+// ---- network naming ------------------------------------------------------
+//
+// Which targets are channels (CHANTYPES) and when two names are the same
+// (CASEMAPPING) are properties of the network, declared in its 005, exactly as
+// e6irc-client's NetworkNames reads them. Until they arrive -- and after a 005
+// retracts one (`-CASEMAPPING`, `-CHANTYPES`) -- RFC 1459 holds: `rfc1459` and
+// `#&`. The mappings known are the server's own (e6irc-proto CaseMapping):
+// `rfc1459`, `rfc1459-strict` (also spelled `strict-rfc1459` by older
+// servers) and `ascii`. Any other (`rfc7613`, `rfc3454`, ...) is compared as
+// `ascii` -- the letters every mapping folds and nothing else -- and kept as
+// `unrecognised` so the page can say so rather than guess silently.
+export const DEFAULT_NAMES = Object.freeze({
+  casemapping: "rfc1459",
+  chantypes: "#&",
+  unrecognised: null,
+});
+
+const KNOWN_CASEMAPPINGS = new Map([
+  ["rfc1459", "rfc1459"],
+  ["rfc1459-strict", "rfc1459-strict"],
+  ["strict-rfc1459", "rfc1459-strict"],
+  ["ascii", "ascii"],
+]);
+
+// `value` in the network's canonical case, for keying buffers and nicks.
+// Without `names`, RFC 1459 (matching the server's CaseMapping::Rfc1459).
+export function fold(value, names = DEFAULT_NAMES) {
+  const mapping = names.casemapping;
+  const specials = mapping !== "ascii";
   let out = "";
   for (const ch of value) {
     const code = ch.charCodeAt(0);
     if (code >= 65 && code <= 90) out += String.fromCharCode(code + 32);
-    else if (ch === "[") out += "{";
-    else if (ch === "]") out += "}";
-    else if (ch === "\\") out += "|";
-    else if (ch === "~") out += "^";
+    else if (specials && ch === "[") out += "{";
+    else if (specials && ch === "]") out += "}";
+    else if (specials && ch === "\\") out += "|";
+    else if (mapping === "rfc1459" && ch === "~") out += "^";
     else out += ch;
   }
   return out;
 }
 
-export function isChannel(target) {
-  return target.startsWith("#") || target.startsWith("&");
+export function isChannel(target, names = DEFAULT_NAMES) {
+  return typeof target === "string" && target.length > 0 && names.chantypes.includes(target[0]);
 }
+
+// Fold the CASEMAPPING and CHANTYPES tokens of one 005 line into `current`.
+export function namesFrom(params, current = DEFAULT_NAMES) {
+  let names = current;
+  // <me> TOKEN... :are supported by this server -- tokens never contain spaces.
+  for (const token of params.slice(1).filter((param) => !param.includes(" "))) {
+    const equals = token.indexOf("=");
+    const key = equals === -1 ? token : token.slice(0, equals);
+    const value = equals === -1 ? "" : token.slice(equals + 1);
+    if (key === "-CASEMAPPING") {
+      names = { ...names, casemapping: DEFAULT_NAMES.casemapping, unrecognised: null };
+    } else if (key === "CASEMAPPING") {
+      const known = KNOWN_CASEMAPPINGS.get(value);
+      names = known
+        ? { ...names, casemapping: known, unrecognised: null }
+        : { ...names, casemapping: "ascii", unrecognised: value };
+    } else if (key === "-CHANTYPES") {
+      names = { ...names, chantypes: DEFAULT_NAMES.chantypes };
+    } else if (key === "CHANTYPES") {
+      // `CHANTYPES=` (or a bare `CHANTYPES`): the network has no channels.
+      names = { ...names, chantypes: value };
+    }
+  }
+  return Object.freeze(names);
+}
+
+// The rules an authoritative session event's ISUPPORT tokens describe: the
+// defaults, overridden by the network's own CASEMAPPING and CHANTYPES.
+export function namesFromIsupport(tokens) {
+  return namesFrom(["", ...tokens], DEFAULT_NAMES);
+}
+
+// Whether two naming rules key names differently, so buffers keyed under one
+// must be re-keyed under the other.
+export function namesDiffer(a, b) {
+  return a.casemapping !== b.casemapping || a.chantypes !== b.chantypes;
+}
+
+// Re-key a Map of buffers (keyed by fold) under `names`. Two buffers that the
+// new rules make one name are merged into the first: its lines, then the
+// other's, with their unread counts added. Returns the new map and each
+// merged pair, so the page can say what it merged.
+export function rekeyBuffers(buffers, names) {
+  const rekeyed = new Map();
+  const merged = [];
+  for (const buffer of buffers.values()) {
+    const key = buffer.key === SERVER_KEY ? SERVER_KEY : fold(buffer.display, names);
+    const existing = rekeyed.get(key);
+    if (existing) {
+      existing.lines.push(...buffer.lines);
+      existing.unread += buffer.unread;
+      existing.mentions += buffer.mentions;
+      for (const [, member] of buffer.nicks) existing.nicks.set(fold(member.name, names), member);
+      merged.push([existing.display, buffer.display]);
+      continue;
+    }
+    buffer.key = key;
+    const nicks = new Map();
+    for (const [, member] of buffer.nicks) nicks.set(fold(member.name, names), member);
+    buffer.nicks = nicks;
+    rekeyed.set(key, buffer);
+  }
+  return { buffers: rekeyed, merged };
+}
+
+// The server buffer's key: not a legal channel or nick, so no fold changes it.
+export const SERVER_KEY = "*server*";
 
 // Route chat-bearing commands through one policy for both live delivery and
 // persisted history. IRC STATUSMSG prefixes such as `@#ops` address a subset
 // of a channel but still belong in that channel's buffer.
-export function chatMessageRoute(message, ownNick, isKnownChannel = () => false) {
+export function chatMessageRoute(message, ownNick, isKnownChannel = () => false, names = DEFAULT_NAMES) {
   if (
     (message.command !== "PRIVMSG" && message.command !== "NOTICE")
     || typeof message.params?.[0] !== "string"
@@ -41,10 +135,10 @@ export function chatMessageRoute(message, ownNick, isKnownChannel = () => false)
   }
   if (statusLength > 0) {
     const candidate = target.slice(statusLength);
-    if (isChannel(candidate) || isKnownChannel(candidate)) target = candidate;
+    if (isChannel(candidate, names) || isKnownChannel(candidate)) target = candidate;
   }
 
-  if (isChannel(target) || isKnownChannel(target)) return { kind: "channel", target };
+  if (isChannel(target, names) || isKnownChannel(target)) return { kind: "channel", target };
   if (
     wireTarget === "*"
     || wireTarget === ""
@@ -52,7 +146,7 @@ export function chatMessageRoute(message, ownNick, isKnownChannel = () => false)
   ) return { kind: "server", target: null };
 
   const sentByUs = Boolean(
-    message.nick && ownNick && fold(message.nick) === fold(ownNick),
+    message.nick && ownNick && fold(message.nick, names) === fold(ownNick, names),
   );
   return { kind: "dm", target: sentByUs ? wireTarget : (message.nick || wireTarget) };
 }
@@ -270,9 +364,9 @@ export function kickPairs(channelsValue, targetsValue) {
 // `/names #elsewhere` and the `*` of a NAMES reply for no channel would
 // otherwise each leave a conversation in the list the person never joined.
 // (The line itself is still shown: every line reaches the console.)
-export function existingChannelBuffer(buffers, name) {
+export function existingChannelBuffer(buffers, name, names = DEFAULT_NAMES) {
   if (typeof name !== "string") return null;
-  const buffer = buffers.get(fold(name));
+  const buffer = buffers.get(fold(name, names));
   return buffer?.kind === "channel" ? buffer : null;
 }
 
@@ -521,17 +615,17 @@ export function seededNick(configured) {
 
 // Reconcile channel buffers against an authoritative BNC session snapshot.
 // Detached replay is bounded history and cannot answer current membership.
-export function reconcileChannelSnapshot(current, joined) {
+export function reconcileChannelSnapshot(current, joined, names = DEFAULT_NAMES) {
+  const key = (channel) => fold(channel, names);
   const joinedByKey = new Map();
   for (const channel of joined) {
-    const key = fold(channel);
-    if (!joinedByKey.has(key)) joinedByKey.set(key, channel);
+    if (!joinedByKey.has(key(channel))) joinedByKey.set(key(channel), channel);
   }
-  const currentKeys = new Set(current.map(fold));
+  const currentKeys = new Set(current.map(key));
   return Object.freeze({
-    removed: Object.freeze(current.filter((channel) => !joinedByKey.has(fold(channel)))),
+    removed: Object.freeze(current.filter((channel) => !joinedByKey.has(key(channel)))),
     added: Object.freeze(
-      [...joinedByKey.values()].filter((channel) => !currentKeys.has(fold(channel))),
+      [...joinedByKey.values()].filter((channel) => !currentKeys.has(key(channel))),
     ),
     joined: Object.freeze([...joinedByKey.values()]),
   });

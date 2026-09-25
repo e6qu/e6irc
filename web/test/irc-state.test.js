@@ -5,6 +5,8 @@ import test from "node:test";
 
 import {
   DEFAULT_CHANNEL_MODES,
+  DEFAULT_NAMES,
+  SERVER_KEY,
   asMessage,
   bufferAction,
   channelModesFrom,
@@ -14,6 +16,7 @@ import {
   composerRequests,
   existingChannelBuffer,
   fold,
+  isChannel,
   isPrefixMode,
   kickPairs,
   memberRank,
@@ -22,12 +25,16 @@ import {
   messageIdentity,
   modeChanges,
   modeTakesParameter,
+  namesDiffer,
+  namesFrom,
+  namesFromIsupport,
   nickPrefix,
   oldestRingFloor,
   outgoingChat,
   parseIrc,
   prependHistory,
   reconcileChannelSnapshot,
+  rekeyBuffers,
   seededNick,
   splitSigil,
   splitUtf8,
@@ -49,6 +56,78 @@ test("IRC parsing preserves tags, prefix, trailing text, and RFC1459 identity", 
     params: ["#Chat", "hello there"],
   });
   assert.equal(fold("[Alice]~"), "{alice}^");
+});
+
+test("names follow the network's CASEMAPPING and CHANTYPES", () => {
+  // Until a 005 says otherwise: rfc1459 and #&.
+  assert.equal(fold("#A[]\\~"), "#a{}|^");
+  assert.ok(isChannel("#a") && isChannel("&a") && !isChannel("!a") && !isChannel(""));
+
+  // An ascii network: #a[ and #a{ are two channels.
+  const ascii = namesFrom(["me", "CASEMAPPING=ascii", "CHANTYPES=#!", "are supported"]);
+  assert.equal(ascii.casemapping, "ascii");
+  assert.equal(fold("#A[", ascii), "#a[");
+  assert.notEqual(fold("#a[", ascii), fold("#a{", ascii));
+  assert.ok(isChannel("!x", ascii) && !isChannel("&x", ascii));
+  assert.deepEqual(
+    chatMessageRoute(parseIrc(":bob!u@h PRIVMSG !chan :hi"), "me", () => false, ascii),
+    { kind: "channel", target: "!chan" },
+  );
+  assert.deepEqual(
+    chatMessageRoute(parseIrc(":bob!u@h PRIVMSG &x :hi"), "me", () => false, ascii),
+    { kind: "dm", target: "bob" },
+  );
+
+  // rfc1459-strict, in either spelling: brackets fold, ~ and ^ stay apart.
+  for (const spelling of ["rfc1459-strict", "strict-rfc1459"]) {
+    const strict = namesFromIsupport([`CASEMAPPING=${spelling}`]);
+    assert.equal(strict.casemapping, "rfc1459-strict");
+    assert.equal(fold("#A[~", strict), "#a{~");
+  }
+
+  // An unknown mapping compares as ascii and is named; retraction restores.
+  const unknown = namesFromIsupport(["CASEMAPPING=rfc7613"]);
+  assert.equal(unknown.casemapping, "ascii");
+  assert.equal(unknown.unrecognised, "rfc7613");
+  const retracted = namesFrom(["me", "-CASEMAPPING", "-CHANTYPES", "x"], ascii);
+  assert.ok(!namesDiffer(retracted, DEFAULT_NAMES));
+  assert.equal(namesFromIsupport(["CHANTYPES="]).chantypes, "", "a network without channels");
+
+  // Snapshots reconcile under the network's mapping.
+  assert.deepEqual(
+    reconcileChannelSnapshot(["#a["], ["#a{"], ascii),
+    { removed: ["#a["], added: ["#a{"], joined: ["#a{"] },
+  );
+});
+
+test("buffers are re-keyed when the naming rules change, merging what becomes one name", () => {
+  const buffer = (display, extra = {}) => ({
+    key: fold(display),
+    display,
+    kind: "channel",
+    lines: [],
+    nicks: new Map(),
+    unread: 0,
+    mentions: 0,
+    ...extra,
+  });
+  const ascii = namesFromIsupport(["CASEMAPPING=ascii"]);
+  const server = { ...buffer(SERVER_KEY), kind: "server" };
+  const brackets = buffer("#A[", { lines: ["b"], unread: 1 });
+  brackets.nicks.set(fold("Al[ex]"), { name: "Al[ex]", modes: new Set() });
+  const initial = new Map([[SERVER_KEY, server], [brackets.key, brackets]]);
+  const narrowed = rekeyBuffers(initial, ascii);
+  assert.deepEqual([...narrowed.buffers.keys()], [SERVER_KEY, "#a["]);
+  assert.deepEqual([...brackets.nicks.keys()], ["al[ex]"]);
+  assert.deepEqual(narrowed.merged, []);
+
+  const braces = { ...buffer("#a{", { lines: ["c"], unread: 2 }), key: fold("#a{", ascii) };
+  narrowed.buffers.set(braces.key, braces);
+  const widened = rekeyBuffers(narrowed.buffers, DEFAULT_NAMES);
+  assert.deepEqual([...widened.buffers.keys()], [SERVER_KEY, "#a{"]);
+  assert.deepEqual(widened.buffers.get("#a{").lines, ["b", "c"]);
+  assert.equal(widened.buffers.get("#a{").unread, 3);
+  assert.deepEqual(widened.merged, [["#A[", "#a{"]]);
 });
 
 test("IRC parsing distinguishes server and user notice sources", () => {
