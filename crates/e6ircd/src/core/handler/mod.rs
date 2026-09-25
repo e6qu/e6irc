@@ -141,7 +141,7 @@ pub(crate) fn channel_command(
     let session = command.actor().session_owner();
     let label = command.label();
     let result = match command.operation() {
-        crate::core::state::ChannelCommandOperation::Knock => {
+        crate::core::state::ChannelCommandOperation::Knock { .. } => {
             Some(crate::core::state::ChannelCommandResult::Knock(
                 chanops::knock_on_owner(state, command),
             ))
@@ -954,11 +954,25 @@ pub(crate) fn reap_idle(state: &mut ServerState, now: e6irc_proto::time::MonoMil
     }
 }
 
+/// The reason a `QUIT` leaves with, as Solanum's `m_quit` builds it: the
+/// client's comment, or its nick when it gave none, prefixed `Quit: ` — unless
+/// the comment is empty (`QUIT :`), which leaves an empty reason rather than a
+/// bare `Quit: ` that says nothing.
+fn quit_reason(comment: Option<&str>, nick: &str) -> String {
+    match comment.unwrap_or(nick) {
+        "" => String::new(),
+        comment => format!("Quit: {comment}"),
+    }
+}
+
 fn cmd_quit(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    let reason = match p.first() {
-        Some(r) => format!("Quit: {r}"),
-        None => "Quit: Client Quit".to_string(),
-    };
+    let nick = state
+        .sessions
+        .get(&conn)
+        .and_then(|session| session.nick())
+        .unwrap_or("*")
+        .to_string();
+    let reason = quit_reason(p.first().copied(), &nick);
     let host = state
         .sessions
         .get(&conn)
@@ -1023,6 +1037,40 @@ mod tests {
             let (_, rest) = out.split_once('!').expect("normalized mask has a !");
             assert!(rest.contains('@'), "{mask:?} normalized to {out:?}");
         }
+    }
+
+    #[test]
+    fn a_bare_host_or_address_is_a_host_mask_and_an_extban_is_kept() {
+        // Solanum's `pretty_mask`: a nick can hold neither `.` nor `:`, so a
+        // bare token with one is a host or an address.
+        assert_eq!(normalize_ban_mask("evil.example"), "*!*@evil.example");
+        assert_eq!(normalize_ban_mask("203.0.113.0/24"), "*!*@203.0.113.0/24");
+        assert_eq!(normalize_ban_mask("2001:db8::/32"), "*!*@2001:db8::/32");
+        assert_eq!(normalize_ban_mask("$a:alice"), "$a:alice");
+        assert_eq!(normalize_ban_mask("$~a"), "$~a");
+    }
+
+    #[test]
+    fn quit_reason_is_solanums() {
+        assert_eq!(quit_reason(None, "alice"), "Quit: alice");
+        assert_eq!(quit_reason(Some(""), "alice"), "");
+        assert_eq!(quit_reason(Some("bye"), "alice"), "Quit: bye");
+    }
+
+    #[test]
+    fn a_knock_delay_runs_out() {
+        let at = e6irc_proto::time::MonoMillis::from_millis;
+        assert!(!knock_throttled(None, at(10), KNOCK_DELAY_MS));
+        assert!(knock_throttled(
+            Some(at(10)),
+            at(10 + KNOCK_DELAY_MS - 1),
+            KNOCK_DELAY_MS
+        ));
+        assert!(!knock_throttled(
+            Some(at(10)),
+            at(10 + KNOCK_DELAY_MS),
+            KNOCK_DELAY_MS
+        ));
     }
 
     #[test]
@@ -1124,7 +1172,15 @@ mod tests {
     #[test]
     fn a_list_mask_add_must_stand_as_a_parameter() {
         let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
-        assert!(channel_list_mask("::x", true, casemap).is_err());
+        assert!(channel_list_mask(":x!u@h", true, casemap).is_err());
+        // A bare token with a `:` is a host; one *typed* with a leading `:`
+        // is still refused, though normalizing would have hidden the colon
+        // (`*!*@::1` is how to ban that address).
+        assert!(channel_list_mask("::1", true, casemap).is_err());
+        assert_eq!(
+            channel_list_mask("2001:db8::1", true, casemap).map(|m| m.as_str().to_string()),
+            Ok("*!*@2001:db8::1".to_string())
+        );
         assert!(channel_list_mask("a\u{1}b", true, casemap).is_err());
         assert!(channel_list_mask("a b", true, casemap).is_err());
         assert!(channel_list_mask("a!b@c", true, casemap).is_ok());
@@ -1137,10 +1193,22 @@ mod tests {
     /// user mode is one `user_mode_is_set` knows.
     #[test]
     fn the_mode_tables_match_the_handlers() {
-        let modes = crate::core::state::ChanModes::default();
+        let mut modes = crate::core::state::ChanModes::default();
         for c in CHANMODES_FLAGS.chars() {
             assert!(chan_bool_mode(&modes, c).is_some(), "flag {c}");
+            // The setter and the getter name the same field.
+            *modes.flag_mut(c).expect("a settable flag") = true;
+            assert_eq!(chan_bool_mode(&modes, c), Some(true), "flag {c}");
+            *modes.flag_mut(c).expect("a settable flag") = false;
         }
+        for c in (b'A'..=b'z').map(char::from) {
+            assert_eq!(
+                modes.flag_mut(c).is_some(),
+                CHANMODES_FLAGS.contains(c),
+                "{c}"
+            );
+        }
+        assert_eq!(crate::core::state::MlockModes::LOCKABLE, CHANMODES_FLAGS);
         for c in (b'A'..=b'z').map(char::from) {
             if chan_bool_mode(&modes, c).is_some() {
                 assert!(CHANMODES_FLAGS.contains(c), "unadvertised flag {c}");

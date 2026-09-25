@@ -55,8 +55,15 @@ USER 10001:10001
 EXPOSE 8080
 # The image has no HTTP client, so the daemon probes itself: `e6ircd
 # healthcheck` reads the same E6IRC_HTTP_ADDR the server binds and needs no
-# configuration file. The start period covers migrations on a cold database.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+# configuration file. `/healthz` is bound once startup has connected to
+# PostgreSQL, migrated, and loaded its state (liveness is about a running core;
+# a process still in its bounded, self-terminating database wait has none yet).
+# The start period therefore outlasts the default startup budget, derived from
+# the daemon's constants: DEFAULT_STARTUP_WAIT_SECONDS (300 s, config.rs) plus
+# MIGRATION_LOCK_ATTEMPTS (6) x MIGRATION_LOCK_TIMEOUT (10 s) and the doubling
+# pauses between them (1+2+4+8+16 s, db.rs) = 391 s, with margin for the
+# migrations' own work. A unit test (db.rs) holds this number above that sum.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=420s --retries=3 \
   CMD ["/usr/local/bin/e6ircd", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/e6ircd"]
 # Replace the command with `--config /path/to/e6irc.toml` to run from a

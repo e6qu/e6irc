@@ -234,7 +234,10 @@ pub(super) fn invite_on_owner(
     if !chan.is_member(actor.recipient.conn()) {
         return crate::core::state::ChannelInviteResult::NotOnChannel { target };
     }
-    if chan.modes.invite_only && !chan.member(actor.recipient.conn()).is_some_and(|m| m.op) {
+    // Inviting takes channel-operator status unless the channel is `+g` (free
+    // invite) — Solanum's `m_invite`, "unconditionally require ops, unless the
+    // channel is +g", whether or not the channel is `+i`.
+    if !chan.modes.free_invite && !chan.member(actor.recipient.conn()).is_some_and(|m| m.op) {
         return crate::core::state::ChannelInviteResult::NotOperator { target };
     }
     if chan.is_member(invitee.owner().conn()) {
@@ -253,13 +256,13 @@ pub(super) fn invite_on_owner(
                 && recipient.caps().invite_notify
         })
         .collect();
-    // An invitation is a pass through `+i`, so one is recorded only while the
-    // channel is `+i` — which is also exactly when the inviter had to be an
-    // operator. On an open channel any member may INVITE; recording those would
-    // let a member stock passes to be honoured after operators lock the channel,
-    // and spend the operators' own entries through the eviction below.
+    // An invitation is a pass through `+i` and past `+l`, so one is recorded
+    // only while the channel has either (Solanum stores an invite exactly when
+    // it "could affect the ability to join"). One sent while the channel is
+    // open is delivered but passes nothing: it cannot be stocked to be honoured
+    // after operators later lock the channel.
     let chan = state.channels.get_mut(&key).expect("checked");
-    if chan.modes.invite_only {
+    if chan.modes.invite_only || chan.modes.limit.is_some() {
         let invited = &mut chan.invited;
         while invited.len() >= INVITE_LIMIT && !invited.contains(&invitee.owner().conn()) {
             let victim = *invited.iter().next().expect("non-empty at invite cap");
@@ -621,18 +624,44 @@ pub(super) fn cmd_stats(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     );
 }
 
+/// How often one user may KNOCK, and how often one channel may be knocked on
+/// (Solanum's `knock_delay` and `knock_delay_channel` defaults), in monotonic
+/// milliseconds. Every knock pages each of the channel's operators, so without
+/// both a user could page them without bound, and a crowd could per channel.
+pub(super) const KNOCK_DELAY_MS: u64 = 5 * 60 * 1000;
+pub(super) const KNOCK_DELAY_CHANNEL_MS: u64 = 60 * 1000;
+
+/// Whether a knock last delivered at `last` is still inside `delay_ms` of `now`.
+pub(super) fn knock_throttled(
+    last: Option<e6irc_proto::time::MonoMillis>,
+    now: e6irc_proto::time::MonoMillis,
+    delay_ms: u64,
+) -> bool {
+    last.is_some_and(|last| now.saturating_sub(last).as_millis() < delay_ms)
+}
+
 pub(super) fn cmd_knock(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let Some(&target) = p.first() else {
         state.err_needmoreparams(conn, "KNOCK");
         return;
     };
+    // The user's own delay is the session's to know; the channel's owner
+    // decides in Solanum's order (open, banned, then the delays), so it is
+    // carried along rather than answered here. An operator is exempt from it.
+    let session = &state.sessions[&conn];
+    let user_throttled = session.oper.is_none()
+        && knock_throttled(
+            session.last_knock,
+            (state.config.mono_clock)(),
+            KNOCK_DELAY_MS,
+        );
     let owner = state.channel_owner(target);
     let label = state.channel_reply_label(conn, &owner);
     let command = crate::core::state::ChannelCommand::new(
         owner,
         state.channel_actor(conn),
         target.to_string(),
-        crate::core::state::ChannelCommandOperation::Knock,
+        crate::core::state::ChannelCommandOperation::Knock { user_throttled },
         label,
     );
     if state.owns_channel(command.owner()) {
@@ -648,10 +677,9 @@ pub(super) fn knock_on_owner(
     command: crate::core::state::ChannelCommand,
 ) -> crate::core::state::ChannelKnockResult {
     let (owner, actor, target, operation) = command.into_parts();
-    debug_assert!(matches!(
-        operation,
-        crate::core::state::ChannelCommandOperation::Knock
-    ));
+    let crate::core::state::ChannelCommandOperation::Knock { user_throttled } = operation else {
+        unreachable!("KNOCK command operation");
+    };
     let key = state.chan_key(&target);
     assert_eq!(owner.key(), &key, "KNOCK owner does not match target");
     let Some(chan) = state.channels.get(&key) else {
@@ -665,18 +693,43 @@ pub(super) fn knock_on_owner(
     if chan.is_member(actor.recipient.conn()) {
         return crate::core::state::ChannelKnockResult::AlreadyOnChannel { display };
     }
-    if !chan.modes.invite_only {
+    // A knock asks for a way in, so it is for a channel that is closed to the
+    // knocker some way an operator can open: invite-only, keyed, or full
+    // (Solanum's `m_knock`). Anything else is ERR_CHANOPEN.
+    let full = chan
+        .modes
+        .limit
+        .is_some_and(|limit| chan.member_count() >= limit as usize);
+    if !(chan.modes.invite_only || chan.modes.key.is_some() || full) {
         return crate::core::state::ChannelKnockResult::ChannelOpen { display };
     }
-    // A banned user cannot knock (Solanum refuses with ERR_CANNOTSENDTOCHAN):
-    // otherwise +b is no barrier to spamming the channel's ops with knock
-    // requests they can't act on.
+    // A banned or quieted user cannot knock (Solanum refuses with
+    // ERR_CANNOTSENDTOCHAN): otherwise +b/+q is no barrier to spamming the
+    // channel's ops with knock requests they can't act on.
     let casemap = state.casemap;
-    if chan.is_banned(casemap, &actor.identity.prefix) {
+    if chan.is_silenced(casemap, &actor.mask_subject()) {
         return crate::core::state::ChannelKnockResult::CannotSend { display };
+    }
+    let now = (state.config.mono_clock)();
+    if user_throttled {
+        return crate::core::state::ChannelKnockResult::TooManyKnocks {
+            display,
+            scope: "user",
+        };
+    }
+    if knock_throttled(chan.last_knock, now, KNOCK_DELAY_CHANNEL_MS) {
+        return crate::core::state::ChannelKnockResult::TooManyKnocks {
+            display,
+            scope: "channel",
+        };
     }
     // Deliver the knock to the channel's operators, then confirm to the knocker.
     let ops = chan.operator_recipients();
+    state
+        .channels
+        .get_mut(&key)
+        .expect("checked above")
+        .last_knock = Some(now);
     for (recipient, nick) in ops {
         let line = format!(
             ":{} {} {} {} {} :has asked for an invite",
@@ -709,11 +762,24 @@ fn emit_knock_result_now(
     result: crate::core::state::ChannelKnockResult,
 ) {
     match result {
-        crate::core::state::ChannelKnockResult::KnockDelivered { display } => state.numeric(
+        crate::core::state::ChannelKnockResult::KnockDelivered { display } => {
+            // The knocker's delay starts with a knock that was delivered.
+            let now = (state.config.mono_clock)();
+            if let Some(session) = state.sessions.get_mut(&conn) {
+                session.last_knock = Some(now);
+            }
+            state.numeric(
+                conn,
+                RPL_KNOCKDLVR,
+                &[&display],
+                Some("Your KNOCK has been delivered"),
+            );
+        }
+        crate::core::state::ChannelKnockResult::TooManyKnocks { display, scope } => state.numeric(
             conn,
-            RPL_KNOCKDLVR,
+            ERR_TOOMANYKNOCK,
             &[&display],
-            Some("Your KNOCK has been delivered"),
+            Some(&format!("Too many KNOCKs ({scope}).")),
         ),
         crate::core::state::ChannelKnockResult::NoSuchChannel { target } => {
             state.err_nosuchchannel(conn, &target);
@@ -734,7 +800,7 @@ fn emit_knock_result_now(
             conn,
             ERR_CANNOTSENDTOCHAN,
             &[&display],
-            Some("Cannot knock on channel (+b)"),
+            Some("Cannot knock on channel (+b/+q)"),
         ),
     }
 }

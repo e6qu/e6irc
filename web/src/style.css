@@ -339,9 +339,9 @@ body {
 }
 .line { display: grid; grid-template-columns: 3.5rem minmax(5.5rem, max-content) minmax(0, 1fr); gap: 0.65rem; padding: 0.14rem 0; align-items: baseline; word-break: break-word; }
 .ts { color: var(--muted); font: 0.72rem/1.5 var(--font-mono); font-variant-numeric: tabular-nums; }
-.from { max-width: 12rem; overflow: hidden; color: color-mix(in srgb, var(--fg) 88%, var(--accent)); font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
-.text { min-width: 0; white-space: pre-wrap; }
-.msg-link { color: var(--accent); text-decoration: underline; word-break: break-all; }
+.from { unicode-bidi: isolate; max-width: 12rem; overflow: hidden; color: color-mix(in srgb, var(--fg) 88%, var(--accent)); font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.text { min-width: 0; unicode-bidi: isolate; white-space: pre-wrap; }
+.msg-link { unicode-bidi: isolate; color: var(--accent); text-decoration: underline; word-break: break-all; }
 #load-earlier {
   flex: 0 0 auto; margin: 0.35rem auto 0; padding: 0.2rem 0.9rem; font: inherit;
   font-size: 0.8rem; border: 1px solid var(--border); border-radius: 0.8rem;

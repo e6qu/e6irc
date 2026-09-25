@@ -33,7 +33,10 @@ requests reject incompatible fields.
 The container starts with `e6ircd --config-from-environment`; the environment
 goes through the same parser and validation as a configuration file. Managed
 configuration schema changes migrate persisted rows with their historic explicit
-behavior; new configuration never receives an implicit decode default.
+behavior; new configuration never receives an implicit decode default. After
+the first import the console owns the operational settings: a start whose file
+or environment states one with a value other than the stored one is refused,
+naming each such setting and printing no value.
 History accepts one typed cursor window and a bounded page size.
 Chat, console, and identity pages share the relay-desk visual system and
 accessible light, dark, and forced-colors palettes. Both network forms read one
@@ -684,6 +687,36 @@ A 2026-09-24 security review found, and this change fixes:
 - **Front-channel logout signed out any visitor.** It cleared the session
   cookie of whoever loaded it; it now clears it only when that cookie named a
   session the logout revoked.
+
+A sweep of startup, shutdown and operations found, and this change fixes:
+
+- **A graceful shutdown lost the bouncer's last backlog lines.** Every
+  network's persistence task was aborted the moment its driver released the
+  upstream, so lines still queued — the goodbye among them — never reached
+  PostgreSQL. They are now written within the shared driver-stop deadline; only
+  a write still running at the deadline is abandoned, and reported.
+- **`SIGHUP` during the database wait killed the daemon.** The reload handler
+  was installed only after PostgreSQL was reached and migrated, and systemd does
+  not restart a unit that died of `SIGHUP`. It is now installed first.
+- **`/readyz` let one client exhaust the database pool.** The unauthenticated
+  probe bypasses admission and took a pool connection per request; concurrent
+  requests now share one probe, reused for a second.
+- **`check-config` passed configurations that start refused.** It now runs the
+  start's own checks for the monitoring token and every TLS certificate/key
+  pair.
+- **A failed certificate reload could be skipped forever.** The file stamp was
+  the modification time alone and a failure was recorded as settled; a fix that
+  kept the time was never read. Stamps now include length, inode and
+  status-change time, and a failing read is retried at every check (reported
+  once per distinct failure).
+- **`E6IRC_SECRET_KEY=` meant a key to one reader and "unset" to the rest.** The
+  master-key variables go through the environment's one rule, and a source test
+  refuses any other environment read in the daemon.
+- **The container health check's start period (60 s) was shorter than the
+  startup it waits for.** It is 420 s, above the 300 s database wait plus the
+  migration lock retries; a unit test holds it there.
+- **The deployment guide pointed at a `/metrics` route that does not exist.**
+  It is `/api/v1/admin/metrics`, which needs administrator authentication.
 
 ## Remaining qualification
 

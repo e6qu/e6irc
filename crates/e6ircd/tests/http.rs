@@ -8419,6 +8419,23 @@ async fn network_buffer_read() {
         assert!(body.contains("Invalid buffer limit"), "{body}");
     }
 
+    // Persisted history has no ring positions: a `through` cursor cannot bound
+    // it, and is refused rather than answered with lines the reader holds.
+    let (status, _, body) = request(
+        http,
+        &auth("/api/v1/me/networks/work/buffer?through=7%3A42"),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("\"field\":\"through\""), "{body}");
+    let (status, _, body) = request(
+        http,
+        &auth("/api/v1/me/networks/work/buffer?through=not-a-cursor"),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("\"field\":\"through\""), "{body}");
+
     // A network the caller doesn't own → 404.
     let (status, _, _) = request(http, &auth("/api/v1/me/networks/nope/buffer")).await;
     assert_eq!(status, 404);

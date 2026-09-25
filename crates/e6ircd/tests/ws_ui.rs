@@ -153,6 +153,14 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
                     if event["t"] == "session" {
                         session = Some(event.clone());
                     }
+                    // The replay is read as the session's current nick, so
+                    // the session comes before the first replayed line.
+                    if event["t"] == "line" {
+                        assert!(
+                            session.is_some(),
+                            "a replayed line preceded the session event: {event}"
+                        );
+                    }
                     if event["t"] == "snapshot" {
                         return (event, session);
                     }
@@ -171,14 +179,22 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
             .is_some_and(|cursor| !cursor.is_empty()),
         "the boundary names the ring position to resume from: {boundary}"
     );
+    let session =
+        session.expect("the replay boundary must be preceded by authoritative IRC session state");
+    assert_eq!(session["nick"], "alicebnc", "{session}");
     assert_eq!(
-        session,
-        Some(serde_json::json!({
-            "t": "session",
-            "nick": "alicebnc",
-            "channels": ["#lobby"]
-        })),
-        "the replay boundary must be preceded by authoritative IRC session state"
+        session["channels"],
+        serde_json::json!(["#lobby"]),
+        "{session}"
+    );
+    // The upstream's own ISUPPORT rides with it, so channel modes are read the
+    // network's way even after the ring evicts the 005 lines.
+    let isupport = session["isupport"].as_array().expect("isupport tokens");
+    assert!(
+        isupport.iter().any(|token| token
+            .as_str()
+            .is_some_and(|token| token.starts_with("PREFIX="))),
+        "{session}"
     );
 
     // upstream -> UI: the peer posts, the UI receives a JSON line event

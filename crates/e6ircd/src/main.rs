@@ -166,10 +166,36 @@ fn probe(
     }
 }
 
+/// Judge the configuration by everything the server's start checks short of
+/// reaching the network or the database: parse and validation
+/// ([`Config::load`]), then what start reads beside the document
+/// ([`net::check_offline`]). What needs the database — whether the stated
+/// console-owned settings agree with the stored revision — is left to start,
+/// and the success report says so.
 fn check_config(args: &[String]) -> ExitCode {
-    match load_config_or_fail(args, "e6ircd check-config") {
-        Ok(_) => ExitCode::SUCCESS,
-        Err(code) => code,
+    const CONTEXT: &str = "e6ircd check-config";
+    let config = match load_config_or_fail(args, CONTEXT) {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+    match net::check_offline(&config) {
+        Ok(()) => {
+            if config.database.is_some() {
+                // Judged only by start, which reaches the database: saying
+                // nothing would read as having checked it.
+                eprintln!(
+                    "{CONTEXT}: the configuration is valid as stated. Not checked, because it \
+                     needs the database: whether each setting it states that the console owns \
+                     agrees with the revision stored there. Start refuses, by name, any that \
+                     differs."
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{CONTEXT}: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -205,7 +231,7 @@ impl ConfigSource {
             Self::Environment => (
                 environment_config::configuration_table(&environment_config::process_environment)
                     .map_err(|error| ConfigError::Invalid(error.to_string()))
-                    .and_then(Config::from_table),
+                    .and_then(|document| Config::from_table(document.table, &document.defaulted)),
                 None,
                 "the environment".to_owned(),
             ),
@@ -418,8 +444,10 @@ fn seal(args: &[String]) -> ExitCode {
 fn load_seal_key(args: &[String]) -> Result<SecretKey, String> {
     match args {
         [] => {
-            let v = std::env::var("E6IRC_SECRET_KEY")
-                .map_err(|_| "no --key-file and E6IRC_SECRET_KEY is unset".to_string())?;
+            let v = e6ircd::config::EnvironmentSecretKeys::from_process()
+                .map_err(|e| e.to_string())?
+                .primary
+                .ok_or_else(|| "no --key-file and E6IRC_SECRET_KEY is unset".to_string())?;
             SecretKey::from_base64_text(v).map_err(|e| format!("E6IRC_SECRET_KEY: {e}"))
         }
         [flag, path] if flag == "--key-file" => {

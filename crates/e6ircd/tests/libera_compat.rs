@@ -33,13 +33,17 @@ const WHITELIST: &[&str] = &[
     "TARGMAX",
     // Libera advertises additional modes. Unsupported modes return 472.
     "CHANMODES",
+    // Libera's extban types are `agjrxz`; only the account extban (`a`) is
+    // implemented here, and advertising a type the list modes refuse (696)
+    // would be a false claim. The prefix (`$`) and ACCOUNTEXTBAN agree.
+    "EXTBAN",
 ];
 
-/// Floor on the tokens our own burst carries (25 today). A ratchet: dropping
+/// Floor on the tokens our own burst carries (27 today). A ratchet: dropping
 /// a token is a decision to make here, not a silent narrowing of the check.
-const MIN_OURS: usize = 25;
-/// Floor on the shared, non-whitelisted tokens actually compared (14 today).
-const MIN_CHECKED: usize = 14;
+const MIN_OURS: usize = 27;
+/// Floor on the shared, non-whitelisted tokens actually compared (15 today).
+const MIN_CHECKED: usize = 15;
 /// Tokens clients key on that both sides advertise; each must be compared.
 const MUST_COMPARE: &[&str] = &[
     "CASEMAPPING",
@@ -50,6 +54,7 @@ const MUST_COMPARE: &[&str] = &[
     "CHANLIMIT",
     "STATUSMSG",
     "MAXLIST",
+    "ACCOUNTEXTBAN",
 ];
 
 fn isupport_tokens(lines: impl Iterator<Item = String>) -> HashMap<String, String> {

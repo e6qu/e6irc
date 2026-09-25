@@ -4,7 +4,9 @@ use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use e6irc_client::token_cache::{CachedToken, default_token_path, load_token, store_token};
+use e6irc_client::token_cache::{
+    CachedToken, check_token_path_writable, default_token_path, load_token, store_token,
+};
 use e6irc_client::{CleartextCredentials, TerminalSafe};
 use reqwest::{Client, Method, Response, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -79,6 +81,42 @@ fn api_base(requested: Option<&str>, cached: Option<&CachedToken>) -> io::Result
             "--base is required when no cached login supplies an API origin",
         )),
     }
+}
+
+/// The API origin and the bearer token for one request. The login cache is
+/// read whenever it is needed: for the token when none was given explicitly,
+/// and for the origin when `--base` was not given — an explicit token with no
+/// `--base` goes to the cached login's origin. Tokens never mix: an explicit
+/// token is the one sent, whatever the cache holds, and a cached token is only
+/// sent to the origin that issued it.
+fn api_origin_and_token(
+    requested_base: Option<&str>,
+    explicit_token: Option<String>,
+    load_cache: impl FnOnce() -> io::Result<Option<CachedToken>>,
+) -> io::Result<(String, Option<String>)> {
+    let cached = if requested_base.is_none() || explicit_token.is_none() {
+        load_cache()?
+    } else {
+        None
+    };
+    let base = api_base(requested_base, cached.as_ref())?;
+    let token = match (explicit_token, cached) {
+        (Some(token), _) => Some(token),
+        (None, Some(cached)) => {
+            if normalized_base(cached.base_url())? != base {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "cached token belongs to {}; use that base or provide --token",
+                        cached.base_url()
+                    ),
+                ));
+            }
+            Some(cached.access_token().to_owned())
+        }
+        (None, None) => None,
+    };
+    Ok((base, token))
 }
 
 fn endpoint(base: &str, path: &str) -> io::Result<String> {
@@ -159,6 +197,17 @@ struct Pinned {
 
 pub async fn login(base: &str, cache_path: &Path, transport: Transport) -> io::Result<()> {
     let base = normalized_base(base)?;
+    // The approved token is only worth anything if it can be kept: a cache
+    // path that cannot be written fails now, before the user approves.
+    check_token_path_writable(cache_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot store a token at {}: {error}",
+                TerminalSafe::from_untrusted(&cache_path.display().to_string())
+            ),
+        )
+    })?;
     // The whole exchange exists to obtain a token, so it is decided up front.
     let pinned = token_may_cross(&base, true, transport.cleartext).await?;
     let client = client(pinned.as_ref(), transport.response_timeout)?;
@@ -301,36 +350,11 @@ pub async fn api(
     cache_path: Option<&Path>,
     transport: Transport,
 ) -> io::Result<()> {
-    let cached = if explicit_token.is_none() {
-        let resolved_cache;
-        let cache_path = match cache_path {
-            Some(path) => path,
-            None => {
-                resolved_cache = default_token_path()?;
-                &resolved_cache
-            }
-        };
-        load_token(cache_path)?
-    } else {
-        None
-    };
-    let base = api_base(requested_base, cached.as_ref())?;
-    let token = match (explicit_token, cached) {
-        (Some(token), _) => Some(token),
-        (None, Some(cached)) => {
-            if normalized_base(cached.base_url())? != base {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "cached token belongs to {}; use that base or provide --token",
-                        cached.base_url()
-                    ),
-                ));
-            }
-            Some(cached.access_token().to_owned())
-        }
-        (None, None) => None,
-    };
+    let (base, token) =
+        api_origin_and_token(requested_base, explicit_token, || match cache_path {
+            Some(path) => load_token(path),
+            None => load_token(&default_token_path()?),
+        })?;
     let pinned = token_may_cross(&base, token.is_some(), transport.cleartext).await?;
     let method = Method::from_bytes(method.as_bytes()).map_err(invalid_input)?;
     let mut request = client(pinned.as_ref(), transport.response_timeout)?
@@ -586,6 +610,49 @@ mod tests {
             "https://other.example"
         );
         assert!(api_base(None, None).is_err());
+    }
+
+    /// An explicit token with no `--base` goes to the cached login's origin
+    /// (as `--base`'s help says), carrying the explicit token, never the
+    /// cached one; with `--base` the cache is not read at all.
+    #[test]
+    fn an_explicit_token_uses_the_cached_origin_but_never_the_cached_token() {
+        let cache = || {
+            Ok(Some(CachedToken::new(
+                "https://irc.example/".into(),
+                "cached".into(),
+            )?))
+        };
+        assert_eq!(
+            api_origin_and_token(None, Some("explicit".into()), cache).unwrap(),
+            (
+                "https://irc.example".to_owned(),
+                Some("explicit".to_owned())
+            )
+        );
+        assert_eq!(
+            api_origin_and_token(None, None, cache).unwrap(),
+            ("https://irc.example".to_owned(), Some("cached".to_owned()))
+        );
+        let unread = || {
+            Err(io::Error::other(
+                "the cache is not read when nothing is needed from it",
+            ))
+        };
+        assert_eq!(
+            api_origin_and_token(
+                Some("https://other.example"),
+                Some("explicit".into()),
+                unread
+            )
+            .unwrap(),
+            (
+                "https://other.example".to_owned(),
+                Some("explicit".to_owned())
+            )
+        );
+        assert!(api_origin_and_token(Some("https://other.example"), None, cache).is_err());
+        assert!(api_origin_and_token(None, Some("explicit".into()), || Ok(None)).is_err());
     }
 
     const REFUSE_CLEARTEXT: Transport = Transport {

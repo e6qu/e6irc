@@ -23,8 +23,8 @@ test("live event parser accepts the closed server event contract", () => {
     cursor: "7:42",
   });
   assert.deepEqual(
-    parseUiEvent('{"t":"session","nick":"alice","channels":["#one","#Two"]}'),
-    { type: "session", nick: "alice", channels: ["#one", "#Two"] },
+    parseUiEvent('{"t":"session","nick":"alice","channels":["#one","#Two"],"isupport":["PREFIX=(ov)@+"]}'),
+    { type: "session", nick: "alice", channels: ["#one", "#Two"], isupport: ["PREFIX=(ov)@+"] },
   );
   assert.deepEqual(parseUiEvent('{"t":"status","v":"connected"}'), {
     type: "status",
@@ -61,10 +61,13 @@ test("live event parser rejects every malformed or unsupported shape", () => {
     '{"t":"snapshot","v":"partial","cursor":"7:1"}',
     '{"t":"replay","v":"partial"}',
     '{"t":"replay","v":"full","cursor":"7:1"}',
-    '{"t":"session","nick":"","channels":[]}',
-    '{"t":"session","nick":"alice","channels":"#one"}',
-    '{"t":"session","nick":"alice","channels":[1]}',
-    '{"t":"session","nick":"alice","channels":[],"extra":true}',
+    '{"t":"session","nick":"","channels":[],"isupport":[]}',
+    '{"t":"session","nick":"alice","channels":"#one","isupport":[]}',
+    '{"t":"session","nick":"alice","channels":[1],"isupport":[]}',
+    '{"t":"session","nick":"alice","channels":[],"isupport":[],"extra":true}',
+    '{"t":"session","nick":"alice","channels":[]}',
+    '{"t":"session","nick":"alice","channels":[],"isupport":"PREFIX=(ov)@+"}',
+    '{"t":"session","nick":"alice","channels":[],"isupport":[""]}',
     '{"t":"status","v":"connected","reason":"unexpected"}',
     '{"t":"status","v":"disconnected","reason":1}',
     '{"t":"status","v":"unknown"}',

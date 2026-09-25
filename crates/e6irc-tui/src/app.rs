@@ -6,7 +6,7 @@
 //! network multiplexing is the BNC's job server-side — a client attaches
 //! to one network and opens buffers within it.
 
-use e6irc_client::{OwnedMessage, TerminalSafe};
+use e6irc_client::{NetworkNames, OwnedMessage, TerminalSafe};
 
 /// One rendered line in a buffer's scrollback. Both fields are
 /// [`TerminalSafe`], so a line can only ever hold server text with its terminal
@@ -78,7 +78,9 @@ pub const SERVER_BUFFER: &str = "*server*";
 pub struct Buffer {
     pub name: String,
     pub kind: BufferKind,
-    pub log: Vec<LogLine>,
+    /// Oldest first. A deque: once full, every new line drops the oldest,
+    /// which must cost one line, not a shift of the whole scrollback.
+    pub log: std::collections::VecDeque<LogLine>,
     seen_msgids: std::collections::HashSet<String>,
     msgid_order: std::collections::VecDeque<String>,
     latest_time: Option<String>,
@@ -98,7 +100,7 @@ impl Buffer {
         Self {
             name,
             kind,
-            log: Vec::new(),
+            log: std::collections::VecDeque::new(),
             seen_msgids: std::collections::HashSet::new(),
             msgid_order: std::collections::VecDeque::new(),
             latest_time: None,
@@ -110,13 +112,12 @@ impl Buffer {
     }
 
     fn push(&mut self, line: LogLine) {
-        self.log.push(line);
+        self.log.push_back(line);
         // Scrollback is bounded: every line here came from the server, so an
         // unbounded log is a remote party deciding how much memory this client
         // uses. Oldest lines go first, which is what a scrollback is.
         if self.log.len() > SCROLLBACK_LINES {
-            let excess = self.log.len() - SCROLLBACK_LINES;
-            self.log.drain(..excess);
+            self.log.pop_front();
             // `scroll` is an offset from the *end*, so dropping lines off the
             // front does not move the view and must not adjust it. Only the
             // push below did, and that is what the fixup accounts for.
@@ -167,7 +168,7 @@ impl Buffer {
 
     /// The window of lines to render for a pane `height` rows tall, when
     /// each line takes one row.
-    pub fn visible(&self, height: usize) -> &[LogLine] {
+    pub fn visible(&self, height: usize) -> std::collections::vec_deque::Iter<'_, LogLine> {
         self.visible_rows(height, |_| 1)
     }
 
@@ -175,7 +176,11 @@ impl Buffer {
     /// line takes `rows(line)` rows (a long line wraps): the lines ending at
     /// the scroll position whose rows fill the pane. The first may be taller
     /// than what is left of the pane; the renderer shows its end.
-    pub fn visible_rows(&self, height: usize, rows: impl Fn(&LogLine) -> usize) -> &[LogLine] {
+    pub fn visible_rows(
+        &self,
+        height: usize,
+        rows: impl Fn(&LogLine) -> usize,
+    ) -> std::collections::vec_deque::Iter<'_, LogLine> {
         let end = self.log.len().saturating_sub(self.scroll);
         let mut start = end;
         let mut filled = 0;
@@ -183,7 +188,7 @@ impl Buffer {
             start -= 1;
             filled += rows(&self.log[start]).max(1);
         }
-        &self.log[start..end]
+        self.log.range(start..end)
     }
 }
 
@@ -219,6 +224,9 @@ pub struct App {
     /// The STATUSMSG sigils the server declared in `005` (`@#chan` addresses
     /// the channel's operators, but is still said in `#chan`).
     statusmsg_sigils: String,
+    /// The network's CASEMAPPING and CHANTYPES from `005`: which targets are
+    /// channels, and which names are the same buffer.
+    names: NetworkNames,
 }
 
 /// The STATUSMSG sigils assumed until the server's `005` says otherwise: the
@@ -272,6 +280,7 @@ impl App {
             input_limit_reported: false,
             outbound_limit_reported: false,
             statusmsg_sigils: DEFAULT_STATUSMSG_SIGILS.to_owned(),
+            names: NetworkNames::default(),
         }
     }
 
@@ -281,7 +290,7 @@ impl App {
         let bare = target.trim_start_matches(|sigil| self.statusmsg_sigils.contains(sigil));
         [bare, target]
             .into_iter()
-            .find(|candidate| e6irc_client::is_channel_target(candidate))
+            .find(|candidate| self.names.is_channel(candidate))
     }
 
     /// Adopt the nickname the server confirmed at registration. It is the
@@ -336,7 +345,7 @@ impl App {
     fn buffer_index(&self, name: &str) -> Option<usize> {
         self.buffers
             .iter()
-            .position(|buffer| e6irc_proto::casemap::CaseMapping::Rfc1459.eq(&buffer.name, name))
+            .position(|buffer| self.names.eq(&buffer.name, name))
     }
 
     /// Open a buffer (or focus it if already open) and return its index.
@@ -470,7 +479,6 @@ impl App {
             .and_then(|s| s.split('!').next())
             .unwrap_or("?")
             .to_string();
-        let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
         match msg.command.as_str() {
             "PRIVMSG" | "NOTICE" => {
                 let Some(target) = msg.params.first().cloned() else {
@@ -487,9 +495,9 @@ impl App {
                 // a bouncer's status), belongs to no conversation.
                 let buffer = if let Some(channel) = self.channel_of(&target) {
                     channel.to_owned()
-                } else if casemap.eq(&target, &self.nick) && from_a_user {
+                } else if self.names.eq(&target, &self.nick) && from_a_user {
                     sender.clone()
-                } else if casemap.eq(&sender, &self.nick) {
+                } else if self.names.eq(&sender, &self.nick) {
                     // Our own message, sent from another client attached to
                     // the same bouncer network: it belongs to its recipient.
                     target
@@ -546,7 +554,7 @@ impl App {
                 let Some(new_nick) = msg.params.first() else {
                     return;
                 };
-                if casemap.eq(&sender, &self.nick) {
+                if self.names.eq(&sender, &self.nick) {
                     self.nick = new_nick.clone();
                     self.status(format!("you are now known as {new_nick}"));
                 } else {
@@ -558,7 +566,7 @@ impl App {
                     return;
                 };
                 let reason = msg.params.get(2).map(String::as_str).unwrap_or("");
-                let who = if casemap.eq(kicked, &self.nick) {
+                let who = if self.names.eq(kicked, &self.nick) {
                     "you were"
                 } else {
                     &format!("{kicked} was")
@@ -582,7 +590,7 @@ impl App {
                 let (Some(invited), Some(channel)) = (msg.params.first(), msg.params.get(1)) else {
                     return;
                 };
-                if casemap.eq(invited, &self.nick) {
+                if self.names.eq(invited, &self.nick) {
                     self.status(format!(
                         "{sender} invited you to {channel} — /join {channel} to accept"
                     ));
@@ -628,19 +636,20 @@ impl App {
             // leaves the user believing it was delivered. `params[0]` is our
             // own nick; what follows names the subject, then says why.
             numeric if e6irc_client::is_refusal(msg) => {
-                let subject = msg.params.get(1).map(String::as_str).unwrap_or("");
+                let subject = e6irc_client::numeric_subject(msg).unwrap_or("");
                 let detail = msg.params.get(1..).unwrap_or_default().join(" ");
                 self.note_in(subject, &format!("{detail} ({numeric})"));
             }
             // Every other numeric — the welcome burst, a WHOIS answer to
             // `/raw`, NAMES, a topic on join — is shown beside the
             // conversation it names, else in the server buffer. `params[0]` is
-            // our own nick.
+            // our own nick; where the subject sits after it is the numeric's
+            // own ([`e6irc_client::numeric_subject`]: NAMES leads with `=`).
             numeric if numeric.len() == 3 && numeric.bytes().all(|byte| byte.is_ascii_digit()) => {
                 if numeric == "005" {
                     self.adopt_isupport(msg);
                 }
-                let subject = msg.params.get(1).map(String::as_str).unwrap_or("");
+                let subject = e6irc_client::numeric_subject(msg).unwrap_or("");
                 let detail = msg.params.get(1..).unwrap_or_default().join(" ");
                 self.note_about(subject, &detail);
             }
@@ -656,6 +665,16 @@ impl App {
     /// Adopt what a `005` line declares that routing depends on. Tokens sit
     /// between the nick and the trailing "are supported by this server".
     fn adopt_isupport(&mut self, msg: &OwnedMessage) {
+        let changed = self.names.adopt_isupport(msg);
+        if changed.casemapping {
+            if let Some(mapping) = self.names.unrecognised_casemapping() {
+                self.note_server(&format!(
+                    "the server's CASEMAPPING={mapping} is not one this client knows; names \
+                     are compared as ascii (letters only)"
+                ));
+            }
+            self.note_merged_buffers();
+        }
         let tokens = msg
             .params
             .get(1..msg.params.len().saturating_sub(1))
@@ -666,6 +685,29 @@ impl App {
             } else if token == "-STATUSMSG" {
                 self.statusmsg_sigils.clear();
             }
+        }
+    }
+
+    /// Say which open buffers a new case mapping makes one name: lines for that
+    /// name now go to the first of them. The default mapping (rfc1459) folds
+    /// the most, so only a 005 that widens a narrower mapping mid-session can
+    /// do this — and a buffer silently ceasing to receive its lines would be
+    /// worse than being told.
+    fn note_merged_buffers(&mut self) {
+        let mut notes = Vec::new();
+        for (index, buffer) in self.buffers.iter().enumerate() {
+            if let Some(first) = self.buffers[..index]
+                .iter()
+                .find(|earlier| self.names.eq(&earlier.name, &buffer.name))
+            {
+                notes.push(format!(
+                    "under the server's case mapping {} and {} are one name; its lines go to {}",
+                    first.name, buffer.name, first.name
+                ));
+            }
+        }
+        for note in notes {
+            self.note_server(&note);
         }
     }
 
@@ -682,9 +724,7 @@ impl App {
     /// would attribute an event to a conversation it never touched.
     fn note_about_user(&mut self, nick: &str, text: &str) {
         for buffer in &mut self.buffers {
-            if e6irc_client::is_channel_target(&buffer.name)
-                || e6irc_proto::casemap::CaseMapping::Rfc1459.eq(&buffer.name, nick)
-            {
+            if self.names.is_channel(&buffer.name) || self.names.eq(&buffer.name, nick) {
                 buffer.push(LogLine::new("*", text));
             }
         }
@@ -1092,7 +1132,7 @@ mod tests {
         // live tail would be worse than one that grew.
         assert!(
             buf.log
-                .last()
+                .back()
                 .expect("a line")
                 .text
                 .as_str()
@@ -1100,7 +1140,7 @@ mod tests {
         );
         assert!(
             buf.log
-                .first()
+                .front()
                 .expect("a line")
                 .text
                 .as_str()
@@ -1122,7 +1162,6 @@ mod tests {
         app.scroll_up(10);
         let before: Vec<String> = app.buffers[idx]
             .visible(5)
-            .iter()
             .map(|l| l.text.as_str().to_string())
             .collect();
         // Now push past the cap, so every new line drains one from the front.
@@ -1132,7 +1171,6 @@ mod tests {
         let buf = &app.buffers[idx];
         let after: Vec<String> = buf
             .visible(5)
-            .iter()
             .map(|l| l.text.as_str().to_string())
             .collect();
         // The user is looking at the same lines. Without the `scroll` fixup the
@@ -1179,7 +1217,7 @@ mod tests {
         let index = app.buffer_index(buffer).expect("buffer");
         app.buffers[index]
             .log
-            .last()
+            .back()
             .map(|line| line.text.to_string())
             .unwrap_or_default()
     }
@@ -1277,10 +1315,85 @@ mod tests {
         assert_eq!(last_line(&app, "#c"), "owners");
         // A server-local `&channel` stays itself even when `&` is a sigil.
         app.on_message(&msg(
-            ":srv 005 me STATUSMSG=&@ :are supported by this server",
+            ":srv 005 me STATUSMSG=&@ CHANTYPES=#& :are supported by this server",
         ));
         app.on_message(&msg(":op!o@h PRIVMSG &local :here"));
         assert_eq!(last_line(&app, "&local"), "here");
+    }
+
+    /// NAMES puts a visibility symbol (`=`, `@`, `*`) before the channel: the
+    /// reply belongs beside the channel, not in the server buffer.
+    #[test]
+    fn names_replies_are_shown_in_their_channel() {
+        let mut app = App::new("#c".into(), "me".into());
+        app.on_message(&msg(":srv 353 me = #C :me @op bob"));
+        app.on_message(&msg(":srv 353 me @ #c :carol"));
+        assert_eq!(app.buffers.len(), 1, "no server buffer: {:?}", app.buffers);
+        assert_eq!(last_line(&app, "#c"), "@ #c carol");
+        app.on_message(&msg(":srv 441 me bob #c :They aren't on that channel"));
+        assert_eq!(
+            app.buffers.len(),
+            1,
+            "a nick-first refusal names its channel"
+        );
+    }
+
+    /// The network's 005 decides which names are one buffer and which targets
+    /// are channels: on an `ascii` network `#a[` and `#a{` are two channels,
+    /// and with `CHANTYPES=#!` a `!` target is a channel, not a query.
+    #[test]
+    fn buffers_follow_the_networks_casemapping_and_chantypes() {
+        let mut app = App::new("#a[".into(), "me".into());
+        app.on_message(&msg(":bob!u@h PRIVMSG #a{ :default folds"));
+        assert_eq!(app.buffers.len(), 1, "rfc1459 until the network says");
+        app.on_message(&msg(
+            ":srv 005 me CASEMAPPING=ascii CHANTYPES=#! :are supported by this server",
+        ));
+        app.on_message(&msg(":bob!u@h PRIVMSG #a{ :braces"));
+        app.on_message(&msg(":bob!u@h PRIVMSG #A[ :brackets"));
+        assert_eq!(last_line(&app, "#a{"), "braces");
+        assert_eq!(last_line(&app, "#a["), "brackets");
+        assert_ne!(app.buffer_index("#a{"), app.buffer_index("#a["));
+        app.on_message(&msg(":bob!u@h PRIVMSG !chan :bang"));
+        assert_eq!(last_line(&app, "!chan"), "bang");
+        assert!(app.buffer_index("bob").is_none(), "not a query with bob");
+        app.on_message(&msg(":bob!u@h PRIVMSG &local :amp"));
+        assert!(
+            app.buffer_index("&local").is_none(),
+            "& is not a channel here"
+        );
+    }
+
+    /// A mapping this client does not know compares as ascii, and says so; a
+    /// later 005 that makes two open buffers one name says that too.
+    #[test]
+    fn a_casemapping_change_is_reported_not_silent() {
+        let mut app = App::new("#a[".into(), "me".into());
+        app.on_message(&msg(
+            ":srv 005 me CASEMAPPING=rfc7613 :are supported by this server",
+        ));
+        let server = app.buffer_index(SERVER_BUFFER).expect("server buffer");
+        assert!(
+            app.buffers[server]
+                .log
+                .iter()
+                .any(|line| line.text.as_str().contains("not one this client knows")),
+            "{:?}",
+            app.buffers[server].log
+        );
+        app.on_message(&msg(":bob!u@h PRIVMSG #a{ :braces"));
+        assert_ne!(app.buffer_index("#a{"), app.buffer_index("#a["));
+        app.on_message(&msg(
+            ":srv 005 me CASEMAPPING=rfc1459 :are supported by this server",
+        ));
+        assert!(
+            app.buffers[server]
+                .log
+                .iter()
+                .any(|line| line.text.as_str().contains("#a[ and #a{ are one name")),
+            "{:?}",
+            app.buffers[server].log
+        );
     }
 
     /// A QUIT is reported in the query with that user whatever case the
@@ -1321,7 +1434,7 @@ mod tests {
         assert_eq!(outbound.line(), "PRIVMSG #c :ho");
         assert!(app.current().log.is_empty(), "no echo before admission");
         app.outbound_accepted(&outbound);
-        assert_eq!(app.current().log.last().unwrap().text, "ho");
+        assert_eq!(app.current().log.back().unwrap().text, "ho");
     }
 
     #[test]
@@ -1390,7 +1503,7 @@ mod tests {
         assert!(
             app.current()
                 .log
-                .last()
+                .back()
                 .is_some_and(|line| line.text.as_str().contains("/msg nick text"))
         );
 
@@ -1401,7 +1514,7 @@ mod tests {
         assert_eq!(literal.line(), "PRIVMSG #c :/join is message text");
         app.outbound_accepted(&literal);
         assert_eq!(
-            app.current().log.last().unwrap().text,
+            app.current().log.back().unwrap().text,
             "/join is message text"
         );
 
@@ -1412,7 +1525,7 @@ mod tests {
         assert_eq!(direct.line(), "PRIVMSG Alice :hello there");
         assert_eq!(app.current().name, "Alice");
         app.outbound_accepted(&direct);
-        assert_eq!(app.current().log.last().unwrap().text, "hello there");
+        assert_eq!(app.current().log.back().unwrap().text, "hello there");
 
         app.input = "/raw WHOIS Alice".into();
         let Action::Send(raw) = app.on_enter() else {
@@ -1448,7 +1561,7 @@ mod tests {
         assert!(
             app.current()
                 .log
-                .last()
+                .back()
                 .is_some_and(|line| line.text.as_str().contains("exceeds an IRC wire budget"))
         );
 
@@ -1542,7 +1655,7 @@ mod tests {
         assert!(
             app.current()
                 .log
-                .last()
+                .back()
                 .unwrap()
                 .text
                 .as_str()
@@ -1743,7 +1856,7 @@ mod tests {
     fn actions_and_formatting_render_as_meant() {
         let mut app = App::new("#home".into(), "me".into());
         app.on_message(&msg(":alice!u@h PRIVMSG #home :\x01ACTION waves\x01"));
-        let line = app.current().log.last().expect("a line").clone();
+        let line = app.current().log.back().expect("a line").clone();
         assert_eq!(line.from, "* alice");
         assert_eq!(line.text, "waves");
         app.on_message(&msg(
@@ -1771,7 +1884,7 @@ mod tests {
         assert!(
             app.current()
                 .log
-                .last()
+                .back()
                 .is_some_and(|line| line.text.as_str().contains("more unread lines"))
         );
         assert_eq!(
@@ -1816,7 +1929,7 @@ mod tests {
         assert!(
             app.current()
                 .log
-                .last()
+                .back()
                 .is_some_and(|line| line.text.as_str().contains("paste of 2 lines"))
         );
         app.on_char('x');

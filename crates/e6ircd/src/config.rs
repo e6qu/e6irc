@@ -209,6 +209,76 @@ pub struct Config {
     /// Database retention and expired-resource cleanup policy.
     #[serde(default)]
     pub storage: StorageConfig,
+    /// Which keys the document this configuration was read from states, so a
+    /// console-owned setting it states can be held to the stored value
+    /// ([`ManagedConfig::bootstrap_drift`]) while one it leaves unstated is
+    /// not. Not a key of the document itself.
+    #[serde(skip)]
+    pub stated: StatedSettings,
+}
+
+/// The keys a configuration document states, as opposed to leaving them to a
+/// default. On a database-backed start every console-owned setting the
+/// document states must agree with the stored revision, and one it does not
+/// state is the console's alone ([`ManagedConfig::bootstrap_drift`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum StatedSettings {
+    /// A configuration built in code rather than read from a document. Every
+    /// setting counts as stated: nothing says which were meant, and treating
+    /// all of them as meant is the reading under which none can be silently
+    /// overridden.
+    #[default]
+    Everything,
+    /// A document (a file, or the environment's): the dotted paths of every
+    /// value that is not a table (`http.admin_accounts`, `limits.command_burst`,
+    /// `oidc`), less the ones the environment filled with its own defaults.
+    Keys(std::collections::BTreeSet<String>),
+}
+
+impl StatedSettings {
+    /// The keys `document` states, less `defaulted` (the environment's own
+    /// defaults, which no operator stated).
+    fn of_document(document: &toml::Table, defaulted: &[&str]) -> Self {
+        fn leaves(prefix: &str, table: &toml::Table, out: &mut std::collections::BTreeSet<String>) {
+            for (key, value) in table {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                match value {
+                    toml::Value::Table(table) => leaves(&path, table, out),
+                    _ => {
+                        out.insert(path);
+                    }
+                }
+            }
+        }
+        let mut keys = std::collections::BTreeSet::new();
+        leaves("", document, &mut keys);
+        for key in defaulted {
+            keys.remove(*key);
+        }
+        Self::Keys(keys)
+    }
+
+    /// Whether the document states anything at `path` (a bootstrap key path
+    /// such as `http.admin_accounts` or `oidc[0].client_secret`): the key
+    /// itself, a key enclosing it (`oidc` states `oidc[0].client_secret`), or
+    /// a key inside it (`bnc.tls.cert_path` states part of `bnc.tls`).
+    fn covers(&self, path: &str) -> bool {
+        fn encloses(outer: &str, inner: &str) -> bool {
+            inner
+                .strip_prefix(outer)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '[']))
+        }
+        match self {
+            Self::Everything => true,
+            Self::Keys(keys) => keys
+                .iter()
+                .any(|key| encloses(key, path) || encloses(path, key)),
+        }
+    }
 }
 
 const DEFAULT_API_RATE_BURST: usize = 240;
@@ -300,7 +370,9 @@ impl Default for LimitsConfig {
 /// release revision remain bootstrap configuration. Every field in this type is
 /// rendered and editable by the admin console, stored as one revision, and
 /// applied on the next process start; the BNC listener is additionally applied
-/// live by its runtime controller.
+/// live by its runtime controller. The first database-backed start imports them
+/// from the configuration; after that a configuration may still state one only
+/// with the stored value, or start is refused ([`Self::bootstrap_drift`]).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedConfig {
@@ -341,6 +413,15 @@ pub struct ManagedConfig {
 }
 
 impl ManagedConfig {
+    /// The names (never values) of the settings that differ between this
+    /// revision and `next`, as dotted paths into the nested tables
+    /// (`limits.command_burst`); a list such as `motd` or `listeners` is one
+    /// name. Derived from the serialized form so a new field cannot be left
+    /// out of the audit detail.
+    pub fn changed_fields(&self, next: &Self) -> Vec<String> {
+        changed_paths(self, next, Lists::Whole)
+    }
+
     /// Whether reaching `next` from this configuration needs a restart.
     ///
     /// The one definition of which settings apply live, so the answer an
@@ -349,47 +430,6 @@ impl ManagedConfig {
     /// storage maintenance each re-read their settings every cycle. Everything
     /// else is read once, at start. (Storage used to be missing here, so a
     /// retention-only change was reported as needing a restart it did not.)
-    /// The names (never values) of the settings that differ between this
-    /// revision and `next`, as dotted paths into the nested tables
-    /// (`limits.command_burst`); a list such as `motd` or `listeners` is one
-    /// name. Derived from the serialized form so a new field cannot be left
-    /// out of the audit detail.
-    pub fn changed_fields(&self, next: &Self) -> Vec<String> {
-        fn collect(
-            prefix: &str,
-            before: &serde_json::Value,
-            after: &serde_json::Value,
-            out: &mut Vec<String>,
-        ) {
-            match (before, after) {
-                (serde_json::Value::Object(before), serde_json::Value::Object(after)) => {
-                    let keys: std::collections::BTreeSet<&String> =
-                        before.keys().chain(after.keys()).collect();
-                    for key in keys {
-                        let path = if prefix.is_empty() {
-                            key.clone()
-                        } else {
-                            format!("{prefix}.{key}")
-                        };
-                        match (before.get(key), after.get(key)) {
-                            (Some(b), Some(a)) => collect(&path, b, a, out),
-                            _ => out.push(path),
-                        }
-                    }
-                }
-                _ if before != after => out.push(prefix.to_string()),
-                _ => {}
-            }
-        }
-        let mut changed = Vec::new();
-        let (before, after) = (
-            serde_json::to_value(self).expect("managed configuration serializes"),
-            serde_json::to_value(next).expect("managed configuration serializes"),
-        );
-        collect("", &before, &after, &mut changed);
-        changed
-    }
-
     pub fn requires_restart_to_reach(&self, next: &Self) -> bool {
         let mut reached_live = self.clone();
         reached_live.bnc_addr = next.bnc_addr;
@@ -412,11 +452,23 @@ impl ManagedConfig {
             && (!config.oidc_providers.is_empty()
                 || !config.opers.is_empty()
                 || network_has_secret);
-        let seal = |value: &str| -> String {
-            key.map_or_else(String::new, |key| {
-                key.seal(value, crate::secret::CONFIG_CONTEXT)
-            })
-        };
+        Ok(Self::with_secrets(
+            config,
+            credentials_from_bootstrap,
+            |value: &str| {
+                key.map_or_else(String::new, |key| {
+                    key.seal(value, crate::secret::CONFIG_CONTEXT)
+                })
+            },
+        ))
+    }
+
+    /// The settings `config` holds, every secret passed through `seal`.
+    fn with_secrets(
+        config: &Config,
+        credentials_from_bootstrap: bool,
+        seal: impl Fn(&str) -> String,
+    ) -> Self {
         let mut oidc_providers = config.oidc_providers.clone();
         for provider in &mut oidc_providers {
             provider.client_secret = seal(&provider.client_secret);
@@ -439,7 +491,7 @@ impl ManagedConfig {
                 network.sasl_account = Some(seal(account));
             }
         }
-        Ok(Self {
+        Self {
             server_name: config.server_name.clone(),
             network_name: config.network_name.clone(),
             description: config.description.clone(),
@@ -470,7 +522,35 @@ impl ManagedConfig {
             opers,
             networks,
             credentials_from_bootstrap,
-        })
+        }
+    }
+
+    /// The console-owned settings `config` states with a value other than the
+    /// one this stored revision gives them, by bootstrap key path
+    /// (`http.admin_accounts`, `oidc[0].client_secret`) and never by value.
+    ///
+    /// The comparison is between what the configuration states and what start
+    /// would actually run with once this revision is applied to it
+    /// ([`Self::apply_to`]), with the stored secrets opened by `key`. A setting
+    /// the configuration does not state ([`Config::stated`]) is the console's
+    /// alone and never differs. Secrets are compared in constant time, and
+    /// only whether one differs survives the comparison.
+    pub fn bootstrap_drift(
+        &self,
+        config: &Config,
+        key: Option<&crate::secret::SecretKeyring>,
+    ) -> Result<Vec<String>, ConfigError> {
+        let mut effective = config.clone();
+        self.apply_to(&mut effective);
+        effective.resolve_secrets_with_key(key)?;
+        let mut stated = Self::with_secrets(config, false, str::to_owned);
+        let mut stored = Self::with_secrets(&effective, false, str::to_owned);
+        reduce_secrets_to_equality(&mut stated, &mut stored);
+        Ok(changed_paths(&stated, &stored, Lists::OfTablesByIndex)
+            .iter()
+            .filter_map(|path| bootstrap_path(path))
+            .filter(|path| config.stated.covers(path))
+            .collect())
     }
 
     /// The attach listener these settings describe, when enabled.
@@ -539,6 +619,178 @@ impl ManagedConfig {
     }
 }
 
+/// Why a database-backed start refuses: the configuration states console-owned
+/// settings with values other than the stored revision's
+/// ([`ManagedConfig::bootstrap_drift`]). Names each setting and never a value.
+#[derive(Debug)]
+pub struct ManagedSettingsConflict {
+    /// Bootstrap key paths, as [`ManagedConfig::bootstrap_drift`] names them.
+    pub settings: Vec<String>,
+    /// The stored revision they were compared with, and who saved it when.
+    pub revision: i64,
+    pub updated_by: String,
+    pub updated_at: String,
+}
+
+impl std::fmt::Display for ManagedSettingsConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "the configuration states {} setting(s) that the console owns with a value other \
+             than the stored one (revision {}, saved by {} at {}):",
+            self.settings.len(),
+            self.revision,
+            self.updated_by,
+            self.updated_at
+        )?;
+        for setting in &self.settings {
+            writeln!(
+                f,
+                "  {setting}: the stated value differs from the stored value"
+            )?;
+        }
+        write!(
+            f,
+            "No value is shown: any of them may be a secret. After the first database-backed \
+             start these settings belong to the console (/console/configuration), and a stated \
+             value that differs is refused rather than ignored. For each one, either remove it \
+             from the configuration file or environment so the stored value applies, or set it \
+             to the stored value, or change it in the console and then restart with it stated \
+             the same way."
+        )?;
+        if self
+            .settings
+            .iter()
+            .any(|setting| setting == "http.admin_accounts")
+        {
+            write!(
+                f,
+                " An operator locked out of the console regains administrator access with \
+                 `e6ircd recover-administrator`, which does not need the server started."
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ManagedSettingsConflict {}
+
+/// How [`changed_paths`] names a list that differs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lists {
+    /// As one name (`motd`, `listeners`): the audit detail's granularity.
+    Whole,
+    /// A list of tables of the same length on both sides by element and key
+    /// (`oidc_providers[0].client_secret`), so a refusal can say which value
+    /// differs; any other list as one name.
+    OfTablesByIndex,
+}
+
+/// The dotted paths (never the values) at which two revisions differ. Derived
+/// from the serialized form so a new field cannot be left out.
+fn changed_paths(before: &ManagedConfig, after: &ManagedConfig, lists: Lists) -> Vec<String> {
+    use serde_json::Value;
+    fn collect(prefix: &str, before: &Value, after: &Value, lists: Lists, out: &mut Vec<String>) {
+        match (before, after) {
+            (Value::Object(before), Value::Object(after)) => {
+                let keys: std::collections::BTreeSet<&String> =
+                    before.keys().chain(after.keys()).collect();
+                for key in keys {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    match (before.get(key), after.get(key)) {
+                        (Some(b), Some(a)) => collect(&path, b, a, lists, out),
+                        _ => out.push(path),
+                    }
+                }
+            }
+            (Value::Array(before), Value::Array(after))
+                if lists == Lists::OfTablesByIndex
+                    && before.len() == after.len()
+                    && before.iter().chain(after).all(Value::is_object) =>
+            {
+                for (index, (b, a)) in before.iter().zip(after).enumerate() {
+                    collect(&format!("{prefix}[{index}]"), b, a, lists, out);
+                }
+            }
+            _ if before != after => out.push(prefix.to_string()),
+            _ => {}
+        }
+    }
+    let mut changed = Vec::new();
+    let (before, after) = (
+        serde_json::to_value(before).expect("managed configuration serializes"),
+        serde_json::to_value(after).expect("managed configuration serializes"),
+    );
+    collect("", &before, &after, lists, &mut changed);
+    changed
+}
+
+/// Where a [`ManagedConfig`] path is stated in a configuration document: the
+/// same key, except for the settings a document keeps under `[http]` or
+/// `[bnc]` or under a table-array name. `None` for what no document states.
+fn bootstrap_path(managed: &str) -> Option<String> {
+    let (field, rest) = managed.split_at(managed.find(['.', '[']).unwrap_or(managed.len()));
+    let key = match field {
+        "public_url" => "http.public_url",
+        "secure_cookies" => "http.secure_cookies",
+        "admin_accounts" => "http.admin_accounts",
+        "bnc_addr" => "bnc.addr",
+        "bnc_tls" => "bnc.tls",
+        "oidc_providers" => "oidc",
+        "opers" => "oper",
+        "networks" => "network",
+        // Derived from whether a master key is present; never stated.
+        "credentials_from_bootstrap" => return None,
+        same => same,
+    };
+    Some(format!("{key}{rest}"))
+}
+
+/// Replace every secret of two revisions with a marker recording only whether
+/// it equals the secret in the same position of the other, judged in constant
+/// time. The comparison that follows then sees that a secret differs and
+/// nothing else about it. A secret with no counterpart is in a list whose
+/// length differs, which that comparison reports whole without reading it.
+fn reduce_secrets_to_equality(left: &mut ManagedConfig, right: &mut ManagedConfig) {
+    fn reduce(left: &mut String, right: &mut String) {
+        let equal =
+            aws_lc_rs::constant_time::verify_slices_are_equal(left.as_bytes(), right.as_bytes())
+                .is_ok();
+        left.clear();
+        right.clear();
+        if !equal {
+            right.push_str("differs");
+        }
+    }
+    fn reduce_optional(left: &mut Option<String>, right: &mut Option<String>) {
+        // One side absent differs by shape; no content is compared.
+        if let (Some(left), Some(right)) = (left, right) {
+            reduce(left, right);
+        }
+    }
+    for (l, r) in left
+        .oidc_providers
+        .iter_mut()
+        .zip(&mut right.oidc_providers)
+    {
+        reduce(&mut l.client_secret, &mut r.client_secret);
+    }
+    for (l, r) in left.opers.iter_mut().zip(&mut right.opers) {
+        reduce(&mut l.password, &mut r.password);
+    }
+    for (l, r) in left.networks.iter_mut().zip(&mut right.networks) {
+        reduce_optional(&mut l.sasl_password, &mut r.sasl_password);
+        reduce_optional(&mut l.server_password, &mut r.server_password);
+        if l.kind.account_is_secret() || r.kind.account_is_secret() {
+            reduce_optional(&mut l.sasl_account, &mut r.sasl_account);
+        }
+    }
+}
+
 /// The bootstrap values a managed-settings revision is judged against. They
 /// come from the file or environment the process started with — the console
 /// cannot change them — yet a managed value is valid only together with them.
@@ -582,13 +834,16 @@ impl EnvironmentSecretKeys {
     const PRIMARY_VARIABLE: &'static str = "E6IRC_SECRET_KEY";
     const PREVIOUS_VARIABLE: &'static str = "E6IRC_PREVIOUS_SECRET_KEYS";
 
+    /// Read by the environment's one rule (`environment_config::optional`): a
+    /// variable set but empty is unset, so `E6IRC_SECRET_KEY=` beside a
+    /// `[secrets].key_file` is no conflict and is no key either.
     pub fn from_process() -> Result<Self, ConfigError> {
-        let read = |variable: &str| match std::env::var(variable) {
-            Ok(value) => Ok(Some(value)),
-            Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::Invalid(format!(
-                "{variable} is not valid UTF-8"
-            ))),
+        let read = |variable: &'static str| {
+            crate::environment_config::optional(
+                &crate::environment_config::process_environment,
+                variable,
+            )
+            .map_err(|error| ConfigError::Invalid(error.to_string()))
         };
         Ok(Self {
             primary: read(Self::PRIMARY_VARIABLE)?,
@@ -1379,6 +1634,7 @@ impl Default for Config {
             limits: LimitsConfig::default(),
             observability: ObservabilityConfig::default(),
             storage: StorageConfig::default(),
+            stated: StatedSettings::Everything,
         }
     }
 }
@@ -1447,14 +1703,24 @@ fn open_secret(
 impl Config {
     pub fn load(path: &std::path::Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
-        Self::checked(toml::from_str(&text).map_err(ConfigError::Parse)?)
+        // Deserialized from the text rather than from its table, so a value of
+        // the wrong shape keeps the position the refusal reports it by.
+        let mut config: Self = toml::from_str(&text).map_err(ConfigError::Parse)?;
+        let document: toml::Table = toml::from_str(&text).map_err(ConfigError::Parse)?;
+        config.stated = StatedSettings::of_document(&document, &[]);
+        Self::checked(config)
     }
 
-    /// A configuration stated as a document already in memory (the container
-    /// environment; see `environment_config`). It gets exactly the validation a
-    /// file does.
-    pub fn from_table(table: toml::Table) -> Result<Self, ConfigError> {
-        Self::checked(table.try_into().map_err(ConfigError::Parse)?)
+    /// A configuration stated as a document: a file's, or one built in memory
+    /// (the container environment; see `environment_config`), which gets
+    /// exactly the validation a file does. `defaulted` names the keys the
+    /// builder filled with its own defaults rather than an operator's
+    /// statement, so they are not held to the stored console settings.
+    pub fn from_table(table: toml::Table, defaulted: &[&str]) -> Result<Self, ConfigError> {
+        let stated = StatedSettings::of_document(&table, defaulted);
+        let mut config: Self = table.try_into().map_err(ConfigError::Parse)?;
+        config.stated = stated;
+        Self::checked(config)
     }
 
     /// Structure and non-secret content are checked first; then sealed secrets
@@ -4001,5 +4267,193 @@ account_claim = "preferred_username"
         let mut resized = current.clone();
         resized.sendq += 1;
         assert!(current.requires_restart_to_reach(&resized));
+    }
+
+    /// Every console-owned setting is named by the key a document states it
+    /// under. A setting whose name mapped nowhere could never be found stated,
+    /// so a changed value of it would be ignored again, silently.
+    #[test]
+    fn every_console_owned_setting_maps_to_the_key_a_document_states_it_under() {
+        let everything: toml::Table = toml::from_str(
+            r#"
+            server_name = "irc.example"
+            network_name = "example"
+            description = "d"
+            motd = ["m"]
+            nicklen = 16
+            sendq = 1024
+            core_queue = 1024
+            core_workers = 1
+            max_hot_channels = 8
+            [[listeners]]
+            addr = "127.0.0.1:6667"
+            [registration]
+            before_connect = true
+            [limits]
+            command_burst = 40
+            [observability]
+            enabled = true
+            [storage]
+            history_retention_days = 30
+            [bnc]
+            addr = "127.0.0.1:6698"
+            tls = { cert_path = "c", key_path = "k" }
+            [http]
+            addr = "127.0.0.1:8080"
+            public_url = "https://irc.example"
+            secure_cookies = true
+            admin_accounts = ["alice"]
+            [[oidc]]
+            name = "idp"
+            [[oper]]
+            name = "root"
+            [[network]]
+            name = "libera"
+            "#,
+        )
+        .expect("document");
+        let stated = StatedSettings::of_document(&everything, &[]);
+        let settings = ManagedConfig::from_config(&Config::default(), None).expect("managed");
+        let serialized = serde_json::to_value(&settings).expect("serializes");
+        for field in serialized.as_object().expect("an object").keys() {
+            match bootstrap_path(field) {
+                Some(path) => assert!(stated.covers(&path), "{field} maps to {path}, unstated"),
+                None => assert_eq!(field, "credentials_from_bootstrap"),
+            }
+        }
+        let nothing = StatedSettings::of_document(&toml::Table::new(), &[]);
+        assert!(!nothing.covers("http.admin_accounts"));
+        // A key encloses what is inside it; a key inside a path states part of it.
+        assert!(stated.covers("oidc[0].client_secret"));
+        assert!(stated.covers("bnc.tls"));
+        assert!(!stated.covers("http.addrx"));
+    }
+
+    /// The configuration a document states, and the revision it imports on a
+    /// first start.
+    fn stated_and_imported(
+        document: &str,
+        key: &crate::secret::SecretKeyring,
+    ) -> (Config, ManagedConfig) {
+        let config =
+            Config::from_table(toml::from_str(document).expect("document"), &[]).expect("valid");
+        let imported = ManagedConfig::from_config(&config, Some(key)).expect("imported");
+        (config, imported)
+    }
+
+    const DRIFT_DOCUMENT: &str = r#"
+        server_name = "irc.example"
+        network_name = "example"
+        [[listeners]]
+        addr = "127.0.0.1:6667"
+        [database]
+        url = "postgres://localhost/e6irc"
+        [http]
+        addr = "127.0.0.1:8080"
+        public_url = "https://irc.example"
+        admin_accounts = ["alice", "bob"]
+        [[oidc]]
+        name = "idp"
+        issuer_url = "https://idp.example"
+        client_id = "e6irc"
+        client_secret = "first-client-secret"
+        account_claim = "preferred_username"
+        token_endpoint_auth_method = "client_secret_post"
+    "#;
+
+    #[test]
+    fn a_stated_setting_that_differs_from_the_stored_one_is_named_and_never_shown() {
+        let key = crate::secret::SecretKeyring::single(crate::secret::SecretKey::generate());
+        let (config, stored) = stated_and_imported(DRIFT_DOCUMENT, &key);
+        assert_eq!(
+            stored.bootstrap_drift(&config, Some(&key)).unwrap(),
+            Vec::<String>::new(),
+            "the revision a document imported agrees with it"
+        );
+
+        let (fewer_admins, _) =
+            stated_and_imported(&DRIFT_DOCUMENT.replace(r#", "bob""#, ""), &key);
+        assert_eq!(
+            stored.bootstrap_drift(&fewer_admins, Some(&key)).unwrap(),
+            ["http.admin_accounts"]
+        );
+
+        let (rotated, _) = stated_and_imported(
+            &DRIFT_DOCUMENT.replace("first-client-secret", "second-client-secret"),
+            &key,
+        );
+        let drift = stored.bootstrap_drift(&rotated, Some(&key)).unwrap();
+        assert_eq!(drift, ["oidc[0].client_secret"]);
+        let refusal = ManagedSettingsConflict {
+            settings: drift,
+            revision: 1,
+            updated_by: "bootstrap".into(),
+            updated_at: "now".into(),
+        }
+        .to_string();
+        assert!(refusal.contains("oidc[0].client_secret"), "{refusal}");
+        assert!(
+            !refusal.contains("first-client") && !refusal.contains("second-client"),
+            "{refusal}"
+        );
+
+        // Unstated, the list is the console's alone.
+        let (unstated, _) = stated_and_imported(
+            &DRIFT_DOCUMENT.replace(r#"admin_accounts = ["alice", "bob"]"#, ""),
+            &key,
+        );
+        let mut console_edited = stored.clone();
+        console_edited.admin_accounts = vec!["carol".into()];
+        assert!(
+            console_edited
+                .bootstrap_drift(&unstated, Some(&key))
+                .unwrap()
+                .is_empty()
+        );
+        // A configuration built in code states everything it holds.
+        let mut built = config.clone();
+        built.stated = StatedSettings::Everything;
+        assert_eq!(
+            console_edited.bootstrap_drift(&built, Some(&key)).unwrap(),
+            ["http.admin_accounts"]
+        );
+    }
+
+    /// The environment's own defaults are not an operator's statement: an unset
+    /// `E6IRC_NETWORK_NAME` or `E6IRC_IRC_ADDR` leaves the setting to the
+    /// console, and a set one is held to it.
+    #[test]
+    fn an_environment_default_is_not_held_to_the_stored_value() {
+        let minimal = [
+            ("E6IRC_SERVER_NAME", "irc.example"),
+            ("E6IRC_PUBLIC_URL", "https://irc.example"),
+            ("E6IRC_DATABASE_URL", "postgres://localhost/e6irc"),
+            ("APPLICATION_RELEASE_REVISION", "0123456789abcdef"),
+        ];
+        let from = |pairs: &[(&'static str, &'static str)]| {
+            let document = crate::environment_config::configuration_table(&|variable: &str| {
+                Ok(pairs
+                    .iter()
+                    .find(|(name, _)| *name == variable)
+                    .map(|(_, value)| (*value).to_owned()))
+            })
+            .expect("environment");
+            Config::from_table(document.table, &document.defaulted).expect("valid")
+        };
+        let config = from(&minimal);
+        let mut stored = ManagedConfig::from_config(&config, None).expect("managed");
+        stored.network_name = "Console".into();
+        stored.listeners[0].addr = "127.0.0.1:7000".parse().unwrap();
+        assert!(stored.bootstrap_drift(&config, None).unwrap().is_empty());
+
+        let mut stating = minimal.to_vec();
+        stating.extend([
+            ("E6IRC_NETWORK_NAME", "e6qu"),
+            ("E6IRC_IRC_ADDR", "127.0.0.1:6667"),
+        ]);
+        assert_eq!(
+            stored.bootstrap_drift(&from(&stating), None).unwrap(),
+            ["listeners[0].addr", "network_name"]
+        );
     }
 }

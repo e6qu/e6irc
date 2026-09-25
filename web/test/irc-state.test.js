@@ -5,13 +5,18 @@ import test from "node:test";
 
 import {
   DEFAULT_CHANNEL_MODES,
+  DEFAULT_NAMES,
+  SERVER_KEY,
   asMessage,
   bufferAction,
   channelModesFrom,
+  channelModesFromIsupport,
   chatMessageRoute,
   clearTranscript,
+  composerRequests,
   existingChannelBuffer,
   fold,
+  isChannel,
   isPrefixMode,
   kickPairs,
   memberRank,
@@ -20,11 +25,20 @@ import {
   messageIdentity,
   modeChanges,
   modeTakesParameter,
+  namesDiffer,
+  namesFrom,
+  namesFromIsupport,
   nickPrefix,
+  oldestRingFloor,
+  outgoingChat,
   parseIrc,
+  prependHistory,
   reconcileChannelSnapshot,
+  rekeyBuffers,
   seededNick,
   splitSigil,
+  splitUtf8,
+  stripBidiControls,
   stripFormatting,
   tagValue,
   topicReply,
@@ -42,6 +56,78 @@ test("IRC parsing preserves tags, prefix, trailing text, and RFC1459 identity", 
     params: ["#Chat", "hello there"],
   });
   assert.equal(fold("[Alice]~"), "{alice}^");
+});
+
+test("names follow the network's CASEMAPPING and CHANTYPES", () => {
+  // Until a 005 says otherwise: rfc1459 and #&.
+  assert.equal(fold("#A[]\\~"), "#a{}|^");
+  assert.ok(isChannel("#a") && isChannel("&a") && !isChannel("!a") && !isChannel(""));
+
+  // An ascii network: #a[ and #a{ are two channels.
+  const ascii = namesFrom(["me", "CASEMAPPING=ascii", "CHANTYPES=#!", "are supported"]);
+  assert.equal(ascii.casemapping, "ascii");
+  assert.equal(fold("#A[", ascii), "#a[");
+  assert.notEqual(fold("#a[", ascii), fold("#a{", ascii));
+  assert.ok(isChannel("!x", ascii) && !isChannel("&x", ascii));
+  assert.deepEqual(
+    chatMessageRoute(parseIrc(":bob!u@h PRIVMSG !chan :hi"), "me", () => false, ascii),
+    { kind: "channel", target: "!chan" },
+  );
+  assert.deepEqual(
+    chatMessageRoute(parseIrc(":bob!u@h PRIVMSG &x :hi"), "me", () => false, ascii),
+    { kind: "dm", target: "bob" },
+  );
+
+  // rfc1459-strict, in either spelling: brackets fold, ~ and ^ stay apart.
+  for (const spelling of ["rfc1459-strict", "strict-rfc1459"]) {
+    const strict = namesFromIsupport([`CASEMAPPING=${spelling}`]);
+    assert.equal(strict.casemapping, "rfc1459-strict");
+    assert.equal(fold("#A[~", strict), "#a{~");
+  }
+
+  // An unknown mapping compares as ascii and is named; retraction restores.
+  const unknown = namesFromIsupport(["CASEMAPPING=rfc7613"]);
+  assert.equal(unknown.casemapping, "ascii");
+  assert.equal(unknown.unrecognised, "rfc7613");
+  const retracted = namesFrom(["me", "-CASEMAPPING", "-CHANTYPES", "x"], ascii);
+  assert.ok(!namesDiffer(retracted, DEFAULT_NAMES));
+  assert.equal(namesFromIsupport(["CHANTYPES="]).chantypes, "", "a network without channels");
+
+  // Snapshots reconcile under the network's mapping.
+  assert.deepEqual(
+    reconcileChannelSnapshot(["#a["], ["#a{"], ascii),
+    { removed: ["#a["], added: ["#a{"], joined: ["#a{"] },
+  );
+});
+
+test("buffers are re-keyed when the naming rules change, merging what becomes one name", () => {
+  const buffer = (display, extra = {}) => ({
+    key: fold(display),
+    display,
+    kind: "channel",
+    lines: [],
+    nicks: new Map(),
+    unread: 0,
+    mentions: 0,
+    ...extra,
+  });
+  const ascii = namesFromIsupport(["CASEMAPPING=ascii"]);
+  const server = { ...buffer(SERVER_KEY), kind: "server" };
+  const brackets = buffer("#A[", { lines: ["b"], unread: 1 });
+  brackets.nicks.set(fold("Al[ex]"), { name: "Al[ex]", modes: new Set() });
+  const initial = new Map([[SERVER_KEY, server], [brackets.key, brackets]]);
+  const narrowed = rekeyBuffers(initial, ascii);
+  assert.deepEqual([...narrowed.buffers.keys()], [SERVER_KEY, "#a["]);
+  assert.deepEqual([...brackets.nicks.keys()], ["al[ex]"]);
+  assert.deepEqual(narrowed.merged, []);
+
+  const braces = { ...buffer("#a{", { lines: ["c"], unread: 2 }), key: fold("#a{", ascii) };
+  narrowed.buffers.set(braces.key, braces);
+  const widened = rekeyBuffers(narrowed.buffers, DEFAULT_NAMES);
+  assert.deepEqual([...widened.buffers.keys()], [SERVER_KEY, "#a{"]);
+  assert.deepEqual(widened.buffers.get("#a{").lines, ["b", "c"]);
+  assert.equal(widened.buffers.get("#a{").unread, 3);
+  assert.deepEqual(widened.merged, [["#A[", "#a{"]]);
 });
 
 test("IRC parsing distinguishes server and user notice sources", () => {
@@ -123,17 +209,34 @@ test("membership sigils retain every mode and render the highest rank", () => {
   assert.equal(nickPrefix(member.modes), "@");
 });
 
-test("CTCP ACTION is rendered as an event", () => {
+test("CTCP ACTION is rendered as an event that keeps its actor", () => {
+  // The actor is kept as the sender: an action naming you is a mention.
   assert.deepEqual(asMessage("msg", "alice", "\x01ACTION waves\x01"), {
     kind: "event",
     from: null,
+    sender: "alice",
     text: "* alice waves",
   });
   assert.deepEqual(asMessage("notice", "alice", "plain"), {
     kind: "notice",
     from: "alice",
+    sender: "alice",
     text: "plain",
   });
+});
+
+test("bidirectional override and isolate controls are removed from displayed text", () => {
+  // RLO would show `https://evil.example/\u202Egpj.exe` as ending in "exe.jpg".
+  assert.equal(
+    stripBidiControls("see https://evil.example/\u202Emoc.elgoog//:sptth"),
+    "see https://evil.example/moc.elgoog//:sptth",
+  );
+  for (const control of ["\u202A", "\u202B", "\u202C", "\u202D", "\u202E", "\u2066", "\u2067", "\u2068", "\u2069"]) {
+    assert.equal(stripBidiControls(`a${control}b`), "ab", JSON.stringify(control));
+  }
+  // Right-to-left text itself is left alone.
+  assert.equal(stripBidiControls("שלום world"), "שלום world");
+  assert.equal(stripBidiControls(undefined), "");
 });
 
 test("history merge never replaces live or unidentified lines", () => {
@@ -217,15 +320,15 @@ test("formatting codes are removed rather than shown as digits and control bytes
   assert.equal(stripFormatting("price\x03 42"), "price 42");
   assert.equal(stripFormatting("\x033three"), "three");
   assert.equal(stripFormatting(undefined), "");
-  assert.deepEqual(asMessage("msg", "bot", "\x0303ok\x03"), { kind: "msg", from: "bot", text: "ok" });
+  assert.deepEqual(asMessage("msg", "bot", "\x0303ok\x03"), { kind: "msg", from: "bot", sender: "bot", text: "ok" });
 });
 
 test("a CTCP other than ACTION is named, not shown as raw control bytes", () => {
   assert.deepEqual(asMessage("msg", "alice", "\x01VERSION\x01"), {
-    kind: "event", from: null, text: "alice sent a CTCP VERSION request",
+    kind: "event", from: null, sender: null, text: "alice sent a CTCP VERSION request",
   });
   assert.deepEqual(asMessage("msg", "alice", "\x01PING 12345\x01"), {
-    kind: "event", from: null, text: "alice sent a CTCP PING request: 12345",
+    kind: "event", from: null, sender: null, text: "alice sent a CTCP PING request: 12345",
   });
 });
 
@@ -353,4 +456,138 @@ test("a bridge's session snapshot joins its channels under the provider account'
   assert.deepEqual(reconciliation.removed, []);
   assert.deepEqual(reconciliation.added, ["#random"]);
   assert.deepEqual(reconciliation.joined, ["#General", "#random"]);
+});
+
+// ---- history merge around rows the history has no counterpart for ---------
+
+test("history merge on a network without msgids matches past join notices and local echoes", () => {
+  // No msgid anywhere. The live buffer opens with a join notice, which history
+  // has no counterpart for, and holds a local echo of our own message, which
+  // history holds as the ring's copy of the line.
+  const wire = (text, nick = "bob") => ({
+    identity: null, kind: "msg", sender: nick, text, wire: `:${nick}!u@h PRIVMSG #c :${text}`,
+  });
+  const older = wire("older");
+  const first = wire("first");
+  const second = wire("second");
+  const joined = { identity: null, kind: "event", sender: null, text: "carol joined", wire: null };
+  const echo = { identity: null, kind: "msg", sender: "me", text: "mine", wire: null };
+  const live = [joined, first, echo, second];
+  const isMine = (nick) => nick === "me";
+
+  assert.deepEqual(
+    mergeTimeline([older, first, wire("mine", "me"), second], live, 20, isMine),
+    [older, joined, first, echo, second],
+    "the overlap is matched past rows history cannot hold, so it is not prepended again",
+  );
+  // Our own older line is still prepended when it precedes the overlap.
+  assert.deepEqual(
+    mergeTimeline([wire("earlier", "me"), first, wire("mine", "me"), second], live, 20, isMine),
+    [wire("earlier", "me"), joined, first, echo, second],
+  );
+});
+
+test("history bounded by ring position is prepended whole, with msgids still unique", () => {
+  const history = [
+    { identity: null, text: "same", wire: ":b!u@h PRIVMSG #c :same" },
+    { identity: "m1", text: "identified", wire: ":b!u@h PRIVMSG #c :identified" },
+  ];
+  const live = [
+    { identity: null, text: "same", wire: ":b!u@h PRIVMSG #c :same" },
+    { identity: "m1", text: "identified", wire: ":b!u@h PRIVMSG #c :identified" },
+  ];
+  // Equal wire text is not identity: bounded history is older by position, so
+  // its unidentified row stays; the shared msgid appears once.
+  assert.deepEqual(prependHistory(history, live, 20), [history[0], ...live]);
+});
+
+test("a buffer's ring floor is its oldest row's cursor-before", () => {
+  assert.equal(oldestRingFloor([]), undefined);
+  assert.equal(oldestRingFloor([{ ringFloor: null }, { ringFloor: "9:4" }]), null);
+  assert.equal(oldestRingFloor([{ ringFloor: "9:3" }, { ringFloor: "9:4" }]), "9:3");
+});
+
+// ---- outgoing chat: local echo and line splitting -------------------------
+
+test("every composer request that sends chat names its command, targets and body", () => {
+  assert.deepEqual(outgoingChat("hello", "#c"), { command: "PRIVMSG", targets: ["#c"], body: "hello" });
+  assert.equal(outgoingChat("hello", ""), null, "the console sends no chat without a command");
+  // /me in any letter case, as the server lowercases the command.
+  for (const me of ["/me waves", "/ME waves", "/Me   waves"]) {
+    assert.deepEqual(outgoingChat(me, "bob"), { command: "PRIVMSG", targets: ["bob"], body: "\x01ACTION waves\x01" }, me);
+  }
+  assert.equal(outgoingChat("/me waves", ""), null);
+  assert.deepEqual(outgoingChat("/msg NickServ identify pw", "#c"), {
+    command: "PRIVMSG", targets: ["NickServ"], body: "identify pw",
+  });
+  assert.deepEqual(outgoingChat("/MSG a,#b  hi", ""), { command: "PRIVMSG", targets: ["a", "#b"], body: "hi" });
+  assert.deepEqual(outgoingChat("/notice bob heads up", "#c"), { command: "NOTICE", targets: ["bob"], body: "heads up" });
+  assert.equal(outgoingChat("/msg bob", "#c"), null);
+  // Typed raw, into the console or with /raw and /quote.
+  assert.deepEqual(outgoingChat("/raw PRIVMSG NickServ :IDENTIFY pw", ""), {
+    command: "PRIVMSG", targets: ["NickServ"], body: "IDENTIFY pw",
+  });
+  assert.deepEqual(outgoingChat("/quote notice #c :hi there", ""), { command: "NOTICE", targets: ["#c"], body: "hi there" });
+  for (const other of ["/join #c", "/nick bob", "/raw WHOIS bob", "/part"]) {
+    assert.equal(outgoingChat(other, "#c"), null, other);
+  }
+});
+
+test("UTF-8 splitting never breaks a code point and keeps words whole where it can", () => {
+  const bytes = (text) => new TextEncoder().encode(text).length;
+  const emoji = "😀".repeat(10); // 40 bytes
+  const pieces = splitUtf8(emoji, 10);
+  assert.deepEqual(pieces, ["😀😀", "😀😀", "😀😀", "😀😀", "😀😀"]);
+  assert.deepEqual(splitUtf8("aé😀", 3), ["aé", "😀"]);
+  assert.deepEqual(splitUtf8("hello world again", 12), ["hello world ", "again"]);
+  assert.deepEqual(splitUtf8("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+  for (const piece of splitUtf8("x y ".repeat(200) + "é".repeat(300), 50)) assert.ok(bytes(piece) <= 50, piece);
+  assert.equal(splitUtf8("x y ".repeat(200), 50).join(""), "x y ".repeat(200));
+});
+
+test("a message longer than one relayed IRC line is sent as several requests", () => {
+  const bytes = (text) => new TextEncoder().encode(text).length;
+  // What the upstream relays: `:nick!user@host PRIVMSG #chan :body`, 510 bytes
+  // at most, with the user and host given their usual room.
+  const relayed = (nick, line) => bytes(`:${nick}!~abcdefghij@${"h".repeat(63)} ${line}`);
+  const short = "hello";
+  assert.deepEqual(composerRequests(short, "#chan", "alice"), [short]);
+
+  const long = "word ".repeat(300).trim();
+  const plain = composerRequests(long, "#chan", "alice");
+  assert.ok(plain.length > 1);
+  assert.equal(plain.join(""), long);
+  for (const piece of plain) assert.ok(relayed("alice", `PRIVMSG #chan :${piece}`) <= 510, piece.length);
+
+  const action = composerRequests(`/ME ${"ü".repeat(400)}`, "#chan", "alice");
+  assert.ok(action.length > 1);
+  for (const request of action) {
+    assert.match(request, /^\/me /);
+    assert.ok(relayed("alice", `PRIVMSG #chan :\x01ACTION ${request.slice(4)}\x01`) <= 510);
+  }
+  assert.equal(action.map((request) => request.slice(4)).join(""), "ü".repeat(400));
+
+  const direct = composerRequests(`/msg bob ${"z".repeat(900)}`, "", "alice");
+  assert.ok(direct.length > 1);
+  for (const request of direct) {
+    assert.match(request, /^\/msg bob z+$/);
+    assert.ok(relayed("alice", `PRIVMSG bob :${request.slice(9)}`) <= 510);
+  }
+  // A raw line is sent exactly as typed; the server bounds it.
+  const raw = `/raw PRIVMSG bob :${"z".repeat(900)}`;
+  assert.deepEqual(composerRequests(raw, "", "alice"), [raw]);
+  // A nick not yet known is given room for a long one.
+  for (const piece of composerRequests(long, "#chan", null)) {
+    assert.ok(relayed("n".repeat(30), `PRIVMSG #chan :${piece}`) <= 510);
+  }
+});
+
+test("an ISUPPORT token list builds the network's table from the defaults", () => {
+  const { modes, malformed } = channelModesFromIsupport(["CHANTYPES=#", "PREFIX=(ov)@+", "CHANMODES=eIbq,k,flj,CFLMPQScgimnprstuz"]);
+  assert.deepEqual(malformed, []);
+  assert.deepEqual(modes.prefix, [["o", "@"], ["v", "+"]]);
+  assert.equal(modeTakesParameter(modes, "q", false), true, "+q is a list mode on this network");
+  assert.equal(modeTakesParameter(modes, "f", true), true);
+  assert.deepEqual(channelModesFromIsupport([]).modes, DEFAULT_CHANNEL_MODES);
+  assert.deepEqual(channelModesFromIsupport(["PREFIX=(ov)@"]).malformed, ["PREFIX=(ov)@"]);
 });

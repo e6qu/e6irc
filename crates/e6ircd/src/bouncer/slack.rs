@@ -50,10 +50,113 @@ impl NetworkDriver for SlackDriver {
 }
 
 async fn run(config: SlackConfig, mut ends: DriverEnds) {
-    super::run_with_backoff(config, &mut ends, |config, ends| {
-        Box::pin(session_once(config, ends))
-    })
+    super::run_with_backoff_carrying(
+        Arc::new(Shared::new(config)),
+        &mut ends,
+        |shared, ends| Box::pin(session_once(shared, ends)),
+        Some(|shared| Box::pin(shared.next_report())),
+    )
     .await;
+}
+
+/// What one Slack driver keeps across its sockets and sessions. Everything
+/// here outlives the socket it came from: an envelope is acknowledged the
+/// moment it arrives, so Slack never sends it again — the message waiting on
+/// its name lookup is the only copy there is, and a reconnect that dropped it
+/// lost it for good. The re-delivery memory is the same: an envelope Slack
+/// re-sends on the next socket is recognised there too, not relayed twice.
+struct Shared {
+    config: SlackConfig,
+    deliveries: super::CarriedDeliveries,
+    /// Acknowledged messages waiting on their name lookups, in order.
+    inbound: tokio::sync::Mutex<super::SerialQueue<Inbound>>,
+    recent: Mutex<RecentEnvelopes>,
+    names: Arc<Mutex<UserNames>>,
+    /// How the latest session shows channels and senders; a message that
+    /// finishes its lookups between sessions is shown the same way.
+    view: Mutex<Option<View>>,
+}
+
+/// The channel names and sender directory messages are rendered with.
+struct View {
+    channels: HashMap<String, String>,
+    senders: super::BridgedSenders,
+}
+
+impl Shared {
+    fn new(config: SlackConfig) -> Self {
+        Self {
+            config,
+            deliveries: super::CarriedDeliveries::new("Slack"),
+            inbound: tokio::sync::Mutex::new(super::SerialQueue::new(INBOUND_QUEUE_CAPACITY)),
+            recent: Mutex::new(RecentEnvelopes::default()),
+            names: Arc::new(Mutex::new(UserNames::default())),
+            view: Mutex::new(None),
+        }
+    }
+
+    /// The next finished delivery or relayed message, as what it tells the
+    /// network. Cancel-safe: both queues keep their item in progress.
+    async fn next_report(&self) -> super::CarriedReport {
+        tokio::select! {
+            report = self.deliveries.next_report() => report,
+            inbound = async { self.inbound.lock().await.next().await } => {
+                let lines = self.render(&inbound);
+                Box::new(move |ends: &DriverEnds| {
+                    if let Inbound::Message(resolved) = &inbound {
+                        for (user, error) in &resolved.failures {
+                            eprintln!("slack: users.info for {user} failed: {error}");
+                            ends.record_error(super::NetworkFailure::UpstreamRequestFailed);
+                        }
+                    }
+                    for line in lines {
+                        ends.emit_line(line);
+                    }
+                })
+            }
+        }
+    }
+
+    /// The IRC lines for one finished inbound item, in its bridged channel.
+    fn render(&self, inbound: &Inbound) -> Vec<String> {
+        let mut view = self.view.lock().expect("slack view");
+        let view = view
+            .as_mut()
+            .expect("a message is queued only by a session, which set the view first");
+        match inbound {
+            Inbound::Message(resolved) => {
+                let Some(channel) = view.channels.get(&resolved.message.channel) else {
+                    return Vec::new();
+                };
+                let names = self.names.lock().expect("slack name cache");
+                render_message(
+                    &resolved.message,
+                    channel,
+                    &names,
+                    &view.channels,
+                    &mut view.senders,
+                )
+            }
+            Inbound::Malformed { channel } => view
+                .channels
+                .get(channel)
+                .map(|shown| vec![super::unrelayed_notice("slack", shown, MALFORMED, None)])
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// What a message event the bridge cannot read is called.
+const MALFORMED: &str = "malformed";
+
+/// One acknowledged inbound item, in the order it arrived.
+enum Inbound {
+    Message(Resolved),
+    /// An event in a bridged channel the bridge could not read: said in the
+    /// channel, in its place among the messages around it.
+    Malformed {
+        channel: String,
+    },
 }
 
 /// How often the bridge pings each socket. Slack may say nothing for longer
@@ -164,62 +267,41 @@ impl Identity {
     }
 }
 
-async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
+async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionOutcome {
     use super::NetworkFailure;
     use super::SessionOutcome::Dropped;
-    let http = match super::bridge_http_or_outcome(
-        "slack",
-        Duration::from_secs(30),
-        config.internal_upstreams,
-    ) {
-        Ok(c) => c,
+    let config = &shared.config;
+    // Connecting needs nothing of `ends`, and can take a request timeout or
+    // three: the work the driver carries keeps finishing meanwhile.
+    let opened = super::while_carrying(ends, || shared.next_report(), connect(config)).await;
+    let Connected {
+        http,
+        base,
+        identity,
+        id_to_channel,
+        channel_to_id,
+        first,
+    } = match opened {
+        Ok(connected) => connected,
         Err(outcome) => return outcome,
-    };
-    let base = super::bridge_api_base(&config.api_base, DEFAULT_API);
-
-    let identity: Identity = match slack_call(&http, &base, &config.bot_token, "auth.test").await {
-        Ok(identity) => identity,
-        Err(error) => return slack_failure("auth.test failed", &error),
     };
     // Senders are keyed by their user or bot id: a display name is free text,
     // and anyone may pick the bot's own.
-    let mut senders = super::BridgedSenders::new(slack_account(&identity.user_id, &identity.user));
+    let senders = super::BridgedSenders::new(slack_account(&identity.user_id, &identity.user));
     let echo_identity = senders.own().clone();
-
-    let (id_to_channel, channel_to_id) = match super::resolve_bridge_channels(
-        "slack",
-        &config.channels,
-        |id| {
-            let http = &http;
-            let base = &base;
-            let token = &config.bot_token;
-            async move { fetch_channel_name(http, base, token, &id).await }
-        },
-        |id, error: String| slack_failure(&format!("channel {id} lookup failed"), &error),
-    )
-    .await
-    {
-        Ok(maps) => maps,
-        Err(outcome) => return outcome,
-    };
-
-    let first = match open_next(config, &http, &base).await {
-        Ok(ws) => ws,
-        Err(outcome) => return outcome,
-    };
     let mut sockets = vec![Socket::new(first)];
     if let Err(outcome) = ends.begin_bridge_session(&echo_identity, id_to_channel.values()) {
         return outcome;
     }
+    *shared.view.lock().expect("slack view") = Some(View {
+        channels: id_to_channel.clone(),
+        senders,
+    });
 
-    let names = Arc::new(Mutex::new(UserNames::default()));
-    let mut recent = RecentEnvelopes::default();
     let mut opening: Option<Opening> = None;
     let mut ping =
         tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut deliveries = super::DeliveryQueue::new(super::DELIVERY_QUEUE_CAPACITY);
-    let mut inbound: super::SerialQueue<Resolved> = super::SerialQueue::new(INBOUND_QUEUE_CAPACITY);
 
     loop {
         // The soonest moment a retiring socket is let go.
@@ -243,6 +325,10 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                     }
                     super::BridgeRead::ReadFailed => return Dropped(NetworkFailure::ConnectionLost),
                 };
+                // Only a frame that is not JSON at all ends the session: the
+                // socket itself is speaking something else. Anything JSON is
+                // acked first and read after, so an event the bridge cannot
+                // read is never left unacked for Slack to send forever.
                 let envelope = match parse_envelope(&text) {
                     Ok(envelope) => envelope,
                     Err(e) => {
@@ -268,7 +354,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                         }
                         return Dropped(NetworkFailure::UpstreamWriteFailed);
                     }
-                    if !recent.first_time(ack_id) {
+                    if !shared.recent.lock().expect("slack envelope memory").first_time(ack_id) {
                         eprintln!(
                             "slack: envelope {ack_id} delivered again (retry attempt {}); \
                              already relayed",
@@ -279,6 +365,13 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                 }
                 match envelope.kind {
                     EnvelopeKind::Nothing => {}
+                    EnvelopeKind::Malformed { channel, error } => {
+                        eprintln!("slack: an event could not be read: {error}");
+                        if let Some(channel) = channel.filter(|channel| id_to_channel.contains_key(channel)) {
+                            let item = Inbound::Malformed { channel: channel.clone() };
+                            queue_inbound(shared, ends, &id_to_channel, &channel, async move { item }).await;
+                        }
+                    }
                     EnvelopeKind::Disconnect(reason) => match reason {
                         DisconnectReason::Warning | DisconnectReason::RefreshRequested => {
                             if !retiring {
@@ -314,17 +407,11 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                             continue;
                         }
                         let channel = message.channel.clone();
-                        let work = resolve_names(http.clone(), base.clone(), config.bot_token.clone(), names.clone(), message);
-                        if inbound.push(work).is_err() {
-                            eprintln!("slack: {INBOUND_QUEUE_CAPACITY} messages wait on name lookups; one was not relayed");
-                            ends.record_error(NetworkFailure::UpstreamRequestFailed);
-                            if let Some(channel) = id_to_channel.get(&channel) {
-                                ends.emit_line(format!(
-                                    ":*bnc* NOTICE {channel} :slack: a message was not relayed; \
-                                     name lookups are backlogged"
-                                ));
-                            }
-                        }
+                        let work = resolve_names(http.clone(), base.clone(), config.bot_token.clone(), shared.names.clone(), message);
+                        queue_inbound(shared, ends, &id_to_channel, &channel, async move {
+                            Inbound::Message(work.await)
+                        })
+                        .await;
                     }
                 }
                 if sockets.is_empty() && opening.is_none() {
@@ -358,19 +445,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                     }
                 }
             }
-            resolved = inbound.next() => {
-                for (user, error) in &resolved.failures {
-                    eprintln!("slack: users.info for {user} failed: {error}");
-                    ends.record_error(NetworkFailure::UpstreamRequestFailed);
-                }
-                if let Some(channel) = id_to_channel.get(&resolved.message.channel) {
-                    let names = names.lock().expect("slack name cache");
-                    for line in render_message(&resolved.message, channel, &names, &id_to_channel, &mut senders) {
-                        ends.emit_line(line);
-                    }
-                }
-            }
-            outcome = deliveries.next() => super::report_delivery(ends, "Slack", "channel", outcome),
+            report = shared.next_report() => report(ends),
             cmd = ends.next_command() => {
                 let deliver = {
                     let (http, base, token) = (http.clone(), base.clone(), config.bot_token.clone());
@@ -379,7 +454,10 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                         async move { post_message(&http, &base, &token, &id, &text).await }
                     }
                 };
-                if super::queue_channel_command(ends, cmd, &channel_to_id, &echo_identity, "Slack", &mut deliveries, deliver)
+                if shared
+                    .deliveries
+                    .queue_command(ends, cmd, &channel_to_id, &echo_identity, deliver)
+                    .await
                     .is_none()
                 {
                     return super::SessionOutcome::Stopped;
@@ -389,8 +467,93 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
     }
 }
 
+/// What connecting learned: who the bot is, how its channels are named, and
+/// the first socket.
+struct Connected {
+    http: super::BridgeHttp,
+    base: String,
+    identity: Identity,
+    id_to_channel: HashMap<String, String>,
+    channel_to_id: HashMap<String, String>,
+    first: super::BridgeWs,
+}
+
+/// Everything before the session begins: `auth.test`, the channel lookups,
+/// and the first Socket Mode connection.
+async fn connect(config: &SlackConfig) -> Result<Connected, super::SessionOutcome> {
+    let http =
+        super::bridge_http_or_outcome("slack", Duration::from_secs(30), config.internal_upstreams)?;
+    let base = super::bridge_api_base(&config.api_base, DEFAULT_API);
+    let identity: Identity = slack_call(&http, &base, &config.bot_token, "auth.test")
+        .await
+        .map_err(|error| slack_failure("auth.test failed", &error))?;
+    let (id_to_channel, channel_to_id) = super::resolve_bridge_channels(
+        "slack",
+        &config.channels,
+        |id| {
+            let http = &http;
+            let base = &base;
+            let token = &config.bot_token;
+            async move { fetch_channel_name(http, base, token, &id).await }
+        },
+        channel_lookup_failure,
+    )
+    .await?;
+    let first = open_next(config, &http, &base).await?;
+    Ok(Connected {
+        http,
+        base,
+        identity,
+        id_to_channel,
+        channel_to_id,
+        first,
+    })
+}
+
+/// Queue one acknowledged inbound item behind the ones before it, or — past
+/// [`INBOUND_QUEUE_CAPACITY`] — say in its channel that it was not relayed.
+async fn queue_inbound(
+    shared: &Shared,
+    ends: &DriverEnds,
+    id_to_channel: &HashMap<String, String>,
+    channel: &str,
+    work: impl std::future::Future<Output = Inbound> + Send + 'static,
+) {
+    if shared.inbound.lock().await.push(work).is_err() {
+        eprintln!(
+            "slack: {INBOUND_QUEUE_CAPACITY} messages wait on name lookups; one was not relayed"
+        );
+        ends.record_error(super::NetworkFailure::UpstreamRequestFailed);
+        if let Some(channel) = id_to_channel.get(channel) {
+            ends.emit_line(format!(
+                ":*bnc* NOTICE {channel} :slack: a message was not relayed; \
+                 name lookups are backlogged"
+            ));
+        }
+    }
+}
+
+/// What a failed `conversations.info` for a configured channel means. A
+/// channel Slack says does not exist, that the bot is not in, or that is
+/// archived is an answer about the configuration — a mapping refusal naming
+/// the channel, on the refusal schedule, since joining or unarchiving it
+/// upstream clears it — not a transport failure retried forever.
+fn channel_lookup_failure(id: &str, error: String) -> super::SessionOutcome {
+    let diagnostic = match error.as_str() {
+        "channel_not_found" => format!("Slack has no channel {id}, or the bot cannot see it"),
+        "not_in_channel" => format!("the bot is not a member of Slack channel {id}"),
+        "is_archived" => format!("Slack channel {id} is archived"),
+        _ => return slack_failure(&format!("channel {id} lookup failed"), &error),
+    };
+    eprintln!("slack: {diagnostic} ({error})");
+    super::SessionOutcome::ConfigurationRejected(super::ConfigurationRefusal::new(
+        super::NetworkFailure::ChannelMappingFailed,
+        &diagnostic,
+    ))
+}
+
 /// A message once the names it needs are looked up, and the lookups that
-/// failed (reported by the loop; never remembered as names).
+/// failed (reported with it; never remembered as names).
 struct Resolved {
     message: SlackMessage,
     failures: Vec<(String, String)>,
@@ -728,6 +891,12 @@ enum EnvelopeKind {
     /// Nothing to relay: `hello`, an envelope type or event the bridge does
     /// not subscribe to, a housekeeping subtype.
     Nothing,
+    /// A frame or event the bridge could not read (see [`parse_envelope`]),
+    /// and the channel its event names, if any.
+    Malformed {
+        channel: Option<String>,
+        error: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -746,8 +915,6 @@ struct SocketFrame {
     #[serde(rename = "type")]
     kind: SocketFrameKind,
     #[serde(default)]
-    envelope_id: Option<String>,
-    #[serde(default)]
     reason: Option<String>,
 }
 
@@ -762,9 +929,6 @@ enum SocketFrameKind {
 
 #[derive(serde::Deserialize)]
 struct EventsApiFrame {
-    envelope_id: String,
-    #[serde(default)]
-    retry_attempt: Option<u32>,
     payload: SocketPayload,
 }
 
@@ -843,43 +1007,63 @@ const HOUSEKEEPING_SUBTYPES: &[&str] = &[
     "message_deleted",
 ];
 
+/// One Socket Mode frame. Only text that is not JSON at all is an error — the
+/// socket is speaking something else, and the session ends. Any JSON frame
+/// yields its `envelope_id` to ack whatever else is wrong with it: a frame the
+/// bridge could not read used to end the session *before* the ack, so Slack
+/// sent it again on the next socket, which failed the same way, forever, and
+/// nothing else was relayed. What cannot be read is
+/// [`EnvelopeKind::Malformed`], naming its channel when it has one.
 fn parse_envelope(text: &str) -> Result<Envelope, String> {
-    let frame: SocketFrame =
+    let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("Socket Mode JSON: {e}"))?;
-    match frame.kind {
-        SocketFrameKind::Disconnect => {
-            let reason = match frame.reason.as_deref() {
-                Some("warning") => DisconnectReason::Warning,
-                Some("refresh_requested") => DisconnectReason::RefreshRequested,
-                Some("link_disabled") => DisconnectReason::LinkDisabled,
-                Some(other) => DisconnectReason::Other(e6irc_client::bounded_diagnostic(other)),
-                None => DisconnectReason::Other("no reason given".into()),
-            };
-            return Ok(Envelope {
-                ack: frame.envelope_id,
-                retry_attempt: None,
-                kind: EnvelopeKind::Disconnect(reason),
-            });
-        }
-        SocketFrameKind::Other => {
-            return Ok(Envelope {
-                ack: frame.envelope_id,
-                retry_attempt: None,
-                kind: EnvelopeKind::Nothing,
-            });
-        }
-        SocketFrameKind::EventsApi => {}
-    }
-
-    let events: EventsApiFrame =
-        serde_json::from_str(text).map_err(|e| format!("events_api frame: {e}"))?;
-    let kind = match parse_message_event(events.payload.event)? {
-        Some(message) => EnvelopeKind::Message(message),
-        None => EnvelopeKind::Nothing,
+    let ack = value
+        .get("envelope_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let retry_attempt = value
+        .get("retry_attempt")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|attempt| u32::try_from(attempt).ok());
+    let malformed = |error: String| EnvelopeKind::Malformed {
+        channel: value
+            .pointer("/payload/event/channel")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        error,
+    };
+    let kind = match SocketFrame::deserialize(&value) {
+        Err(error) => malformed(format!("Socket Mode frame: {error}")),
+        Ok(SocketFrame {
+            kind: SocketFrameKind::Disconnect,
+            reason,
+        }) => EnvelopeKind::Disconnect(match reason.as_deref() {
+            Some("warning") => DisconnectReason::Warning,
+            Some("refresh_requested") => DisconnectReason::RefreshRequested,
+            Some("link_disabled") => DisconnectReason::LinkDisabled,
+            Some(other) => DisconnectReason::Other(e6irc_client::bounded_diagnostic(other)),
+            None => DisconnectReason::Other("no reason given".into()),
+        }),
+        Ok(SocketFrame {
+            kind: SocketFrameKind::Other,
+            ..
+        }) => EnvelopeKind::Nothing,
+        Ok(SocketFrame {
+            kind: SocketFrameKind::EventsApi,
+            ..
+        }) => match (&ack, EventsApiFrame::deserialize(&value)) {
+            (None, _) => malformed("events_api frame had no envelope_id".into()),
+            (_, Err(error)) => malformed(format!("events_api frame: {error}")),
+            (Some(_), Ok(events)) => match parse_message_event(events.payload.event) {
+                Ok(Some(message)) => EnvelopeKind::Message(message),
+                Ok(None) => EnvelopeKind::Nothing,
+                Err(error) => malformed(error),
+            },
+        },
     };
     Ok(Envelope {
-        ack: Some(events.envelope_id),
-        retry_attempt: events.retry_attempt,
+        ack,
+        retry_attempt,
         kind,
     })
 }
@@ -1434,29 +1618,45 @@ mod tests {
         assert!(parse_envelope("not json").is_err());
     }
 
+    /// A message missing what it needs is not given defaults: it is
+    /// malformed, named by its channel — and still acked, by whatever
+    /// envelope id it carries.
     #[test]
     fn rejects_malformed_user_messages_instead_of_defaulting_fields() {
-        assert!(
-            parse_envelope(
+        for (frame, ack) in [
+            (
                 r#"{"type":"events_api","payload":{"event":
-               {"type":"message","channel":"C1","user":"U1","text":"hi"}}}"#
-            )
-            .is_err()
-        );
-        assert!(
-            parse_envelope(
+               {"type":"message","channel":"C1","user":"U1","text":"hi"}}}"#,
+                None,
+            ),
+            (
                 r#"{"envelope_id":"x","type":"events_api","payload":{"event":
-               {"type":"message","channel":"C1","text":"hi"}}}"#
-            )
-            .is_err()
-        );
-        assert!(
-            parse_envelope(
+               {"type":"message","channel":"C1","text":"hi"}}}"#,
+                Some("x"),
+            ),
+            (
                 r#"{"envelope_id":"x","type":"events_api","payload":{"event":
-               {"type":"message","subtype":"bot_message","channel":"C1","text":"hi"}}}"#
-            )
-            .is_err()
-        );
+               {"type":"message","subtype":"bot_message","channel":"C1","text":"hi"}}}"#,
+                Some("x"),
+            ),
+        ] {
+            let envelope = parse_envelope(frame).expect("JSON is never a session error");
+            assert_eq!(envelope.ack.as_deref(), ack, "{frame}");
+            assert!(
+                matches!(
+                    envelope.kind,
+                    EnvelopeKind::Malformed { channel: Some(ref channel), .. } if channel == "C1"
+                ),
+                "{frame}: {:?}",
+                envelope.kind
+            );
+        }
+        let envelope = parse_envelope(r#"{"envelope_id":"y","payload":{}}"#).expect("JSON");
+        assert_eq!(envelope.ack.as_deref(), Some("y"));
+        assert!(matches!(
+            envelope.kind,
+            EnvelopeKind::Malformed { channel: None, .. }
+        ));
     }
 
     #[test]
@@ -1573,34 +1773,58 @@ mod tests {
             handle: NetworkHandle,
             events: tokio::sync::broadcast::Receiver<DriverEvent>,
             session: tokio::task::JoinHandle<SessionOutcome>,
+            /// The driver's state, for a second session to continue with.
+            shared: Arc<Shared>,
         }
 
-        async fn bridge(options: Options) -> Bridge {
-            let oracle = bridge_oracle::start_with(
+        fn config(oracle: &Oracle, channels: &[&str]) -> SlackConfig {
+            SlackConfig {
+                bot_token: "xoxb-token".into(),
+                app_token: "xapp-token".into(),
+                api_base: oracle.api_base.clone(),
+                internal_upstreams: crate::egress::InternalUpstreams::Allow,
+                channels: channels.iter().map(|channel| channel.to_string()).collect(),
+                buffer_cap: 64,
+            }
+        }
+
+        async fn manual(options: Options) -> Oracle {
+            bridge_oracle::start_with(
                 Provider::Slack,
                 Options {
                     manual: true,
                     ..options
                 },
             )
-            .await;
-            let config = SlackConfig {
-                bot_token: "xoxb-token".into(),
-                app_token: "xapp-token".into(),
-                api_base: oracle.api_base.clone(),
-                internal_upstreams: crate::egress::InternalUpstreams::Allow,
-                channels: vec!["C1".into()],
-                buffer_cap: 64,
-            };
+            .await
+        }
+
+        /// One session of `shared` on a network of its own, running.
+        fn spawn_session(
+            shared: &Arc<Shared>,
+        ) -> (
+            NetworkHandle,
+            tokio::sync::broadcast::Receiver<DriverEvent>,
+            tokio::task::JoinHandle<SessionOutcome>,
+        ) {
             let (handle, mut ends) = NetworkHandle::channels(64);
             let events = handle.subscribe();
-            let session = tokio::spawn(async move { session_once(&config, &mut ends).await });
+            let shared = shared.clone();
+            let session = tokio::spawn(async move { session_once(&shared, &mut ends).await });
+            (handle, events, session)
+        }
+
+        async fn bridge(options: Options) -> Bridge {
+            let oracle = manual(options).await;
+            let shared = Arc::new(Shared::new(config(&oracle, &["C1"])));
+            let (handle, events, session) = spawn_session(&shared);
             oracle.wait_connected(0).await;
             Bridge {
                 oracle,
                 handle,
                 events,
                 session,
+                shared,
             }
         }
 
@@ -1963,6 +2187,170 @@ mod tests {
             .await
             .expect("no ping within 40 seconds of quiet");
         }
+
+        /// An event the bridge cannot read is acked and said in its channel,
+        /// and the session goes on. It used to end the session before the
+        /// ack: Slack sent it again on the next socket, which failed the same
+        /// way, and nothing else was relayed, ever.
+        #[tokio::test]
+        async fn an_unreadable_event_is_acked_said_and_the_session_goes_on() {
+            let mut b = bridge(Options::default()).await;
+            // No user: unreadable, in a bridged channel.
+            b.oracle.send(
+                0,
+                slack_envelope(
+                    "env-1",
+                    json!({ "type": "message", "channel": "C1", "text": "whose?" }),
+                ),
+            );
+            acked(&mut b.oracle, 0, "env-1").await;
+            assert_eq!(
+                line(&mut b.events).await,
+                ":*bnc* NOTICE #general :slack: a malformed message from an unknown sender \
+                 was not relayed"
+            );
+            // Unreadable in a channel the bridge does not carry; an events_api
+            // frame with no payload; a frame with no type; a JSON string.
+            // Each is acked where it can be, and none is said or fatal.
+            b.oracle.send(
+                0,
+                slack_envelope(
+                    "env-2",
+                    json!({ "type": "message", "channel": "C9", "text": "whose?" }),
+                ),
+            );
+            acked(&mut b.oracle, 0, "env-2").await;
+            b.oracle
+                .send(0, json!({ "envelope_id": "env-3", "type": "events_api" }));
+            acked(&mut b.oracle, 0, "env-3").await;
+            b.oracle.send(0, json!({ "envelope_id": "env-4" }));
+            acked(&mut b.oracle, 0, "env-4").await;
+            b.oracle.send(0, json!("a JSON string"));
+            b.oracle
+                .send(0, slack_envelope("env-5", slack_message("five")));
+            acked(&mut b.oracle, 0, "env-5").await;
+            assert_eq!(
+                line(&mut b.events).await,
+                ":Alice!U1@slack PRIVMSG #general :five",
+                "something was said about the unbridged or envelope-level frames"
+            );
+            assert!(!b.session.is_finished());
+        }
+
+        /// A frame that is not JSON at all means the socket is speaking
+        /// something else: that, and only that, ends the session.
+        #[tokio::test]
+        async fn a_frame_that_is_not_json_ends_the_session() {
+            let b = bridge(Options::default()).await;
+            b.oracle.send_text(0, "not json");
+            assert!(matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), b.session)
+                    .await
+                    .expect("the session did not end")
+                    .expect("session task"),
+                SessionOutcome::Dropped(NetworkFailure::UpstreamProtocolFailed)
+            ));
+        }
+
+        /// An acked message still waiting on its name lookup, and a client's
+        /// post still in flight, outlive the socket: the next session relays
+        /// and delivers them. Both queues were the session's, so a reconnect
+        /// lost up to 256 acked messages — which Slack never sends again —
+        /// and every accepted post, without a word. The re-delivery memory
+        /// outlives it too: an envelope Slack sends again on the new socket
+        /// is acked there and not relayed a second time.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_reconnect_loses_no_acked_message_or_accepted_post_and_relays_nothing_twice() {
+            let mut b = bridge(Options {
+                user_lookup_delay: std::time::Duration::from_millis(800),
+                post_delay: std::time::Duration::from_millis(800),
+                ..Options::default()
+            })
+            .await;
+            b.oracle.send(
+                0,
+                slack_envelope("env-1", slack_message("acked before the drop")),
+            );
+            acked(&mut b.oracle, 0, "env-1").await;
+            assert_eq!(
+                b.handle.send("PRIVMSG #general :posted before the drop"),
+                SendOutcome::Sent
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            b.oracle.close(0, 1000);
+            assert!(matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), b.session)
+                    .await
+                    .expect("the session did not end")
+                    .expect("session task"),
+                SessionOutcome::Dropped(_)
+            ));
+
+            let (_handle, mut events, session) = spawn_session(&b.shared);
+            b.oracle.wait_connected(1).await;
+            let (mut relayed, mut echoed) = (false, false);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !(relayed && echoed) {
+                    match events.recv().await.expect("driver events") {
+                        DriverEvent::Line(line)
+                            if line.line
+                                == ":Alice!U1@slack PRIVMSG #general :acked before the drop" =>
+                        {
+                            relayed = true;
+                        }
+                        DriverEvent::Echo { line, .. }
+                            if line.line.ends_with(":posted before the drop") =>
+                        {
+                            echoed = true;
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("relayed: {relayed}, delivered: {echoed}"));
+
+            let mut again = slack_envelope("env-1", slack_message("acked before the drop"));
+            again["retry_attempt"] = json!(1);
+            b.oracle.send(1, again);
+            acked(&mut b.oracle, 1, "env-1").await;
+            b.oracle
+                .send(1, slack_envelope("env-2", slack_message("after")));
+            acked(&mut b.oracle, 1, "env-2").await;
+            assert_eq!(
+                line(&mut events).await,
+                ":Alice!U1@slack PRIVMSG #general :after",
+                "the re-delivered envelope was relayed a second time"
+            );
+            assert!(!session.is_finished());
+        }
+
+        /// A channel Slack says does not exist, that the bot is not in, or
+        /// that is archived is a mapping refusal naming the channel, not a
+        /// failed request retried forever.
+        #[tokio::test]
+        async fn a_missing_unjoined_or_archived_channel_is_a_mapping_refusal() {
+            for (channel, says) in [
+                ("CGONE", "has no channel"),
+                ("CNOTIN", "not a member"),
+                ("CARCHIVED", "archived"),
+            ] {
+                let oracle = manual(Options::default()).await;
+                let shared = Shared::new(config(&oracle, &[channel]));
+                let (_handle, mut ends) = NetworkHandle::channels(8);
+                match session_once(&shared, &mut ends).await {
+                    SessionOutcome::ConfigurationRejected(refusal) => {
+                        assert_eq!(refusal.failure(), NetworkFailure::ChannelMappingFailed);
+                        assert!(
+                            refusal.diagnostic().contains(channel)
+                                && refusal.diagnostic().contains(says),
+                            "{refusal:?}"
+                        );
+                    }
+                    _ => panic!("channel {channel} was not a mapping refusal"),
+                }
+            }
+        }
     }
 
     /// The scripted oracle, and a bridge network's session connecting to it,
@@ -1977,17 +2365,17 @@ mod tests {
         let oracle =
             crate::bouncer::bridge_oracle::start(crate::bouncer::bridge_oracle::Provider::Slack)
                 .await;
-        let config = SlackConfig {
+        let shared = Shared::new(SlackConfig {
             bot_token: "xoxb-token".into(),
             app_token: "xapp-token".into(),
             api_base: oracle.api_base.clone(),
             internal_upstreams: crate::egress::InternalUpstreams::Allow,
             channels: vec!["C1".into()],
             buffer_cap: 10,
-        };
+        });
         let (handle, mut ends) = crate::bouncer::NetworkHandle::bridge_channels(10);
         let driver_events = handle.subscribe();
-        let session = tokio::spawn(async move { session_once(&config, &mut ends).await });
+        let session = tokio::spawn(async move { session_once(&shared, &mut ends).await });
         (oracle, handle, driver_events, session)
     }
 

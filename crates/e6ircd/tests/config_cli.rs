@@ -44,6 +44,14 @@ fn report(output: &Output) -> String {
 fn the_environment_alone_states_a_valid_configuration() {
     let output = e6ircd(&["check-config", "--config-from-environment"], &minimal());
     assert!(output.status.success(), "{}", report(&output));
+    // Agreement with the settings the console stores needs the database, which
+    // the check does not reach: its success says so rather than implying it.
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Not checked, because it needs the database"),
+        "{}",
+        report(&output)
+    );
 
     let mut with_oidc = minimal();
     with_oidc.extend([
@@ -217,4 +225,74 @@ fn an_unparsable_file_is_reported_by_position_and_never_by_its_text() {
     assert!(!output.status.success(), "{said}");
     assert!(said.contains("line 3, column"), "{said}");
     assert!(!said.contains(SECRET), "{said}");
+}
+
+/// The master-key variables follow the environment's one rule: set but empty
+/// is unset, as for every other variable, never an empty key to decode.
+#[test]
+fn an_empty_master_key_variable_is_unset() {
+    let mut environment = minimal();
+    environment.push(("E6IRC_SECRET_KEY", String::new()));
+    environment.push(("E6IRC_PREVIOUS_SECRET_KEYS", String::new()));
+    let output = e6ircd(&["check-config", "--config-from-environment"], &environment);
+    assert!(output.status.success(), "{}", report(&output));
+}
+
+/// A monitoring token start would refuse is refused by `check-config` too, by
+/// name and without its value.
+#[test]
+fn a_monitoring_token_start_would_refuse_fails_the_check() {
+    const TOKEN: &str = "too-short-monitoring-token";
+    let mut environment = minimal();
+    environment.push(("E6IRC_MONITORING_TOKEN", TOKEN.to_owned()));
+    let output = e6ircd(&["check-config", "--config-from-environment"], &environment);
+    let said = report(&output);
+    assert!(!output.status.success(), "{said}");
+    assert!(said.contains("E6IRC_MONITORING_TOKEN"), "{said}");
+    assert!(!said.contains(TOKEN), "{said}");
+}
+
+/// Every TLS certificate and key the configuration names is read and matched
+/// by `check-config`, as start reads them: a missing file or a key that is not
+/// the certificate's fails the check instead of the start.
+#[test]
+fn every_configured_certificate_pair_is_read_by_the_check() {
+    let dir = std::env::temp_dir().join(format!("e6irc-check-tls-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch directory");
+    let generate = || rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("pair");
+    let (first, second) = (generate(), generate());
+    let path = |name: &str| dir.join(name).to_str().expect("UTF-8 path").to_owned();
+    std::fs::write(path("cert.pem"), first.cert.pem()).expect("write certificate");
+    std::fs::write(path("key.pem"), first.signing_key.serialize_pem()).expect("write key");
+    std::fs::write(path("other-key.pem"), second.signing_key.serialize_pem()).expect("write key");
+    let check = |listener_key: &str, bnc_key: &str| {
+        let configuration = path("e6irc.toml");
+        std::fs::write(
+            &configuration,
+            format!(
+                "server_name = \"irc.example.test\"\nnetwork_name = \"Example\"\n\
+                 application_release_revision = {REVISION:?}\n\
+                 [[listeners]]\naddr = \"127.0.0.1:6697\"\n\
+                 tls = {{ cert_path = {cert:?}, key_path = {listener_key:?} }}\n\
+                 [database]\nurl = \"postgres://e6irc@db.example.invalid/e6irc\"\n\
+                 [bnc]\naddr = \"127.0.0.1:6698\"\n\
+                 tls = {{ cert_path = {cert:?}, key_path = {bnc_key:?} }}\n",
+                cert = path("cert.pem"),
+            ),
+        )
+        .expect("write the configuration");
+        e6ircd(&["check-config", "--config", &configuration], &[])
+    };
+    let matched = check(&path("key.pem"), &path("key.pem"));
+    assert!(matched.status.success(), "{}", report(&matched));
+    for (listener_key, bnc_key, named) in [
+        (path("missing.pem"), path("key.pem"), "missing.pem"),
+        (path("key.pem"), path("other-key.pem"), "cert.pem"),
+    ] {
+        let output = check(&listener_key, &bnc_key);
+        let said = report(&output);
+        assert!(!output.status.success(), "{said}");
+        assert!(said.contains(named), "{said}");
+    }
+    std::fs::remove_dir_all(dir).expect("remove the scratch directory");
 }

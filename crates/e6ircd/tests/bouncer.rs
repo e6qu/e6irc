@@ -1050,46 +1050,24 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
     .expect("timeout");
     assert!(persisted, "line was not persisted to the BNC buffer");
     drop(running_a);
-    drop(pool);
 
     // Server B: same DB, but the network points at a dead upstream so the
-    // only content is the restored backlog. Attaching replays it.
-    use e6ircd::config::{BncConfig, DatabaseConfig, NetworkEntry};
-    let config_b = Config {
-        server_name: "irc.bncB.example".into(),
-        network_name: "BncHostB".into(),
-        listeners: vec![ListenerConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            tls: None,
-            websocket: false,
-        }],
-        database: Some(DatabaseConfig {
-            url: url.clone(),
-            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
-            max_connections: None,
-        }),
-        networks: vec![NetworkEntry {
-            kind: NetworkKind::Irc,
-            name: "up".into(),
-            owner: Some("alice".into()),
-            addr: "127.0.0.1:1".into(), // unreachable: no live traffic
-            tls: false,
-            nick: "bncnick".into(),
-            username: Some("tester".into()),
-            realname: Some("bncnick".into()),
-            autojoin: vec![],
-            buffer_cap: 1000,
-            sasl_account: None,
-            sasl_password: None,
-            server_password: None,
-        }],
-        bnc: Some(BncConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            tls: None,
-        }),
-        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
-        ..Config::default()
-    };
+    // only content is the restored backlog. Attaching replays it. The console
+    // owns the network definitions after the first start, so the move is made
+    // there (as an administrator would) and B's configuration states the same:
+    // a configuration stating otherwise is refused rather than ignored.
+    const UNREACHABLE: &str = "127.0.0.1:1"; // no live traffic
+    let stored = e6ircd::db::load_managed_config(&pool)
+        .await
+        .expect("stored settings");
+    let mut moved = stored.settings.clone();
+    moved.networks[0].addr = UNREACHABLE.into();
+    e6ircd::db::save_managed_config(&pool, stored.revision, &moved, "test", "move up")
+        .await
+        .expect("move the network");
+    drop(pool);
+    let mut config_b = bnc_config(up, url.clone());
+    config_b.networks[0].addr = UNREACHABLE.into();
     let running_b = net::start(config_b).await.expect("start B");
     let bnc = running_b.bnc_addr.expect("bnc bound");
     // No wait for the restore: an attach is held until the network's persisted

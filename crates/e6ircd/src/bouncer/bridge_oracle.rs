@@ -40,6 +40,8 @@ pub struct Options {
     pub rate_limit_first_post: bool,
     /// The first Slack `users.info` fails; later ones succeed.
     pub fail_first_user_lookup: bool,
+    /// How long a Slack `users.info` takes to answer.
+    pub user_lookup_delay: Duration,
 }
 
 #[derive(Debug)]
@@ -131,7 +133,12 @@ impl Drop for Oracle {
 impl Oracle {
     /// Manual mode: write one text frame to connection `connection`.
     pub fn send(&self, connection: usize, frame: serde_json::Value) {
-        self.write(connection, Message::Text(frame.to_string().into()));
+        self.send_text(connection, &frame.to_string());
+    }
+
+    /// Manual mode: write one text frame of exactly `text`, JSON or not.
+    pub fn send_text(&self, connection: usize, text: &str) {
+        self.write(connection, Message::Text(text.into()));
     }
 
     /// Manual mode: close connection `connection` with `code`.
@@ -625,14 +632,29 @@ async fn discord_channel(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !matches!(state.provider, Provider::Discord)
-        || id != "42"
-        || bearer(&headers) != Some("Bot discord-token")
+    if !matches!(state.provider, Provider::Discord) || bearer(&headers) != Some("Bot discord-token")
     {
         return (StatusCode::UNAUTHORIZED, axum::Json(json!({}))).into_response();
     }
-    (StatusCode::OK, axum::Json(json!({ "name": "general" }))).into_response()
+    match id.as_str() {
+        "42" => (StatusCode::OK, axum::Json(json!({ "name": "general" }))).into_response(),
+        // A channel in a server the bot is not in.
+        DISCORD_HIDDEN_CHANNEL => (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({ "message": "Missing Access", "code": 50001 })),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({ "message": "Unknown Channel", "code": 10003 })),
+        )
+            .into_response(),
+    }
 }
+
+/// A Discord channel id the oracle answers `403 Missing Access` for; any id
+/// but 42 and this one is `404 Unknown Channel`.
+pub const DISCORD_HIDDEN_CHANNEL: &str = "43";
 
 async fn discord_gateway(State(state): State<OracleState>) -> impl IntoResponse {
     (
@@ -719,10 +741,19 @@ async fn slack_channel(
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<SlackChannelQuery>,
 ) -> axum::response::Response {
-    if !slack_authorized(&state, &headers) || query.channel != "C1" {
+    if !slack_authorized(&state, &headers) {
         return slack_refused();
     }
-    axum::Json(json!({ "ok": true, "channel": { "name": "general" } })).into_response()
+    let error = match query.channel.as_str() {
+        "C1" => {
+            return axum::Json(json!({ "ok": true, "channel": { "name": "general" } }))
+                .into_response();
+        }
+        "CARCHIVED" => "is_archived",
+        "CNOTIN" => "not_in_channel",
+        _ => "channel_not_found",
+    };
+    axum::Json(json!({ "ok": false, "error": error })).into_response()
 }
 
 async fn slack_user(
@@ -734,6 +765,7 @@ async fn slack_user(
         .events
         .send(OracleEvent::UserLookup(query.user.clone()))
         .expect("slack oracle event receiver");
+    tokio::time::sleep(state.options.user_lookup_delay).await;
     if !slack_authorized(&state, &headers) {
         return slack_refused();
     }

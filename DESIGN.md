@@ -328,7 +328,13 @@ These are project-wide rules, enforced in review and (where possible) CI:
   - One worker and N workers give the same answers by construction. The
     session's shard counts the JOINs it has routed to another shard
     (`Session::pending_joins`) from the moment they are sent, so a pipelined
-    burst meets the channel limit exactly as on one worker. What a
+    burst meets the channel limit exactly as on one worker. A change to the
+    user while such a JOIN is in flight (NICK, AWAY, SETNAME, CHGHOST, QUIT)
+    is sent to that channel's owner too: owner queues are FIFO, so it lands
+    after the JOIN and corrects the member the JOIN's snapshot created (an
+    owner that refused the JOIN has no member and tells no one). `JOIN 0`
+    parts every channel whichever shard owns it, and parts an in-flight JOIN
+    as soon as it is answered (`Session::part_on_join`). What a
     command needs to know about a user or channel on another shard (WHOIS,
     ISON, USERHOST, MONITOR, WHOWAS, LUSERS, a labeled away reply) is read
     from process-wide directories that every shard — including a lone one —
@@ -343,6 +349,16 @@ These are project-wide rules, enforced in review and (where possible) CI:
   - The registered-session count is maintained at the transitions, in the one
     function that can register a session, and debug-asserted against a full
     scan; it used to be recounted over every session after every event.
+  - The same rule — an index kept where the state changes, never a scan per
+    event — holds for every per-event question about global state. The user
+    directory keeps its LUSERS counts (users, invisible, operators) and a
+    folded-account → connections index in the two functions that add or drop
+    a record, so a registration's LUSERS and resolving a conversation's
+    account to a nick are lookups, not a copy of every user under the
+    process-wide lock. A channel message republishes only the channel's
+    newest-message time (the channel directory tracks "ring changed"
+    separately from "channel changed"), not its ranks and ban lists. Each such
+    index has a unit test that recounts it after every kind of mutation.
   - Server-rendered form posts have no form extractor of their own. Each
     handler takes `Result<axum::Form<T>, FormRejection>`, so a malformed body
     reaches the handler rather than axum's plain-text rejection, and matches it
@@ -1006,6 +1022,35 @@ subset's exact behavior.
   the advertisements cannot disagree. A `+k` key or list-mode mask that could
   not stand as a middle parameter (a leading `:`, a space or control byte, and
   for a key a `,`, which would split JOIN's key list) is refused, not rewritten.
+  Implemented today: lists `+b +q +e +I`, `+k`, `+l`, and the flags
+  `+g +i +m +n +s +t +C` (`ChanModes::FLAGS` is the one flag table; MLOCK can
+  lock each); the rest of Solanum's set answers 472.
+- List-mode masks follow Solanum's `pretty_mask`: `nick` → `nick!*@*`, and a
+  bare token with a `.` or `:` (a host or an address) → `*!*@token`. A host
+  that is an address or a CIDR range (`*!*@203.0.113.0/24`,
+  `*!*@2001:db8::/32`) matches the address the connection came from — fixed
+  at connect as the session's `real_ip`, so a `SETHOST` cloak is no way out
+  of it — and a glob is tried against both the shown host and that address.
+  The account extban `$a` / `$a:<glob>` / `$~a…` (Solanum `extb_account`)
+  works on all four lists; ISUPPORT advertises exactly that
+  (`EXTBAN=$,a`, `ACCOUNTEXTBAN=a`). A mask that could never match as written
+  — another extban type, a CIDR prefix out of range — is refused with 696,
+  never stored. What a mask means is decided once when it is stored
+  (`core/banmask.rs`), not on every match.
+- JOIN admission runs Solanum's `can_join` order: ban, key (compared
+  casefolded, in constant time), `+i` (an invite or `+I` passes), `+l` (an
+  invite passes). INVITE takes channel-operator status unless the channel is
+  `+g`; an invite is recorded only while the channel is `+i` or `+l`, the
+  modes it lets its holder past. `+k` on a keyed channel replaces the key.
+  A STATUSMSG (`@#c`/`+#c`) — PRIVMSG, NOTICE, TAGMSG or multiline — needs
+  op or voice in the channel (482 otherwise). A PART reason is dropped
+  whenever the member could not say it as a message (banned, quieted, or
+  unvoiced under `+m`). KNOCK is for a channel that is `+i`, keyed or full;
+  the banned and the quieted are refused, and each user may knock once per
+  five minutes and each channel be knocked on once per minute (712,
+  Solanum's `knock_delay` / `knock_delay_channel`). `QUIT` with no comment
+  leaves as `Quit: <nick>`, `QUIT :` with an empty reason. PART of a channel
+  that does not exist (or is secret and not joined) is 403.
 - A plain member (no op or voice) banned or quieted in any channel it is in
   cannot change nick (Solanum `ERR_BANNICKCHANGE` 435) — renaming would escape a
   `nick!*@*` mask. The check spans core shards through the published channel
@@ -1019,7 +1064,12 @@ subset's exact behavior.
 - An over-long `USER` name is truncated to `USERLEN`, never refused (Modern
   IRC); only a character the source prefix cannot carry is refused (468).
 - Oper system: config-defined opers, privileges (kline/dline/xline-style
-  bans, SETHOST, global notices), all actions audit-logged.
+  bans, SETHOST, global notices), all actions audit-logged. A K-line host
+  that is an address or CIDR range matches the connection's real address; a
+  D-line must be an IP address, CIDR range or address glob (anything else is
+  refused) and matches only that address; so a SETHOST lifts neither. A
+  reason `public|private` shows the banned user and their peers only the
+  public part; the operator listing and the audit trail keep both.
 - **Integrated services** (no separate Atheme process): `NickServ` and
   `ChanServ` pseudo-clients whose command surfaces
   (`REGISTER`, `IDENTIFY`, `GHOST`, `ACCESS`/`FLAGS`, `OP`, topic retention,
@@ -1620,12 +1670,15 @@ The shell also contains `/console/configuration`, the database-backed operationa
 plane. Its singleton `server_settings` row is a typed JSON document with an
 optimistic-concurrency revision, actor, and timestamp; every committed revision
 also writes a redacted `CONFIG` audit entry in the same transaction. The
-database URL, master-key source, HTTP bind, configured administrator grants,
-and optional one-time first-administrator token remain bootstrap values
-because they are prerequisites for reaching the console.
-Identity, MOTD, IRC listeners, public URL/cookie policy, administrator grants,
-OIDC providers, operators, registration policy, resource limits, trusted
-proxies, server-level networks, and the BNC attach address are UI-managed.
+database URL, master-key source, HTTP bind, release revision, and optional
+one-time first-administrator token remain bootstrap values because they are
+prerequisites for reaching the console; the console cannot edit them.
+Everything else is console-owned: identity, MOTD, IRC listeners, public
+URL/cookie policy, administrator grants (`http.admin_accounts`), OIDC
+providers, operators, registration policy, resource limits, trusted proxies,
+server-level networks, and the BNC attach address. The rule for a console-owned
+setting the bootstrap configuration also states is stated once, in §18
+("Operational configuration").
 Credential-bearing values are sealed before entering PostgreSQL and are never
 rendered back. Existing
 plaintext bootstrap credentials remain authoritative until a master key is
@@ -1780,7 +1833,10 @@ transition half made (a driver stopped whose replacement never starts, a
 suspension committed that the core never heard about). An account's drivers
 stop concurrently. A stopping network's persistence task writes the lines its
 driver said last (its goodbye among them) unless the network's rows are about
-to be deleted.
+to be deleted. A process shutdown keeps the rows, so it writes them too: the
+driver's release and that final write share the one driver-stop deadline, and
+only a write still in progress when it passes (a wedged database) is abandoned
+and reported.
 The registry refuses to register over a live driver *before* the second driver
 starts, so two upstream sessions can never race for one network, and each
 caller states what it means: create and edit **supersede** (stop the
@@ -2243,8 +2299,28 @@ Design constraints recorded now:
   then parks (a room join refused before an invitation arrives, a channel name
   the provider side can rename). The diagnostic is e6irc's own sentence naming
   the room or channel; provider response text is deliberately never carried.
-  A 401/403 on Discord's channel lookup is about the token, so it is
-  `AuthRejected` and parks at once.
+  What a refusal of a credentialed request means depends on what it asked
+  about (`CredentialRequest`): a login or the bot's own account
+  (`GET /users/@me`, Matrix `/login`) refused with 401 or 403 is the
+  credentials, `AuthRejected`, parked at once; on Discord's channel lookup
+  only a 401 is the token — a 403 (Missing Access: the bot is not in that
+  channel's server, or may not view it) and a 404 (Unknown Channel) are
+  `ChannelMappingFailed` refusals naming the channel id, on the refusal
+  schedule. Slack's `conversations.info` answers `channel_not_found`,
+  `not_in_channel` and `is_archived` the same way. (A 403 used to park the
+  network as a bad token; a 404 was retried forever.)
+- A bridge's work that needs no socket belongs to the driver, not the
+  session. Discord's and Slack's outbound deliveries (`CarriedDeliveries`,
+  REST posts in a bounded serial queue) and Slack's acknowledged inbound
+  messages waiting on their name lookups, its display-name cache and its
+  envelope re-delivery memory all live in the driver's shared state. Each
+  session drains the queues in its loop and while it connects
+  (`while_carrying`); between sessions — the backoff, a refusal's schedule,
+  a park — the runner does (`run_with_backoff_carrying`). A reconnect used to
+  drop every accepted post and up to 256 acked Slack messages (which Slack
+  never sends again), without a word, and an envelope re-delivered on the
+  next socket was relayed twice. A parked driver still finishes what it
+  accepted: each delivery ends in its echo or its undelivered notice.
 - A Matrix password login creates a device on the homeserver that only
   `/logout` removes, so the login belongs to the driver, not to the session:
   made once, reused by every reconnect, replaced only when the homeserver
@@ -2268,6 +2344,16 @@ Design constraints recorded now:
   room with `m.room.encryption` state (checked after each join) or an
   encrypted event mid-session is `ConfigurationRejected(room_encrypted)`: the
   bridge holds no device keys and would otherwise relay nothing, silently.
+  The sync's `rooms.leave` is read too: a bridged room the account was kicked
+  or banned from (or left from another client) has what was said before the
+  leave relayed, then a notice in its channel, the position forgotten, and
+  the session ended as `ConfigurationRejected(channel_join_refused)` on the
+  refusal schedule — the next session joins afresh, a kick clears, and a ban
+  answers the join with a 403 until the network parks. Reading only `join`
+  kept syncing a room the bridge would never hear again. Every message the
+  bridge sends carries `"m.mentions": {}`: without it clients fall back to
+  the body-matching push rules, and an IRC line saying `@room` paged the
+  whole room.
   `m.emote` becomes a CTCP ACTION, `m.notice` a NOTICE, media its body plus the
   spec's `/_matrix/media/v3/download` link (homeservers that enforce
   authenticated media will not open it), `m.location` its body plus a geo URI;
@@ -2284,18 +2370,35 @@ Design constraints recorded now:
   IDENTIFY budget is not spent; op 9 (invalid session) ends the session — it
   used to be ignored while the gateway kept ACKing heartbeats, leaving the
   network "connected" and deaf — and op 9 `d:false` and close codes
-  4004/4007/4009/4010–4014 forget the session. A heartbeat that finds the
-  previous one unacknowledged drops the zombie connection; op 7 reconnects
-  without recording a failure. 4004 is `AuthRejected`; 4010–4014 are
+  4004/4007/4009/4010–4014 forget the session. After op 9 the next connection
+  waits a random one to five seconds, as Discord requires, before it
+  identifies (`SessionOutcome::DroppedFor`: the runner waits the longer of
+  that and its backoff, which alone re-dialled in 200 ms). A heartbeat that
+  finds the previous one unacknowledged drops the zombie connection; op 7
+  reconnects without recording a failure. A `MESSAGE_CREATE` is its content
+  followed by each attachment's URL on a line of its own (attachments used to
+  be dropped whenever there was text); user mentions `<@id>`/`<@!id>` read as
+  `@username` from the message's own `mentions`, channel mentions `<#id>` as
+  the bridged channel's name, custom emoji `<:name:id>`/`<a:name:id>` as
+  `:name:`; a message with nothing to show (a sticker, an embed, a system
+  message) is one bounded "not relayed" notice naming what it was, never a
+  silent skip. 4004 is `AuthRejected`; 4010–4014 are
   configuration refusals that park at once with a code-specific diagnostic
   (4014 names the Message Content intent). Posts send
   `allowed_mentions: {parse: []}`, so an IRC line can never page a guild.
 - Slack reads `disconnect.reason`: `warning` and `refresh_requested` open the
   next socket inside the session while the retiring one is still read and
   acked (no failure recorded); `link_disabled` is a configuration refusal.
-  Envelopes are acked before any HTTP work, deliveries and name lookups run in
-  bounded serial queues beside the socket, a re-delivered envelope id is acked
-  and not relayed twice, and the socket is pinged every 30 s. Outbound text
+  Envelopes are acked before any HTTP work — and before they are read: only a
+  frame that is not JSON ends the session, while anything JSON is acked by its
+  `envelope_id` first, and an event that cannot be read is one "malformed"
+  not-relayed notice in its channel when that channel is bridged (logged
+  otherwise). Parsing before the ack used to fail the session on one bad
+  event, which Slack then re-sent forever, relaying nothing else — the rule
+  Matrix follows for timeline events. Deliveries and name lookups run in
+  bounded serial queues beside the socket (driver-owned, above), a
+  re-delivered envelope id is acked and not relayed twice, and the socket is
+  pinged every 30 s. Outbound text
   escapes `& < >` (which also neutralises `<!channel>`); inbound entities and
   markup are decoded (`<@U…>` to `@name`, `<#C…|n>` to `#n`, links to
   `label (url)`). Message subtypes are a whitelist (file shares, thread
@@ -2493,6 +2596,18 @@ Design constraints recorded now:
   upstream sessions — at 100k channels an always-on 500-entry ring per
   channel would be tens of GB, so eviction is load-bearing, not an
   optimization.
+  The store (`core::hot_history::HotHistory`) keeps what each event asks of
+  it as an index updated where a ring comes or goes: the LRU order is a
+  `Recency` (a stamp per touch, stale stamps skipped and periodically
+  compacted — amortized O(1), where a list searched on every message was
+  O(targets)); an identity → conversations index answers "free this `~nick`'s
+  conversations" on every unauthenticated disconnect or nick change, and
+  CHATHISTORY TARGETS' conversation list, without visiting any other ring; and
+  each ring keeps its newest timestamp as a sliding-window maximum (entries
+  arrive in wall-clock order from several clocks, so the back entry is not
+  necessarily the newest). A permanently deleted account's hot copy follows
+  the database purge: its lines and its conversations leave the rings, and
+  its entries leave every channel's access list, on every shard.
 
 ---
 
@@ -2566,7 +2681,10 @@ Surface (initial):
   heartbeat is within 45 s; database-free, so a database outage shows on
   `readyz` and never restart-loops the container, while a stalled shard is a
   503 the health check acts on. It used to be a constant.
-- `readyz` (the same core check plus configured-PostgreSQL readiness; no auth)
+- `readyz` (the same core check plus configured-PostgreSQL readiness; no auth).
+  The database probe is shared: one request at a time runs it and its answer
+  is reused for one second, so a flood of this unauthenticated route, which
+  bypasses admission, holds at most one pool connection.
 
 The OpenAPI 3.1 document at `/api/v1/openapi.json` is hand-authored for
 request/response semantics and always served (no feature gate, no utoipa
@@ -2685,7 +2803,8 @@ history, storage, notification, and socket-protocol failures have visible,
 actionable states; an API failure is never rendered as an empty account. The
 member list is rank-ordered with sigils kept live from channel `MODE`, reading
 membership sigils and which modes take a parameter from the network's own
-`005 PREFIX` and `CHANMODES` (RFC-style defaults until they arrive), and the
+`005 PREFIX` and `CHANMODES` (carried by the session event, so they outlive
+the ring; RFC-style defaults until the network sends them), and the
 client offers a join-channel input and click-to-query on nicks. On phone widths
 the member list is a header-toggled panel mirroring the conversation rail. The
 sign-out link exists only once `/me` has supplied its CSRF-bearing URL.
@@ -2693,8 +2812,16 @@ sign-out link exists only once `/me` has supplied its CSRF-bearing URL.
 ### 13.2 Live chat over WebSocket
 
 The chat page opens one WS (`/ws/ui`, cookie-authenticated). The server pushes
-typed line, status, authoritative `session` (nick + joined channels), and
-`{"t":"snapshot","v":"complete"}` replay-boundary events. Raw line events preserve IRCv3 `time` and `msgid` tags so live and
+typed line, status, authoritative `session` (nick, joined channels, and the
+upstream's `RPL_ISUPPORT` tokens as `isupport`), and
+`{"t":"snapshot","v":"complete"}` replay-boundary events. The attach's
+`session` event is taken atomically with the replay and sent *before* the
+first replayed line: the client reads the replay as the nick the session has
+now (a replayed line of its own is its own, not a stranger's under the
+configured nick) and with the network's own PREFIX and CHANMODES even after the
+ring has evicted the 001 and 005 that said so, and it applies the same event
+again at the replay boundary, so replayed history cannot leave it believing an
+old nick, mode table or membership. Raw line events preserve IRCv3 `time` and `msgid` tags so live and
 persisted timelines use the same clock and have stable overlap identity. The
 client applies the protocol parser's last-duplicate-tag rule, parses each line,
 routes it to the right buffer (channel / DM / server), with STATUSMSG targets
@@ -2702,7 +2829,17 @@ such as `@#ops` routed to the underlying channel,
 maintains the per-channel member list, reconciles stale replay buffers against
 the session event, and renders the active buffer (all via
 DOM APIs, never `innerHTML` on server text, so a hostile upstream line can't
-inject markup). Startup uses this atomic socket replay as its single initial
+inject markup). Bidirectional embedding, override and isolate controls
+(U+202A–U+202E, U+2066–U+2069) are removed from rendered text, and the
+sender, the text and each link are separate bidi isolates (a link laid out
+left to right), so a line cannot display a link as an address other than the
+one it opens. The transcript is `aria-busy` and `aria-live="off"` from each
+connect until the replay boundary, so a screen reader announces live traffic,
+not the replayed backlog. The conversation and member lists are reconciled in
+place, keyed by conversation and member, so a new line or a JOIN, PART or MODE
+never takes keyboard focus from the entry it is on. Unread and mention counts
+exclude the console's copy of each line and a full replay's backlog; no replay
+raises a desktop notification; a `/me` action naming the reader is a mention. Startup uses this atomic socket replay as its single initial
 backlog source rather than racing it against a duplicate REST snapshot. The
 replay boundary precedes live traffic; only after it does
 the client request authoritative NAMES snapshots, preventing stale detached
@@ -2728,15 +2865,28 @@ server validates as one complete IRC line and maps to the driver. CR/LF/NUL
 injection and an over-limit derived line reject the whole request; they are
 never cleaned or truncated into a different message. At most 64 sends await a
 result. The browser appends local echo and sent-history only after the server
-returns the matching `sent` event; `send-error`, queue refusal, replacement,
+returns the matching `sent` event, in the buffer the line was addressed to
+(`/msg`, `/notice`, `/me` in any letter case, and a raw PRIVMSG or NOTICE
+included), because the server echoes a line to every attached client but the
+one that sent it; a message longer than one relayed IRC line is split on UTF-8
+code point boundaries into several requests; `send-error`, queue refusal, replacement,
 and socket closure retain retryable text and cannot produce a false successful
 echo. This keeps the web client on the exact same multiplexer attach path as an
 IRC client — the web client *is* an attached client of the user's networks.
 Fetching persisted history prepends it without replacing live lines or local
-echoes that arrived while the request was in flight. Matching non-empty
-`msgid` values and the exact ordered wire overlap at the history/live boundary
-are deduplicated; content equality elsewhere is not identity because distinct
-IRC messages can have identical bodies. Explicit history expands the buffer's
+echoes that arrived while the request was in flight. Each row records the
+replay cursor before its line (a local echo, the cursor when its send was
+accepted), so every later ring line for that buffer is already a row, and
+history is read with `GET /api/v1/me/networks/{name}/buffer?through=<cursor>`
+— only the running ring's lines at or before the oldest row's position — so no
+line arrives twice and none is matched by content. A cursor the server cannot
+bound (another ring lifetime, or a stopped network whose lines are persisted
+history without positions) is refused with 409; only then is the page read
+whole, and matching non-empty `msgid` values and the exact ordered overlap at
+the seam are deduplicated, over wire lines and the client's own lines against
+their local echoes, skipping join/part notices history has no counterpart
+for; content equality elsewhere is not identity because distinct IRC messages
+can have identical bodies. Explicit history expands the buffer's
 bounded capacity by one API page, so loading older context remains effective
 even when the normal live window is full. Live and persisted PRIVMSG/NOTICE
 rows use the same routing function, so a status-target or server notice cannot
@@ -2893,8 +3043,14 @@ two seconds) and reports that refusal, not the broken pipe.
 URI and user code, honors the server's polling interval/slow-down/expiry
 contract, and atomically stores the issued bearer token without printing it.
 The shared cache includes the issuing API origin so `api` cannot silently send
-it to a different `--base`; an explicit token or `E6IRC_API_TOKEN` wins without
-requiring a cache path. Unix storage is created with private directory/file
+it to a different `--base`; an explicit token (`--token`,
+`--bearer-token-file`, `E6IRC_API_TOKEN`) is the one sent, and without
+`--base` it goes to the cached login's origin (the cache is read for the origin
+only — its token is never mixed in); with `--base` the cache is not read. The
+cache path is proved writable (its private directory created, a temporary file
+made and removed) before the device flow starts, so a path that cannot hold the
+token fails before the user approves anything; a bare file name
+(`--token-file token.json`) lives in the current directory. Unix storage is created with private directory/file
 modes and refused when group/other-readable. Windows uses the current user's
 local application-data directory and atomic replacement. Both native clients
 can use the same cache for SASL OAUTHBEARER with `--oauth-from-cache`.
@@ -2919,14 +3075,31 @@ with "server stopped responding" and runs the reconnect path; the answer to
 its own probe stays out of the log. Reconnection is not a fixed
 two-second loop: rejected credentials, a rejected server password, and a ban
 are never retried (the client stops with a final status, as the bouncer's
-driver parks), and any other failure backs off exponentially from
+driver parks) — a SCRAM server-final `e=invalid-proof`, `e=unknown-user`,
+`e=invalid-encoding` or `e=invalid-username-encoding` is a credential rejection
+exactly like a 904 answering the proof — and any other failure backs off exponentially from
 `--reconnect-delay` to five minutes. A refused channel is dropped from the
 session with a status line instead of failing the whole connect. A refusal is
 any error numeric or `FAIL JOIN` about that channel, not a list of known
 numerics: one this client never heard of (479, 489, 520, ...) would otherwise
 leave the join waiting out its deadline and the client reconnecting forever.
 Messages to a STATUSMSG target (`@#chan`, `+#chan`, with the sigils the
-server's `005 STATUSMSG` declares) are shown in the channel's buffer. The client
+server's `005 STATUSMSG` declares) are shown in the channel's buffer.
+Which targets are channels and which names are the same are the network's:
+every native client (CLI, TUI, and the `e6irc-client` join/refusal matching)
+reads `005 CASEMAPPING` and `CHANTYPES` through one
+`e6irc_client::NetworkNames`, recorded on the `Connection` from every 005 it
+reads, defaulting to `rfc1459` and `#&` until one arrives. `rfc1459`,
+`rfc1459-strict` (also spelled `strict-rfc1459`) and `ascii` are known; any
+other mapping is compared as `ascii` (the letters every mapping folds) and the
+client says so. On an `ascii` network `#a[` and `#a{` are two channels. The CLI
+reads the welcome burst up to a round trip before it classifies or compares a
+target; the TUI re-reads a 005 mid-session and says when two open buffers
+become one name. The web client does the same from the session event's
+`isupport` and from live 005s, re-keying its buffers (keyed by the fold) and
+merging any two the new rules make one name. The subject of a numeric is read
+where that numeric puts it (`e6irc_client::numeric_subject`: `params[2]` for
+353, 341, 441 and 443), so a NAMES reply is shown beside its channel. The client
 adopts the nickname the server confirmed — a BNC's welcome carries the real
 upstream nick, which may differ from `--nick` — and follows its own NICK
 changes, so direct messages and its own JOIN/PART are recognised. Every error
@@ -2951,7 +3124,11 @@ INVITE, TOPIC and MODE are rendered; `/me` renders as `* nick …` and mIRC
 formatting is stripped; long lines wrap by display width; a resize redraws at
 once. A multi-line bracketed paste is refused whole rather than sent line by
 line. Quitting sends the queued lines and the last read marker, then `QUIT`,
-within five seconds, and says so if it could not. A read marker is never
+within five seconds, and says so if it could not. SIGTERM, SIGINT and SIGHUP
+end the UI the same way (they would otherwise kill it with the terminal raw,
+on the alternate screen and in bracketed-paste mode, and send no `QUIT`), and a
+panic hook chained onto ratatui's turns bracketed paste off before the
+terminal is restored. A read marker is never
 flushed while disconnected, so one that meets a disconnect is sent after
 reconnecting rather than reported as a lost message. Startup failures print
 `e6irc-tui: <message>` and exit 1. While the current
@@ -2967,7 +3144,8 @@ instead of being lost.
 Capability refusal fails visibly rather than degrading into a different
 experience. A pseudo-terminal journey drives the real full-screen binary
 against e6ircd and proves inbound rendering, outbound delivery, clean exit,
-and terminal restoration. “Multi-buffer” means several channels/queries inside
+and terminal restoration — including after SIGTERM, SIGINT and SIGHUP, each of
+which must still send `QUIT`. “Multi-buffer” means several channels/queries inside
 one connection, not several simultaneous networks; the BNC is the
 cross-network multiplexer.
 
@@ -3063,9 +3241,14 @@ but the CLI, TUI, and BNC must surface the rejection.
   removed only after that command commits. A corrupt, plaintext, or unreadable
   value rolls the entire operation back.
 - TLS ≥ 1.2 everywhere (rustls). Server certificates are reloaded on SIGHUP
-  and when their files change; a failed reload keeps the served certificate
-  and logs an error once per broken file state, and a key that does not match
-  its certificate is refused. Responses carry HSTS (`max-age=31536000`)
+  and when their files change (judged by a digest of their contents, so a
+  time-preserving rewrite is still a change on every platform); a failed reload
+  keeps the served certificate, logs an error once per distinct failure, and
+  is retried at every check until it loads, since a fix need not change what a
+  stamp can see. A key that does not match its certificate is refused. The
+  SIGHUP handler is installed first thing at start, before the database wait:
+  the signal's default action is to terminate, and a service manager does not
+  restart a unit that died of it. Responses carry HSTS (`max-age=31536000`)
   whenever the validated public origin is HTTPS (never on an explicitly plain
   development origin); `includeSubDomains` only with
   `[http].hsts_include_subdomains`, which forces every sibling host of the
@@ -3201,7 +3384,7 @@ The snapshot is the sole source for:
   (`core_heartbeat_age_ms` is the stalest shard's age, so a silent shard is not
   masked by a healthy one) or
   configured PostgreSQL cannot answer `SELECT 1` within a separate two-second
-  query deadline.
+  query deadline (one shared probe, its answer reused for a second).
 
 The production image carries no HTTP client, so a container `HEALTHCHECK`
 cannot be a `curl`. `e6ircd healthcheck [--ready]
@@ -3210,7 +3393,11 @@ cannot be a `curl`. `e6ircd healthcheck [--ready]
 that variable's default (`environment_config::DEFAULT_HTTP_ADDR`); an unspecified listener address is probed on loopback of the
 same family. It exits 0 only on a `200` within three seconds, 1 with the reason
 otherwise, and 2 on a usage error, and the image's `HEALTHCHECK` is that
-command.
+command. Its start period outlasts the default startup budget (the 300 s
+database wait plus the migration lock retries; a unit test derives the sum from
+the constants), because `/healthz` is bound only once startup has reached
+PostgreSQL: liveness speaks for a running core, which a process still in its
+bounded, self-terminating database wait does not have yet.
 
 When PostgreSQL is configured, a sampler stores the typed JSON snapshot in
 `observability_samples`. The UI-managed `[observability]` interval (5–300
@@ -3337,7 +3524,9 @@ Layers, bottom to top:
   console does not edit them.
 - A minimal `e6irc.toml`/environment bootstrap supplies the PostgreSQL URL,
   secrets-key source, HTTP bind, immutable release revision, and either
-  existing administrator authority or a one-time first-administrator token.
+  initial administrator grants (imported on the first start, console-owned
+  afterwards, like every operational setting below) or a one-time
+  first-administrator token.
   Unknown keys are a **startup error**. The token is accepted only with
   PostgreSQL and HTTP configured, is 32–512 control-free bytes, and is
   permanently unusable after the first account exists.
@@ -3345,7 +3534,29 @@ Layers, bottom to top:
   at `/console/configuration`. On first start after migration, validated
   bootstrap values are imported once with provenance. Later starts load the
   persisted revision before constructing the core or listeners, so the UI is
-  authoritative. Writes use compare-and-swap revisions and a same-transaction
+  authoritative. **A console-owned setting the file or environment still
+  states must agree with the stored value, or start fails**
+  (`ManagedConfig::bootstrap_drift`, run in `net::start` before anything is
+  built): the refusal names every differing setting by its bootstrap key
+  (`http.admin_accounts`, `oidc[0].client_secret`) and prints no value, since
+  any may be a secret; stored secrets are opened with the keyring and compared
+  in constant time. Applying the stored revision over a different stated value
+  would ignore it in silence — a name removed from `E6IRC_ADMIN_ACCOUNTS` kept
+  its authority, a rotated `E6IRC_OIDC_CLIENT_SECRET` was never used. The
+  operator resolves it by removing the setting from the bootstrap (the stored
+  value then applies), aligning it with the stored value, or changing it in the
+  console first. A setting the bootstrap does not state is never a conflict: a
+  file's absent key, or an environment variable left unset whose default the
+  environment reader fills in (`E6IRC_NETWORK_NAME`, `E6IRC_IRC_ADDR`,
+  `E6IRC_SECURE_COOKIES`; `EnvironmentDocument::defaulted`). A configuration
+  built in code rather than read from a document counts as stating everything.
+  The comparison is between what is stated and what start would run with after
+  applying the revision (`apply_to`), so it cannot disagree with what is
+  applied. Plaintext credentials still authoritative for want of a master key
+  (below) are the bootstrap's, not the console's, and are not compared. The
+  drift check needs the database, so `check-config` cannot make it and its
+  success report says so; `recover-administrator` does not start the server
+  and is unaffected. Writes use compare-and-swap revisions and a same-transaction
   redacted audit entry; stale writers fail visibly. The write takes the scalar
   settings only: the collections that hold secrets (OIDC providers, operators,
   server-level networks) are kept from the current revision and changed through
@@ -3443,9 +3654,21 @@ Layers, bottom to top:
   `E6IRC_BINARY`) is refused rather than ignored. Every subcommand that needs
   the configuration (`check-config`, `rotate-secrets`,
   `recover-administrator`) takes the same flag, so it runs by `docker exec` in
-  a container that has no file to point at.
+  a container that has no file to point at. `check-config` judges everything
+  start would refuse that needs neither the network nor the database, through
+  the functions start itself uses (`net::check_offline`): parse and
+  validation, the `E6IRC_MONITORING_TOKEN` rule, and every configured TLS
+  certificate/key pair read and matched. Agreement with the stored
+  console-owned settings needs the database and is judged by start alone; a
+  passing `check-config` of a database-backed configuration says so on stderr
+  rather than implying it. Every environment read in the daemon
+  goes through `environment_config`'s one rule (set-but-empty is unset; a
+  control character is refused by name), `E6IRC_SECRET_KEY` and
+  `E6IRC_PREVIOUS_SECRET_KEYS` included; a source test refuses a
+  `std::env` read anywhere else in the daemon.
   The systemd stop budget mechanically exceeds the daemon's bounded shutdown
-  — the core drain followed by the PostgreSQL flush; the guard sums both
+  — the bouncer drivers' stop (their goodbye and their last backlog write),
+  then the core drain, then the PostgreSQL flush; the guard sums the three
   constants. The unit sets `StartLimitIntervalSec=0` (asserted by the same
   guard): a refused first database connection fails the daemon in
   milliseconds, and systemd's default limit of five starts in ten seconds

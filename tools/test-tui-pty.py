@@ -192,6 +192,85 @@ def wait_process_and_drain(
     raise subprocess.TimeoutExpired(process.args, timeout)
 
 
+def spawn_tui(port: int, nick: str) -> tuple[subprocess.Popen[bytes], int]:
+    """Start the TUI on its own pseudo-terminal, as the controlling terminal of
+    a new session, connected to `port` as `nick` in #pty."""
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+
+    def attach_controlling_terminal() -> None:
+        os.setsid()
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+    environment = os.environ.copy()
+    environment["TERM"] = "xterm-256color"
+    process = subprocess.Popen(
+        [
+            str(TUI),
+            "--server",
+            f"127.0.0.1:{port}",
+            "--nick",
+            nick,
+            "--username",
+            nick,
+            "--channel",
+            "#pty",
+            "--history-lines",
+            "10",
+        ],
+        cwd=ROOT,
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        env=environment,
+        close_fds=True,
+        preexec_fn=attach_controlling_terminal,
+    )
+    os.close(slave)
+    os.set_blocking(master, False)
+    return process, master
+
+
+def signal_ends_the_session_cleanly(port: int, peer: IrcPeer, signum: int) -> None:
+    """A signal from outside (a closing terminal emulator, `kill`, a service
+    manager) ends the TUI like /quit: QUIT is sent, and the terminal leaves the
+    alternate screen and bracketed-paste mode instead of staying broken."""
+    name = signal.Signals(signum).name
+    nick = f"pty{name.lower()}"
+    proxy = LineProxy(port)
+    process, master = spawn_tui(proxy.port, nick)
+    output = bytearray()
+    try:
+        peer.wait_line(
+            lambda line: line.startswith(f":{nick}!") and " JOIN #pty" in line,
+            f"{nick} JOIN",
+        )
+        read_pty_until(master, output, b"CONNECTED")
+        if b"\x1b[?2004h" not in output:
+            raise AssertionError("TUI did not enable bracketed paste")
+        os.kill(process.pid, signum)
+        wait_process_and_drain(process, master, output, TIMEOUT)
+        if process.returncode != 0:
+            raise RuntimeError(f"TUI exited {process.returncode} on {name}")
+        after = output[output.index(b"\x1b[?2004h") :]
+        for restore, what in (
+            (b"\x1b[?2004l", "bracketed paste"),
+            (b"\x1b[?1049l", "the alternate screen"),
+        ):
+            if restore not in after:
+                raise AssertionError(f"{name} left {what} on")
+        proxy.wait_line(lambda line: line.startswith("QUIT"), f"QUIT on {name}")
+    except Exception:
+        print(output.decode("utf-8", "replace"))
+        raise
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        os.close(master)
+        proxy.close()
+
+
 def main() -> None:
     if not SERVER.is_file() or not TUI.is_file():
         raise RuntimeError("build e6ircd and e6irc-tui before the PTY journey")
@@ -229,39 +308,7 @@ def main() -> None:
             peer.wait_line(lambda line: " 366 observer #pty " in line, "observer JOIN")
 
             proxy = LineProxy(port)
-            master, slave = pty.openpty()
-            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
-
-            def attach_controlling_terminal() -> None:
-                os.setsid()
-                fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
-
-            environment = os.environ.copy()
-            environment["TERM"] = "xterm-256color"
-            tui = subprocess.Popen(
-                [
-                    str(TUI),
-                    "--server",
-                    f"127.0.0.1:{proxy.port}",
-                    "--nick",
-                    "ptyclient",
-                    "--username",
-                    "ptyclient",
-                    "--channel",
-                    "#pty",
-                    "--history-lines",
-                    "10",
-                ],
-                cwd=ROOT,
-                stdin=slave,
-                stdout=slave,
-                stderr=slave,
-                env=environment,
-                close_fds=True,
-                preexec_fn=attach_controlling_terminal,
-            )
-            os.close(slave)
-            os.set_blocking(master, False)
+            tui, master = spawn_tui(proxy.port, "ptyclient")
             peer.wait_line(
                 lambda line: line.startswith(":ptyclient!") and " JOIN #pty" in line,
                 "TUI JOIN",
@@ -334,10 +381,13 @@ def main() -> None:
                 lambda line: line.startswith(":ptyclient!") and " QUIT " in line,
                 "the TUI's QUIT relayed to the channel",
             )
+            for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                signal_ends_the_session_cleanly(port, peer, signum)
             print(
                 "TUI PTY journey passed: product state, help, inbound, outbound, "
                 "multi-line paste refused, resize redraw, read marker and QUIT on "
-                "exit, clean restore"
+                "exit, clean restore, and the same QUIT and restore on SIGTERM, "
+                "SIGINT and SIGHUP"
             )
         except Exception:
             print(output.decode("utf-8", "replace"))

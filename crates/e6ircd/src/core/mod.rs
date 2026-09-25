@@ -8,7 +8,9 @@
 //! Workers can run as N hash-sharded instances. Each instance owns its local
 //! session state and its assigned channel state.
 
+mod banmask;
 mod handler;
+mod hot_history;
 mod state;
 mod timer;
 
@@ -251,9 +253,10 @@ impl CoreIngress {
     }
 
     /// Tell every shard that `account` was permanently deleted, so each drops
-    /// its read-marker mirror entries for it: the database rows cascaded away
-    /// with the account, and nothing would otherwise evict them before a
-    /// restart.
+    /// what it mirrors of the rows that went with it — read markers, hot
+    /// history lines and conversations, channel access entries: the database
+    /// purged or cascaded them away, and nothing would otherwise evict them
+    /// before a restart.
     pub(crate) async fn broadcast_account_deleted(&self, account: &str) -> Result<(), ()> {
         self.broadcast(|| Input::AccountDeleted {
             account: account.to_owned(),
@@ -752,9 +755,9 @@ pub enum Input {
     ReadMarkersExpired {
         markers: Arc<[ExpiredReadMarker]>,
     },
-    /// An account was permanently deleted, broadcast to every shard so its
-    /// read-marker mirror drops the account's entries (their rows cascaded
-    /// away with the account row).
+    /// An account was permanently deleted, broadcast to every shard so it
+    /// drops its mirror of the account's rows: read markers, hot history,
+    /// channel access (see [`state::ServerState::forget_deleted_account`]).
     AccountDeleted {
         account: String,
     },
@@ -2753,7 +2756,7 @@ impl Core {
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
             Input::Tick { now } => handler::reap_idle(&mut self.state, now),
             Input::ReadMarkersExpired { markers } => self.state.expire_read_markers(&markers),
-            Input::AccountDeleted { account } => self.state.forget_account_read_markers(&account),
+            Input::AccountDeleted { account } => self.state.forget_deleted_account(&account),
             Input::DbReply { conn, reply } => handler::db_reply(&mut self.state, conn, reply),
             Input::HistoryPage {
                 conn,
@@ -4867,6 +4870,111 @@ mod ingress_tests {
         );
     }
 
+    /// A change a user makes while its JOIN is on the way to another shard
+    /// reaches the member that JOIN creates: the channel's owner admitted it
+    /// from the snapshot the JOIN carried, and without the update it kept the
+    /// old nick, away state and real name for good.
+    #[test]
+    fn a_change_made_during_a_remote_join_reaches_the_new_member() {
+        let mut shards = Shards::new();
+        let there = shards.owned[1];
+        shards.client(1, "bob", "away-notify setname");
+        shards.line(1, &format!("JOIN {there}"));
+        shards.client(2, "alice", "");
+        shards.drain(1);
+        // All three before the owner has answered the JOIN.
+        shards.push_line(2, &format!("JOIN {there}"));
+        shards.push_line(2, "NICK alicia");
+        shards.push_line(2, "AWAY :gone");
+        shards.settle();
+        let out = shards.drain(1);
+        let join_at = out
+            .iter()
+            .position(|l| l.contains(&format!(" JOIN {there}")));
+        let nick_at = out
+            .iter()
+            .position(|l| l.contains(" NICK ") && l.ends_with("alicia"));
+        assert!(
+            join_at.is_some() && join_at < nick_at,
+            "bob sees the JOIN, then the NICK: {out:#?}"
+        );
+        assert_eq!(lines_with(&out, " AWAY :gone").len(), 1, "{out:#?}");
+        shards.line(1, &format!("NAMES {there}"));
+        let names = shards.drain(1);
+        assert_eq!(lines_with(&names, "alicia").len(), 1, "{names:#?}");
+        let key = shards.cores[1].state.chan_key(there);
+        let (_, _, identity, profile) = shards.cores[1].state.channels[&key]
+            .member_profiles()
+            .find(|(conn, ..)| *conn == ConnId(2))
+            .expect("alicia is a member");
+        assert_eq!(identity.nick, "alicia");
+        assert!(profile.away, "the owner holds the away state");
+    }
+
+    /// A NICK while a JOIN is in flight to a shard that then refuses it tells
+    /// that channel's members nothing: the user never shared it with them.
+    #[test]
+    fn a_change_made_during_a_refused_remote_join_is_not_told_to_its_members() {
+        let mut shards = Shards::new();
+        let there = shards.owned[1];
+        shards.client(1, "bob", "");
+        shards.line(1, &format!("JOIN {there}"));
+        shards.line(1, &format!("MODE {there} +i"));
+        shards.client(2, "alice", "");
+        shards.drain(1);
+        shards.push_line(2, &format!("JOIN {there}"));
+        shards.push_line(2, "NICK alicia");
+        shards.settle();
+        assert!(lines_with(&shards.drain(1), "alicia").is_empty());
+        assert_eq!(lines_with(&shards.drain(2), " 473 ").len(), 1);
+    }
+
+    /// `JOIN 0` parts every channel, whichever shard owns it — and a JOIN
+    /// still in flight when it was sent is parted once it is answered, so the
+    /// user ends up in no channel, as the client asked, on two workers as on
+    /// one.
+    #[test]
+    fn join_zero_parts_remote_and_in_flight_channels() {
+        for mut shards in [Shards::new(), Shards::on_one_worker()] {
+            let [here, there] = shards.owned;
+            shards.client(1, "bob", "");
+            shards.line(1, &format!("JOIN {here},{there}"));
+            shards.client(2, "alice", "");
+            shards.line(2, &format!("JOIN {here},{there}"));
+            shards.drain(1);
+            shards.drain(2);
+            shards.line(2, "JOIN 0");
+            let out = shards.drain(2);
+            for channel in [here, there] {
+                assert_eq!(
+                    lines_with(&out, &format!(" PART {channel}")).len(),
+                    1,
+                    "{out:#?}"
+                );
+            }
+            shards.drain(1);
+
+            shards.push_line(2, &format!("JOIN {there}"));
+            shards.push_line(2, "JOIN 0");
+            shards.settle();
+            let out = shards.drain(2);
+            let join_at = out
+                .iter()
+                .position(|l| l.contains(&format!(" JOIN {there}")));
+            let part_at = out
+                .iter()
+                .position(|l| l.contains(&format!(" PART {there}")));
+            assert!(
+                join_at.is_some() && join_at < part_at,
+                "the JOIN, then its PART: {out:#?}"
+            );
+            shards.drain(1);
+            shards.line(1, &format!("NAMES {there}"));
+            let names = shards.drain(1);
+            assert!(lines_with(&names, "alice").is_empty(), "{names:#?}");
+        }
+    }
+
     #[test]
     fn a_join_that_outlives_its_session_leaves_no_member_behind() {
         let mut shards = Shards::new();
@@ -5083,6 +5191,7 @@ mod ingress_tests {
                 profile: ChannelMemberProfile {
                     user: "u".into(),
                     host: "host.test".into(),
+                    real_ip: None,
                     realname: "Requester".into(),
                     account: None,
                     away: false,

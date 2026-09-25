@@ -31,8 +31,15 @@
 //!                method belongs to the client registration, so discovery
 //!                cannot report it)
 //!
-//! `E6IRC_SECRET_KEY` and `E6IRC_PREVIOUS_SECRET_KEYS` are read by the
-//! configuration itself, whichever way it was stated.
+//! `E6IRC_SECRET_KEY` and `E6IRC_PREVIOUS_SECRET_KEYS` are read by the same rule,
+//! by the configuration itself, whichever way it was stated.
+//!
+//! On a database-backed start the console owns the operational settings. A
+//! variable that states one (`E6IRC_SERVER_NAME`, `E6IRC_PUBLIC_URL`,
+//! `E6IRC_ADMIN_ACCOUNTS`, the OpenID Connect provider, ...) must agree with the
+//! stored value or start refuses, naming the setting; a variable left unset
+//! states nothing, and the default put in its place is not held to the stored
+//! value ([`EnvironmentDocument::defaulted`]).
 //!
 //! A variable that is set but empty is unset, as it was for the shell. No
 //! refusal ever prints a value: every one of them may be a secret.
@@ -165,6 +172,21 @@ impl<E: Fn(&str) -> Lookup> Environment<'_, E> {
                 .unwrap_or_else(|| default.to_owned()),
         ))
     }
+
+    /// Like [`Self::or_default`], recording `key` in `defaulted` when the
+    /// default is taken, since no operator stated it.
+    fn or_recorded_default(
+        &self,
+        variable: &'static str,
+        default: &str,
+        key: &'static str,
+        defaulted: &mut Vec<&'static str>,
+    ) -> Result<Value, EnvironmentConfigError> {
+        if self.optional(variable)?.is_none() {
+            defaulted.push(key);
+        }
+        self.or_default(variable, default)
+    }
 }
 
 /// One variable read outside [`configuration_table`] by the same rule it
@@ -194,12 +216,29 @@ const OIDC_DEPENDENTS: [&str; 6] = [
     "E6IRC_OIDC_END_SESSION",
 ];
 
-/// The configuration document the environment states, ready for the same
-/// parser a configuration file goes through.
+/// The configuration document the environment states, and which of its keys
+/// hold this module's defaults rather than a variable's value.
+#[derive(Debug, PartialEq)]
+pub struct EnvironmentDocument {
+    /// Ready for the same parser a configuration file goes through
+    /// (`Config::from_table`).
+    pub table: Table,
+    /// Key paths of console-owned settings filled with a default because their
+    /// variable is unset. They are not the operator's statement, so they are
+    /// not held to the settings the console stores
+    /// (`ManagedConfig::bootstrap_drift`): an unset `E6IRC_NETWORK_NAME`
+    /// leaves the network name to the console. A default inside a stated
+    /// table-array entry (an OpenID Connect provider's name) is part of that
+    /// entry and is not listed.
+    pub defaulted: Vec<&'static str>,
+}
+
+/// The configuration document the environment states.
 pub fn configuration_table(
     environment: &impl Fn(&str) -> Lookup,
-) -> Result<Table, EnvironmentConfigError> {
+) -> Result<EnvironmentDocument, EnvironmentConfigError> {
     let environment = Environment(environment);
+    let mut defaulted = Vec::new();
     for (variable, reason) in RETIRED {
         if environment.optional(variable)?.is_some() {
             return Err(EnvironmentConfigError::Retired { variable, reason });
@@ -213,7 +252,12 @@ pub fn configuration_table(
     );
     root.insert(
         "network_name".into(),
-        environment.or_default("E6IRC_NETWORK_NAME", DEFAULT_NETWORK_NAME)?,
+        environment.or_recorded_default(
+            "E6IRC_NETWORK_NAME",
+            DEFAULT_NETWORK_NAME,
+            "network_name",
+            &mut defaulted,
+        )?,
     );
     root.insert(
         "application_release_revision".into(),
@@ -223,7 +267,12 @@ pub fn configuration_table(
     let mut listener = Table::new();
     listener.insert(
         "addr".into(),
-        environment.or_default("E6IRC_IRC_ADDR", DEFAULT_IRC_ADDR)?,
+        environment.or_recorded_default(
+            "E6IRC_IRC_ADDR",
+            DEFAULT_IRC_ADDR,
+            "listeners",
+            &mut defaulted,
+        )?,
     );
     root.insert(
         "listeners".into(),
@@ -237,7 +286,11 @@ pub fn configuration_table(
         environment.required("E6IRC_PUBLIC_URL", None)?,
     );
     let secure_cookies = match environment.optional("E6IRC_SECURE_COOKIES")?.as_deref() {
-        None | Some("true") => true,
+        None => {
+            defaulted.push("http.secure_cookies");
+            true
+        }
+        Some("true") => true,
         Some("false") => false,
         Some(_) => return Err(EnvironmentConfigError::NotBoolean("E6IRC_SECURE_COOKIES")),
     };
@@ -335,7 +388,10 @@ pub fn configuration_table(
         }
     }
 
-    Ok(root)
+    Ok(EnvironmentDocument {
+        table: root,
+        defaulted,
+    })
 }
 
 #[cfg(test)]
@@ -365,7 +421,9 @@ mod tests {
         base
     }
 
-    fn table(pairs: &[(&'static str, &'static str)]) -> Result<Table, EnvironmentConfigError> {
+    fn document(
+        pairs: &[(&'static str, &'static str)],
+    ) -> Result<EnvironmentDocument, EnvironmentConfigError> {
         configuration_table(&|variable: &str| {
             Ok(pairs
                 .iter()
@@ -375,8 +433,13 @@ mod tests {
         })
     }
 
+    fn table(pairs: &[(&'static str, &'static str)]) -> Result<Table, EnvironmentConfigError> {
+        document(pairs).map(|document| document.table)
+    }
+
     fn config(pairs: &[(&'static str, &'static str)]) -> Config {
-        Config::from_table(table(pairs).expect("environment states a configuration"))
+        let document = document(pairs).expect("environment states a configuration");
+        Config::from_table(document.table, &document.defaulted)
             .expect("the stated configuration is valid")
     }
 
@@ -527,7 +590,7 @@ mod tests {
                 minimal(),
                 &[("E6IRC_DATABASE_MAX_CONNECTIONS", out_of_bounds)],
             );
-            let error = Config::from_table(table(&stated).expect("a whole number"))
+            let error = Config::from_table(table(&stated).expect("a whole number"), &[])
                 .expect_err("outside 2..=200");
             assert!(
                 error.to_string().contains("database.max_connections"),
@@ -602,5 +665,52 @@ mod tests {
             );
             assert!(error.to_string().contains("unset it"), "{error}");
         }
+    }
+
+    /// Every environment read in the daemon goes through [`process_environment`]
+    /// and [`optional`]: a second reader with its own rule is how
+    /// `E6IRC_SECRET_KEY=` came to mean "a key" to one reader and "unset" to
+    /// the rest. The daemon's sources may name `std::env`'s variable readers
+    /// only in this module.
+    #[test]
+    fn only_this_module_reads_the_process_environment() {
+        fn sources(directory: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(directory).expect("read the source directory") {
+                let path = entry.expect("a source entry").path();
+                if path.is_dir() {
+                    sources(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let this_module = root.join("environment_config.rs");
+        let mut files = Vec::new();
+        sources(&root, &mut files);
+        assert!(
+            files.contains(&this_module),
+            "the walk sees the daemon's sources"
+        );
+        let readers = ["env::var(", "env::var_os(", "env::vars(", "env::vars_os("];
+        let offenders: Vec<String> = files
+            .iter()
+            .filter(|path| **path != this_module)
+            .flat_map(|path| {
+                let text = std::fs::read_to_string(path).expect("read a source file");
+                text.lines()
+                    .enumerate()
+                    .filter(|(_, line)| readers.iter().any(|reader| line.contains(reader)))
+                    .map(|(number, line)| {
+                        format!("{}:{}: {}", path.display(), number + 1, line.trim())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "read the environment through environment_config::optional:\n{}",
+            offenders.join("\n")
+        );
     }
 }

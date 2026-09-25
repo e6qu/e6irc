@@ -15,7 +15,8 @@ credential is required for these deliberately public endpoints.
    supported entry-point information used by clients.
 2. `GET /healthz` reports that the process and HTTP loop are alive.
 3. `GET /readyz` checks the core heartbeat and performs a real,
-   deadline-bounded PostgreSQL query when a database is configured.
+   deadline-bounded PostgreSQL query when a database is configured; concurrent
+   requests share one probe, whose answer is reused for one second.
 4. A human opens `/login` to discover enabled local and OpenID Connect sign-in
    choices; automation can read `/api/v1/openapi.json` before obtaining a
    token.
@@ -32,7 +33,8 @@ Probe latency/status use fixed telemetry dimensions, and authentication is
 still mandatory on every private resource regardless of service discovery.
 
 **Evidence.** `server_info_endpoint`, `healthz_is_public_and_ok`,
-`readyz_reports_core_and_optional_database_state`, `login_page_renders`, and
+`readyz_reports_core_and_optional_database_state`,
+`concurrent_readiness_requests_share_one_database_probe`, `login_page_renders`, and
 the exact router/OpenAPI catalog test exercise these unauthenticated boundaries
 over real HTTP.
 
@@ -49,8 +51,10 @@ creating the first durable administrator.
 **Flow.**
 
 1. Provide the PostgreSQL URL, stable secret-key source, immutable release
-   revision, public URL/cookie policy, listener bootstrap, and either static
-   administrator grants or a 32–512-byte first-administrator token.
+   revision, public URL/cookie policy, listener bootstrap, and either initial
+   administrator grants or a 32–512-byte first-administrator token. The
+   operational values among these are imported once; afterwards the console
+   owns them, and a restart that states one differently is refused by name.
 2. Build/install `e6ircd` or run the production container. The container builds
    the Vite client and embeds it at image-build time; startup does not compile
    assets.
@@ -69,7 +73,8 @@ creating the first durable administrator.
 
 **Visible failures and recovery.** Missing/invalid configuration, migration
 failure, unavailable PostgreSQL, unreadable/wrong secret key, persisted
-configuration incompatibility, bind failure, invalid bootstrap token, and an
+configuration incompatibility, a stated console-owned setting that differs from
+the stored one (named, never printed), bind failure, invalid bootstrap token, and an
 already-consumed bootstrap produce specific errors. A failed administrator
 configuration read is announced and retryable in place. First-account creation
 is atomic, and there is no in-memory fallback for a configured database.
@@ -168,10 +173,14 @@ time for bounded flush paths.
    paths to flush within the shutdown budget.
 4. Exit; ephemeral live connections and runtime timestamps are expected to
    disappear.
-5. On restart, load managed configuration, registered-channel state, bans,
+5. On restart, refuse to start if the file or environment states a
+   console-owned setting with a value other than the stored revision's, naming
+   each such setting and printing no value; the operator removes or aligns it,
+   or changes it in the console first.
+6. Load managed configuration, registered-channel state, bans,
    network definitions, recent BNC backlog, read markers, history, and browser
    sessions from PostgreSQL.
-6. Start enabled networks and listeners from the loaded revision.
+7. Start enabled networks and listeners from the loaded revision.
 
 While serving, main supervises the core, PostgreSQL worker, protocol listeners,
 connection reaper, observability sampler, and storage-maintenance worker. An
@@ -190,14 +199,22 @@ with the configured external key and never logs them. Shutdown and boot stages,
 flush failures, driver reconnects, readiness, and new runtime timestamps make
 the transition visible without pretending ephemeral sessions survived.
 
-**Evidence.** Graceful shutdown, critical-task outcome provenance, worker
+**Evidence.** `a_process_shutdown_writes_the_last_backlog_lines` and
+`a_wedged_backlog_write_is_aborted_at_the_shutdown_deadline` prove the BNC
+backlog flush and its bound; graceful shutdown, critical-task outcome provenance, worker
 flush behavior, managed retention validation, and exact PostgreSQL maintenance
 deletions are unit/integration tested; BNC backlog, read markers, channels,
 bans, browser sessions, and history each have restart/boot-load PostgreSQL
 tests. The Chromium acceptance
 journey additionally sends real upstream traffic, stops the daemon with
-SIGTERM and requires exit zero, starts a new process on the same database, and
-proves the session, network, reconnected runtime, and backlog together.
+SIGTERM and requires exit zero, starts a new process with the configuration
+file that still states the server and network names the console replaced and
+proves it is refused naming both, then starts one with the file aligned on the
+same database and proves the session, network, reconnected runtime, and backlog
+together. `a_stated_console_setting_must_agree_with_the_stored_revision`
+(PostgreSQL) proves the first-start import, an unchanged restart, the refusal of
+a shortened administrator list and of a rotated OpenID Connect client secret
+(named, never printed), and that an unstated setting is the console's alone.
 
 ## Recover from PostgreSQL interruption
 

@@ -12,6 +12,8 @@ use e6irc_proto::numerics::{
 };
 use e6irc_queue::Sender;
 
+use super::banmask::{MaskShape, MaskSubject};
+use super::hot_history::HotHistory;
 use super::{
     CoreEffect, CoreShardCount, CoreShardId, Output, SessionOutput, SessionOwner, WireLine, Written,
 };
@@ -144,12 +146,12 @@ struct SilencingMasks {
 }
 
 impl SilencingMasks {
-    /// Whether `prefix` is banned or quieted here — [`Channel::is_banned`] or
+    /// Whether `subject` is banned or quieted here — [`Channel::is_banned`] or
     /// [`Channel::is_quieted`], which share the ban-exception list.
-    fn silences(&self, casemap: CaseMapping, prefix: &str) -> bool {
-        (Channel::any_match(casemap, &self.bans, prefix)
-            || Channel::any_match(casemap, &self.quiets, prefix))
-            && !Channel::any_match(casemap, &self.exceptions, prefix)
+    fn silences(&self, casemap: CaseMapping, subject: &MaskSubject<'_>) -> bool {
+        (Channel::any_match(casemap, &self.bans, subject)
+            || Channel::any_match(casemap, &self.quiets, subject))
+            && !Channel::any_match(casemap, &self.exceptions, subject)
     }
 }
 
@@ -160,6 +162,23 @@ impl MembershipDirectory {
             Some(channel) => channels.insert(key.clone(), channel),
             None => channels.remove(key),
         };
+    }
+
+    /// Update only the newest-message time of `key`'s published record.
+    /// Whether there was a record to update.
+    fn publish_latest_message(
+        &self,
+        key: &ChanKey,
+        latest: Option<e6irc_proto::time::Millis>,
+    ) -> bool {
+        let mut channels = self.channels.lock().expect("membership directory poisoned");
+        match channels.get_mut(key) {
+            Some(channel) => {
+                channel.latest_message = latest;
+                true
+            }
+            None => false,
+        }
     }
 
     /// A channel's display name and the time of the newest message in its
@@ -210,14 +229,14 @@ impl MembershipDirectory {
     }
 
     /// The display name of a channel `conn` is in where it holds neither op
-    /// nor voice and its hostmask `prefix` is banned or quieted — the channel a
+    /// nor voice and `subject` is banned or quieted — the channel a
     /// NICK must be refused for (Solanum: a banned member cannot change nick,
     /// or it could escape the ban and speak). `None` when there is none.
     pub(crate) fn silenced_in(
         &self,
         conn: ConnId,
         casemap: CaseMapping,
-        prefix: &str,
+        subject: &MaskSubject<'_>,
     ) -> Option<String> {
         let by_conn = self.by_conn.lock().expect("membership directory poisoned");
         let channels = self.channels.lock().expect("membership directory poisoned");
@@ -231,7 +250,7 @@ impl MembershipDirectory {
                     .ranks
                     .get(&conn)
                     .is_some_and(|modes| modes.op || modes.voice)
-                    && channel.silencing.silences(casemap, prefix)
+                    && channel.silencing.silences(casemap, subject)
             })
             .map(|channel| channel.name.as_str())
             .collect();
@@ -297,10 +316,19 @@ impl MembershipDirectory {
 /// and `contains`/`retain` can't get it wrong; [`MaskKey::as_str`] returns the
 /// original casing for `RPL_BANLIST` and for `mask::matches` (which folds the
 /// mask itself). Build only via [`MaskKey::new`].
+///
+/// It also carries what the mask *means* ([`MaskShape`]: a glob, a CIDR host,
+/// an account extban), decided once here rather than on every match. The
+/// strict decision — refusing a mask that could never match as written — is
+/// made where a mask is *added* (`channel_list_mask`, `BanMask::parse`), before
+/// this is built; a mask reaching here unvalidated (a removal's argument, a
+/// server ban persisted before validation existed) that does not parse keeps
+/// the meaning every mask had before shapes existed, a literal glob.
 #[derive(Debug, Clone)]
 pub struct MaskKey {
     folded: String,
     display: String,
+    shape: MaskShape,
 }
 
 impl MaskKey {
@@ -308,7 +336,13 @@ impl MaskKey {
         Self {
             folded: casemap.casefold(mask),
             display: mask.to_string(),
+            shape: MaskShape::parse(mask).unwrap_or(MaskShape::Glob),
         }
+    }
+
+    /// Whether `subject` matches this mask, by its [`MaskShape`].
+    pub(crate) fn matches(&self, casemap: CaseMapping, subject: &MaskSubject<'_>) -> bool {
+        self.shape.matches(casemap, &self.display, subject)
     }
 
     /// The mask in its stored (original) casing — for display and for
@@ -569,6 +603,20 @@ impl ChannelOptionsDirectory {
         }
     }
 
+    /// Drop `account` from every channel's access list: its rows cascaded
+    /// away with the account. A pass over every registered channel, paid only
+    /// by an account's permanent deletion.
+    pub(crate) fn remove_account(&self, account: &AccountKey) {
+        self.inner
+            .lock()
+            .expect("channel options directory poisoned")
+            .access
+            .retain(|_, entries| {
+                entries.remove(account);
+                !entries.is_empty()
+            });
+    }
+
     pub(crate) fn remove(&self, key: &ChanKey) {
         let mut options = self
             .inner
@@ -594,6 +642,9 @@ pub(crate) struct PublicUser {
     pub(crate) nick: String,
     pub(crate) user: String,
     pub(crate) host: String,
+    /// The address the connection came from ([`Session::real_ip`]); never
+    /// shown, only matched by bans.
+    pub(crate) real_ip: Option<std::net::IpAddr>,
     pub(crate) realname: String,
     pub(crate) account: Option<String>,
     pub(crate) away: Option<String>,
@@ -612,6 +663,7 @@ impl PublicUser {
             nick: session.nick().expect("registered").to_string(),
             user: session.user().expect("registered").to_string(),
             host: session.host.clone(),
+            real_ip: session.real_ip,
             realname: session.realname().expect("registered").to_string(),
             account: session.account.clone(),
             away: session.away.clone(),
@@ -665,6 +717,7 @@ impl PublicUser {
         ChannelMemberProfile {
             user: self.user.clone(),
             host: self.host.clone(),
+            real_ip: self.real_ip,
             realname: self.realname.clone(),
             account: self.account.clone(),
             away: self.away.is_some(),
@@ -675,60 +728,129 @@ impl PublicUser {
     }
 }
 
-/// Process-wide [`PublicUser`] records, by connection.
+/// Process-wide [`PublicUser`] records, by connection, with the indexes the
+/// per-event questions about them need.
 #[derive(Clone, Default)]
 pub(crate) struct UserDirectory {
-    by_conn: Arc<Mutex<HashMap<ConnId, Arc<PublicUser>>>>,
+    inner: Arc<Mutex<Users>>,
+}
+
+/// How many registered users there are, and how many of them are invisible
+/// or operators (LUSERS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct UserCounts {
+    pub(crate) users: usize,
+    pub(crate) invisible: usize,
+    pub(crate) opers: usize,
+}
+
+/// The directory's contents. Every index is kept by [`Users::insert`] and
+/// [`Users::remove`], the only two places a record comes or goes, so LUSERS
+/// and resolving an account to a nick are lookups rather than a copy or scan
+/// of every user under the process-wide lock.
+#[derive(Default)]
+struct Users {
+    by_conn: HashMap<ConnId, Arc<PublicUser>>,
+    /// Casefolded account → connections logged in to it.
+    by_account: HashMap<String, HashSet<ConnId>>,
+    counts: UserCounts,
+}
+
+impl Users {
+    fn account_key(user: &PublicUser) -> Option<String> {
+        user.account
+            .as_deref()
+            .map(|account| CaseMapping::Rfc1459.casefold(account))
+    }
+
+    fn insert(&mut self, user: Arc<PublicUser>) {
+        self.remove(user.conn());
+        let conn = user.conn();
+        if let Some(account) = Self::account_key(&user) {
+            self.by_account.entry(account).or_default().insert(conn);
+        }
+        self.counts.users += 1;
+        self.counts.invisible += usize::from(user.invisible);
+        self.counts.opers += usize::from(user.oper);
+        self.by_conn.insert(conn, user);
+    }
+
+    fn remove(&mut self, conn: ConnId) {
+        let Some(user) = self.by_conn.remove(&conn) else {
+            return;
+        };
+        if let Some(account) = Self::account_key(&user) {
+            let std::collections::hash_map::Entry::Occupied(mut entry) =
+                self.by_account.entry(account)
+            else {
+                unreachable!("a published account is indexed");
+            };
+            entry.get_mut().remove(&conn);
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+        }
+        self.counts.users -= 1;
+        self.counts.invisible -= usize::from(user.invisible);
+        self.counts.opers -= usize::from(user.oper);
+    }
+
+    /// Recount every index from `by_conn` and assert it matches.
+    #[cfg(test)]
+    fn assert_consistent(&self) {
+        let mut by_account: HashMap<String, HashSet<ConnId>> = HashMap::new();
+        for user in self.by_conn.values() {
+            if let Some(account) = Self::account_key(user) {
+                by_account.entry(account).or_default().insert(user.conn());
+            }
+        }
+        assert_eq!(self.by_account, by_account);
+        assert_eq!(
+            self.counts,
+            UserCounts {
+                users: self.by_conn.len(),
+                invisible: self.by_conn.values().filter(|user| user.invisible).count(),
+                opers: self.by_conn.values().filter(|user| user.oper).count(),
+            }
+        );
+    }
 }
 
 impl UserDirectory {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Users> {
+        self.inner.lock().expect("user directory poisoned")
+    }
+
     fn publish(&self, user: Arc<PublicUser>) {
-        self.by_conn
-            .lock()
-            .expect("user directory poisoned")
-            .insert(user.conn(), user);
+        self.lock().insert(user);
     }
 
     fn withdraw(&self, conn: ConnId) {
-        self.by_conn
-            .lock()
-            .expect("user directory poisoned")
-            .remove(&conn);
+        self.lock().remove(conn);
     }
 
     pub(crate) fn get(&self, conn: ConnId) -> Option<Arc<PublicUser>> {
-        self.by_conn
-            .lock()
-            .expect("user directory poisoned")
-            .get(&conn)
-            .cloned()
+        self.lock().by_conn.get(&conn).cloned()
     }
 
-    fn len(&self) -> usize {
-        self.by_conn.lock().expect("user directory poisoned").len()
+    fn counts(&self) -> UserCounts {
+        self.lock().counts
     }
 
     fn all(&self) -> Vec<Arc<PublicUser>> {
-        self.by_conn
-            .lock()
-            .expect("user directory poisoned")
-            .values()
-            .cloned()
-            .collect()
+        self.lock().by_conn.values().cloned().collect()
     }
 
     /// Some online user logged in to `account` (casefolded), if any.
-    fn logged_in_as(&self, account: &str, casemap: CaseMapping) -> Option<Arc<PublicUser>> {
-        self.by_conn
-            .lock()
-            .expect("user directory poisoned")
-            .values()
-            .find(|user| {
-                user.account
-                    .as_deref()
-                    .is_some_and(|name| casemap.casefold(name) == account)
-            })
-            .cloned()
+    fn logged_in_as(&self, account: &str) -> Option<Arc<PublicUser>> {
+        let users = self.lock();
+        let conn = users.by_account.get(account)?.iter().next()?;
+        users.by_conn.get(conn).cloned()
+    }
+
+    #[cfg(test)]
+    fn assert_consistent(&self) {
+        self.lock().assert_consistent();
     }
 }
 
@@ -1253,6 +1375,12 @@ impl PendingServiceReply {
 pub(crate) struct Session {
     output: SessionOutput,
     pub host: String,
+    /// The address the connection came from, fixed when it opened: what a
+    /// D-line, an address-shaped K-line and a channel ban on an address or
+    /// CIDR range match. A `SETHOST` changes `host`, never this, so a cloak is
+    /// no way out of a ban on the address. `None` for a session opened
+    /// in-process under a name rather than an address.
+    pub(crate) real_ip: Option<std::net::IpAddr>,
     /// What this session's per-address limits are charged to, fixed from the
     /// host it opened with (a later SETHOST changes only what is shown).
     limit_key: crate::net::SessionLimitKey,
@@ -1313,6 +1441,12 @@ pub(crate) struct Session {
     /// in flight. A channel this shard owns is joined in the same step and
     /// never appears here.
     pub pending_joins: HashSet<ChanKey>,
+    /// The subset of `pending_joins` a later `JOIN 0` must part once answered:
+    /// the JOIN reached its owner first, so it is honoured, then left.
+    pub part_on_join: HashSet<ChanKey>,
+    /// When this session's last KNOCK was delivered, on the monotonic clock: a
+    /// user may knock once per `KNOCK_DELAY` (Solanum's `knock_delay`).
+    pub last_knock: Option<e6irc_proto::time::MonoMillis>,
     /// Nicks this session MONITORs (display form as given).
     pub monitoring: HashMap<NickKey, String>,
     /// The `draft/multiline` batch this connection is filling, if any.
@@ -1682,6 +1816,22 @@ impl Session {
         };
     }
 
+    /// What a server ban is tested against for this session.
+    pub(crate) fn server_ban_subject(&self) -> ServerBanSubject<'_> {
+        ServerBanSubject {
+            user: self.user().unwrap_or("*"),
+            host: &self.host,
+            real_ip: self.real_ip,
+            realname: self.realname().unwrap_or(""),
+        }
+    }
+
+    /// Who this session is to a channel's masks, given its `prefix()` (taken
+    /// by the caller so the subject can borrow it).
+    pub(crate) fn mask_subject<'a>(&'a self, prefix: &'a str) -> MaskSubject<'a> {
+        MaskSubject::new(prefix, self.real_ip, self.account.as_deref())
+    }
+
     /// `nick!user@host` — total on a registered session (its nick/user exist by
     /// construction). Calling it on an unregistered session is a caller bug.
     pub fn prefix(&self) -> String {
@@ -1770,6 +1920,8 @@ impl LastActive {
 pub(crate) struct ChannelMemberProfile {
     pub(crate) user: String,
     pub(crate) host: String,
+    /// The member's real address, which channel bans match alongside `host`.
+    pub(crate) real_ip: Option<std::net::IpAddr>,
     pub(crate) realname: String,
     pub(crate) account: Option<String>,
     pub(crate) away: bool,
@@ -1789,6 +1941,7 @@ impl ChannelMemberProfile {
         Self {
             user: user.to_string(),
             host: host.to_string(),
+            real_ip: None,
             realname: identity.nick.clone(),
             account: None,
             away: false,
@@ -1834,6 +1987,15 @@ pub struct ChannelActor {
 impl ChannelActor {
     pub(crate) fn session_owner(&self) -> SessionOwner {
         self.recipient.owner
+    }
+
+    /// Who this actor is to a channel's ban, quiet and exception masks.
+    pub(crate) fn mask_subject(&self) -> MaskSubject<'_> {
+        MaskSubject::new(
+            &self.identity.prefix,
+            self.profile.real_ip,
+            self.account.as_deref(),
+        )
     }
 
     pub(crate) fn originator(&self) -> Originator {
@@ -1884,10 +2046,12 @@ pub enum ChannelJoinFailure {
     Full { name: String },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ChannelPartResult {
     Parted { key: ChanKey, line: EventLine },
     NotOnChannel { name: String },
+    NoSuchChannel { name: String },
+    Hidden { name: String, proof: Hidden },
 }
 
 /// Everyone who shares a channel with one user, each counted once: the
@@ -2131,10 +2295,17 @@ pub type ChannelCommand = ChannelRequest<ChannelCommandOperation>;
 /// Closed channel-command operations.
 #[derive(Debug, Clone)]
 pub enum ChannelCommandOperation {
-    Knock,
+    /// `user_throttled`: the knocker's own knock delay has not run out, as its
+    /// session knows; the owner reports it only after the checks Solanum makes
+    /// first.
+    Knock {
+        user_throttled: bool,
+    },
     Invite(ChannelInvitee),
     ChanServRegister,
-    ChanServOp { target_nick: String },
+    ChanServOp {
+        target_nick: String,
+    },
     Names,
     Who(ChannelWhoQuery),
     History(ChannelHistoryRequest),
@@ -2330,12 +2501,31 @@ pub enum ChannelHistoryResult {
 
 #[derive(Debug)]
 pub enum ChannelKnockResult {
-    KnockDelivered { display: String },
-    NoSuchChannel { target: String },
-    Hidden { target: String, proof: Hidden },
-    AlreadyOnChannel { display: String },
-    ChannelOpen { display: String },
-    CannotSend { display: String },
+    KnockDelivered {
+        display: String,
+    },
+    NoSuchChannel {
+        target: String,
+    },
+    Hidden {
+        target: String,
+        proof: Hidden,
+    },
+    AlreadyOnChannel {
+        display: String,
+    },
+    ChannelOpen {
+        display: String,
+    },
+    CannotSend {
+        display: String,
+    },
+    /// Inside the knock delay; `scope` is `user` or `channel`, as Solanum's
+    /// ERR_TOOMANYKNOCK names it.
+    TooManyKnocks {
+        display: String,
+        scope: &'static str,
+    },
 }
 
 #[derive(Debug)]
@@ -2630,9 +2820,20 @@ pub enum ChannelMessageResult {
     },
     CannotSend {
         target: String,
-        no_ctcp: bool,
+        why: SpeakRefusal,
         loud: bool,
     },
+}
+
+/// Why a channel refused a message (PRIVMSG/NOTICE, multiline, TAGMSG).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeakRefusal {
+    /// Banned, quieted, `+m` without voice, or `+n` from outside.
+    CannotSend,
+    /// A CTCP other than ACTION into a `+C` channel.
+    NoCtcp,
+    /// A STATUSMSG (`@#c`/`+#c`) from a sender without op or voice there.
+    NotPrivileged,
 }
 
 /// A completed channel multiline message.
@@ -2677,7 +2878,7 @@ pub enum ChannelMultilineResult {
     },
     CannotSend {
         target: String,
-        no_ctcp: bool,
+        why: SpeakRefusal,
         loud: bool,
         label: Option<String>,
     },
@@ -2691,7 +2892,7 @@ pub type ChannelTagmsg = ChannelRequest<String>;
 pub enum ChannelTagmsgResult {
     Delivered { echo: Option<Bytes> },
     NoSuchChannel { target: String },
-    CannotSend { target: String },
+    CannotSend { target: String, why: SpeakRefusal },
 }
 
 impl ChannelQuit {
@@ -2720,11 +2921,48 @@ pub(crate) struct ChanModes {
     pub secret: bool,
     /// +C: block CTCP (except ACTION).
     pub no_ctcp: bool,
+    /// +g: free invite — any member may INVITE, not only an operator.
+    pub free_invite: bool,
     pub key: Option<String>,
     pub limit: Option<u32>,
 }
 
 impl ChanModes {
+    /// The flag (ISUPPORT `CHANMODES` type D) modes, in the order a mode string
+    /// renders them. The one table: `CHANMODES`, RPL_MYINFO, the MODE apply
+    /// loop and MLOCK all read it, and [`Self::flag`] / [`Self::flag_mut`] know
+    /// exactly these (a unit test pins that).
+    pub(crate) const FLAGS: &'static str = "gimnstC";
+
+    /// A flag mode's current value by its mode char; `None` for a char that is
+    /// not a flag.
+    pub(crate) fn flag(&self, c: char) -> Option<bool> {
+        Some(match c {
+            'g' => self.free_invite,
+            'i' => self.invite_only,
+            'm' => self.moderated,
+            'n' => self.no_external,
+            's' => self.secret,
+            't' => self.topic_ops_only,
+            'C' => self.no_ctcp,
+            _ => return None,
+        })
+    }
+
+    /// The flag mode `c` itself, to set; `None` for a char that is not a flag.
+    pub(crate) fn flag_mut(&mut self, c: char) -> Option<&mut bool> {
+        Some(match c {
+            'g' => &mut self.free_invite,
+            'i' => &mut self.invite_only,
+            'm' => &mut self.moderated,
+            'n' => &mut self.no_external,
+            's' => &mut self.secret,
+            't' => &mut self.topic_ops_only,
+            'C' => &mut self.no_ctcp,
+            _ => return None,
+        })
+    }
+
     /// `+nt`-style string with key/limit args appended. `reveal_key` gates
     /// the `+k` argument: only channel members may see the key, so that
     /// `MODE #chan` from an outsider cannot disclose it and bypass `+k`.
@@ -2732,15 +2970,8 @@ impl ChanModes {
     pub fn to_string_with_args(&self, reveal_key: bool) -> String {
         let mut modes = String::from("+");
         let mut args = String::new();
-        for (set, c) in [
-            (self.invite_only, 'i'),
-            (self.moderated, 'm'),
-            (self.no_external, 'n'),
-            (self.secret, 's'),
-            (self.topic_ops_only, 't'),
-            (self.no_ctcp, 'C'),
-        ] {
-            if set {
+        for c in Self::FLAGS.chars() {
+            if self.flag(c) == Some(true) {
                 modes.push(c);
             }
         }
@@ -2769,9 +3000,10 @@ pub(crate) struct MlockModes {
 }
 
 impl MlockModes {
-    /// Boolean channel modes that MLOCK can lock (args-carrying modes like
-    /// `k`/`l` and list modes are deliberately out of scope).
-    pub const LOCKABLE: &'static [char] = &['i', 'm', 'n', 's', 't', 'C'];
+    /// Boolean channel modes that MLOCK can lock: every flag mode
+    /// ([`ChanModes::FLAGS`]); args-carrying modes like `k`/`l` and list modes
+    /// are deliberately out of scope.
+    pub const LOCKABLE: &'static str = ChanModes::FLAGS;
 
     /// Parse a spec like `+nt-i`. `Err(bad_char)` for any character that is
     /// neither a sign nor a lockable boolean mode. A mode named twice keeps
@@ -2783,7 +3015,7 @@ impl MlockModes {
             match c {
                 '+' => adding = true,
                 '-' => adding = false,
-                c if Self::LOCKABLE.contains(&c) => {
+                c if Self::LOCKABLE.contains(c) => {
                     m.on.retain(|x| x != c);
                     m.off.retain(|x| x != c);
                     if adding {
@@ -2797,13 +3029,11 @@ impl MlockModes {
         }
         // Render equal policies identically regardless of input order.
         m.on = Self::LOCKABLE
-            .iter()
-            .copied()
+            .chars()
             .filter(|mode| m.on.contains(*mode))
             .collect();
         m.off = Self::LOCKABLE
-            .iter()
-            .copied()
+            .chars()
             .filter(|mode| m.off.contains(*mode))
             .collect();
         Ok(m)
@@ -2854,9 +3084,6 @@ pub struct HistoryEntry {
     pub multiline: Option<String>,
 }
 
-/// Ring capacity per target; older entries live only in PostgreSQL.
-pub(crate) const HISTORY_RING_CAP: usize = 500;
-
 /// The storage key and participants for the direct-message conversation between
 /// two identities, from already-casefolded inputs.
 ///
@@ -2890,6 +3117,32 @@ pub struct HistoryKey(String);
 impl HistoryKey {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The two identities of a conversation key (`lo`, `hi`; equal for a
+    /// conversation with oneself), or `None` for a channel's. The one place a
+    /// key is taken apart: a channel name may itself contain `!`, but it starts
+    /// with `#`, which no identity does.
+    pub(crate) fn participants(&self) -> Option<(&str, &str)> {
+        if self.0.starts_with('#') {
+            return None;
+        }
+        self.0.split_once('!')
+    }
+
+    /// The channel this key is the history of, if it is a channel's.
+    fn channel(&self) -> Option<ChanKey> {
+        self.0.starts_with('#').then(|| ChanKey(self.0.clone()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn channel_for_test(name: &str) -> Self {
+        HistoryKey(name.to_string())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn conversation_for_test(a: &str, b: &str) -> Self {
+        HistoryKey(dm_conversation_key(a, b).0)
     }
 }
 
@@ -2926,15 +3179,6 @@ pub(crate) struct MultilineBatch {
     pub kind: Option<crate::core::MessageKind>,
 }
 
-/// One target's newest-last hot history.
-pub(crate) struct HistoryRing {
-    pub entries: std::collections::VecDeque<HistoryEntry>,
-    /// True while the ring holds *every* message this target has ever seen
-    /// (never overflowed, never evicted). When false, older history lives
-    /// only in Postgres and CHATHISTORY must fall back.
-    pub complete: bool,
-}
-
 #[derive(Debug, Clone)]
 pub struct Topic {
     pub text: String,
@@ -2950,9 +3194,11 @@ pub struct Topic {
 /// the storage, matching, and enforcement are otherwise identical.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BanKind {
-    /// `user@host` glob (KLINE).
+    /// `user@host` glob (KLINE); an address or CIDR host matches the real
+    /// address, and a glob host is tried against both the shown host and it.
     Kline,
-    /// bare host / IP glob (DLINE).
+    /// An address, a CIDR range, or an address glob (DLINE), matched against
+    /// the connection's real address only.
     Dline,
     /// realname (gecos) glob (XLINE).
     Xline,
@@ -2998,9 +3244,57 @@ impl BanKind {
 #[derive(Clone)]
 pub struct ServerBan {
     pub mask: MaskKey,
+    /// `public|private`: what follows the first `|` is the operators' note,
+    /// never shown to the banned user or their peers (Solanum's oper reason).
     pub reason: String,
     pub set_by: String,
     pub kind: BanKind,
+}
+
+/// The part of a server-ban `reason` the banned user and their peers are
+/// shown: everything before the first `|` (Solanum's user/oper reason split).
+/// The whole reason stays in the operator listing and the audit trail.
+pub(crate) fn public_ban_reason(reason: &str) -> &str {
+    reason
+        .split_once('|')
+        .map_or(reason, |(public, _)| public)
+        .trim_end()
+}
+
+/// What a server ban is tested against: one connection, as a K-line, D-line
+/// or X-line sees it.
+pub(crate) struct ServerBanSubject<'a> {
+    pub(crate) user: &'a str,
+    pub(crate) host: &'a str,
+    pub(crate) real_ip: Option<std::net::IpAddr>,
+    pub(crate) realname: &'a str,
+}
+
+impl ServerBan {
+    /// Whether this ban matches `subject`. A K-line is a `user@host` mask whose
+    /// host may be an address or CIDR range (matched against the real
+    /// address) or a glob (tried against the shown host and the address); a
+    /// D-line is matched against the real address alone, so a cloak is no way
+    /// out of either; an X-line is a glob over the realname.
+    pub(crate) fn matches(&self, casemap: CaseMapping, subject: &ServerBanSubject<'_>) -> bool {
+        match self.kind {
+            BanKind::Kline => {
+                let shown = format!("{}@{}", subject.user, subject.host);
+                self.mask
+                    .matches(casemap, &MaskSubject::new(&shown, subject.real_ip, None))
+            }
+            BanKind::Dline => subject.real_ip.is_some_and(|address| {
+                let address_text = address.to_string();
+                self.mask.matches(
+                    casemap,
+                    &MaskSubject::new(&address_text, Some(address), None),
+                )
+            }),
+            BanKind::Xline => {
+                e6irc_proto::mask::matches(casemap, self.mask.as_str(), subject.realname)
+            }
+        }
+    }
 }
 
 pub(crate) struct Channel {
@@ -3015,13 +3309,18 @@ pub(crate) struct Channel {
     pub ban_exceptions: Vec<MaskKey>,
     pub invite_exceptions: Vec<MaskKey>,
     /// Connections holding a pending INVITE into this channel (consumed on
-    /// join). Recorded only while the channel is `+i`, when only an operator
-    /// may invite. Lives on the channel — not the invitee's session — so channel
+    /// join), which admits past `+i` and `+l`. Recorded only while the channel
+    /// has one of those, from an operator or, on a `+g` channel, any member.
+    /// Lives on the channel — not the invitee's session — so channel
     /// teardown revokes it: an invite is a grant by an op of *this* channel
     /// incarnation, and a session-side set keyed by name would let it
     /// authorize entry into an unrelated later channel reusing the name
     /// (a +i bypass). Bounded by `INVITE_LIMIT` per channel.
     pub invited: HashSet<ConnId>,
+    /// When the last KNOCK on this channel was delivered, on the monotonic
+    /// clock: a channel takes one per `KNOCK_DELAY_CHANNEL` (Solanum's
+    /// `knock_delay_channel`), so a crowd cannot flood its operators.
+    pub last_knock: Option<e6irc_proto::time::MonoMillis>,
     /// When this incarnation of the channel was created, on the same
     /// millisecond clock that stamps its messages: RPL_CREATIONTIME reports it
     /// in whole seconds, and it is the oldest history a reader without a
@@ -3060,6 +3359,7 @@ impl Channel {
             ban_exceptions: Vec::new(),
             invite_exceptions: Vec::new(),
             invited: HashSet::new(),
+            last_knock: None,
             created_at,
         }
     }
@@ -3252,29 +3552,32 @@ impl Channel {
         (self.modes.secret && !self.is_member(conn)).then_some(Hidden(()))
     }
 
-    fn any_match(casemap: CaseMapping, masks: &[MaskKey], subject: &str) -> bool {
-        masks
-            .iter()
-            .any(|m| e6irc_proto::mask::matches(casemap, m.as_str(), subject))
+    fn any_match(casemap: CaseMapping, masks: &[MaskKey], subject: &MaskSubject<'_>) -> bool {
+        masks.iter().any(|m| m.matches(casemap, subject))
     }
 
-    pub fn is_banned(&self, casemap: CaseMapping, prefix: &str) -> bool {
-        Self::any_match(casemap, &self.bans, prefix)
-            && !Self::any_match(casemap, &self.ban_exceptions, prefix)
+    pub(crate) fn is_banned(&self, casemap: CaseMapping, subject: &MaskSubject<'_>) -> bool {
+        Self::any_match(casemap, &self.bans, subject)
+            && !Self::any_match(casemap, &self.ban_exceptions, subject)
     }
 
     /// Quiets share the ban-exception machinery (Solanum semantics).
-    pub fn is_quieted(&self, casemap: CaseMapping, prefix: &str) -> bool {
-        Self::any_match(casemap, &self.quiets, prefix)
-            && !Self::any_match(casemap, &self.ban_exceptions, prefix)
+    pub(crate) fn is_quieted(&self, casemap: CaseMapping, subject: &MaskSubject<'_>) -> bool {
+        Self::any_match(casemap, &self.quiets, subject)
+            && !Self::any_match(casemap, &self.ban_exceptions, subject)
     }
 
-    pub fn is_invite_excepted(&self, casemap: CaseMapping, prefix: &str) -> bool {
-        Self::any_match(casemap, &self.invite_exceptions, prefix)
+    pub(crate) fn is_invite_excepted(
+        &self,
+        casemap: CaseMapping,
+        subject: &MaskSubject<'_>,
+    ) -> bool {
+        Self::any_match(casemap, &self.invite_exceptions, subject)
     }
 
     /// Whether a sender with membership `member` (its `MemberModes`, or `None`
-    /// when off-channel) and hostmask `prefix` may send to this channel.
+    /// when off-channel) matched against the masks as `subject` may send to
+    /// this channel.
     ///
     /// The single gate for text (PRIVMSG/NOTICE) and tags (TAGMSG) alike: a
     /// client that cannot speak must not be able to relay typing/reaction tags
@@ -3283,26 +3586,27 @@ impl Channel {
     /// or off-channel sender is subject to +m, bans and quiets, and an
     /// off-channel one additionally to +n. STATUSMSG/CTCP are checked by the
     /// caller — they are message-shape concerns, not membership ones.
-    pub fn may_speak(
+    pub(crate) fn may_speak(
         &self,
         member: Option<&MemberModes>,
         casemap: CaseMapping,
-        prefix: &str,
+        subject: &MaskSubject<'_>,
     ) -> bool {
         match member {
             Some(m) if m.op || m.voice => true,
-            Some(_) => {
-                !self.modes.moderated
-                    && !self.is_banned(casemap, prefix)
-                    && !self.is_quieted(casemap, prefix)
-            }
+            Some(_) => !self.modes.moderated && !self.is_silenced(casemap, subject),
             None => {
                 !self.modes.no_external
                     && !self.modes.moderated
-                    && !self.is_banned(casemap, prefix)
-                    && !self.is_quieted(casemap, prefix)
+                    && !self.is_silenced(casemap, subject)
             }
         }
+    }
+
+    /// Banned or quieted (and not excepted): the ban/quiet half of
+    /// [`Channel::may_speak`], without `+m`/`+n`.
+    pub(crate) fn is_silenced(&self, casemap: CaseMapping, subject: &MaskSubject<'_>) -> bool {
+        self.is_banned(casemap, subject) || self.is_quieted(casemap, subject)
     }
 }
 
@@ -3355,6 +3659,11 @@ pub(crate) struct ChannelDirectory {
     /// [`ChannelDirectory::take_touched`]: the only ones whose published
     /// description can have changed.
     touched: Vec<ChanKey>,
+    /// Channels whose history ring changed since the last
+    /// [`ChannelDirectory::take_activity_touched`]: only their newest-message
+    /// time can have changed, which is republished alone — a message must not
+    /// cost rebuilding the channel's whole published record.
+    activity_touched: Vec<ChanKey>,
 }
 
 impl ChannelDirectory {
@@ -3363,6 +3672,7 @@ impl ChannelDirectory {
             shards,
             channels: HashMap::new(),
             touched: Vec::new(),
+            activity_touched: Vec::new(),
         }
     }
 
@@ -3386,17 +3696,18 @@ impl ChannelDirectory {
         self.channels.get_mut(key)
     }
 
-    /// Something published about `key` changed without the channel itself
-    /// being borrowed mutably (its history ring, which is kept beside it).
-    fn touch(&mut self, key: ChanKey) {
-        self.touched.push(key);
+    /// `key`'s history ring, which is kept beside the channel, changed: its
+    /// newest-message time may have too.
+    fn touch_activity(&mut self, key: ChanKey) {
+        self.activity_touched.push(key);
     }
 
     fn take_touched(&mut self) -> Vec<ChanKey> {
-        let mut touched = std::mem::take(&mut self.touched);
-        touched.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
-        touched.dedup();
-        touched
+        sorted_unique(std::mem::take(&mut self.touched))
+    }
+
+    fn take_activity_touched(&mut self) -> Vec<ChanKey> {
+        sorted_unique(std::mem::take(&mut self.activity_touched))
     }
 
     pub(crate) fn contains_key(&self, key: &ChanKey) -> bool {
@@ -3423,6 +3734,12 @@ impl ChannelDirectory {
     pub(crate) fn iter(&self) -> std::collections::hash_map::Iter<'_, ChanKey, Channel> {
         self.channels.iter()
     }
+}
+
+fn sorted_unique(mut keys: Vec<ChanKey>) -> Vec<ChanKey> {
+    keys.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    keys.dedup();
+    keys
 }
 
 impl Index<&ChanKey> for ChannelDirectory {
@@ -3527,12 +3844,9 @@ pub(crate) struct ServerState {
     census: Census,
     /// What this shard last added to the [`Census`]: connections, channels.
     census_reported: (usize, usize),
-    /// Hot history rings, keyed by channel or direct-message conversation.
-    /// Channels and conversations share one store, one LRU and one cap, so
-    /// the ring, overflow and eviction rules cannot drift apart between them.
-    pub history: HashMap<HistoryKey, HistoryRing>,
-    /// Targets holding a hot history ring, most-recently-active first.
-    pub hot_history: std::collections::VecDeque<HistoryKey>,
+    /// Hot history rings, keyed by channel or direct-message conversation,
+    /// with their LRU order and conversation index ([`HotHistory`]).
+    pub(crate) history: HotHistory,
     /// When set, direct sends to this connection are captured instead
     /// of delivered — the labeled-response machinery frames them.
     pub capture: Option<Capture>,
@@ -3649,6 +3963,7 @@ impl ServerState {
         ChannelMemberProfile {
             user: session.user().expect("registered member").to_string(),
             host: session.host.clone(),
+            real_ip: session.real_ip,
             realname: session.realname().expect("registered member").to_string(),
             account: session.account.clone(),
             away: session.away.is_some(),
@@ -4072,8 +4387,9 @@ impl ServerState {
     /// changes a channel (a join, a part, a mode, a topic) already costs one,
     /// to tell those members.
     pub(crate) fn publish_changed_channels(&mut self) {
-        for key in self.channels.take_touched() {
-            let published = self.channels.get(&key).map(|channel| PublicChannel {
+        let touched = self.channels.take_touched();
+        for key in &touched {
+            let published = self.channels.get(key).map(|channel| PublicChannel {
                 name: channel.name.clone(),
                 secret: channel.modes.secret,
                 ranks: channel
@@ -4081,10 +4397,7 @@ impl ServerState {
                     .filter(|(_, modes)| modes.op || modes.voice)
                     .map(|(conn, modes)| (conn, modes.clone()))
                     .collect(),
-                latest_message: self
-                    .history
-                    .get(&HistoryKey::from(&key))
-                    .and_then(|ring| ring.entries.iter().map(|entry| entry.ts).max()),
+                latest_message: self.latest_channel_message(key),
                 created_at: channel.created_at,
                 silencing: SilencingMasks {
                     bans: channel.bans.clone(),
@@ -4092,8 +4405,31 @@ impl ServerState {
                     exceptions: channel.ban_exceptions.clone(),
                 },
             });
-            self.memberships.publish_channel(&key, published);
+            self.memberships.publish_channel(key, published);
         }
+        // A channel whose only change is its ring — a message — republishes
+        // just its newest-message time. One also touched above was published
+        // whole, and one that no longer exists was withdrawn there.
+        for key in self.channels.take_activity_touched() {
+            if touched
+                .binary_search_by(|k| k.as_str().cmp(key.as_str()))
+                .is_ok()
+                || !self.channels.contains_key(&key)
+            {
+                continue;
+            }
+            let latest = self.latest_channel_message(&key);
+            let published = self.memberships.publish_latest_message(&key, latest);
+            assert!(
+                published,
+                "a live channel's record is published by the event that created it"
+            );
+        }
+    }
+
+    /// The newest message time in channel `key`'s ring, if it holds one.
+    fn latest_channel_message(&self, key: &ChanKey) -> Option<e6irc_proto::time::Millis> {
+        self.history.get(&HistoryKey::from(key))?.latest()
     }
 
     /// Bring the rest of the server up to date with every session this event
@@ -4120,11 +4456,19 @@ impl ServerState {
         }
     }
 
-    /// The session's channels, grouped by the shard that owns them.
+    /// The session's channels, grouped by the shard that owns them — with the
+    /// JOINs still on their way to another shard. A change made while a JOIN
+    /// is in flight (a NICK, AWAY, SETNAME, a host change) must reach that
+    /// channel too: the owner admits the member from the snapshot the JOIN
+    /// carried, and the owner's queue is FIFO, so an update sent after the JOIN
+    /// arrives after it and corrects the member it created. Sending it only to
+    /// joined channels left the channel holding the old nick or host for good.
+    /// An owner that refused the JOIN finds no member and ignores the update.
     fn session_channels_by_shard(&self, conn: ConnId) -> Vec<ShardChannels> {
         let mut by_shard: std::collections::BTreeMap<usize, Vec<ChannelOwner>> =
             std::collections::BTreeMap::new();
-        for key in &self.sessions[&conn].channels {
+        let session = &self.sessions[&conn];
+        for key in session.channels.iter().chain(&session.pending_joins) {
             let owner = self.channels.owner(key);
             by_shard.entry(owner.shard().0).or_default().push(owner);
         }
@@ -4250,7 +4594,11 @@ impl ServerState {
         assert_eq!(report.shard(), self.shard, "user event reached wrong shard");
         let mut peers = Peers::of(report.event.subject);
         for key in report.channels.keys() {
-            if let Some(channel) = self.channels.get(key) {
+            // Only a channel the subject is in shares it with anyone: the
+            // report may name one whose JOIN was in flight and then refused.
+            if let Some(channel) = self.channels.get(key)
+                && channel.is_member(report.event.subject)
+            {
                 peers.extend_channel(channel, &report.event, &self.config.server_name);
             }
         }
@@ -4434,8 +4782,7 @@ impl ServerState {
             whowas: directories.whowas,
             census: directories.census,
             census_reported: (0, 0),
-            history: HashMap::new(),
-            hot_history: std::collections::VecDeque::new(),
+            history: HotHistory::default(),
             emitting_deferred: None,
             capture: None,
             registration_buckets: HashMap::new(),
@@ -4514,39 +4861,22 @@ impl ServerState {
     /// alike — the eviction discipline that bounds hot-history RAM must not
     /// differ by target kind.
     pub fn push_history(&mut self, key: &HistoryKey, entry: HistoryEntry) {
-        {
-            // A ring being created now is the *entire* record only when no
-            // database backs it. With a DB this target may have rows in
-            // `messages` already — an earlier incarnation of the channel
-            // (they are dropped when they empty), or an earlier stretch of
-            // the same conversation — so the ring is not authoritative and
-            // CHATHISTORY must be able to fall back rather than report an
-            // empty batch. One rule for channels and conversations alike.
-            let whole_record = !self.config.sasl_enabled;
-            let ring = self
-                .history
-                .entry(key.clone())
-                .or_insert_with(|| HistoryRing {
-                    entries: std::collections::VecDeque::new(),
-                    complete: whole_record,
-                });
-            if ring.entries.len() == HISTORY_RING_CAP {
-                ring.entries.pop_front();
-                ring.complete = false;
-            }
-            ring.entries.push_back(entry);
-        }
+        // A ring being created now is the *entire* record only when no
+        // database backs it. With a DB this target may have rows in
+        // `messages` already — an earlier incarnation of the channel (they
+        // are dropped when they empty), or an earlier stretch of the same
+        // conversation — so the ring is not authoritative and CHATHISTORY
+        // must be able to fall back rather than report an empty batch. One
+        // rule for channels and conversations alike.
+        let whole_record = !self.config.sasl_enabled;
+        // Evicted targets keep no ring at all; their history is served from
+        // Postgres.
+        let evicted = self
+            .history
+            .push(key, entry, whole_record, self.config.max_hot_channels);
         self.channel_ring_changed(key);
-        // Move to MRU.
-        self.hot_history.retain(|k| k != key);
-        self.hot_history.push_front(key.clone());
-        // Evict cold rings beyond the cap. An evicted target keeps no ring at
-        // all; its history is served from Postgres.
-        while self.hot_history.len() > self.config.max_hot_channels {
-            if let Some(cold) = self.hot_history.pop_back() {
-                self.history.remove(&cold);
-                self.channel_ring_changed(&cold);
-            }
+        for cold in evicted {
+            self.channel_ring_changed(&cold);
         }
     }
 
@@ -4554,7 +4884,7 @@ impl ServerState {
     /// created or was evicted — an absent ring is never "the whole record".
     pub fn history_ring(&self, key: &HistoryKey) -> (Vec<HistoryEntry>, bool) {
         match self.history.get(key) {
-            Some(ring) => (ring.entries.iter().cloned().collect(), ring.complete),
+            Some(ring) => (ring.entries().iter().cloned().collect(), ring.complete()),
             None => (Vec::new(), false),
         }
     }
@@ -4563,20 +4893,16 @@ impl ServerState {
     /// delivered but could not be persisted, so a gap exists that only
     /// Postgres could fill — and it does not have it either).
     pub fn mark_history_incomplete(&mut self, key: &HistoryKey) {
-        if let Some(ring) = self.history.get_mut(key) {
-            ring.complete = false;
-        }
+        self.history.mark_incomplete(key);
     }
 
-    /// Destroy an emptied channel: drop it from `channels` and its LRU slot in
-    /// `hot_channels` together, so the two can't desync — a stale `hot_channels`
-    /// key would otherwise inflate the length and evict a still-live channel's
-    /// ring early under the `max_hot_channels` cap.
+    /// Destroy an emptied channel: drop it from `channels` and its ring (with
+    /// its LRU slot) together, so the two can't desync — a stale LRU key would
+    /// otherwise inflate the count and evict a still-live channel's ring early
+    /// under the `max_hot_channels` cap.
     pub fn remove_channel(&mut self, key: &ChanKey) {
         self.channels.remove(key);
-        let hist = HistoryKey::from(key);
-        self.history.remove(&hist);
-        self.hot_history.retain(|k| k != &hist);
+        self.history.remove(&HistoryKey::from(key));
     }
 
     /// Record a nick's details into the WHOWAS ring (on quit/nick change).
@@ -4620,7 +4946,7 @@ impl ServerState {
     pub(crate) fn census(&self) -> (usize, usize, usize) {
         use std::sync::atomic::Ordering::Relaxed;
         let (connections, channels) = self.census_reported;
-        let users = self.users.len();
+        let users = self.users.counts().users;
         (
             self.census
                 .connections
@@ -4957,7 +5283,21 @@ impl ServerState {
     /// Drop every confirmed mirror entry of a permanently deleted `account`:
     /// its rows cascaded away with the account. A write still in flight keeps
     /// its slot until its reply releases it, as in [`Self::expire_read_markers`].
-    pub(crate) fn forget_account_read_markers(&mut self, account: &str) {
+    /// `account` was permanently deleted: drop everything this shard mirrors
+    /// of the rows its deletion removed — its read markers, the history lines
+    /// it sent and the conversations it took part in (the database purge took
+    /// both), and its channel access entries (cascaded). Its suspension stays:
+    /// that is the live authentication gate for the retired name.
+    pub(crate) fn forget_deleted_account(&mut self, account: &str) {
+        self.forget_account_read_markers(account);
+        let key = self.account_key(account);
+        for changed in self.history.forget_account(key.as_str(), self.casemap) {
+            self.channel_ring_changed(&changed);
+        }
+        self.channel_options.remove_account(&key);
+    }
+
+    fn forget_account_read_markers(&mut self, account: &str) {
         let account = self.account_key(account);
         self.deleted_accounts.insert(account.clone());
         let forgotten: Vec<(AccountKey, ChanKey)> = self
@@ -5004,24 +5344,12 @@ impl ServerState {
         Ok(())
     }
 
-    /// The subject a ban of `kind` is tested against, from a session's
-    /// `user` / `host` / `realname`.
-    pub fn ban_subject(kind: BanKind, user: &str, host: &str, realname: &str) -> String {
-        match kind {
-            BanKind::Kline => format!("{user}@{host}"),
-            BanKind::Dline => host.to_string(),
-            BanKind::Xline => realname.to_string(),
-        }
-    }
-
-    /// The `(kind, reason)` of the first server ban matching a session's
-    /// `user` / `host` / `realname`, if any.
-    pub fn ban_match(&self, user: &str, host: &str, realname: &str) -> Option<(BanKind, String)> {
-        self.server_bans.iter().find_map(|b| {
-            let subject = Self::ban_subject(b.kind, user, host, realname);
-            e6irc_proto::mask::matches(self.casemap, b.mask.as_str(), &subject)
-                .then(|| (b.kind, b.reason.clone()))
-        })
+    /// The `(kind, reason)` of the first server ban matching `subject`, if any.
+    pub(crate) fn ban_match(&self, subject: &ServerBanSubject<'_>) -> Option<(BanKind, String)> {
+        self.server_bans
+            .iter()
+            .find(|ban| ban.matches(self.casemap, subject))
+            .map(|ban| (ban.kind, ban.reason.clone()))
     }
 
     /// Key a nick for lookup/storage.
@@ -5050,6 +5378,12 @@ impl ServerState {
     /// Every registered user, on every shard.
     pub(crate) fn registered_users(&self) -> Vec<Arc<PublicUser>> {
         self.users.all()
+    }
+
+    /// How many registered users there are on every shard, and how many are
+    /// invisible or operators: counters, not a copy of the directory.
+    pub(crate) fn user_counts(&self) -> UserCounts {
+        self.users.counts()
     }
 
     /// A channel's display name and when its history ring last saw a message,
@@ -5093,8 +5427,8 @@ impl ServerState {
     /// The ring under `key` gained or lost entries. When it is a channel's,
     /// what this shard publishes about that channel is out of date.
     fn channel_ring_changed(&mut self, key: &HistoryKey) {
-        if key.as_str().starts_with('#') {
-            self.channels.touch(ChanKey(key.as_str().to_string()));
+        if let Some(channel) = key.channel() {
+            self.channels.touch_activity(channel);
         }
     }
 
@@ -5107,8 +5441,10 @@ impl ServerState {
     /// quieted under its current hostmask — see
     /// [`MembershipDirectory::silenced_in`].
     pub(crate) fn silenced_in(&self, conn: ConnId) -> Option<String> {
-        let prefix = self.sessions[&conn].prefix();
-        self.memberships.silenced_in(conn, self.casemap, &prefix)
+        let session = &self.sessions[&conn];
+        let prefix = session.prefix();
+        let subject = session.mask_subject(&prefix);
+        self.memberships.silenced_in(conn, self.casemap, &subject)
     }
 
     /// Where `conn`'s session lives, whether or not it is this shard.
@@ -5154,7 +5490,7 @@ impl ServerState {
             Some(nick) => self.display_nick(nick),
             None => self
                 .users
-                .logged_in_as(identity, self.casemap)
+                .logged_in_as(identity)
                 .map(|user| user.nick.clone())
                 .unwrap_or_else(|| identity.to_string()),
         }
@@ -5226,6 +5562,10 @@ impl ServerState {
             Session {
                 output: SessionOutput::new(tx),
                 limit_key: crate::net::PeerLimitKey::for_session_host(&host),
+                real_ip: host
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+                    .map(|address| address.to_canonical()),
                 host,
                 transport,
                 reg: Registration::Registering {
@@ -5250,6 +5590,8 @@ impl ServerState {
                 bot: false,
                 channels: HashSet::new(),
                 pending_joins: HashSet::new(),
+                part_on_join: HashSet::new(),
+                last_knock: None,
                 monitoring: HashMap::new(),
                 multiline: None,
                 label_groups: HashMap::new(),
@@ -6101,23 +6443,10 @@ impl ServerState {
             .push(CoreEffect::BroadcastIdentityReleased { identity });
     }
 
-    /// Free this shard's direct-message rings of a released `~nick` identity.
+    /// Free this shard's direct-message rings of a released `~nick` identity:
+    /// a lookup of that identity's conversations, not a pass over every ring.
     pub(crate) fn forget_unauthenticated_identity(&mut self, identity: &str) {
-        self.history
-            .retain(|k, _| match k.as_str().split_once('!') {
-                // A DM key is `lo!hi` where each side is an identity
-                // (`~<foldednick>` for an unauthenticated peer); keep it only
-                // if neither side is the one that left. A channel name *can*
-                // legally contain `!` (sanitize::valid_channel_name allows it),
-                // so a channel key can also split here — but the key is
-                // casefolded and `~` folds to `^` under rfc1459, so a folded
-                // channel key never contains the `~`-prefixed identity and is
-                // thus always retained.
-                Some((lo, hi)) => lo != identity && hi != identity,
-                // No `!`: not a DM key, always kept.
-                None => true,
-            });
-        self.hot_history.retain(|k| self.history.contains_key(k));
+        self.history.forget_identity(identity);
     }
 
     /// Apply a registered session's departure on the channel-owning shard.
@@ -6787,7 +7116,7 @@ mod session_store_tests {
         // Deleting an account forgets its confirmed markers, keeps a write in
         // flight counted, and leaves every other account alone.
         state.reserve_read_marker(key(&state, "alice", "#x"));
-        state.forget_account_read_markers("ALICE");
+        state.forget_deleted_account("ALICE");
         check(&state, 1, 1);
         assert_eq!(state.read_marker(&key(&state, "alice", "#x")), None);
         assert_eq!(state.read_marker(&key(&state, "alice", "#y")), None);
@@ -6865,5 +7194,90 @@ mod session_store_tests {
         state.close(ConnId(2), "bye");
         check(&state);
         assert!(state.account_sessions.is_empty());
+    }
+
+    /// The user directory's account index and LUSERS counters equal a
+    /// recount of its records after every kind of change a published record
+    /// goes through: registration, login, account change, mode, operator
+    /// status, logout and departure.
+    #[test]
+    fn user_directory_indexes_equal_a_recount_after_every_change() {
+        let mut state = state();
+        let step = |state: &mut ServerState| {
+            state.publish_changed_sessions();
+            state.users.assert_consistent();
+        };
+        register(&mut state, ConnId(1), "alice");
+        register(&mut state, ConnId(2), "bob");
+        step(&mut state);
+        assert_eq!(state.user_counts().users, 2);
+        state.set_account(ConnId(1), "Alice".into());
+        step(&mut state);
+        assert_eq!(state.identity_nick("alice"), "alice");
+        state.set_account(ConnId(2), "carol".into());
+        step(&mut state);
+        assert_eq!(state.identity_nick("carol"), "bob");
+        state.set_account(ConnId(2), "ALICE".into());
+        step(&mut state);
+        assert_eq!(state.identity_nick("carol"), "carol", "no one is carol now");
+        crate::core::handler::dispatch(&mut state, ConnId(2), b"MODE bob +i");
+        state.sessions.get_mut(&ConnId(1)).expect("alice").oper = Some("god".into());
+        step(&mut state);
+        assert_eq!(
+            state.user_counts(),
+            UserCounts {
+                users: 2,
+                invisible: 1,
+                opers: 1,
+            }
+        );
+        state.clear_account(ConnId(1));
+        step(&mut state);
+        assert_eq!(state.identity_nick("alice"), "bob");
+        state.close(ConnId(2), "bye");
+        step(&mut state);
+        assert_eq!(
+            state.identity_nick("alice"),
+            "alice",
+            "offline: the identity"
+        );
+        assert_eq!(
+            state.user_counts(),
+            UserCounts {
+                users: 1,
+                invisible: 0,
+                opers: 1,
+            }
+        );
+        state.close(ConnId(1), "bye");
+        step(&mut state);
+        assert_eq!(state.user_counts(), UserCounts::default());
+    }
+
+    /// A channel message changes only the channel's newest-message time, and
+    /// only that is republished: the message leaves the channel's whole record
+    /// untouched, and the published time is the ring's newest.
+    #[test]
+    fn a_message_republishes_only_the_channels_latest_message() {
+        let mut state = state();
+        register(&mut state, ConnId(1), "alice");
+        crate::core::handler::dispatch(&mut state, ConnId(1), b"JOIN #c");
+        state.publish_changed_channels();
+        let key = state.chan_key("#c");
+        assert_eq!(state.channel_activity(&key), None, "no message yet");
+        crate::core::handler::dispatch(&mut state, ConnId(1), b"PRIVMSG #c :hi");
+        assert!(
+            state.channels.touched.is_empty(),
+            "a message must not mark the channel's whole record stale"
+        );
+        assert_eq!(state.channels.activity_touched, vec![key.clone()]);
+        state.publish_changed_channels();
+        let latest = state
+            .history
+            .get(&HistoryKey::from(&key))
+            .and_then(crate::core::hot_history::HistoryRing::latest);
+        assert!(latest.is_some());
+        assert_eq!(state.channel_activity(&key).map(|(_, ts)| ts), latest);
+        state.history.assert_consistent();
     }
 }
