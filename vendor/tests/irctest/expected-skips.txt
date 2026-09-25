@@ -1,0 +1,43 @@
+# Every test the DB-less green list (run.sh) skips, as the JUnit report names
+# it, under the reason it skips. check_skips.py fails the run on a skip missing
+# here and on an entry here that no longer skips. A new entry needs its reason.
+
+# e6ircd has no server password: who a client is comes from SASL, so the
+# controller refuses a PASS-configured server.
+irctest.server_tests.connection_registration.PasswordedConnectionRegistrationTestCase::testNoPassword
+irctest.server_tests.connection_registration.PasswordedConnectionRegistrationTestCase::testPassBeforeNickuser
+irctest.server_tests.connection_registration.PasswordedConnectionRegistrationTestCase::testWrongPassword
+
+# A bare INVITE is ERR_NEEDMOREPARAMS, as on Solanum and Libera: there is no
+# list of one's pending invitations.
+irctest.server_tests.invite.InviteTestCase::testInviteList
+
+# The controller states no ISUPPORT values for irctest to compare; the 005
+# burst is held to the vendored Libera snapshot by tests/libera_compat.rs.
+irctest.server_tests.isupport.IsupportTestCase::testValues
+
+# The controller cannot move the e6ircd process's clock (no faketime).
+irctest.server_tests.list.FaketimeListTestCase::testListCreationTime
+irctest.server_tests.list.FaketimeListTestCase::testListTopicTime
+
+# e6ircd advertises no ELIST token, so LIST takes no mask or user-count
+# filter (Libera advertises ELIST=CMNTU).
+irctest.server_tests.list.ListTestCase::testListMask
+irctest.server_tests.list.ListTestCase::testListNotMask
+irctest.server_tests.list.ListTestCase::testListUsers
+
+# NAMES takes one channel (TARGMAX NAMES:1, as on Libera).
+irctest.server_tests.names.NamesTestCase::testNamesMultipleChannels2812
+
+# Only channel operators and voiced members may send to @#chan / +#chan.
+irctest.server_tests.statusmsg.StatusmsgTestCase::testStatusmsgFromRegular
+
+# Every IRC line is UTF-8, over /ws/irc as over TCP.
+irctest.server_tests.websocket.WebsocketTestCase::testReceiveNonUtf8Text
+irctest.server_tests.websocket.WebsocketTestCase::testSendNonUtf8Text
+
+# irctest itself marks these skipped ("Not consistently implemented").
+irctest.server_tests.who.WhoTestCase::testWhoRealNameSpaces
+irctest.server_tests.who.WhoTestCase::testWhoUsernameRealName[hostname]
+irctest.server_tests.who.WhoTestCase::testWhoUsernameRealName[realname-mask]
+irctest.server_tests.who.WhoTestCase::testWhoUsernameRealName[username]

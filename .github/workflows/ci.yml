@@ -64,6 +64,7 @@ jobs:
       - run: tools/test-check-no-defer.sh
       - run: tools/test-check-dead-pub.sh
       - run: tools/test-check-locked-builds.sh
+      - run: python3 vendor/tests/irctest/test_check_skips.py
       # fuzz/Cargo.lock resolves on its own; keep it on the workspace's versions,
       # and current for fuzz/Cargo.toml (`cargo fuzz` has no `--locked`, and
       # would re-resolve a stale lock without a word).
@@ -483,7 +484,7 @@ jobs:
   # Protocol conformance against the pinned irctest suite (vendored
   # hookup in vendor/tests/irctest/) with the standard irctest marker
   # filter. Grow the file list as surface lands; removing a file needs a
-  # written reason.
+  # written reason. run.sh holds the skipped tests to expected-skips.txt.
   irctest:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -561,6 +562,7 @@ jobs:
           PYTHONPATH="$GITHUB_WORKSPACE/vendor/tests/irctest" \
           E6IRC_IRCTEST_DB="postgres://postgres:test@127.0.0.1:5432/irctest" \
           pytest --controller=e6ircd_controller --timeout=20 \
+            -rs --junitxml=irctest-services.xml \
             -m 'not implementation-specific and not deprecated and not strict' \
             `# irctest registers accounts over a normal PRIVMSG, so a 592-byte` \
             `# password cannot fit the 512-byte line limit; e6ircd correctly` \
@@ -586,6 +588,12 @@ jobs:
             irctest/server_tests/read_marker.py \
             irctest/server_tests/who.py \
             irctest/server_tests/whois.py
+      # irctest skips what a server does not advertise, so a lost capability
+      # would otherwise stay green: every skip is listed, with its reason.
+      - name: Hold the skipped tests to the committed list
+        run: |
+          python vendor/tests/irctest/check_skips.py ../irctest/irctest-services.xml \
+            vendor/tests/irctest/expected-skips-services.txt
 
   # Matrix bridge (feature-gated) against a pinned Conduit homeserver.
   # Conduit v0.9.0 needs a config file, so it is started with docker run
