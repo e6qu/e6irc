@@ -19,6 +19,14 @@ The BNC requires a negotiated `sasl` capability before it accepts
 `AUTHENTICATE`. A capability request is atomic. `CAP LIST` reports enabled
 capabilities, not the offered list.
 
+CHATHISTORY replays a message with the client-only tags it was delivered with
+(`+draft/reply`, `+draft/react`, …) and replays reactions and other `TAGMSG`s,
+to a client that negotiated `message-tags` — on the server and, from the raw
+lines it stores, on the bouncer. A client without `message-tags` receives
+neither, and its pages count only the lines it can receive. Typing indicators
+(`+typing`, `+draft/typing`) are live only: they are never replayed. REST
+history serves text messages only.
+
 The CLI, the TUI and the web chat read which targets are channels and which
 names are the same from the network's `005`: `CHANTYPES` (default `#&`) and
 `CASEMAPPING` (default `rfc1459`). `rfc1459`, `rfc1459-strict` (or

@@ -5226,14 +5226,7 @@ impl DriverEnds {
         }
         match origin {
             None => self.publish_buffered(line),
-            Some(origin) => {
-                let mut buffer = self.buffer.lock().expect("buffer poisoned");
-                let seq = buffer.push(line.clone());
-                drop(self.events.send(DriverEvent::Echo {
-                    line: BufferedLine { seq, line },
-                    origin,
-                }));
-            }
+            Some(origin) => self.publish_echo(line, origin),
         }
         // The raw line was delivered, so the client believes in a membership
         // this session does not hold and will not restore. Say so to whoever is
@@ -5268,6 +5261,17 @@ impl DriverEnds {
 
     fn publish_buffered(&self, line: String) {
         let mut buffer = self.buffer.lock().expect("buffer poisoned");
+        // A typing indicator is a moment, not conversation: told live, at the
+        // ring's position, and never retained or stored (the persistence task
+        // stores `Line`s, not `Notice`s).
+        if crate::sanitize::is_ephemeral_tagmsg(&line) {
+            let seq = buffer.position();
+            drop(
+                self.events
+                    .send(DriverEvent::Notice(BufferedLine { seq, line })),
+            );
+            return;
+        }
         let seq = buffer.push(line.clone());
         // A detached network legitimately has no live subscribers; the line is
         // still retained in the buffer above. Keep the buffer lock through the
@@ -5277,6 +5281,22 @@ impl DriverEnds {
             self.events
                 .send(DriverEvent::Line(BufferedLine { seq, line })),
         );
+    }
+
+    /// Publish the echo of a line attachment `origin` sent: retained like any
+    /// line of the conversation, unless it is a typing indicator, which is
+    /// told live at the ring's position (and the persistence task skips).
+    fn publish_echo(&self, line: String, origin: u64) {
+        let mut buffer = self.buffer.lock().expect("buffer poisoned");
+        let seq = if crate::sanitize::is_ephemeral_tagmsg(&line) {
+            buffer.position()
+        } else {
+            buffer.push(line.clone())
+        };
+        drop(self.events.send(DriverEvent::Echo {
+            line: BufferedLine { seq, line },
+            origin,
+        }));
     }
 
     #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
@@ -5292,12 +5312,7 @@ impl DriverEnds {
     pub fn emit_echo(&self, line: String, origin: u64) {
         let line = ingest(line);
         self.runtime.record_input(line.len());
-        let mut buffer = self.buffer.lock().expect("buffer poisoned");
-        let seq = buffer.push(line.clone());
-        drop(self.events.send(DriverEvent::Echo {
-            line: BufferedLine { seq, line },
-            origin,
-        }));
+        self.publish_echo(line, origin);
     }
 
     /// Report a connection-state change, updating the sticky connection state
@@ -7252,6 +7267,34 @@ mod tests {
     }
 
     /// The live notice still reaches an attached client, at the ring position
+    /// A typing indicator is told live and kept out of the backlog, as the
+    /// core keeps it out of history; a reaction is conversation and retained.
+    /// The echo of a client's own typing indicator is not retained either.
+    #[tokio::test]
+    async fn a_typing_indicator_is_told_live_and_not_retained() {
+        let (handle, ends) = NetworkHandle::channels(8);
+        let mut events = handle.subscribe();
+        ends.emit_line("@+typing=active :peer TAGMSG #room".to_string());
+        ends.emit_line("@+draft/react=x;+draft/reply=m1 :peer TAGMSG #room".to_string());
+        ends.emit_echo("@+draft/typing=paused :me TAGMSG #room".to_string(), 1);
+        assert!(
+            matches!(events.recv().await.expect("typing"), DriverEvent::Notice(_)),
+            "told live, not retained"
+        );
+        assert!(matches!(
+            events.recv().await.expect("reaction"),
+            DriverEvent::Line(_)
+        ));
+        assert!(matches!(
+            events.recv().await.expect("echo"),
+            DriverEvent::Echo { .. }
+        ));
+        assert_eq!(
+            untimed(handle.buffer_snapshot()),
+            vec!["@+draft/react=x;+draft/reply=m1 :peer TAGMSG #room".to_string()]
+        );
+    }
+
     /// it was told at, so a replay cursor taken from it resumes correctly.
     #[tokio::test]
     async fn a_backlog_storage_failure_is_told_live_and_not_retained() {

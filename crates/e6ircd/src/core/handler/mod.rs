@@ -340,57 +340,46 @@ pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {
     }
     let server = state.config.server_name.clone();
     let Ok(text) = std::str::from_utf8(line) else {
-        state.send(conn, &invalid_utf8_fail(&server, line));
-        return;
+        let refusal = invalid_utf8_fail(&server, line);
+        return refuse_line(state, conn, line, |state| state.send(conn, &refusal));
     };
     if !e6irc_proto::message::client_frame_fits(text.as_bytes()) {
-        state.numeric(conn, ERR_INPUTTOOLONG, &[], Some("Input line was too long"));
-        return;
+        return refuse_line(state, conn, line, |state| {
+            state.numeric(conn, ERR_INPUTTOOLONG, &[], Some("Input line was too long"));
+        });
     }
     let msg = match Message::parse(text) {
         Ok(m) => m,
         Err(_) => {
-            state.send(
-                conn,
-                &format!(":{server} FAIL * INVALID_MESSAGE :Malformed line"),
-            );
-            return;
+            return refuse_line(state, conn, line, |state| {
+                state.send(
+                    conn,
+                    &format!(":{server} FAIL * INVALID_MESSAGE :Malformed line"),
+                );
+            });
         }
     };
 
     // labeled-response: capture direct replies and frame them under the
     // label. Only for clients that negotiated the cap and sent a label.
-    // Re-escape the label: the parser hands us the unescaped tag value, and
-    // it is echoed back into the tag section of every framed reply. Without
-    // re-escaping, a value like `a\s\nb` would inject a space/newline into the
-    // client's own stream and corrupt the labeled response.
-    let label = msg
-        .tag("label")
-        .and_then(|t| t.value.as_deref())
-        // labeled-response depends on batch. Capability negotiation order is
-        // unrestricted, so accepting the capability alone is fine; a label is
-        // actionable only once both capabilities are active.
-        .filter(|_| {
-            let caps = &state.sessions[&conn].caps;
-            caps.labeled_response && caps.batch
-        })
-        .map(e6irc_proto::message::escape_tag_value);
+    let label = response_label(
+        state,
+        conn,
+        msg.tag("label").and_then(|t| t.value.as_deref()),
+    );
     if let Some(label) = label {
-        state.capture = Some(super::state::Capture {
+        state.capture = Some(super::state::Capture::new(
             conn,
-            lines: Vec::new(),
-            reply_target: None,
-            reply_caps: None,
-            label: Some(label.to_string()),
-            deferred: false,
-            deferrals: 0,
-        });
+            Some(label.clone()),
+            None,
+            None,
+        ));
         dispatch_parsed(state, conn, &msg);
         let cap = state.capture.take();
         // A handler that deferred its response to an async path (CHATHISTORY →
         // PostgreSQL) emits its own labeled batch when the reply lands; framing
         // an empty ACK here would wrongly tell the client there was no response.
-        if cap.as_ref().is_some_and(|c| c.deferred) {
+        if cap.as_ref().is_some_and(super::state::Capture::is_deferred) {
             state.await_labeled_answers(cap.expect("checked above"));
             return;
         }
@@ -399,6 +388,38 @@ pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {
         return;
     }
     dispatch_parsed(state, conn, &msg);
+}
+
+/// The label a reply to `conn` is framed under, from the unescaped `label` tag
+/// value it sent: only once the client negotiated labeled-response and batch
+/// (which it depends on — negotiation order is unrestricted, so accepting the
+/// capability alone is fine). Re-escaped: it is echoed back into the tag
+/// section of every framed reply, and unescaped a value like `a\s\nb` would
+/// inject a space/newline into the client's own stream.
+fn response_label(state: &ServerState, conn: ConnId, value: Option<&str>) -> Option<String> {
+    let caps = &state.sessions[&conn].caps;
+    value
+        .filter(|_| caps.labeled_response && caps.batch)
+        .map(|value| e6irc_proto::message::escape_tag_value(value).into_owned())
+}
+
+/// Refuse a line that could not be parsed whole (not UTF-8, too long,
+/// malformed) with `refuse`, under the label its tag section carries when that
+/// can still be read: the client is waiting on it, refused or not.
+fn refuse_line(
+    state: &mut ServerState,
+    conn: ConnId,
+    line: &[u8],
+    refuse: impl FnOnce(&mut ServerState),
+) {
+    let value = e6irc_proto::message::tag_section_value(line, "label");
+    match response_label(state, conn, value.as_deref()) {
+        Some(label) => {
+            let lines = state.capture_lines(conn, &label, refuse);
+            frame_labeled(state, conn, &label, lines);
+        }
+        None => refuse(state),
+    }
 }
 
 /// Fit a trailing parameter to the wire limit: the largest prefix of `text`
@@ -682,15 +703,12 @@ fn begin_channel_capture(
         "channel owner must not have a capture"
     );
     let conn = actor.recipient.conn();
-    state.capture = Some(crate::core::state::Capture {
+    state.capture = Some(crate::core::state::Capture::new(
         conn,
-        lines: Vec::new(),
-        reply_target: Some(actor.identity.nick.clone()),
-        reply_caps: Some(actor.recipient.caps()),
         label,
-        deferred: false,
-        deferrals: 0,
-    });
+        Some(actor.identity.nick.clone()),
+        Some(actor.recipient.caps()),
+    ));
     conn
 }
 

@@ -246,15 +246,19 @@ pub(super) fn invite_on_owner(
             channel: display,
         };
     }
+    // invite-notify tells the members who could have sent the invitation
+    // themselves: the operators, or everyone on a `+g` channel (Solanum sends
+    // it to chanops only unless the channel is free-invite). Anyone else would
+    // learn who is being let into a channel they cannot let people into.
+    let free_invite = chan.modes.free_invite;
     let recipients: Vec<_> = chan
-        .recipients()
-        .iter()
-        .copied()
-        .filter(|recipient| {
-            recipient.conn() != actor.recipient.conn()
-                && recipient.conn() != invitee.owner().conn()
-                && recipient.caps().invite_notify
+        .recipients_where(|member, modes| {
+            member != actor.recipient.conn()
+                && member != invitee.owner().conn()
+                && (free_invite || modes.op)
         })
+        .into_iter()
+        .filter(|recipient| recipient.caps().invite_notify)
         .collect();
     // An invitation is a pass through `+i` and past `+l`, so one is recorded
     // only while the channel has either (Solanum stores an invite exactly when
@@ -434,7 +438,7 @@ pub(super) fn cmd_list(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         emit_channel_list_rows(state, conn, rows);
         return;
     }
-    let label = state.defer_channel_reply(conn);
+    let label = state.defer_captured_reply(conn);
     let request = state.start_channel_list(conn, label, targets);
     state.route_channel_list(request);
 }

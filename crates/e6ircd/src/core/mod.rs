@@ -1508,7 +1508,7 @@ pub enum DbRequest {
         conn: ConnId,
         name: String,
         contact_email: Option<crate::identity::ContactEmail>,
-        password: String,
+        password: crate::identity::NewPassword,
         /// Which command asked, so the answer speaks that command's language.
         origin: AccountOrigin,
     },
@@ -1768,7 +1768,7 @@ pub enum DbRequest {
         dm_peers: Vec<String>,
         sender_prefix: String,
         sender_account: Option<String>,
-        kind: MessageKind,
+        kind: HistoryKind,
         body: String,
         /// The sender was a bot (+B) at send time (replayed as the `bot` tag).
         sender_is_bot: bool,
@@ -1776,6 +1776,9 @@ pub enum DbRequest {
         /// (see `HistoryEntry::multiline`). Persisted so replay reconstructs the
         /// multiline message under its one msgid.
         multiline: Option<String>,
+        /// The client-only tags the message was relayed with (see
+        /// `HistoryRow::client_tags`); empty for none.
+        client_tags: String,
         /// Unix milliseconds.
         ts: e6irc_proto::time::Millis,
     },
@@ -1966,15 +1969,14 @@ pub enum SelectorBound {
     Timestamp(e6irc_proto::time::Millis),
 }
 
-/// PRIVMSG or NOTICE — the only two message kinds that carry a body, are
-/// delivered to an audience, and enter history. A single type instead of a
-/// `&str` so the three forms of the name cannot drift: the uppercase wire verb
-/// ([`MessageKind::wire`]), the lowercase storage token ([`MessageKind::db`],
-/// the `messages.kind` column), and the "does it trigger automatic replies"
-/// rule ([`MessageKind::is_loud`] — NOTICE never does). Before this they were
-/// carried as a string that was uppercased in one place and lowercased in
-/// another, so the ring and the database stored different casings of the same
-/// message; now the casing exists only at the edges where it is asked for.
+/// PRIVMSG or NOTICE — the only two message kinds that carry a body. A single
+/// type instead of a `&str` so the forms of the name cannot drift: the
+/// uppercase wire verb ([`MessageKind::wire`]) and the "does it trigger
+/// automatic replies" rule ([`MessageKind::is_loud`] — NOTICE never does).
+/// Before this they were carried as a string that was uppercased in one place
+/// and lowercased in another, so the ring and the database stored different
+/// casings of the same message; now the casing exists only at the edges where
+/// it is asked for (the storage token is [`HistoryKind::db`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKind {
     Privmsg,
@@ -1990,35 +1992,99 @@ impl MessageKind {
         }
     }
 
-    /// The lowercase token stored in the `messages.kind` column.
-    pub fn db(self) -> &'static str {
-        match self {
-            MessageKind::Privmsg => "privmsg",
-            MessageKind::Notice => "notice",
-        }
-    }
-
     /// PRIVMSG triggers automatic replies (error numerics, away auto-reply);
     /// NOTICE must never trigger any (Modern IRC), so it is silent.
     pub fn is_loud(self) -> bool {
         matches!(self, MessageKind::Privmsg)
     }
+}
 
-    /// Parse the stored [`MessageKind::db`] token; `None` for anything else,
+/// What a history entry is: a message with text, or a `TAGMSG` — nothing but
+/// its client-only tags (a reaction, say). Both are
+/// stored and replayed under the msgid they were delivered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryKind {
+    Privmsg,
+    Notice,
+    Tagmsg,
+}
+
+impl From<MessageKind> for HistoryKind {
+    fn from(kind: MessageKind) -> Self {
+        match kind {
+            MessageKind::Privmsg => HistoryKind::Privmsg,
+            MessageKind::Notice => HistoryKind::Notice,
+        }
+    }
+}
+
+impl HistoryKind {
+    /// The uppercase verb as it appears on the wire.
+    pub fn wire(self) -> &'static str {
+        match self {
+            HistoryKind::Privmsg => MessageKind::Privmsg.wire(),
+            HistoryKind::Notice => MessageKind::Notice.wire(),
+            HistoryKind::Tagmsg => "TAGMSG",
+        }
+    }
+
+    /// The lowercase token stored in the `messages.kind` column.
+    pub fn db(self) -> &'static str {
+        match self {
+            HistoryKind::Privmsg => "privmsg",
+            HistoryKind::Notice => "notice",
+            HistoryKind::Tagmsg => "tagmsg",
+        }
+    }
+
+    /// Parse the stored [`HistoryKind::db`] token; `None` for anything else,
     /// so a corrupt or unexpected `kind` column surfaces rather than defaulting.
     pub fn from_db(token: &str) -> Option<Self> {
         match token {
-            "privmsg" => Some(MessageKind::Privmsg),
-            "notice" => Some(MessageKind::Notice),
+            "privmsg" => Some(HistoryKind::Privmsg),
+            "notice" => Some(HistoryKind::Notice),
+            "tagmsg" => Some(HistoryKind::Tagmsg),
             _ => None,
         }
     }
 }
 
-/// One rendered history row, newest-last, as the DB returns it.
+/// Which stored history entries a reader can be sent. A stored `TAGMSG` is
+/// nothing but tags, so a reader without `message-tags` — and the REST API,
+/// which serves text — cannot receive one at all. A page is cut in the
+/// reader's scope, so its `LIMIT` counts only entries it can be sent: excluding
+/// them after the cut would return fewer than asked for, which reads as the
+/// end of the buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryScope {
+    /// PRIVMSG and NOTICE only.
+    Text,
+    /// Everything, `TAGMSG` included.
+    TextAndTags,
+}
+
+impl HistoryScope {
+    pub fn admits(self, kind: HistoryKind) -> bool {
+        self == HistoryScope::TextAndTags || kind != HistoryKind::Tagmsg
+    }
+}
+
+impl From<HistoryResponseCaps> for HistoryScope {
+    fn from(caps: HistoryResponseCaps) -> Self {
+        if caps.message_tags {
+            HistoryScope::TextAndTags
+        } else {
+            HistoryScope::Text
+        }
+    }
+}
+
+/// One history entry, as the hot ring keeps it and the database returns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryRow {
     pub msgid: String,
+    /// Unix **milliseconds** (see `Config::clock`): CHATHISTORY pages by this,
+    /// so second granularity would make same-second messages unorderable.
     pub ts: e6irc_proto::time::Millis,
     pub sender_prefix: String,
     /// The sender's account at send time (`None` if unauthenticated). Used to
@@ -2027,14 +2093,24 @@ pub struct HistoryRow {
     /// renamed mid-conversation still sees their own lines addressed to the
     /// correspondent, not to themselves.
     pub sender_account: Option<String>,
-    pub kind: MessageKind,
+    pub kind: HistoryKind,
+    /// The text; empty for a `TAGMSG`.
     pub body: String,
     /// The sender was a bot (+B) at send time; replay re-emits the `bot` tag.
     pub sender_is_bot: bool,
-    /// Encoded `draft/multiline` lines (see `HistoryEntry::multiline`); `None`
-    /// for a single-line message. Reconstructed into a multiline batch (or
-    /// flattened) on replay, reusing this row's single msgid.
+    /// For a `draft/multiline` message: its lines encoded as one string
+    /// (`crate::core::handler::message::encode_multiline`), so the whole message
+    /// is one history entry with one msgid — not one row per line with fresh,
+    /// never-delivered msgids. `None` for an ordinary single-line message;
+    /// `body` then holds the text. On replay a `Some` reconstructs the multiline
+    /// batch (or flattens) reusing the single msgid, as live delivery did.
     pub multiline: Option<String>,
+    /// The client-only tags the message was relayed with, escaped and
+    /// `;`-joined as on the wire (empty for none), less the ephemeral ones
+    /// (`crate::sanitize::history_client_tags`). Replayed to a reader that
+    /// negotiated `message-tags`, as live delivery sent them, so a reply or a
+    /// reaction keeps what it refers to.
+    pub client_tags: String,
 }
 
 /// Capability state that determines the wire shape of a CHATHISTORY reply.
@@ -2049,6 +2125,25 @@ pub struct HistoryResponseCaps {
     pub server_time: bool,
     pub account_tag: bool,
     pub multiline: bool,
+}
+
+impl HistoryResponseCaps {
+    /// [`state::event_tags`] for a reader with these capabilities.
+    pub(crate) fn event_tags(
+        self,
+        ts: e6irc_proto::time::Millis,
+        msgid: Option<&str>,
+        account: Option<&str>,
+        bot: bool,
+    ) -> Vec<String> {
+        let caps = state::Caps {
+            message_tags: self.message_tags,
+            server_time: self.server_time,
+            account_tag: self.account_tag,
+            ..state::Caps::default()
+        };
+        state::event_tags(caps, ts, msgid, account, bot)
+    }
 }
 
 impl From<state::Caps> for HistoryResponseCaps {

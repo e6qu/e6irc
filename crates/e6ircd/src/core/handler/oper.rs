@@ -632,7 +632,9 @@ fn begin_oper_server_ban(
         operator: operator_name(state, conn),
     };
     match queue_server_ban_mutation(state, mutation, requester) {
-        Ok(()) => state.defer_captured_reply(conn),
+        Ok(()) => {
+            state.defer_captured_reply(conn);
+        }
         Err(error) => {
             let server = state.config.server_name.clone();
             let nick = state.sessions[&conn].nick().unwrap_or("*");

@@ -2,6 +2,61 @@
 
 use std::fmt;
 
+/// Longest password any surface accepts, in bytes.
+const MAX_PASSWORD_LEN: usize = 512;
+
+/// Why a password cannot be set on an account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordRefusal {
+    /// Nothing to log in with: SASL PLAIN, the web login and the REST API all
+    /// refuse an empty password, so an account created with one could never be
+    /// logged in to — or dropped — again.
+    Empty,
+    /// Longer than [`MAX_PASSWORD_LEN`].
+    TooLong,
+}
+
+impl PasswordRefusal {
+    /// The one wording every surface uses for the rule.
+    pub fn explanation(self) -> &'static str {
+        "Passwords must contain 1–512 bytes."
+    }
+}
+
+/// A password an account may be given: 1–[`MAX_PASSWORD_LEN`] bytes. Every
+/// surface that sets one — IRC `REGISTER`, NickServ `REGISTER`, the web and
+/// the REST API — parses it here, and account creation takes only this type,
+/// so no path can store a password the others would refuse to verify.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NewPassword(String);
+
+impl NewPassword {
+    pub fn parse(raw: &str) -> Result<Self, PasswordRefusal> {
+        if raw.is_empty() {
+            Err(PasswordRefusal::Empty)
+        } else if raw.len() > MAX_PASSWORD_LEN {
+            Err(PasswordRefusal::TooLong)
+        } else {
+            Ok(Self(raw.to_owned()))
+        }
+    }
+}
+
+impl std::ops::Deref for NewPassword {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A secret: never printed, even in a debug dump of the request carrying it.
+impl fmt::Debug for NewPassword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NewPassword(..)")
+    }
+}
+
 /// Lifetime authentication budget for one IRC or BNC connection.
 ///
 /// Keeping the counter and limit together prevents a new authentication edge
@@ -371,6 +426,24 @@ bounded_lifetime_days!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_password_holds_one_to_512_bytes() {
+        assert_eq!(NewPassword::parse("").err(), Some(PasswordRefusal::Empty));
+        assert_eq!(
+            NewPassword::parse(&"p".repeat(513)).err(),
+            Some(PasswordRefusal::TooLong)
+        );
+        assert_eq!(
+            &*NewPassword::parse(&"p".repeat(512)).expect("fits"),
+            "p".repeat(512)
+        );
+        assert_eq!(
+            format!("{:?}", NewPassword::parse("hunter2").expect("fits")),
+            "NewPassword(..)",
+            "never printed"
+        );
+    }
 
     #[test]
     fn contact_email_parses_once_and_normalizes_only_the_domain() {

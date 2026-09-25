@@ -848,6 +848,30 @@ each with a test that failed before:
   redundant `bnc_networks_account_idx` are dropped; DESIGN §8 now matches the
   schema (the `messages` index, canonical `sent_at`, `login_attempts`).
 
+An IRCv3 conformance review, extension by extension, found, and this change
+fixes:
+
+- **A labeled NickServ IDENTIFY dropped its echo**: a second "deferred" flag
+  was set without counting the answer. A capture now has one count, and every
+  asynchronous answer is gathered into the one labeled response.
+- **900/901 only came from SASL**, and 901 never; they come from the one login
+  and logout path. A labeled `AUTHENTICATE` was ACKed before its verdict, and a
+  line sent mid-verify produced 904 followed by the real verdict.
+- **`REGISTER` stored an empty password** no login could ever use; one parser
+  (`NewPassword`) serves IRC, NickServ and the web. It answers `NEED_NICK` when
+  there is no nick to register.
+- **invite-notify reached every member**, not those who may invite; **WHOIS
+  ignored multi-prefix**; **multiline lines exceeded 512 bytes** inside the
+  batch (now split with `draft/multiline-concat`); **SETNAME cut** an over-long
+  realname (now refused; `NAMELEN` advertised); **`MODES` was not advertised**
+  (now `MODES=4`, enforced); pre-parse refusals lost their **label**; an **empty
+  multiline batch** was answered with silence; MONITOR's 421 had an extra
+  parameter; the attach listener took `AUTHENTICATE *` for a mechanism.
+
+Maintainer decision implemented on top: history keeps client-only tags and
+`TAGMSG` reactions (migration 0081), replayed to `message-tags` readers; typing
+indicators are never stored, on the server or the bouncer.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

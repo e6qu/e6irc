@@ -716,6 +716,11 @@ fn spawn_persistence(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
+            // The echo of a typing indicator is told live and never stored,
+            // like the indicator itself (`publish_echo`).
+            if crate::sanitize::is_ephemeral_tagmsg(&line) {
+                continue;
+            }
             let names = handle.names();
             let stored = async {
                 // A conversation is keyed the network's way. When that way is
@@ -1233,7 +1238,22 @@ where
                         .await?;
                         continue;
                     }
-                    if !awaiting_payload {
+                    if arg == "*" {
+                        // Client abort — answered 906 whether or not an
+                        // exchange is open, as the core answers it: `*` is
+                        // never a mechanism name.
+                        awaiting_payload = false;
+                        sasl_buf.clear();
+                        handshake_numeric(
+                            write,
+                            server_name,
+                            nick.as_deref(),
+                            906,
+                            None,
+                            "SASL authentication aborted",
+                        )
+                        .await?;
+                    } else if !awaiting_payload {
                         // Mechanism selection. Only PLAIN is offered; any
                         // other is answered with the list (908) before the
                         // failure (904), as the SASL spec orders them.
@@ -1252,19 +1272,6 @@ where
                             .await?;
                             reject_sasl(write, server_name, nick.as_deref()).await?;
                         }
-                    } else if arg == "*" {
-                        // Client abort.
-                        awaiting_payload = false;
-                        sasl_buf.clear();
-                        handshake_numeric(
-                            write,
-                            server_name,
-                            nick.as_deref(),
-                            906,
-                            None,
-                            "SASL authentication aborted",
-                        )
-                        .await?;
                     } else {
                         // Continuation: a full 400-char line means more follows;
                         // a shorter line (or "+", the empty final chunk)
@@ -1292,15 +1299,15 @@ where
                                         reject_sasl(write, server_name, nick.as_deref()).await?;
                                     }
                                     PlainVerification::Throttled(retry_after) => {
-                                        write
-                                            .write_all(
-                                                format!(
-                                                    ":{server_name} 904 * :{}\r\n",
-                                                    retry_after.explanation()
-                                                )
-                                                .as_bytes(),
-                                            )
-                                            .await?;
+                                        handshake_numeric(
+                                            write,
+                                            server_name,
+                                            nick.as_deref(),
+                                            904,
+                                            None,
+                                            &retry_after.explanation(),
+                                        )
+                                        .await?;
                                     }
                                     PlainVerification::Unavailable => {
                                         handshake_numeric(
@@ -1988,6 +1995,24 @@ mod handshake_tests {
             replies.contains(" 906 * :SASL authentication aborted\r\n"),
             "{replies}"
         );
+        assert!(matches!(registered, Registered::Closed));
+    }
+
+    /// `AUTHENTICATE *` is an abort whether or not an exchange is open — 906,
+    /// as the core answers it — never a mechanism name to be refused with the
+    /// mechanism list.
+    #[tokio::test]
+    async fn attach_sasl_abort_outside_an_exchange_is_906() {
+        let (replies, registered) = handshake_replies(
+            b"CAP REQ :sasl\r\nNICK alice/libera\r\nAUTHENTICATE *\r\nQUIT :done\r\n",
+        )
+        .await;
+        assert!(
+            replies.contains(":bnc.example 906 alice/libera :SASL authentication aborted\r\n"),
+            "{replies}"
+        );
+        assert!(!replies.contains(" 908 "), "{replies}");
+        assert!(!replies.contains(" 904 "), "{replies}");
         assert!(matches!(registered, Registered::Closed));
     }
 

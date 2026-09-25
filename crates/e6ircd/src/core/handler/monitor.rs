@@ -161,11 +161,13 @@ pub(super) fn cmd_monitor(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             monitor_status(state, conn, &targets);
         }
         other => {
+            // The command is the one middle parameter; the subcommand the
+            // client sent rides the text, so the reply keeps 421's shape.
             state.numeric(
                 conn,
                 ERR_UNKNOWNCOMMAND,
-                &[&format!("MONITOR {other}")],
-                Some("Unknown command"),
+                &["MONITOR"],
+                Some(&format!("Unknown MONITOR subcommand {}", clip_echo(other))),
             );
         }
     }

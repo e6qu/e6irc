@@ -3143,6 +3143,7 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) -> bool {
     // NULL for an ordinary message; the encoded lines for a draft/multiline one
     // (see `core::handler::message::encode_multiline`), authoritative on replay.
     let mut multilines: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut client_tags_column: Vec<String> = Vec::with_capacity(n);
     for request in batch {
         let DbRequest::LogMessage {
             msgid,
@@ -3154,6 +3155,7 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) -> bool {
             body,
             sender_is_bot,
             multiline,
+            client_tags,
             ts,
         } = request
         else {
@@ -3168,6 +3170,7 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) -> bool {
         bodies.push(body);
         bots.push(sender_is_bot);
         multilines.push(multiline);
+        client_tags_column.push(client_tags);
         let Ok(ts) = millis_for_database(ts, "messages.ts") else {
             eprintln!("db: message logging skipped: timestamp exceeds exact database range");
             return false;
@@ -3175,13 +3178,14 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) -> bool {
         tss.push(ts);
     }
     let result = sqlx::query(
-        "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts, dm_peers, sender_is_bot, multiline)
+        "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts, dm_peers, sender_is_bot, multiline, client_tags)
          SELECT m, t, p, a, k, b, at,
                 CASE WHEN d IS NULL THEN NULL ELSE string_to_array(d, '!') END,
-                bot, ml
+                bot, ml, ct
          FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
                      ARRAY(SELECT to_timestamp(x / 1000.0) FROM UNNEST($7::bigint[]) x),
-                     $8::text[], $9::bool[], $10::text[]) AS u(m, t, p, a, k, b, at, d, bot, ml)
+                     $8::text[], $9::bool[], $10::text[], $11::text[])
+              AS u(m, t, p, a, k, b, at, d, bot, ml, ct)
          ON CONFLICT (msgid) DO NOTHING",
     )
     .bind(&msgids)
@@ -3194,6 +3198,7 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) -> bool {
     .bind(&peers)
     .bind(&bots)
     .bind(&multilines)
+    .bind(&client_tags_column)
     .execute(pool)
     .await;
     if let Err(e) = result {
@@ -3427,7 +3432,9 @@ async fn handle_request(
             label,
         } => {
             let rows = async {
-                let rows = query_history(pool, &target, floor, query.clone()).await?;
+                let scope = crate::core::HistoryScope::from(caps);
+                let rows =
+                    query_history_in_scope(pool, &target, floor, query.clone(), scope).await?;
                 if rows.is_empty()
                     && positioned_by_unknown_msgid(pool, &target, floor, &query).await?
                 {
@@ -4225,6 +4232,7 @@ struct HistoryDbRow {
     sender_is_bot: bool,
     /// Encoded draft/multiline lines, or NULL for an ordinary message.
     multiline: Option<String>,
+    client_tags: String,
 }
 
 /// A CHATHISTORY statement: the column list, then whatever narrows it.
@@ -4239,11 +4247,32 @@ struct HistoryDbRow {
 /// no temporary to outlive the query. The SQL also stays greppable, which an
 /// interpolated string would not.
 macro_rules! history_select {
-    ($rest:literal) => {
+    ($scope:expr, $rest:literal) => {
+        match $scope {
+            crate::core::HistoryScope::TextAndTags => concat!(
+                "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, \
+                 sender_account, kind, body, sender_is_bot, multiline, client_tags FROM messages ",
+                history_where!(""),
+                $rest
+            ),
+            crate::core::HistoryScope::Text => concat!(
+                "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, \
+                 sender_account, kind, body, sender_is_bot, multiline, client_tags FROM messages ",
+                history_where!("AND kind <> 'tagmsg' "),
+                $rest
+            ),
+        }
+    };
+}
+
+/// The predicate every history statement starts with: the target (`$1`), the
+/// reader's floor (`$2`), and — for a reader that cannot receive a TAGMSG — the
+/// scope, applied before the `LIMIT` so it counts only rows the reader is sent.
+macro_rules! history_where {
+    ($scope:literal) => {
         concat!(
-            "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, \
-             sender_account, kind, body, sender_is_bot, multiline FROM messages ",
-            $rest
+            "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) ",
+            $scope
         )
     };
 }
@@ -4252,14 +4281,26 @@ macro_rules! history_select {
 /// inner select aliases the timestamp so the outer query can order by it, and
 /// carries `ts`/`id` for that ordering.
 macro_rules! history_window {
-    ($older:literal, $newer:literal) => {
+    ($scope:expr, $older:literal, $newer:literal) => {
+        match $scope {
+            crate::core::HistoryScope::TextAndTags => history_window!(@ "", $older, $newer),
+            crate::core::HistoryScope::Text => {
+                history_window!(@ "AND kind <> 'tagmsg' ", $older, $newer)
+            }
+        }
+    };
+    (@ $scope:literal, $older:literal, $newer:literal) => {
         concat!(
-            "SELECT msgid, ts_millis, sender_prefix, sender_account, kind, body, sender_is_bot, multiline FROM ( (SELECT msgid, \
+            "SELECT msgid, ts_millis, sender_prefix, sender_account, kind, body, sender_is_bot, multiline, \
+             client_tags FROM ( (SELECT msgid, \
              (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, sender_account, kind, \
-             body, sender_is_bot, multiline, ts, id FROM messages ",
+             body, sender_is_bot, multiline, client_tags, ts, id FROM messages ",
+            history_where!($scope),
             $older,
             ") UNION ALL (SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, \
-             sender_prefix, sender_account, kind, body, sender_is_bot, multiline, ts, id FROM messages ",
+             sender_prefix, sender_account, kind, body, sender_is_bot, multiline, client_tags, ts, id \
+             FROM messages ",
+            history_where!($scope),
             $newer,
             ") ) w ORDER BY ts ASC, id ASC"
         )
@@ -4310,11 +4351,24 @@ pub(crate) async fn positioned_by_unknown_msgid(
     Ok(false)
 }
 
+/// A page of `target`'s text messages — what the REST API serves, which has no
+/// way to present a TAGMSG.
 pub async fn query_history(
     pool: &PgPool,
     target: &str,
     floor: crate::core::HistoryFloor,
     query: crate::core::HistoryQuery,
+) -> Result<Vec<crate::core::HistoryRow>, DbError> {
+    query_history_in_scope(pool, target, floor, query, crate::core::HistoryScope::Text).await
+}
+
+/// A page of `target`'s history cut in the reader's `scope`.
+pub(crate) async fn query_history_in_scope(
+    pool: &PgPool,
+    target: &str,
+    floor: crate::core::HistoryFloor,
+    query: crate::core::HistoryQuery,
+    scope: crate::core::HistoryScope,
 ) -> Result<Vec<crate::core::HistoryRow>, DbError> {
     use crate::core::HistoryQuery;
     // Every statement below binds the target as `$1` and the floor as `$2`,
@@ -4330,7 +4384,7 @@ pub async fn query_history(
         limit,
     } = query
     {
-        return query_between_selectors(pool, target, floor, &first, &second, limit).await;
+        return query_between_selectors(pool, target, floor, &first, &second, limit, scope).await;
     }
     // LATEST/BEFORE (and its msgid pivot) select newest-first and get reversed
     // below; the rest are already oldest-first. Computed before the match
@@ -4358,16 +4412,15 @@ pub async fn query_history(
         Option<usize>,
     ) = match query {
         HistoryQuery::Latest { limit } => (
-            history_select!(
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $3"
-            ),
+            history_select!(scope, "ORDER BY ts DESC, id DESC LIMIT $3"),
             None,
             limit,
             None,
         ),
         HistoryQuery::Before { before_ts, limit } => (
             history_select!(
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4"
+                scope,
+                "AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4"
             ),
             Some(Position::Millis(millis_for_database(
                 before_ts,
@@ -4381,7 +4434,8 @@ pub async fn query_history(
         // the most recent ones rather than the oldest.
         HistoryQuery::LatestAfter { after_ts, limit } => (
             history_select!(
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND ts > to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4"
+                scope,
+                "AND ts > to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4"
             ),
             Some(Position::Millis(millis_for_database(
                 after_ts,
@@ -4392,7 +4446,8 @@ pub async fn query_history(
         ),
         HistoryQuery::LatestAfterMsgid { msgid, limit } => (
             history_select!(
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4"
+                scope,
+                "AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4"
             ),
             Some(Position::Msgid(msgid)),
             limit,
@@ -4400,7 +4455,8 @@ pub async fn query_history(
         ),
         HistoryQuery::After { after_ts, limit } => (
             history_select!(
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND ts > to_timestamp($3::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $4"
+                scope,
+                "AND ts > to_timestamp($3::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $4"
             ),
             Some(Position::Millis(millis_for_database(
                 after_ts,
@@ -4412,8 +4468,9 @@ pub async fn query_history(
         // Half older than the point, half at/after it, then oldest-first.
         HistoryQuery::Around { around_ts, limit } => (
             history_window!(
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4",
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND ts >= to_timestamp($3::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $5"
+                scope,
+                "AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4",
+                "AND ts >= to_timestamp($3::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $5"
             ),
             Some(Position::Millis(millis_for_database(
                 around_ts,
@@ -4437,7 +4494,8 @@ pub async fn query_history(
         // which is what the caller asked about.
         HistoryQuery::BeforeMsgid { msgid, limit } => (
             history_select!(
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4"
+                scope,
+                "AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4"
             ),
             Some(Position::Msgid(msgid)),
             limit,
@@ -4445,7 +4503,8 @@ pub async fn query_history(
         ),
         HistoryQuery::AfterMsgid { msgid, limit } => (
             history_select!(
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts ASC, id ASC LIMIT $4"
+                scope,
+                "AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts ASC, id ASC LIMIT $4"
             ),
             Some(Position::Msgid(msgid)),
             limit,
@@ -4453,8 +4512,9 @@ pub async fn query_history(
         ),
         HistoryQuery::AroundMsgid { msgid, limit } => (
             history_window!(
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4",
-                "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) AND (ts, id) >= (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts ASC, id ASC LIMIT $5"
+                scope,
+                "AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts DESC, id DESC LIMIT $4",
+                "AND (ts, id) >= (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1 AND ts >= to_timestamp($2::double precision / 1000)) ORDER BY ts ASC, id ASC LIMIT $5"
             ),
             Some(Position::Msgid(msgid)),
             limit / 2,
@@ -4490,11 +4550,12 @@ fn history_row_from_db(row: HistoryDbRow) -> Result<crate::core::HistoryRow, DbE
         ts: millis_from_database(row.ts_millis, "messages.ts")?,
         sender_prefix: row.sender_prefix,
         sender_account: row.sender_account,
-        kind: crate::core::MessageKind::from_db(&row.kind)
+        kind: crate::core::HistoryKind::from_db(&row.kind)
             .expect("messages.kind is constrained to known message kinds"),
         body: row.body,
         sender_is_bot: row.sender_is_bot,
         multiline: row.multiline,
+        client_tags: row.client_tags,
     })
 }
 
@@ -4511,6 +4572,7 @@ async fn query_between_selectors(
     first: &crate::core::SelectorBound,
     second: &crate::core::SelectorBound,
     limit: usize,
+    scope: crate::core::HistoryScope,
 ) -> Result<Vec<crate::core::HistoryRow>, DbError> {
     use crate::core::SelectorBound;
     struct HistoryMarker {
@@ -4594,14 +4656,16 @@ async fn query_between_selectors(
     );
     let sql = if newest_first {
         history_select!(
-            "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) \
+            scope,
+            "\
              AND (ts, id) > (to_timestamp($3::double precision / 1000), $4::bigint) \
              AND (ts, id) < (to_timestamp($5::double precision / 1000), $6::bigint) \
              ORDER BY ts DESC, id DESC LIMIT $7"
         )
     } else {
         history_select!(
-            "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) \
+            scope,
+            "\
              AND (ts, id) > (to_timestamp($3::double precision / 1000), $4::bigint) \
              AND (ts, id) < (to_timestamp($5::double precision / 1000), $6::bigint) \
              ORDER BY ts ASC, id ASC LIMIT $7"
@@ -6161,7 +6225,8 @@ pub async fn begin_account_export(
              'timestamp', to_char(m.ts AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
              'direct_message_peers', m.dm_peers,
              'sender_is_bot', m.sender_is_bot,
-             'multiline', m.multiline
+             'multiline', m.multiline,
+             'client_tags', m.client_tags
          )::text
          FROM messages m WHERE {predicate} ORDER BY m.id"
     )))
@@ -10194,29 +10259,49 @@ mod history_sql_tests {
     /// history read, so it is pinned rather than trusted.
     #[test]
     fn history_select_expands_to_the_expected_statement() {
+        let prefix = "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, \
+                      sender_prefix, sender_account, kind, body, sender_is_bot, multiline, \
+                      client_tags FROM messages WHERE target = $1 AND ts >= \
+                      to_timestamp($2::double precision / 1000) ";
         assert_eq!(
-            history_select!("WHERE target = $1 ORDER BY ts DESC, id DESC LIMIT $2"),
-            "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, \
-             sender_account, kind, body, sender_is_bot, multiline FROM messages WHERE target = $1 ORDER BY ts \
-             DESC, id DESC LIMIT $2"
+            history_select!(
+                crate::core::HistoryScope::TextAndTags,
+                "ORDER BY ts DESC, id DESC LIMIT $3"
+            ),
+            format!("{prefix}ORDER BY ts DESC, id DESC LIMIT $3")
+        );
+        // A reader that cannot receive a TAGMSG has them cut before the LIMIT.
+        assert_eq!(
+            history_select!(
+                crate::core::HistoryScope::Text,
+                "ORDER BY ts DESC, id DESC LIMIT $3"
+            ),
+            format!("{prefix}AND kind <> 'tagmsg' ORDER BY ts DESC, id DESC LIMIT $3")
         );
     }
 
     /// The windowed form keeps the alias and the ordering columns the outer
-    /// query depends on.
+    /// query depends on, and cuts both halves in the reader's scope.
     #[test]
     fn history_window_keeps_alias_and_ordering_columns() {
-        let sql = history_window!("WHERE a", "WHERE b");
-        assert!(
-            sql.contains("AS ts_millis"),
-            "the millis column is aliased so FromRow can bind it by name: {sql}"
-        );
-        assert_eq!(
-            sql.matches("ts, id").count(),
-            2,
-            "both halves carry ordering columns"
-        );
-        assert!(sql.trim_end().ends_with("ORDER BY ts ASC, id ASC"));
-        assert!(sql.contains("UNION ALL"));
+        for (scope, cuts) in [
+            (crate::core::HistoryScope::TextAndTags, 0),
+            (crate::core::HistoryScope::Text, 2),
+        ] {
+            let sql = history_window!(scope, "AND a", "AND b");
+            assert!(
+                sql.contains("AS ts_millis"),
+                "the millis column is aliased so FromRow can bind it by name: {sql}"
+            );
+            assert_eq!(
+                sql.matches("ts, id").count(),
+                2,
+                "both halves carry ordering columns"
+            );
+            assert_eq!(sql.matches("kind <> 'tagmsg'").count(), cuts, "{sql}");
+            assert_eq!(sql.matches("client_tags").count(), 3, "{sql}");
+            assert!(sql.trim_end().ends_with("ORDER BY ts ASC, id ASC"));
+            assert!(sql.contains("UNION ALL"));
+        }
     }
 }
