@@ -223,11 +223,20 @@ struct NetworkCreation {
     /// `Some` exactly for `kind=irc`; a bridge request cannot carry one.
     username: Option<String>,
     realname: String,
-    autojoin: Vec<String>,
+    /// As the request wrote each entry: `#channel`, or `#channel key`.
+    autojoin: Vec<crate::bouncer::AutojoinEntry>,
     sasl_account: Option<String>,
     sasl_password: Option<String>,
     /// `None` for every bridge: only an IRC request can carry one.
     server_password: Option<String>,
+}
+
+/// The autojoin entries a request states, each `#channel` or `#channel key`.
+fn submitted_autojoin(autojoin: &[String]) -> Vec<crate::bouncer::AutojoinEntry> {
+    autojoin
+        .iter()
+        .map(|entry| crate::bouncer::AutojoinEntry::from_submitted(entry))
+        .collect()
 }
 
 impl From<CreateNetwork> for NetworkCreation {
@@ -253,7 +262,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 nick,
                 username: Some(username),
                 realname,
-                autojoin,
+                autojoin: submitted_autojoin(&autojoin),
                 sasl_account,
                 sasl_password,
                 server_password,
@@ -273,7 +282,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 nick,
                 username: None,
                 realname: String::new(),
-                autojoin,
+                autojoin: submitted_autojoin(&autojoin),
                 sasl_account: None,
                 sasl_password: Some(sasl_password),
                 server_password: None,
@@ -292,7 +301,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 nick: String::new(),
                 username: None,
                 realname: String::new(),
-                autojoin,
+                autojoin: submitted_autojoin(&autojoin),
                 sasl_account: None,
                 sasl_password: Some(sasl_password),
                 server_password: None,
@@ -312,7 +321,7 @@ impl From<CreateNetwork> for NetworkCreation {
                 nick: String::new(),
                 username: None,
                 realname: String::new(),
-                autojoin,
+                autojoin: submitted_autojoin(&autojoin),
                 sasl_account: Some(sasl_account),
                 sasl_password: Some(sasl_password),
                 server_password: None,
@@ -322,8 +331,8 @@ impl From<CreateNetwork> for NetworkCreation {
 }
 
 /// An ephemeral qualification request. It intentionally omits the durable
-/// network name but exercises the configured connection and channel joins
-/// without persisting anything.
+/// network name, registers the configured identity, joins nothing, and
+/// persists nothing; its channels are validated as a save would validate them.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct PreflightNetwork {
@@ -465,7 +474,11 @@ pub(super) struct NetworkResponse {
     /// The IRC `USER` name; `null` for a bridge.
     username: Option<String>,
     realname: Option<String>,
+    /// The channels, without their keys.
     autojoin: Vec<String>,
+    /// The channels among `autojoin` that have a sealed key stored. The key
+    /// itself is never shown.
+    autojoin_keyed: Vec<String>,
     sasl_account: Option<String>,
     has_sasl_account: bool,
     has_sasl_password: bool,
@@ -578,6 +591,17 @@ pub(super) fn network_response(
     let has_sasl_account = network.sasl_account.is_some();
     let has_sasl_password = network.sasl_password_sealed.is_some();
     let has_server_password = network.server_password_sealed.is_some();
+    let autojoin_keyed = network
+        .autojoin
+        .iter()
+        .filter(|entry| entry.key_sealed.is_some())
+        .map(|entry| entry.channel.clone())
+        .collect();
+    let autojoin = network
+        .autojoin
+        .into_iter()
+        .map(|entry| entry.channel)
+        .collect();
     let account = if network.kind.account_is_secret() {
         None
     } else {
@@ -591,7 +615,8 @@ pub(super) fn network_response(
         nick: network.nick,
         username: network.username,
         realname: network.realname,
-        autojoin: network.autojoin,
+        autojoin,
+        autojoin_keyed,
         sasl_account: account,
         has_sasl_account,
         has_sasl_password,
@@ -761,7 +786,7 @@ pub(super) async fn preflight_network_core(
         &req.nick,
         Some(&req.username),
         Some(&req.realname),
-        &req.autojoin,
+        &submitted_autojoin(&req.autojoin),
         internal_upstreams,
     )?;
     refuse_cleartext_credentials(
@@ -988,7 +1013,7 @@ pub(super) fn check_upstream_bounds(
     addr: &str,
     nick: &str,
     realname: Option<&str>,
-    autojoin: &[String],
+    autojoin: &[crate::bouncer::AutojoinEntry],
     internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<(), NetworkMutationError> {
     let overlong = if addr.len() > 255 {
@@ -997,7 +1022,9 @@ pub(super) fn check_upstream_bounds(
         Some(("nick", "nick is limited to 64 bytes"))
     } else if realname.is_some_and(|r| r.len() > 128) {
         Some(("realname", "realname is limited to 128 bytes"))
-    } else if autojoin.len() > 64 || autojoin.iter().any(|c| c.len() > 64) {
+    } else if autojoin.len() > crate::bouncer::AutojoinEntry::MAX_CONFIGURED
+        || autojoin.iter().any(|entry| entry.channel.len() > 64)
+    {
         Some(("autojoin", "autojoin is limited to 64 channels of 64 bytes"))
     } else {
         None
@@ -1015,7 +1042,10 @@ pub(super) fn check_upstream_bounds(
         Some("nick")
     } else if realname.is_some_and(has_control) {
         Some("realname")
-    } else if autojoin.iter().any(|c| has_control(c)) {
+    } else if autojoin
+        .iter()
+        .any(|entry| has_control(&entry.channel) || entry.key.as_deref().is_some_and(has_control))
+    {
         Some("autojoin")
     } else {
         None
@@ -1069,7 +1099,7 @@ pub(super) struct IrcUpstreamIdentity {
     pub(super) nick: crate::bouncer::UpstreamNick,
     pub(super) username: crate::bouncer::UpstreamUsername,
     pub(super) realname: Option<crate::bouncer::UpstreamRealname>,
-    pub(super) autojoin: Vec<crate::bouncer::UpstreamChannel>,
+    pub(super) autojoin: Vec<crate::bouncer::AutojoinChannel>,
 }
 
 fn identity_problem(error: crate::bouncer::UpstreamIdentityError) -> NetworkMutationError {
@@ -1089,7 +1119,7 @@ pub(super) fn validate_irc_upstream(
     nick: &str,
     username: Option<&str>,
     realname: Option<&str>,
-    autojoin: &[String],
+    autojoin: &[crate::bouncer::AutojoinEntry],
     internal_upstreams: crate::egress::InternalUpstreams,
 ) -> Result<IrcUpstreamIdentity, NetworkMutationError> {
     // Required, and never derived from the nick: a legal nickname (`_bot`) is
@@ -1132,7 +1162,7 @@ pub(super) fn validate_irc_upstream(
             .map(str::parse)
             .transpose()
             .map_err(identity_problem)?,
-        autojoin: crate::bouncer::UpstreamChannel::parse_list(autojoin)
+        autojoin: crate::bouncer::AutojoinChannel::parse_list(autojoin)
             .map_err(identity_problem)?,
     })
 }
@@ -1308,7 +1338,17 @@ impl SecretDestination {
     }
 }
 
-/// Apply a replace's two credential actions to `row`, the one place a stored
+/// A replace's actions on the network's write-only secrets: the SASL (or
+/// bridge) credentials, the server password, and the autojoin channels' keys.
+struct SecretActions {
+    credentials: UpdateNetworkCredentials,
+    server_password: UpdateServerPassword,
+    /// The autojoin list as the request wrote it, with any new keys inline.
+    autojoin: Vec<crate::bouncer::AutojoinEntry>,
+    autojoin_keys: UpdateAutojoinKeys,
+}
+
+/// Apply a replace's credential actions to `row`, the one place a stored
 /// secret can be carried from `before` into an edited network.
 ///
 /// A stored secret is write-only: the API never shows it. Keeping one while
@@ -1322,11 +1362,18 @@ fn apply_credential_actions(
     owner: &str,
     before: &crate::db::BncNetworkRow,
     row: &mut crate::db::BncNetworkRow,
-    credentials: UpdateNetworkCredentials,
-    server_password: UpdateServerPassword,
+    actions: SecretActions,
 ) -> Result<(), NetworkMutationError> {
-    apply_network_credentials(state, owner, row, credentials)?;
-    apply_server_password(state, owner, row, server_password)?;
+    apply_network_credentials(state, owner, row, actions.credentials)?;
+    apply_server_password(state, owner, row, actions.server_password)?;
+    apply_autojoin_keys(
+        state,
+        owner,
+        before,
+        row,
+        actions.autojoin,
+        actions.autojoin_keys,
+    )?;
     if SecretDestination::of(before).admits(&SecretDestination::of(row)) {
         return Ok(());
     }
@@ -1334,11 +1381,19 @@ fn apply_credential_actions(
         |before: &Option<String>, after: &Option<String>| after.is_some() && before == after;
     let account_carried =
         row.kind.account_is_secret() && carried(&before.sasl_account, &row.sasl_account);
+    let key_carried = row.autojoin.iter().any(|entry| {
+        before
+            .autojoin
+            .iter()
+            .any(|stored| carried(&stored.key_sealed, &entry.key_sealed))
+    });
     let field =
         if account_carried || carried(&before.sasl_password_sealed, &row.sasl_password_sealed) {
             "credentials"
         } else if carried(&before.server_password_sealed, &row.server_password_sealed) {
             "server_password"
+        } else if key_carried {
+            "autojoin"
         } else {
             return Ok(());
         };
@@ -1346,11 +1401,93 @@ fn apply_credential_actions(
         StatusCode::CONFLICT,
         "Credentials must be entered again",
         Some(
-            "the network now points somewhere else, and a stored password or token is never \
-             sent to a new destination; set it again or remove it",
+            "the network now points somewhere else, and a stored password, token, or channel \
+             key is never sent to a new destination; set it again or remove it",
         ),
     )
     .with_field(field))
+}
+
+/// The one spelling-insensitive comparison of two autojoin channel names: two
+/// names that differ only in ASCII case are the same channel on every network,
+/// whatever its case mapping.
+fn same_channel(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+/// Set `row.autojoin` from a replace: each entry written with a key stores
+/// that key, sealed; each channel named in `keys.keep` carries the key stored
+/// for it; every other channel has none. A kept channel must be listed without
+/// a new key and have a stored key to keep, so a keep that would do nothing,
+/// or a key both kept and replaced, is refused rather than read one way.
+fn apply_autojoin_keys(
+    state: &AppState,
+    owner: &str,
+    before: &crate::db::BncNetworkRow,
+    row: &mut crate::db::BncNetworkRow,
+    autojoin: Vec<crate::bouncer::AutojoinEntry>,
+    keys: UpdateAutojoinKeys,
+) -> Result<(), NetworkMutationError> {
+    let refused = |detail: &str| {
+        network_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid channel key action",
+            Some(detail),
+        )
+        .with_field("autojoin")
+    };
+    let stored_key = |channel: &str| {
+        before
+            .autojoin
+            .iter()
+            .find(|stored| same_channel(&stored.channel, channel))
+            .and_then(|stored| stored.key_sealed.clone())
+    };
+    for kept in &keys.keep {
+        match autojoin
+            .iter()
+            .find(|entry| same_channel(&entry.channel, kept))
+        {
+            None => {
+                return Err(refused(&format!(
+                    "{kept} keeps its key but is not in autojoin"
+                )));
+            }
+            Some(entry) if entry.key.is_some() => {
+                return Err(refused(&format!(
+                    "{kept} both keeps its stored key and sets a new one"
+                )));
+            }
+            Some(_) => {}
+        }
+        if stored_key(kept).is_none() {
+            return Err(refused(&format!("{kept} has no stored key to keep")));
+        }
+    }
+    row.autojoin = autojoin
+        .into_iter()
+        .map(|entry| {
+            let key_sealed = match &entry.key {
+                Some(key) => Some(
+                    seal_network_secret(state, owner, key)
+                        .map_err(|error| error.with_field("autojoin"))?,
+                ),
+                None if keys
+                    .keep
+                    .iter()
+                    .any(|kept| same_channel(kept, &entry.channel)) =>
+                {
+                    stored_key(&entry.channel)
+                }
+                None => None,
+            };
+            Ok(crate::db::BncAutojoin {
+                channel: entry.channel,
+                key_sealed,
+            })
+        })
+        .collect::<Result<_, NetworkMutationError>>()?;
+    Ok(())
 }
 
 fn apply_network_credentials(
@@ -1473,7 +1610,7 @@ struct BridgeUpstreamFields<'a> {
     nick: &'a str,
     username: Option<&'a str>,
     realname: Option<&'a str>,
-    autojoin: &'a [String],
+    autojoin: &'a [crate::bouncer::AutojoinEntry],
 }
 
 fn validate_bridge_upstream(
@@ -1498,6 +1635,14 @@ fn validate_bridge_upstream(
             Some("username applies only to IRC networks"),
         )
         .with_field("username"));
+    }
+    if autojoin.iter().any(|entry| entry.key.is_some()) {
+        return Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Unsupported bridge field",
+            Some("channel keys apply only to IRC networks; list each room or channel id alone"),
+        )
+        .with_field("autojoin"));
     }
     if !tls {
         return Err(network_error(
@@ -1663,15 +1808,16 @@ async fn update_network_in_lane(
         username,
         realname,
         autojoin,
+        autojoin_keys,
         credentials,
         server_password,
     } = req;
-    let (addr, nick, username, realname, autojoin) = (
+    let autojoin = submitted_autojoin(&autojoin);
+    let (addr, nick, username, realname) = (
         addr.as_str(),
         nick.as_str(),
         username.as_deref(),
         realname.as_deref(),
-        autojoin.as_slice(),
     );
     let lane = ActiveOwnerLane::enter(state, lane, account).await?;
     let pool = pool_of(state);
@@ -1691,7 +1837,7 @@ async fn update_network_in_lane(
             nick,
             username,
             realname,
-            autojoin,
+            &autojoin,
             state.internal_upstreams,
         )?;
     } else {
@@ -1703,7 +1849,7 @@ async fn update_network_in_lane(
                 nick,
                 username,
                 realname,
-                autojoin,
+                autojoin: &autojoin,
             },
             state.internal_upstreams,
         )?;
@@ -1713,14 +1859,17 @@ async fn update_network_in_lane(
     row.nick = nick.to_string();
     row.username = username.map(str::to_string);
     row.realname = realname.map(str::to_string);
-    row.autojoin = autojoin.to_vec();
     apply_credential_actions(
         state,
         account,
         &before,
         &mut row,
-        credentials,
-        server_password,
+        SecretActions {
+            credentials,
+            server_password,
+            autojoin,
+            autojoin_keys,
+        },
     )?;
     // Judged on the row as it will be stored: a kept credential on a network
     // edited to tls=false is refused like a new one.
@@ -1776,7 +1925,20 @@ fn changed_network_fields(
     note("nick", before.nick != after.nick);
     note("username", before.username != after.username);
     note("realname", before.realname != after.realname);
-    note("autojoin", before.autojoin != after.autojoin);
+    let channels = |row: &crate::db::BncNetworkRow| -> Vec<String> {
+        row.autojoin
+            .iter()
+            .map(|entry| entry.channel.clone())
+            .collect()
+    };
+    let keys = |row: &crate::db::BncNetworkRow| -> Vec<Option<String>> {
+        row.autojoin
+            .iter()
+            .map(|entry| entry.key_sealed.clone())
+            .collect()
+    };
+    note("autojoin", channels(before) != channels(after));
+    note("autojoin_keys", keys(before) != keys(after));
     note("sasl_account", before.sasl_account != after.sasl_account);
     note(
         "sasl_password",
@@ -1801,6 +1963,9 @@ fn present_network_fields(row: &crate::db::BncNetworkRow) -> Vec<&'static str> {
     }
     if !row.autojoin.is_empty() {
         present.push("autojoin");
+    }
+    if row.autojoin.iter().any(|entry| entry.key_sealed.is_some()) {
+        present.push("autojoin_keys");
     }
     if row.sasl_account.is_some() {
         present.push("sasl_account");
@@ -2081,6 +2246,7 @@ async fn create_network_in_lane(
     // account so a blob can never be opened for a different account's row.
     let need_key = req.sasl_password.is_some()
         || server_password.is_some()
+        || req.autojoin.iter().any(|entry| entry.key.is_some())
         || (kind.account_is_secret() && req.sasl_account.is_some());
     let key = match (&state.secret_key, need_key) {
         (Some(k), _) => Some(k),
@@ -2109,6 +2275,17 @@ async fn create_network_in_lane(
         key.expect("key present when a server password is")
             .seal(password.as_str(), &context)
     });
+    let stored_autojoin = req
+        .autojoin
+        .iter()
+        .map(|entry| crate::db::BncAutojoin {
+            channel: entry.channel.clone(),
+            key_sealed: entry.key.as_ref().map(|channel_key| {
+                key.expect("key present when a channel key is")
+                    .seal(channel_key, &context)
+            }),
+        })
+        .collect();
 
     // Build before inserting. A factory rejection must not create durable state
     // that then depends on a best-effort compensating delete.
@@ -2139,7 +2316,7 @@ async fn create_network_in_lane(
         nick: req.nick.clone(),
         username: req.username.clone(),
         realname: (kind == NetworkKind::Irc).then(|| req.realname.clone()),
-        autojoin: req.autojoin.clone(),
+        autojoin: stored_autojoin,
         sasl_account: stored_account,
         sasl_password_sealed: sealed_password,
         server_password_sealed: sealed_server_password,
@@ -2341,12 +2518,26 @@ pub(super) struct UpdateNetwork {
     pub(super) realname: Option<String>,
     /// Required: `PUT` replaces the whole configuration, so an omitted list
     /// cannot mean "keep" — and read as "none", it silently cleared the stored
-    /// channels. An empty list is how a replace says "join nothing".
+    /// channels. An empty list is how a replace says "join nothing". An entry
+    /// is `#channel`, or `#channel key` to set that channel's key.
     pub(super) autojoin: Vec<String>,
+    /// Which stored channel keys carry over. Required for the reason
+    /// `credentials` is: a key is write-only, so an entry written without one
+    /// could otherwise mean either keep or remove it.
+    pub(super) autojoin_keys: UpdateAutojoinKeys,
     pub(super) credentials: UpdateNetworkCredentials,
     /// Required for the same reason as `credentials`: an omitted field would
     /// have to mean either keep or erase a write-only secret.
     pub(super) server_password: UpdateServerPassword,
+}
+
+/// What a replace does with the autojoin channels' stored keys: each channel
+/// in `keep` (listed in `autojoin` without a new key) keeps the key stored for
+/// it; every other channel has the key written in its entry, or none.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct UpdateAutojoinKeys {
+    pub(super) keep: Vec<String>,
 }
 
 /// What a replace does with the stored server password (`PASS`).
@@ -2645,7 +2836,7 @@ mod tests {
     fn a_replace_states_its_server_password_action() {
         let replace = |server_password: &str| {
             serde_json::from_str::<UpdateNetwork>(&format!(
-                r#"{{"addr":"irc.example:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice","autojoin":[],"credentials":{{"action":"keep"}}{server_password}}}"#
+                r#"{{"addr":"irc.example:6697","tls":true,"nick":"alice","username":"alice","realname":"Alice","autojoin":[],"autojoin_keys":{{"keep":[]}},"credentials":{{"action":"keep"}}{server_password}}}"#
             ))
             .map(|request| request.server_password)
         };
@@ -2674,10 +2865,30 @@ mod tests {
         // `keep` is refused, not dropped.
         assert!(
             serde_json::from_str::<UpdateNetwork>(
-                r#"{"addr":"irc.example:6697","tls":true,"nick":"alice","credentials":{"action":"keep","password":"typed"},"server_password":{"action":"keep"}}"#
+                r#"{"addr":"irc.example:6697","tls":true,"nick":"alice","autojoin":[],"autojoin_keys":{"keep":[]},"credentials":{"action":"keep","password":"typed"},"server_password":{"action":"keep"}}"#
             )
             .is_err()
         );
+        // And for the channel keys: omitted, they would have to mean keep or
+        // remove; a stray field beside `keep` is refused.
+        let keys = |autojoin_keys: &str| {
+            serde_json::from_str::<UpdateNetwork>(&format!(
+                r##"{{"addr":"irc.example:6697","tls":true,"nick":"alice","autojoin":["#a"]{autojoin_keys},"credentials":{{"action":"keep"}},"server_password":{{"action":"keep"}}}}"##
+            ))
+            .map(|request| request.autojoin_keys.keep)
+        };
+        assert_eq!(
+            keys(r##","autojoin_keys":{"keep":["#a"]}"##).expect("keep"),
+            ["#a"]
+        );
+        for refused in [
+            "",
+            r#","autojoin_keys":null"#,
+            r#","autojoin_keys":{}"#,
+            r##","autojoin_keys":{"keep":[],"set":{"#a":"k"}}"##,
+        ] {
+            assert!(keys(refused).is_err(), "{refused}");
+        }
         let error = parse_server_password("a\r\nQUIT".into()).expect_err("a delimiter");
         assert_eq!(error.field, Some("server_password"));
         assert!(!error.message().contains("QUIT"), "{}", error.message());
@@ -2862,6 +3073,22 @@ mod tests {
                 .message()
                 .ends_with("username applies only to IRC networks")
         );
+        // A bridge's rooms and channel ids have no key.
+        let keyed = validate_bridge_upstream(
+            crate::config::NetworkKind::Discord,
+            BridgeUpstreamFields {
+                addr: "",
+                tls: true,
+                nick: "",
+                username: None,
+                realname: None,
+                autojoin: &super::submitted_autojoin(&["123 secret".to_string()]),
+            },
+            crate::egress::InternalUpstreams::Refuse,
+        )
+        .expect_err("a bridge's channel takes no key");
+        assert_eq!(keyed.field, Some("autojoin"));
+        assert!(!keyed.message().contains("secret"), "{keyed:?}");
 
         // The request shapes themselves: required on create and on the
         // connection test, and not a field a bridge request has at all.
@@ -2906,6 +3133,7 @@ mod tests {
     fn an_identity_that_would_reshape_a_wire_line_is_refused_at_its_field() {
         let ok = |nick: &str, realname: Option<&str>, autojoin: &[&str]| {
             let autojoin: Vec<String> = autojoin.iter().map(ToString::to_string).collect();
+            let autojoin = super::submitted_autojoin(&autojoin);
             validate_irc_upstream(
                 "irc.example:6697",
                 nick,
@@ -2915,11 +3143,20 @@ mod tests {
                 crate::egress::InternalUpstreams::Refuse,
             )
         };
-        let identity = ok("alice", Some("Alice Example"), &["#e6irc", "&local"])
-            .expect("an ordinary identity");
+        let identity = ok(
+            "alice",
+            Some("Alice Example"),
+            &["#e6irc", "&local", "#staff hunter2"],
+        )
+        .expect("an ordinary identity");
         assert_eq!(identity.nick.as_str(), "alice");
         assert_eq!(identity.username.as_str(), "ident");
-        assert_eq!(identity.autojoin.len(), 2);
+        assert_eq!(identity.autojoin.len(), 3);
+        assert_eq!(identity.autojoin[2].channel().as_str(), "#staff");
+        assert_eq!(
+            identity.autojoin[2].key().map(|key| key.as_str()),
+            Some("hunter2")
+        );
 
         for (nick, realname, autojoin, field) in [
             // `NICK al ice` carries two parameters.
@@ -2929,9 +3166,12 @@ mod tests {
             ("alice", Some("two\u{1b}[2Jlines"), &[][..], "realname"),
             // `JOIN 0` leaves every channel.
             ("alice", Some("Alice"), &["0"][..], "autojoin"),
-            // A key nobody configured, and a second channel in one entry.
-            ("alice", Some("Alice"), &["#a key"][..], "autojoin"),
+            // A key that is not one parameter, and a second channel in one
+            // entry.
+            ("alice", Some("Alice"), &["#a two words"][..], "autojoin"),
+            ("alice", Some("Alice"), &["#a :key"][..], "autojoin"),
             ("alice", Some("Alice"), &["#a,#b"][..], "autojoin"),
+            ("alice", Some("Alice"), &["#a k,ey"][..], "autojoin"),
             ("alice", Some("Alice"), &["e6irc"][..], "autojoin"),
         ] {
             let error = ok(nick, realname, autojoin).expect_err("must be refused");

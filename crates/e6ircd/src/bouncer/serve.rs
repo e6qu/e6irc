@@ -244,6 +244,15 @@ impl Registry {
                 })?,
                 NetworkKind::Matrix | NetworkKind::Discord | NetworkKind::Slack => String::new(),
             };
+            // A server-level network's autojoin is public configuration (the
+            // administrator API returns it), so it names channels only: an
+            // entry with a key in it is refused by the channel grammar rather
+            // than read as a key nobody could keep secret.
+            let autojoin: Vec<super::AutojoinEntry> = e
+                .autojoin
+                .iter()
+                .map(|channel| super::AutojoinEntry::unkeyed(channel.as_str()))
+                .collect();
             let driver: Box<dyn super::NetworkDriver> = if e.kind == NetworkKind::Local {
                 let identity_error = |error: super::UpstreamIdentityError| {
                     format!("network '{}' (kind=local) has invalid {error}", e.name)
@@ -257,7 +266,7 @@ impl Registry {
                     nick: e.nick.parse().map_err(identity_error)?,
                     username: username.parse().map_err(identity_error)?,
                     realname: realname.parse().map_err(identity_error)?,
-                    autojoin: super::UpstreamChannel::parse_list(&e.autojoin)
+                    autojoin: super::AutojoinChannel::parse_list(&autojoin)
                         .map_err(identity_error)?,
                     buffer_cap: e.buffer_cap,
                     sasl: None,
@@ -278,7 +287,7 @@ impl Registry {
                     nick: e.nick.clone(),
                     username: e.username.clone(),
                     realname,
-                    autojoin: e.autojoin.clone(),
+                    autojoin,
                     buffer_cap: e.buffer_cap,
                     sasl_account: e.sasl_account.clone(),
                     sasl_password: e.sasl_password.clone(),

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use e6irc_queue::{Config as QueueConfig, Policy, Receiver, queue};
 
+use super::upstream_identity::ChannelKey;
 use super::{ConnectionEvent, DriverEnds, NetworkConfig, NetworkDriver, NetworkHandle};
 use crate::core::{ConnId, ConnectionIdAllocator, CoreIngress, Input, Output};
 
@@ -54,7 +55,7 @@ pub struct LocalDriver {
     nick: String,
     username: String,
     realname: String,
-    autojoin: Vec<String>,
+    autojoin: Vec<(String, Option<ChannelKey>)>,
     buffer_cap: usize,
 }
 
@@ -69,7 +70,11 @@ impl LocalDriver {
             nick: config.nick.to_string(),
             username: config.username.to_string(),
             realname: config.realname.as_str().to_string(),
-            autojoin: config.autojoin.iter().map(ToString::to_string).collect(),
+            autojoin: config
+                .autojoin
+                .iter()
+                .map(|entry| (entry.channel().to_string(), entry.key().cloned()))
+                .collect(),
             buffer_cap: config.buffer_cap,
         }
     }
@@ -101,7 +106,8 @@ struct LocalSession {
     nick: String,
     username: String,
     realname: String,
-    autojoin: Vec<String>,
+    /// The channels to join, keyed ones with their keys, as `JOIN` takes them.
+    autojoin: Vec<(String, Option<ChannelKey>)>,
 }
 
 async fn run(session: LocalSession, mut ends: DriverEnds) {
@@ -302,12 +308,7 @@ async fn drive_session(
     // the in-process session is a registered non-oper client of the core, so
     // one JOIN per channel would spend the command-flood burst on a long
     // autojoin list and be closed with Excess Flood before it finished.
-    let autojoin: Vec<(String, Option<super::upstream_identity::ChannelKey>)> = session
-        .autojoin
-        .iter()
-        .map(|channel| (channel.clone(), None))
-        .collect();
-    for line in super::irc_driver::join_lines(&autojoin) {
+    for line in super::irc_driver::join_lines(&session.autojoin) {
         if !say(core, conn, line).await {
             return Stopped;
         }
@@ -480,7 +481,10 @@ mod tests {
             nick: "alice".into(),
             username: "ident".into(),
             realname: "Alice".into(),
-            autojoin,
+            autojoin: autojoin
+                .into_iter()
+                .map(|channel| (channel, None))
+                .collect(),
         };
         let (handle, mut ends) = NetworkHandle::channels(8);
         let events = handle.subscribe();

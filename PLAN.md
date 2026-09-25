@@ -781,7 +781,13 @@ attached clients found, and this change fixes:
   `STATUSMSG`; stored conversations keep their spelling and are keyed and
   re-keyed under the network's mapping (migration 0076), and TARGETS names them
   as spelled. Read markers keep their spelling and mapping too and are re-keyed
-  the same way (migration 0083).
+  the same way (migration 0086).
+- **A keyed channel could not be autojoined.** Only a key a client joined with
+  or a `+k` the driver saw was remembered, in memory, so a restart lost it and
+  the channel was answered with 475. An account network's autojoin entry now
+  takes a key (`#staff key`), stored sealed (migration 0087), write-only over
+  the API with an explicit keep action, never carried to a new destination,
+  and edited in the network dialog.
 - **Replay and CHATHISTORY disagreed on time** on networks without
   `server-time`: every line is stamped when it is taken in.
 - **Echoes**: a message to several targets is echoed per target, an echo the

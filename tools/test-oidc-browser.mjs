@@ -1616,6 +1616,7 @@ try {
             username: "webident",
             realname: null,
             autojoin: [],
+            autojoin_keyed: [],
             sasl_account: null,
             has_sasl_account: false,
             has_sasl_password: false,

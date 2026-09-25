@@ -51,8 +51,8 @@ pub(crate) use serve::{MutationLane, UnwrittenLines};
 #[cfg(feature = "slack")]
 pub use slack::{SlackConfig, SlackDriver};
 pub use upstream_identity::{
-    ConfirmedChannel, UpstreamChannel, UpstreamIdentityError, UpstreamNick, UpstreamRealname,
-    UpstreamUsername,
+    AutojoinChannel, AutojoinEntry, ConfirmedChannel, UpstreamChannel, UpstreamIdentityError,
+    UpstreamNick, UpstreamRealname, UpstreamUsername,
 };
 
 /// The ISUPPORT a network is described with when it has reported nothing of
@@ -251,7 +251,9 @@ pub struct DriverSpec {
     pub username: Option<String>,
     /// Required for `kind=irc`; empty for a bridge.
     pub realname: String,
-    pub autojoin: Vec<String>,
+    /// The channels (a bridge's rooms or channel ids) to join, plaintext. Only
+    /// an IRC channel has a key; a bridge's entry carrying one is refused.
+    pub autojoin: Vec<AutojoinEntry>,
     pub buffer_cap: usize,
     pub sasl_account: Option<String>,
     pub sasl_password: Option<String>,
@@ -315,6 +317,16 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
             kind.as_db_str()
         ));
     }
+    if kind.is_bridge() && autojoin.iter().any(|entry| entry.key.is_some()) {
+        return Err(format!(
+            "kind={} does not accept channel keys; they apply only to IRC networks",
+            kind.as_db_str()
+        ));
+    }
+    // What a bridge joins is a provider's room or channel id, which has no key.
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    let bridged =
+        || -> Vec<String> { autojoin.iter().map(|entry| entry.channel.clone()).collect() };
     match kind {
         // The Irc arm uses every parameter but the network's identity, so they
         // are never "unused" even in a build with no bridge features — the
@@ -362,7 +374,7 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
                 nick: nick.parse().map_err(identity_error)?,
                 username: username.parse().map_err(identity_error)?,
                 realname: realname.parse().map_err(identity_error)?,
-                autojoin: UpstreamChannel::parse_list(&autojoin).map_err(identity_error)?,
+                autojoin: AutojoinChannel::parse_list(&autojoin).map_err(identity_error)?,
                 buffer_cap,
                 sasl,
                 server_password,
@@ -394,7 +406,7 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
                     homeserver: addr,
                     user: nick,
                     password,
-                    rooms: autojoin,
+                    rooms: bridged(),
                     buffer_cap,
                     internal_upstreams,
                 })))
@@ -422,7 +434,7 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
                 Ok(Box::new(DiscordDriver::new(DiscordConfig {
                     token,
                     api_base: addr,
-                    channels: autojoin,
+                    channels: bridged(),
                     buffer_cap,
                     internal_upstreams,
                 })))
@@ -449,7 +461,7 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
                     bot_token,
                     app_token,
                     api_base: addr,
-                    channels: autojoin,
+                    channels: bridged(),
                     buffer_cap,
                     internal_upstreams,
                 })))
@@ -464,8 +476,9 @@ pub fn build_driver(spec: DriverSpec) -> Result<Box<dyn NetworkDriver>, String> 
 }
 
 /// Build the driver for a persisted network row, unsealing its stored secrets
-/// per kind: the password (`sasl_password_sealed`) and the IRC server password
-/// (`server_password_sealed`) are always sealed, and for a
+/// per kind: the password (`sasl_password_sealed`), the IRC server password
+/// (`server_password_sealed`) and each autojoin channel's key are always
+/// sealed, and for a
 /// kind whose *account* field carries a secret (Slack's bot token) that is
 /// sealed too — an IRC `sasl_account` is a public name and stays plaintext.
 pub fn driver_from_row(
@@ -498,6 +511,16 @@ pub fn driver_from_row(
         Some(sealed) => Some(unseal(sealed)?),
         None => None,
     };
+    let autojoin = row
+        .autojoin
+        .iter()
+        .map(|entry| {
+            Ok(AutojoinEntry {
+                channel: entry.channel.clone(),
+                key: entry.key_sealed.as_deref().map(unseal).transpose()?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let realname = match row.kind {
         crate::config::NetworkKind::Irc => row.realname.clone().ok_or_else(|| {
             "kind=irc stored network has no realname; update the network configuration".to_string()
@@ -518,7 +541,7 @@ pub fn driver_from_row(
         nick: row.nick.clone(),
         username: row.username.clone(),
         realname,
-        autojoin: row.autojoin.clone(),
+        autojoin,
         buffer_cap: DB_NETWORK_BUFFER_CAP,
         sasl_account: account,
         sasl_password: password,
@@ -6684,6 +6707,49 @@ mod tests {
         })
         .err()
         .expect("invalid driver configuration should be rejected")
+    }
+
+    /// A channel key is a `JOIN` parameter of an IRC channel: a bridge's rooms
+    /// and channel ids have none, and a key that is not one parameter is
+    /// refused before a driver exists, never shown in the refusal.
+    #[test]
+    fn a_channel_key_is_irc_only_and_one_parameter() {
+        use crate::config::NetworkKind;
+        let spec = |kind: NetworkKind, addr: &str, nick: &str, key: &str| DriverSpec {
+            kind,
+            owner: Some("owner".into()),
+            name: "network".into(),
+            addr: addr.into(),
+            tls: true,
+            nick: nick.into(),
+            username: (kind == NetworkKind::Irc).then(|| "ident".into()),
+            realname: nick.into(),
+            autojoin: vec![AutojoinEntry {
+                channel: "#staff".into(),
+                key: Some(key.into()),
+            }],
+            buffer_cap: 16,
+            sasl_account: None,
+            sasl_password: (kind != NetworkKind::Irc).then(|| "token".into()),
+            server_password: None,
+            internal_upstreams: crate::egress::InternalUpstreams::Refuse,
+            first_dial: FirstDial::Immediate,
+        };
+        let error = build_driver(spec(NetworkKind::Discord, "", "", "k3y"))
+            .err()
+            .expect("a bridge takes no key");
+        assert!(error.contains("does not accept channel keys"), "{error}");
+        let error = build_driver(spec(
+            NetworkKind::Irc,
+            "irc.example:6697",
+            "alice",
+            "two words",
+        ))
+        .err()
+        .expect("a key is one parameter");
+        assert!(error.contains("autojoin keys must be one word"), "{error}");
+        assert!(!error.contains("two words"), "{error}");
+        assert!(build_driver(spec(NetworkKind::Irc, "irc.example:6697", "alice", "k3y")).is_ok());
     }
 
     /// A server password is an IRC connection's `PASS`: a bridge has no such

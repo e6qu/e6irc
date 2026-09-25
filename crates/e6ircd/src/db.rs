@@ -55,6 +55,8 @@ pub enum DbError {
     DuplicateNetwork(String),
     /// A persisted BNC network kind is outside the closed driver-kind set.
     InvalidNetworkKind(String),
+    /// A persisted BNC network's autojoin channels and keys do not pair up.
+    InvalidNetworkAutojoin(String),
     /// Persisted server settings do not decode into the closed typed schema.
     InvalidServerSettings(String),
     /// A database-wide secret re-seal could not prove every value readable.
@@ -136,6 +138,10 @@ impl std::fmt::Display for DbError {
             Self::InvalidNetworkKind(kind) => {
                 write!(f, "invalid persisted BNC network kind: {kind}")
             }
+            Self::InvalidNetworkAutojoin(network) => write!(
+                f,
+                "persisted BNC network {network} has autojoin keys that do not pair with its channels"
+            ),
             Self::InvalidServerSettings(error) => {
                 write!(f, "invalid persisted server settings: {error}")
             }
@@ -6138,6 +6144,12 @@ pub async fn begin_account_export(
                     'username', n.username,
                     'realname', n.realname,
                     'autojoin', n.autojoin,
+                    'autojoin_keyed', COALESCE((
+                        SELECT jsonb_agg(entry.channel ORDER BY entry.position)
+                        FROM unnest(n.autojoin, n.autojoin_keys_sealed)
+                             WITH ORDINALITY AS entry(channel, key_sealed, position)
+                        WHERE entry.key_sealed IS NOT NULL
+                    ), '[]'::jsonb),
                     'sasl_account', n.sasl_account,
                     'has_sasl_password', n.sasl_password_sealed IS NOT NULL,
                     'has_server_password', n.server_password_sealed IS NOT NULL,
@@ -7483,9 +7495,48 @@ pub async fn set_local_password(
 
 // ---- per-account BNC networks (DESIGN §10.3) ----------------------------
 
-/// A stored per-account BNC network. `sasl_password_sealed` and
-/// `server_password_sealed` are sealed blobs (or `None`); the caller opens
-/// them with the master key before starting the driver.
+/// One stored autojoin entry: a channel (or a bridge's room or channel id) and,
+/// for an IRC channel, its key sealed like every stored upstream secret. The
+/// key is write-only: its `Debug` says only whether one is stored.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BncAutojoin {
+    pub channel: String,
+    pub key_sealed: Option<String>,
+}
+
+impl From<&str> for BncAutojoin {
+    /// A channel joined without a key.
+    fn from(channel: &str) -> Self {
+        Self {
+            channel: channel.to_string(),
+            key_sealed: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for BncAutojoin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BncAutojoin")
+            .field("channel", &self.channel)
+            .field("key_sealed", &self.key_sealed.as_ref().map(|_| "<sealed>"))
+            .finish()
+    }
+}
+
+/// Split autojoin entries into the two parallel columns they are stored in
+/// (`autojoin`, `autojoin_keys_sealed`), whose lengths a table CHECK holds
+/// equal.
+fn autojoin_columns(autojoin: &[BncAutojoin]) -> (Vec<String>, Vec<Option<String>>) {
+    autojoin
+        .iter()
+        .map(|entry| (entry.channel.clone(), entry.key_sealed.clone()))
+        .unzip()
+}
+
+/// A stored per-account BNC network. `sasl_password_sealed`,
+/// `server_password_sealed` and each autojoin key are sealed blobs (or
+/// `None`); the caller opens them with the master key before starting the
+/// driver.
 #[derive(Debug, Clone)]
 pub struct BncNetworkRow {
     /// Which driver backs this network (`irc` for a plain upstream, or a
@@ -7498,7 +7549,7 @@ pub struct BncNetworkRow {
     /// The IRC `USER` name. Present exactly for `kind = irc` (a table CHECK).
     pub username: Option<String>,
     pub realname: Option<String>,
-    pub autojoin: Vec<String>,
+    pub autojoin: Vec<BncAutojoin>,
     pub sasl_account: Option<String>,
     pub sasl_password_sealed: Option<String>,
     /// The sealed IRC server password (`PASS`). Only `kind = irc` carries one
@@ -7519,6 +7570,19 @@ fn stored_network_kind(kind: &str) -> Result<crate::config::NetworkKind, DbError
 fn bnc_row(row: &sqlx::postgres::PgRow) -> Result<BncNetworkRow, DbError> {
     use sqlx::Row;
     let kind = row.get::<String, _>("kind");
+    let channels: Vec<String> = row.get("autojoin");
+    let keys: Vec<Option<String>> = row.get("autojoin_keys_sealed");
+    if channels.len() != keys.len() {
+        return Err(DbError::InvalidNetworkAutojoin(row.get("name")));
+    }
+    let autojoin = channels
+        .into_iter()
+        .zip(keys)
+        .map(|(channel, key_sealed)| BncAutojoin {
+            channel,
+            key_sealed,
+        })
+        .collect();
     Ok(BncNetworkRow {
         kind: stored_network_kind(&kind)?,
         name: row.get("name"),
@@ -7528,7 +7592,7 @@ fn bnc_row(row: &sqlx::postgres::PgRow) -> Result<BncNetworkRow, DbError> {
         username: row.get("username"),
         realname: row.get("realname"),
         enabled: row.get("enabled"),
-        autojoin: row.get("autojoin"),
+        autojoin,
         sasl_account: row.get("sasl_account"),
         sasl_password_sealed: row.get("sasl_password_sealed"),
         server_password_sealed: row.get("server_password_sealed"),
@@ -7541,7 +7605,8 @@ fn bnc_row(row: &sqlx::postgres::PgRow) -> Result<BncNetworkRow, DbError> {
 macro_rules! bnc_network_columns {
     () => {
         "n.name, n.addr, n.tls, n.nick, n.username, n.realname, n.autojoin, \
-         n.sasl_account, n.sasl_password_sealed, n.server_password_sealed, n.enabled, n.kind"
+         n.autojoin_keys_sealed, n.sasl_account, n.sasl_password_sealed, \
+         n.server_password_sealed, n.enabled, n.kind"
     };
 }
 
@@ -7606,12 +7671,13 @@ pub async fn create_bnc_network(
     if count >= MAX_BNC_NETWORKS_PER_ACCOUNT {
         return Err(DbError::TooManyNetworks);
     }
+    let (autojoin, autojoin_keys) = autojoin_columns(&net.autojoin);
     let id = sqlx::query_scalar(
         "INSERT INTO bnc_networks
            (account_id, name, addr, tls, nick, realname, autojoin,
             sasl_account, sasl_password_sealed, kind, enabled, username,
-            server_password_sealed)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            server_password_sealed, autojoin_keys_sealed)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
          ON CONFLICT (account_id, lower(name)) DO NOTHING
          RETURNING id",
     )
@@ -7621,13 +7687,14 @@ pub async fn create_bnc_network(
     .bind(net.tls)
     .bind(&net.nick)
     .bind(&net.realname)
-    .bind(&net.autojoin)
+    .bind(&autojoin)
     .bind(&net.sasl_account)
     .bind(&net.sasl_password_sealed)
     .bind(net.kind.as_db_str())
     .bind(net.enabled)
     .bind(&net.username)
     .bind(&net.server_password_sealed)
+    .bind(&autojoin_keys)
     .fetch_optional(&mut *tx)
     .await
     .map_err(query_error)?
@@ -7758,12 +7825,13 @@ pub async fn update_bnc_network(
     audit: NetworkAudit<'_>,
 ) -> Result<bool, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
+    let (autojoin, autojoin_keys) = autojoin_columns(&network.autojoin);
     let mut transaction = pool.begin().await.map_err(query_error)?;
     let stored: Option<String> = sqlx::query_scalar(
         "UPDATE bnc_networks n
          SET addr = $3, tls = $4, nick = $5, realname = $6, autojoin = $7,
              sasl_account = $8, sasl_password_sealed = $9, username = $10,
-             server_password_sealed = $11
+             server_password_sealed = $11, autojoin_keys_sealed = $12
          FROM accounts a
          WHERE n.account_id = a.id AND a.name_folded = $1 AND lower(n.name) = lower($2)
          RETURNING n.name",
@@ -7774,11 +7842,12 @@ pub async fn update_bnc_network(
     .bind(network.tls)
     .bind(&network.nick)
     .bind(&network.realname)
-    .bind(&network.autojoin)
+    .bind(&autojoin)
     .bind(&network.sasl_account)
     .bind(&network.sasl_password_sealed)
     .bind(&network.username)
     .bind(&network.server_password_sealed)
+    .bind(&autojoin_keys)
     .fetch_optional(&mut *transaction)
     .await
     .map_err(query_error)?;

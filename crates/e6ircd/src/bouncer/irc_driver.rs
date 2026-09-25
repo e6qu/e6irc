@@ -12,7 +12,7 @@ use e6irc_client::{Connection, NetworkNames, OwnedMessage, RelayEvent};
 
 use super::replies::{Correlation, ReplyRouter, Upstream};
 use super::upstream_identity::{
-    ChannelKey, ConfirmedChannel, UpstreamChannel, UpstreamNick, UpstreamRealname, UpstreamUsername,
+    AutojoinChannel, ChannelKey, ConfirmedChannel, UpstreamNick, UpstreamRealname, UpstreamUsername,
 };
 use super::{ClientTags, ConnectionEvent, DriverEnds, NetworkHandle};
 
@@ -27,8 +27,8 @@ pub struct NetworkConfig {
     /// The `USER` name (ident), exactly as sent. Never derived from the nick.
     pub username: UpstreamUsername,
     pub realname: UpstreamRealname,
-    /// Channels to auto-join after registering.
-    pub autojoin: Vec<UpstreamChannel>,
+    /// Channels to auto-join after registering, keyed ones with their keys.
+    pub autojoin: Vec<AutojoinChannel>,
     /// Detached buffer capacity.
     pub buffer_cap: usize,
     /// SASL PLAIN credentials for the upstream, when it requires auth.
@@ -95,8 +95,9 @@ pub struct IrcNetwork;
 /// casing kept. `connect_once` joins the configured autojoin plus everything
 /// here, so channels joined at runtime (not just the static config) are
 /// restored after a drop — the behaviour ZNC/soju users rely on. In-memory
-/// only, keys included: a process restart legitimately falls back to the
-/// configured autojoin, which is the operator-declared floor.
+/// only, learned keys included: a process restart legitimately falls back to
+/// the configured autojoin, with its configured keys, which is the owner's
+/// declared floor.
 #[derive(Debug, Default)]
 pub struct JoinedChannels(std::sync::Mutex<Intent>);
 
@@ -209,23 +210,27 @@ impl JoinedChannels {
 
     /// The configured autojoin plus every channel the upstream confirmed
     /// before the drop, with the keys they were joined with. Autojoin wins on
-    /// a fold-collision: its casing is the operator's.
-    fn rejoin(&self, autojoin: &[UpstreamChannel]) -> Vec<(String, Option<ChannelKey>)> {
+    /// a fold-collision: its casing is the owner's. A configured channel is
+    /// joined with the key it was last seen with (a `+k` since, or the key a
+    /// client joined it with), and otherwise with its configured key.
+    fn rejoin(&self, autojoin: &[AutojoinChannel]) -> Vec<(String, Option<ChannelKey>)> {
         let intent = self.0.lock().expect("joined set poisoned");
         let names = &intent.names;
         let mut list: Vec<(String, Option<ChannelKey>)> = autojoin
             .iter()
-            .map(|channel| {
+            .map(|configured| {
+                let channel = configured.channel().as_str();
                 let key = intent
                     .channels
-                    .get(&names.fold(channel.as_str()))
-                    .and_then(|intended| intended.key.clone());
+                    .get(&names.fold(channel))
+                    .and_then(|intended| intended.key.clone())
+                    .or_else(|| configured.key().cloned());
                 (channel.to_string(), key)
             })
             .collect();
         let configured: std::collections::HashSet<String> = autojoin
             .iter()
-            .map(|channel| names.fold(channel.as_str()))
+            .map(|configured| names.fold(configured.channel().as_str()))
             .collect();
         list.extend(
             intent
@@ -1915,6 +1920,32 @@ pub(super) mod tests {
                 .iter()
                 .all(|(channel, _)| channel != "#Priv")
         );
+    }
+
+    /// A configured key joins its channel after every connect, including the
+    /// first one after a restart, when nothing was learned yet; a key seen
+    /// since (a `+k`) is the one the channel is rejoined with.
+    #[test]
+    fn a_configured_key_joins_its_channel_until_another_is_seen() {
+        let configured: Vec<AutojoinChannel> = ["#staff hunter2", "#open"]
+            .iter()
+            .map(|entry| entry.parse().expect("an autojoin entry"))
+            .collect();
+        let joined = JoinedChannels::default();
+        let rejoin = joined.rejoin(&configured);
+        assert_eq!(join_lines(&rejoin), ["JOIN #staff,#open hunter2"]);
+        joined
+            .apply(
+                confirmed(&["#staff".into(), "#open".into()]),
+                &NetworkNames::default(),
+            )
+            .expect("fits");
+        joined.set_key("#STAFF", ChannelKey::parse("rotated"));
+        assert_eq!(
+            join_lines(&joined.rejoin(&configured)),
+            ["JOIN #staff,#open rotated"]
+        );
+        assert!(!format!("{configured:?}").contains("hunter2"));
     }
 
     /// A key's place among a MODE line's parameters is decided by which modes

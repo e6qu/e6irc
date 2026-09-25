@@ -3,7 +3,7 @@
 //! Each of these is interpolated into a registration or `JOIN` line, so a
 //! string that merely passed a length check could still change the *shape* of
 //! that line: `NICK al ice` carries two parameters, `JOIN 0` leaves every
-//! channel, `JOIN #a key` supplies a key nobody configured. Holding them as
+//! channel, `JOIN #a,#b` joins two. Holding them as
 //! types built only by [`std::str::FromStr`] means the configuration file, a
 //! stored row, and the API cannot differ in what they admit, and the driver
 //! cannot be handed a value that was never checked (DESIGN §2).
@@ -201,22 +201,9 @@ pub struct UpstreamChannel(String);
 
 impl UpstreamChannel {
     pub const MAX_BYTES: usize = 64;
-    /// Most channels a network may be configured to join.
-    pub const MAX_CONFIGURED: usize = 64;
 
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-
-    /// Parse a whole configured list, bounding its length as well as each name.
-    pub fn parse_list<S: AsRef<str>>(values: &[S]) -> Result<Vec<Self>, UpstreamIdentityError> {
-        if values.len() > Self::MAX_CONFIGURED {
-            return Err(UpstreamIdentityError {
-                field: "autojoin",
-                reason: "is limited to 64 channels",
-            });
-        }
-        values.iter().map(|value| value.as_ref().parse()).collect()
     }
 }
 
@@ -294,17 +281,19 @@ impl ConfirmedChannel {
     }
 }
 
-/// The key of a keyed channel (`+k`), as a client joined it with or the
-/// channel was since set to, so the driver can rejoin it after a reconnect.
-/// A secret of the channel's members: it is kept in memory only, beside the
-/// reconnect intent, and never shown — its `Debug` is redacted, so no log or
-/// panic message can carry it.
+/// The key of a keyed channel (`+k`): as the owner configured it for an
+/// autojoin channel, or as a client joined it with or the channel was since
+/// set to, so the driver can join it and rejoin it after a reconnect. A secret
+/// of the channel's members: a configured one is stored sealed (DESIGN §10),
+/// a learned one is kept in memory only, beside the reconnect intent, and
+/// neither is ever shown — its `Debug` is redacted, so no log or panic message
+/// can carry it.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ChannelKey(String);
 
 impl ChannelKey {
     /// The longest key kept: longer than any server's `KEYLEN`.
-    const MAX_BYTES: usize = 100;
+    pub(crate) const MAX_BYTES: usize = 100;
 
     /// `None` for what cannot be one key parameter of a `JOIN` line.
     pub(crate) fn parse(value: &str) -> Option<Self> {
@@ -323,6 +312,112 @@ impl ChannelKey {
 impl fmt::Debug for ChannelKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ChannelKey(<redacted>)")
+    }
+}
+
+/// One configured autojoin entry in plaintext, before it is parsed: a channel
+/// (or a bridge's room or channel id) and, for an IRC channel, the key it is
+/// joined with. This is the form a request states and a stored row opens to;
+/// only [`AutojoinChannel`] reaches a driver. Its `Debug` never shows the key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AutojoinEntry {
+    pub channel: String,
+    pub key: Option<String>,
+}
+
+impl AutojoinEntry {
+    /// Most entries a network may be configured to join.
+    pub const MAX_CONFIGURED: usize = 64;
+
+    /// A channel joined without a key.
+    pub fn unkeyed(channel: impl Into<String>) -> Self {
+        Self {
+            channel: channel.into(),
+            key: None,
+        }
+    }
+
+    /// An entry as a request writes it: `#channel`, or `#channel key` for a
+    /// keyed one — the two parameters of `JOIN`, in the order `JOIN` takes
+    /// them. Whether the key is one parameter is [`AutojoinChannel`]'s to say.
+    pub fn from_submitted(value: &str) -> Self {
+        match value.split_once(' ') {
+            Some((channel, key)) => Self {
+                channel: channel.to_string(),
+                key: Some(key.to_string()),
+            },
+            None => Self::unkeyed(value),
+        }
+    }
+}
+
+impl fmt::Debug for AutojoinEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AutojoinEntry")
+            .field("channel", &self.channel)
+            .field("key", &self.key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// A configured channel the IRC driver joins after registering, with the key
+/// it is joined with when it is keyed. Built only from an [`AutojoinEntry`]
+/// (or its request form, by [`FromStr`]), so the key is one `JOIN` parameter
+/// and the channel one channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutojoinChannel {
+    channel: UpstreamChannel,
+    key: Option<ChannelKey>,
+}
+
+impl AutojoinChannel {
+    pub fn channel(&self) -> &UpstreamChannel {
+        &self.channel
+    }
+
+    pub(crate) fn key(&self) -> Option<&ChannelKey> {
+        self.key.as_ref()
+    }
+
+    /// Parse one plaintext entry.
+    pub fn from_entry(entry: &AutojoinEntry) -> Result<Self, UpstreamIdentityError> {
+        let key = entry
+            .key
+            .as_deref()
+            .map(|key| {
+                ChannelKey::parse(key).ok_or(UpstreamIdentityError {
+                    field: "autojoin",
+                    reason: "keys must be one word each, of at most 100 bytes, without commas, \
+                             control characters, or a leading ':'",
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            channel: entry.channel.parse()?,
+            key,
+        })
+    }
+
+    /// Parse a whole configured list, bounding its length as well as each
+    /// entry.
+    pub fn parse_list(entries: &[AutojoinEntry]) -> Result<Vec<Self>, UpstreamIdentityError> {
+        if entries.len() > AutojoinEntry::MAX_CONFIGURED {
+            return Err(UpstreamIdentityError {
+                field: "autojoin",
+                reason: "is limited to 64 channels",
+            });
+        }
+        entries.iter().map(Self::from_entry).collect()
+    }
+}
+
+impl FromStr for AutojoinChannel {
+    type Err = UpstreamIdentityError;
+
+    /// `#channel` or `#channel key`, as [`AutojoinEntry::from_submitted`]
+    /// reads a request.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::from_entry(&AutojoinEntry::from_submitted(value))
     }
 }
 
@@ -536,15 +631,61 @@ mod tests {
 
     #[test]
     fn a_configured_list_is_bounded_and_fails_on_its_first_bad_name() {
-        let many: Vec<String> = (0..64).map(|n| format!("#c{n}")).collect();
-        assert_eq!(UpstreamChannel::parse_list(&many).expect("64").len(), 64);
-        let too_many: Vec<String> = (0..65).map(|n| format!("#c{n}")).collect();
+        let many: Vec<AutojoinEntry> = (0..64)
+            .map(|n| AutojoinEntry::unkeyed(format!("#c{n}")))
+            .collect();
+        assert_eq!(AutojoinChannel::parse_list(&many).expect("64").len(), 64);
+        let too_many: Vec<AutojoinEntry> = (0..65)
+            .map(|n| AutojoinEntry::unkeyed(format!("#c{n}")))
+            .collect();
         assert_eq!(
-            UpstreamChannel::parse_list(&too_many)
+            AutojoinChannel::parse_list(&too_many)
                 .expect_err("65")
                 .reason(),
             "is limited to 64 channels"
         );
-        assert!(UpstreamChannel::parse_list(&["#ok", "0"]).is_err());
+        assert!(
+            AutojoinChannel::parse_list(&[
+                AutojoinEntry::unkeyed("#ok"),
+                AutojoinEntry::unkeyed("0")
+            ])
+            .is_err()
+        );
+    }
+
+    /// An autojoin entry is the two `JOIN` parameters in `JOIN`'s order: one
+    /// channel, then optionally one key. The key is a secret and never shown.
+    #[test]
+    fn an_autojoin_entry_is_a_channel_and_optionally_one_key() {
+        let keyed: AutojoinChannel = "#staff hunter2".parse().expect("a keyed channel");
+        assert_eq!(keyed.channel().as_str(), "#staff");
+        assert_eq!(keyed.key().map(ChannelKey::as_str), Some("hunter2"));
+        assert!(!format!("{keyed:?}").contains("hunter2"));
+        let entry = AutojoinEntry::from_submitted("#staff hunter2");
+        assert!(!format!("{entry:?}").contains("hunter2"));
+        let open: AutojoinChannel = "#open".parse().expect("an open channel");
+        assert_eq!(open.key(), None);
+        for (bad, reason) in [
+            ("#a two words", "keys must be one word each"),
+            ("#a k,ey", "keys must be one word each"),
+            ("#a :key", "keys must be one word each"),
+            ("#a ", "keys must be one word each"),
+            ("0 key", "names must begin with #, &, + or !"),
+            ("#a,#b key", "names must be one word each"),
+        ] {
+            let error = bad.parse::<AutojoinChannel>().expect_err(bad);
+            assert_eq!(error.field(), "autojoin", "{bad:?}");
+            assert!(error.reason().starts_with(reason), "{bad:?}: {error}");
+        }
+        assert!(
+            format!("#a {}", "k".repeat(100))
+                .parse::<AutojoinChannel>()
+                .is_ok()
+        );
+        assert!(
+            format!("#a {}", "k".repeat(101))
+                .parse::<AutojoinChannel>()
+                .is_err()
+        );
     }
 }

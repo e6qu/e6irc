@@ -2863,7 +2863,13 @@ async fn bnc_networks_crud() {
     assert_eq!(alice_nets.len(), 1);
     assert_eq!(alice_nets[0].name, "libera");
     assert_eq!(alice_nets[0].kind, e6ircd::config::NetworkKind::Irc);
-    assert_eq!(alice_nets[0].autojoin, vec!["#rust", "#e6irc"]);
+    assert_eq!(
+        alice_nets[0].autojoin,
+        [
+            db::BncAutojoin::from("#rust"),
+            db::BncAutojoin::from("#e6irc")
+        ]
+    );
     assert_eq!(
         alice_nets[0].sasl_password_sealed.as_deref(),
         Some("enc:v1:abc")
@@ -3662,7 +3668,7 @@ async fn bnc_read_markers_follow_the_networks_case_mapping() {
     );
 }
 
-/// Migration 0083 names every stored read marker from what the backlog knows:
+/// Migration 0086 names every stored read marker from what the backlog knows:
 /// the spelling and mapping of the newest stored line of its conversation, or,
 /// with none left, its own key under the mapping the network last used.
 #[tokio::test]
@@ -3722,6 +3728,80 @@ async fn read_marker_display_migration_backfills_from_the_backlog() {
             ("#dev[m]", "#Dev[m]", "ascii"),
             ("#gone[", "#gone[", "ascii"),
         ]
+    );
+}
+
+/// Migration 0087 gives every stored network one (absent) key per autojoin
+/// channel, and the table holds the two lists to one length and keys to IRC
+/// networks, so a key cannot be stored beside the wrong channel or on a bridge.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn autojoin_key_migration_pairs_every_channel_with_no_key() {
+    let url = support::test_db("autojoin_key_migration").await;
+    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    MIGRATIONS
+        .run_to(86, &pool)
+        .await
+        .expect("migrate through 0086");
+    let account: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (name, name_folded) VALUES ('alice', 'alice') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("account");
+    sqlx::query(
+        "INSERT INTO bnc_networks (account_id, name, addr, nick, username, kind, autojoin)
+         VALUES ($1, 'libera', 'irc.example:6697', 'alice', 'alice', 'irc', '{#a,#b}'),
+                ($1, 'quiet', 'irc.example:6697', 'alice', 'alice', 'irc', '{}')",
+    )
+    .bind(account)
+    .execute(&pool)
+    .await
+    .expect("networks");
+    MIGRATIONS.run(&pool).await.expect("migrate");
+    let keys: Vec<(String, Vec<Option<String>>)> =
+        sqlx::query_as("SELECT name, autojoin_keys_sealed FROM bnc_networks ORDER BY name")
+            .fetch_all(&pool)
+            .await
+            .expect("keys");
+    assert_eq!(
+        keys,
+        [
+            ("libera".to_string(), vec![None, None]),
+            ("quiet".to_string(), vec![]),
+        ]
+    );
+    let refused_by = |result: Result<sqlx::postgres::PgQueryResult, sqlx::Error>| {
+        result
+            .err()
+            .and_then(|error| error.into_database_error())
+            .and_then(|error| error.constraint().map(str::to_string))
+    };
+    assert_eq!(
+        refused_by(
+            sqlx::query(
+                "UPDATE bnc_networks SET autojoin_keys_sealed = '{x}' WHERE name = 'libera'"
+            )
+            .execute(&pool)
+            .await
+        )
+        .as_deref(),
+        Some("bnc_networks_autojoin_keys_paired")
+    );
+    assert_eq!(
+        refused_by(
+            sqlx::query(
+                "INSERT INTO bnc_networks
+                     (account_id, name, addr, nick, kind, autojoin, autojoin_keys_sealed,
+                      sasl_password_sealed)
+                 VALUES ($1, 'bot', '', '', 'discord', '{123}', '{x}', 'enc:v1:t')",
+            )
+            .bind(account)
+            .execute(&pool)
+            .await
+        )
+        .as_deref(),
+        Some("bnc_networks_autojoin_keys_irc_only")
     );
 }
 
@@ -6270,7 +6350,13 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
         nick: "alice".into(),
         username: Some("alice".into()),
         realname: Some("Alice".into()),
-        autojoin: vec![],
+        autojoin: vec![
+            db::BncAutojoin {
+                channel: "#staff".into(),
+                key_sealed: Some(old.seal("channel-key", &owner_context)),
+            },
+            "#open".into(),
+        ],
         sasl_account: None,
         sasl_password_sealed: None,
         server_password_sealed: Some(old.seal("account-pass", &owner_context)),
@@ -6298,7 +6384,7 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
         report,
         db::SecretRotationReport {
             managed_config_secrets: 5,
-            account_network_secrets: 3,
+            account_network_secrets: 4,
         }
     );
 
@@ -6331,6 +6417,17 @@ async fn secret_rotation_reseals_every_database_secret_atomically() {
         "account-pass",
         "an account network's server password is resealed"
     );
+    assert_eq!(
+        new_verifier
+            .open(
+                rotated_private.autojoin[0].key_sealed.as_deref().unwrap(),
+                &owner_context,
+            )
+            .unwrap(),
+        "channel-key",
+        "an account network's channel key is resealed"
+    );
+    assert_eq!(rotated_private.autojoin[1], db::BncAutojoin::from("#open"));
     let managed_pass = rotated.settings.networks[1]
         .server_password
         .as_deref()
@@ -7930,9 +8027,10 @@ async fn account_export_and_security_activity_are_owner_scoped_and_secret_free()
     sqlx::query(
         "INSERT INTO bnc_networks
             (account_id, name, addr, tls, nick, username, sasl_account, sasl_password_sealed,
-             server_password_sealed)
+             server_password_sealed, autojoin, autojoin_keys_sealed)
          VALUES ($1, 'libera', 'irc.libera.chat:6697', true, 'Alice', 'alice',
-                 'alice', 'enc:v1:must-not-export', 'enc:v2:server-password-must-not-export')",
+                 'alice', 'enc:v1:must-not-export', 'enc:v2:server-password-must-not-export',
+                 '{#rust,#staff}', ARRAY[NULL, 'enc:v2:channel-key-must-not-export'])",
     )
     .bind(alice_id)
     .execute(&pool)
@@ -7982,6 +8080,15 @@ async fn account_export_and_security_activity_are_owner_scoped_and_secret_free()
     assert_eq!(value["networks"][0]["has_sasl_password"], true);
     assert_eq!(value["networks"][0]["has_server_password"], true);
     assert!(!export.contains("server-password-must-not-export"));
+    assert_eq!(
+        value["networks"][0]["autojoin"],
+        serde_json::json!(["#rust", "#staff"])
+    );
+    assert_eq!(
+        value["networks"][0]["autojoin_keyed"],
+        serde_json::json!(["#staff"])
+    );
+    assert!(!export.contains("channel-key-must-not-export"));
     assert_eq!(
         value["messages"][0]["message_id"], "alice-sent",
         "a channel message is stored under the display name and is still the account's"

@@ -376,16 +376,21 @@ fn operations() -> serde_json::Value {
         "maxLength": e6irc_client::ServerPassword::MAX_LEN, "writeOnly": true,
         "description": "The network's connection password, sent as PASS before registration; only for a private server that requires one. Stored sealed; never returned."
     });
+    let irc_autojoin_schema = serde_json::json!({
+        "type": "array", "maxItems": 64, "items": { "type": "string" },
+        "description": "Channels to join, each `#channel`, or `#channel key` for a keyed one. A key is stored sealed and never returned (see autojoin_keyed); a bridge's entries take none."
+    });
     let network_response_schema = serde_json::json!({
         "type": "object", "additionalProperties": false,
-        "required": ["name", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "sasl_account", "has_sasl_account", "has_sasl_password", "has_server_password", "enabled", "connected", "runtime"],
+        "required": ["name", "kind", "addr", "tls", "nick", "username", "realname", "autojoin", "autojoin_keyed", "sasl_account", "has_sasl_account", "has_sasl_password", "has_server_password", "enabled", "connected", "runtime"],
         "properties": {
             "name": { "type": "string", "minLength": 1 },
             "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] },
             "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" },
             "username": { "type": ["string", "null"], "description": "IRC user name (ident); null for a bridge." },
             "realname": { "type": ["string", "null"] },
-            "autojoin": { "type": "array", "items": { "type": "string" } },
+            "autojoin": { "type": "array", "items": { "type": "string" }, "description": "The channels (or bridge rooms) joined, without their keys." },
+            "autojoin_keyed": { "type": "array", "items": { "type": "string" }, "description": "The channels among autojoin that have a key stored. The key is stored sealed and never returned." },
             "sasl_account": { "type": ["string", "null"] },
             "has_sasl_account": { "type": "boolean" }, "has_sasl_password": { "type": "boolean" }, "has_server_password": { "type": "boolean" },
             "enabled": { "type": "boolean" }, "connected": { "type": ["boolean", "null"] },
@@ -1728,13 +1733,13 @@ fn operations() -> serde_json::Value {
                     "description": "Each network includes stored configuration, `connected` (true/false, or null with no running handle), and an owner-safe `runtime` object when its driver is active: lifecycle/timestamps, a credential-safe last-error code and summary, connect latency, attempts/errors, attached clients, traffic, and in-memory buffer usage.",
                     "security": authenticated, "responses": network_list_response },
                 "post": { "summary": "Create a BNC network and start its driver",
-                    "description": "Every request explicitly selects one driver and its complete connection intent. IRC requires addr, tls, nick, username, realname, and autojoin, with paired optional SASL credentials and an optional server_password (PASS, 400 with field=server_password when it cannot travel in one line); username is the IRC user name sent in USER, is never derived from the nick, and is refused for every other kind. Matrix requires an HTTP(S) homeserver, tls=true, provider user, autojoin, and password. Discord requires tls=true, autojoin, and a bot token. Slack requires tls=true, autojoin, bot token, and app token. An empty bridge addr explicitly selects that provider's built-in endpoint.",
+                    "description": "Every request explicitly selects one driver and its complete connection intent. IRC requires addr, tls, nick, username, realname, and autojoin (each entry `#channel`, or `#channel key` for a keyed channel, whose key is stored sealed and never returned), with paired optional SASL credentials and an optional server_password (PASS, 400 with field=server_password when it cannot travel in one line); username is the IRC user name sent in USER, is never derived from the nick, and is refused for every other kind. Matrix requires an HTTP(S) homeserver, tls=true, provider user, autojoin, and password. Discord requires tls=true, autojoin, and a bot token. Slack requires tls=true, autojoin, bot token, and app token. An empty bridge addr explicitly selects that provider's built-in endpoint.",
                     "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "oneOf": [
                             { "type": "object", "additionalProperties": false,
                                 "required": ["kind", "name", "addr", "tls", "nick", "username", "realname", "autojoin"],
-                                "properties": { "kind": { "const": "irc" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] }, "server_password": server_password_schema.clone() } },
+                                "properties": { "kind": { "const": "irc" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required for kind=irc; never derived from the nick." }, "realname": { "type": "string" }, "autojoin": irc_autojoin_schema.clone(), "sasl_account": { "type": ["string", "null"] }, "sasl_password": { "type": ["string", "null"] }, "server_password": server_password_schema.clone() } },
                             { "type": "object", "additionalProperties": false,
                                 "required": ["kind", "name", "addr", "tls", "nick", "autojoin", "sasl_password"],
                                 "properties": { "kind": { "const": "matrix" }, "name": { "type": "string" }, "addr": { "type": "string" }, "tls": { "const": true }, "nick": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "sasl_password": { "type": "string", "writeOnly": true } } },
@@ -1754,7 +1759,7 @@ fn operations() -> serde_json::Value {
             "/api/v1/me/network-preflight": {
                 "post": {
                     "summary": "Qualify an IRC upstream without saving it",
-                    "description": "Uses the production DNS-vetting, TCP/TLS, optional server password (PASS), capability negotiation, optional SASL registration, and configured channel-join path. The connection closes after the probe.",
+                    "description": "Uses the production DNS-vetting, TCP/TLS, optional server password (PASS), capability negotiation, and optional SASL registration path. The autojoin list (keys included) is validated as a save would validate it, but no channel is joined. The connection says QUIT after the probe.",
                     "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "type": "object", "additionalProperties": false,
@@ -1765,7 +1770,7 @@ fn operations() -> serde_json::Value {
                                 "nick": { "type": "string", "minLength": 1, "maxLength": 64 },
                                 "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER; never derived from the nick." },
                                 "realname": { "type": "string", "minLength": 1, "maxLength": 128 },
-                                "autojoin": { "type": "array", "items": { "type": "string" } },
+                                "autojoin": irc_autojoin_schema.clone(),
                                 "sasl_account": { "type": ["string", "null"], "minLength": 1, "maxLength": 255, "writeOnly": true },
                                 "sasl_password": { "type": ["string", "null"], "minLength": 1, "maxLength": 512, "writeOnly": true },
                                 "server_password": server_password_schema.clone()
@@ -1849,19 +1854,22 @@ fn operations() -> serde_json::Value {
                     "responses": { "200": network_response["200"],
                         "404": { "description": "no such network" } } },
                 "put": { "summary": "Replace a BNC network's mutable configuration and restart its driver",
-                    "description": "The stored kind selects the same IRC/Matrix/Discord/Slack field contract documented on create. The credential action is required and explicit: `keep` preserves write-only values; `remove` clears paired IRC SASL and is rejected for bridges; `set` replaces supplied values. IRC requires account and may omit password to preserve it. Matrix/Discord accept only password. Slack accepts account, password, or both and preserves an omitted token. The server-password action is required and explicit too: `keep` preserves the stored value, `remove` clears it, `set` replaces it; only an IRC network accepts `remove` or `set` (400 with field=server_password otherwise). A stored secret never follows the network to a new destination: when the IRC host or port changes, TLS is turned off, or a bridge's API base or homeserver moves to another origin, a secret carried over unchanged (by `keep`, or by replacing only the other half of a pair) is a 409 naming `credentials` or `server_password`; enter it again or remove it.",
+                    "description": "The stored kind selects the same IRC/Matrix/Discord/Slack field contract documented on create. The credential action is required and explicit: `keep` preserves write-only values; `remove` clears paired IRC SASL and is rejected for bridges; `set` replaces supplied values. IRC requires account and may omit password to preserve it. Matrix/Discord accept only password. Slack accepts account, password, or both and preserves an omitted token. The server-password action is required and explicit too: `keep` preserves the stored value, `remove` clears it, `set` replaces it; only an IRC network accepts `remove` or `set` (400 with field=server_password otherwise). The channel keys are write-only as well: an autojoin entry `#channel key` sets that channel's key, a channel named in `autojoin_keys.keep` (and listed without a new key) keeps the key stored for it, and every other channel has none; keeping a key the channel does not have, for a channel not listed, or beside a new key is a 400 with field=autojoin. A stored secret never follows the network to a new destination: when the IRC host or port changes, TLS is turned off, or a bridge's API base or homeserver moves to another origin, a secret carried over unchanged (by `keep`, or by replacing only the other half of a pair) is a 409 naming `credentials`, `server_password`, or `autojoin` (a kept channel key); enter it again or remove it.",
                     "security": authenticated,
                     "parameters": network_name_parameter,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "type": "object", "additionalProperties": false,
-                            "required": ["addr", "tls", "nick", "autojoin", "credentials", "server_password"],
+                            "required": ["addr", "tls", "nick", "autojoin", "autojoin_keys", "credentials", "server_password"],
                             "properties": {
                                 "addr": { "type": "string" },
                                 "tls": { "type": "boolean" },
                                 "nick": { "type": "string" },
                                 "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,9}$", "description": "IRC user name (ident) sent in USER. Required when the stored network is kind=irc (400 with field=username when absent or invalid); refused for a bridge." },
                                 "realname": { "type": "string", "description": "IRC real name sent in USER. Required when the stored network is kind=irc (400 with field=realname when absent); refused for a bridge." },
-                                "autojoin": { "type": "array", "items": { "type": "string" }, "description": "The complete channel (or bridge room) list; PUT replaces the whole configuration, so it is required and an empty list joins nothing." },
+                                "autojoin": { "type": "array", "maxItems": 64, "items": { "type": "string" }, "description": "The complete channel (or bridge room) list; PUT replaces the whole configuration, so it is required and an empty list joins nothing. An IRC entry `#channel key` sets that channel's key." },
+                                "autojoin_keys": { "type": "object", "additionalProperties": false, "required": ["keep"],
+                                    "description": "Which stored channel keys carry over. Required: a key is write-only, so an entry listed without one could otherwise mean either keep or remove it.",
+                                    "properties": { "keep": { "type": "array", "items": { "type": "string" }, "description": "Channels, listed in autojoin without a new key, that keep their stored key. Every other channel's stored key is removed." } } },
                                 "credentials": {
                                     "oneOf": [
                                         { "type": "object", "additionalProperties": false,
@@ -2891,7 +2899,9 @@ mod tests {
     }
 
     /// `PUT` is a full replacement: the contract and the parser agree that the
-    /// autojoin list cannot be omitted, where omission once cleared it.
+    /// autojoin list cannot be omitted, where omission once cleared it, nor
+    /// the channel-key action, whose omission would have to mean keep or
+    /// remove a write-only key.
     #[test]
     fn network_replace_requires_the_autojoin_list() {
         let spec = super::document();
@@ -2904,6 +2914,7 @@ mod tests {
             .filter_map(serde_json::Value::as_str)
             .collect();
         assert!(required.contains(&"autojoin"), "{required:?}");
+        assert!(required.contains(&"autojoin_keys"), "{required:?}");
         assert!(
             replace["properties"]["realname"]["description"]
                 .as_str()
@@ -2921,6 +2932,11 @@ mod tests {
         assert!(refused.to_string().contains("autojoin"), "{refused}");
         let mut with = without;
         with["autojoin"] = serde_json::json!([]);
+        let refused = serde_json::from_value::<super::UpdateNetwork>(with.clone())
+            .err()
+            .expect("an omitted channel-key action is refused");
+        assert!(refused.to_string().contains("autojoin_keys"), "{refused}");
+        with["autojoin_keys"] = serde_json::json!({ "keep": [] });
         assert!(serde_json::from_value::<super::UpdateNetwork>(with).is_ok());
     }
 

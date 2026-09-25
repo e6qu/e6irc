@@ -1594,7 +1594,7 @@ async fn bnc_network_management_lifecycle() {
     // Full configuration replacement is available through REST as well. The
     // credential action is mandatory even when there is no secret to change.
     let update = format!(
-        r##"{{"addr":"{up}","tls":false,"nick":"alice_updated","username":"alice_upda","realname":"Alice","autojoin":["#other"],"credentials":{{"action":"keep"}},"server_password":{{"action":"keep"}}}}"##
+        r##"{{"addr":"{up}","tls":false,"nick":"alice_updated","username":"alice_upda","realname":"Alice","autojoin":["#other"],"autojoin_keys":{{"keep":[]}},"credentials":{{"action":"keep"}},"server_password":{{"action":"keep"}}}}"##
     );
     let update_req = format!(
         "PUT /api/v1/me/networks/work HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
@@ -1905,7 +1905,7 @@ async fn bnc_network_upstream_secret_requires_master_key() {
         "must refuse to store a server password unsealed"
     );
 
-    let remove = r#"{"addr":"up.example:6697","tls":true,"nick":"alice_","username":"alice_","realname":"Alice","autojoin":[],"credentials":{"action":"remove"},"server_password":{"action":"keep"}}"#;
+    let remove = r#"{"addr":"up.example:6697","tls":true,"nick":"alice_","username":"alice_","realname":"Alice","autojoin":[],"autojoin_keys":{"keep":[]},"credentials":{"action":"remove"},"server_password":{"action":"keep"}}"#;
     let remove_req = format!(
         "PUT /api/v1/me/networks/stored-secret HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{remove}",
@@ -2135,7 +2135,7 @@ async fn a_server_password_is_sealed_write_only_and_replaced_only_by_an_action()
     // byte, set reseals, remove clears.
     let put = |server_password: &str| {
         let body = format!(
-            r#"{{{identity},"autojoin":[],"credentials":{{"action":"keep"}}{server_password}}}"#
+            r#"{{{identity},"autojoin":[],"autojoin_keys":{{"keep":[]}},"credentials":{{"action":"keep"}}{server_password}}}"#
         );
         format!(
             "PUT /api/v1/me/networks/private HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
@@ -2176,7 +2176,7 @@ async fn a_server_password_is_sealed_write_only_and_replaced_only_by_an_action()
     );
     let put_moved = |server_password: &str| {
         let body = format!(
-            r#"{{{moved},"autojoin":[],"credentials":{{"action":"keep"}}{server_password}}}"#
+            r#"{{{moved},"autojoin":[],"autojoin_keys":{{"keep":[]}},"credentials":{{"action":"keep"}}{server_password}}}"#
         );
         format!(
             "PUT /api/v1/me/networks/private HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
@@ -2223,6 +2223,287 @@ async fn a_server_password_is_sealed_write_only_and_replaced_only_by_an_action()
             .iter()
             .all(|detail| !detail.contains("letmein") && !detail.contains("rotated")),
         "{details:?}"
+    );
+}
+
+/// An upstream that welcomes every registration and reports each `JOIN` line
+/// it is sent, for the channel-key test to read.
+async fn joining_upstream() -> (
+    std::net::SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (joins_tx, joins_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.expect("accept");
+            let joins = joins_tx.clone();
+            tokio::spawn(async move {
+                let (reader, mut writer) = socket.into_split();
+                let mut lines = tokio::io::BufReader::new(reader).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let reply = if line == "CAP LS 302" {
+                        ":up CAP * LS :".to_owned()
+                    } else if let Some(nick) = line.strip_prefix("NICK ") {
+                        format!(":up 001 {nick} :welcome")
+                    } else if let Some(token) = line.strip_prefix("PING ") {
+                        format!(":up PONG up {token}")
+                    } else {
+                        if line.starts_with("JOIN ") && joins.send(line).is_err() {
+                            return;
+                        }
+                        continue;
+                    };
+                    if writer
+                        .write_all(format!("{reply}\r\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, joins_rx)
+}
+
+/// An autojoin channel's key over the API: written after its channel on
+/// create, stored sealed under the owner's context, joined with, never
+/// returned (only which channels have one), kept, replaced, or removed on a
+/// replace only as the request says, never carried to a new destination, and
+/// joined with again by the driver a restart builds from the stored row.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn an_autojoin_key_is_sealed_write_only_and_joined_across_a_restart() {
+    let url = support::test_db("autojoin_key_is_sealed_write_only").await;
+    let secret_key = e6ircd::secret::SecretKey::generate();
+    let key_path = temporary_path("autojoin-key-key");
+    std::fs::write(&key_path, secret_key.to_base64()).expect("write test key");
+    let _key_file = TemporaryFile(key_path.clone());
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account_with_contact(&pool, "alice", "s3cr3t", None)
+        .await
+        .expect("acct");
+    let token = issue_api_token(&pool, "alice", "test")
+        .await
+        .expect("token");
+    let (up, mut joins) = joining_upstream().await;
+    let config = || Config {
+        server_name: "irc.keys.example".into(),
+        network_name: "KeyNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+            hsts_include_subdomains: false,
+        }),
+        database: Some(DatabaseConfig {
+            url: url.clone(),
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
+        }),
+        bnc: Some(BncConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }),
+        secrets: Some(SecretsConfig {
+            key_file: key_path.clone(),
+            previous_key_files: Vec::new(),
+        }),
+        internal_upstreams: e6ircd::egress::InternalUpstreams::Allow,
+        ..Config::default()
+    };
+    let running = net::start(config()).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    wait_http_ready(http).await;
+    let identity = format!(
+        r#""addr":"{up}","tls":false,"nick":"alice_","username":"alice_","realname":"Alice""#
+    );
+    let problem_field = |body: &str| -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(body).expect("problem JSON")["field"].clone()
+    };
+    let mut next_join = async || {
+        tokio::time::timeout(deadline::HANG, joins.recv())
+            .await
+            .expect("the driver joins")
+            .expect("the upstream is listening")
+    };
+
+    // A key that cannot be one JOIN parameter is refused at its field.
+    let (status, body) = post_json(
+        http,
+        "/api/v1/me/networks",
+        &token,
+        &format!(r##"{{"kind":"irc","name":"bad",{identity},"autojoin":["#staff two words"]}}"##),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(problem_field(&body), "autojoin", "{body}");
+    assert!(!body.contains("two words"), "{body}");
+
+    let (status, body) = post_json(
+        http,
+        "/api/v1/me/networks",
+        &token,
+        &format!(
+            r##"{{"kind":"irc","name":"keyed",{identity},"autojoin":["#staff hunter2-4b1d","#open"]}}"##
+        ),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(next_join().await, "JOIN #staff,#open hunter2-4b1d");
+    let context = e6ircd::bouncer::bnc_secret_context("alice");
+    let stored = async || {
+        e6ircd::db::get_bnc_network(&pool, "alice", "keyed")
+            .await
+            .expect("get")
+            .expect("network")
+            .autojoin
+    };
+    let autojoin = stored().await;
+    assert_eq!(autojoin[0].channel, "#staff");
+    let sealed = autojoin[0].key_sealed.clone().expect("a stored key");
+    assert!(e6ircd::secret::is_sealed(&sealed), "stored in the clear");
+    assert_eq!(secret_key.open(&sealed, &context).unwrap(), "hunter2-4b1d");
+    assert_eq!(autojoin[1], e6ircd::db::BncAutojoin::from("#open"));
+    assert!(!format!("{autojoin:?}").contains(&sealed));
+    let detail_req = format!(
+        "GET /api/v1/me/networks/keyed HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &detail_req).await;
+    assert_eq!(status, 200, "{body}");
+    let detail: serde_json::Value = serde_json::from_str(&body).expect("detail");
+    assert_eq!(detail["autojoin"], serde_json::json!(["#staff", "#open"]));
+    assert_eq!(detail["autojoin_keyed"], serde_json::json!(["#staff"]));
+    assert!(
+        !body.contains("hunter2") && !body.contains(&sealed),
+        "{body}"
+    );
+
+    let put_to = |addr: &str, autojoin: &str, keep: &str| {
+        let body = format!(
+            r#"{{"addr":"{addr}","tls":false,"nick":"alice_","username":"alice_","realname":"Alice","autojoin":{autojoin},"autojoin_keys":{{"keep":{keep}}},"credentials":{{"action":"keep"}},"server_password":{{"action":"keep"}}}}"#
+        );
+        format!(
+            "PUT /api/v1/me/networks/keyed HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let here = up.to_string();
+    let put = |autojoin: &str, keep: &str| put_to(&here, autojoin, keep);
+
+    // Kept: the ciphertext byte for byte, and the restarted driver joins with it.
+    let (status, _, body) = request(http, &put(r##"["#STAFF","#open"]"##, r##"["#staff"]"##)).await;
+    assert_eq!(status, 204, "{body}");
+    assert_eq!(
+        stored().await[0].key_sealed.as_deref(),
+        Some(sealed.as_str())
+    );
+    assert_eq!(next_join().await, "JOIN #STAFF,#open hunter2-4b1d");
+
+    // A keep that would do nothing, or that contradicts a new key, is refused
+    // and changes nothing.
+    for (autojoin, keep) in [
+        (r##"["#staff","#open"]"##, r##"["#gone"]"##),
+        (r##"["#staff","#open"]"##, r##"["#open"]"##),
+        (r##"["#staff new","#open"]"##, r##"["#staff"]"##),
+        (r##"["#open"]"##, r##"["#staff"]"##),
+    ] {
+        let (status, _, body) = request(http, &put(autojoin, keep)).await;
+        assert_eq!(status, 400, "{autojoin} {keep}: {body}");
+        assert_eq!(problem_field(&body), "autojoin", "{body}");
+    }
+    assert_eq!(
+        stored().await[0].key_sealed.as_deref(),
+        Some(sealed.as_str())
+    );
+
+    // A kept key never follows the network to a new destination.
+    let elsewhere = format!("127.0.0.1:{}", up.port() + 1);
+    let (status, _, body) = request(
+        http,
+        &put_to(&elsewhere, r##"["#staff","#open"]"##, r##"["#staff"]"##),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(problem_field(&body), "autojoin", "{body}");
+    assert_eq!(
+        stored().await[0].key_sealed.as_deref(),
+        Some(sealed.as_str())
+    );
+
+    // Replaced: resealed, and joined with.
+    let (status, _, body) = request(http, &put(r##"["#staff rotated-77a0","#open"]"##, "[]")).await;
+    assert_eq!(status, 204, "{body}");
+    let resealed = stored().await[0].key_sealed.clone().expect("a stored key");
+    assert_ne!(resealed, sealed);
+    assert_eq!(
+        secret_key.open(&resealed, &context).unwrap(),
+        "rotated-77a0"
+    );
+    assert_eq!(next_join().await, "JOIN #staff,#open rotated-77a0");
+
+    // A restart builds the driver from the stored row, key included.
+    assert_eq!(
+        running.shutdown.run().await,
+        e6ircd::net::ShutdownOutcome::Flushed
+    );
+    let running = net::start(config()).await.expect("restart");
+    let http = running.http_addr.expect("http bound");
+    wait_http_ready(http).await;
+    assert_eq!(next_join().await, "JOIN #staff,#open rotated-77a0");
+
+    // Removed: listed without a key and not kept.
+    let (status, _, body) = request(http, &put(r##"["#staff","#open"]"##, "[]")).await;
+    assert_eq!(status, 204, "{body}");
+    assert!(
+        stored()
+            .await
+            .iter()
+            .all(|entry| entry.key_sealed.is_none())
+    );
+    assert_eq!(next_join().await, "JOIN #staff,#open");
+    let (_, _, body) = request(http, &detail_req).await;
+    let detail: serde_json::Value = serde_json::from_str(&body).expect("detail");
+    assert_eq!(detail["autojoin_keyed"], serde_json::json!([]));
+
+    // The audit trail names the field, never the value.
+    let details: Vec<String> = sqlx::query_scalar(
+        "SELECT detail FROM audit_log WHERE action IN ('NETWORK_CREATE', 'NETWORK_UPDATE') ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("audit");
+    assert!(details[0].contains("autojoin_keys"), "{details:?}");
+    assert!(
+        details
+            .iter()
+            .filter(|detail| detail.contains("autojoin_keys"))
+            .count()
+            >= 3,
+        "{details:?}"
+    );
+    assert!(
+        details
+            .iter()
+            .all(|detail| !detail.contains("hunter2") && !detail.contains("rotated")),
+        "{details:?}"
+    );
+    assert_eq!(
+        running.shutdown.run().await,
+        e6ircd::net::ShutdownOutcome::Flushed
     );
 }
 
@@ -2357,6 +2638,7 @@ async fn openapi_spec_is_served() {
             "username",
             "realname",
             "autojoin",
+            "autojoin_keyed",
             "sasl_account",
             "has_sasl_account",
             "has_sasl_password",
@@ -7295,6 +7577,7 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         "tls": true,
         "nick": "@alice:new.example",
         "autojoin": ["!one:new.example", "!two:new.example"],
+        "autojoin_keys": { "keep": [] },
         "credentials": { "action": "set", "password": "matrix-new-password" },
         "server_password": { "action": "keep" }
     })
@@ -7312,6 +7595,7 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         "tls": true,
         "nick": "",
         "autojoin": ["200", "201"],
+        "autojoin_keys": { "keep": [] },
         "credentials": { "action": "set", "password": "discord-new-token" },
         "server_password": { "action": "keep" }
     })
@@ -7331,6 +7615,7 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         "tls": true,
         "nick": "",
         "autojoin": ["C200", "C201"],
+        "autojoin_keys": { "keep": [] },
         "credentials": { "action": "set", "password": "slack-new-app" },
         "server_password": { "action": "keep" }
     })
@@ -7412,6 +7697,7 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         "tls": true,
         "nick": "@alice:new.example",
         "autojoin": [],
+        "autojoin_keys": { "keep": [] },
         "credentials": { "action": "set", "password": "do-not-echo" },
         "server_password": { "action": "keep" }
     })

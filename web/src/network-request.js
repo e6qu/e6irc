@@ -13,7 +13,8 @@
 //                                     the SASL credentials and another for the
 //                                     server password, so an omitted password
 //                                     can never ambiguously mean either "leave
-//                                     the stored one alone" or "delete it".
+//                                     the stored one alone" or "delete it"; and
+//                                     the channels whose stored key is kept.
 //
 // Shaping them here, away from the DOM, is what makes both testable.
 
@@ -30,12 +31,79 @@ export class NetworkRequestError extends Error {
   }
 }
 
-/** Split an auto-join box into channels, on commas or whitespace. */
+// What begins a channel name (RFC 2811); a word that does not is a key.
+const CHANNEL_PREFIX = /^[#&+!]/;
+
+/**
+ * Split an auto-join box into entries, on commas or whitespace: each channel,
+ * and a keyed channel's key after it, as `/join #staff key` takes them. An
+ * entry is `#channel` or `#channel key`, the form the API reads. A key is
+ * never repeated in a refusal: it is a secret.
+ */
 export function autojoinList(value) {
-  return String(value ?? "")
-    .split(/[\s,]+/)
-    .map((entry) => entry.trim())
-    .filter(Boolean);
+  const entries = [];
+  for (const word of String(value ?? "").split(/[\s,]+/).filter(Boolean)) {
+    if (CHANNEL_PREFIX.test(word)) {
+      entries.push(word);
+      continue;
+    }
+    const channel = entries.at(-1);
+    if (channel === undefined) {
+      throw new NetworkRequestError(
+        "autojoin",
+        "Channels to join must start with a channel: a name begins with #, &, + or !, and a key goes after its channel (#staff key).",
+      );
+    }
+    if (channel.includes(" ")) {
+      throw new NetworkRequestError(
+        "autojoin",
+        `${channel.split(" ")[0]} is followed by two words that are not channels; a channel takes one key.`,
+      );
+    }
+    entries[entries.length - 1] = `${channel} ${word}`;
+  }
+  return entries;
+}
+
+/** The channel an auto-join entry names, without its key. */
+function entryChannel(entry) {
+  return entry.split(" ")[0];
+}
+
+/** One channel name, compared the way the server compares a kept key's. */
+function sameChannel(a, b) {
+  const lower = (name) => name.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+  return lower(a) === lower(b);
+}
+
+const REMOVE_KEY_CONTROL = (channel) => `“Remove the stored key for ${channel}”`;
+
+/**
+ * The channel-key half of a replace: which stored keys are kept.
+ *
+ * A key is write-only, so the box shows a keyed channel without it. Listed
+ * that way, the channel keeps its stored key unless its Remove box is ticked;
+ * written with a key after it, that key replaces the stored one; left out of
+ * the list, its key goes with it. A key typed after a channel whose Remove box
+ * is ticked would not be saved, so it is refused rather than dropped.
+ * `storedKeyed` is what the server reported before the edit.
+ */
+export function autojoinKeysAction({ entries = [], storedKeyed = [], removingKeys = [] } = {}) {
+  const keep = [];
+  for (const channel of storedKeyed) {
+    const entry = entries.find((candidate) => sameChannel(entryChannel(candidate), channel));
+    if (entry === undefined) continue;
+    const removing = removingKeys.some((removed) => sameChannel(removed, channel));
+    const typed = entry.includes(" ");
+    if (removing && typed) {
+      throw new NetworkRequestError(
+        "autojoin",
+        `${REMOVE_KEY_CONTROL(channel)} is ticked, so the key typed after it would not be saved. Untick it to save the new key, or delete the key to remove the stored one.`,
+      );
+    }
+    if (!removing && !typed) keep.push(channel);
+  }
+  return { keep };
 }
 
 const REMOVE_CONTROL = "“Remove the stored account and password”";
@@ -224,6 +292,11 @@ export function updateNetworkBody(form) {
   return {
     ...base,
     realname: String(form.realname ?? "").trim() || base.nick,
+    autojoin_keys: autojoinKeysAction({
+      entries: base.autojoin,
+      storedKeyed: form.storedKeyed ?? [],
+      removingKeys: form.removingKeys ?? [],
+    }),
     credentials: credentialAction(form),
     server_password: serverPasswordAction(form),
   };

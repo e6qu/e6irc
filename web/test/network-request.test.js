@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   NetworkRequestError,
+  autojoinKeysAction,
   autojoinList,
   createNetworkBody,
   credentialAction,
@@ -147,6 +148,44 @@ test("auto-join accepts commas, spaces, or both, and drops the gaps", () => {
   assert.deepEqual(autojoinList("#e6qu, #rust  #irc"), ["#e6qu", "#rust", "#irc"]);
   assert.deepEqual(autojoinList(""), []);
   assert.deepEqual(autojoinList(undefined), []);
+});
+
+// A keyed channel is written as /join takes it: the key after the channel. A
+// word that is not a channel is the key of the channel before it.
+test("auto-join reads a key after its channel, and never repeats one in a refusal", () => {
+  assert.deepEqual(autojoinList("#staff hunter2, #rust #irc"), ["#staff hunter2", "#rust", "#irc"]);
+  for (const typed of ["hunter2 #staff", "#staff hunter2 again"]) {
+    assert.throws(
+      () => autojoinList(typed),
+      (error) => error instanceof NetworkRequestError && error.field === "autojoin"
+        && !error.message.includes("hunter2") && !error.message.includes("again"),
+      typed,
+    );
+  }
+});
+
+// The key is write-only: a stored one is kept by listing its channel without a
+// key, replaced by writing one, and removed by its box or with its channel.
+test("a replace keeps exactly the stored keys the form leaves alone", () => {
+  const body = (autojoin, removingKeys = []) => updateNetworkBody({
+    addr: "irc.libera.chat:6697", tls: true, nick: "ada", autojoin,
+    storedKeyed: ["#staff", "#ops"], removingKeys,
+  });
+  assert.deepEqual(body("#staff, #ops, #rust").autojoin_keys, { keep: ["#staff", "#ops"] });
+  assert.deepEqual(body("#STAFF new, #ops").autojoin_keys, { keep: ["#ops"] });
+  assert.deepEqual(body("#staff new, #ops").autojoin, ["#staff new", "#ops"]);
+  assert.deepEqual(body("#staff, #ops", ["#ops"]).autojoin_keys, { keep: ["#staff"] });
+  assert.deepEqual(body("#rust").autojoin_keys, { keep: [] });
+  assert.throws(
+    () => body("#staff, #ops zq9x", ["#ops"]),
+    (error) => error instanceof NetworkRequestError && error.field === "autojoin" && !error.message.includes("zq9x"),
+  );
+  assert.deepEqual(
+    updateNetworkBody({ addr: "irc.libera.chat:6697", tls: true, nick: "ada" }).autojoin_keys,
+    { keep: [] },
+    "a network with no stored keys keeps none",
+  );
+  assert.deepEqual(autojoinKeysAction(), { keep: [] });
 });
 
 // ---- the two ambiguous edits of a stored credential ------------------------
