@@ -923,7 +923,14 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
                     state.service_notice(
                         conn,
                         "ChanServ",
-                        &format!("\x02{bad}\x02 is not a lockable mode. Lockable: i m n s t C."),
+                        &format!(
+                            "\x02{bad}\x02 is not a lockable mode. Lockable: {}.",
+                            crate::core::state::MlockModes::LOCKABLE
+                                .chars()
+                                .map(String::from)
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        ),
                     );
                     return;
                 }
@@ -1426,11 +1433,11 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
     // completing registration.
     {
         let session = &state.sessions[&conn];
-        let user = session.user().unwrap_or("*");
         let host = session.host.clone();
-        let realname = session.realname().unwrap_or("");
-        if let Some((kind, reason)) = state.ban_match(user, &host, realname) {
+        if let Some((kind, reason)) = state.ban_match(&session.server_ban_subject()) {
             let label = kind.label();
+            // The operators' half of a `public|private` reason stays theirs.
+            let reason = crate::core::state::public_ban_reason(&reason);
             state.numeric(
                 conn,
                 ERR_YOUREBANNEDCREEP,

@@ -91,7 +91,21 @@ blocks CTCP except `ACTION`.
 
 **STATUSMSG** — a message addressed to a status-prefixed target
 (`@#chan` = ops only, `+#chan` = ops and voiced). It is delivered only to
-those members and is *not* stored in history.
+those members and is *not* stored in history. Only a member holding op or
+voice in the channel may send one (Solanum); anyone else gets `482`.
+
+**Ban mask / extban / CIDR mask** — the argument of a channel list mode
+(`+b` ban, `+q` quiet, `+e` ban exception, `+I` invite exception). A
+**hostmask** is a `nick!user@host` glob; a **CIDR mask** (Classless
+Inter-Domain Routing) has an address range as its host (`*!*@203.0.113.0/24`)
+and matches the address the user connected from, whatever host it shows. An
+**extban** (extended ban) is a `$`-prefixed mask of another kind: `$a` (any
+logged-in user), `$a:<account mask>`, and their negations `$~a…`
+(advertised as `EXTBAN=$,a`).
+
+**KNOCK** — a request to be let into a channel closed to the requester
+(`+i`, keyed, or full), delivered to its operators; throttled per user and
+per channel.
 
 **TAGMSG** — a message that carries only [message tags](#irc-and-ircv3), no
 text body (e.g. typing indicators, reactions).
@@ -135,8 +149,10 @@ and the lock is re-applied when the channel is re-created.
 obtained via the `OPER` command against configured credentials.
 
 **Server ban** — an operator ban refused at registration, one code path
-with a `kind`: **K-line** (`user@host`), **D-line** (host/IP), **X-line**
-(realname/gecos). `KILL` forcibly disconnects a client; `WALLOPS` messages
+with a `kind`: **K-line** (`user@host`, the host a glob, an address or a
+CIDR range), **D-line** (an IP address, CIDR range or address glob, matched
+against the address the user connected from), **X-line** (realname/gecos).
+A reason `public|private` shows the banned user only the part before `|`. `KILL` forcibly disconnects a client; `WALLOPS` messages
 opers.
 
 **SETHOST / chghost** — an oper command that changes a user's displayed host

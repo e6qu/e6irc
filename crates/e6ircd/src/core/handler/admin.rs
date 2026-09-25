@@ -7,7 +7,7 @@
 //! same disconnection of matching sessions, same audit row — rather than a
 //! second, divergent implementation.
 
-use super::oper::{BanMask, BanReject, QueueServerBanError, ban_mask, queue_server_ban_mutation};
+use super::oper::{BanMask, QueueServerBanError, ban_mask, queue_server_ban_mutation};
 use super::*;
 use crate::core::state::{BanKind, MaskKey};
 use crate::core::{AdminReply, AdminRequest};
@@ -696,17 +696,16 @@ fn begin_add_ban(
     };
     // Reuse the oper mask normalization + netban ("matches everyone") refusal so
     // the console cannot set a wider ban than KLINE would allow.
-    let parsed =
-        match BanMask::parse(kind, &[mask_in], false) {
-            Ok((parsed, _default_reason)) => parsed,
-            Err(BanReject::MatchesEveryone(display)) => {
-                let _ = reply.send(ban_error(crate::core::BanControlError::Invalid, format!(
-                "refusing {} for {display}: it matches every user (use a more specific mask)",
-                kind.label()
-            )));
-                return;
-            }
-        };
+    let parsed = match BanMask::parse(kind, &[mask_in], false) {
+        Ok((parsed, _default_reason)) => parsed,
+        Err(reject) => {
+            let _ = reply.send(ban_error(
+                crate::core::BanControlError::Invalid,
+                reject.describe(kind.label()),
+            ));
+            return;
+        }
+    };
     let reason = e6irc_proto::message::truncate_on_char_boundary(reason_in.trim(), 300);
     let reason = if reason.is_empty() {
         "Banned via admin console"

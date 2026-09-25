@@ -12,6 +12,7 @@ use e6irc_proto::numerics::{
 };
 use e6irc_queue::Sender;
 
+use super::banmask::{MaskShape, MaskSubject};
 use super::hot_history::HotHistory;
 use super::{
     CoreEffect, CoreShardCount, CoreShardId, Output, SessionOutput, SessionOwner, WireLine, Written,
@@ -145,12 +146,12 @@ struct SilencingMasks {
 }
 
 impl SilencingMasks {
-    /// Whether `prefix` is banned or quieted here — [`Channel::is_banned`] or
+    /// Whether `subject` is banned or quieted here — [`Channel::is_banned`] or
     /// [`Channel::is_quieted`], which share the ban-exception list.
-    fn silences(&self, casemap: CaseMapping, prefix: &str) -> bool {
-        (Channel::any_match(casemap, &self.bans, prefix)
-            || Channel::any_match(casemap, &self.quiets, prefix))
-            && !Channel::any_match(casemap, &self.exceptions, prefix)
+    fn silences(&self, casemap: CaseMapping, subject: &MaskSubject<'_>) -> bool {
+        (Channel::any_match(casemap, &self.bans, subject)
+            || Channel::any_match(casemap, &self.quiets, subject))
+            && !Channel::any_match(casemap, &self.exceptions, subject)
     }
 }
 
@@ -228,14 +229,14 @@ impl MembershipDirectory {
     }
 
     /// The display name of a channel `conn` is in where it holds neither op
-    /// nor voice and its hostmask `prefix` is banned or quieted — the channel a
+    /// nor voice and `subject` is banned or quieted — the channel a
     /// NICK must be refused for (Solanum: a banned member cannot change nick,
     /// or it could escape the ban and speak). `None` when there is none.
     pub(crate) fn silenced_in(
         &self,
         conn: ConnId,
         casemap: CaseMapping,
-        prefix: &str,
+        subject: &MaskSubject<'_>,
     ) -> Option<String> {
         let by_conn = self.by_conn.lock().expect("membership directory poisoned");
         let channels = self.channels.lock().expect("membership directory poisoned");
@@ -249,7 +250,7 @@ impl MembershipDirectory {
                     .ranks
                     .get(&conn)
                     .is_some_and(|modes| modes.op || modes.voice)
-                    && channel.silencing.silences(casemap, prefix)
+                    && channel.silencing.silences(casemap, subject)
             })
             .map(|channel| channel.name.as_str())
             .collect();
@@ -315,10 +316,19 @@ impl MembershipDirectory {
 /// and `contains`/`retain` can't get it wrong; [`MaskKey::as_str`] returns the
 /// original casing for `RPL_BANLIST` and for `mask::matches` (which folds the
 /// mask itself). Build only via [`MaskKey::new`].
+///
+/// It also carries what the mask *means* ([`MaskShape`]: a glob, a CIDR host,
+/// an account extban), decided once here rather than on every match. The
+/// strict decision — refusing a mask that could never match as written — is
+/// made where a mask is *added* (`channel_list_mask`, `BanMask::parse`), before
+/// this is built; a mask reaching here unvalidated (a removal's argument, a
+/// server ban persisted before validation existed) that does not parse keeps
+/// the meaning every mask had before shapes existed, a literal glob.
 #[derive(Debug, Clone)]
 pub struct MaskKey {
     folded: String,
     display: String,
+    shape: MaskShape,
 }
 
 impl MaskKey {
@@ -326,7 +336,13 @@ impl MaskKey {
         Self {
             folded: casemap.casefold(mask),
             display: mask.to_string(),
+            shape: MaskShape::parse(mask).unwrap_or(MaskShape::Glob),
         }
+    }
+
+    /// Whether `subject` matches this mask, by its [`MaskShape`].
+    pub(crate) fn matches(&self, casemap: CaseMapping, subject: &MaskSubject<'_>) -> bool {
+        self.shape.matches(casemap, &self.display, subject)
     }
 
     /// The mask in its stored (original) casing — for display and for
@@ -626,6 +642,9 @@ pub(crate) struct PublicUser {
     pub(crate) nick: String,
     pub(crate) user: String,
     pub(crate) host: String,
+    /// The address the connection came from ([`Session::real_ip`]); never
+    /// shown, only matched by bans.
+    pub(crate) real_ip: Option<std::net::IpAddr>,
     pub(crate) realname: String,
     pub(crate) account: Option<String>,
     pub(crate) away: Option<String>,
@@ -644,6 +663,7 @@ impl PublicUser {
             nick: session.nick().expect("registered").to_string(),
             user: session.user().expect("registered").to_string(),
             host: session.host.clone(),
+            real_ip: session.real_ip,
             realname: session.realname().expect("registered").to_string(),
             account: session.account.clone(),
             away: session.away.clone(),
@@ -697,6 +717,7 @@ impl PublicUser {
         ChannelMemberProfile {
             user: self.user.clone(),
             host: self.host.clone(),
+            real_ip: self.real_ip,
             realname: self.realname.clone(),
             account: self.account.clone(),
             away: self.away.is_some(),
@@ -1354,6 +1375,12 @@ impl PendingServiceReply {
 pub(crate) struct Session {
     output: SessionOutput,
     pub host: String,
+    /// The address the connection came from, fixed when it opened: what a
+    /// D-line, an address-shaped K-line and a channel ban on an address or
+    /// CIDR range match. A `SETHOST` changes `host`, never this, so a cloak is
+    /// no way out of a ban on the address. `None` for a session opened
+    /// in-process under a name rather than an address.
+    pub(crate) real_ip: Option<std::net::IpAddr>,
     /// What this session's per-address limits are charged to, fixed from the
     /// host it opened with (a later SETHOST changes only what is shown).
     limit_key: crate::net::SessionLimitKey,
@@ -1414,6 +1441,12 @@ pub(crate) struct Session {
     /// in flight. A channel this shard owns is joined in the same step and
     /// never appears here.
     pub pending_joins: HashSet<ChanKey>,
+    /// The subset of `pending_joins` a later `JOIN 0` must part once answered:
+    /// the JOIN reached its owner first, so it is honoured, then left.
+    pub part_on_join: HashSet<ChanKey>,
+    /// When this session's last KNOCK was delivered, on the monotonic clock: a
+    /// user may knock once per `KNOCK_DELAY` (Solanum's `knock_delay`).
+    pub last_knock: Option<e6irc_proto::time::MonoMillis>,
     /// Nicks this session MONITORs (display form as given).
     pub monitoring: HashMap<NickKey, String>,
     /// The `draft/multiline` batch this connection is filling, if any.
@@ -1783,6 +1816,22 @@ impl Session {
         };
     }
 
+    /// What a server ban is tested against for this session.
+    pub(crate) fn server_ban_subject(&self) -> ServerBanSubject<'_> {
+        ServerBanSubject {
+            user: self.user().unwrap_or("*"),
+            host: &self.host,
+            real_ip: self.real_ip,
+            realname: self.realname().unwrap_or(""),
+        }
+    }
+
+    /// Who this session is to a channel's masks, given its `prefix()` (taken
+    /// by the caller so the subject can borrow it).
+    pub(crate) fn mask_subject<'a>(&'a self, prefix: &'a str) -> MaskSubject<'a> {
+        MaskSubject::new(prefix, self.real_ip, self.account.as_deref())
+    }
+
     /// `nick!user@host` — total on a registered session (its nick/user exist by
     /// construction). Calling it on an unregistered session is a caller bug.
     pub fn prefix(&self) -> String {
@@ -1871,6 +1920,8 @@ impl LastActive {
 pub(crate) struct ChannelMemberProfile {
     pub(crate) user: String,
     pub(crate) host: String,
+    /// The member's real address, which channel bans match alongside `host`.
+    pub(crate) real_ip: Option<std::net::IpAddr>,
     pub(crate) realname: String,
     pub(crate) account: Option<String>,
     pub(crate) away: bool,
@@ -1890,6 +1941,7 @@ impl ChannelMemberProfile {
         Self {
             user: user.to_string(),
             host: host.to_string(),
+            real_ip: None,
             realname: identity.nick.clone(),
             account: None,
             away: false,
@@ -1935,6 +1987,15 @@ pub struct ChannelActor {
 impl ChannelActor {
     pub(crate) fn session_owner(&self) -> SessionOwner {
         self.recipient.owner
+    }
+
+    /// Who this actor is to a channel's ban, quiet and exception masks.
+    pub(crate) fn mask_subject(&self) -> MaskSubject<'_> {
+        MaskSubject::new(
+            &self.identity.prefix,
+            self.profile.real_ip,
+            self.account.as_deref(),
+        )
     }
 
     pub(crate) fn originator(&self) -> Originator {
@@ -1985,10 +2046,12 @@ pub enum ChannelJoinFailure {
     Full { name: String },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ChannelPartResult {
     Parted { key: ChanKey, line: EventLine },
     NotOnChannel { name: String },
+    NoSuchChannel { name: String },
+    Hidden { name: String, proof: Hidden },
 }
 
 /// Everyone who shares a channel with one user, each counted once: the
@@ -2232,10 +2295,17 @@ pub type ChannelCommand = ChannelRequest<ChannelCommandOperation>;
 /// Closed channel-command operations.
 #[derive(Debug, Clone)]
 pub enum ChannelCommandOperation {
-    Knock,
+    /// `user_throttled`: the knocker's own knock delay has not run out, as its
+    /// session knows; the owner reports it only after the checks Solanum makes
+    /// first.
+    Knock {
+        user_throttled: bool,
+    },
     Invite(ChannelInvitee),
     ChanServRegister,
-    ChanServOp { target_nick: String },
+    ChanServOp {
+        target_nick: String,
+    },
     Names,
     Who(ChannelWhoQuery),
     History(ChannelHistoryRequest),
@@ -2431,12 +2501,31 @@ pub enum ChannelHistoryResult {
 
 #[derive(Debug)]
 pub enum ChannelKnockResult {
-    KnockDelivered { display: String },
-    NoSuchChannel { target: String },
-    Hidden { target: String, proof: Hidden },
-    AlreadyOnChannel { display: String },
-    ChannelOpen { display: String },
-    CannotSend { display: String },
+    KnockDelivered {
+        display: String,
+    },
+    NoSuchChannel {
+        target: String,
+    },
+    Hidden {
+        target: String,
+        proof: Hidden,
+    },
+    AlreadyOnChannel {
+        display: String,
+    },
+    ChannelOpen {
+        display: String,
+    },
+    CannotSend {
+        display: String,
+    },
+    /// Inside the knock delay; `scope` is `user` or `channel`, as Solanum's
+    /// ERR_TOOMANYKNOCK names it.
+    TooManyKnocks {
+        display: String,
+        scope: &'static str,
+    },
 }
 
 #[derive(Debug)]
@@ -2731,9 +2820,20 @@ pub enum ChannelMessageResult {
     },
     CannotSend {
         target: String,
-        no_ctcp: bool,
+        why: SpeakRefusal,
         loud: bool,
     },
+}
+
+/// Why a channel refused a message (PRIVMSG/NOTICE, multiline, TAGMSG).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeakRefusal {
+    /// Banned, quieted, `+m` without voice, or `+n` from outside.
+    CannotSend,
+    /// A CTCP other than ACTION into a `+C` channel.
+    NoCtcp,
+    /// A STATUSMSG (`@#c`/`+#c`) from a sender without op or voice there.
+    NotPrivileged,
 }
 
 /// A completed channel multiline message.
@@ -2778,7 +2878,7 @@ pub enum ChannelMultilineResult {
     },
     CannotSend {
         target: String,
-        no_ctcp: bool,
+        why: SpeakRefusal,
         loud: bool,
         label: Option<String>,
     },
@@ -2792,7 +2892,7 @@ pub type ChannelTagmsg = ChannelRequest<String>;
 pub enum ChannelTagmsgResult {
     Delivered { echo: Option<Bytes> },
     NoSuchChannel { target: String },
-    CannotSend { target: String },
+    CannotSend { target: String, why: SpeakRefusal },
 }
 
 impl ChannelQuit {
@@ -2821,11 +2921,48 @@ pub(crate) struct ChanModes {
     pub secret: bool,
     /// +C: block CTCP (except ACTION).
     pub no_ctcp: bool,
+    /// +g: free invite — any member may INVITE, not only an operator.
+    pub free_invite: bool,
     pub key: Option<String>,
     pub limit: Option<u32>,
 }
 
 impl ChanModes {
+    /// The flag (ISUPPORT `CHANMODES` type D) modes, in the order a mode string
+    /// renders them. The one table: `CHANMODES`, RPL_MYINFO, the MODE apply
+    /// loop and MLOCK all read it, and [`Self::flag`] / [`Self::flag_mut`] know
+    /// exactly these (a unit test pins that).
+    pub(crate) const FLAGS: &'static str = "gimnstC";
+
+    /// A flag mode's current value by its mode char; `None` for a char that is
+    /// not a flag.
+    pub(crate) fn flag(&self, c: char) -> Option<bool> {
+        Some(match c {
+            'g' => self.free_invite,
+            'i' => self.invite_only,
+            'm' => self.moderated,
+            'n' => self.no_external,
+            's' => self.secret,
+            't' => self.topic_ops_only,
+            'C' => self.no_ctcp,
+            _ => return None,
+        })
+    }
+
+    /// The flag mode `c` itself, to set; `None` for a char that is not a flag.
+    pub(crate) fn flag_mut(&mut self, c: char) -> Option<&mut bool> {
+        Some(match c {
+            'g' => &mut self.free_invite,
+            'i' => &mut self.invite_only,
+            'm' => &mut self.moderated,
+            'n' => &mut self.no_external,
+            's' => &mut self.secret,
+            't' => &mut self.topic_ops_only,
+            'C' => &mut self.no_ctcp,
+            _ => return None,
+        })
+    }
+
     /// `+nt`-style string with key/limit args appended. `reveal_key` gates
     /// the `+k` argument: only channel members may see the key, so that
     /// `MODE #chan` from an outsider cannot disclose it and bypass `+k`.
@@ -2833,15 +2970,8 @@ impl ChanModes {
     pub fn to_string_with_args(&self, reveal_key: bool) -> String {
         let mut modes = String::from("+");
         let mut args = String::new();
-        for (set, c) in [
-            (self.invite_only, 'i'),
-            (self.moderated, 'm'),
-            (self.no_external, 'n'),
-            (self.secret, 's'),
-            (self.topic_ops_only, 't'),
-            (self.no_ctcp, 'C'),
-        ] {
-            if set {
+        for c in Self::FLAGS.chars() {
+            if self.flag(c) == Some(true) {
                 modes.push(c);
             }
         }
@@ -2870,9 +3000,10 @@ pub(crate) struct MlockModes {
 }
 
 impl MlockModes {
-    /// Boolean channel modes that MLOCK can lock (args-carrying modes like
-    /// `k`/`l` and list modes are deliberately out of scope).
-    pub const LOCKABLE: &'static [char] = &['i', 'm', 'n', 's', 't', 'C'];
+    /// Boolean channel modes that MLOCK can lock: every flag mode
+    /// ([`ChanModes::FLAGS`]); args-carrying modes like `k`/`l` and list modes
+    /// are deliberately out of scope.
+    pub const LOCKABLE: &'static str = ChanModes::FLAGS;
 
     /// Parse a spec like `+nt-i`. `Err(bad_char)` for any character that is
     /// neither a sign nor a lockable boolean mode. A mode named twice keeps
@@ -2884,7 +3015,7 @@ impl MlockModes {
             match c {
                 '+' => adding = true,
                 '-' => adding = false,
-                c if Self::LOCKABLE.contains(&c) => {
+                c if Self::LOCKABLE.contains(c) => {
                     m.on.retain(|x| x != c);
                     m.off.retain(|x| x != c);
                     if adding {
@@ -2898,13 +3029,11 @@ impl MlockModes {
         }
         // Render equal policies identically regardless of input order.
         m.on = Self::LOCKABLE
-            .iter()
-            .copied()
+            .chars()
             .filter(|mode| m.on.contains(*mode))
             .collect();
         m.off = Self::LOCKABLE
-            .iter()
-            .copied()
+            .chars()
             .filter(|mode| m.off.contains(*mode))
             .collect();
         Ok(m)
@@ -3065,9 +3194,11 @@ pub struct Topic {
 /// the storage, matching, and enforcement are otherwise identical.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BanKind {
-    /// `user@host` glob (KLINE).
+    /// `user@host` glob (KLINE); an address or CIDR host matches the real
+    /// address, and a glob host is tried against both the shown host and it.
     Kline,
-    /// bare host / IP glob (DLINE).
+    /// An address, a CIDR range, or an address glob (DLINE), matched against
+    /// the connection's real address only.
     Dline,
     /// realname (gecos) glob (XLINE).
     Xline,
@@ -3113,9 +3244,57 @@ impl BanKind {
 #[derive(Clone)]
 pub struct ServerBan {
     pub mask: MaskKey,
+    /// `public|private`: what follows the first `|` is the operators' note,
+    /// never shown to the banned user or their peers (Solanum's oper reason).
     pub reason: String,
     pub set_by: String,
     pub kind: BanKind,
+}
+
+/// The part of a server-ban `reason` the banned user and their peers are
+/// shown: everything before the first `|` (Solanum's user/oper reason split).
+/// The whole reason stays in the operator listing and the audit trail.
+pub(crate) fn public_ban_reason(reason: &str) -> &str {
+    reason
+        .split_once('|')
+        .map_or(reason, |(public, _)| public)
+        .trim_end()
+}
+
+/// What a server ban is tested against: one connection, as a K-line, D-line
+/// or X-line sees it.
+pub(crate) struct ServerBanSubject<'a> {
+    pub(crate) user: &'a str,
+    pub(crate) host: &'a str,
+    pub(crate) real_ip: Option<std::net::IpAddr>,
+    pub(crate) realname: &'a str,
+}
+
+impl ServerBan {
+    /// Whether this ban matches `subject`. A K-line is a `user@host` mask whose
+    /// host may be an address or CIDR range (matched against the real
+    /// address) or a glob (tried against the shown host and the address); a
+    /// D-line is matched against the real address alone, so a cloak is no way
+    /// out of either; an X-line is a glob over the realname.
+    pub(crate) fn matches(&self, casemap: CaseMapping, subject: &ServerBanSubject<'_>) -> bool {
+        match self.kind {
+            BanKind::Kline => {
+                let shown = format!("{}@{}", subject.user, subject.host);
+                self.mask
+                    .matches(casemap, &MaskSubject::new(&shown, subject.real_ip, None))
+            }
+            BanKind::Dline => subject.real_ip.is_some_and(|address| {
+                let address_text = address.to_string();
+                self.mask.matches(
+                    casemap,
+                    &MaskSubject::new(&address_text, Some(address), None),
+                )
+            }),
+            BanKind::Xline => {
+                e6irc_proto::mask::matches(casemap, self.mask.as_str(), subject.realname)
+            }
+        }
+    }
 }
 
 pub(crate) struct Channel {
@@ -3130,13 +3309,18 @@ pub(crate) struct Channel {
     pub ban_exceptions: Vec<MaskKey>,
     pub invite_exceptions: Vec<MaskKey>,
     /// Connections holding a pending INVITE into this channel (consumed on
-    /// join). Recorded only while the channel is `+i`, when only an operator
-    /// may invite. Lives on the channel — not the invitee's session — so channel
+    /// join), which admits past `+i` and `+l`. Recorded only while the channel
+    /// has one of those, from an operator or, on a `+g` channel, any member.
+    /// Lives on the channel — not the invitee's session — so channel
     /// teardown revokes it: an invite is a grant by an op of *this* channel
     /// incarnation, and a session-side set keyed by name would let it
     /// authorize entry into an unrelated later channel reusing the name
     /// (a +i bypass). Bounded by `INVITE_LIMIT` per channel.
     pub invited: HashSet<ConnId>,
+    /// When the last KNOCK on this channel was delivered, on the monotonic
+    /// clock: a channel takes one per `KNOCK_DELAY_CHANNEL` (Solanum's
+    /// `knock_delay_channel`), so a crowd cannot flood its operators.
+    pub last_knock: Option<e6irc_proto::time::MonoMillis>,
     /// When this incarnation of the channel was created, on the same
     /// millisecond clock that stamps its messages: RPL_CREATIONTIME reports it
     /// in whole seconds, and it is the oldest history a reader without a
@@ -3175,6 +3359,7 @@ impl Channel {
             ban_exceptions: Vec::new(),
             invite_exceptions: Vec::new(),
             invited: HashSet::new(),
+            last_knock: None,
             created_at,
         }
     }
@@ -3367,29 +3552,32 @@ impl Channel {
         (self.modes.secret && !self.is_member(conn)).then_some(Hidden(()))
     }
 
-    fn any_match(casemap: CaseMapping, masks: &[MaskKey], subject: &str) -> bool {
-        masks
-            .iter()
-            .any(|m| e6irc_proto::mask::matches(casemap, m.as_str(), subject))
+    fn any_match(casemap: CaseMapping, masks: &[MaskKey], subject: &MaskSubject<'_>) -> bool {
+        masks.iter().any(|m| m.matches(casemap, subject))
     }
 
-    pub fn is_banned(&self, casemap: CaseMapping, prefix: &str) -> bool {
-        Self::any_match(casemap, &self.bans, prefix)
-            && !Self::any_match(casemap, &self.ban_exceptions, prefix)
+    pub(crate) fn is_banned(&self, casemap: CaseMapping, subject: &MaskSubject<'_>) -> bool {
+        Self::any_match(casemap, &self.bans, subject)
+            && !Self::any_match(casemap, &self.ban_exceptions, subject)
     }
 
     /// Quiets share the ban-exception machinery (Solanum semantics).
-    pub fn is_quieted(&self, casemap: CaseMapping, prefix: &str) -> bool {
-        Self::any_match(casemap, &self.quiets, prefix)
-            && !Self::any_match(casemap, &self.ban_exceptions, prefix)
+    pub(crate) fn is_quieted(&self, casemap: CaseMapping, subject: &MaskSubject<'_>) -> bool {
+        Self::any_match(casemap, &self.quiets, subject)
+            && !Self::any_match(casemap, &self.ban_exceptions, subject)
     }
 
-    pub fn is_invite_excepted(&self, casemap: CaseMapping, prefix: &str) -> bool {
-        Self::any_match(casemap, &self.invite_exceptions, prefix)
+    pub(crate) fn is_invite_excepted(
+        &self,
+        casemap: CaseMapping,
+        subject: &MaskSubject<'_>,
+    ) -> bool {
+        Self::any_match(casemap, &self.invite_exceptions, subject)
     }
 
     /// Whether a sender with membership `member` (its `MemberModes`, or `None`
-    /// when off-channel) and hostmask `prefix` may send to this channel.
+    /// when off-channel) matched against the masks as `subject` may send to
+    /// this channel.
     ///
     /// The single gate for text (PRIVMSG/NOTICE) and tags (TAGMSG) alike: a
     /// client that cannot speak must not be able to relay typing/reaction tags
@@ -3398,26 +3586,27 @@ impl Channel {
     /// or off-channel sender is subject to +m, bans and quiets, and an
     /// off-channel one additionally to +n. STATUSMSG/CTCP are checked by the
     /// caller — they are message-shape concerns, not membership ones.
-    pub fn may_speak(
+    pub(crate) fn may_speak(
         &self,
         member: Option<&MemberModes>,
         casemap: CaseMapping,
-        prefix: &str,
+        subject: &MaskSubject<'_>,
     ) -> bool {
         match member {
             Some(m) if m.op || m.voice => true,
-            Some(_) => {
-                !self.modes.moderated
-                    && !self.is_banned(casemap, prefix)
-                    && !self.is_quieted(casemap, prefix)
-            }
+            Some(_) => !self.modes.moderated && !self.is_silenced(casemap, subject),
             None => {
                 !self.modes.no_external
                     && !self.modes.moderated
-                    && !self.is_banned(casemap, prefix)
-                    && !self.is_quieted(casemap, prefix)
+                    && !self.is_silenced(casemap, subject)
             }
         }
+    }
+
+    /// Banned or quieted (and not excepted): the ban/quiet half of
+    /// [`Channel::may_speak`], without `+m`/`+n`.
+    pub(crate) fn is_silenced(&self, casemap: CaseMapping, subject: &MaskSubject<'_>) -> bool {
+        self.is_banned(casemap, subject) || self.is_quieted(casemap, subject)
     }
 }
 
@@ -3774,6 +3963,7 @@ impl ServerState {
         ChannelMemberProfile {
             user: session.user().expect("registered member").to_string(),
             host: session.host.clone(),
+            real_ip: session.real_ip,
             realname: session.realname().expect("registered member").to_string(),
             account: session.account.clone(),
             away: session.away.is_some(),
@@ -4266,11 +4456,19 @@ impl ServerState {
         }
     }
 
-    /// The session's channels, grouped by the shard that owns them.
+    /// The session's channels, grouped by the shard that owns them — with the
+    /// JOINs still on their way to another shard. A change made while a JOIN
+    /// is in flight (a NICK, AWAY, SETNAME, a host change) must reach that
+    /// channel too: the owner admits the member from the snapshot the JOIN
+    /// carried, and the owner's queue is FIFO, so an update sent after the JOIN
+    /// arrives after it and corrects the member it created. Sending it only to
+    /// joined channels left the channel holding the old nick or host for good.
+    /// An owner that refused the JOIN finds no member and ignores the update.
     fn session_channels_by_shard(&self, conn: ConnId) -> Vec<ShardChannels> {
         let mut by_shard: std::collections::BTreeMap<usize, Vec<ChannelOwner>> =
             std::collections::BTreeMap::new();
-        for key in &self.sessions[&conn].channels {
+        let session = &self.sessions[&conn];
+        for key in session.channels.iter().chain(&session.pending_joins) {
             let owner = self.channels.owner(key);
             by_shard.entry(owner.shard().0).or_default().push(owner);
         }
@@ -4396,7 +4594,11 @@ impl ServerState {
         assert_eq!(report.shard(), self.shard, "user event reached wrong shard");
         let mut peers = Peers::of(report.event.subject);
         for key in report.channels.keys() {
-            if let Some(channel) = self.channels.get(key) {
+            // Only a channel the subject is in shares it with anyone: the
+            // report may name one whose JOIN was in flight and then refused.
+            if let Some(channel) = self.channels.get(key)
+                && channel.is_member(report.event.subject)
+            {
                 peers.extend_channel(channel, &report.event, &self.config.server_name);
             }
         }
@@ -5142,24 +5344,12 @@ impl ServerState {
         Ok(())
     }
 
-    /// The subject a ban of `kind` is tested against, from a session's
-    /// `user` / `host` / `realname`.
-    pub fn ban_subject(kind: BanKind, user: &str, host: &str, realname: &str) -> String {
-        match kind {
-            BanKind::Kline => format!("{user}@{host}"),
-            BanKind::Dline => host.to_string(),
-            BanKind::Xline => realname.to_string(),
-        }
-    }
-
-    /// The `(kind, reason)` of the first server ban matching a session's
-    /// `user` / `host` / `realname`, if any.
-    pub fn ban_match(&self, user: &str, host: &str, realname: &str) -> Option<(BanKind, String)> {
-        self.server_bans.iter().find_map(|b| {
-            let subject = Self::ban_subject(b.kind, user, host, realname);
-            e6irc_proto::mask::matches(self.casemap, b.mask.as_str(), &subject)
-                .then(|| (b.kind, b.reason.clone()))
-        })
+    /// The `(kind, reason)` of the first server ban matching `subject`, if any.
+    pub(crate) fn ban_match(&self, subject: &ServerBanSubject<'_>) -> Option<(BanKind, String)> {
+        self.server_bans
+            .iter()
+            .find(|ban| ban.matches(self.casemap, subject))
+            .map(|ban| (ban.kind, ban.reason.clone()))
     }
 
     /// Key a nick for lookup/storage.
@@ -5251,8 +5441,10 @@ impl ServerState {
     /// quieted under its current hostmask — see
     /// [`MembershipDirectory::silenced_in`].
     pub(crate) fn silenced_in(&self, conn: ConnId) -> Option<String> {
-        let prefix = self.sessions[&conn].prefix();
-        self.memberships.silenced_in(conn, self.casemap, &prefix)
+        let session = &self.sessions[&conn];
+        let prefix = session.prefix();
+        let subject = session.mask_subject(&prefix);
+        self.memberships.silenced_in(conn, self.casemap, &subject)
     }
 
     /// Where `conn`'s session lives, whether or not it is this shard.
@@ -5370,6 +5562,10 @@ impl ServerState {
             Session {
                 output: SessionOutput::new(tx),
                 limit_key: crate::net::PeerLimitKey::for_session_host(&host),
+                real_ip: host
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+                    .map(|address| address.to_canonical()),
                 host,
                 transport,
                 reg: Registration::Registering {
@@ -5394,6 +5590,8 @@ impl ServerState {
                 bot: false,
                 channels: HashSet::new(),
                 pending_joins: HashSet::new(),
+                part_on_join: HashSet::new(),
+                last_knock: None,
                 monitoring: HashMap::new(),
                 multiline: None,
                 label_groups: HashMap::new(),
