@@ -4864,6 +4864,8 @@ pub async fn persist_owned_channel_mutation(
     else {
         return Ok(ChannelControlResult::MissingOrNotOwner);
     };
+    // The account an access change or transfer named, as resolved.
+    let mut resolved = None;
 
     let (action, detail) = match mutation {
         PersistedChannelMutation::SetTopic { topic } => {
@@ -4946,54 +4948,38 @@ pub async fn persist_owned_channel_mutation(
             )
         }
         PersistedChannelMutation::SetAccess { account, flags } => {
-            let account_folded = CaseMapping::Rfc1459.casefold(account);
+            let Some(target) = resolve_account(&mut *transaction, account).await? else {
+                return Ok(ChannelControlResult::AccountMissing);
+            };
             if let Some(flags) = flags {
-                let account_id: Option<i64> =
-                    sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1")
-                        .bind(&account_folded)
-                        .fetch_optional(&mut *transaction)
-                        .await
-                        .map_err(query_error)?;
-                let Some(account_id) = account_id else {
-                    return Ok(ChannelControlResult::AccountMissing);
-                };
                 if let AccessEntryWrite::LimitReached =
-                    write_access_entry(&mut transaction, channel_id, account_id, flags).await?
+                    write_access_entry(&mut transaction, channel_id, target.id, flags).await?
                 {
                     return Ok(ChannelControlResult::AccessLimitReached);
                 }
             } else {
-                sqlx::query(
-                    "DELETE FROM channel_access ca USING accounts a
-                     WHERE ca.channel_id = $1 AND ca.account_id = a.id
-                       AND a.name_folded = $2",
-                )
-                .bind(channel_id)
-                .bind(&account_folded)
-                .execute(&mut *transaction)
-                .await
-                .map_err(query_error)?;
-            }
-            (
-                "CHANNEL_ACCESS",
-                format!(
-                    "account={account_folded} flags={}",
-                    flags.as_deref().unwrap_or("-")
-                ),
-            )
-        }
-        PersistedChannelMutation::TransferFounder { account } => {
-            let account_id: Option<i64> =
-                sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1")
-                    .bind(account)
-                    .fetch_optional(&mut *transaction)
+                sqlx::query("DELETE FROM channel_access WHERE channel_id = $1 AND account_id = $2")
+                    .bind(channel_id)
+                    .bind(target.id)
+                    .execute(&mut *transaction)
                     .await
                     .map_err(query_error)?;
-            let Some(account_id) = account_id else {
+            }
+            let detail = format!(
+                "account={} flags={}",
+                target.name_folded,
+                flags.as_deref().unwrap_or("-")
+            );
+            resolved = Some(target.name);
+            ("CHANNEL_ACCESS", detail)
+        }
+        PersistedChannelMutation::TransferFounder { account } => {
+            let Some(founder) = resolve_account(&mut *transaction, account).await? else {
                 return Ok(ChannelControlResult::AccountMissing);
             };
-            transfer_channel_founder(&mut transaction, channel_id, account_id).await?;
-            ("CHANNEL_FOUNDER", account.clone())
+            transfer_channel_founder(&mut transaction, channel_id, founder.id).await?;
+            resolved = Some(founder.name);
+            ("CHANNEL_FOUNDER", founder.name_folded)
         }
         PersistedChannelMutation::Drop => {
             sqlx::query("DELETE FROM channels WHERE id = $1")
@@ -5013,7 +4999,7 @@ pub async fn persist_owned_channel_mutation(
     )
     .await?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(ChannelControlResult::Applied)
+    Ok(ChannelControlResult::Applied { account: resolved })
 }
 
 /// Whether `account` holds a registered relationship with `channel` — its
@@ -5056,16 +5042,12 @@ pub async fn list_channel_access(pool: &PgPool) -> Result<Vec<(String, String, S
     .map_err(query_error)
 }
 
-/// Whether a founder transfer (ChanServ `SET FOUNDER`, the owner console's
-/// transfer) keeps the channel's successor. A successor that becomes the
-/// founder stops being the successor either way (migration 0075's trigger;
-/// the core's founder mirror follows the same two rules).
-pub const FOUNDER_TRANSFER_KEEPS_SUCCESSOR: bool = true;
-
-/// Make `founder_id` the founder of the locked channel `channel_id`, applying
-/// [`FOUNDER_TRANSFER_KEEPS_SUCCESSOR`]; a transfer to the founder it already
-/// has changes nothing. The one founder transfer both ChanServ and the owner
-/// console run.
+/// Make `founder_id` the founder of the locked channel `channel_id`: the one
+/// founder transfer both ChanServ and the owner console run. A transfer clears
+/// the successor — the outgoing founder picked the heir, and the new founder
+/// names their own (maintainer decision; succession by account deletion clears
+/// it too, through migration 0075's trigger). A transfer to the founder the
+/// channel already has changes nothing.
 async fn transfer_channel_founder(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     channel_id: i64,
@@ -5075,13 +5057,12 @@ async fn transfer_channel_founder(
         "UPDATE channels
          SET founder_account_id = $2,
              successor_account_id = CASE
-                 WHEN $3 OR founder_account_id = $2 THEN successor_account_id
+                 WHEN founder_account_id = $2 THEN successor_account_id
              END
          WHERE id = $1",
     )
     .bind(channel_id)
     .bind(founder_id)
-    .bind(FOUNDER_TRANSFER_KEEPS_SUCCESSOR)
     .execute(&mut **transaction)
     .await
     .map(|_| ())

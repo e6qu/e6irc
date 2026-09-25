@@ -1103,12 +1103,24 @@ subset's exact behavior.
     warned with Atheme's notices, and renamed to `Guest` plus a number after 30
     seconds (on the first reaper tick at or past the deadline) unless they
     identify to that account or leave the nick first; identifying to another
-    account does not count. `NICKLEN` is at least 10, so a Guest nick always
+    account does not count. The clock does not restart (maintainer decision):
+    a session keeps the earliest deadline each protected nick it held got — at
+    most eight, past which a new nick's clock starts at the earliest kept — so
+    leaving and coming back finds the same deadline, and a session coming back,
+    unidentified, after its deadline passed is renamed at once, on the `NICK`.
+    Identifying to the protecting account settles that nick's clock. `NICKLEN` is at least 10, so a Guest nick always
     fits. `DROP <account> <password>` answers with a confirmation key and
     deletes the account when repeated with it, after verifying the primary
     password, through the same deletion procedure as the console (§9.1) — so
     the account's sessions, the dropping one included, are disconnected by
-    its live gate. A user whose `IDENTIFY` or SASL verification is still
+    its live gate. `GHOST`, `REGAIN`, the enforcement rename and ChanServ
+    `OP`/`DEOP`/`VOICE`/`DEVOICE` act on another user's session, so each writes
+    an audit row before it is done — `NICK_GHOST`, `NICK_REGAIN`,
+    `NICK_GUEST_RENAME` (the protecting account as actor) with the folded nick
+    as target, `CHANNEL_OP`/`_DEOP`/`_VOICE`/`_DEVOICE` with the channel as
+    target and `nick=` detail — and one the audit trail cannot take is not
+    done (the enforcement rename retries on the next tick). A user whose
+    `IDENTIFY` or SASL verification is still
     running at the deadline keeps the nick until the verdict: the rename is
     rechecked on the next tick. `GROUP` claims a nick for an account as
     `REGISTER` does, so both refuse what any account claim refuses — a
@@ -1131,16 +1143,19 @@ subset's exact behavior.
     `VOP` by default); anyone on the list may `LIST` it, only the founder
     changes it, and an `ADD` for an account that already has an entry says it
     changed (or already had) the role rather than that it added one. Wherever
-    ChanServ takes an account, any of the account's nicks names it (Atheme
-    resolves a grouped nick to its account), and the reply names the account.
+    ChanServ — or the owner console's access and transfer controls — takes an
+    account, any of the account's nicks names it (Atheme resolves a grouped
+    nick to its account; one storage lookup, `resolve_account`, serves both
+    surfaces and login), and the reply names the account.
     `OP`/`DEOP` need op access and `VOICE`/`DEVOICE` voice or op access (the
     founder has both); the `MODE` line names the member by the nick the
     channel knows. `SET` takes `FOUNDER`, `SUCCESSOR`, `KEEPTOPIC` and `MLOCK`;
     the successor is the account the channel passes to when the founder's
     account is deleted (§9.1), is never the founder, and is cleared when it
-    becomes founder or its own account is deleted. Whether a transfer to anyone
-    else keeps it is one constant (`FOUNDER_TRANSFER_KEEPS_SUCCESSOR`, today:
-    it is kept) that storage and the core's mirror both follow. The successor
+    becomes founder, its own account is deleted, or the channel is transferred
+    to anyone (maintainer decision: the new founder names their own heir; one
+    transfer statement serves ChanServ and the owner console, and the core's
+    mirror follows the same rule). The successor
     is shown wherever a channel's holders are: `FLAGS` and `ACCESS LIST`, the
     owner console, and the administrators' channel directory. Every
     founder-only change — ChanServ's `FLAGS`/`ACCESS`, `SET`, `DROP`, and the

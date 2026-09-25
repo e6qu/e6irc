@@ -274,6 +274,9 @@ fn nickserv_ghost(state: &mut ServerState, conn: ConnId, args: &[&str]) {
     let Some((nick, victim)) = owned_nick_holder(state, conn, "GHOST", args) else {
         return;
     };
+    if !audit_nick_action(state, conn, "NICK_GHOST", &nick) {
+        return;
+    }
     let by = registered_nick(state, conn);
     super::session_action(
         state,
@@ -294,6 +297,9 @@ fn nickserv_regain(state: &mut ServerState, conn: ConnId, args: &[&str]) {
     let Some((nick, holder)) = owned_nick_holder(state, conn, "REGAIN", args) else {
         return;
     };
+    if !audit_nick_action(state, conn, "NICK_REGAIN", &nick) {
+        return;
+    }
     let by_mask = state.sessions[&conn].prefix();
     let by = state.session_shard(conn);
     super::session_action(
@@ -301,6 +307,22 @@ fn nickserv_regain(state: &mut ServerState, conn: ConnId, args: &[&str]) {
         holder,
         crate::core::state::SessionAction::Regain { nick, by, by_mask },
     );
+}
+
+/// Record a NickServ action on another session's nick — `action` by the
+/// caller's account on `nick` — before it is taken; when the audit trail
+/// cannot record it, the caller is told and it is not taken.
+fn audit_nick_action(state: &mut ServerState, conn: ConnId, action: &str, nick: &str) -> bool {
+    let account = state.sessions[&conn]
+        .account()
+        .map(str::to_owned)
+        .expect("a NickServ action on an owned nick comes from an identified session");
+    let target = state.nick_key(nick);
+    if super::oper::queue_audit(state, &account, action, target.as_str(), "").is_err() {
+        services_unavailable(state, conn, "NickServ");
+        return false;
+    }
+    true
 }
 
 /// On the shard holding a regained nick: rename its holder to a Guest nick,
@@ -840,7 +862,8 @@ fn time_ago(seconds: u64) -> String {
 
 /// How long a user holding a protected nick has to identify before it is
 /// renamed to a Guest nick (Atheme's default enforcement delay). The rename
-/// runs on the first reaper tick at or after the deadline.
+/// runs on the first reaper tick at or after the deadline — or at once, for a
+/// session returning to a nick whose deadline has already passed.
 pub(crate) const NICK_ENFORCE_DELAY_MS: u64 = 30_000;
 
 /// Guest nicks are `Guest` and a number of at most this many digits: every
@@ -852,45 +875,63 @@ const _: () = assert!(
     "the longest Guest nick must fit the shortest NICKLEN"
 );
 
-/// Check the nick `conn` holds against nick protection: warn and start the
-/// clock when it is protected and the session is not identified to the
-/// account protecting it; otherwise clear any enforcement in progress.
-pub(super) fn check_nick_protection(state: &mut ServerState, conn: ConnId) {
-    let Some(session) = state.sessions.get(&conn) else {
-        return;
-    };
-    let Some(nick) = session.nick().map(str::to_owned) else {
-        return;
-    };
+/// The account protecting the nick `conn` holds, when the session is not
+/// identified to it: the nick is being enforced against this session.
+fn enforced_protector(
+    state: &ServerState,
+    conn: ConnId,
+) -> Option<(
+    String,
+    crate::core::state::NickKey,
+    crate::core::state::AccountKey,
+)> {
+    let session = state.sessions.get(&conn)?;
+    let nick = session.nick()?.to_owned();
     let key = state.nick_key(&nick);
     let identified = session.account().map(|account| state.account_key(account));
     let protector = state
         .nick_protector(&key)
-        .filter(|protector| identified.as_ref() != Some(protector));
-    let Some(protector) = protector else {
-        state
-            .sessions
-            .get_mut(&conn)
-            .expect("checked")
-            .nick_enforcement = None;
+        .filter(|protector| identified.as_ref() != Some(protector))?;
+    Some((nick, key, protector))
+}
+
+/// Whether `conn` is waiting for an IDENTIFY or SASL verdict: enforcement
+/// waits for it rather than racing it.
+fn verification_in_flight(state: &ServerState, conn: ConnId) -> bool {
+    let session = &state.sessions[&conn];
+    session.sasl_verify_pending || session.pending_identify.is_some()
+}
+
+/// Check the nick `conn` holds against nick protection. When it is protected
+/// and the session is not identified to the account protecting it, the
+/// session's clock for that nick runs — the one it already had, if it held the
+/// nick before, else a fresh one with a warning. A clock that ran out while
+/// the session was away renames it on return. Otherwise the session holds no
+/// enforced nick (its clocks are kept).
+pub(super) fn check_nick_protection(state: &mut ServerState, conn: ConnId) {
+    let Some((nick, key, protector)) = enforced_protector(state, conn) else {
+        if let Some(session) = state.sessions.get_mut(&conn) {
+            session.nick_enforcement.release();
+        }
         return;
     };
-    if state.sessions[&conn]
-        .nick_enforcement
-        .as_ref()
-        .is_some_and(|enforcement| enforcement.nick == key)
-    {
-        return; // a case change of a nick already being enforced
-    }
-    let deadline = (state.config.mono_clock)().saturating_add_millis(NICK_ENFORCE_DELAY_MS);
-    state
+    let now = (state.config.mono_clock)();
+    let enforcement = &mut state
         .sessions
         .get_mut(&conn)
         .expect("checked")
-        .nick_enforcement = Some(crate::core::state::NickEnforcement {
-        nick: key,
-        deadline,
-    });
+        .nick_enforcement;
+    if enforcement.held() == Some(&key) {
+        return; // a case change of a nick already being enforced
+    }
+    let deadline = enforcement.deadline(&key, now.saturating_add_millis(NICK_ENFORCE_DELAY_MS));
+    enforcement.hold(key.clone());
+    if deadline <= now {
+        if !verification_in_flight(state, conn) {
+            enforce_rename(state, conn, &nick, &key, &protector);
+        }
+        return;
+    }
     state.service_notice(
         conn,
         "NickServ",
@@ -905,7 +946,7 @@ pub(super) fn check_nick_protection(state: &mut ServerState, conn: ConnId) {
         "NickServ",
         &format!(
             "You have {} seconds to identify to your nickname before it is changed.",
-            NICK_ENFORCE_DELAY_MS / 1000
+            deadline.saturating_sub(now).as_millis().div_ceil(1000)
         ),
     );
 }
@@ -916,45 +957,65 @@ pub(super) fn check_nick_protection(state: &mut ServerState, conn: ConnId) {
 /// verification is still running keeps its enforcement for the next tick: the
 /// verdict decides, not the timing of the check.
 pub(crate) fn enforce_nick_protection(state: &mut ServerState, now: e6irc_proto::time::MonoMillis) {
-    let due: Vec<(ConnId, crate::core::state::NickKey)> = state
+    let due: Vec<ConnId> = state
         .sessions
         .iter()
         .filter(|(_, session)| !session.sasl_verify_pending && session.pending_identify.is_none())
-        .filter_map(|(&conn, session)| {
-            session
-                .nick_enforcement
-                .as_ref()
-                .filter(|enforcement| enforcement.deadline <= now)
-                .map(|enforcement| (conn, enforcement.nick.clone()))
-        })
+        .filter(|(_, session)| session.nick_enforcement.due(now).is_some())
+        .map(|(&conn, _)| conn)
         .collect();
-    for (conn, key) in due {
-        state
-            .sessions
-            .get_mut(&conn)
-            .expect("listed above")
-            .nick_enforcement = None;
-        let session = &state.sessions[&conn];
-        let Some(nick) = session.nick().map(str::to_owned) else {
-            continue;
-        };
-        if state.nick_key(&nick) != key {
-            continue; // it moved to another nick
+    for conn in due {
+        let held = state.sessions[&conn].nick_enforcement.held().cloned();
+        match enforced_protector(state, conn) {
+            Some((nick, key, protector)) if Some(&key) == held.as_ref() => {
+                enforce_rename(state, conn, &nick, &key, &protector);
+            }
+            // It moved to another nick, identified, or the nick lost its
+            // protection.
+            _ => state
+                .sessions
+                .get_mut(&conn)
+                .expect("listed above")
+                .nick_enforcement
+                .release(),
         }
-        let identified = session.account().map(|account| state.account_key(account));
-        let still_protected = state
-            .nick_protector(&key)
-            .is_some_and(|protector| identified.as_ref() != Some(&protector));
-        if !still_protected {
-            continue;
-        }
-        state.service_notice(
-            conn,
-            "NickServ",
-            &format!("You failed to identify in time for the nickname {nick}"),
-        );
-        rename_to_guest(state, conn);
     }
+}
+
+/// Rename `conn` off the protected `nick` it failed to identify for, audited
+/// (`NICK_GUEST_RENAME`, with the protecting account as actor) before it is
+/// done. When the audit trail cannot take the row the session keeps the nick
+/// until the next tick tries again.
+fn enforce_rename(
+    state: &mut ServerState,
+    conn: ConnId,
+    nick: &str,
+    key: &crate::core::state::NickKey,
+    protector: &crate::core::state::AccountKey,
+) {
+    if super::oper::queue_audit(
+        state,
+        protector.as_str(),
+        "NICK_GUEST_RENAME",
+        key.as_str(),
+        "",
+    )
+    .is_err()
+    {
+        return;
+    }
+    state
+        .sessions
+        .get_mut(&conn)
+        .expect("enforced session")
+        .nick_enforcement
+        .release();
+    state.service_notice(
+        conn,
+        "NickServ",
+        &format!("You failed to identify in time for the nickname {nick}"),
+    );
+    rename_to_guest(state, conn);
 }
 
 /// Rename `conn` to a free `Guest<number>` nick that no account protects,
@@ -1701,20 +1762,41 @@ pub(crate) fn chanserv_status_on_owner(
         };
     };
     let member = channel
-        .member_mut(target_conn)
+        .member(target_conn)
         .expect("member_named found this member");
-    let field = if change.is_op() {
-        &mut member.op
+    let held = if change.is_op() {
+        member.op
     } else {
-        &mut member.voice
+        member.voice
     };
-    if *field == change.grants() {
+    if held == change.grants() {
         return ChanServStatusResult::Unchanged {
             target: target_nick,
             change,
         };
     }
-    *field = change.grants();
+    // It acts on someone else's session: audited, and not made unless it is.
+    if super::oper::queue_audit(
+        state,
+        &account,
+        change.audit_action(),
+        key.as_str(),
+        &format!("nick={target_nick}"),
+    )
+    .is_err()
+    {
+        return ChanServStatusResult::AuditUnavailable;
+    }
+    let member = state
+        .channels
+        .get_mut(&key)
+        .and_then(|channel| channel.member_mut(target_conn))
+        .expect("member_named found this member");
+    if change.is_op() {
+        member.op = change.grants();
+    } else {
+        member.voice = change.grants();
+    }
     let line = state.server_line(format!(
         ":{} MODE {display} {} {target_nick}",
         state.config.server_name,
@@ -1767,6 +1849,7 @@ pub(crate) fn emit_chanserv_status_result(
             };
             format!("{done} \x02{target}\x02 on \x02{channel}\x02.")
         }
+        ChanServStatusResult::AuditUnavailable => SERVICES_UNAVAILABLE.to_string(),
     };
     state.service_notice(conn, "ChanServ", &text);
 }

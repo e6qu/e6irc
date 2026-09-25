@@ -1073,9 +1073,13 @@ pub enum PersistedChannelMutation {
     Drop,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelControlResult {
-    Applied,
+    /// Stored. `account` is the account an access change or founder transfer
+    /// named, as storage resolved it (a grouped nick names its account).
+    Applied {
+        account: Option<String>,
+    },
     MissingOrNotOwner,
     AccountMissing,
     AccessLimitReached,

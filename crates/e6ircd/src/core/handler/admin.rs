@@ -894,7 +894,7 @@ pub(crate) fn channel_control_result(
     };
     let reply = pending.reply;
     let response = match result {
-        ChannelControlResult::Applied => {
+        ChannelControlResult::Applied { account: resolved } => {
             let summary = match mutation {
                 PersistedChannelMutation::SetTopic { topic } => {
                     let live_topic = topic.map(|(text, set_by, set_at_secs)| Topic {
@@ -977,6 +977,7 @@ pub(crate) fn channel_control_result(
                     format!("Updated the mode lock for {}", key.as_str())
                 }
                 PersistedChannelMutation::SetAccess { account, flags } => {
+                    let account = resolved.unwrap_or(account);
                     let account_key = state.account_key(&account);
                     match flags {
                         Some(flags) => {
@@ -993,6 +994,7 @@ pub(crate) fn channel_control_result(
                     format!("Updated {account}'s access on {}", key.as_str())
                 }
                 PersistedChannelMutation::TransferFounder { account } => {
+                    let account = resolved.unwrap_or(account);
                     state.transfer_founder(key.as_str(), &account);
                     format!("Transferred {} to {account}", key.as_str())
                 }

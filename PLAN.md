@@ -739,7 +739,7 @@ A review of that surface fixed, each with a test that failed before:
   change access, set KEEPTOPIC/MLOCK or `DROP` the channel. Storage now
   re-checks the founder with the row locked for all of them.
 - **The successor was invisible.** FLAGS, ACCESS LIST and both consoles show
-  it; the core mirrors it, following the one transfer policy constant.
+  it; the core mirrors it, and a transfer clears it.
 - **STATS k/d/x split an X-line mask with spaces and blanked an IPv6 mask**
   to `*`; masks, and a session's host, are spelled as Solanum spells them.
 - **The nick mirror could drift and a late verdict revived a deleted
@@ -749,7 +749,13 @@ A review of that surface fixed, each with a test that failed before:
   verified**; it waits for the verdict.
 - **ChanServ refused grouped nicks where it takes an account**, ACCESS ADD on
   an existing entry claimed it was added, and the OP/DEOP/VOICE/DEVOICE MODE
-  line echoed the nick as typed.
+  line echoed the nick as typed. The owner console resolves grouped nicks the
+  same way.
+
+Maintainer decisions implemented on top: a founder transfer always clears the
+successor; the nick-protection clock never restarts (leaving and returning
+keeps the deadline, and a return after it renames at once); and GHOST, REGAIN,
+the enforcement rename and ChanServ OP/DEOP/VOICE/DEVOICE are audited.
 
 ## Remaining qualification
 

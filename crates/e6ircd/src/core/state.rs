@@ -458,23 +458,24 @@ impl FounderDirectory {
     }
 
     /// A registered channel passed to `founder` (a transfer, or the
-    /// succession an account deletion performs), with storage's two rules
-    /// for its successor: one promoted to founder is cleared, and any other is
-    /// kept exactly when [`crate::db::FOUNDER_TRANSFER_KEEPS_SUCCESSOR`] says.
-    /// Passing a channel to the founder it already has changes nothing, so
-    /// every shard may apply the same succession broadcast.
+    /// succession an account deletion performs): as in storage, it has no
+    /// successor from then on. Passing a channel to the founder it already has
+    /// changes nothing, so every shard may apply the same succession broadcast.
     pub(crate) fn transfer(&self, key: ChanKey, founder: AccountKey) {
         let mut channels = self.lock();
-        let current = channels.get(&key);
-        if current.is_some_and(|ownership| ownership.founder == founder) {
+        if channels
+            .get(&key)
+            .is_some_and(|ownership| ownership.founder == founder)
+        {
             return;
         }
-        let successor = current
-            .and_then(|ownership| ownership.successor.clone())
-            .filter(|successor| {
-                *successor != founder && crate::db::FOUNDER_TRANSFER_KEEPS_SUCCESSOR
-            });
-        channels.insert(key, ChannelOwnership { founder, successor });
+        channels.insert(
+            key,
+            ChannelOwnership {
+                founder,
+                successor: None,
+            },
+        );
     }
 
     pub(crate) fn set_successor(&self, key: &ChanKey, successor: Option<AccountKey>) {
@@ -781,13 +782,97 @@ impl NickRegistrationDirectory {
     }
 }
 
-/// A protected nick a session holds without identifying to its account: at
-/// `deadline` (monotonic) it is renamed to a Guest nick unless it has left the
-/// nick or identified by then.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A session's nick-protection clocks (NickServ ENFORCE): the protected nick
+/// it holds without identifying to its account, if any, and the earliest
+/// deadline each protected nick it has held got. A clock never restarts:
+/// leaving a nick and coming back — or cycling through protected nicks —
+/// finds the deadline it already had, and a session returning to a nick whose
+/// deadline has passed is renamed at once.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct NickEnforcement {
-    pub(crate) nick: NickKey,
-    pub(crate) deadline: e6irc_proto::time::MonoMillis,
+    held: Option<NickKey>,
+    /// At most [`Self::TRACKED`] entries, one per nick.
+    deadlines: Vec<(NickKey, e6irc_proto::time::MonoMillis)>,
+}
+
+impl NickEnforcement {
+    /// Most nicks whose clocks one session keeps. Past it a new nick's clock
+    /// starts at the earliest one kept, so a session cannot buy fresh clocks
+    /// by cycling through more nicks than that.
+    const TRACKED: usize = 8;
+
+    /// The deadline for holding `nick` unidentified: the one it already has,
+    /// or else `fresh`.
+    pub(crate) fn deadline(
+        &mut self,
+        nick: &NickKey,
+        fresh: e6irc_proto::time::MonoMillis,
+    ) -> e6irc_proto::time::MonoMillis {
+        if let Some((_, deadline)) = self.deadlines.iter().find(|(held, _)| held == nick) {
+            return *deadline;
+        }
+        let mut deadline = fresh;
+        if self.deadlines.len() >= Self::TRACKED {
+            let earliest = self
+                .deadlines
+                .iter()
+                .map(|(_, deadline)| *deadline)
+                .min()
+                .expect("full");
+            deadline = deadline.min(earliest);
+            let latest = self
+                .deadlines
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, (_, deadline))| *deadline)
+                .map(|(index, _)| index)
+                .expect("full");
+            self.deadlines.swap_remove(latest);
+        }
+        self.deadlines.push((nick.clone(), deadline));
+        deadline
+    }
+
+    /// The protected nick held unidentified, if any.
+    pub(crate) fn held(&self) -> Option<&NickKey> {
+        self.held.as_ref()
+    }
+
+    pub(crate) fn hold(&mut self, nick: NickKey) {
+        self.held = Some(nick);
+    }
+
+    /// The session holds no protected nick unidentified any more; the clocks
+    /// are kept.
+    pub(crate) fn release(&mut self) {
+        self.held = None;
+    }
+
+    /// The held nick, when its deadline is at or before `now`.
+    pub(crate) fn due(&self, now: e6irc_proto::time::MonoMillis) -> Option<&NickKey> {
+        let held = self.held.as_ref()?;
+        self.deadlines
+            .iter()
+            .any(|(nick, deadline)| nick == held && *deadline <= now)
+            .then_some(held)
+    }
+
+    /// The nicks with a clock, for dropping those an identify has settled.
+    pub(crate) fn clocked(&self) -> Vec<NickKey> {
+        self.deadlines
+            .iter()
+            .map(|(nick, _)| nick.clone())
+            .collect()
+    }
+
+    /// Forget `nick`'s clock (and stop holding it): the session proved it may
+    /// use it.
+    pub(crate) fn settle(&mut self, nick: &NickKey) {
+        self.deadlines.retain(|(held, _)| held != nick);
+        if self.held.as_ref() == Some(nick) {
+            self.held = None;
+        }
+    }
 }
 
 /// What any shard may know about a registered user: the public face of a
@@ -1583,8 +1668,8 @@ pub(crate) struct Session {
     /// Deferred NickServ REGISTER reply.
     pub pending_register: Option<PendingServiceReply>,
     /// The protected nick this session holds without having identified to
-    /// its account, and when it is renamed for it (NickServ ENFORCE).
-    pub(crate) nick_enforcement: Option<NickEnforcement>,
+    /// its account, and the clocks of those it has held (NickServ ENFORCE).
+    pub(crate) nick_enforcement: NickEnforcement,
     /// The confirmation key NickServ DROP last gave this session, with the
     /// account it is for: the drop proceeds only when it is repeated.
     pub(crate) drop_confirmation: Option<(AccountKey, String)>,
@@ -2748,6 +2833,16 @@ impl StatusChange {
         matches!(self, Self::Op | Self::Voice)
     }
 
+    /// The audit event recording it.
+    pub(crate) fn audit_action(self) -> &'static str {
+        match self {
+            Self::Op => "CHANNEL_OP",
+            Self::Deop => "CHANNEL_DEOP",
+            Self::Voice => "CHANNEL_VOICE",
+            Self::Devoice => "CHANNEL_DEVOICE",
+        }
+    }
+
     /// The channel mode change it announces.
     pub(crate) fn mode(self) -> &'static str {
         match self {
@@ -2785,6 +2880,9 @@ pub enum ChanServStatusResult {
         channel: String,
         change: StatusChange,
     },
+    /// The change could not be recorded in the audit trail, so it was not
+    /// made.
+    AuditUnavailable,
 }
 
 #[derive(Debug)]
@@ -5917,7 +6015,7 @@ impl ServerState {
                 credential_attempts: crate::identity::CredentialAttemptBudget::default(),
                 pending_identify: None,
                 pending_register: None,
-                nick_enforcement: None,
+                nick_enforcement: NickEnforcement::default(),
                 drop_confirmation: None,
                 away: None,
                 oper: None,
@@ -6749,21 +6847,25 @@ impl ServerState {
         if let Some(previous) = previous {
             self.forget_account_session(&previous, conn);
         }
-        // Identifying to the account protecting the nick held ends its
-        // enforcement (NickServ ENFORCE); identifying to any other does not.
-        let enforced_nick = self.sessions[&conn]
+        // Identifying to the account protecting a nick settles its clock
+        // (NickServ ENFORCE) — the held one's enforcement ends; identifying
+        // to any other account settles nothing.
+        let settled: Vec<NickKey> = self.sessions[&conn]
             .nick_enforcement
-            .as_ref()
-            .map(|enforcement| enforcement.nick.clone());
-        if let Some(nick) = enforced_nick
-            && self
-                .nick_protector(&nick)
-                .is_none_or(|protector| protector == key)
-        {
-            self.sessions
-                .get_mut(&conn)
-                .expect("session logging in")
-                .nick_enforcement = None;
+            .clocked()
+            .into_iter()
+            .filter(|nick| {
+                self.nick_protector(nick)
+                    .is_none_or(|protector| protector == key)
+            })
+            .collect();
+        let enforcement = &mut self
+            .sessions
+            .get_mut(&conn)
+            .expect("session logging in")
+            .nick_enforcement;
+        for nick in &settled {
+            enforcement.settle(nick);
         }
         self.account_sessions.entry(key).or_default().insert(conn);
         if let Some(nick) = released {
@@ -6971,6 +7073,35 @@ mod wire_line_tests {
         assert!(wire_line_violation(tagged.as_bytes(), false).is_none());
         let huge_tags = format!("@a={} :s PING\r\n", "t".repeat(9000));
         assert!(wire_line_violation(huge_tags.as_bytes(), false).is_some());
+    }
+}
+
+#[cfg(test)]
+mod nick_enforcement_tests {
+    use super::{NickEnforcement, NickKey};
+    use e6irc_proto::time::MonoMillis;
+
+    /// Cycling through more protected nicks than a session tracks never buys
+    /// a clock later than the earliest it already had, and the tracked set
+    /// stays bounded.
+    #[test]
+    fn cycling_through_many_nicks_never_restarts_a_clock() {
+        let mut enforcement = NickEnforcement::default();
+        let first = enforcement.deadline(&NickKey("n0".into()), MonoMillis::from_millis(100));
+        assert_eq!(first, MonoMillis::from_millis(100));
+        for (index, fresh) in (1..40u64).map(|index| (index, 100 + index * 10)) {
+            let nick = NickKey(format!("n{index}"));
+            let deadline = enforcement.deadline(&nick, MonoMillis::from_millis(fresh));
+            if index >= NickEnforcement::TRACKED as u64 {
+                assert_eq!(deadline, first, "nick {index} got a fresh clock");
+            }
+            assert!(enforcement.clocked().len() <= NickEnforcement::TRACKED);
+        }
+        // A nick still tracked keeps its own deadline.
+        assert_eq!(
+            enforcement.deadline(&NickKey("n0".into()), MonoMillis::from_millis(9_999)),
+            first
+        );
     }
 }
 

@@ -4832,22 +4832,28 @@ async fn owned_channel_control_is_scoped_and_complete() {
         db::persist_owned_channel_mutation(&pool, "#control", "boss", &topic)
             .await
             .expect("topic"),
-        ChannelControlResult::Applied
+        ChannelControlResult::Applied { account: None }
     );
-    for mutation in [
-        PersistedChannelMutation::SetMlock {
-            mlock: Some("+nt-i".into()),
-        },
-        PersistedChannelMutation::SetAccess {
-            account: "alice".into(),
-            flags: Some("ov".into()),
-        },
+    for (mutation, account) in [
+        (
+            PersistedChannelMutation::SetMlock {
+                mlock: Some("+nt-i".into()),
+            },
+            None,
+        ),
+        (
+            PersistedChannelMutation::SetAccess {
+                account: "alice".into(),
+                flags: Some("ov".into()),
+            },
+            Some("alice".to_string()),
+        ),
     ] {
         assert_eq!(
             db::persist_owned_channel_mutation(&pool, "#control", "boss", &mutation)
                 .await
                 .expect("mutation"),
-            ChannelControlResult::Applied
+            ChannelControlResult::Applied { account }
         );
     }
 
@@ -4889,7 +4895,7 @@ async fn owned_channel_control_is_scoped_and_complete() {
         )
         .await
         .expect("disable retention"),
-        ChannelControlResult::Applied
+        ChannelControlResult::Applied { account: None }
     );
     assert_eq!(
         db::persist_owned_channel_mutation(&pool, "#control", "boss", &topic)
@@ -4908,7 +4914,9 @@ async fn owned_channel_control_is_scoped_and_complete() {
         )
         .await
         .expect("transfer"),
-        ChannelControlResult::Applied
+        ChannelControlResult::Applied {
+            account: Some("alice".into())
+        }
     );
     assert!(
         db::list_owned_channels(&pool, "boss")
@@ -10708,18 +10716,15 @@ async fn a_deleted_founders_channels_pass_to_their_successors() {
     ));
     assert_eq!(successor("#c").await, None);
     assert_eq!(set("#d", Some("dave"), "alice").await, applied("Dave"));
+    assert_eq!(set("#b", Some("carol"), "dave").await, applied("Carol"));
     assert!(matches!(
         db::set_channel_founder(&pool, "#b", "alice", "dave")
             .await
             .expect("transfer"),
         db::FounderTransfer::Transferred { .. }
     ));
-    // A transfer to anyone else follows the one transfer policy.
-    assert_eq!(
-        successor("#b").await,
-        None,
-        "#b had no successor since Dave became its founder"
-    );
+    // Any transfer clears the successor: the new founder names their own.
+    assert_eq!(successor("#b").await, None, "a transfer kept the successor");
     let deleted = db::delete_account_permanently(&pool, dave_id, "Alice", &[])
         .await
         .expect("delete")
@@ -10816,8 +10821,7 @@ async fn chanserv_resolves_grouped_nicks_and_the_console_shows_the_successor() {
         [("#room".to_string(), "carol".to_string())]
     );
 
-    // A founder transfer by grouped nick keeps the successor exactly when the
-    // transfer policy says so.
+    // A founder transfer by grouped nick clears the successor.
     assert_eq!(
         db::set_channel_founder(&pool, "#room", "Bob_Away", "alice")
             .await
@@ -10826,11 +10830,66 @@ async fn chanserv_resolves_grouped_nicks_and_the_console_shows_the_successor() {
             founder: "Bob".into()
         }
     );
-    let kept = !db::list_channel_successors(&pool)
+    assert_eq!(
+        db::list_channel_successors(&pool)
+            .await
+            .expect("successors"),
+        []
+    );
+    // The owner console resolves a grouped nick the same way, and its
+    // transfer clears the successor too.
+    assert_eq!(
+        db::set_channel_successor(&pool, "#room", Some("carol_alt"), "bob")
+            .await
+            .expect("successor"),
+        db::SuccessorChange::Applied {
+            successor: Some("Carol".into())
+        }
+    );
+    use e6ircd::core::{ChannelControlResult, PersistedChannelMutation};
+    assert_eq!(
+        db::persist_owned_channel_mutation(
+            &pool,
+            "#room",
+            "bob",
+            &PersistedChannelMutation::SetAccess {
+                account: "CAROL_ALT".into(),
+                flags: Some("v".into()),
+            },
+        )
         .await
-        .expect("successors")
-        .is_empty();
-    assert_eq!(kept, db::FOUNDER_TRANSFER_KEEPS_SUCCESSOR);
+        .expect("console access"),
+        ChannelControlResult::Applied {
+            account: Some("Carol".into())
+        }
+    );
+    assert!(
+        db::list_channel_access(&pool)
+            .await
+            .expect("list")
+            .contains(&("#room".to_string(), "carol".to_string(), "v".to_string()))
+    );
+    assert_eq!(
+        db::persist_owned_channel_mutation(
+            &pool,
+            "#room",
+            "bob",
+            &PersistedChannelMutation::TransferFounder {
+                account: "alice".into(),
+            },
+        )
+        .await
+        .expect("console transfer"),
+        ChannelControlResult::Applied {
+            account: Some("Alice".into())
+        }
+    );
+    assert_eq!(
+        db::list_channel_successors(&pool)
+            .await
+            .expect("successors"),
+        []
+    );
 }
 
 /// One IRC client of a running server, for the end-to-end services tests.

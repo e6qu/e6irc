@@ -8722,6 +8722,203 @@ fn identifying_within_the_delay_cancels_the_rename() {
     );
 }
 
+thread_local! {
+    /// Milliseconds past `test_mono()` that [`set_mono`] reads, per test thread.
+    static MONO_AHEAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A monotonic clock a test moves with [`advance_mono`].
+fn set_mono() -> MonoMillis {
+    MonoMillis::from_millis(test_mono().as_millis() + MONO_AHEAD.with(std::cell::Cell::get))
+}
+
+fn advance_mono(to: u64) {
+    MONO_AHEAD.with(|ahead| ahead.set(to));
+}
+
+/// A server whose monotonic clock the test moves, for nick protection.
+fn server_with_moving_clock() -> TestServer {
+    advance_mono(0);
+    TestServer::configured(
+        true,
+        || Millis::from_millis(1_000_000_000),
+        |config| config.mono_clock = set_mono,
+    )
+}
+
+/// A session's clock for a protected nick never restarts: leaving the nick
+/// and coming back finds the deadline it had, and the rename follows it.
+#[test]
+fn leaving_and_returning_to_a_protected_nick_keeps_its_deadline() {
+    let mut s = server_with_moving_clock();
+    let _owner = protected_alice(&mut s);
+    let intruder = s.register(2, "intruder");
+    s.line(intruder, "NICK alice");
+    assert_eq!(notices(&s.drain(intruder)).len(), 2);
+    advance_mono(25_000);
+    s.line(intruder, "NICK alice_");
+    s.drain(intruder);
+    advance_mono(26_000);
+    s.line(intruder, "NICK alice");
+    assert_eq!(
+        notices(&s.drain(intruder))[1],
+        "You have 4 seconds to identify to your nickname before it is changed.",
+        "the clock restarted"
+    );
+    tick_after(&mut s, 30_000);
+    assert!(
+        s.drain(intruder)
+            .iter()
+            .any(|line| line.contains(" NICK Guest")),
+        "not renamed at the original deadline"
+    );
+}
+
+/// A session returning, unidentified, to a nick whose deadline passed while it
+/// was away is renamed on the spot, not at the next tick.
+#[test]
+fn returning_to_a_protected_nick_after_its_deadline_renames_at_once() {
+    let mut s = server_with_moving_clock();
+    let _owner = protected_alice(&mut s);
+    let intruder = s.register(2, "intruder");
+    s.line(intruder, "NICK alice");
+    s.drain(intruder);
+    s.line(intruder, "NICK elsewhere");
+    s.drain(intruder);
+    advance_mono(40_000);
+    s.db_requests();
+    s.line(intruder, "NICK alice");
+    let out = s.drain(intruder);
+    assert_eq!(
+        notices(&out),
+        ["You failed to identify in time for the nickname alice"],
+        "{out:#?}"
+    );
+    assert!(
+        out.iter().any(|line| line.contains(" NICK Guest")),
+        "{out:#?}"
+    );
+    // The rename acted on the session for the protecting account: audited.
+    assert!(s.db_requests().iter().any(|request| matches!(
+        request,
+        e6ircd::core::DbRequest::AuditLog { actor, action, target, .. }
+            if actor == "alice" && action == "NICK_GUEST_RENAME" && target == "alice"
+    )));
+}
+
+/// Identifying to the protecting account settles the nick's clock: coming
+/// back later, still identified, draws nothing.
+#[test]
+fn identifying_settles_the_clock_for_good() {
+    let mut s = server_with_moving_clock();
+    let _owner = protected_alice(&mut s);
+    let second = s.register(2, "second");
+    s.line(second, "NICK alice");
+    s.drain(second);
+    identify(&mut s, second, "alice");
+    s.line(second, "NICK other");
+    advance_mono(60_000);
+    s.line(second, "NICK alice");
+    let out = s.drain(second);
+    assert!(notices(&out).is_empty(), "{out:#?}");
+    tick_after(&mut s, 90_000);
+    assert!(!s.drain(second).iter().any(|line| line.contains(" NICK ")));
+}
+
+/// GHOST, REGAIN and ChanServ OP/DEOP/VOICE/DEVOICE act on other users'
+/// sessions, so each is audited with the acting account and its target — and
+/// not done when the audit trail cannot take the row.
+#[test]
+fn services_actions_on_other_sessions_are_audited() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+    let audits = |s: &mut TestServer| -> Vec<(String, String, String, String)> {
+        s.db_requests()
+            .into_iter()
+            .filter_map(|request| match request {
+                e6ircd::core::DbRequest::AuditLog {
+                    actor,
+                    action,
+                    target,
+                    detail,
+                } => Some((actor, action, target, detail)),
+                _ => None,
+            })
+            .collect()
+    };
+    let row = |actor: &str, action: &str, target: &str, detail: &str| {
+        (
+            actor.to_string(),
+            action.to_string(),
+            target.to_string(),
+            detail.to_string(),
+        )
+    };
+    let stale = s.register(1, "Boss");
+    let boss = s.register(2, "boss_");
+    identify(&mut s, boss, "BOSS");
+    s.line(boss, "PRIVMSG NickServ :GHOST Boss");
+    assert_eq!(audits(&mut s), [row("boss", "NICK_GHOST", "boss", "")]);
+    s.drain(stale);
+    let holder = s.register(3, "boss");
+    s.line(boss, "PRIVMSG NickServ :REGAIN boss");
+    assert_eq!(audits(&mut s), [row("boss", "NICK_REGAIN", "boss", "")]);
+    s.drain(holder);
+
+    let carol = s.register(4, "carol");
+    s.line(carol, "JOIN #chan");
+    s.line(boss, "JOIN #chan");
+    s.drain(boss);
+    s.drain(carol);
+    for (command, action) in [
+        ("VOICE", "CHANNEL_VOICE"),
+        ("DEVOICE", "CHANNEL_DEVOICE"),
+        ("OP", "CHANNEL_OP"),
+        ("DEOP", "CHANNEL_DEOP"),
+    ] {
+        s.line(boss, &format!("PRIVMSG ChanServ :{command} #chan CAROL"));
+        assert_eq!(
+            audits(&mut s),
+            [row("boss", action, "#chan", "nick=carol")],
+            "{command}"
+        );
+    }
+    // An unchanged status changes nothing, and records nothing.
+    s.line(boss, "PRIVMSG ChanServ :DEOP #chan carol");
+    assert!(audits(&mut s).is_empty());
+}
+
+/// When the audit trail cannot take the row, the action is not taken.
+#[test]
+fn a_services_action_the_audit_trail_cannot_record_is_refused() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    let carol = s.register(2, "carol");
+    s.line(carol, "JOIN #chan");
+    s.line(boss, "JOIN #chan");
+    s.drain(boss);
+    s.drain(carol);
+    // Fill the database queue (capacity 64) so the audit row cannot be queued.
+    for _ in 0..64 {
+        s.line(carol, "PRIVMSG #chan :filling the database queue");
+    }
+    s.drain(boss);
+    s.drain(carol);
+    s.line(boss, "PRIVMSG ChanServ :VOICE #chan carol");
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["Services are temporarily unavailable. Try again later."]
+    );
+    assert!(
+        !s.drain(carol).iter().any(|line| line.contains(" MODE ")),
+        "voiced without an audit row"
+    );
+}
+
 /// The rename waits for an IDENTIFY that is still being verified at the
 /// deadline: the verdict decides, not when the tick happens to fall.
 #[test]
@@ -9512,8 +9709,8 @@ fn a_deleted_founders_channel_follows_its_successor_in_the_mirror() {
 }
 
 /// The successor is part of who holds a channel, so the founder sees it in
-/// FLAGS and ACCESS listings; it follows a founder transfer by the one
-/// transfer policy, and goes when its own account is deleted.
+/// FLAGS and ACCESS listings; it goes when its own account is deleted, and a
+/// founder transfer clears it.
 #[test]
 fn the_successor_is_listed_and_followed_through_transfers_and_deletion() {
     let mut s = TestServer::new();
@@ -9550,8 +9747,30 @@ fn the_successor_is_listed_and_followed_through_transfers_and_deletion() {
         ]
     );
 
-    // A transfer to someone else keeps the successor exactly when storage's
-    // transfer policy does, and the new founder sees it.
+    // Deleting the successor's account clears it.
+    s.core.handle(Input::AccountDeleted {
+        account: "carol".into(),
+        successions: Vec::new(),
+    });
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #room");
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["Access list for \x02#room\x02:", "End of access list."]
+    );
+
+    // A transfer to anyone clears the successor: the new founder names their
+    // own.
+    s.line(boss, "PRIVMSG ChanServ :SET #room SUCCESSOR erin");
+    s.db_requests();
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::SuccessorSet {
+        display: "#room".into(),
+        successor: Some("erin".into()),
+        outcome: Some(e6ircd::db::SuccessorChange::Applied {
+            successor: Some("erin".into()),
+        }),
+        label: None,
+    });
+    s.drain(boss);
     s.line(boss, "PRIVMSG ChanServ :SET #room FOUNDER dave");
     s.db_requests();
     s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::FounderChanged {
@@ -9564,21 +9783,10 @@ fn the_successor_is_listed_and_followed_through_transfers_and_deletion() {
     let dave = s.register(2, "dave");
     identify(&mut s, dave, "dave");
     s.line(dave, "PRIVMSG ChanServ :FLAGS #room");
-    let listed = notices(&s.drain(dave)).contains(&"carol (successor)");
-    assert_eq!(listed, e6ircd::db::FOUNDER_TRANSFER_KEEPS_SUCCESSOR);
-
-    // Deleting the successor's account clears it.
-    if listed {
-        s.core.handle(Input::AccountDeleted {
-            account: "carol".into(),
-            successions: Vec::new(),
-        });
-        s.line(dave, "PRIVMSG ChanServ :FLAGS #room");
-        assert_eq!(
-            notices(&s.drain(dave)),
-            ["Access list for \x02#room\x02:", "End of access list."]
-        );
-    }
+    assert_eq!(
+        notices(&s.drain(dave)),
+        ["Access list for \x02#room\x02:", "End of access list."]
+    );
 }
 
 /// A transfer to the successor itself always leaves the channel without one.
@@ -10085,7 +10293,7 @@ fn owner_channel_control_waits_for_storage_and_updates_the_hot_access_map() {
     s.core.handle(Input::ChannelControlResult {
         owner,
         request_id,
-        result: e6ircd::core::ChannelControlResult::Applied,
+        result: e6ircd::core::ChannelControlResult::Applied { account: None },
     });
     assert!(matches!(
         reply_rx.try_recv(),
@@ -10159,7 +10367,7 @@ fn owner_channel_control_verdicts_are_request_bound_and_consumed_once() {
     s.core.handle(Input::ChannelControlResult {
         owner: owner.clone(),
         request_id,
-        result: e6ircd::core::ChannelControlResult::Applied,
+        result: e6ircd::core::ChannelControlResult::Applied { account: None },
     });
     assert!(matches!(
         reply_rx.try_recv(),
@@ -10171,7 +10379,7 @@ fn owner_channel_control_verdicts_are_request_bound_and_consumed_once() {
     s.core.handle(Input::ChannelControlResult {
         owner,
         request_id,
-        result: e6ircd::core::ChannelControlResult::Applied,
+        result: e6ircd::core::ChannelControlResult::Applied { account: None },
     });
     let (next_tx, mut next_rx) = tokio::sync::oneshot::channel();
     s.core.handle(Input::Admin {
