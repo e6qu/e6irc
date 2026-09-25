@@ -2036,6 +2036,25 @@ pub(super) fn kind_feature_available(kind: crate::config::NetworkKind) -> bool {
 #[serde(deny_unknown_fields)]
 pub(super) struct BufferQuery {
     pub(super) limit: Option<usize>,
+    /// A live-socket replay cursor: only the lines at or before it. A reader
+    /// that already holds every line after it asks this way, so no line
+    /// reaches it twice and nothing has to be matched up by content.
+    pub(super) through: Option<String>,
+}
+
+/// A `through` cursor this read cannot bound: it belongs to another ring
+/// lifetime (the network restarted), or the network is stopped and the lines
+/// are persisted history, which has no ring positions. Answering with lines
+/// anyway would hand the reader copies of what it already holds.
+fn unhonoured_buffer_cursor() -> Response {
+    problem_at_field(
+        StatusCode::CONFLICT,
+        "Buffer cursor not honoured",
+        Some(
+            "The cursor does not name a position of this network's live buffer; read without `through`.",
+        ),
+        Some("through"),
+    )
 }
 
 /// Recent bouncer lines for one caller-owned network, oldest-first — the same
@@ -2072,16 +2091,42 @@ pub(super) async fn network_buffer(
         Ok(limit) => limit,
         Err(response) => return response.into(),
     };
-    if let Some(handle) = state
+    let through = match params
+        .through
+        .as_deref()
+        .map(crate::bouncer::ReplayCursor::parse)
+    {
+        None => None,
+        Some(Some(cursor)) => Some(cursor),
+        Some(None) => {
+            return problem_at_field(
+                StatusCode::BAD_REQUEST,
+                "Invalid buffer cursor",
+                Some("`through` must be a cursor the live chat socket handed out."),
+                Some("through"),
+            );
+        }
+    };
+    let handle = state
         .bnc_registry
         .as_ref()
-        .and_then(|registry| registry.get_owned(&account, &name))
-    {
-        let lines = handle.buffer_snapshot();
+        .and_then(|registry| registry.get_owned(&account, &name));
+    if let Some(handle) = handle {
+        let lines = match through {
+            None => handle.buffer_snapshot(),
+            Some(cursor) => match handle.buffer_through(cursor) {
+                Some(lines) => lines,
+                None => return unhonoured_buffer_cursor(),
+            },
+        };
         let skip = lines.len().saturating_sub(limit as usize);
         return json_no_store(NetworkBufferLinesResponse {
             lines: lines[skip..].to_vec(),
         });
+    }
+    // Persisted history holds no ring positions, so a cursor cannot bound it.
+    if through.is_some() {
+        return unhonoured_buffer_cursor();
     }
     // The DB buffer API canonicalizes the owner/network composite key, matching
     // the live registry even when this URL uses a different case.

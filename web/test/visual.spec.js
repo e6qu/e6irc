@@ -939,7 +939,7 @@ test("only a join asked for here moves the view", async ({ page }) => {
   await page.routeWebSocket(/\/ws\/ui/, (socket) => {
     upstream = socket;
     socket.send(JSON.stringify({ t: "status", v: "connected" }));
-    socket.send(JSON.stringify({ t: "session", nick: "viewer", channels: [] }));
+    socket.send(JSON.stringify({ t: "session", nick: "viewer", channels: [], isupport: [] }));
     socket.send(snapshotEvent(0));
     socket.onMessage((frame) => {
       const request = JSON.parse(frame);
@@ -985,8 +985,8 @@ test("a connection the server refuses by policy is said once and not hammered", 
 test("opening a network returns to the conversation that was open, never to whatever replay mentioned last", async ({ page }) => {
   const attach = (channels) => page.routeWebSocket(/\/ws\/ui/, (socket) => {
     socket.send(JSON.stringify({ t: "status", v: "connected" }));
+    socket.send(JSON.stringify({ t: "session", nick: "viewer", channels, isupport: [] }));
     channels.forEach((channel, index) => socket.send(lineEvent(`:viewer!u@h JOIN ${channel}`, index + 1)));
-    socket.send(JSON.stringify({ t: "session", nick: "viewer", channels }));
     socket.send(snapshotEvent(channels.length));
   });
   await mockSession(page, [ircNetwork("Libera")]);
@@ -1008,8 +1008,8 @@ test("opening a network returns to the conversation that was open, never to what
 test("a network's only conversation opens by itself", async ({ page }) => {
   await page.routeWebSocket(/\/ws\/ui/, (socket) => {
     socket.send(JSON.stringify({ t: "status", v: "connected" }));
+    socket.send(JSON.stringify({ t: "session", nick: "viewer", channels: ["#only"], isupport: [] }));
     socket.send(lineEvent(":viewer!u@h JOIN #only", 1));
-    socket.send(JSON.stringify({ t: "session", nick: "viewer", channels: ["#only"] }));
     socket.send(snapshotEvent(1));
   });
   await mockSession(page, [ircNetwork("Libera")]);
@@ -1367,14 +1367,16 @@ test("phone conversation rail returns focus after Escape", async ({ page }) => {
 
 // The server names a ring position on every line and on the replay boundary;
 // the client hands the last one back on its next attach. Positions here count
-// from `first` so a mock can continue a ring across attaches.
+// from `first` so a mock can continue a ring across attaches. The session (the
+// driver's current nick, channels and ISUPPORT) precedes the replay, as the
+// server sends it.
 const cursorAt = (position) => `9:${position}`;
 const lineEvent = (line, position) => JSON.stringify({ t: "line", v: line, cursor: cursorAt(position) });
 const snapshotEvent = (position) => JSON.stringify({ t: "snapshot", v: "complete", cursor: cursorAt(position) });
-const attachReplay = (socket, lines, channels, first = 1) => {
+const attachReplay = (socket, lines, channels, first = 1, { nick = "viewer", isupport = [] } = {}) => {
   socket.send(JSON.stringify({ t: "status", v: "connected" }));
+  socket.send(JSON.stringify({ t: "session", nick, channels, isupport }));
   lines.forEach((line, index) => socket.send(lineEvent(line, first + index)));
-  socket.send(JSON.stringify({ t: "session", nick: "viewer", channels }));
   socket.send(snapshotEvent(first + lines.length - 1));
 };
 
@@ -1450,8 +1452,8 @@ test("a cursor the server cannot honour reloads the transcript once", async ({ p
     // it says the replay is the whole ring and the page starts over.
     socket.send(JSON.stringify({ t: "status", v: "connected" }));
     socket.send(JSON.stringify({ t: "replay", v: "full" }));
+    socket.send(JSON.stringify({ t: "session", nick: "viewer", channels: ["#only"], isupport: [] }));
     ring.forEach((line, index) => socket.send(JSON.stringify({ t: "line", v: line, cursor: `10:${index + 1}` })));
-    socket.send(JSON.stringify({ t: "session", nick: "viewer", channels: ["#only"] }));
     socket.send(JSON.stringify({ t: "snapshot", v: "complete", cursor: `10:${ring.length}` }));
   });
   await mockSession(page, [ircNetwork("Libera")]);
@@ -1798,4 +1800,364 @@ test("on a phone the member list opens from the buffer header", async ({ page })
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("bob");
   await expect(members).toBeHidden();
   await expect(list).toBeHidden();
+});
+
+// ---- chat defects: history seam, focus, unread, echo, session, a11y ---------
+
+// The buffer read "Load earlier" makes, as the served contract declares it.
+async function mockBuffer(page, respond) {
+  await page.route("/api/v1/openapi.json", (route) => route.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify({ paths: { ...apiContract.paths, "/api/v1/me/networks/{name}/buffer": {
+      get: {
+        parameters: [
+          { name: "name", in: "path", required: true, schema: { type: "string" } },
+          { name: "limit", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 1000 } },
+          { name: "through", in: "query", required: false, schema: { type: "string", minLength: 1 } },
+        ],
+        responses: {
+          200: response({
+            type: "object", additionalProperties: false, required: ["lines"],
+            properties: { lines: { type: "array", items: { type: "string" } } },
+          }),
+          409: { description: "cursor not honoured" },
+        },
+      },
+    } } }),
+  }));
+  await page.route(/\/api\/v1\/me\/networks\/[^/]+\/buffer/, respond);
+}
+
+// A chat attached to #only on a network that sends no msgid: a join notice
+// opens the buffer, a message follows, and the reader sends one of their own.
+async function historySeam(page, respond) {
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    attachReplay(socket, [
+      ":viewer!u@h JOIN #only",
+      ":carol!u@h JOIN #only",
+      ":bob!u@h PRIVMSG #only :live one",
+    ], ["#only"]);
+    socket.onMessage((frame) => {
+      const request = JSON.parse(frame);
+      if (request.id) socket.send(JSON.stringify({ t: "sent", v: request.id }));
+    });
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  const reads = [];
+  await mockBuffer(page, (route) => {
+    const url = new URL(route.request().url());
+    reads.push(url.searchParams.get("through"));
+    return respond(route, url);
+  });
+  await page.goto("/?network=Libera");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("#only");
+  const composer = page.getByRole("textbox", { name: "Message" });
+  await composer.fill("mine");
+  await composer.press("Enter");
+  const messages = page.getByLabel("Messages");
+  await expect(messages.locator(".line-msg", { hasText: "mine" })).toHaveCount(1);
+  await page.getByRole("button", { name: "Load earlier messages" }).click();
+  await expect(messages.locator(".line-msg", { hasText: "older" })).toHaveCount(1);
+  return { messages, reads };
+}
+
+test("earlier history is read through the oldest row's ring position and shown once", async ({ page }) => {
+  const { messages, reads } = await historySeam(page, (route, url) => {
+    // The ring through position 1: the lines before carol's join.
+    expect(url.searchParams.get("through")).toBe(cursorAt(1));
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ lines: [":bob!u@h PRIVMSG #only :older", ":viewer!u@h JOIN #only"] }),
+    });
+  });
+  expect(reads).toEqual([cursorAt(1)]);
+  await expect(messages.locator(".line-msg")).toHaveText([/older/, /live one/, /mine/]);
+  await expect(messages.locator(".line-event", { hasText: "carol joined" })).toHaveCount(1);
+});
+
+test("history the server cannot bound is matched at the seam past join notices and local echoes", async ({ page }) => {
+  const { messages, reads } = await historySeam(page, (route, url) => {
+    if (url.searchParams.has("through")) {
+      return route.fulfill({
+        status: 409,
+        contentType: "application/problem+json",
+        body: JSON.stringify({ title: "Buffer cursor not honoured", field: "through" }),
+      });
+    }
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ lines: [
+        ":bob!u@h PRIVMSG #only :older",
+        ":viewer!u@h JOIN #only",
+        ":carol!u@h JOIN #only",
+        ":bob!u@h PRIVMSG #only :live one",
+        ":viewer!u@h PRIVMSG #only :mine",
+      ] }),
+    });
+  });
+  expect(reads).toEqual([cursorAt(1), null]);
+  await expect(messages.locator(".line-msg")).toHaveText([/older/, /live one/, /mine/]);
+});
+
+test("new lines and member changes keep keyboard focus where it is", async ({ page }) => {
+  let upstream;
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    upstream = socket;
+    attachReplay(socket, [":viewer!u@h JOIN #only", ":viewer!u@h JOIN #other"], ["#only", "#other"]);
+    socket.onMessage((frame) => {
+      const request = JSON.parse(frame);
+      if (request.message !== "/raw NAMES #only") return;
+      socket.send(lineEvent(":irc.example 353 viewer = #only :@carol viewer bob", 3));
+      socket.send(lineEvent(":irc.example 366 viewer #only :End of /NAMES list", 4));
+    });
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  await page.goto("/?network=Libera");
+  await page.getByRole("button", { name: /^Open #only/ }).click();
+  const members = page.getByRole("complementary", { name: "Members" });
+  await expect(members.getByRole("button", { name: "Open conversation with carol" })).toBeVisible();
+
+  const other = page.locator("#buffers").getByRole("button", { name: /^Open #other/ });
+  await other.focus();
+  upstream.send(lineEvent(":bob!u@h PRIVMSG #other :elsewhere", 5));
+  await expect(other).toHaveAccessibleName("Open #other, 1 unread message");
+  await expect(other).toBeFocused();
+
+  const carol = members.getByRole("button", { name: "Open conversation with carol" });
+  await carol.focus();
+  upstream.send(lineEvent(":dave!u@h JOIN #only", 6));
+  await expect(members.getByRole("button", { name: "Open conversation with dave" })).toBeVisible();
+  await expect(carol).toBeFocused();
+  // A re-rank reorders the list: bob moves ahead of carol, and keeps focus.
+  const bob = members.getByRole("button", { name: "Open conversation with bob" });
+  await bob.focus();
+  upstream.send(lineEvent(":carol!u@h MODE #only -o carol", 7));
+  await expect(carol).toHaveText("carol");
+  await expect(members.getByRole("button")).toHaveText(["bob", "carol", "dave", "viewer"]);
+  await expect(bob).toBeFocused();
+});
+
+test("replayed history is not unread, and the console's copy of a line is not counted", async ({ page }) => {
+  let upstream;
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    upstream = socket;
+    attachReplay(socket, [
+      ":viewer!u@h JOIN #only",
+      ":viewer!u@h JOIN #other",
+      ":bob!u@h PRIVMSG #other :old news for viewer",
+    ], ["#only", "#other"]);
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  await page.goto("/?network=Libera");
+  await page.getByRole("button", { name: /^Open #only/ }).click();
+  const buffers = page.locator("#buffers");
+  await expect(buffers.getByRole("button", { name: /^Open #other/ })).toHaveAccessibleName("Open #other");
+  await expect(page).toHaveTitle("e6irc");
+
+  upstream.send(lineEvent(":bob!u@h PRIVMSG #other :news for viewer", 4));
+  await expect(buffers.getByRole("button", { name: /^Open #other/ }))
+    .toHaveAccessibleName("Open #other, 1 unread message, 1 mention");
+  await expect(buffers.getByRole("button", { name: /^Open console/ })).toHaveAccessibleName("Open console");
+  await expect(page).toHaveTitle("(1) e6irc");
+});
+
+test("an action that names you is a mention", async ({ page }) => {
+  let upstream;
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    upstream = socket;
+    attachReplay(socket, [":viewer!u@h JOIN #only", ":viewer!u@h JOIN #other"], ["#only", "#other"]);
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  await page.goto("/?network=Libera");
+  await page.getByRole("button", { name: /^Open #only/ }).click();
+  upstream.send(lineEvent(":bob!u@h PRIVMSG #other :\x01ACTION pokes viewer\x01", 3));
+  await expect(page.locator("#buffers").getByRole("button", { name: /^Open #other/ }))
+    .toHaveAccessibleName("Open #other, 1 unread message, 1 mention");
+});
+
+test("/msg, /notice, /ME and a raw PRIVMSG are shown where they were sent", async ({ page }) => {
+  const requests = [];
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    attachReplay(socket, [":viewer!u@h JOIN #only"], ["#only"]);
+    socket.onMessage((frame) => {
+      const request = JSON.parse(frame);
+      if (!request.id) return;
+      requests.push(request.message);
+      socket.send(JSON.stringify({ t: "sent", v: request.id }));
+    });
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  await page.goto("/?network=Libera");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("#only");
+  const composer = page.getByRole("textbox", { name: "Message" });
+  const messages = page.getByLabel("Messages");
+  const send = async (text) => {
+    await composer.fill(text);
+    await composer.press("Enter");
+    await expect(composer).toHaveValue("");
+  };
+
+  await send("/ME waves");
+  await expect(messages.locator(".line-event", { hasText: "* viewer waves" })).toHaveCount(1);
+  await send("/msg bob hi there");
+  await send("/notice bob heads up");
+  await page.getByRole("button", { name: /^Open bob/ }).click();
+  await expect(messages.locator(".line-msg", { hasText: "hi there" }).locator(".from")).toHaveText("viewer");
+  await expect(messages.locator(".line-notice", { hasText: "heads up" })).toHaveCount(1);
+
+  await page.getByRole("button", { name: /^Open console/ }).click();
+  await send("PRIVMSG carol :psst");
+  await expect(messages.getByText("» PRIVMSG carol :psst")).toHaveCount(1);
+  await page.getByRole("button", { name: /^Open carol/ }).click();
+  await expect(messages.locator(".line-msg", { hasText: "psst" })).toHaveCount(1);
+  expect(requests).toEqual(["/ME waves", "/msg bob hi there", "/notice bob heads up", "/raw PRIVMSG carol :psst"]);
+});
+
+test("a message longer than one IRC line goes as several, each shown once", async ({ page }) => {
+  const requests = [];
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    attachReplay(socket, [":viewer!u@h JOIN #only"], ["#only"]);
+    socket.onMessage((frame) => {
+      const request = JSON.parse(frame);
+      if (!request.id) return;
+      requests.push(request.message);
+      socket.send(JSON.stringify({ t: "sent", v: request.id }));
+    });
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  await page.goto("/?network=Libera");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("#only");
+  const long = "word ".repeat(150).trim();
+  const composer = page.getByRole("textbox", { name: "Message" });
+  await composer.fill(long);
+  await expect(composer).toHaveValue(long);
+  await composer.press("Enter");
+  await expect.poll(() => requests.length).toBe(2);
+  expect(requests.join("")).toBe(long);
+  // Room is left for the source the upstream relays the line behind.
+  for (const request of requests) {
+    expect(new TextEncoder().encode(`:viewer!~abcdefghij@${"h".repeat(63)} PRIVMSG #only :${request}`).length).toBeLessThanOrEqual(510);
+  }
+  await expect(page.getByLabel("Messages").locator(".line-msg")).toHaveCount(2);
+  // Input history recalls the message as written, once.
+  await composer.press("ArrowUp");
+  await expect(composer).toHaveValue(long);
+});
+
+test("the replay is read as the session's nick with the network's own member prefixes", async ({ page }) => {
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    // The stored configuration says "viewer"; the network gave "viewer2", and
+    // the ring no longer holds the 001 or 005 that said so.
+    attachReplay(socket, [
+      ":viewer2!u@h JOIN #only",
+      ":viewer2!u@h PRIVMSG bob :sent from another client",
+    ], ["#only"], 1, { nick: "viewer2", isupport: ["PREFIX=(Yov)!@+", "CHANMODES=b,k,l,imnt"] });
+    socket.onMessage((frame) => {
+      const request = JSON.parse(frame);
+      if (request.message !== "/raw NAMES #only") return;
+      socket.send(lineEvent(":irc.example 353 viewer2 = #only :!carol viewer2", 3));
+      socket.send(lineEvent(":irc.example 366 viewer2 #only :End of /NAMES list", 4));
+    });
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  await page.goto("/?network=Libera");
+  const buffers = page.locator("#buffers");
+  await expect(buffers.getByRole("button", { name: /^Open bob/ })).toBeVisible();
+  await expect(buffers.getByRole("button", { name: /^Open viewer2/ })).toHaveCount(0);
+  await buffers.getByRole("button", { name: /^Open #only/ }).click();
+  const carol = page.getByRole("complementary", { name: "Members" }).getByRole("button", { name: "Open conversation with carol" });
+  await expect(carol).toHaveText("!carol");
+});
+
+test("the replay is not read aloud; live lines after the boundary are", async ({ page }) => {
+  let upstream;
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    upstream = socket;
+    socket.send(JSON.stringify({ t: "status", v: "connected" }));
+    socket.send(JSON.stringify({ t: "session", nick: "viewer", channels: ["#only"], isupport: [] }));
+    socket.send(lineEvent(":viewer!u@h JOIN #only", 1));
+    socket.send(lineEvent(":bob!u@h PRIVMSG #only :history", 2));
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  await page.goto("/?network=Libera");
+  const messages = page.locator("#messages");
+  await page.getByRole("button", { name: /^Open #only/ }).click();
+  await expect(messages.locator(".line-msg", { hasText: "history" })).toHaveCount(1);
+  // Several frames pass: the replay is still quiet.
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await expect(messages).toHaveAttribute("aria-live", "off");
+  await expect(messages).toHaveAttribute("aria-busy", "true");
+  upstream.send(snapshotEvent(2));
+  await expect(messages).toHaveAttribute("aria-live", "polite");
+  await expect(messages).toHaveAttribute("aria-busy", "false");
+});
+
+test("a link cannot be displayed as a different address by bidi controls", async ({ page }) => {
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    attachReplay(socket, [
+      ":viewer!u@h JOIN #only",
+      ":bob!u@h PRIVMSG #only :get https://evil.example/‮fdp.exe now",
+    ], ["#only"]);
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  await page.goto("/?network=Libera");
+  const row = page.getByLabel("Messages").locator(".line-msg");
+  await expect(row).toHaveCount(1);
+  const link = row.locator(".msg-link");
+  await expect(link).toHaveText("https://evil.example/fdp.exe");
+  await expect(link).toHaveAttribute("dir", "ltr");
+  await expect(link).toHaveAttribute("href", "https://evil.example/fdp.exe");
+  expect(await row.locator(".text").textContent()).not.toMatch(/[‪-‮⁦-⁩]/);
+  await expect(link).toHaveCSS("unicode-bidi", "isolate");
+  await expect(row.locator(".text")).toHaveCSS("unicode-bidi", "isolate");
+  await expect(row.locator(".from")).toHaveCSS("unicode-bidi", "isolate");
+});
+
+test("a nick changing only its letter case renames the conversation", async ({ page }) => {
+  let upstream;
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    upstream = socket;
+    attachReplay(socket, [":bob!u@h PRIVMSG viewer :hi"], []);
+  });
+  await mockSession(page, [ircNetwork("Libera")]);
+  await page.goto("/?network=Libera");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("bob");
+  upstream.send(lineEvent(":bob!u@h NICK Bob", 2));
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Bob");
+  await expect(page.locator("#buffers").getByRole("button", { name: /^Open Bob/ })).toBeVisible();
+  await expect(page.locator("#buffers").getByRole("button", { name: /^Open bob/ })).toHaveCount(0);
+});
+
+test("enabling the open network opens one live socket, not two", async ({ page }) => {
+  let sockets = 0;
+  await page.routeWebSocket(/\/ws\/ui/, (socket) => {
+    sockets += 1;
+    attachReplay(socket, [], []);
+  });
+  const stored = [ircNetwork("Libera", { enabled: false, connected: null, runtime: null })];
+  await mockSession(page, stored);
+  await page.route("/api/v1/openapi.json", (route) => route.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify({ paths: { ...apiContract.paths, "/api/v1/me/networks/{name}": {
+      patch: {
+        parameters: [{ name: "name", in: "path", required: true, schema: { type: "string" } }],
+        requestBody: { required: true, content: { "application/json": { schema: {
+          type: "object", additionalProperties: false, required: ["enabled"], properties: { enabled: { type: "boolean" } },
+        } } } },
+        responses: { 200: response({
+          type: "object", additionalProperties: false, required: ["name", "enabled"],
+          properties: { name: { type: "string" }, enabled: { type: "boolean" } },
+        }) },
+      },
+    } } }),
+  }));
+  await page.route(/\/api\/v1\/me\/networks\/Libera$/, (route) => {
+    stored[0] = ircNetwork("Libera");
+    return route.fulfill({ contentType: "application/json", body: JSON.stringify({ name: "Libera", enabled: true }) });
+  });
+  await page.goto("/?network=Libera");
+  await page.locator('[data-alert="network-unavailable"]').getByRole("button", { name: "Enable Libera" }).click();
+  await expect(page.locator("#status")).toContainText("Libera: connected");
+  await page.waitForTimeout(500);
+  expect(sockets).toBe(1);
 });

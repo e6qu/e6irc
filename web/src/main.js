@@ -38,8 +38,10 @@ import {
   asMessage,
   bufferAction,
   channelModesFrom,
+  channelModesFromIsupport,
   chatMessageRoute,
   clearTranscript,
+  composerRequests,
   existingChannelBuffer,
   fold,
   isChannel,
@@ -51,10 +53,14 @@ import {
   messageIdentity,
   modeChanges,
   nickPrefix,
+  oldestRingFloor,
+  outgoingChat,
   parseIrc,
+  prependHistory,
   reconcileChannelSnapshot,
   seededNick,
   splitSigil,
+  stripBidiControls,
   stripFormatting,
   stripSigil,
   tagValue,
@@ -241,6 +247,13 @@ let myNick = null;
 let socket = null;
 let upstreamConnected = false;
 let snapshotComplete = false;
+// From connect() until the replay boundary: the lines arriving are the ring's
+// replay, not live traffic, so they are neither announced nor notified.
+let replaying = false;
+// Whether that replay is history this page has never shown (a first attach,
+// or a cursor the server could not honour) rather than the lines missed since
+// this page's cursor. Only the latter is unread: the former is the backlog.
+let replayIsHistory = false;
 let memberTracking = true;
 let nextSendId = 0;
 const pendingSends = new Map();
@@ -257,23 +270,43 @@ function rememberSentText(text) {
   historyIdx = -1;
 }
 
+// Show accepted chat where it was addressed. The server does not echo a line
+// back to the socket that sent it, so this is the only copy this page gets:
+// `/msg`, `/notice`, `/me` in any letter case, and a PRIVMSG typed raw each
+// land in their target's buffer, routed by the same rule as a received line.
+function echoOutgoing(text, target) {
+  const chat = outgoingChat(text, target);
+  if (!chat) return;
+  const isKnownChannel = (candidate) => buffers.get(fold(candidate))?.kind === "channel";
+  for (const to of chat.targets) {
+    const message = { nick: myNick, sourceIsUser: true, command: chat.command, params: [to, chat.body] };
+    const route = chatMessageRoute(message, myNick, isKnownChannel);
+    const rendered = asMessage(chat.command === "NOTICE" ? "notice" : "msg", myNick, chat.body);
+    const row = { sender: rendered.sender };
+    if (route?.kind === "channel" && existingChannelBuffer(buffers, route.target)) {
+      addLine(route.target, rendered.kind, "channel", rendered.from, rendered.text, row);
+    } else if (route?.kind === "dm") {
+      addLine(route.target, rendered.kind, "dm", rendered.from, rendered.text, row);
+    } else if (target) {
+      // A channel with no open buffer, or no conversation at all (`*`): the
+      // console is where a line with nowhere else to go is shown.
+      addServer(`» ${chat.command} ${to} :${chat.body}`);
+    }
+  }
+}
+
 function acceptPendingSend(requestId) {
   const pending = pendingSends.get(requestId);
   if (!pending) return false;
   pendingSends.delete(requestId);
-  const { buffer, text } = pending;
-  if (buffer) {
-    if (text.startsWith("/me ")) {
-      addLine(buffer.display, "event", buffer.kind, null, `* ${myNick} ${text.slice(4)}`);
-    } else if (!text.startsWith("/")) {
-      addLine(buffer.display, "msg", buffer.kind, myNick, text);
-    }
-  } else {
+  const { buffer, target, text } = pending;
+  if (!buffer) {
     // Sent from the console: show the line that went out, so the console reads
     // as the exchange it is.
     addServer(`» ${text.startsWith("/raw ") ? text.slice(5) : text}`);
   }
-  rememberSentText(text);
+  echoOutgoing(text, target);
+  rememberSentText(pending.typed);
   return true;
 }
 
@@ -281,7 +314,7 @@ function rejectPendingSend(requestId, message) {
   const pending = pendingSends.get(requestId);
   if (!pending) return false;
   pendingSends.delete(requestId);
-  rememberSentText(pending.text);
+  rememberSentText(pending.typed);
   // Said once. A failure used to go into the console buffer as well, which is
   // rarely the buffer being read and worded it differently from the alert.
   showAlert(
@@ -310,7 +343,7 @@ function restoreRejectedMessage(text) {
 function rejectAllPendingSends(reason) {
   if (pendingSends.size === 0) return;
   const count = pendingSends.size;
-  for (const pending of pendingSends.values()) rememberSentText(pending.text);
+  for (const pending of pendingSends.values()) rememberSentText(pending.typed);
   pendingSends.clear();
   showAlert(
     "send",
@@ -422,8 +455,19 @@ function resyncMemberships() {
   renderNickList();
 }
 
-function applySessionSnapshot(nick, channels) {
+// The session event is the driver's current state: it arrives before the
+// replay, so the replay is read as the nick the session has now and with the
+// network's own channel modes, and it is applied again at the replay boundary,
+// because replayed history (an old 001, 005, NICK, or a PART from before a
+// rejoin) must not be what the page is left believing.
+let attachSession = null;
+function applySessionSnapshot({ nick, channels, isupport }, { reapplied = false } = {}) {
   myNick = nick;
+  const { modes, malformed } = channelModesFromIsupport(isupport);
+  channelModes = modes;
+  if (malformed.length && !reapplied) {
+    addServer(`Ignored unreadable ISUPPORT ${malformed.join(" ")}; channel modes use the defaults for those.`);
+  }
   const current = [...buffers.values()]
     .filter((buffer) => buffer.kind === "channel")
     .map((buffer) => buffer.display);
@@ -501,72 +545,120 @@ function updateTitle() {
   document.title = unread > 0 ? `(${unread}) e6irc` : "e6irc";
 }
 
+// Bring a rendered list in line with `entries`, keeping every item that is
+// still there: its element is updated in place and moved only when it is out
+// of order. A list re-rendered from scratch drops keyboard focus, so every
+// list that changes under the person (conversations on each new line, members
+// on each JOIN, PART and MODE) goes through here. An item that did have to
+// move gets its focus back.
+function reconcileList(container, entries, { key, create, update }) {
+  const focused = document.activeElement;
+  const hadFocus = focused instanceof HTMLElement && container.contains(focused);
+  const existing = new Map();
+  for (const item of container.children) existing.set(item.dataset.key, item);
+  let next = container.firstElementChild;
+  for (const entry of entries) {
+    const itemKey = key(entry);
+    let item = existing.get(itemKey);
+    if (item) {
+      existing.delete(itemKey);
+    } else {
+      item = create();
+      item.dataset.key = itemKey;
+    }
+    update(item, entry);
+    if (item === next) next = next.nextElementSibling;
+    else container.insertBefore(item, next);
+  }
+  for (const stale of existing.values()) stale.remove();
+  if (hadFocus && focused.isConnected && document.activeElement !== focused) focused.focus();
+}
+
+function bufferListItem() {
+  const li = document.createElement("li");
+  const button = document.createElement("button");
+  button.type = "button";
+  // Read at click time: a conversation keeps its element across a rename.
+  button.addEventListener("click", () => setActive(li.dataset.key));
+  li.appendChild(button);
+  return li;
+}
+
+function updateBufferListItem(li, b) {
+  const button = li.firstElementChild;
+  const archived = b.kind === "channel" && !b.joined;
+  button.className = "buf" + (b.key === active ? " active" : "") + (archived ? " archived" : "");
+  if (b.key === active) button.setAttribute("aria-current", "true");
+  else button.removeAttribute("aria-current");
+  const bufferName = b.key === SERVER ? CONSOLE_NAME : b.display;
+  const inactive = b.key !== active;
+  const unreadLabel = b.unread > 0 && inactive
+    ? `, ${b.unread} unread message${b.unread === 1 ? "" : "s"}`
+    : "";
+  const mentionLabel = b.mentions > 0 && inactive
+    ? `, ${b.mentions} mention${b.mentions === 1 ? "" : "s"}`
+    : "";
+  const archivedLabel = archived ? ", past channel, not currently joined" : "";
+  button.setAttribute(
+    "aria-label",
+    `Open ${bufferName}${archivedLabel}${unreadLabel}${mentionLabel}`,
+  );
+  const label = document.createElement("span");
+  label.className = "buf-name";
+  label.textContent = bufferName;
+  const parts = [label];
+  if (archived) {
+    const state = document.createElement("span");
+    state.className = "buffer-state";
+    state.textContent = "past";
+    state.setAttribute("aria-hidden", "true");
+    parts.push(state);
+  }
+  if (b.unread > 0 && inactive) {
+    const badge = document.createElement("span");
+    badge.className = "badge";
+    badge.textContent = String(b.unread);
+    badge.setAttribute("aria-hidden", "true");
+    parts.push(badge);
+  }
+  if (b.mentions > 0 && inactive) {
+    const badge = document.createElement("span");
+    badge.className = "mention-badge";
+    badge.textContent = `@${b.mentions}`;
+    badge.title = `${b.mentions} unread mention${b.mentions === 1 ? "" : "s"}`;
+    badge.setAttribute("aria-hidden", "true");
+    parts.push(badge);
+  }
+  // The button itself stays, so focus on it survives; only its contents are
+  // replaced.
+  button.replaceChildren(...parts);
+}
+
 function renderBufferList() {
   updateTitle();
-  buffersEl.replaceChildren();
   const order = [...buffers.values()].sort((a, b) => {
     if (a.key === SERVER) return -1;
     if (b.key === SERVER) return 1;
     return a.display.localeCompare(b.display);
   });
-  for (const b of order) {
-    const li = document.createElement("li");
-    const button = document.createElement("button");
-    button.type = "button";
-    const archived = b.kind === "channel" && !b.joined;
-    button.className = "buf" + (b.key === active ? " active" : "") + (archived ? " archived" : "");
-    if (b.key === active) button.setAttribute("aria-current", "true");
-    const bufferName = b.key === SERVER ? CONSOLE_NAME : b.display;
-    const inactive = b.key !== active;
-    const unreadLabel = b.unread > 0 && inactive
-      ? `, ${b.unread} unread message${b.unread === 1 ? "" : "s"}`
-      : "";
-    const mentionLabel = b.mentions > 0 && inactive
-      ? `, ${b.mentions} mention${b.mentions === 1 ? "" : "s"}`
-      : "";
-    const archivedLabel = archived ? ", past channel, not currently joined" : "";
-    button.setAttribute(
-      "aria-label",
-      `Open ${bufferName}${archivedLabel}${unreadLabel}${mentionLabel}`,
-    );
-    const label = document.createElement("span");
-    label.className = "buf-name";
-    label.textContent = bufferName;
-    button.appendChild(label);
-    if (archived) {
-      const state = document.createElement("span");
-      state.className = "buffer-state";
-      state.textContent = "past";
-      state.setAttribute("aria-hidden", "true");
-      button.appendChild(state);
-    }
-    if (b.unread > 0 && inactive) {
-      const badge = document.createElement("span");
-      badge.className = "badge";
-      badge.textContent = String(b.unread);
-      badge.setAttribute("aria-hidden", "true");
-      button.appendChild(badge);
-    }
-    if (b.mentions > 0 && inactive) {
-      const badge = document.createElement("span");
-      badge.className = "mention-badge";
-      badge.textContent = `@${b.mentions}`;
-      badge.title = `${b.mentions} unread mention${b.mentions === 1 ? "" : "s"}`;
-      badge.setAttribute("aria-hidden", "true");
-      button.appendChild(badge);
-    }
-    button.addEventListener("click", () => setActive(b.key));
-    li.appendChild(button);
-    buffersEl.appendChild(li);
-  }
+  reconcileList(buffersEl, order, {
+    key: (b) => b.key,
+    create: bufferListItem,
+    update: updateBufferListItem,
+  });
 }
 
 // Render `text` into `span`, turning http(s) URLs into links. Everything goes
 // through text nodes and element *properties* (never innerHTML), and only
 // http/https tokens become links — a `javascript:`/`data:` scheme never matches
 // URL_RE — so a hostile line still cannot inject markup or an unsafe href.
+// Bidirectional override and isolate controls are removed first, so a link
+// cannot display as an address other than the one it opens; the link is
+// also laid out left to right in isolation (`dir="ltr"`, styled
+// `unicode-bidi: isolate`), so right-to-left text beside it cannot reorder it.
 const URL_RE = /https?:\/\/[^\s<>"']+/g;
-function renderText(span, text) {
+function renderText(span, value) {
+  const text = stripBidiControls(value);
   URL_RE.lastIndex = 0;
   let last = 0;
   let m;
@@ -588,6 +680,7 @@ function renderText(span, text) {
     a.target = "_blank";
     a.rel = "noopener noreferrer";
     a.className = "msg-link";
+    a.dir = "ltr";
     span.appendChild(a);
     if (tail) span.appendChild(document.createTextNode(tail));
     last = m.index + m[0].length;
@@ -603,12 +696,17 @@ function messageRow(line) {
   time.textContent = line.time;
   if (line.time) time.setAttribute("aria-label", `At ${line.time}`);
   if (line.title) time.title = line.title; // full date+time on hover
+  // Each part is its own bidi isolate with its own direction, so a
+  // right-to-left nick or message cannot reorder the parts around it.
   const from = document.createElement("span");
   from.className = "from";
-  from.textContent = line.from ? line.from : "";
-  if (line.from) from.setAttribute("aria-label", `From ${line.from}`);
+  from.dir = "auto";
+  const sender = stripBidiControls(line.from ?? "");
+  from.textContent = sender;
+  if (sender) from.setAttribute("aria-label", `From ${sender}`);
   const text = document.createElement("span");
   text.className = "text";
+  text.dir = "auto";
   renderText(text, line.text);
   row.append(time, from, text);
   return row;
@@ -638,18 +736,31 @@ function renderActive({ atLatest = true } = {}) {
   // Switching buffers replaces a complete historical transcript. Mark that
   // replacement busy and quiet so assistive technology announces only later
   // live additions, not every already-read line as a new message.
-  messagesEl.setAttribute("aria-busy", "true");
-  messagesEl.setAttribute("aria-live", "off");
+  quietTranscript();
   messagesEl.replaceChildren();
   if (b) for (const line of b.lines) messagesEl.appendChild(messageRow(line));
   messagesEl.scrollTop = atLatest ? messagesEl.scrollHeight : 0;
   if (b) b.pendingVisibleMessages = 0;
   renderJumpLatest();
+  announceTranscriptWhenSettled();
+  renderNickList();
+}
+
+// The transcript is announced as it grows only once it holds live traffic: a
+// socket's replay is history, and read aloud it was every buffered line at
+// once. Quiet from connect() until the replay boundary, and while a buffer's
+// whole transcript is swapped in; announced again the frame after both.
+function quietTranscript() {
+  messagesEl.setAttribute("aria-busy", "true");
+  messagesEl.setAttribute("aria-live", "off");
+}
+
+function announceTranscriptWhenSettled() {
   requestAnimationFrame(() => {
+    if (replaying) return;
     messagesEl.setAttribute("aria-busy", "false");
     messagesEl.setAttribute("aria-live", "polite");
   });
-  renderNickList();
 }
 
 function isAtLatest() {
@@ -713,22 +824,30 @@ function renderNickList() {
   } else {
     clearAlert("members");
   }
-  nicksEl.replaceChildren();
-  for (const m of members) {
-    const li = document.createElement("li");
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "nick";
-    const action = `Open conversation with ${m.name}`;
-    button.title = action;
-    button.setAttribute("aria-label", action);
-    button.textContent = nickPrefix(m.modes, channelModes) + m.name;
-    // Native button semantics make click, Enter, and Space equivalent.
-    const open = () => setActive(ensureBuffer(m.name, "dm").display);
-    button.addEventListener("click", open);
-    li.appendChild(button);
-    nicksEl.appendChild(li);
-  }
+  reconcileList(nicksEl, members, {
+    key: (m) => fold(m.name),
+    create: nickListItem,
+    update: (li, m) => {
+      const button = li.firstElementChild;
+      const action = `Open conversation with ${m.name}`;
+      button.title = action;
+      button.setAttribute("aria-label", action);
+      button.dataset.nick = m.name;
+      button.textContent = nickPrefix(m.modes, channelModes) + m.name;
+    },
+  });
+}
+
+function nickListItem() {
+  const li = document.createElement("li");
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "nick";
+  // Native button semantics make click, Enter, and Space equivalent. The
+  // name is read at click time: the element outlives a rename or re-rank.
+  button.addEventListener("click", () => setActive(ensureBuffer(button.dataset.nick, "dm").display));
+  li.appendChild(button);
+  return li;
 }
 
 // Which conversation was open on each network, so opening the network again
@@ -837,20 +956,32 @@ function lineTime(tags, useCurrentTime = true) {
   };
 }
 
-function addLine(bufName, kind, bufKind, from, text, tags = null, wire = null) {
+// `sender` is who said it, for highlighting: the `from` column for a message,
+// the actor of a `/me` action (shown in the text, with no `from`).
+function addLine(bufName, kind, bufKind, from, text, { tags = null, wire = null, sender = from } = {}) {
   const b = ensureBuffer(bufName, bufKind);
-  // A highlight: someone else's channel/DM message that names us.
-  const mention = kind === "msg" && from != null && !isMe(from) && mentionsMe(text);
+  // A highlight: someone else's channel/DM message or action that names us.
+  const mention = (kind === "msg" || kind === "event") && sender != null && !isMe(sender) && mentionsMe(text);
   const line = {
     ...lineTime(tags),
     from,
+    sender,
     text,
     kind,
     mention,
     identity: messageIdentity(tags),
     wire,
+    // The ring position before this row's line (see oldestRingFloor): the line
+    // being handled has not yet moved the cursor past it, and a local echo's
+    // own ring line comes after every line already received.
+    ringFloor: replayCursor,
   };
-  maybeNotify(b, line);
+  // The console's copy of each received line ("wire") is not another unread
+  // message: the line is counted where it is read. Replayed history is the
+  // backlog, not news, and no replay is a reason to raise a desktop
+  // notification about something that was said while the page was away.
+  const counts = kind !== "wire" && !(replaying && replayIsHistory);
+  if (!replaying) maybeNotify(b, line);
   b.lines.push(line);
   const lineLimit = b.historyLoaded ? MAX_LOADED_LINES : MAX_LINES;
   if (b.lines.length > lineLimit) b.lines.shift();
@@ -870,14 +1001,14 @@ function addLine(bufName, kind, bufKind, from, text, tags = null, wire = null) {
       b.pendingVisibleMessages += 1;
     }
     renderJumpLatest();
-  } else {
+  } else if (counts) {
     b.unread += 1;
     if (line.mention) b.mentions += 1;
     renderBufferList();
   }
 }
 
-const addServer = (text, wire = null) => addLine(SERVER, "server", "server", null, text, null, wire);
+const addServer = (text, wire = null) => addLine(SERVER, "server", "server", null, text, { wire });
 const addEvent = (chan, text) => addLine(chan, "event", "channel", null, text);
 
 function addNick(chan, nick, render = true) {
@@ -933,7 +1064,10 @@ function renameNick(from, to) {
   const toName = stripSigil(to, channelModes);
   if (!fromKey || !toName) return;
   const conversation = buffers.get(fromKey);
-  if (conversation && conversation.kind === "dm" && !buffers.has(fold(toName))) {
+  // A case-only change (bob -> Bob) keeps the key; the buffer is renamed in
+  // place rather than left under the old spelling.
+  const toKey = fold(toName);
+  if (conversation && conversation.kind === "dm" && (toKey === fromKey || !buffers.has(toKey))) {
     // Sends to the old nick would go nowhere while echoing here as delivered.
     buffers.delete(fromKey);
     conversation.key = fold(toName);
@@ -960,7 +1094,7 @@ function renameNick(from, to) {
 function setTopic(chan, topic) {
   const b = existingChannelBuffer(buffers, chan);
   if (!b) return;
-  b.topic = stripFormatting(topic);
+  b.topic = stripBidiControls(stripFormatting(topic));
   if (b.key === active) buftopicEl.textContent = b.topic;
 }
 
@@ -996,7 +1130,7 @@ function maybeNotify(b, line) {
   }
   const isDM = b.kind === "dm";
   if (!(line.mention || isDM)) return;
-  const title = isDM ? `DM from ${line.from ?? "?"}` : `${b.display}: ${line.from ?? ""}`;
+  const title = isDM ? `DM from ${line.sender ?? "?"}` : `${b.display}: ${line.sender ?? ""}`;
   try {
     // eslint-disable-next-line no-new
     new Notification(title, { body: line.text, tag: b.key });
@@ -1015,7 +1149,7 @@ function maybeNotify(b, line) {
 function handleLine(raw) {
   // The console is the whole exchange: every line the network sent, beside the
   // ones typed here. Other buffers keep their readable rendering.
-  addLine(SERVER, "wire", "server", null, `« ${raw}`, null, raw);
+  addLine(SERVER, "wire", "server", null, `« ${raw}`, { wire: raw });
   const m = parseIrc(raw);
   switch (m.command) {
     case "001":
@@ -1038,13 +1172,13 @@ function handleLine(raw) {
       const kind = m.command === "NOTICE" ? "notice" : "msg";
       const r = asMessage(kind, m.nick, text);
       if (route.kind === "channel") {
-        addLine(route.target, r.kind, "channel", r.from, r.text, m.tags, raw);
+        addLine(route.target, r.kind, "channel", r.from, r.text, { tags: m.tags, wire: raw, sender: r.sender });
       } else if (route.kind === "server") {
         // A server / global notice (e.g. the bouncer's *bnc* control messages):
         // show it in the server buffer, not a phantom DM keyed on the sender.
-        addLine(SERVER, r.kind, "server", r.from, r.text, m.tags, raw);
+        addLine(SERVER, r.kind, "server", r.from, r.text, { tags: m.tags, wire: raw, sender: r.sender });
       } else {
-        addLine(route.target, r.kind, "dm", r.from, r.text, m.tags, raw);
+        addLine(route.target, r.kind, "dm", r.from, r.text, { tags: m.tags, wire: raw, sender: r.sender });
       }
       break;
     }
@@ -1312,6 +1446,10 @@ async function reconcileUnavailableNetwork() {
 let replayCursor = null;
 
 function resetTranscripts() {
+  // The whole ring follows: it is history this page has not shown, and its
+  // positions belong to a ring the old cursor does not name.
+  replayIsHistory = true;
+  replayCursor = null;
   for (const b of buffers.values()) clearTranscript(b);
   renderActive();
   renderBufferList();
@@ -1322,6 +1460,10 @@ function connect() {
   terminalSocket = false;
   upstreamConnected = false;
   snapshotComplete = false;
+  replaying = true;
+  replayIsHistory = replayCursor === null;
+  attachSession = null;
+  quietTranscript();
   setComposerAvailable(false);
   setStatus(`opening ${network}…`, "connecting");
   rejectAllPendingSends("the connection was replaced");
@@ -1359,6 +1501,9 @@ function connect() {
   liveSocket.addEventListener("close", (event) => {
     if (socket !== liveSocket) return;
     socket = null;
+    // A replay cut short is over: what the page says next is live again.
+    replaying = false;
+    announceTranscriptWhenSettled();
     rejectAllPendingSends("the live connection closed");
     upstreamConnected = false;
     setComposerAvailable(false);
@@ -1398,8 +1543,13 @@ function connect() {
       return;
     }
     if (event.type === "line") {
-      replayCursor = event.cursor;
-      handleLine(event.value);
+      // Rows the line makes record the cursor before it (addLine), so the
+      // cursor moves on once they exist, however handling ended.
+      try {
+        handleLine(event.value);
+      } finally {
+        replayCursor = event.cursor;
+      }
     } else if (event.type === "replay") {
       resetTranscripts();
     } else if (event.type === "sent") {
@@ -1424,10 +1574,14 @@ function connect() {
     } else if (event.type === "snapshot") {
       replayCursor = event.cursor;
       snapshotComplete = true;
+      replaying = false;
+      if (attachSession) applySessionSnapshot(attachSession, { reapplied: true });
       if (upstreamConnected) resyncMemberships();
       settleInitialView();
+      announceTranscriptWhenSettled();
     } else if (event.type === "session") {
-      applySessionSnapshot(event.nick, event.channels);
+      if (replaying) attachSession = event;
+      applySessionSnapshot(event);
     } else if (event.type === "status" && event.value === "unavailable") {
       terminalSocket = true;
       upstreamConnected = false;
@@ -1526,7 +1680,11 @@ composer.addEventListener("submit", (e) => {
     messageInput.focus();
     return;
   }
-  if (pendingSends.size >= MAX_PENDING_SENDS) {
+  const target = b ? b.display : "";
+  // A message longer than one IRC line goes as several, split here: the server
+  // refuses an over-long line whole rather than cutting it.
+  const requests = composerRequests(text, target, myNick);
+  if (pendingSends.size + requests.length > MAX_PENDING_SENDS) {
     showAlert(
       "send",
       `${MAX_PENDING_SENDS} messages are still waiting to be confirmed; wait or reconnect before sending more.`,
@@ -1534,20 +1692,28 @@ composer.addEventListener("submit", (e) => {
     );
     return;
   }
-  const target = b ? b.display : "";
   // Only /join: the server has no /j alias, so /j is forwarded as an unknown
   // command and must not be remembered as a join to follow.
   const joining = text.match(/^\/join\s+(\S+)/i);
   if (joining) rememberRequestedJoins(joining[1]);
-  nextSendId += 1;
-  const requestId = nextSendId.toString(36);
-  pendingSends.set(requestId, { buffer: b, text });
-  try {
-    if (!sendComposer(target, text, requestId)) throw new Error("The live connection closed.");
-  } catch (error) {
-    pendingSends.delete(requestId);
-    showAlert("send", errorMessage("send the message", error), "error");
-    return;
+  for (const [index, request] of requests.entries()) {
+    nextSendId += 1;
+    const requestId = nextSendId.toString(36);
+    // `typed` is what input history recalls: the message as written, not the
+    // piece of it this request carries.
+    pendingSends.set(requestId, { buffer: b, target, text: request, typed: text });
+    try {
+      if (!sendComposer(target, request, requestId)) throw new Error("The live connection closed.");
+    } catch (error) {
+      pendingSends.delete(requestId);
+      // The message stays in the box. Parts already sent stay sent, and the
+      // alert says how many, so the person can remove them before retrying.
+      const action = index > 0
+        ? `send the rest of the message (${index} of its ${requests.length} parts were sent)`
+        : "send the message";
+      showAlert("send", errorMessage(action, error), "error");
+      return;
+    }
   }
   messageInput.value = "";
   messageInput.focus();
@@ -1703,14 +1869,12 @@ async function setNetworkEnabled(name, enabled, button) {
     await apiSend("PATCH", `/api/v1/me/networks/${encodeURIComponent(name)}`, { enabled });
     clearAlert("network-unavailable");
     addServer(`${name} ${enabled ? "enabled" : "disabled"}.`);
-    await refreshNetworkList();
-    // Enabling the open network opens its socket here rather than reloading
+    // Enabling the open network opens its socket in the refresh, the one place
+    // that does so for a network enabled from anywhere, rather than reloading
     // the page: a reload would throw away an unsent message, and it raced
-    // whatever the person did next.
-    if (enabled && network && fold(network) === fold(name)) {
-      clearAlert("networks");
-      connect();
-    }
+    // whatever the person did next. Connecting here as well opened a second
+    // socket that replaced the first mid-replay.
+    await refreshNetworkList();
   } catch (error) {
     button.disabled = false;
     button.textContent = was;
@@ -2255,6 +2419,9 @@ function resetNetworkState() {
   myNick = null;
   upstreamConnected = false;
   snapshotComplete = false;
+  replaying = false;
+  replayIsHistory = false;
+  attachSession = null;
   memberTracking = true;
   channelModes = DEFAULT_CHANNEL_MODES;
   initialViewSettled = false;
@@ -2433,13 +2600,27 @@ async function loadEarlier() {
     btn.disabled = true;
     btn.textContent = "Loading…";
   }
+  // Every ring line after the buffer's oldest row's floor is already a row
+  // here (oldestRingFloor), so history is read through that position and holds
+  // nothing twice. An empty buffer holds nothing yet: everything up to the
+  // socket's cursor is earlier. The server refuses a position it cannot bound
+  // (the network restarted, or is stopped and its lines are persisted
+  // history); only then is history read whole and matched at the seam.
+  const floor = oldestRingFloor(b.lines);
+  const through = floor === undefined ? replayCursor : floor;
+  const page = `/api/v1/me/networks/${encodeURIComponent(network)}/buffer?limit=1000`;
   let lines = [];
+  let bounded = false;
   try {
-    lines = backlogFrom(
-      await apiGet(
-        `/api/v1/me/networks/${encodeURIComponent(network)}/buffer?limit=1000`,
-      ),
-    );
+    if (through) {
+      try {
+        lines = backlogFrom(await apiGet(`${page}&through=${encodeURIComponent(through)}`));
+        bounded = true;
+      } catch (error) {
+        if (!(error instanceof ApiError && error.status === 409)) throw error;
+      }
+    }
+    if (!bounded) lines = backlogFrom(await apiGet(page));
     clearAlert("history");
   } catch (error) {
     showAlert("history", errorMessage("load earlier messages", error), "error");
@@ -2460,6 +2641,7 @@ async function loadEarlier() {
     rebuilt.push({
       ...lineTime(m.tags, false),
       from: rendered.from,
+      sender: rendered.sender,
       text: rendered.text,
       kind: rendered.kind,
       mention: false,
@@ -2470,8 +2652,9 @@ async function loadEarlier() {
   // History is older context, never authority over the live buffer. Messages
   // can arrive while this request is in flight, and local echoes may not exist
   // in persisted input at all, so replacing `b.lines` loses user-visible data.
-  // Stable msgids suppress true overlap; unidentified rows are retained.
-  b.lines = mergeTimeline(rebuilt, b.lines, MAX_LOADED_LINES);
+  b.lines = bounded
+    ? prependHistory(rebuilt, b.lines, MAX_LOADED_LINES)
+    : mergeTimeline(rebuilt, b.lines, MAX_LOADED_LINES, isMe);
   b.historyLoaded = true;
   // The control is one node shared by every conversation: left as it was
   // during the request, it stayed disabled and reading "Loading…" for the rest
@@ -2663,6 +2846,9 @@ function openChosenNetwork(networks, networkFailure) {
           : { href: `/console/networks/${encodeURIComponent(selected.name)}`, label: "Open network" },
       );
       addServer(`${reason} The live socket was not opened.`);
+      // No socket, and none until the network can run: refreshNetworkList
+      // opens it once the network is enabled, here or anywhere else.
+      terminalSocket = true;
       return;
     }
     // Seed our nick from the stored configuration (overridden by 001/NICK and

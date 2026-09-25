@@ -3541,6 +3541,17 @@ impl std::fmt::Display for ReplayCursor {
     }
 }
 
+/// One exact attach boundary (see
+/// [`NetworkHandle::subscribe_with_replay_snapshot`]): the live receiver, the
+/// replay before it, and the session state and upstream features as of that
+/// same instant.
+pub(crate) struct AttachSnapshot {
+    pub events: tokio::sync::broadcast::Receiver<DriverEvent>,
+    pub replay: Replay,
+    pub session: Option<IrcSessionSnapshot>,
+    pub features: UpstreamFeatures,
+}
+
 /// What an attach replays: the lines, where the ring stands after them, and
 /// whether a presented cursor was honoured (only the lines after it) or the
 /// whole ring was replayed instead.
@@ -3616,6 +3627,23 @@ impl Buffer {
 
     pub fn snapshot(&self) -> Vec<String> {
         self.lines.iter().map(|entry| entry.line.clone()).collect()
+    }
+
+    /// The retained lines at or before `through`, when that cursor names a
+    /// position of this ring; `None` for another ring's cursor, whose
+    /// positions mean nothing here. A position the ring has since evicted
+    /// past is honoured: no line at or before it is retained any more.
+    fn lines_through(&self, through: ReplayCursor) -> Option<Vec<String>> {
+        if through.epoch != self.epoch || through.seq >= self.next_seq {
+            return None;
+        }
+        Some(
+            self.lines
+                .iter()
+                .take_while(|entry| entry.seq <= through.seq)
+                .map(|entry| entry.line.clone())
+                .collect(),
+        )
     }
 
     /// The lines after `after`, when that cursor names a position of this ring
@@ -3904,6 +3932,17 @@ impl NetworkHandle {
         self.buffer.lock().expect("buffer poisoned").snapshot()
     }
 
+    /// The detached buffer's lines at or before `through`, or `None` when the
+    /// cursor belongs to another ring lifetime (see [`Buffer::lines_through`]).
+    /// A reader holding every line after a cursor asks for what came before
+    /// it, so what it already has is never sent twice.
+    pub fn buffer_through(&self, through: ReplayCursor) -> Option<Vec<String>> {
+        self.buffer
+            .lock()
+            .expect("buffer poisoned")
+            .lines_through(through)
+    }
+
     /// Establish one exact boundary between detached-buffer/session replay and
     /// live delivery. Buffered emitters hold these same locks until their event
     /// has been published, so every line and its state effect are either in the
@@ -3915,16 +3954,17 @@ impl NetworkHandle {
     pub(crate) fn subscribe_with_replay_snapshot(
         &self,
         after: Option<ReplayCursor>,
-    ) -> (
-        tokio::sync::broadcast::Receiver<DriverEvent>,
-        Replay,
-        Option<IrcSessionSnapshot>,
-    ) {
+    ) -> AttachSnapshot {
         let irc_session = self.irc_session.lock().expect("IRC session state poisoned");
         let buffer = self.buffer.lock().expect("buffer poisoned");
         let events = self.events.subscribe();
         let replay = buffer.replay_after(after);
-        (events, replay, irc_session.snapshot())
+        AttachSnapshot {
+            events,
+            replay,
+            session: irc_session.snapshot(),
+            features: irc_session.features.clone(),
+        }
     }
 
     /// Authoritative IRC identity/membership state, once the driver has begun
@@ -4974,7 +5014,12 @@ where
     let _attachment = handle.track_attachment();
     let attach_id = handle.next_attachment_id();
     // A raw IRC client has no cursor to present; it always takes the whole ring.
-    let (mut events, replay, session_snapshot) = handle.subscribe_with_replay_snapshot(None);
+    let AttachSnapshot {
+        mut events,
+        replay,
+        session: session_snapshot,
+        ..
+    } = handle.subscribe_with_replay_snapshot(None);
 
     // Send the current upstream connection status up front, so a client that
     // attaches to an already-connected (or still-reconnecting) network learns the
@@ -6087,7 +6132,12 @@ mod tests {
         ends.emit_line(":upstream PRIVMSG #room :before boundary".into());
 
         ends.begin_irc_session("upstream".into());
-        let (mut events, replay, session) = handle.subscribe_with_replay_snapshot(None);
+        let AttachSnapshot {
+            mut events,
+            replay,
+            session,
+            ..
+        } = handle.subscribe_with_replay_snapshot(None);
         let snapshot: Vec<&str> = replay
             .lines
             .iter()
@@ -8085,16 +8135,16 @@ mod tests {
     #[test]
     fn preloaded_history_takes_positions_below_the_live_lines() {
         let (handle, ends) = NetworkHandle::channels(4);
-        let empty = handle.subscribe_with_replay_snapshot(None).1;
+        let empty = handle.subscribe_with_replay_snapshot(None).replay;
         assert!(replayed(&empty).is_empty());
         let resumed_from_empty = handle
             .subscribe_with_replay_snapshot(Some(empty.position()))
-            .1;
+            .replay;
         assert!(resumed_from_empty.resumed);
 
         ends.emit_line("live".into());
         handle.preload_front(vec!["older".into(), "old".into()]);
-        let replay = handle.subscribe_with_replay_snapshot(None).1;
+        let replay = handle.subscribe_with_replay_snapshot(None).replay;
         assert_eq!(replayed(&replay), ["older", "old", "live"]);
         let positions: Vec<u64> = replay.lines.iter().map(|entry| entry.seq).collect();
         assert!(
@@ -8107,8 +8157,46 @@ mod tests {
         );
         let after_older = handle
             .subscribe_with_replay_snapshot(Some(replay.cursor_at(positions[0])))
-            .1;
+            .replay;
         assert_eq!(replayed(&after_older), ["old", "live"]);
         assert!(after_older.resumed);
+    }
+
+    /// A reader holding every line after a cursor is given only what came at
+    /// or before it; another ring's cursor, or one naming a position this ring
+    /// never reached, is refused rather than answered with the wrong lines.
+    #[test]
+    fn buffer_through_returns_only_the_lines_at_or_before_the_cursor() {
+        let (handle, ends) = NetworkHandle::channels(3);
+        for line in ["a", "b", "c"] {
+            ends.emit_line(line.into());
+        }
+        let replay = handle.subscribe_with_replay_snapshot(None).replay;
+        let positions: Vec<u64> = replay.lines.iter().map(|entry| entry.seq).collect();
+        assert_eq!(
+            handle.buffer_through(replay.cursor_at(positions[1])),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            handle.buffer_through(replay.position()),
+            Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+        assert_eq!(
+            handle.buffer_through(replay.cursor_at(positions[2] + 1)),
+            None,
+            "a position the ring has not reached names nothing"
+        );
+        let foreign =
+            ReplayCursor::parse(&format!("{}:{}", replay.epoch + 1, positions[1])).expect("cursor");
+        assert_eq!(handle.buffer_through(foreign), None);
+
+        // Evicted past the cursor: nothing at or before it is retained.
+        for line in ["d", "e", "f"] {
+            ends.emit_line(line.into());
+        }
+        assert_eq!(
+            handle.buffer_through(replay.cursor_at(positions[1])),
+            Some(Vec::new())
+        );
     }
 }
