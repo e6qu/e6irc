@@ -26,6 +26,7 @@ mod observation;
 mod oidc;
 mod openapi;
 mod preflight;
+mod revocation;
 mod sessions;
 mod ws;
 
@@ -40,6 +41,7 @@ use oidc::*;
 use openapi::*;
 pub(crate) use preflight::PreflightLimiter;
 use preflight::PreflightPermit;
+pub(crate) use revocation::CredentialWatch;
 use sessions::*;
 pub(crate) use ws::UiSocketLimiter;
 use ws::*;
@@ -156,6 +158,9 @@ pub struct AppState {
     pub(crate) preflight_limiter: Arc<PreflightLimiter>,
     /// Live chat sockets open per account.
     pub(crate) ui_sockets: Arc<UiSocketLimiter>,
+    /// The credential each live socket was opened with, so the socket ends
+    /// when the credential is revoked or expires.
+    pub(crate) credential_watch: Arc<CredentialWatch>,
     /// Account exports running at once.
     pub(crate) account_exports: AccountExportSlots,
     /// The per-IP connection cap, shared with the TCP listeners so IRC sessions

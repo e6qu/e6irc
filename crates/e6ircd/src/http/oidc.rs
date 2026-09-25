@@ -1440,7 +1440,11 @@ pub(crate) enum RequestCredential {
     /// must prove possession of the session-bound CSRF value.
     Session(String),
     /// Tokens carry only the explicit grant checked for the requested method.
-    ApiToken(crate::identity::ApiTokenScopes),
+    ApiToken {
+        scopes: crate::identity::ApiTokenScopes,
+        /// The stored token, so a socket it opens can end when it does.
+        credential: crate::db::RevocableCredential,
+    },
 }
 
 impl RequestCredential {
@@ -1449,7 +1453,16 @@ impl RequestCredential {
     pub(crate) fn browser_session(&self) -> Option<&str> {
         match self {
             Self::Session(session) => Some(session),
-            Self::ApiToken(_) => None,
+            Self::ApiToken { .. } => None,
+        }
+    }
+
+    /// The stored credential behind this request, which a long-lived socket
+    /// watches so it ends when the credential does.
+    pub(crate) fn revocable(&self) -> crate::db::RevocableCredential {
+        match self {
+            Self::Session(session) => crate::db::RevocableCredential::browser_session(session),
+            Self::ApiToken { credential, .. } => credential.clone(),
         }
     }
 
@@ -1458,7 +1471,7 @@ impl RequestCredential {
     pub(crate) fn grants_write(&self) -> bool {
         match self {
             Self::Session(_) => true,
-            Self::ApiToken(scopes) => scopes.contains(crate::identity::ApiTokenScope::Write),
+            Self::ApiToken { scopes, .. } => scopes.contains(crate::identity::ApiTokenScope::Write),
         }
     }
 }
@@ -1493,7 +1506,10 @@ async fn authenticate_principal(
                     .await
                     .map(|(account, flags)| RequestPrincipal {
                         account,
-                        credential: RequestCredential::ApiToken(principal.scopes),
+                        credential: RequestCredential::ApiToken {
+                            scopes: principal.scopes,
+                            credential: crate::db::RevocableCredential::api_token(bearer),
+                        },
                         flags,
                     })
             }
@@ -1555,7 +1571,7 @@ fn authorize_api_request(
     parts: &axum::http::request::Parts,
     administrator_route: bool,
 ) -> Result<(), ApiAuthorizationDenial> {
-    let RequestCredential::ApiToken(scopes) = credential else {
+    let RequestCredential::ApiToken { scopes, .. } = credential else {
         if parts.method != axum::http::Method::GET && parts.method != axum::http::Method::HEAD {
             let RequestCredential::Session(session) = credential else {
                 unreachable!("closed request credential set")

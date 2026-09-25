@@ -975,6 +975,21 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         };
         let monitoring_token_digest =
             crate::http::monitoring_token_digest_from_env().map_err(io::Error::other)?;
+        // Live chat sockets end with the credential that opened them; the
+        // store announces every revocation on a dedicated connection.
+        let credential_watch = crate::http::CredentialWatch::new();
+        if let (Some(pool), Some(database)) = (&pool, &config.database) {
+            let watcher = tokio::spawn(
+                credential_watch
+                    .clone()
+                    .run(database.url.clone(), pool.clone()),
+            );
+            listeners.push(supervise_listener(
+                "credential-change listener",
+                watcher,
+                critical_tx.clone(),
+            ));
+        }
         Some(Arc::new(crate::http::AppState {
             server_name: config.server_name.clone(),
             network_name: config.network_name.clone(),
@@ -1016,6 +1031,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             api_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
             preflight_limiter: crate::http::PreflightLimiter::new(),
             ui_sockets: crate::http::UiSocketLimiter::new(),
+            credential_watch: credential_watch.clone(),
             account_exports: crate::http::AccountExportSlots::new(),
             conn_limiter: limiter.clone(),
             database_readiness: crate::http::DatabaseReadiness::default(),

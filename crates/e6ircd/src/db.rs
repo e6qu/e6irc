@@ -17,7 +17,11 @@ use crate::core::{DbReply, DbRequest, Input};
 use crate::observability::Telemetry;
 use e6irc_queue::Receiver;
 
+mod credential_change;
 mod secret_rotation;
+pub use credential_change::{
+    CredentialChange, CredentialChangeListener, RevocableCredential, credential_remaining,
+};
 pub use secret_rotation::{SecretRotationReport, rotate_database_secrets};
 
 /// Migrations are compiled into the binary; startup refuses to run on

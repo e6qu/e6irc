@@ -1659,6 +1659,24 @@ browser can read a close frame but not a refused upgrade — which the chat
 client shows once and does not retry by itself. A silent peer is sent a
 WebSocket Ping after `ATTACH_LIVENESS_INTERVAL` (120 s) and detached after a
 second silent interval, the same rule as an attached IRC client (§10.1).
+A chat socket also ends with the credential that opened it. The browser
+session or personal access token is authorized once, at the upgrade, but the
+socket lives for hours, so it holds a lease on that credential and is closed
+with code 1008 ("Your sign-in ended…"; the client does not retry) when the
+credential is revoked or reaches its expiry. Revocation has many paths —
+logout, single and bulk session revocation, a password change, identity
+unlink, provider front- and back-channel logout, the 32-session cap, token
+revocation, suspension, host recovery, account deletion by cascade — and some
+run in another process, so no path announces it: `web_sessions` and
+`api_tokens` do (migration 0076), with a trigger that notifies
+`e6irc_credential_changed` on every committed delete or update. One listener
+per process, on its own connection, re-reads each announced credential that a
+socket holds; after its connection is lost it re-reads every held credential,
+because what was announced in between was not heard. A credential that cannot
+be re-read (the database is unavailable) closes its sockets with 1013 instead,
+which the client retries, authenticating again. `/ws/irc` is not such a
+socket: it carries no HTTP credential, and its SASL login is an IRC session's,
+with the same lifetime as one on a TCP listener.
 The account directory also projects effective administrator authority, its
 durable/configuration sources, and suspension posture.
 `PATCH /api/v1/admin/accounts/{id}` and matching CSRF-protected console forms
