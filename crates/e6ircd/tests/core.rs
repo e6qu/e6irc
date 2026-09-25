@@ -9541,6 +9541,63 @@ fn admin_channel_drop_waits_for_the_database_verdict() {
     );
 }
 
+/// A topic set over the API is stored whole or refused. With a long server
+/// name and channel name the TOPIC line's head leaves less than TOPICLEN for
+/// the text; the core used to store the part that fitted and answer success.
+#[test]
+fn an_api_topic_that_does_not_fit_its_line_is_refused_not_shortened() {
+    let server = format!("irc.{}.example", "s".repeat(52));
+    let channel = format!("#{}", "c".repeat(49));
+    let mut s = TestServer::configured(
+        true,
+        || Millis::from_millis(1_000_000_000),
+        |config| {
+            config.server_name = server.clone();
+        },
+    );
+    s.core
+        .preload_founders(vec![(channel.clone(), "boss".to_string())]);
+    let submit = |s: &mut TestServer, topic: String| {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        s.core.handle(Input::Admin {
+            req: e6ircd::core::AdminRequest::MutateOwnedChannel {
+                channel: channel.clone(),
+                actor: "boss".into(),
+                mutation: e6ircd::core::ChannelMutation::SetTopic { topic: Some(topic) },
+            },
+            reply: reply_tx,
+        });
+        reply_rx
+    };
+    let mut refused = submit(&mut s, "t".repeat(390));
+    match refused.try_recv() {
+        Ok(e6ircd::core::AdminReply::ChannelErr {
+            kind: e6ircd::core::ChannelControlError::Invalid,
+            message,
+        }) => assert!(message.contains("390 bytes"), "{message}"),
+        other => panic!("an over-long topic was not refused: {other:?}"),
+    }
+    assert!(
+        s.db_requests().is_empty(),
+        "nothing is stored for a refusal"
+    );
+
+    let fitting = "t".repeat(300);
+    let _pending = submit(&mut s, fitting.clone());
+    match s.db_requests().as_slice() {
+        [
+            e6ircd::core::DbRequest::MutateOwnedChannel {
+                mutation:
+                    e6ircd::core::PersistedChannelMutation::SetTopic {
+                        topic: Some((text, _, _)),
+                    },
+                ..
+            },
+        ] => assert_eq!(text, &fitting, "a topic that fits is stored whole"),
+        other => panic!("the fitting topic was not queued: {other:#?}"),
+    }
+}
+
 #[test]
 fn owner_channel_control_waits_for_storage_and_updates_the_hot_access_map() {
     let mut s = TestServer::new();

@@ -334,17 +334,22 @@ fn normalize_channel_mutation(
                         .channels
                         .get(key)
                         .map_or(key.as_str(), |channel| channel.name.as_str());
-                    let fitted = super::fit_trailing(
-                        &format!(":{} TOPIC {display} :", state.config.server_name),
-                        &raw,
-                    );
-                    (!fitted.is_empty()).then(|| {
-                        (
-                            fitted.to_string(),
-                            actor.to_string(),
-                            (state.config.clock)().as_secs(),
-                        )
-                    })
+                    // The topic travels in a TOPIC line whose head (this
+                    // server's and the channel's names) takes part of the wire
+                    // budget. A topic that does not fit whole is refused: the
+                    // request asked for this text, and storing less of it
+                    // while answering success would be a silent change.
+                    let head = format!(":{} TOPIC {display} :", state.config.server_name);
+                    let fitted = super::fit_trailing(&head, &raw);
+                    if fitted.len() != raw.len() {
+                        let room = super::fit_trailing(&head, &"x".repeat(raw.len())).len();
+                        return Err(format!(
+                            "topic is {} bytes; on this channel a topic holds at most {room}",
+                            raw.len()
+                        ));
+                    }
+                    (!raw.is_empty())
+                        .then(|| (raw, actor.to_string(), (state.config.clock)().as_secs()))
                 }
             };
             Ok(PersistedChannelMutation::SetTopic { topic })

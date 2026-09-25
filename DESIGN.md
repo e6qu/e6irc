@@ -2781,7 +2781,12 @@ Surface (initial):
   value.
 - `channels`: owner-scoped registered-channel inventory and management at
   `/me/channels` (live-operator registration, retained topic, KEEPTOPIC,
-  canonical MLOCK, access flags, founder transfer, unregister)
+  canonical MLOCK, access flags, founder transfer, unregister). A topic is
+  stored whole or refused: TOPICLEN bounds it, and so does the TOPIC line that
+  carries it, whose head (the server's and the channel's names) can leave
+  less room than TOPICLEN; a topic that does not fit is a `400` naming how
+  much fits, never a shortened topic answered as success. (IRC `TOPIC` keeps
+  IRC's own rule, truncation, because an IRC client expects it.)
 - `history`: paged queries per §11.2
 - `admin`: bounded, exact-filtered/stable-cursor account posture, registered
   channel policy, global K/D/X-line policy, and audit log; server stats;
