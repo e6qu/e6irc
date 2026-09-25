@@ -33,7 +33,10 @@ requests reject incompatible fields.
 The container starts with `e6ircd --config-from-environment`; the environment
 goes through the same parser and validation as a configuration file. Managed
 configuration schema changes migrate persisted rows with their historic explicit
-behavior; new configuration never receives an implicit decode default.
+behavior; new configuration never receives an implicit decode default. After
+the first import the console owns the operational settings: a start whose file
+or environment states one with a value other than the stored one is refused,
+naming each such setting and printing no value.
 History accepts one typed cursor window and a bounded page size.
 Chat, console, and identity pages share the relay-desk visual system and
 accessible light, dark, and forced-colors palettes. Both network forms read one

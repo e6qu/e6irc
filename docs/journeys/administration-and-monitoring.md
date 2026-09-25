@@ -13,7 +13,7 @@ deployment supplies a stable master key before importing credentials.
 **Flow.**
 
 1. Bootstrap TOML/environment supplies PostgreSQL, secret-key source, initial
-   HTTP bind/public URL/revision, and either static administrator grants or a
+   HTTP bind/public URL/revision, and either initial administrator grants or a
    one-time first-administrator token.
 2. On an empty account store, `/login` links to `/bootstrap`. The deployer
    submits the token, account name, and confirmed primary password through an
@@ -25,7 +25,11 @@ deployment supplies a stable master key before importing credentials.
 4. Migrations run; the first successful boot validates and imports a managed
    configuration snapshot with provenance.
 5. Later starts load the persisted revision before constructing the core and
-   listeners.
+   listeners. From here the console owns every operational setting: one the
+   TOML/environment still states must agree with the stored value, or start
+   fails naming it (a secret named, never shown); the deployer removes the
+   stated value, aligns it, or changes it in the console first. A setting the
+   bootstrap leaves unstated is never a conflict.
 6. The administrator edits identity, IRC listeners, BNC attach listener,
    public URL/cookie/admin access, capacity, monitoring retention, durable
    history/audit retention, registration, server/shared networks, IRC
@@ -34,7 +38,8 @@ deployment supplies a stable master key before importing credentials.
    other. The response distinguishes live-applied values from
    restart-required values.
 
-**Visible failures and recovery.** Unknown bootstrap keys, invalid values,
+**Visible failures and recovery.** Unknown bootstrap keys, invalid values, a
+stated console-owned setting that differs from the stored revision,
 missing/invalid bootstrap token, mismatched password confirmation, a consumed
 bootstrap, stale revisions, listener bind errors, provider validation errors,
 and database errors fail explicitly. A failed bootstrap creates no partial

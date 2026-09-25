@@ -606,7 +606,12 @@ fn serves_http(config: &Config) -> bool {
 /// the parse-and-validate [`Config::load`] does, so a configuration it passes
 /// cannot fail `start` over a malformed variable or an unreadable key file.
 /// (With a database, the listeners and `[bnc]` in force come from the stored
-/// revision once one exists; this judges the configuration as stated.)
+/// revision once one exists; this judges the configuration as stated. Whether
+/// the console-owned settings it states agree with that revision needs the
+/// database, so only `start` can judge it — [`ManagedConfig::bootstrap_drift`]
+/// — and `check-config` says so rather than implying it passed.)
+///
+/// [`ManagedConfig::bootstrap_drift`]: crate::config::ManagedConfig::bootstrap_drift
 pub fn check_offline(config: &Config) -> io::Result<()> {
     if serves_http(config) {
         crate::http::monitoring_token_digest_from_env().map_err(io::Error::other)?;
@@ -678,6 +683,23 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             let mut snapshot = crate::db::load_or_initialize_managed_config(&pool, &imported)
                 .await
                 .map_err(io::Error::other)?;
+            // The console owns every setting in the stored revision. One the
+            // configuration also states must agree with it: applying the
+            // revision over a different stated value would ignore that value
+            // without a word (a name removed from the administrator list that
+            // kept its authority, a rotated client secret never used).
+            let conflicting = snapshot
+                .settings
+                .bootstrap_drift(&config, secret_key.as_deref())
+                .map_err(io::Error::other)?;
+            if !conflicting.is_empty() {
+                return Err(io::Error::other(crate::config::ManagedSettingsConflict {
+                    settings: conflicting,
+                    revision: snapshot.revision,
+                    updated_by: snapshot.updated_by,
+                    updated_at: snapshot.updated_at,
+                }));
+            }
             // A legacy plaintext deployment cannot be copied into PostgreSQL
             // safely without a key. Once a key is supplied, import the still-
             // authoritative bootstrap credentials as sealed values in one
