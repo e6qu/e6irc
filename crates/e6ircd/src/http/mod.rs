@@ -1613,11 +1613,117 @@ pub fn router(state: Arc<AppState>) -> Router {
     // The fallback applies only to routes registered before it is set, so the
     // probes added here are given it again.
     let router = add_probe_routes(router).method_not_allowed_fallback(method_not_allowed);
+    let form_targets = Arc::new(LogoutFormTargets::from_providers(&state.oidc_providers));
     observed(
-        bound_request(router, REQUEST_DEADLINE).layer(axum::middleware::from_fn(baseline_headers)),
+        bound_request(router, REQUEST_DEADLINE)
+            .layer(axum::middleware::from_fn(baseline_headers))
+            .layer(axum::middleware::from_fn_with_state(
+                form_targets,
+                admit_logout_form_targets,
+            )),
         state.observation.clone(),
     )
     .with_state(state)
+}
+
+/// The origins a sign-out form's submission may be redirected to: each
+/// configured provider's end-session endpoint. Signing out is a form `POST`
+/// answered with a `303` to that endpoint, and browsers hold every redirect of
+/// a form submission to the page's `form-action`, so `form-action 'self'`
+/// alone blocked coordinated logout outright.
+struct LogoutFormTargets(Option<String>);
+
+impl LogoutFormTargets {
+    fn from_providers(providers: &[OidcProviderConfig]) -> Self {
+        let mut origins: Vec<String> = providers
+            .iter()
+            .filter_map(|provider| provider.end_session_endpoint.as_deref())
+            .filter_map(|endpoint| url::Url::parse(endpoint).ok())
+            .map(|endpoint| endpoint.origin())
+            .filter(url::Origin::is_tuple)
+            .map(|origin| origin.ascii_serialization())
+            .collect();
+        origins.sort();
+        origins.dedup();
+        Self((!origins.is_empty()).then(|| origins.join(" ")))
+    }
+
+    /// `csp` with the targets added to its `form-action 'self'`.
+    fn admit(&self, csp: &str) -> Option<String> {
+        let targets = self.0.as_deref()?;
+        csp.contains("form-action 'self'").then(|| {
+            csp.replace(
+                "form-action 'self'",
+                &format!("form-action 'self' {targets}"),
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod logout_form_target_tests {
+    use super::*;
+
+    fn provider(name: &str, end_session: Option<&str>) -> OidcProviderConfig {
+        OidcProviderConfig {
+            name: name.into(),
+            issuer_url: "https://idp.example".into(),
+            client_id: "e6irc".into(),
+            client_secret: "secret".into(),
+            account_claim: crate::config::OidcAccountClaim::PreferredUsername,
+            scopes: vec![],
+            allowed_email_domains: vec![],
+            end_session_endpoint: end_session.map(str::to_owned),
+            token_endpoint_auth_method: crate::config::TokenEndpointAuthMethod::ClientSecretBasic,
+        }
+    }
+
+    /// A sign-out form's `303` to a provider's end-session endpoint is a
+    /// redirect of a form submission, which browsers hold to `form-action`:
+    /// each provider's end-session origin is admitted there, once, and only
+    /// there.
+    #[test]
+    fn end_session_origins_join_form_action_and_nothing_else() {
+        let targets = LogoutFormTargets::from_providers(&[
+            provider(
+                "shauth",
+                Some("http://localhost:8080/oauth2/sessions/logout"),
+            ),
+            provider("again", Some("http://localhost:8080/other")),
+            provider("corp", Some("https://login.corp.example/logout?x=1")),
+            provider("dex", None),
+        ]);
+        let csp = "default-src 'none'; form-action 'self'; base-uri 'none'";
+        assert_eq!(
+            targets.admit(csp).as_deref(),
+            Some(
+                "default-src 'none'; form-action 'self' http://localhost:8080 \
+                 https://login.corp.example; base-uri 'none'"
+            )
+        );
+        assert_eq!(targets.admit("default-src 'none'"), None);
+        let none = LogoutFormTargets::from_providers(&[provider("dex", None)]);
+        assert_eq!(none.admit(csp), None);
+    }
+}
+
+async fn admit_logout_form_targets(
+    State(targets): State<Arc<LogoutFormTargets>>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let widened = response
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|csp| targets.admit(csp));
+    if let Some(csp) = widened.and_then(|csp| header::HeaderValue::from_str(&csp).ok()) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_SECURITY_POLICY, csp);
+    }
+    response
 }
 
 /// Browser features no e6irc page uses, denied to every document the server

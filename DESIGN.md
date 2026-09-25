@@ -1703,7 +1703,10 @@ provider-verified email claim.
   unsafe API method; it answers the provider URL, and the page navigates
   there. Signing out is a form `POST` (the value in its body) that the browser
   follows as a navigation to the provider's end-session endpoint; a script may
-  send the header instead. The `GET` forms of both, which took the value as a
+  send the header instead. Browsers hold every redirect of a form submission to
+  the page's `form-action`, so each configured provider's end-session origin
+  is added to `form-action 'self'` on every page (one layer over the router);
+  `'self'` alone blocked coordinated logout. The `GET` forms of both, which took the value as a
   `csrf` query parameter, are gone.
 - Local-account login form (argon2id verify) for accounts without OIDC. It
   accepts only the primary password, not an IRC app password, is covered by the
