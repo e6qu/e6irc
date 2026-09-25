@@ -1501,9 +1501,18 @@ provider-verified email claim.
   controls its discovery document can aim this server's token and key
   requests at internal infrastructure. A literal address is judged before each
   request and every resolved address at connect time. First login
-  auto-provisions an account (nick derived from `preferred_username`,
-  conflict → user picks). Subsequent logins match on (issuer, subject),
-  never on email.
+  auto-provisions an account named exactly by the provider's configured
+  claim (`preferred_username`, or an email's local part); a name already in
+  use or retired is a `409` (§12) — the server never picks or invents a name,
+  and the person is not asked to pick one either. An email names an account
+  only when the provider marked it verified *and* the provider has an
+  allowed-domain policy that admits it: without a policy, `alice@anywhere`
+  would become `alice` for whoever registered that mailbox at a provider that
+  lets people register — a configured administrator's name among them. Such a
+  first sign-in is refused with a `403` saying what the administrator must
+  configure; there is no fallback to another claim the administrator did not
+  choose. Subsequent logins match on (issuer, subject), never on email, and
+  are not re-judged by these rules.
 - An in-flight OIDC authorization is held by the browser, not the server:
   `/start`, `/sso`, and `/link` seal the provider, OAuth `state`, PKCE
   verifier, nonce, ten-minute expiry, link target, and silent flag into the

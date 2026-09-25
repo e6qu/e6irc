@@ -8513,6 +8513,25 @@ pub async fn bnc_buffer_summary(
 
 // ---- web auth (OIDC identities + sessions) ------------------------------
 
+/// The account an OpenID Connect identity is linked to, if any.
+pub async fn oidc_linked_account(
+    pool: &PgPool,
+    issuer: &str,
+    subject: &str,
+) -> Result<Option<String>, DbError> {
+    sqlx::query_scalar(OIDC_LINKED_ACCOUNT)
+        .bind(issuer)
+        .bind(subject)
+        .fetch_optional(pool)
+        .await
+        .map_err(query_error)
+}
+
+/// The account (`name`) linked to the identity (`$1` issuer, `$2` subject).
+const OIDC_LINKED_ACCOUNT: &str = "SELECT a.name FROM accounts a
+     JOIN oidc_identities o ON o.account_id = a.id
+     WHERE o.issuer = $1 AND o.subject = $2";
+
 /// Find the account linked to (issuer, subject), or provision one named
 /// exactly `account_name`, the name the provider's configured claim carries.
 /// A name that is already an account's or retired is refused with
@@ -8524,16 +8543,8 @@ pub async fn find_or_create_oidc_account(
     subject: &str,
     account_name: &str,
 ) -> Result<String, DbError> {
-    const LINKED_ACCOUNT: &str = "SELECT a.name FROM accounts a
-         JOIN oidc_identities o ON o.account_id = a.id
-         WHERE o.issuer = $1 AND o.subject = $2";
-    let existing: Option<String> = sqlx::query_scalar(LINKED_ACCOUNT)
-        .bind(issuer)
-        .bind(subject)
-        .fetch_optional(pool)
-        .await
-        .map_err(query_error)?;
-    if let Some(name) = existing {
+    const LINKED_ACCOUNT: &str = OIDC_LINKED_ACCOUNT;
+    if let Some(name) = oidc_linked_account(pool, issuer, subject).await? {
         return Ok(name);
     }
 

@@ -644,27 +644,33 @@ async fn complete_flow(
             }
         };
     }
-    let (account_name, detail) = match provider.account_claim {
-        crate::config::OidcAccountClaim::PreferredUsername => (
+    // A returning identity signs in to the account it is linked to, whatever
+    // its claims now say; only a first sign-in derives a name.
+    let linked = match crate::db::oidc_linked_account(&pool, issuer, subject).await {
+        Ok(linked) => linked,
+        Err(e) => {
+            eprintln!("oidc: identity lookup failed: {e}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Account storage failed",
+                None,
+            );
+        }
+    };
+    let preferred = match linked {
+        Some(account) => account,
+        None => match provisioned_account_name(
+            provider,
             claims
                 .preferred_username()
-                .and_then(|value| crate::sanitize::account_name(value.as_str())),
-            "The configured preferred_username claim must contain an IRC-safe account name.",
-        ),
-        crate::config::OidcAccountClaim::Email => (
-            claims
-                .email()
-                .and_then(|value| crate::identity::ContactEmail::parse(value.as_str()).ok())
-                .and_then(|email| crate::sanitize::account_name(email.local_part())),
-            "The configured email claim must be a valid email with an IRC-safe local part.",
-        ),
-    };
-    let Some(preferred) = account_name else {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "Provider sent no usable account claim",
-            Some(detail),
-        );
+                .map(|value| value.as_str().to_string())
+                .as_deref(),
+            email.as_deref(),
+            claims.email_verified() == Some(true),
+        ) {
+            Ok(name) => name,
+            Err(refusal) => return refusal.response(),
+        },
     };
     // Only stored roles reach the database.
     let role = token_claims
@@ -741,6 +747,93 @@ async fn complete_flow(
         ],
     )
         .into_response()
+}
+
+/// Why a first sign-in may not provision an account.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ProvisioningRefusal {
+    /// The configured claim is absent or not an IRC-safe account name.
+    UnusableClaim(&'static str),
+    /// The email claim names accounts, but the provider has not verified the
+    /// address: anyone could have typed it at a provider that lets people
+    /// register.
+    UnverifiedEmail,
+    /// The email claim names accounts, but no domain policy says whose
+    /// addresses they are: without one, `alice@anywhere` would become the
+    /// account `alice`, whoever holds that mailbox.
+    NoDomainPolicy,
+}
+
+impl ProvisioningRefusal {
+    pub(super) fn response(&self) -> Response {
+        match self {
+            Self::UnusableClaim(detail) => problem(
+                StatusCode::UNAUTHORIZED,
+                "Provider sent no usable account claim",
+                Some(detail),
+            ),
+            Self::UnverifiedEmail => problem(
+                StatusCode::FORBIDDEN,
+                "Account provisioning refused",
+                Some(
+                    "This provider names new accounts by email, and it has not verified this \
+                     identity's address. Verify the address with the provider, or ask an \
+                     administrator to create the account and link this identity to it.",
+                ),
+            ),
+            Self::NoDomainPolicy => problem(
+                StatusCode::FORBIDDEN,
+                "Account provisioning refused",
+                Some(
+                    "This provider names new accounts by the local part of an email address, \
+                     which is only a name when the provider's allowed email domains say whose \
+                     addresses they are, and it has none. Ask an administrator to configure \
+                     the provider's allowed email domains, or to create the account and link \
+                     this identity to it.",
+                ),
+            ),
+        }
+    }
+}
+
+/// The account a first sign-in provisions, named by the provider's
+/// configured claim. An email names an account only when the provider
+/// verified it and a domain policy admits it (the policy itself is enforced
+/// for every sign-in by [`email_domain_admitted`]); the local part of an
+/// address anyone could claim never becomes a name. There is no fallback to
+/// another claim: the administrator chose this one.
+pub(super) fn provisioned_account_name(
+    provider: &OidcProviderConfig,
+    preferred_username: Option<&str>,
+    email: Option<&str>,
+    email_verified: bool,
+) -> Result<String, ProvisioningRefusal> {
+    match provider.account_claim {
+        crate::config::OidcAccountClaim::PreferredUsername => preferred_username
+            .and_then(crate::sanitize::account_name)
+            .ok_or(ProvisioningRefusal::UnusableClaim(
+                "The configured preferred_username claim must contain an IRC-safe account name.",
+            )),
+        crate::config::OidcAccountClaim::Email => {
+            let unusable = ProvisioningRefusal::UnusableClaim(
+                "The configured email claim must be a valid email with an IRC-safe local part.",
+            );
+            let email = email
+                .and_then(|value| crate::identity::ContactEmail::parse(value).ok())
+                .ok_or(unusable)?;
+            if !email_verified {
+                return Err(ProvisioningRefusal::UnverifiedEmail);
+            }
+            if provider.allowed_email_domains.is_empty() {
+                return Err(ProvisioningRefusal::NoDomainPolicy);
+            }
+            crate::sanitize::account_name(email.local_part()).ok_or(
+                ProvisioningRefusal::UnusableClaim(
+                    "The configured email claim must be a valid email with an IRC-safe local part.",
+                ),
+            )
+        }
+    }
 }
 
 fn email_domain_admitted(

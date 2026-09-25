@@ -4186,6 +4186,46 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
         }
     }
 
+    /// An email names a new account only when the provider verified it and a
+    /// domain policy says whose addresses they are; otherwise the local part
+    /// of an address anyone could register would become — say — a configured
+    /// administrator's name.
+    #[test]
+    fn an_email_names_a_new_account_only_when_verified_under_a_domain_policy() {
+        let mut provider = logout_test_provider();
+        provider.account_claim = crate::config::OidcAccountClaim::Email;
+        assert_eq!(
+            provisioned_account_name(&provider, Some("alice"), Some("alice@corp.example"), true),
+            Err(ProvisioningRefusal::NoDomainPolicy),
+            "no fallback to preferred_username either"
+        );
+        provider.allowed_email_domains =
+            vec![crate::identity::EmailDomain::parse("corp.example").expect("domain")];
+        assert_eq!(
+            provisioned_account_name(&provider, None, Some("alice@corp.example"), false),
+            Err(ProvisioningRefusal::UnverifiedEmail)
+        );
+        assert_eq!(
+            provisioned_account_name(&provider, None, Some("alice@corp.example"), true),
+            Ok("alice".to_string())
+        );
+        assert!(matches!(
+            provisioned_account_name(&provider, Some("alice"), None, true),
+            Err(ProvisioningRefusal::UnusableClaim(_))
+        ));
+        assert_eq!(
+            ProvisioningRefusal::NoDomainPolicy.response().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let mut by_username = logout_test_provider();
+        by_username.account_claim = crate::config::OidcAccountClaim::PreferredUsername;
+        assert_eq!(
+            provisioned_account_name(&by_username, Some("bob"), None, false),
+            Ok("bob".to_string())
+        );
+    }
+
     #[test]
     fn verifies_signed_backchannel_logout_contract() {
         let now = 1_800_000_000;

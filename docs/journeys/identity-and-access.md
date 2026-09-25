@@ -123,7 +123,9 @@ after an unlink.
 
 **Visible failures and recovery.** Linking an identity owned by another account
 is a conflict, never a move. Missing/unverified or non-matching email under a
-provider domain policy is rejected before linking. Unlinking an identity
+provider domain policy is rejected before linking. A first sign-in through a
+provider that names accounts by email is refused unless the address is
+verified and the provider has an allowed-domain policy. Unlinking an identity
 outside the caller’s account is indistinguishable from absence. The server
 refuses a mutation that would violate the account’s access invariants.
 
