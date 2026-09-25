@@ -102,6 +102,7 @@ fn our_isupport() -> HashMap<String, String> {
             mono_clock: || e6irc_proto::time::MonoMillis::from_millis(0),
             command_flood: None,
             registration_burst: None,
+            sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
         },
         db_tx,

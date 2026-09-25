@@ -309,10 +309,10 @@ pub struct LimitsConfig {
     pub command_rate: usize,
     /// CIDRs of trusted reverse proxies (e.g. the load balancer). When a
     /// request's socket peer matches one of these, its client IP is taken
-    /// from `X-Forwarded-For`; otherwise the socket peer IP is used. Parsing
-    /// is validated at startup — an invalid CIDR is a hard error.
+    /// from `X-Forwarded-For`; otherwise the socket peer IP is used. Parsed
+    /// when the configuration is read: an invalid CIDR is a hard error.
     #[serde(default)]
-    pub trusted_proxies: Vec<String>,
+    pub trusted_proxies: Vec<ipnet::IpNet>,
     /// Token-bucket size for the auth endpoints (credential issue + OIDC login
     /// start), per client IP; the bucket refills to full over 60 seconds.
     /// `None` disables auth rate limiting.
@@ -329,6 +329,55 @@ pub struct LimitsConfig {
     /// account minting from one address. `None` disables the throttle.
     #[serde(default)]
     pub registration_burst: Option<usize>,
+    /// Refuse to register any IRC client that has not logged in to an account
+    /// by the end of registration (Solanum's `need_sasl` auth block, for
+    /// everyone). See [`SaslRequirement`].
+    #[serde(default)]
+    pub require_sasl: bool,
+    /// The same refusal, only for clients connecting from these address
+    /// ranges (a cloud provider's, say). Redundant, and refused, when
+    /// `require_sasl` already covers everyone.
+    #[serde(default)]
+    pub require_sasl_from: Vec<ipnet::IpNet>,
+}
+
+impl LimitsConfig {
+    /// Who these limits require to log in with SASL before registering.
+    pub fn sasl_requirement(&self) -> SaslRequirement {
+        SaslRequirement {
+            everyone: self.require_sasl,
+            ranges: self.require_sasl_from.clone(),
+        }
+    }
+}
+
+/// Which IRC clients must have logged in to an account by the end of
+/// registration (`limits.require_sasl`, `limits.require_sasl_from`). A client
+/// it covers that is still anonymous when its NICK/USER/CAP END complete is
+/// refused as Libera refuses its SASL-only ranges: a NOTICE saying so, 465,
+/// and `ERROR :Closing Link: … (SASL access only)`.
+///
+/// Logged in means an account on the connection: SASL, or a
+/// `draft/account-registration` REGISTER before connect (which logs the new
+/// account in, and which the operator enables separately). The bouncer's
+/// in-process sessions are exempt: their owner authenticated to the bouncer,
+/// and they have no address for a range to match.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SaslRequirement {
+    everyone: bool,
+    ranges: Vec<ipnet::IpNet>,
+}
+
+impl SaslRequirement {
+    /// Whether a client connecting from `address` (`None` for a session with
+    /// no address) must log in before registering.
+    pub fn covers(&self, address: Option<std::net::IpAddr>) -> bool {
+        self.everyone
+            || address.is_some_and(|address| {
+                let address = address.to_canonical();
+                self.ranges.iter().any(|range| range.contains(&address))
+            })
+    }
 }
 
 /// Solanum's defaults: a 40-command burst refilling at 20 per second.
@@ -364,6 +413,8 @@ impl Default for LimitsConfig {
             api_rate_burst: DEFAULT_API_RATE_BURST,
             administrator_api_rate_burst: DEFAULT_ADMINISTRATOR_API_RATE_BURST,
             registration_burst: None,
+            require_sasl: false,
+            require_sasl_from: Vec::new(),
         }
     }
 }
@@ -2121,12 +2172,22 @@ impl Config {
                     .into(),
             ));
         }
-        for cidr in &self.limits.trusted_proxies {
-            if cidr.parse::<ipnet::IpNet>().is_err() {
-                return Err(ConfigError::Invalid(format!(
-                    "limits.trusted_proxies: invalid CIDR '{cidr}'"
-                )));
-            }
+        if self.limits.require_sasl && !self.limits.require_sasl_from.is_empty() {
+            return Err(ConfigError::Invalid(
+                "limits.require_sasl_from lists address ranges, but limits.require_sasl already \
+                 requires SASL of every client: clear one of them"
+                    .into(),
+            ));
+        }
+        if (self.limits.require_sasl || !self.limits.require_sasl_from.is_empty())
+            && self.database.is_none()
+        {
+            return Err(ConfigError::Invalid(
+                "limits.require_sasl and limits.require_sasl_from require [database]: without \
+                 accounts no client can log in with SASL, so every client they cover would be \
+                 refused"
+                    .into(),
+            ));
         }
         if !self.oidc_providers.is_empty() {
             if self.database.is_none() {
@@ -3627,6 +3688,130 @@ mod tests {
             cfg.validate().is_err(),
             "registration_burst=0 refuses every account creation and must be rejected"
         );
+    }
+
+    /// A document with `limits` as its `[limits]` table, and a database
+    /// unless `database` is false.
+    fn with_limits(limits: &str, database: bool) -> Result<Config, ConfigError> {
+        let database = if database {
+            "[database]\nurl = \"postgres://localhost/e6irc\"\n"
+        } else {
+            ""
+        };
+        Config::from_table(
+            toml::from_str(&format!(
+                "server_name = \"irc.example\"\nnetwork_name = \"example\"\n\
+                 [[listeners]]\naddr = \"127.0.0.1:6667\"\n{database}[limits]\n{limits}\n"
+            ))
+            .expect("document"),
+            &[],
+        )
+    }
+
+    #[test]
+    fn the_sasl_requirement_is_parsed_and_covers_what_it_names() {
+        let everyone = with_limits("require_sasl = true", true).expect("valid");
+        assert!(everyone.limits.sasl_requirement().covers(None));
+        assert!(
+            everyone
+                .limits
+                .sasl_requirement()
+                .covers(Some("198.51.100.1".parse().unwrap()))
+        );
+
+        let ranges = with_limits(
+            r#"require_sasl_from = ["192.0.2.0/24", "2001:db8::/32"]"#,
+            true,
+        )
+        .expect("valid")
+        .limits
+        .sasl_requirement();
+        for (address, covered) in [
+            ("192.0.2.1", true),
+            ("::ffff:192.0.2.1", true),
+            ("2001:db8::1", true),
+            ("192.0.3.1", false),
+            ("2001:db9::1", false),
+        ] {
+            assert_eq!(
+                ranges.covers(Some(address.parse().unwrap())),
+                covered,
+                "{address}"
+            );
+        }
+        assert!(!ranges.covers(None), "no address, no range to be in");
+        assert!(!Config::default().limits.sasl_requirement().covers(None));
+    }
+
+    #[test]
+    fn a_sasl_requirement_that_cannot_work_or_contradicts_itself_is_refused() {
+        let error = with_limits(r#"require_sasl_from = ["192.0.2.0/33"]"#, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("require_sasl_from"), "{error}");
+        let error = with_limits(r#"require_sasl_from = ["cloud"]"#, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("require_sasl_from"), "{error}");
+
+        for limits in [
+            "require_sasl = true",
+            r#"require_sasl_from = ["192.0.2.0/24"]"#,
+        ] {
+            let error = with_limits(limits, false).unwrap_err().to_string();
+            assert!(error.contains("require [database]"), "{limits}: {error}");
+        }
+
+        let error = with_limits(
+            "require_sasl = true\nrequire_sasl_from = [\"192.0.2.0/24\"]",
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("clear one of them"), "{error}");
+    }
+
+    #[test]
+    fn an_invalid_trusted_proxy_is_refused_when_the_configuration_is_read() {
+        let error = with_limits(r#"trusted_proxies = ["10.0.0.0/40"]"#, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("trusted_proxies"), "{error}");
+        let parsed = with_limits(r#"trusted_proxies = ["10.0.0.0/8"]"#, false).expect("valid");
+        assert_eq!(
+            parsed.limits.trusted_proxies,
+            ["10.0.0.0/8".parse::<ipnet::IpNet>().unwrap()]
+        );
+    }
+
+    /// The SASL requirement is console-owned like every other limit: the
+    /// console's form stores it, and a configuration that states another value
+    /// is held to the stored one.
+    #[test]
+    fn the_sasl_requirement_is_a_console_owned_setting() {
+        let key = crate::secret::SecretKeyring::single(crate::secret::SecretKey::generate());
+        let (_, stored) = stated_and_imported(DRIFT_DOCUMENT, &key);
+        let (stated, _) = stated_and_imported(
+            &format!("{DRIFT_DOCUMENT}\n[limits]\nrequire_sasl_from = [\"192.0.2.0/24\"]\n"),
+            &key,
+        );
+        assert_eq!(
+            stored.bootstrap_drift(&stated, Some(&key)).unwrap(),
+            ["limits.require_sasl_from"]
+        );
+        let mut console = stored.clone();
+        console.limits.require_sasl = true;
+        let json = serde_json::to_value(&console).expect("serializes");
+        assert_eq!(json["limits"]["require_sasl"], true);
+        let round_trip: ManagedConfig = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(round_trip, console);
+        round_trip
+            .validate(BootstrapContext {
+                http_listener: None,
+                hsts_include_subdomains: false,
+                internal_upstreams: crate::egress::InternalUpstreams::Refuse,
+            })
+            .expect("the console may save it");
     }
 
     #[test]

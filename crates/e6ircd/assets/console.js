@@ -1159,10 +1159,9 @@ import { loadSettings, saveSetting } from "/console-settings.js";
           max_connections_per_ip: optionalPositiveInteger(fields, "max_connections_per_ip", "Connections per IP"),
           command_burst: positiveInteger(fields, "command_burst", "Command burst"),
           command_rate: positiveInteger(fields, "command_rate", "Command rate"),
-          trusted_proxies: String(fields.get("trusted_proxies") || "")
-            .split("\n")
-            .map((entry) => entry.trim())
-            .filter(Boolean),
+          trusted_proxies: splitValues(String(fields.get("trusted_proxies") || ""), "\n"),
+          require_sasl: fields.has("require_sasl"),
+          require_sasl_from: splitValues(String(fields.get("require_sasl_from") || ""), "\n"),
           auth_rate_burst: optionalPositiveInteger(fields, "auth_rate_burst", "Authentication burst"),
           api_rate_burst: positiveInteger(fields, "api_rate_burst", "Authenticated API burst"),
           administrator_api_rate_burst: positiveInteger(fields, "administrator_api_rate_burst", "Administrator API burst"),
@@ -1525,6 +1524,8 @@ import { loadSettings, saveSetting } from "/console-settings.js";
     for (const name of ["nicklen", "sendq", "core_queue", "core_workers", "max_hot_channels"]) configurationValue(form, name, settings[name]);
     for (const name of ["max_connections_per_ip", "command_burst", "command_rate", "auth_rate_burst", "api_rate_burst", "administrator_api_rate_burst", "registration_burst"]) configurationValue(form, name, settings.limits[name]);
     configurationValue(form, "trusted_proxies", apiCollection(settings.limits, "trusted_proxies", "configuration").join("\n"));
+    configurationChecked(form, "require_sasl", settings.limits.require_sasl);
+    configurationValue(form, "require_sasl_from", apiCollection(settings.limits, "require_sasl_from", "configuration").join("\n"));
     configurationChecked(form, "observability_enabled", settings.observability.enabled);
     configurationValue(form, "observability_sample_interval_seconds", settings.observability.sample_interval_seconds);
     configurationValue(form, "observability_retention_hours", settings.observability.retention_hours);

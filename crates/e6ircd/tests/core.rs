@@ -104,6 +104,7 @@ impl TestServer {
             mono_clock: test_mono,
             command_flood: None,
             registration_burst: None,
+            sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
         };
         adjust(&mut config);
@@ -1897,6 +1898,143 @@ fn sasl_plain_success_flow() {
     s.line(c, "USER a 0 * :A");
     s.line(c, "CAP END");
     assert!(has_numeric(&s.drain(c), "001"));
+}
+
+/// A server whose `[limits]` require SASL as `limits` says.
+fn sasl_required_server(limits: e6ircd::config::LimitsConfig) -> TestServer {
+    TestServer::configured(
+        true,
+        || Millis::from_millis(1_000_000_000),
+        |config| {
+            config.sasl_requirement = limits.sasl_requirement();
+        },
+    )
+}
+
+/// Log `conn` in to `account` with SASL PLAIN, before registration.
+fn sasl_login(s: &mut TestServer, conn: ConnId, account: &str) {
+    s.line(conn, "CAP LS 302");
+    s.line(conn, "CAP REQ :sasl");
+    s.line(conn, "AUTHENTICATE PLAIN");
+    s.line(
+        conn,
+        &format!("AUTHENTICATE {}", b64(&format!("\0{account}\0pw"))),
+    );
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: account.into(),
+            origin: e6ircd::core::CredentialOrigin::Sasl,
+        },
+    });
+    assert!(has_numeric(&s.drain(conn), "903"), "{account} logged in");
+}
+
+/// NICK and USER (and CAP END, harmless without negotiation) for `conn`.
+fn finish_registration(s: &mut TestServer, conn: ConnId, nick: &str) -> Vec<String> {
+    s.line(conn, &format!("NICK {nick}"));
+    s.line(conn, &format!("USER {nick} 0 * :{nick}"));
+    s.line(conn, "CAP END");
+    s.drain(conn)
+}
+
+/// The refusal Libera gives a client of a SASL-only range: 465 naming why,
+/// then the `SASL access only` closing link — and no welcome.
+fn assert_refused_for_sasl(out: &[String], host: &str) {
+    assert!(
+        out.iter().any(|l| l.split(' ').nth(1) == Some("465")
+            && l.ends_with(":You need to identify via SASL to use this server")),
+        "{out:#?}"
+    );
+    assert!(
+        out.iter()
+            .any(|l| l == &format!("ERROR :Closing Link: {host} (SASL access only)")),
+        "{out:#?}"
+    );
+    assert!(!has_numeric(out, "001"), "{out:#?}");
+}
+
+#[test]
+fn sasl_required_of_everyone_refuses_an_anonymous_client_and_admits_a_logged_in_one() {
+    let mut s = sasl_required_server(e6ircd::config::LimitsConfig {
+        require_sasl: true,
+        ..Default::default()
+    });
+    let anonymous = s.connect(1);
+    assert_refused_for_sasl(
+        &finish_registration(&mut s, anonymous, "joe"),
+        "host1.example",
+    );
+    // Closed, not parked: the nick it asked for is free.
+    let alice = s.connect(2);
+    sasl_login(&mut s, alice, "alice");
+    assert!(has_numeric(
+        &finish_registration(&mut s, alice, "joe"),
+        "001"
+    ));
+
+    // A SASL attempt that fails does not count as logging in.
+    let failed = s.connect(3);
+    s.line(failed, "CAP LS 302");
+    s.line(failed, "CAP REQ :sasl");
+    s.line(failed, "AUTHENTICATE PLAIN");
+    s.line(failed, &format!("AUTHENTICATE {}", b64("\0bob\0wrong")));
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: failed,
+        reply: e6ircd::core::DbReply::PasswordRejected {
+            origin: e6ircd::core::CredentialOrigin::Sasl,
+        },
+    });
+    assert_refused_for_sasl(&finish_registration(&mut s, failed, "bob"), "host3.example");
+
+    // The bouncer's in-process sessions are exempt: their owner logged in to
+    // the bouncer.
+    let local = s.connect_with_transport(4, e6ircd::core::ConnectionTransport::Local);
+    assert!(has_numeric(
+        &finish_registration(&mut s, local, "carol"),
+        "001"
+    ));
+}
+
+#[test]
+fn sasl_required_from_ranges_refuses_only_clients_inside_them() {
+    let mut s = sasl_required_server(e6ircd::config::LimitsConfig {
+        require_sasl_from: vec![
+            "192.0.2.0/24".parse().expect("CIDR"),
+            "2001:db8::/32".parse().expect("CIDR"),
+        ],
+        ..Default::default()
+    });
+    for (id, address, refused) in [
+        (1, "192.0.2.7", true),
+        // An IPv4 client reaching a dual-stack socket is matched as IPv4.
+        (2, "::ffff:192.0.2.8", true),
+        (3, "2001:db8::9", true),
+        (4, "198.51.100.1", false),
+        (5, "2001:db9::1", false),
+        // A session opened under a name has no address a range can match.
+        (6, "host6.example", false),
+    ] {
+        let conn = s.connect_from(id, address, e6ircd::core::ConnectionTransport::Tcp);
+        let out = finish_registration(&mut s, conn, &format!("user{id}"));
+        if refused {
+            assert!(has_numeric(&out, "465"), "{address}: {out:#?}");
+            assert!(
+                out.iter().any(|l| l.ends_with("(SASL access only)")),
+                "{address}: {out:#?}"
+            );
+        } else {
+            assert!(has_numeric(&out, "001"), "{address}: {out:#?}");
+        }
+    }
+    let logged_in = s.connect_from(7, "192.0.2.10", e6ircd::core::ConnectionTransport::Tcp);
+    sasl_login(&mut s, logged_in, "dave");
+    assert!(has_numeric(
+        &finish_registration(&mut s, logged_in, "dave"),
+        "001"
+    ));
 }
 
 #[test]
@@ -6265,6 +6403,7 @@ fn fresh_session_flood_bucket_starts_full_regardless_of_uptime() {
             mono_clock: early_mono,
             command_flood: Some(CommandFlood::new(10, 1).expect("valid bucket")),
             registration_burst: None,
+            sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
         },
         db_tx,
@@ -6352,6 +6491,7 @@ fn default_flood_bucket_admits_a_burst_of_forty_then_kills_and_exempts_keepalive
                 mono_clock: ticking_mono,
                 command_flood: Some(flood),
                 registration_burst: None,
+                sasl_requirement: Default::default(),
                 reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
             },
             db_tx,
@@ -6482,6 +6622,7 @@ fn account_creation_is_rate_limited_per_ip() {
             mono_clock: test_mono,
             command_flood: None,
             registration_burst: Some(1),
+            sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
         },
         db_tx,
@@ -6557,6 +6698,7 @@ fn hot_history_ring_is_lru_evicted() {
             mono_clock: test_mono,
             command_flood: None,
             registration_burst: None,
+            sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
         },
         db_tx,
@@ -8624,6 +8766,7 @@ fn history_logmessage_gated_on_database() {
                 mono_clock: test_mono,
                 command_flood: None,
                 registration_burst: None,
+                sasl_requirement: Default::default(),
                 reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
             },
             db_tx,

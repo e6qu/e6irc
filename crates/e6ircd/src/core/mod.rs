@@ -3345,6 +3345,7 @@ mod ingress_tests {
             mono_clock,
             command_flood: None,
             registration_burst: None,
+            sasl_requirement: Default::default(),
             reserved_account_names: crate::identity::ReservedAccountNames::default(),
         }
     }

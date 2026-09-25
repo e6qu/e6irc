@@ -747,12 +747,15 @@ strip = "symbols"
 - RecvQ/flood control: a token bucket per connection, on by default with
   Solanum's shape (`limits.command_burst = 40` tokens, `limits.command_rate =
   20` per second; a registered non-oper session spends one per command, PING
-  and PONG exempt, and is closed with Excess Flood when the bucket is empty),
-  plus per-IP connection throttle and registration throttle. It used to be off
-  by default with a fixed one-token-per-second refill, which left every
-  output-amplifying command class — repeated JOIN/NAMES targets, repeated list
-  modes — unbounded for anyone who never turned it on, and made any burst that
-  was turned on flood-kill an ordinary autojoin storm.
+  and PONG exempt, and is closed with Excess Flood when the bucket is empty).
+  It used to be off by default with a fixed one-token-per-second refill, which
+  left every output-amplifying command class — repeated JOIN/NAMES targets,
+  repeated list modes — unbounded for anyone who never turned it on, and made
+  any burst that was turned on flood-kill an ordinary autojoin storm. Two
+  per-address bounds are off unless configured: `limits.max_connections_per_ip`
+  caps simultaneous connections from one address (the excess is refused at
+  accept), and `limits.registration_burst` throttles account creation
+  (REGISTER and NickServ REGISTER) per address.
 - JOIN, PART and NAMES target lists are casefold-deduplicated and bounded by
   the advertised `TARGMAX` (`JOIN:250`, `PART:250` — the channel limit — and
   `NAMES:1`, as on Libera); the first target past the bound is refused with
@@ -763,8 +766,26 @@ strip = "symbols"
   however it is framed (`TOPIC :#c` used to clear the topic). Every echo of
   client text, PONG included, is fitted to the 512-byte wire limit.
 - Registration pipeline: `CAP LS 302` → (SASL) → NICK/USER → welcome burst
-  (001–005 with ISUPPORT, LUSERS, MOTD). SASL-required mode configurable
-  globally and per-IP-range.
+  (001–005 with ISUPPORT, LUSERS, MOTD).
+- SASL-required mode, globally (`limits.require_sasl = true`) or for clients
+  connecting from listed address ranges (`limits.require_sasl_from`, CIDRs; an
+  IPv4-mapped IPv6 peer is matched as IPv4). A client it covers that has not
+  logged in to an account when registration would complete — after NICK, USER
+  and CAP END, and after any SASL verdict in flight — is refused as Libera and
+  Solanum refuse a SASL-only range: `465 :You need to identify via SASL to use
+  this server`, then `ERROR :Closing Link: <host> (SASL access only)`, and the
+  connection closes (a server ban is checked, and reported, first). Logged in
+  means SASL, or a `draft/account-registration` REGISTER before connect, which
+  logs the new account in and which `registration.before_connect` enables
+  separately (bounded by `limits.registration_burst`). The bouncer's in-process
+  `local` sessions (§10.2) are exempt: their owner authenticated to the
+  bouncer. There is no WebIRC gateway to exempt: `/ws/irc` clients are judged
+  by the address `limits.trusted_proxies` resolves for them. Both settings are
+  console-owned limits (§18), and configuration validation — `check-config`,
+  start, and a console save — refuses a range that is not a CIDR, either
+  setting without `[database]` (no client could log in), and ranges listed
+  while `require_sasl` already covers everyone. The refusal is 465, which
+  e6irc-client reads as a policy refusal that never parks (§10.3).
 
 ### 7.3 Queue-based core: state model at 100k+ connections
 

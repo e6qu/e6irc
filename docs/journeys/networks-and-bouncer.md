@@ -133,11 +133,15 @@ joins every configured channel, and says `QUIT` when it is done. It never gates
 - A taken nickname is never replaced with an invented one. The row says the
   nickname is in use, quotes the network, and offers the two repairs: choose
   another nickname in settings, or wait for the old session to time out.
-- Any other registration refusal — a ghost holding the nickname, a connection
-  throttle, a ban — retries after 30s, 1m, 2m, and 4m, shows the upstream's own
-  sanitized reason and the next attempt time for the whole wait, and parks on
-  the fifth refusal in a row. A dial that dies before registration does not
-  reset that count.
+- Any other registration refusal retries after 30s, 1m, 2m, and 4m and shows
+  the upstream's own sanitized reason and the next attempt time for the whole
+  wait. What happens next follows the three retry policies of DESIGN §10.3. A
+  refusal that may be a configuration fault — a ghost holding the nickname, a
+  nickname or user name the network will not take — parks on the fifth of one
+  kind in a row. A capacity or policy answer — a connection throttle, a ban,
+  "SASL access only", services that are down — never parks: it is retried every
+  4m for as long as it lasts. A dial that dies before registration does not
+  reset the count.
 - A synchronous driver-construction failure happens before insertion. Once
   storage succeeds, registry insertion owns the running/retrying driver.
 - A transient owner-network directory read leaves the table semantics intact,
