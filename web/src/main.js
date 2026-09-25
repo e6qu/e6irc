@@ -980,8 +980,9 @@ function addLine(bufName, kind, bufKind, from, text, { tags = null, wire = null,
   // message: the line is counted where it is read. Replayed history is the
   // backlog, not news, and no replay is a reason to raise a desktop
   // notification about something that was said while the page was away.
-  const counts = kind !== "wire" && !(replaying && replayIsHistory);
-  if (!replaying) maybeNotify(b, line);
+  // Nor is a line you sent yourself, wherever it lands.
+  const counts = kind !== "wire" && !(replaying && replayIsHistory) && !(sender != null && isMe(sender));
+  if (!replaying && !(sender != null && isMe(sender))) maybeNotify(b, line);
   b.lines.push(line);
   const lineLimit = b.historyLoaded ? MAX_LOADED_LINES : MAX_LINES;
   if (b.lines.length > lineLimit) b.lines.shift();
