@@ -65,11 +65,11 @@ const WHITELIST: &[&str] = &[
     "EXTBAN",
 ];
 
-/// Floor on the tokens our own burst carries (29 today). A ratchet: dropping
+/// Floor on the tokens our own burst carries (31 today). A ratchet: dropping
 /// a token is a decision to make here, not a silent narrowing of the check.
-const MIN_OURS: usize = 29;
-/// Floor on the shared, non-whitelisted tokens actually compared (16 today).
-const MIN_CHECKED: usize = 16;
+const MIN_OURS: usize = 31;
+/// Floor on the shared, non-whitelisted tokens actually compared (18 today).
+const MIN_CHECKED: usize = 18;
 /// Tokens clients key on that both sides advertise; each must be compared.
 const MUST_COMPARE: &[&str] = &[
     "CASEMAPPING",
@@ -82,6 +82,9 @@ const MUST_COMPARE: &[&str] = &[
     "MAXLIST",
     "ACCOUNTEXTBAN",
     "MODES",
+    // LIST's conditions (`ELIST=CMNTU`) and its paced reply (`SAFELIST`).
+    "ELIST",
+    "SAFELIST",
 ];
 
 fn isupport_tokens(lines: impl Iterator<Item = String>) -> HashMap<String, String> {

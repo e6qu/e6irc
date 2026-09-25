@@ -887,6 +887,16 @@ answers in the reader's scope, as the bouncer's does: for a reader without
 `TAGMSG`s in the window is not listed (ring times per scope, a second
 `dm_conversations` time, migration 0085).
 
+Maintainer decision implemented: `LIST` takes Libera's conditions and
+advertises them (`ELIST=CMNTU`, `SAFELIST`), as Solanum's `m_list` parses
+them — member counts, creation and topic times in minutes, name masks and
+their negations, comma-separated, all of which must hold; each shard applies
+them to the channels it owns. The reply, which could overrun the client's
+SendQ and disconnect it on a network with more channels than that holds, is
+now paced to half of it (DESIGN §7.2, §7.7). irctest's `testListMask`,
+`testListNotMask` and `testListUsers` run and pass; the creation- and
+topic-time cases still need a controller that can move the clock.
+
 A review of whether the docs, tests, CI and guards tell the truth found, and
 this change fixes:
 

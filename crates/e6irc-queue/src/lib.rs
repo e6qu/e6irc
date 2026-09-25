@@ -286,6 +286,11 @@ impl<T> Sender<T> {
         self.shared.lock().buf.len()
     }
 
+    /// The most events the queue buffers ([`Config::capacity`]).
+    pub fn capacity(&self) -> usize {
+        self.shared.config.capacity
+    }
+
     pub fn monitor(&self) -> QueueMonitor {
         let state = self.shared.lock();
         self.shared.publish_unconditionally(&state);

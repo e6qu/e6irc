@@ -33,6 +33,12 @@ impl ChanKey {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// A key from a name the test has already folded.
+    #[cfg(test)]
+    pub(crate) fn for_test(folded: &str) -> Self {
+        ChanKey(folded.to_string())
+    }
 }
 
 /// Casefolded nick key; same rationale as [`ChanKey`].
@@ -2664,7 +2670,7 @@ pub struct ChannelListRequest {
     id: ChannelListRequestId,
     session: SessionOwner,
     actor: ChannelActor,
-    targets: Option<Vec<ChanKey>>,
+    filter: crate::core::list::ListFilter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2675,13 +2681,13 @@ impl ChannelListRequest {
         id: ChannelListRequestId,
         session: SessionOwner,
         actor: ChannelActor,
-        targets: Option<Vec<ChanKey>>,
+        filter: crate::core::list::ListFilter,
     ) -> Self {
         Self {
             id,
             session,
             actor,
-            targets,
+            filter,
         }
     }
 
@@ -2697,8 +2703,8 @@ impl ChannelListRequest {
         &self.actor
     }
 
-    pub(crate) fn targets(&self) -> Option<&[ChanKey]> {
-        self.targets.as_deref()
+    pub(crate) fn filter(&self) -> &crate::core::list::ListFilter {
+        &self.filter
     }
 }
 
@@ -2716,14 +2722,6 @@ pub struct ChannelListResult {
     pub(crate) id: ChannelListRequestId,
     pub(crate) session: SessionOwner,
     pub(crate) rows: Vec<ChannelListRow>,
-}
-
-struct PendingChannelList {
-    session: SessionOwner,
-    remaining: usize,
-    label: Option<String>,
-    prefix: Vec<Bytes>,
-    rows: Vec<ChannelListRow>,
 }
 
 /// A parsed channel MODE mutation, with its mode token separate from arguments.
@@ -4267,7 +4265,8 @@ pub(crate) struct ServerState {
     pub pending_channel_controls: HashMap<u64, PendingChannelControl>,
     /// Monotonic request ID source for `pending_channel_controls`.
     pub channel_control_id: u64,
-    pending_channel_lists: HashMap<ChannelListRequestId, PendingChannelList>,
+    /// Each connection's LIST still answering, gathering or sending.
+    pub(crate) channel_lists: HashMap<ConnId, crate::core::list::ListProgress>,
     channel_list_id: u64,
 }
 
@@ -4545,11 +4544,13 @@ impl ServerState {
         ));
     }
 
+    /// Ask every channel shard for `conn`'s LIST rows; the connection has no
+    /// LIST in progress.
     pub fn start_channel_list(
         &mut self,
         conn: ConnId,
         label: Option<String>,
-        targets: Option<Vec<String>>,
+        filter: crate::core::list::ListFilter,
     ) -> ChannelListRequest {
         let id = ChannelListRequestId(self.channel_list_id);
         self.channel_list_id = self
@@ -4557,34 +4558,18 @@ impl ServerState {
             .checked_add(1)
             .expect("channel LIST request identifiers exhausted");
         let session = SessionOwner::new(conn, self.shard);
-        let targets = targets.map(|targets| {
-            targets
-                .into_iter()
-                .map(|target| self.chan_key(&target))
-                .collect()
-        });
-        let request = ChannelListRequest::new(id, session, self.channel_actor(conn), targets);
-        let previous = self.pending_channel_lists.insert(
-            id,
-            PendingChannelList {
-                session,
-                remaining: self.channels.shard_count(),
-                prefix: if label.is_some() {
-                    std::mem::take(
-                        &mut self
-                            .capture
-                            .as_mut()
-                            .expect("labeled LIST capture exists")
-                            .lines,
-                    )
-                } else {
-                    Vec::new()
-                },
+        let request = ChannelListRequest::new(id, session, self.channel_actor(conn), filter);
+        let previous = self.channel_lists.insert(
+            conn,
+            crate::core::list::ListProgress::Gathering {
+                id,
                 label,
+                remaining: self.channels.shard_count(),
                 rows: Vec::new(),
+                aborted: false,
             },
         );
-        assert!(previous.is_none(), "channel LIST request identifier reused");
+        assert!(previous.is_none(), "a connection has one LIST in progress");
         request
     }
 
@@ -4604,23 +4589,52 @@ impl ServerState {
             }));
     }
 
+    /// Add one shard's rows to the LIST they answer: the whole LIST once the
+    /// last shard's are in. `None` while others are outstanding, or when the
+    /// connection closed in the meantime.
     pub fn take_channel_list(
         &mut self,
         result: ChannelListResult,
-    ) -> Option<(Option<String>, Vec<Bytes>, Vec<ChannelListRow>)> {
-        let pending = self.pending_channel_lists.get_mut(&result.id)?;
-        assert!(
-            pending.remaining > 0,
-            "LIST received too many shard results"
-        );
-        pending.remaining -= 1;
-        pending.rows.extend(result.rows);
-        (pending.remaining == 0).then(|| {
-            let pending = self
-                .pending_channel_lists
-                .remove(&result.id)
-                .expect("completed channel LIST request exists");
-            (pending.label, pending.prefix, pending.rows)
+    ) -> Option<crate::core::list::GatheredList> {
+        use crate::core::list::{GatheredList, ListProgress};
+        let conn = result.session.conn();
+        let Some(ListProgress::Gathering {
+            id,
+            remaining,
+            rows,
+            ..
+        }) = self.channel_lists.get_mut(&conn)
+        else {
+            // Rows reach only a connection still gathering them: it has at
+            // most one LIST, which stops gathering once the last shard's rows
+            // are in. A closed connection's LIST is simply gone.
+            assert!(
+                !self.channel_lists.contains_key(&conn),
+                "LIST rows reached a connection that is not gathering them"
+            );
+            return None;
+        };
+        assert_eq!(*id, result.id, "LIST rows reached another LIST");
+        *remaining = remaining
+            .checked_sub(1)
+            .expect("LIST received too many shard results");
+        rows.extend(result.rows);
+        if *remaining > 0 {
+            return None;
+        }
+        let Some(ListProgress::Gathering {
+            label,
+            rows,
+            aborted,
+            ..
+        }) = self.channel_lists.remove(&conn)
+        else {
+            unreachable!("the LIST was gathering a moment ago");
+        };
+        Some(GatheredList {
+            label,
+            rows,
+            aborted,
         })
     }
 
@@ -5218,7 +5232,7 @@ impl ServerState {
             admin_connection_list_id: 0,
             pending_channel_controls: HashMap::new(),
             channel_control_id: 0,
-            pending_channel_lists: HashMap::new(),
+            channel_lists: HashMap::new(),
             channel_list_id: 0,
         }
     }
@@ -6501,6 +6515,18 @@ impl ServerState {
     }
 
     pub fn numeric(&mut self, conn: ConnId, code: u16, middle: &[&str], trailing: Option<&str>) {
+        let line = self.numeric_line(conn, code, middle, trailing);
+        self.send(conn, &line);
+    }
+
+    /// The line [`Self::numeric`] sends, without sending it.
+    pub(crate) fn numeric_line(
+        &self,
+        conn: ConnId,
+        code: u16,
+        middle: &[&str],
+        trailing: Option<&str>,
+    ) -> String {
         let target = self.reply_target(conn);
         let mut line = format!(
             ":{} {} {}",
@@ -6559,7 +6585,35 @@ impl ServerState {
                 e6irc_proto::message::MAX_LINE_LEN.saturating_sub(line.len() + 2 /* CRLF */);
             line.push_str(e6irc_proto::message::truncate_on_char_boundary(t, budget));
         }
-        self.send(conn, &line);
+        line
+    }
+
+    /// `:<server> NOTICE <target> :<text>`, from the server itself, without
+    /// sending it.
+    pub(crate) fn server_notice_line(&self, conn: ConnId, text: &str) -> String {
+        format!(
+            ":{} NOTICE {} :{text}",
+            self.config.server_name,
+            self.reply_target(conn)
+        )
+    }
+
+    /// Send a line straight to `conn`'s queue: past a labeled command's
+    /// capture, and past output held behind a deferred reply. For a reply
+    /// that is itself earlier than whatever the hold is waiting on — the rows
+    /// of a LIST that is still being paced out.
+    pub(crate) fn send_unheld(&mut self, conn: ConnId, bytes: Bytes) {
+        let previous = self.emitting_deferred.replace(conn);
+        self.send_bytes_uncaptured(conn, bytes);
+        self.emitting_deferred = previous;
+    }
+
+    /// How many more lines `conn`'s send queue takes before it is half full,
+    /// the most a paced reply may occupy (`None` when the session is gone).
+    pub(crate) fn paced_room(&self, conn: ConnId) -> Option<usize> {
+        self.sessions
+            .get(&conn)
+            .map(|session| session.output.paced_room())
     }
 
     /// `ERR_NEEDMOREPARAMS (<cmd>) :Not enough parameters`.
@@ -6854,8 +6908,7 @@ impl ServerState {
         let Some(session) = self.sessions.get(&conn) else {
             return;
         };
-        self.pending_channel_lists
-            .retain(|_, pending| pending.session.conn() != conn);
+        self.channel_lists.remove(&conn);
         let was_registered = session.is_registered();
         // Output withheld behind an in-flight deferred DB reply (a CHATHISTORY
         // ring miss, say) would be dropped with the session — including the

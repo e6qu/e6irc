@@ -118,6 +118,12 @@ history and bouncer playback are ordered.
 drain its SendQ past the configured cap is disconnected ("SendQ exceeded")
 so one slow client cannot stall the server.
 
+**ELIST / SAFELIST** — the `005` tokens describing `LIST`. `ELIST` (extended
+LIST) names the conditions it takes, one letter each: `C` creation time, `M`
+channel-name mask, `N` negated mask, `T` topic time, `U` user count.
+`SAFELIST` says the reply is paced to the client's SendQ, so listing every
+channel cannot get the client disconnected.
+
 ---
 
 ## Services (NickServ, ChanServ, oper)

@@ -11,6 +11,7 @@
 mod banmask;
 mod handler;
 mod hot_history;
+mod list;
 mod state;
 mod timer;
 
@@ -370,6 +371,9 @@ impl Input {
             Input::ChannelMultilineResult { session, .. } => session.shard(),
             Input::ChannelTagmsg { tagmsg } => tagmsg.owner().shard(),
             Input::ChannelTagmsgResult { session, .. } => session.shard(),
+            Input::PaceChannelLists => {
+                panic!("a worker paces its own LIST replies, through its own queue")
+            }
             Input::Tick { .. }
             | Input::Shutdown
             | Input::ReadMarkersExpired { .. }
@@ -787,6 +791,10 @@ pub enum Input {
     Tick {
         now: e6irc_proto::time::MonoMillis,
     },
+    /// A worker's own reminder, every [`LIST_PACE_INTERVAL`] while it has a
+    /// LIST reply being paced out and nothing else to do: the reply's client
+    /// may have read enough for more of its rows.
+    PaceChannelLists,
     /// Read markers storage maintenance deleted as past the history
     /// retention, broadcast to every shard so its mirror drops them too. The
     /// mirror counts toward the per-account marker cap: a marker the database
@@ -2453,6 +2461,11 @@ pub(crate) enum CoreWorkerExit {
 /// it has stopped, and [`CoreWorkerExit::Backlogged`] says so loudly.
 pub(crate) const CROSS_SHARD_BACKLOG_LIMIT: usize = 65_536;
 
+/// How long a worker with a LIST reply being paced out waits, idle, before
+/// giving it another turn: at the default send queue, half of it — 512 rows —
+/// per turn.
+pub(crate) const LIST_PACE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// One core and the only queue allowed to drive its state transitions.
 pub(crate) struct CoreWorker {
     core: Core,
@@ -2499,15 +2512,34 @@ impl CoreWorker {
                     None => std::future::pending().await,
                 }
             };
+            // A LIST reply being paced out needs a turn once its client has
+            // read some of it, even if nothing else happens meanwhile.
+            let pacing = self
+                .core
+                .state
+                .channel_lists
+                .values()
+                .any(list::ListProgress::is_sending);
+            let pace = tokio::time::sleep(LIST_PACE_INTERVAL);
+            let mut paced = false;
             let popped = tokio::select! {
                 envelope = self.receiver.pop() => Some(envelope),
                 () = room => None,
                 () = &mut changed, if self.stopping => None,
+                () = pace, if pacing => {
+                    paced = true;
+                    None
+                }
             };
             match popped {
                 Some(Some(envelope)) => self.accept(envelope),
                 Some(None) => return CoreWorkerExit::IngressClosed,
                 None => {}
+            }
+            if paced {
+                // Through the queue like any event; a full queue already
+                // holds events enough to pace on.
+                drop(shards[self.core.shard.0].try_push(Input::PaceChannelLists));
             }
         }
     }
@@ -3080,6 +3112,8 @@ impl Core {
                 handler::channel_tagmsg_result(&mut self.state, session.conn(), result, label);
             }
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
+            // Its whole work is the pacing every event ends with, below.
+            Input::PaceChannelLists => {}
             Input::Tick { now } => {
                 handler::reap_idle(&mut self.state, now);
                 handler::services::enforce_nick_protection(&mut self.state, now);
@@ -3257,6 +3291,9 @@ impl Core {
                 );
             }
         }
+        // Any event is a chance for a paced LIST reply to use the room its
+        // client's send queue has made since.
+        handler::pace_channel_lists(&mut self.state);
         // Sweep connections whose SendQ overflowed while handling the
         // event: the slow client dies (may cascade if its QUIT broadcast
         // overflows someone else's queue — hence the loop). Dropping the
@@ -3339,6 +3376,16 @@ impl SessionOutput {
             // zombie.
             Err(PushError::Closed(_)) => Ok(Written::Queued),
         }
+    }
+
+    /// How many more lines the queue takes before it is half full: the most
+    /// a paced reply (a LIST) may occupy, leaving the other half for whatever
+    /// else the connection is sent meanwhile. Solanum's SAFELIST bound.
+    pub(crate) fn paced_room(&self) -> usize {
+        self.tx
+            .capacity()
+            .div_ceil(2)
+            .saturating_sub(self.tx.depth())
     }
 
     /// Queue the connection's closing line; nothing is written after it.
@@ -5659,6 +5706,138 @@ mod ingress_tests {
                     ChannelCommandOperation::ChanServStatus { .. }
                 )
         ));
+    }
+
+    /// Read `rx` up to and including the line that ends with `end`.
+    async fn output_until(rx: &mut Receiver<super::Output>, end: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        loop {
+            let line =
+                String::from_utf8(next_output(rx).await.payload.0.to_vec()).expect("utf8 output");
+            let done = line.trim_end().ends_with(end);
+            lines.push(line.trim_end().to_string());
+            if done {
+                return lines;
+            }
+        }
+    }
+
+    /// LIST's conditions reach the channels of every shard, and a reply larger
+    /// than half the lister's send queue is paced out by the worker as the
+    /// client reads it rather than overflowing the queue.
+    #[tokio::test]
+    async fn list_conditions_and_pacing_span_the_shards() {
+        let TwoWorkerHarness {
+            mut first,
+            mut second,
+            first_tx,
+            first_rx,
+            second_tx,
+            second_rx,
+            ingress,
+        } = two_worker_harness();
+        // Thirty-two lines: a LIST of more than fifteen rows needs several
+        // turns.
+        let output_config = Config {
+            name: "list-output",
+            capacity: 32,
+            policy: Policy::Fifo,
+        };
+        let (alice_tx, mut alice_rx) = queue(output_config);
+        let (bob_tx, mut bob_rx) = queue(output_config);
+        first.state.open(
+            ConnId(2),
+            alice_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        second.state.open(
+            ConnId(1),
+            bob_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        for (core, conn, nick, rx) in [
+            (&mut first, ConnId(2), "alice", &mut alice_rx),
+            (&mut second, ConnId(1), "bob", &mut bob_rx),
+        ] {
+            for line in [format!("NICK {nick}"), format!("USER {nick} 0 * :{nick}")] {
+                core.handle(Input::Line {
+                    conn,
+                    line: line.into_bytes(),
+                });
+                while rx.try_pop().is_some() {}
+            }
+        }
+        // Twenty channels on each shard, more than the queue holds, and a
+        // secret one.
+        let on_shard = |shard: usize, count: usize| -> Vec<String> {
+            (0..)
+                .map(|index| format!("#room{index}"))
+                .filter(|name| first.state.channel_owner(name).shard() == CoreShardId(shard))
+                .take(count)
+                .collect()
+        };
+        let mut rooms = on_shard(0, 20);
+        rooms.extend(on_shard(1, 20));
+        rooms.sort();
+        let secret = (0..)
+            .map(|index| format!("#secret{index}"))
+            .find(|name| first.state.channel_owner(name).shard() == CoreShardId(1))
+            .expect("a channel on shard one");
+        let first_worker = tokio::spawn(CoreWorker::new(first, first_rx, ingress.clone()).run());
+        let second_worker = tokio::spawn(CoreWorker::new(second, second_rx, ingress.clone()).run());
+        let send = |tx: &Sender<Input>, conn: ConnId, line: &str| {
+            tx.try_push(Input::Line {
+                conn,
+                line: line.as_bytes().to_vec(),
+            })
+            .expect("line queued");
+        };
+        for room in rooms.iter().chain([&secret]) {
+            send(&second_tx, ConnId(1), &format!("JOIN {room}"));
+            output_until(&mut bob_rx, ":End of /NAMES list").await;
+        }
+        send(&second_tx, ConnId(1), &format!("MODE {secret} +s"));
+        output_until(&mut bob_rx, "+s").await;
+        // A second member for the first room.
+        send(&first_tx, ConnId(2), &format!("JOIN {}", rooms[0]));
+        output_until(&mut alice_rx, ":End of /NAMES list").await;
+
+        let listed = |lines: &[String]| -> Vec<String> {
+            assert!(lines[0].contains(" 321 alice "), "{lines:#?}");
+            lines
+                .iter()
+                .filter(|line| line.split(' ').nth(1) == Some("322"))
+                .map(|line| line.split(' ').nth(3).expect("channel").to_string())
+                .collect()
+        };
+        send(&first_tx, ConnId(2), "LIST");
+        let everything = output_until(&mut alice_rx, ":End of /LIST").await;
+        assert_eq!(listed(&everything), rooms, "{everything:#?}");
+        send(&first_tx, ConnId(2), "LIST >1");
+        let crowded = output_until(&mut alice_rx, ":End of /LIST").await;
+        assert_eq!(listed(&crowded), [rooms[0].clone()]);
+        let last = &rooms[39];
+        send(&first_tx, ConnId(2), &format!("LIST #room*,!{last},<2"));
+        let narrowed = output_until(&mut alice_rx, ":End of /LIST").await;
+        assert_eq!(listed(&narrowed), rooms[1..39]);
+        send(&first_tx, ConnId(2), "LIST #secret*");
+        let hidden = output_until(&mut alice_rx, ":End of /LIST").await;
+        assert!(listed(&hidden).is_empty(), "{hidden:#?}");
+        // Its member lists it from the other shard.
+        send(&second_tx, ConnId(1), "LIST #secret*");
+        let shown = output_until(&mut bob_rx, ":End of /LIST").await;
+        assert!(
+            shown
+                .iter()
+                .any(|line| line.contains(&format!(" 322 bob {secret} 1 ")))
+        );
+
+        first_tx.try_push(Input::Shutdown).expect("stop first");
+        second_tx.try_push(Input::Shutdown).expect("stop second");
+        first_worker.await.expect("first worker");
+        second_worker.await.expect("second worker");
     }
 
     #[tokio::test]
