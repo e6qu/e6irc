@@ -726,6 +726,31 @@ account deletion passing founded channels to their successors in storage and
 in every shard's mirror. Operators read the server bans, private reasons
 included, with STATS k/d/x.
 
+A review of that surface fixed, each with a test that failed before:
+
+- **GROUP claimed names REGISTER refuses.** Any identified user could group a
+  configured administrator's name and so block that administrator's account
+  from ever being created. Every claim path now asks one predicate
+  (`ReservedAccountNames::claimable`), and storage refuses a services nick to
+  every creation path, OpenID Connect included; the administrator set is
+  computed once and shared.
+- **Founder-only ChanServ changes trusted the core's founder check.** A
+  pipelined `SET FOUNDER` let the former founder still name the successor,
+  change access, set KEEPTOPIC/MLOCK or `DROP` the channel. Storage now
+  re-checks the founder with the row locked for all of them.
+- **The successor was invisible.** FLAGS, ACCESS LIST and both consoles show
+  it; the core mirrors it, following the one transfer policy constant.
+- **STATS k/d/x split an X-line mask with spaces and blanked an IPv6 mask**
+  to `*`; masks, and a session's host, are spelled as Solanum spells them.
+- **The nick mirror could drift and a late verdict revived a deleted
+  account's nicks**; storage's idempotent answers now repair it and a deleted
+  account gains nothing back.
+- **Nick protection renamed a session whose IDENTIFY was still being
+  verified**; it waits for the verdict.
+- **ChanServ refused grouped nicks where it takes an account**, ACCESS ADD on
+  an existing entry claimed it was added, and the OP/DEOP/VOICE/DEVOICE MODE
+  line echoed the nick as typed.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

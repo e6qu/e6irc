@@ -641,8 +641,11 @@ pub(super) fn cmd_stats(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 /// One STATS line per server ban of `kind`, in Solanum's shapes: a K-line is
 /// `216 K <host> * <user> :<reason>`, a D-line `225 D <address> :<reason>`, an
 /// X-line `247 X 0 <mask> :<reason>` (every ban here is permanent, so the
-/// letter is the uppercase one and the X-line hold is 0).
+/// letter is the uppercase one and the X-line hold is 0). Each mask part is
+/// spelled by [`crate::sanitize::mask_middle`], so an X-line mask with spaces
+/// or an IPv6 address stays one readable parameter.
 fn stats_server_bans(state: &mut ServerState, conn: ConnId, kind: crate::core::state::BanKind) {
+    use crate::sanitize::mask_middle;
     let bans: Vec<(String, String)> = state
         .server_bans
         .iter()
@@ -653,13 +656,28 @@ fn stats_server_bans(state: &mut ServerState, conn: ConnId, kind: crate::core::s
         match kind {
             crate::core::state::BanKind::Kline => {
                 let (user, host) = mask.split_once('@').unwrap_or(("*", mask.as_str()));
-                state.numeric(conn, RPL_STATSKLINE, &["K", host, "*", user], Some(&reason));
+                state.numeric(
+                    conn,
+                    RPL_STATSKLINE,
+                    &["K", &mask_middle(host), "*", &mask_middle(user)],
+                    Some(&reason),
+                );
             }
             crate::core::state::BanKind::Dline => {
-                state.numeric(conn, RPL_STATSDLINE, &["D", &mask], Some(&reason));
+                state.numeric(
+                    conn,
+                    RPL_STATSDLINE,
+                    &["D", &mask_middle(&mask)],
+                    Some(&reason),
+                );
             }
             crate::core::state::BanKind::Xline => {
-                state.numeric(conn, RPL_STATSXLINE, &["X", "0", &mask], Some(&reason));
+                state.numeric(
+                    conn,
+                    RPL_STATSXLINE,
+                    &["X", "0", &mask_middle(&mask)],
+                    Some(&reason),
+                );
             }
         }
     }

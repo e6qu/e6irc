@@ -386,45 +386,121 @@ impl AccountKey {
     }
 }
 
-/// Process-wide authoritative registered-channel ownership.
+/// Process-wide authoritative registered-channel ownership: each registered
+/// channel's founder and successor (ChanServ SET SUCCESSOR).
 #[derive(Clone, Default)]
 pub(crate) struct FounderDirectory {
-    by_channel: Arc<Mutex<HashMap<ChanKey, AccountKey>>>,
+    by_channel: Arc<Mutex<HashMap<ChanKey, ChannelOwnership>>>,
+}
+
+/// Who owns a registered channel, and who inherits it.
+#[derive(Clone)]
+struct ChannelOwnership {
+    founder: AccountKey,
+    successor: Option<AccountKey>,
 }
 
 impl FounderDirectory {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ChanKey, ChannelOwnership>> {
+        self.by_channel.lock().expect("founder directory poisoned")
+    }
+
+    /// Seed founders (without successors; see [`Self::replace_successors`]).
     pub(crate) fn replace(&self, rows: impl IntoIterator<Item = (ChanKey, AccountKey)>) {
-        *self.by_channel.lock().expect("founder directory poisoned") = rows.into_iter().collect();
+        *self.lock() = rows
+            .into_iter()
+            .map(|(channel, founder)| {
+                (
+                    channel,
+                    ChannelOwnership {
+                        founder,
+                        successor: None,
+                    },
+                )
+            })
+            .collect();
+    }
+
+    /// Seed the successors of already-seeded channels.
+    pub(crate) fn replace_successors(&self, rows: impl IntoIterator<Item = (ChanKey, AccountKey)>) {
+        let mut channels = self.lock();
+        for ownership in channels.values_mut() {
+            ownership.successor = None;
+        }
+        for (channel, successor) in rows {
+            if let Some(ownership) = channels.get_mut(&channel) {
+                ownership.successor = Some(successor);
+            }
+        }
     }
 
     pub(crate) fn founder(&self, key: &ChanKey) -> Option<AccountKey> {
-        self.by_channel
-            .lock()
-            .expect("founder directory poisoned")
+        self.lock()
             .get(key)
-            .cloned()
+            .map(|ownership| ownership.founder.clone())
     }
 
-    pub(crate) fn set(&self, key: ChanKey, founder: AccountKey) {
-        self.by_channel
-            .lock()
-            .expect("founder directory poisoned")
-            .insert(key, founder);
+    pub(crate) fn successor(&self, key: &ChanKey) -> Option<AccountKey> {
+        self.lock()
+            .get(key)
+            .and_then(|ownership| ownership.successor.clone())
+    }
+
+    /// A newly registered channel: its founder, and no successor yet.
+    pub(crate) fn register(&self, key: ChanKey, founder: AccountKey) {
+        self.lock().insert(
+            key,
+            ChannelOwnership {
+                founder,
+                successor: None,
+            },
+        );
+    }
+
+    /// A registered channel passed to `founder` (a transfer, or the
+    /// succession an account deletion performs), with storage's two rules
+    /// for its successor: one promoted to founder is cleared, and any other is
+    /// kept exactly when [`crate::db::FOUNDER_TRANSFER_KEEPS_SUCCESSOR`] says.
+    /// Passing a channel to the founder it already has changes nothing, so
+    /// every shard may apply the same succession broadcast.
+    pub(crate) fn transfer(&self, key: ChanKey, founder: AccountKey) {
+        let mut channels = self.lock();
+        let current = channels.get(&key);
+        if current.is_some_and(|ownership| ownership.founder == founder) {
+            return;
+        }
+        let successor = current
+            .and_then(|ownership| ownership.successor.clone())
+            .filter(|successor| {
+                *successor != founder && crate::db::FOUNDER_TRANSFER_KEEPS_SUCCESSOR
+            });
+        channels.insert(key, ChannelOwnership { founder, successor });
+    }
+
+    pub(crate) fn set_successor(&self, key: &ChanKey, successor: Option<AccountKey>) {
+        if let Some(ownership) = self.lock().get_mut(key) {
+            ownership.successor = successor;
+        }
+    }
+
+    /// `account` was deleted: it succeeds no channel any more (its references
+    /// were set to NULL with it).
+    pub(crate) fn forget_successor(&self, account: &AccountKey) {
+        for ownership in self.lock().values_mut() {
+            if ownership.successor.as_ref() == Some(account) {
+                ownership.successor = None;
+            }
+        }
     }
 
     pub(crate) fn remove(&self, key: &ChanKey) {
-        self.by_channel
-            .lock()
-            .expect("founder directory poisoned")
-            .remove(key);
+        self.lock().remove(key);
     }
 
     pub(crate) fn count(&self, account: &AccountKey) -> usize {
-        self.by_channel
-            .lock()
-            .expect("founder directory poisoned")
+        self.lock()
             .values()
-            .filter(|founder| *founder == account)
+            .filter(|ownership| ownership.founder == *account)
             .count()
     }
 }
@@ -665,8 +741,13 @@ impl NickRegistrationDirectory {
         self.lock().grouped.insert(nick, account);
     }
 
-    pub(crate) fn ungroup(&self, nick: &NickKey) {
-        self.lock().grouped.remove(nick);
+    /// `nick` is no longer grouped to `account`; a grouping to another
+    /// account is left alone.
+    pub(crate) fn ungroup_from(&self, nick: &NickKey, account: &AccountKey) {
+        let mut registrations = self.lock();
+        if registrations.grouped.get(nick) == Some(account) {
+            registrations.grouped.remove(nick);
+        }
     }
 
     pub(crate) fn set_enforce(&self, account: AccountKey, enforce: bool) {
@@ -3928,10 +4009,12 @@ pub(crate) struct ServerState {
     /// verification already in flight cannot re-authenticate after the
     /// suspension event has run.
     pub suspended_accounts: HashSet<AccountKey>,
-    /// Accounts permanently deleted while this process runs. A MARKREAD write
-    /// already in flight when one was deleted can answer after its mirror was
-    /// emptied; the confirmation is dropped rather than stored for an account
-    /// that no longer exists. One entry per deletion: the names are retired.
+    /// Accounts permanently deleted while this process runs. A write already
+    /// in flight when one was deleted (MARKREAD, NickServ GROUP or SET
+    /// ENFORCE) can answer after its mirror was emptied; the confirmation adds
+    /// nothing back for an account that no longer exists (see
+    /// [`Self::account_deleted`]). One entry per deletion: the names are
+    /// retired.
     deleted_accounts: HashSet<AccountKey>,
     /// Requests to the DB worker (answered via `Input::DbReply`).
     pub db_tx: Sender<super::DbRequest>,
@@ -5135,17 +5218,17 @@ impl ServerState {
         sa.channels.intersection(&sb.channels).next().is_some()
     }
 
+    /// Whether any session, on any shard, is logged in to `account`.
+    pub(crate) fn account_online(&self, account: &AccountKey) -> bool {
+        self.users.logged_in_as(account.as_str()).is_some()
+    }
+
     /// All connections currently identified to `account`, compared under the
     /// server casemapping. This is the one account comparison that must fold
     /// rather than use raw `==`: everywhere else accounts are folded before use
     /// (`is_founder`, `access_modes`, `identity_nick`), and a raw compare here
     /// would silently fail to sync a sibling connection (e.g. MARKREAD) if any
     /// session ever held a non-canonical account label.
-    /// Whether any session, on any shard, is logged in to `account`.
-    pub(crate) fn account_online(&self, account: &AccountKey) -> bool {
-        self.users.logged_in_as(account.as_str()).is_some()
-    }
-
     pub fn account_connections(&self, account: &str) -> Vec<ConnId> {
         self.account_sessions
             .get(&self.account_key(account))
@@ -5217,7 +5300,7 @@ impl ServerState {
         key: (AccountKey, ChanKey),
         marker_ms: e6irc_proto::time::Millis,
     ) -> Option<e6irc_proto::time::Millis> {
-        if self.deleted_accounts.contains(&key.0) {
+        if self.account_deleted(&key.0) {
             return Some(marker_ms);
         }
         let held = self.read_marker_slot_held(&key);
@@ -5298,11 +5381,28 @@ impl ServerState {
         );
     }
 
-    /// Record a channel's founder (called when registration succeeds).
-    pub fn set_founder(&mut self, channel: &str, founder_account: &str) {
+    /// Load persisted channel successors as `(name_folded, successor_folded)`
+    /// rows, after [`Self::preload_founders`].
+    pub fn preload_successors(&mut self, rows: Vec<(String, String)>) {
+        self.registered_founders.replace_successors(
+            rows.into_iter()
+                .map(|(name_folded, successor)| (ChanKey(name_folded), AccountKey(successor))),
+        );
+    }
+
+    /// Record a newly registered channel's founder.
+    pub fn register_founder(&mut self, channel: &str, founder_account: &str) {
         let key = self.chan_key(channel);
         let founder = self.account_key(founder_account);
-        self.registered_founders.set(key, founder);
+        self.registered_founders.register(key, founder);
+    }
+
+    /// Record that a registered channel passed to `founder_account` (see
+    /// [`FounderDirectory::transfer`]).
+    pub fn transfer_founder(&mut self, channel: &str, founder_account: &str) {
+        let key = self.chan_key(channel);
+        let founder = self.account_key(founder_account);
+        self.registered_founders.transfer(key, founder);
     }
 
     /// Whether `account` is the registered founder of channel `key`.
@@ -5447,9 +5547,6 @@ impl ServerState {
         }
     }
 
-    /// Drop every confirmed mirror entry of a permanently deleted `account`:
-    /// its rows cascaded away with the account. A write still in flight keeps
-    /// its slot until its reply releases it, as in [`Self::expire_read_markers`].
     /// `account` was permanently deleted: drop everything this shard mirrors
     /// of the rows its deletion removed — its read markers, the history lines
     /// it sent and the conversations it took part in (the database purge took
@@ -5458,8 +5555,8 @@ impl ServerState {
     ///
     /// The channels it founded with a successor passed to that successor in
     /// the same transaction (`successions`, `(channel, new founder)`): the
-    /// founder mirror follows them. Its grouped nicks and nick protection went
-    /// with the account too.
+    /// founder mirror follows them. It succeeds no channel any more, and its
+    /// grouped nicks and nick protection went with the account too.
     pub(crate) fn forget_deleted_account(
         &mut self,
         account: &str,
@@ -5472,13 +5569,18 @@ impl ServerState {
         }
         self.channel_options.remove_account(&key);
         self.nick_registrations.forget_account(&key);
+        self.registered_founders.forget_successor(&key);
         for succession in successions {
             let channel = self.chan_key(&succession.channel);
             let founder = self.account_key(&succession.founder);
-            self.registered_founders.set(channel, founder);
+            self.registered_founders.transfer(channel, founder);
         }
     }
 
+    /// Drop every confirmed read-marker mirror entry of a permanently deleted
+    /// `account`: its rows cascaded away with the account. A write still in
+    /// flight keeps its slot until its reply releases it, as in
+    /// [`Self::expire_read_markers`].
     fn forget_account_read_markers(&mut self, account: &str) {
         let account = self.account_key(account);
         self.deleted_accounts.insert(account.clone());
@@ -5534,7 +5636,6 @@ impl ServerState {
             .map(|ban| (ban.kind, ban.reason.clone()))
     }
 
-    /// Key a nick for lookup/storage.
     /// Seed the grouped-nick and nick-protection mirror from PostgreSQL
     /// (see [`NickRegistrationDirectory`]).
     pub fn preload_nick_registrations(
@@ -5557,6 +5658,22 @@ impl ServerState {
             .protector(nick, self.account_key(nick.as_str()))
     }
 
+    /// Whether `account` was permanently deleted while this process runs: a
+    /// late verdict may not add anything of it back to a mirror.
+    pub(crate) fn account_deleted(&self, account: &AccountKey) -> bool {
+        self.deleted_accounts.contains(account)
+    }
+
+    /// The account `name` names for ChanServ: the account a grouped nick
+    /// belongs to, or the account of that name (Atheme resolves any of an
+    /// account's nicks to it). Storage resolves the same way when it applies
+    /// the change; this answers the core's own checks.
+    pub(crate) fn resolve_account_key(&self, name: &str) -> AccountKey {
+        self.nick_registrations
+            .grouped_owner(&self.nick_key(name))
+            .unwrap_or_else(|| self.account_key(name))
+    }
+
     /// Whether `nick` belongs to `account`: it is the account's name, or a
     /// nick grouped to it (GHOST and REGAIN act only on a nick one owns).
     pub(crate) fn nick_owned_by(&self, nick: &NickKey, account: &str) -> bool {
@@ -5565,6 +5682,7 @@ impl ServerState {
             || self.nick_registrations.grouped_owner(nick) == Some(account)
     }
 
+    /// Key a nick for lookup/storage.
     pub fn nick_key(&self, nick: &str) -> NickKey {
         NickKey(self.casemap.casefold(nick))
     }
@@ -5769,6 +5887,10 @@ impl ServerState {
         transport: crate::core::ConnectionTransport,
     ) {
         let opened_at = (self.config.mono_clock)();
+        // The shown host rides as a middle parameter (WHO, WHOIS): an IPv6
+        // address that starts with `:` is spelled with a leading `0`, as
+        // Solanum does, or every such reply would carry the funnel's `*`.
+        let host = crate::sanitize::mask_middle(&host).into_owned();
         let prev = self.sessions.insert(
             conn,
             Session {

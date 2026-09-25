@@ -1408,10 +1408,7 @@ pub(super) struct RequestPrincipal {
 /// a grant in the running configuration. This is the one place that answers
 /// the question, for the JSON administrator routes and the console pages alike.
 pub(super) fn is_effective_admin(state: &AppState, principal: &RequestPrincipal) -> bool {
-    principal.flags.is_admin()
-        || state
-            .configured_admin_accounts
-            .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&principal.account))
+    principal.flags.is_admin() || state.configured_admin_accounts.reserves(&principal.account)
 }
 
 /// Authenticate a request by its browser session and nothing else, yielding the

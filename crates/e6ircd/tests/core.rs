@@ -2325,6 +2325,62 @@ fn stats_lists_server_bans_to_operators_only() {
     }
 }
 
+/// A ban mask that cannot stand as a middle parameter as stored — an X-line
+/// mask with spaces, an IPv6 address starting with `:` — is listed in
+/// Solanum's spellings (`\s`, a leading `0`), not split into two parameters or
+/// flattened into the funnel's `*` placeholder.
+#[test]
+fn stats_lists_spaced_and_ipv6_masks_as_one_readable_parameter() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    s.line(op, "KLINE *@::1 :v6 spam");
+    commit_server_ban(&mut s);
+    s.line(op, "DLINE :::2");
+    commit_server_ban(&mut s);
+    s.line(op, "XLINE *Evil Corp* :spam");
+    commit_server_ban(&mut s);
+    s.drain(op);
+
+    s.line(op, "STATS k");
+    assert_eq!(
+        s.drain(op)[0],
+        ":irc.test.example 216 god K 0::1 * * :v6 spam"
+    );
+    s.line(op, "STATS d");
+    let out = s.drain(op);
+    assert!(
+        out[0].starts_with(":irc.test.example 225 god D 0::2 :"),
+        "{out:#?}"
+    );
+    s.line(op, "STATS x");
+    assert_eq!(
+        s.drain(op)[0],
+        ":irc.test.example 247 god X 0 *Evil\\sCorp* :spam"
+    );
+}
+
+/// A session from an IPv6 address that starts with `:` shows its host with a
+/// leading `0`, as Solanum does, so WHO and WHOIS carry the address rather
+/// than the funnel's `*`.
+#[test]
+fn an_ipv6_host_starting_with_a_colon_is_shown_with_a_leading_zero() {
+    let mut s = TestServer::new();
+    let local = s.connect_from(1, "::1", e6ircd::core::ConnectionTransport::Tcp);
+    s.line(local, "NICK local");
+    s.line(local, "USER local 0 * :Local");
+    s.drain(local);
+    let asker = s.register(2, "asker");
+    s.line(asker, "WHOIS local");
+    let out = s.drain(asker);
+    assert!(
+        out.iter()
+            .any(|line| line.contains(" 311 asker local local 0::1 * :Local")),
+        "{out:#?}"
+    );
+}
+
 #[test]
 fn nick_to_exact_same_nick_is_a_silent_noop() {
     let mut s = TestServer::new();
@@ -3194,7 +3250,7 @@ fn channel_access_reply_for_unregistered_channel_is_not_phantom_inserted() {
             display: "#ghost".into(),
             account: "bob".into(),
             flags: Some("o".into()),
-            applied: true,
+            previous: None,
             frontend: e6ircd::core::AccessFrontend::Flags,
             label: None,
         },
@@ -7592,7 +7648,6 @@ fn chanserv_set_keeptopic_off_stops_topic_retention() {
         display: "#reg".into(),
         keeptopic: false,
         topic: None,
-        applied: true,
         label: None,
     });
     let out = s.drain(boss);
@@ -7650,7 +7705,6 @@ fn chanserv_set_keeptopic_off_stops_topic_retention() {
         display: "#reg".into(),
         keeptopic: true,
         topic: Some(("while off".into(), "boss!u@127.0.0.1".into(), 1)),
-        applied: true,
         label: None,
     });
     s.drain(boss);
@@ -7684,7 +7738,6 @@ fn chanserv_set_keeptopic_on_recaptures_the_live_topic() {
         display: "#reg".into(),
         keeptopic: false,
         topic: None,
-        applied: true,
         label: None,
     });
     s.drain(boss);
@@ -7765,7 +7818,6 @@ fn chanserv_set_mlock_enforces_modes() {
         channel: "#reg".into(),
         display: "#reg".into(),
         mlock: Some("+m-t".into()),
-        applied: true,
         label: None,
     });
     let out = s.drain(boss);
@@ -8654,21 +8706,75 @@ fn identifying_within_the_delay_cancels_the_rename() {
         "an identified owner was renamed: {out:#?}"
     );
 
-    // Identifying to some other account does not count.
-    let third = s.register(3, "third");
-    identify(&mut s, third, "mallory");
-    s.line(third, "PRIVMSG NickServ :GHOST alice");
-    s.drain(third);
+    // Identifying to some other account while the clock runs does not count.
     s.line(second, "NICK other");
     s.drain(second);
+    let third = s.register(3, "third");
     s.line(third, "NICK alice");
     assert_eq!(notices(&s.drain(third)).len(), 2, "no warning");
+    identify(&mut s, third, "mallory");
     tick_after(&mut s, 30_000);
     assert!(
         s.drain(third)
             .iter()
             .any(|line| line.contains(" NICK Guest3")),
         "identified to another account, yet kept the protected nick"
+    );
+}
+
+/// The rename waits for an IDENTIFY that is still being verified at the
+/// deadline: the verdict decides, not when the tick happens to fall.
+#[test]
+fn an_identify_in_flight_at_the_deadline_defers_the_rename() {
+    let mut s = TestServer::new();
+    let _owner = protected_alice(&mut s);
+    let late = s.register(2, "late");
+    s.line(late, "NICK alice");
+    s.drain(late);
+    s.line(late, "PRIVMSG NickServ :IDENTIFY alice pw");
+    s.db_requests();
+    tick_after(&mut s, 30_000);
+    assert!(
+        !s.drain(late).iter().any(|line| line.contains(" NICK ")),
+        "renamed while its IDENTIFY was being verified"
+    );
+    s.core.handle(Input::DbReply {
+        conn: late,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "alice".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+        },
+    });
+    s.drain(late);
+    tick_after(&mut s, 45_000);
+    assert!(
+        !s.drain(late).iter().any(|line| line.contains(" NICK ")),
+        "renamed after identifying in time"
+    );
+
+    // A verification that fails leaves the rename to the next tick.
+    let wrong = s.register(3, "wrong");
+    s.line(late, "NICK elsewhere");
+    s.drain(late);
+    s.line(wrong, "NICK alice");
+    s.drain(wrong);
+    s.line(wrong, "PRIVMSG NickServ :IDENTIFY alice guess");
+    s.db_requests();
+    tick_after(&mut s, 30_000);
+    assert!(!s.drain(wrong).iter().any(|line| line.contains(" NICK ")));
+    s.core.handle(Input::DbReply {
+        conn: wrong,
+        reply: e6ircd::core::DbReply::PasswordRejected {
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+        },
+    });
+    s.drain(wrong);
+    tick_after(&mut s, 45_000);
+    assert!(
+        s.drain(wrong)
+            .iter()
+            .any(|line| line.contains(" NICK Guest")),
+        "a failed IDENTIFY kept the protected nick"
     );
 }
 
@@ -8809,6 +8915,95 @@ fn a_grouped_nick_is_mirrored_from_the_boot_load() {
             .any(|line| line.contains(" NICK Guest")),
         "not renamed"
     );
+}
+
+/// Storage's idempotent answers repair the mirror: GROUP's "already yours"
+/// records the grouping, UNGROUP's "not yours" drops a stale one. A verdict
+/// that arrives after its account was deleted adds nothing back.
+#[test]
+fn nickserv_verdicts_repair_the_mirror_and_cannot_resurrect_a_deleted_account() {
+    let mut s = TestServer::new();
+    let owner = s.register(1, "owner");
+    identify(&mut s, owner, "alice");
+    s.line(owner, "NICK alice_away");
+    s.drain(owner);
+    s.line(owner, "PRIVMSG NickServ :GROUP");
+    nickserv_verdict(
+        &mut s,
+        owner,
+        e6ircd::core::DbReply::NickGroup {
+            account: "alice".into(),
+            nick: "alice_away".into(),
+            outcome: Some(e6ircd::db::NickGroupOutcome::AlreadyYours),
+            label: None,
+        },
+    );
+    s.drain(owner);
+    // The mirror now knows the nick is alice's: GHOST reaches it.
+    s.line(owner, "NICK owner");
+    s.drain(owner);
+    let holder = s.register(2, "alice_away");
+    s.line(owner, "PRIVMSG NickServ :GHOST alice_away");
+    assert_eq!(
+        notices(&s.drain(owner)),
+        ["\x02alice_away\x02 has been ghosted."]
+    );
+    s.drain(holder);
+
+    // Storage says it is not alice's after all: the mirror follows.
+    s.line(owner, "PRIVMSG NickServ :UNGROUP alice_away");
+    nickserv_verdict(
+        &mut s,
+        owner,
+        e6ircd::core::DbReply::NickUngroup {
+            account: "alice".into(),
+            nick: "alice_away".into(),
+            removed: Some(false),
+            label: None,
+        },
+    );
+    s.drain(owner);
+    s.line(owner, "PRIVMSG NickServ :GHOST alice_away");
+    assert_eq!(
+        notices(&s.drain(owner)),
+        ["You do not own \x02alice_away\x02."]
+    );
+
+    // Late verdicts for an account deleted in the meantime.
+    s.line(owner, "PRIVMSG NickServ :SET ENFORCE ON");
+    s.db_requests();
+    s.line(owner, "NICK alice_back");
+    s.line(owner, "PRIVMSG NickServ :GROUP");
+    s.db_requests();
+    s.core.handle(Input::AccountDeleted {
+        account: "alice".into(),
+        successions: Vec::new(),
+    });
+    for reply in [
+        e6ircd::core::DbReply::NickEnforce {
+            account: "alice".into(),
+            enforce: true,
+            outcome: Some(e6ircd::db::NickEnforceChange::Changed),
+            label: None,
+        },
+        e6ircd::core::DbReply::NickGroup {
+            account: "alice".into(),
+            nick: "alice_back".into(),
+            outcome: Some(e6ircd::db::NickGroupOutcome::Grouped),
+            label: None,
+        },
+    ] {
+        s.core.handle(Input::DbReply { conn: owner, reply });
+    }
+    let taker = s.register(3, "taker");
+    for nick in ["alice", "alice_back"] {
+        s.line(taker, &format!("NICK {nick}"));
+        let out = s.drain(taker);
+        assert!(
+            notices(&out).is_empty(),
+            "a deleted account's nick {nick} is protected: {out:#?}"
+        );
+    }
 }
 
 #[test]
@@ -9089,7 +9284,7 @@ fn chanserv_access_lists_roles_and_edits_the_flags_store() {
         display: "#chan".into(),
         account: "dave".into(),
         flags: Some("o".into()),
-        applied: true,
+        previous: None,
         frontend: e6ircd::core::AccessFrontend::AccessAdd { role: "AOP" },
         label: None,
     });
@@ -9107,15 +9302,14 @@ fn chanserv_access_lists_roles_and_edits_the_flags_store() {
         s.db_requests().as_slice(),
         [e6ircd::core::DbRequest::SetChannelAccess { flags: Some(flags), .. }] if flags == "v"
     ));
-    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessSet {
-        channel: "#chan".into(),
-        display: "#chan".into(),
-        account: "erin".into(),
-        flags: Some("v".into()),
-        applied: false,
-        frontend: e6ircd::core::AccessFrontend::AccessAdd { role: "VOP" },
-        label: None,
-    });
+    s.channel_service_persisted(
+        e6ircd::core::ChannelServicePersistence::AccessAccountMissing {
+            display: "#chan".into(),
+            account: "erin".into(),
+            frontend: e6ircd::core::AccessFrontend::AccessAdd { role: "VOP" },
+            label: None,
+        },
+    );
     assert_eq!(notices(&s.drain(boss)), ["\x02erin\x02 is not registered."]);
 
     s.line(boss, "PRIVMSG ChanServ :ACCESS #chan DEL nobody");
@@ -9230,15 +9424,17 @@ fn chanserv_set_successor_is_persisted_and_answered_by_its_verdict() {
         matches!(
             queued.as_slice(),
             [e6ircd::core::DbRequest::SetChannelSuccessor { successor: Some(successor), actor, .. }]
-                if successor == "carol" && actor == "boss"
+                if successor == "Carol" && actor == "boss"
         ),
         "{queued:?}"
     );
     assert!(s.drain(boss).is_empty(), "answered before PostgreSQL");
     s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::SuccessorSet {
         display: "#room".into(),
-        successor: Some("carol".into()),
-        outcome: Some(e6ircd::db::SuccessorChange::Applied),
+        successor: Some("Carol".into()),
+        outcome: Some(e6ircd::db::SuccessorChange::Applied {
+            successor: Some("carol".into()),
+        }),
         label: None,
     });
     assert_eq!(
@@ -9273,6 +9469,8 @@ fn a_deleted_founders_channel_follows_its_successor_in_the_mirror() {
     let mut s = TestServer::new();
     s.core
         .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+    s.core
+        .preload_successors(vec![("#room".to_string(), "carol".to_string())]);
     s.core.handle(Input::AccountDeleted {
         account: "boss".into(),
         successions: vec![e6ircd::db::ChannelSuccession {
@@ -9280,19 +9478,315 @@ fn a_deleted_founders_channel_follows_its_successor_in_the_mirror() {
             founder: "carol".into(),
         }],
     });
+    // A registered channel opens no ops by arrival: the former founder's
+    // join is not opped, the successor's is.
+    let boss = s.register(2, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #room");
+    let out = s.drain(boss);
+    assert!(
+        out.iter()
+            .any(|line| line.ends_with(" 353 boss = #room :boss")),
+        "the former founder was opped on join: {out:#?}"
+    );
     let carol = s.register(1, "carol");
+    identify(&mut s, carol, "carol");
+    s.line(carol, "JOIN #room");
+    let out = s.drain(boss);
+    assert!(
+        out.iter().any(|line| line.ends_with("MODE #room +o carol")),
+        "the successor was not opped on join: {out:#?}"
+    );
+    s.drain(carol);
+    // The successor became founder, so the channel has no successor now.
+    s.line(carol, "PRIVMSG ChanServ :FLAGS #room");
+    assert_eq!(
+        notices(&s.drain(carol)),
+        ["Access list for \x02#room\x02:", "End of access list."]
+    );
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #room");
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["You are not the founder of \x02#room\x02."]
+    );
+}
+
+/// The successor is part of who holds a channel, so the founder sees it in
+/// FLAGS and ACCESS listings; it follows a founder transfer by the one
+/// transfer policy, and goes when its own account is deleted.
+#[test]
+fn the_successor_is_listed_and_followed_through_transfers_and_deletion() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "PRIVMSG ChanServ :SET #room SUCCESSOR carol");
+    s.db_requests();
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::SuccessorSet {
+        display: "#room".into(),
+        successor: Some("carol".into()),
+        outcome: Some(e6ircd::db::SuccessorChange::Applied {
+            successor: Some("carol".into()),
+        }),
+        label: None,
+    });
+    s.drain(boss);
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #room");
+    assert_eq!(
+        notices(&s.drain(boss)),
+        [
+            "Access list for \x02#room\x02:",
+            "carol (successor)",
+            "End of access list."
+        ]
+    );
+    s.line(boss, "PRIVMSG ChanServ :ACCESS #room LIST");
+    assert_eq!(
+        notices(&s.drain(boss))[2..4],
+        [
+            "1     boss                   Founder",
+            "2     carol                  Successor"
+        ]
+    );
+
+    // A transfer to someone else keeps the successor exactly when storage's
+    // transfer policy does, and the new founder sees it.
+    s.line(boss, "PRIVMSG ChanServ :SET #room FOUNDER dave");
+    s.db_requests();
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::FounderChanged {
+        channel: "#room".into(),
+        account: "dave".into(),
+        display: "#room".into(),
+        label: None,
+    });
+    s.drain(boss);
+    let dave = s.register(2, "dave");
+    identify(&mut s, dave, "dave");
+    s.line(dave, "PRIVMSG ChanServ :FLAGS #room");
+    let listed = notices(&s.drain(dave)).contains(&"carol (successor)");
+    assert_eq!(listed, e6ircd::db::FOUNDER_TRANSFER_KEEPS_SUCCESSOR);
+
+    // Deleting the successor's account clears it.
+    if listed {
+        s.core.handle(Input::AccountDeleted {
+            account: "carol".into(),
+            successions: Vec::new(),
+        });
+        s.line(dave, "PRIVMSG ChanServ :FLAGS #room");
+        assert_eq!(
+            notices(&s.drain(dave)),
+            ["Access list for \x02#room\x02:", "End of access list."]
+        );
+    }
+}
+
+/// A transfer to the successor itself always leaves the channel without one.
+#[test]
+fn a_transfer_to_the_successor_clears_it() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+    s.core
+        .preload_successors(vec![("#room".to_string(), "carol".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "PRIVMSG ChanServ :SET #room FOUNDER carol");
+    s.db_requests();
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::FounderChanged {
+        channel: "#room".into(),
+        account: "carol".into(),
+        display: "#room".into(),
+        label: None,
+    });
+    let carol = s.register(2, "carol");
     identify(&mut s, carol, "carol");
     s.line(carol, "PRIVMSG ChanServ :FLAGS #room");
     assert_eq!(
         notices(&s.drain(carol)),
         ["Access list for \x02#room\x02:", "End of access list."]
     );
-    let boss = s.register(2, "boss");
+}
+
+/// A founder-only change that storage refused because its requester stopped
+/// founding the channel (a transfer committed first) says so.
+#[test]
+fn a_change_refused_in_storage_for_a_former_founder_says_so() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
     identify(&mut s, boss, "boss");
+    s.line(boss, "PRIVMSG ChanServ :SET #room SUCCESSOR carol");
+    s.db_requests();
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::SuccessorSet {
+        display: "#room".into(),
+        successor: Some("carol".into()),
+        outcome: Some(e6ircd::db::SuccessorChange::Refused(
+            e6ircd::db::ChannelRefusal::NotFounder,
+        )),
+        label: None,
+    });
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["You are no longer the founder of \x02#room\x02."]
+    );
     s.line(boss, "PRIVMSG ChanServ :FLAGS #room");
     assert_eq!(
         notices(&s.drain(boss)),
-        ["You are not the founder of \x02#room\x02."]
+        ["Access list for \x02#room\x02:", "End of access list."],
+        "a refused successor entered the mirror"
+    );
+}
+
+/// ACCESS ADD on an account that already has an entry changes it, and says
+/// so, rather than claiming it was added.
+#[test]
+fn chanserv_access_add_on_an_existing_entry_reports_the_change() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+    s.core
+        .preload_access(vec![("#chan".into(), "bob".into(), "o".into())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "PRIVMSG ChanServ :ACCESS #chan ADD bob");
+    s.db_requests();
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessSet {
+        channel: "#chan".into(),
+        display: "#chan".into(),
+        account: "bob".into(),
+        flags: Some("v".into()),
+        previous: Some("o".into()),
+        frontend: e6ircd::core::AccessFrontend::AccessAdd { role: "VOP" },
+        label: None,
+    });
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["\x02bob\x02's role in \x02#chan\x02 was changed from \x02AOP\x02 to \x02VOP\x02."]
+    );
+    s.line(boss, "PRIVMSG ChanServ :ACCESS #chan ADD bob VOP");
+    s.db_requests();
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessSet {
+        channel: "#chan".into(),
+        display: "#chan".into(),
+        account: "bob".into(),
+        flags: Some("v".into()),
+        previous: Some("v".into()),
+        frontend: e6ircd::core::AccessFrontend::AccessAdd { role: "VOP" },
+        label: None,
+    });
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["\x02bob\x02 already has the \x02VOP\x02 role in \x02#chan\x02."]
+    );
+}
+
+/// ChanServ takes any of an account's nicks where it expects an account, as
+/// Atheme does: the core's own checks resolve a grouped nick through the
+/// mirror (storage resolves it again when it applies the change).
+#[test]
+fn chanserv_resolves_a_grouped_nick_to_its_account() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+    s.core
+        .preload_access(vec![("#chan".into(), "alice".into(), "o".into())]);
+    s.core
+        .preload_nick_registrations(e6ircd::db::NickRegistrations {
+            grouped: vec![
+                ("alice_away".into(), "alice".into()),
+                ("boss_alt".into(), "boss".into()),
+            ],
+            enforced: Vec::new(),
+        });
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    // FLAGS edits alice's entry, not an empty one for the nick.
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #chan alice_away +v");
+    let queued = s.db_requests();
+    assert!(
+        matches!(
+            queued.as_slice(),
+            [e6ircd::core::DbRequest::SetChannelAccess { flags: Some(flags), .. }]
+                if flags == "ov"
+        ),
+        "{queued:?}"
+    );
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessUnavailable {
+        channel: "#chan".into(),
+        display: "#chan".into(),
+        label: None,
+    });
+    s.drain(boss);
+    // ACCESS DEL finds alice's entry by her grouped nick.
+    s.line(boss, "PRIVMSG ChanServ :ACCESS #chan DEL alice_away");
+    let queued = s.db_requests();
+    assert!(
+        matches!(
+            queued.as_slice(),
+            [e6ircd::core::DbRequest::SetChannelAccess { flags: None, frontend, .. }]
+                if *frontend == e6ircd::core::AccessFrontend::AccessDel { role: "AOP" }
+        ),
+        "{queued:?}"
+    );
+    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessSet {
+        channel: "#chan".into(),
+        display: "#chan".into(),
+        account: "alice".into(),
+        flags: None,
+        previous: Some("o".into()),
+        frontend: e6ircd::core::AccessFrontend::AccessDel { role: "AOP" },
+        label: None,
+    });
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["\x02alice\x02 was removed from the \x02AOP\x02 role in \x02#chan\x02."]
+    );
+    // The founder's own grouped nick is the founder.
+    s.line(boss, "PRIVMSG ChanServ :SET #chan SUCCESSOR boss_alt");
+    assert_eq!(
+        notices(&s.drain(boss)),
+        ["\x02boss_alt\x02 is the founder of \x02#chan\x02 and cannot also be its successor."]
+    );
+    assert!(s.db_requests().is_empty());
+}
+
+/// An AOP who is not the founder may DEOP, and the MODE line names the
+/// member by the nick the channel knows, however the command spelled it.
+#[test]
+fn an_aop_may_deop_and_the_mode_line_names_the_member_as_they_are() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+    s.core.preload_access(vec![
+        ("#chan".into(), "dave".into(), "o".into()),
+        ("#chan".into(), "carol".into(), "o".into()),
+    ]);
+    let dave = s.register(1, "dave");
+    identify(&mut s, dave, "dave");
+    s.line(dave, "JOIN #chan");
+    let carol = s.register(2, "carol");
+    identify(&mut s, carol, "carol");
+    s.line(carol, "JOIN #chan");
+    s.drain(dave);
+    s.drain(carol);
+    s.line(dave, "PRIVMSG ChanServ :DEOP #chan CAROL");
+    let seen = s.drain(carol);
+    assert!(
+        seen.iter()
+            .any(|line| line.ends_with("MODE #chan -o carol")),
+        "{seen:#?}"
+    );
+    assert_eq!(
+        notices(&s.drain(dave)),
+        ["Deopped \x02carol\x02 on \x02#chan\x02."]
+    );
+    s.line(dave, "PRIVMSG ChanServ :OP #chan Carol");
+    assert!(
+        s.drain(carol)
+            .iter()
+            .any(|line| line.ends_with("MODE #chan +o carol"))
     );
 }
 
@@ -9816,7 +10310,7 @@ fn chanserv_flags_auto_ops_on_join() {
         display: "#chan".to_string(),
         account: "alice".to_string(),
         flags: Some("o".to_string()),
-        applied: true,
+        previous: None,
         frontend: e6ircd::core::AccessFrontend::Flags,
         label: None,
     });
@@ -9875,15 +10369,14 @@ fn chanserv_flags_unregistered_account_leaves_no_phantom_access() {
     assert!(persisted, "SetChannelAccess not queued");
 
     // The DB reports the write did not apply (no such account).
-    s.channel_service_persisted(e6ircd::core::ChannelServicePersistence::AccessSet {
-        channel: "#chan".to_string(),
-        display: "#chan".to_string(),
-        account: "ghost".to_string(),
-        flags: Some("o".to_string()),
-        applied: false,
-        frontend: e6ircd::core::AccessFrontend::Flags,
-        label: None,
-    });
+    s.channel_service_persisted(
+        e6ircd::core::ChannelServicePersistence::AccessAccountMissing {
+            display: "#chan".to_string(),
+            account: "ghost".to_string(),
+            frontend: e6ircd::core::AccessFrontend::Flags,
+            label: None,
+        },
+    );
     assert!(
         s.drain(boss)
             .iter()
@@ -9946,7 +10439,7 @@ fn account_deletion_drops_its_hot_history_and_channel_access() {
         display: "#chan".to_string(),
         account: "alice".to_string(),
         flags: Some("o".to_string()),
-        applied: true,
+        previous: None,
         frontend: e6ircd::core::AccessFrontend::Flags,
         label: None,
     });
@@ -10033,7 +10526,7 @@ fn chanserv_flags_revocation_applies_after_requester_disconnect() {
         display: "#chan".to_string(),
         account: "alice".to_string(),
         flags: Some("o".to_string()),
-        applied: true,
+        previous: None,
         frontend: e6ircd::core::AccessFrontend::Flags,
         label: None,
     });
@@ -10053,7 +10546,7 @@ fn chanserv_flags_revocation_applies_after_requester_disconnect() {
         display: "#chan".to_string(),
         account: "alice".to_string(),
         flags: None,
-        applied: true,
+        previous: None,
         frontend: e6ircd::core::AccessFrontend::Flags,
         label: None,
     });
@@ -12672,7 +13165,7 @@ fn labeled_chanserv_flags_is_one_labeled_response_that_orders_later_output() {
         display: "#chan".to_string(),
         account: "alice".to_string(),
         flags: Some("o".to_string()),
-        applied: true,
+        previous: None,
         frontend: e6ircd::core::AccessFrontend::Flags,
         label: Some("f1".to_string()),
     });
@@ -14063,6 +14556,45 @@ fn configured_administrator_names_cannot_be_registered_over_irc() {
     let alice = s.register(2, "alice");
     s.line(alice, "PRIVMSG NickServ :REGISTER pw");
     assert_eq!(created_accounts(&mut s), ["alice"]);
+}
+
+/// GROUP claims a nick for an account just as REGISTER does, so it refuses a
+/// configured administrator's name the same way: grouping it would block the
+/// administrator's own account from ever being created, and let the grouper
+/// protect the name against them.
+#[test]
+fn a_configured_administrator_name_cannot_be_grouped() {
+    let mut s = TestServer::configured(
+        true,
+        || Millis::from_millis(1_000_000_000),
+        |config| {
+            config.reserved_account_names = e6ircd::identity::ReservedAccountNames::new(["Root"]);
+        },
+    );
+    let mallory = s.register(1, "mallory");
+    identify(&mut s, mallory, "mallory");
+    s.line(mallory, "NICK rOOt");
+    s.drain(mallory);
+    s.line(mallory, "PRIVMSG NickServ :GROUP");
+    assert_eq!(
+        notices(&s.drain(mallory)),
+        ["\x02rOOt\x02 is reserved for a server administrator and cannot be registered."]
+    );
+    let queued = s.db_requests();
+    assert!(
+        !queued
+            .iter()
+            .any(|request| matches!(request, e6ircd::core::DbRequest::GroupNick { .. })),
+        "a reserved name reached storage: {queued:?}"
+    );
+    // Any other nick groups as before.
+    s.line(mallory, "NICK mallory_");
+    s.drain(mallory);
+    s.line(mallory, "PRIVMSG NickServ :GROUP");
+    assert!(matches!(
+        s.db_requests().as_slice(),
+        [e6ircd::core::DbRequest::GroupNick { nick, .. }] if nick == "mallory_"
+    ));
 }
 
 /// An account name that has spent its password attempts is refused over SASL

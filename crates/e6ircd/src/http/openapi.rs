@@ -558,8 +558,8 @@ fn operations() -> serde_json::Value {
         serde_json::json!({
             "type": "object", "additionalProperties": false, "required": ["channels", "next_before_id"],
             "properties": { "channels": { "type": "array", "items": { "type": "object", "additionalProperties": false,
-                "required": ["id", "name", "founder", "created_at", "policy"],
-                "properties": { "id": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "founder": { "type": "string" }, "created_at": { "type": "string" }, "policy": { "type": "object", "additionalProperties": false, "required": ["keeptopic", "topic_retained", "mlock", "access_entries"], "properties": { "keeptopic": { "type": "boolean" }, "topic_retained": { "type": "boolean", "description": "Whether a retained topic is stored; the topic text itself is not returned here." }, "mlock": { "type": "string" }, "access_entries": { "type": "integer", "minimum": 0 } } } }
+                "required": ["id", "name", "founder", "successor", "created_at", "policy"],
+                "properties": { "id": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "founder": { "type": "string" }, "successor": { "type": ["string", "null"], "description": "The account the channel passes to if the founder's account is deleted (ChanServ SET SUCCESSOR)." }, "created_at": { "type": "string" }, "policy": { "type": "object", "additionalProperties": false, "required": ["keeptopic", "topic_retained", "mlock", "access_entries"], "properties": { "keeptopic": { "type": "boolean" }, "topic_retained": { "type": "boolean", "description": "Whether a retained topic is stored; the topic text itself is not returned here." }, "mlock": { "type": ["string", "null"] }, "access_entries": { "type": "integer", "minimum": 0 } } } }
             } }, "next_before_id": { "type": ["integer", "null"], "minimum": 1 } }
         }),
     );
@@ -585,9 +585,9 @@ fn operations() -> serde_json::Value {
     );
     let owned_channel_schema = serde_json::json!({
         "type": "object", "additionalProperties": false,
-        "required": ["name", "founder", "keeptopic", "topic", "topic_setter", "topic_set_at", "mlock", "access"],
+        "required": ["name", "founder", "successor", "keeptopic", "topic", "topic_setter", "topic_set_at", "mlock", "access"],
         "properties": {
-            "name": { "type": "string" }, "founder": { "type": "string" }, "keeptopic": { "type": "boolean" },
+            "name": { "type": "string" }, "founder": { "type": "string" }, "successor": { "type": ["string", "null"], "description": "The account the channel passes to if the founder's account is deleted (ChanServ SET SUCCESSOR)." }, "keeptopic": { "type": "boolean" },
             "topic": { "type": ["string", "null"] }, "topic_setter": { "type": ["string", "null"] }, "topic_set_at": { "type": ["integer", "null"], "minimum": 0 }, "mlock": { "type": ["string", "null"] },
             "access": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["account", "flags"], "properties": { "account": { "type": "string" }, "flags": { "type": "string", "enum": ["o", "v", "ov", "vo"] } } } }
         }

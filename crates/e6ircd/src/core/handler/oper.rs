@@ -996,11 +996,17 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .nick()
         .map(String::from)
         .expect("registered");
-    // A host must be a single non-empty token without user/prefix chars.
-    // A host rides in every future prefix built for this user, so an unbounded
-    // one makes every subsequent line unfittable at the source — bound it here
-    // (63 bytes, the DNS label/hostname norm) alongside the character rules.
-    if newhost.is_empty() || newhost.len() > 63 || newhost.contains([' ', '@', '!', '\0']) {
+    // A host must be a single non-empty token without user/prefix chars, and
+    // may not start with `:`: it rides as a middle parameter (CHGHOST, 396,
+    // WHO), where a leading `:` would open the trailing early. A host rides
+    // in every future prefix built for this user, so an unbounded one makes
+    // every subsequent line unfittable at the source — bound it here (63
+    // bytes, the DNS label/hostname norm) alongside the character rules.
+    if newhost.is_empty()
+        || newhost.len() > 63
+        || newhost.starts_with(':')
+        || newhost.contains([' ', '@', '!', '\0'])
+    {
         state.send(
             conn,
             &format!(":{server} NOTICE {oper_nick} :Invalid host: {newhost}"),

@@ -283,14 +283,16 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
-    if state.config.reserved_account_names.reserves(&nick) {
-        register_fail(
-            state,
-            conn,
-            "BAD_ACCOUNT_NAME",
-            &nick,
-            "That account name is reserved for a server administrator and cannot be registered",
-        );
+    if let Err(refusal) = state.config.reserved_account_names.claimable(&nick) {
+        let description = match refusal {
+            crate::identity::NameClaimRefusal::ServiceNick => {
+                "That account name is a services nick and cannot be registered"
+            }
+            crate::identity::NameClaimRefusal::ConfiguredAdministrator => {
+                "That account name is reserved for a server administrator and cannot be registered"
+            }
+        };
+        register_fail(state, conn, "BAD_ACCOUNT_NAME", &nick, description);
         return;
     }
     if state.config.registration_require_email && *email == "*" {

@@ -1224,6 +1224,9 @@ pub enum ChannelDropRequester {
 pub enum ChannelDropResult {
     Dropped,
     Missing,
+    /// The ChanServ requester no longer founds the channel (a transfer
+    /// committed after the core's check).
+    NotFounder,
     Unavailable,
 }
 
@@ -1358,13 +1361,24 @@ pub enum ChannelServicePersistence {
         display: String,
         label: Option<String>,
     },
+    /// An access entry now holds `flags` (`None`: it is gone).
     AccessSet {
         channel: String,
         display: String,
+        /// The account the requested name resolved to (a grouped nick
+        /// resolves to its account), as its display name.
         account: String,
         flags: Option<String>,
-        applied: bool,
+        /// What the entry held before (`None`: there was no entry).
+        previous: Option<String>,
         /// Which command asked, so the verdict speaks its language.
+        frontend: AccessFrontend,
+        label: Option<String>,
+    },
+    /// No account has the name an access change named.
+    AccessAccountMissing {
+        display: String,
+        account: String,
         frontend: AccessFrontend,
         label: Option<String>,
     },
@@ -1387,7 +1401,6 @@ pub enum ChannelServicePersistence {
         display: String,
         keeptopic: bool,
         topic: Option<(String, String, u64)>,
-        applied: bool,
         label: Option<String>,
     },
     KeeptopicUnavailable {
@@ -1403,7 +1416,6 @@ pub enum ChannelServicePersistence {
         channel: String,
         display: String,
         mlock: Option<String>,
-        applied: bool,
         label: Option<String>,
     },
     MlockUnavailable {
@@ -1422,8 +1434,17 @@ pub enum ChannelServicePersistence {
     /// store failed.
     SuccessorSet {
         display: String,
+        /// The successor as requested (`None`: clear it).
         successor: Option<String>,
         outcome: Option<crate::db::SuccessorChange>,
+        label: Option<String>,
+    },
+    /// A founder-only change (SET FOUNDER, access, KEEPTOPIC, MLOCK) found,
+    /// with the channel row locked, that the channel is gone or its requester
+    /// no longer founds it.
+    Refused {
+        display: String,
+        refusal: crate::db::ChannelRefusal,
         label: Option<String>,
     },
 }
@@ -2560,6 +2581,12 @@ impl Core {
         self.state.preload_founders(rows);
     }
 
+    /// Seed each registered channel's successor, after
+    /// [`Self::preload_founders`] (see [`ServerState::preload_successors`]).
+    pub fn preload_successors(&mut self, rows: Vec<(String, String)>) {
+        self.state.preload_successors(rows);
+    }
+
     /// Seed the retained-topic map from persisted rows before the worker
     /// loop starts (see [`ServerState::preload_topics`]).
     pub fn preload_topics(&mut self, rows: Vec<(String, String, String, u64)>) {
@@ -3692,7 +3719,7 @@ mod ingress_tests {
                 display: channel.into(),
                 account: "alice".into(),
                 flags: Some("o".into()),
-                applied: true,
+                previous: None,
                 frontend: super::AccessFrontend::Flags,
                 label: None,
             },
@@ -4740,10 +4767,6 @@ mod ingress_tests {
         );
     }
 
-    /// alice, not logged in, confides in bob, then identifies to her account
-    /// and leaves. A stranger takes the nick `alice` and asks for the
-    /// conversation with bob. Returns what CHATHISTORY shows the stranger and
-    /// the ring conversations TARGETS hands the database on their behalf.
     /// Identify `conn` to `account` through NickServ, answering the verify.
     fn identify_on(shards: &mut Shards, conn: u64, account: &str) {
         shards.line(conn, &format!("PRIVMSG NickServ :IDENTIFY {account} pw"));
@@ -4828,6 +4851,10 @@ mod ingress_tests {
         );
     }
 
+    /// alice, not logged in, confides in bob, then identifies to her account
+    /// and leaves. A stranger takes the nick `alice` and asks for the
+    /// conversation with bob. Returns what CHATHISTORY shows the stranger and
+    /// the ring conversations TARGETS hands the database on their behalf.
     fn conversation_after_login_and_nick_reuse(
         mut shards: Shards,
     ) -> (Vec<String>, Vec<(String, e6irc_proto::time::Millis)>) {

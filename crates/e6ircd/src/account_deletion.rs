@@ -17,9 +17,9 @@ pub(crate) struct AccountDeletion {
     pub(crate) registry: Arc<crate::bouncer::Registry>,
     pub(crate) secret_key: Option<Arc<crate::secret::SecretKeyring>>,
     pub(crate) internal_upstreams: crate::egress::InternalUpstreams,
-    /// Administrators configuration grants (casefolded): deletion may not
-    /// remove the last effective one.
-    pub(crate) configured_administrators: Vec<String>,
+    /// Administrators configuration grants: deletion may not remove the last
+    /// effective one.
+    pub(crate) configured_administrators: crate::identity::ReservedAccountNames,
 }
 
 /// Why a deletion did not happen.
@@ -63,11 +63,14 @@ impl AccountDeletion {
         allow_self: bool,
     ) -> Result<String, AccountDeletionError> {
         let pool = &self.pool;
-        let target =
-            crate::db::account_deletion_target(pool, account_id, &self.configured_administrators)
-                .await
-                .map_err(deletion_error)?
-                .ok_or(AccountDeletionError::NotFound)?;
+        let target = crate::db::account_deletion_target(
+            pool,
+            account_id,
+            &self.configured_administrators.folded_names(),
+        )
+        .await
+        .map_err(deletion_error)?
+        .ok_or(AccountDeletionError::NotFound)?;
         if !allow_self && target.folded == CaseMapping::Rfc1459.casefold(actor) {
             return Err(AccountDeletionError::OwnAccount);
         }
@@ -100,7 +103,7 @@ impl AccountDeletion {
             pool,
             account_id,
             actor,
-            &self.configured_administrators,
+            &self.configured_administrators.folded_names(),
         )
         .await
         {

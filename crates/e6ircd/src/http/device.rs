@@ -188,6 +188,7 @@ struct RegisteredChannelResponse {
     id: i64,
     name: String,
     founder: String,
+    successor: Option<String>,
     created_at: String,
     policy: RegisteredChannelPolicyResponse,
 }
@@ -613,7 +614,7 @@ pub(super) async fn admin_accounts(
                 .into_iter()
                 .map(|entry| {
                     let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&entry.name);
-                    let configured = state.configured_admin_accounts.contains(&folded);
+                    let configured = state.configured_admin_accounts.reserves(&folded);
                     AccountDirectoryResponseEntry {
                         id: entry.id,
                         name: entry.name,
@@ -822,11 +823,11 @@ pub(super) async fn admin_create_account_invitation(
             Some("The account must be a valid IRC nickname of at most 64 bytes."),
         );
     }
-    if state.account_name_reserved(&body.account) {
+    if let Some(detail) = state.unclaimable_account_name(&body.account) {
         return problem(
             StatusCode::CONFLICT,
             "Account name unavailable",
-            Some(super::RESERVED_ACCOUNT_NAME_DETAIL),
+            Some(detail),
         );
     }
     let contact_email = match super::parse_optional_contact_email(body.contact_email.as_deref()) {
@@ -1888,6 +1889,7 @@ pub(super) async fn admin_channels(
                     id: entry.id,
                     name: entry.name,
                     founder: entry.founder,
+                    successor: entry.successor,
                     created_at: entry.created_at,
                     policy: RegisteredChannelPolicyResponse {
                         keeptopic: entry.keeptopic,

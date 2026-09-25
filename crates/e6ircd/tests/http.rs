@@ -5474,11 +5474,12 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
         body.contains("with no successor; transfer them, name a successor, or unregister"),
         "{body}"
     );
-    assert!(
-        e6ircd::db::set_channel_founder(&pool, "#bob", "alice", "founder")
+    assert!(matches!(
+        e6ircd::db::set_channel_founder(&pool, "#bob", "alice", "Bob")
             .await
-            .expect("transfer")
-    );
+            .expect("transfer"),
+        e6ircd::db::FounderTransfer::Transferred { .. }
+    ));
     let (status, headers, body) = request(http, &delete_bob(&bob_csrf)).await;
     assert_eq!(status, 204, "{body}");
     assert!(headers.contains("Max-Age=0"), "{headers}");

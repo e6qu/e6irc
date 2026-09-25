@@ -993,9 +993,7 @@ pub(crate) fn channel_control_result(
                     format!("Updated {account}'s access on {}", key.as_str())
                 }
                 PersistedChannelMutation::TransferFounder { account } => {
-                    state
-                        .registered_founders
-                        .set(key.clone(), state.account_key(&account));
+                    state.transfer_founder(key.as_str(), &account);
                     format!("Transferred {} to {account}", key.as_str())
                 }
                 PersistedChannelMutation::Drop => {
@@ -1060,7 +1058,7 @@ pub(crate) fn owned_channel_registration_result(
     state.pending_channel_registrations.remove(&key);
     let response = match result {
         ChannelRegistrationResult::Registered => {
-            state.set_founder(&channel, &founder_account);
+            state.register_founder(&channel, &founder_account);
             replace_registered_topic(state, &key, topic);
             AdminReply::Ok(format!("Registered {channel} to {founder_account}"))
         }

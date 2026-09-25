@@ -36,6 +36,22 @@ pub(crate) fn username(raw: &str, max_len: usize) -> Option<String> {
     (valid && !kept.is_empty()).then(|| kept.to_string())
 }
 
+/// A host or ban mask spelled so it stands as one middle parameter, in
+/// Solanum's spellings: a leading `:` (an IPv6 address such as `::1`) gets a
+/// `0` in front — `0::1`, the same address — so it cannot open the trailing
+/// parameter early, and a space (an X-line mask may hold several) is written
+/// `\s`, which is how X-line masks spell a space anyway. The operator's
+/// listing (STATS K/D/X) and a session's shown host both go through it, so
+/// neither can be rendered as the numeric funnel's `*` placeholder or split
+/// into two parameters.
+pub(crate) fn mask_middle(mask: &str) -> std::borrow::Cow<'_, str> {
+    if !mask.starts_with(':') && !mask.contains(' ') {
+        return std::borrow::Cow::Borrowed(mask);
+    }
+    let zero = if mask.starts_with(':') { "0" } else { "" };
+    std::borrow::Cow::Owned(format!("{zero}{}", mask.replace(' ', "\\s")))
+}
+
 /// A provider-supplied name reduced to a nick-like account name: ASCII
 /// alphanumerics and the RFC1459 "special" nick characters survive, everything
 /// else (spaces, control, line/tag separators) is dropped and bounded to 32.

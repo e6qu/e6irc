@@ -841,6 +841,15 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         None
     };
 
+    // The configured administrators, once: the core refuses their names as
+    // accounts, the HTTP state grants their authority, and account deletion
+    // keeps the last of them.
+    let configured_administrators = crate::identity::ReservedAccountNames::new(
+        config
+            .http
+            .iter()
+            .flat_map(|http| http.admin_accounts.iter().map(String::as_str)),
+    );
     // The database worker carries out NickServ DROP through the same deletion
     // procedure as the console, so it starts once the network registry that
     // procedure stops an account's networks through exists. Keep the worker
@@ -854,12 +863,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 registry: registry.clone(),
                 secret_key: secret_key.clone(),
                 internal_upstreams: config.internal_upstreams,
-                configured_administrators: config
-                    .http
-                    .iter()
-                    .flat_map(|http| &http.admin_accounts)
-                    .map(|account| e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account))
-                    .collect(),
+                configured_administrators: configured_administrators.clone(),
             };
             Some(tokio::spawn(crate::db::run_worker_observed(
                 pool.clone(),
@@ -962,16 +966,9 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let (public_url, secure_cookies, configured_admin_accounts) = match &config.http {
-            Some(h) => (
-                h.public_url.clone(),
-                h.secure_cookies,
-                h.admin_accounts
-                    .iter()
-                    .map(|a| e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(a))
-                    .collect(),
-            ),
-            None => (None, false, std::collections::HashSet::new()),
+        let (public_url, secure_cookies) = match &config.http {
+            Some(h) => (h.public_url.clone(), h.secure_cookies),
+            None => (None, false),
         };
         let monitoring_token_digest =
             crate::http::monitoring_token_digest_from_env().map_err(io::Error::other)?;
@@ -999,7 +996,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             managed_config: managed_config.clone(),
             telemetry: telemetry.clone(),
             secret_key: secret_key.clone(),
-            configured_admin_accounts,
+            configured_admin_accounts: configured_administrators.clone(),
             csrf_key: {
                 use aws_lc_rs::rand::SecureRandom;
                 let mut k = [0u8; 32];
@@ -1105,12 +1102,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 .map_err(io::Error::other)?,
         ),
         registration_burst: config.limits.registration_burst,
-        reserved_account_names: crate::identity::ReservedAccountNames::new(
-            config
-                .http
-                .iter()
-                .flat_map(|http| http.admin_accounts.iter().map(String::as_str)),
-        ),
+        reserved_account_names: configured_administrators.clone(),
     };
     let shard_count = core_tx.shard_count();
     let mut cores = (0..shard_count.len())
@@ -1130,6 +1122,9 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     // within the run that registered them.
     if let Some(pool) = &pool {
         let founders = crate::db::list_registered_channels(pool)
+            .await
+            .map_err(io::Error::other)?;
+        let successors = crate::db::list_channel_successors(pool)
             .await
             .map_err(io::Error::other)?;
         let topics = crate::db::list_channel_topics(pool)
@@ -1160,22 +1155,20 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         let nick_registrations = crate::db::list_nick_registrations(pool)
             .await
             .map_err(io::Error::other)?;
-        let configured_administrators = config
-            .http
-            .as_ref()
-            .map_or(&[][..], |http| http.admin_accounts.as_slice());
-        for name in crate::db::unclaimed_account_names(pool, configured_administrators)
-            .await
-            .map_err(io::Error::other)?
+        for name in
+            crate::db::unclaimed_account_names(pool, &configured_administrators.folded_names())
+                .await
+                .map_err(io::Error::other)?
         {
             eprintln!(
                 "e6ircd: configured administrator {name:?} has no account yet; only OIDC sign-in \
-                 or the bootstrap/recovery flows can create it (NickServ REGISTER and \
-                 invitations refuse the name)"
+                 or the bootstrap/recovery flows can create it (NickServ REGISTER and GROUP, \
+                 IRCv3 REGISTER and invitations refuse the name)"
             );
         }
         for core in &mut cores {
             core.preload_founders(founders.clone());
+            core.preload_successors(successors.clone());
             core.preload_topics(topics.clone());
             core.preload_keeptopic_off(keeptopic_off.clone());
             core.preload_mlock(mlock.clone())

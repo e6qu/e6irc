@@ -1538,15 +1538,19 @@ async fn channel_access_is_capped_per_channel() {
         .expect("target account");
     let over = db::set_channel_access(&pool, "#c", "t256", Some("v".into()), "founder").await;
     assert!(
-        matches!(over, Err(db::DbError::TooManyAccessEntries)),
+        matches!(over, Ok(db::AccessChange::LimitReached)),
         "the 257th access entry must be refused: {over:?}"
     );
 
     // Re-flagging an EXISTING entry is still allowed — it replaces, not grows.
     let reflag = db::set_channel_access(&pool, "#c", "t0", Some("o".into()), "founder").await;
-    assert!(
-        matches!(reflag, Ok(true)),
-        "re-flagging an existing entry stays allowed at the cap: {reflag:?}"
+    assert_eq!(
+        reflag.expect("re-flag"),
+        db::AccessChange::Applied {
+            account: "t0".into(),
+            previous: Some("v".into()),
+        },
+        "re-flagging an existing entry stays allowed at the cap"
     );
 }
 
@@ -4055,10 +4059,11 @@ async fn channel_keeptopic_persist_and_load() {
 
     // Turn it off → it appears in the off-list and clears all retained-topic
     // columns in the same UPDATE.
-    assert!(
-        db::set_channel_keeptopic(&pool, "#c", false, None, "founder")
+    assert_eq!(
+        db::set_channel_keeptopic(&pool, "#c", false, None, "boss")
             .await
-            .expect("off")
+            .expect("off"),
+        Ok(())
     );
     assert_eq!(
         db::list_keeptopic_off(&pool).await.expect("list"),
@@ -4073,16 +4078,17 @@ async fn channel_keeptopic_persist_and_load() {
 
     // Back on → the exception clears and the supplied live topic is captured
     // atomically, without a second write that can fail independently.
-    assert!(
+    assert_eq!(
         db::set_channel_keeptopic(
             &pool,
             "#c",
             true,
             Some(("current".into(), "boss!b@h".into(), 2000)),
-            "founder"
+            "boss"
         )
         .await
-        .expect("on")
+        .expect("on"),
+        Ok(())
     );
     assert!(
         db::list_keeptopic_off(&pool)
@@ -4099,10 +4105,11 @@ async fn channel_keeptopic_persist_and_load() {
             2000
         )]
     );
-    assert!(
-        !db::set_channel_keeptopic(&pool, "#missing", true, None, "founder")
+    assert_eq!(
+        db::set_channel_keeptopic(&pool, "#missing", true, None, "boss")
             .await
-            .expect("missing option row")
+            .expect("missing option row"),
+        Err(db::ChannelRefusal::ChannelMissing)
     );
     assert_eq!(
         db::set_channel_topic(&pool, "#missing", None)
@@ -4140,24 +4147,33 @@ async fn channel_mlock_persist_and_load() {
     // The database boundary rejects a semantically valid but non-canonical
     // spelling; every shipped writer canonicalizes before it reaches storage.
     assert!(
-        db::set_channel_mlock(&pool, "#c", Some("+tn-i".into()), "founder")
+        db::set_channel_mlock(&pool, "#c", Some("+tn-i".into()), "boss")
             .await
             .is_err()
     );
     for noncanonical in ["+-i", "+i-i"] {
         assert!(
-            db::set_channel_mlock(&pool, "#c", Some(noncanonical.into()), "founder")
+            db::set_channel_mlock(&pool, "#c", Some(noncanonical.into()), "boss")
                 .await
                 .is_err(),
             "database accepted non-canonical MLOCK {noncanonical}"
         );
     }
 
-    // Canonical set → loads back with the same spec.
-    assert!(
-        db::set_channel_mlock(&pool, "#c", Some("+nt-i".into()), "founder")
+    // Only the founder may change it: the check runs with the row locked.
+    assert_eq!(
+        db::set_channel_mlock(&pool, "#c", Some("+nt-i".into()), "mallory")
             .await
-            .expect("set")
+            .expect("not founder"),
+        Err(db::ChannelRefusal::NotFounder)
+    );
+
+    // Canonical set → loads back with the same spec.
+    assert_eq!(
+        db::set_channel_mlock(&pool, "#c", Some("+nt-i".into()), "boss")
+            .await
+            .expect("set"),
+        Ok(())
     );
     assert_eq!(
         db::list_channel_mlock(&pool).await.expect("list"),
@@ -4165,10 +4181,11 @@ async fn channel_mlock_persist_and_load() {
     );
 
     // Clear → it no longer loads.
-    assert!(
-        db::set_channel_mlock(&pool, "#c", None, "founder")
+    assert_eq!(
+        db::set_channel_mlock(&pool, "#c", None, "boss")
             .await
-            .expect("clear")
+            .expect("clear"),
+        Ok(())
     );
     assert!(
         db::list_channel_mlock(&pool)
@@ -4176,10 +4193,11 @@ async fn channel_mlock_persist_and_load() {
             .expect("list")
             .is_empty()
     );
-    assert!(
-        !db::set_channel_mlock(&pool, "#missing", Some("+m".into()), "founder")
+    assert_eq!(
+        db::set_channel_mlock(&pool, "#missing", Some("+m".into()), "boss")
             .await
-            .expect("missing row")
+            .expect("missing row"),
+        Err(db::ChannelRefusal::ChannelMissing)
     );
 }
 
@@ -4719,10 +4737,17 @@ async fn channel_access_persist_and_load() {
     .await
     .expect("channel");
 
-    let applied = db::set_channel_access(&pool, "#c", "alice", Some("ov".into()), "founder")
+    let applied = db::set_channel_access(&pool, "#c", "alice", Some("ov".into()), "boss")
         .await
         .expect("set");
-    assert!(applied, "granting a registered account must apply");
+    assert_eq!(
+        applied,
+        db::AccessChange::Applied {
+            account: "alice".into(),
+            previous: None,
+        },
+        "granting a registered account must apply"
+    );
     assert_eq!(
         db::list_channel_access(&pool).await.expect("list"),
         vec![("#c".to_string(), "alice".to_string(), "ov".to_string())]
@@ -4730,20 +4755,39 @@ async fn channel_access_persist_and_load() {
 
     // Granting to an account that isn't registered writes no row and reports
     // that nothing applied — the caller must not create a hot entry for it.
-    let phantom = db::set_channel_access(&pool, "#c", "ghost", Some("o".into()), "founder")
+    let phantom = db::set_channel_access(&pool, "#c", "ghost", Some("o".into()), "boss")
         .await
         .expect("phantom grant");
-    assert!(!phantom, "granting an unregistered account must not apply");
+    assert_eq!(
+        phantom,
+        db::AccessChange::AccountMissing,
+        "granting an unregistered account must not apply"
+    );
     assert_eq!(
         db::list_channel_access(&pool).await.expect("list"),
         vec![("#c".to_string(), "alice".to_string(), "ov".to_string())],
         "phantom grant leaked a row"
     );
 
-    let cleared = db::set_channel_access(&pool, "#c", "alice", None, "founder")
+    // Only the founder changes the list, checked with the row locked.
+    assert_eq!(
+        db::set_channel_access(&pool, "#c", "alice", None, "alice")
+            .await
+            .expect("not founder"),
+        db::AccessChange::Refused(db::ChannelRefusal::NotFounder)
+    );
+
+    let cleared = db::set_channel_access(&pool, "#c", "alice", None, "boss")
         .await
         .expect("clear");
-    assert!(cleared, "clearing access always applies");
+    assert_eq!(
+        cleared,
+        db::AccessChange::Applied {
+            account: "alice".into(),
+            previous: Some("ov".into()),
+        },
+        "clearing reports what the entry held"
+    );
     assert!(
         db::list_channel_access(&pool)
             .await
@@ -4920,22 +4964,43 @@ async fn channel_founder_transfer() {
         vec![("#c".to_string(), "boss".to_string())]
     );
 
-    // Transfer to an existing account succeeds and moves ownership.
-    assert!(
-        db::set_channel_founder(&pool, "#c", "alice", "founder")
+    // Someone who does not found the channel cannot transfer it.
+    assert_eq!(
+        db::set_channel_founder(&pool, "#c", "alice", "alice")
             .await
-            .expect("transfer")
+            .expect("transfer"),
+        db::FounderTransfer::Refused(db::ChannelRefusal::NotFounder)
+    );
+
+    // Transfer to an existing account succeeds and moves ownership.
+    assert_eq!(
+        db::set_channel_founder(&pool, "#c", "alice", "boss")
+            .await
+            .expect("transfer"),
+        db::FounderTransfer::Transferred {
+            founder: "alice".into()
+        }
     );
     assert_eq!(
         db::list_registered_channels(&pool).await.expect("list"),
         vec![("#c".to_string(), "alice".to_string())]
     );
 
-    // Transfer to a nonexistent account fails and leaves ownership intact.
-    assert!(
-        !db::set_channel_founder(&pool, "#c", "nobody", "founder")
+    // The former founder cannot transfer it any more: the check is made with
+    // the row locked, whatever the core believed when it queued the request.
+    assert_eq!(
+        db::set_channel_founder(&pool, "#c", "boss", "boss")
             .await
-            .expect("transfer")
+            .expect("transfer"),
+        db::FounderTransfer::Refused(db::ChannelRefusal::NotFounder)
+    );
+
+    // Transfer to a nonexistent account fails and leaves ownership intact.
+    assert_eq!(
+        db::set_channel_founder(&pool, "#c", "nobody", "alice")
+            .await
+            .expect("transfer"),
+        db::FounderTransfer::AccountMissing
     );
     assert_eq!(
         db::list_registered_channels(&pool).await.expect("list"),
@@ -6341,9 +6406,12 @@ async fn history_read_authorization_is_scoped() {
             .unwrap()
     );
     // Granting access lets them read.
-    db::set_channel_access(&pool, "#chan", "bob", Some("v".into()), "founder")
-        .await
-        .expect("grant");
+    assert!(matches!(
+        db::set_channel_access(&pool, "#chan", "bob", Some("v".into()), "alice")
+            .await
+            .expect("grant"),
+        db::AccessChange::Applied { .. }
+    ));
     assert!(
         db::account_may_read_channel(&pool, "#chan", "bob")
             .await
@@ -7222,11 +7290,12 @@ async fn permanent_account_deletion_requires_succession_purges_and_retires() {
         db::delete_account_permanently(&pool, bob_id, "Alice", &[]).await,
         Err(db::DbError::AccountOwnsChannels(1))
     ));
-    assert!(
-        db::set_channel_founder(&pool, "#bob", "alice", "founder")
+    assert!(matches!(
+        db::set_channel_founder(&pool, "#bob", "alice", "Bob")
             .await
-            .expect("transfer")
-    );
+            .expect("transfer"),
+        db::FounderTransfer::Transferred { .. }
+    ));
     let session = db::create_web_session(&pool, "Bob", None)
         .await
         .expect("session");
@@ -9387,31 +9456,43 @@ async fn chanserv_changes_are_audited_with_the_founder_as_actor() {
     db::persist_channel_registration(&pool, "#Room", "Founder", &None)
         .await
         .expect("register");
-    assert!(
+    assert!(matches!(
         db::set_channel_access(&pool, "#room", "Bob", Some("v".into()), "Founder")
             .await
-            .expect("access")
-    );
-    assert!(
+            .expect("access"),
+        db::AccessChange::Applied { .. }
+    ));
+    assert_eq!(
         db::set_channel_keeptopic(&pool, "#room", false, None, "Founder")
             .await
-            .expect("keeptopic")
+            .expect("keeptopic"),
+        Ok(())
     );
-    assert!(
+    assert_eq!(
         db::set_channel_mlock(&pool, "#room", Some("+nt".into()), "Founder")
             .await
-            .expect("mlock")
+            .expect("mlock"),
+        Ok(())
     );
-    assert!(
+    assert!(matches!(
         db::set_channel_founder(&pool, "#room", "bob", "Founder")
             .await
-            .expect("founder")
-    );
+            .expect("founder"),
+        db::FounderTransfer::Transferred { .. }
+    ));
 
-    assert!(
+    // The former founder can no longer drop it.
+    assert_eq!(
+        db::drop_channel(&pool, "#room", db::ChannelDropper::Founder("Founder"))
+            .await
+            .expect("drop"),
+        Err(db::ChannelRefusal::NotFounder)
+    );
+    assert_eq!(
         db::drop_channel(&pool, "#room", db::ChannelDropper::Founder("BOB"))
             .await
-            .expect("drop")
+            .expect("drop"),
+        Ok(())
     );
 
     let recorded: Vec<(String, String, String, String)> = sqlx::query_as(
@@ -10354,11 +10435,30 @@ async fn grouped_nicks_belong_to_one_account_and_sign_in_to_it() {
         db::create_account_with_contact(&pool, "Alice_away", "pw", None).await,
         Err(db::DbError::DuplicateAccount(_))
     ));
+    // A services nick is no account's name, whichever path creates it.
+    assert!(matches!(
+        db::create_account_with_contact(&pool, "NickServ", "pw", None).await,
+        Err(db::DbError::DuplicateAccount(_))
+    ));
+    assert!(matches!(
+        db::find_or_create_oidc_account(&pool, "https://issuer.example", "subject", "ChanServ")
+            .await,
+        Err(db::DbError::DuplicateAccount(_))
+    ));
+    // The storage triggers refuse a direct write too, by their own names: any
+    // other failure would not prove the invariant.
+    let refused_by = |result: Result<sqlx::postgres::PgQueryResult, sqlx::Error>| {
+        result
+            .expect_err("storage accepted the write")
+            .as_database_error()
+            .and_then(|error| error.constraint().map(str::to_string))
+    };
     let direct = sqlx::query("INSERT INTO accounts (name, name_folded) VALUES ('a3', 'a3')")
         .execute(&pool)
         .await;
-    assert!(
-        direct.is_err(),
+    assert_eq!(
+        refused_by(direct).as_deref(),
+        Some("accounts_name_not_grouped"),
         "storage must refuse an account named like a grouped nick"
     );
     let direct = sqlx::query(
@@ -10367,8 +10467,9 @@ async fn grouped_nicks_belong_to_one_account_and_sign_in_to_it() {
     .bind(bob_id)
     .execute(&pool)
     .await;
-    assert!(
-        direct.is_err(),
+    assert_eq!(
+        refused_by(direct).as_deref(),
+        Some("account_nicks_not_an_account_name"),
         "storage must refuse grouping an account's name"
     );
 
@@ -10502,19 +10603,28 @@ async fn a_deleted_founders_channels_pass_to_their_successors() {
     .execute(&pool)
     .await
     .expect("channels");
-    use db::SuccessorChange::{AccountMissing, Applied, ChannelMissing, IsFounder};
-    let set = |channel: &'static str, successor: Option<&'static str>| {
+    use db::ChannelRefusal::{ChannelMissing, NotFounder};
+    use db::SuccessorChange::{AccountMissing, IsFounder, Refused};
+    let applied = |successor: &str| db::SuccessorChange::Applied {
+        successor: Some(successor.to_string()),
+    };
+    let set = |channel: &'static str, successor: Option<&'static str>, actor: &'static str| {
         let pool = pool.clone();
         async move {
-            db::set_channel_successor(&pool, channel, successor, "founder")
+            db::set_channel_successor(&pool, channel, successor, actor)
                 .await
                 .expect("successor")
         }
     };
-    assert_eq!(set("#A", Some("carol")).await, Applied);
-    assert_eq!(set("#a", Some("bob")).await, IsFounder);
-    assert_eq!(set("#a", Some("nobody")).await, AccountMissing);
-    assert_eq!(set("#nope", Some("carol")).await, ChannelMissing);
+    assert_eq!(set("#A", Some("carol"), "bob").await, applied("Carol"));
+    assert_eq!(set("#a", Some("bob"), "bob").await, IsFounder);
+    assert_eq!(set("#a", Some("nobody"), "bob").await, AccountMissing);
+    assert_eq!(
+        set("#nope", Some("carol"), "bob").await,
+        Refused(ChannelMissing)
+    );
+    // Only the founder names the successor, checked with the row locked.
+    assert_eq!(set("#a", Some("dave"), "alice").await, Refused(NotFounder));
     let successor = |channel: &'static str| {
         let pool = pool.clone();
         async move {
@@ -10542,7 +10652,7 @@ async fn a_deleted_founders_channels_pass_to_their_successors() {
     ));
     assert_eq!(successor("#a").await.as_deref(), Some("carol"));
 
-    assert_eq!(set("#b", Some("dave")).await, Applied);
+    assert_eq!(set("#b", Some("dave"), "bob").await, applied("Dave"));
     let deleted = db::delete_account_permanently(&pool, bob_id, "Alice", &[])
         .await
         .expect("delete")
@@ -10589,18 +10699,26 @@ async fn a_deleted_founders_channels_pass_to_their_successors() {
 
     // A transfer to the successor leaves no successor; deleting a successor
     // clears it.
-    assert_eq!(set("#c", Some("carol")).await, Applied);
-    assert!(
+    assert_eq!(set("#c", Some("carol"), "alice").await, applied("Carol"));
+    assert!(matches!(
         db::set_channel_founder(&pool, "#c", "carol", "alice")
             .await
-            .expect("transfer")
-    );
+            .expect("transfer"),
+        db::FounderTransfer::Transferred { .. }
+    ));
     assert_eq!(successor("#c").await, None);
-    assert_eq!(set("#d", Some("dave")).await, Applied);
-    assert!(
+    assert_eq!(set("#d", Some("dave"), "alice").await, applied("Dave"));
+    assert!(matches!(
         db::set_channel_founder(&pool, "#b", "alice", "dave")
             .await
-            .expect("transfer")
+            .expect("transfer"),
+        db::FounderTransfer::Transferred { .. }
+    ));
+    // A transfer to anyone else follows the one transfer policy.
+    assert_eq!(
+        successor("#b").await,
+        None,
+        "#b had no successor since Dave became its founder"
     );
     let deleted = db::delete_account_permanently(&pool, dave_id, "Alice", &[])
         .await
@@ -10612,6 +10730,107 @@ async fn a_deleted_founders_channels_pass_to_their_successors() {
         None,
         "a deleted successor is cleared"
     );
+}
+
+/// ChanServ names accounts the way Atheme does: a grouped nick stands for its
+/// account in access changes, founder transfers and the successor, and the
+/// verdict names the account it resolved to. The successor shows wherever the
+/// console shows who holds a channel.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn chanserv_resolves_grouped_nicks_and_the_console_shows_the_successor() {
+    let (pool, _) =
+        alice_and_bob("chanserv_resolves_grouped_nicks_and_the_console_shows_the").await;
+    db::create_account_with_contact(&pool, "Carol", "pw", None)
+        .await
+        .expect("Carol");
+    assert_eq!(
+        db::group_nick(&pool, "bob", "Bob_Away")
+            .await
+            .expect("group"),
+        db::NickGroupOutcome::Grouped
+    );
+    assert_eq!(
+        db::group_nick(&pool, "carol", "carol_alt")
+            .await
+            .expect("group"),
+        db::NickGroupOutcome::Grouped
+    );
+    db::persist_channel_registration(&pool, "#Room", "Alice", &None)
+        .await
+        .expect("register");
+
+    assert_eq!(
+        db::set_channel_access(&pool, "#room", "bob_away", Some("o".into()), "alice")
+            .await
+            .expect("access"),
+        db::AccessChange::Applied {
+            account: "Bob".into(),
+            previous: None,
+        }
+    );
+    assert_eq!(
+        db::list_channel_access(&pool).await.expect("list"),
+        [("#room".to_string(), "bob".to_string(), "o".to_string())]
+    );
+    assert_eq!(
+        db::set_channel_access(&pool, "#room", "BOB", Some("v".into()), "alice")
+            .await
+            .expect("access"),
+        db::AccessChange::Applied {
+            account: "Bob".into(),
+            previous: Some("o".into()),
+        },
+        "a change of an existing entry reports what it held"
+    );
+    assert_eq!(
+        db::set_channel_successor(&pool, "#room", Some("CAROL_ALT"), "alice")
+            .await
+            .expect("successor"),
+        db::SuccessorChange::Applied {
+            successor: Some("Carol".into())
+        }
+    );
+
+    let owned = db::list_owned_channels(&pool, "alice")
+        .await
+        .expect("owned");
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned[0].successor.as_deref(), Some("Carol"));
+    let directory = db::query_registered_channel_directory(
+        &pool,
+        db::RegisteredChannelDirectoryFilter {
+            before_id: None,
+            exact_name: None,
+            exact_founder: None,
+            page_size: registered_channel_page_size(10),
+        },
+    )
+    .await
+    .expect("directory");
+    assert_eq!(directory.entries[0].successor.as_deref(), Some("Carol"));
+    assert_eq!(
+        db::list_channel_successors(&pool)
+            .await
+            .expect("successors"),
+        [("#room".to_string(), "carol".to_string())]
+    );
+
+    // A founder transfer by grouped nick keeps the successor exactly when the
+    // transfer policy says so.
+    assert_eq!(
+        db::set_channel_founder(&pool, "#room", "Bob_Away", "alice")
+            .await
+            .expect("transfer"),
+        db::FounderTransfer::Transferred {
+            founder: "Bob".into()
+        }
+    );
+    let kept = !db::list_channel_successors(&pool)
+        .await
+        .expect("successors")
+        .is_empty();
+    assert_eq!(kept, db::FOUNDER_TRANSFER_KEEPS_SUCCESSOR);
 }
 
 /// One IRC client of a running server, for the end-to-end services tests.

@@ -76,8 +76,6 @@ pub enum DbError {
     TooManyCredentials,
     /// The account already holds the maximum number of BNC networks.
     TooManyNetworks,
-    /// The channel already holds the maximum number of access entries.
-    TooManyAccessEntries,
     /// Browser bootstrap is permanently closed once any account exists.
     AlreadyInitialized,
     /// An administrator attempted to suspend the account authenticating the
@@ -153,7 +151,6 @@ impl std::fmt::Display for DbError {
             Self::ReplayedLogoutToken => write!(f, "OpenID Connect logout token was replayed"),
             Self::TooManyCredentials => write!(f, "account holds too many app passwords"),
             Self::TooManyNetworks => write!(f, "account holds too many networks"),
-            Self::TooManyAccessEntries => write!(f, "channel holds too many access entries"),
             Self::AlreadyInitialized => write!(f, "server account bootstrap is already complete"),
             Self::CannotSuspendSelf => write!(f, "an administrator cannot suspend itself"),
             Self::RecoveryOfSuspendedAccount(n) => write!(
@@ -1241,14 +1238,19 @@ async fn lock_account_name(
         .map_err(query_error)
 }
 
-/// Whether a new account may not take `folded`: the name is retired, or it is
+/// Whether a new account may not take `folded`: the name is retired, it is
 /// a nick grouped to another account (migration 0075's storage triggers refuse
-/// both; this answers first, so the refusal is a duplicate, not a fault).
+/// both; this answers first, so the refusal is a duplicate, not a fault), or
+/// it is a services pseudo-client's nick, which no session could ever use.
+/// Every creation path — OpenID Connect provisioning included — asks this.
 /// The caller holds the name's lock.
 async fn account_name_is_unavailable(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     folded: &str,
 ) -> Result<bool, DbError> {
+    if crate::identity::SERVICE_NICKS.contains(&folded) {
+        return Ok(true);
+    }
     sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM retired_account_names WHERE name_folded = $1)
              OR EXISTS (SELECT 1 FROM account_nicks WHERE nick_folded = $1)",
@@ -1775,6 +1777,9 @@ pub async fn bootstrap_first_admin(
     password: &str,
 ) -> Result<i64, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(name);
+    if crate::identity::SERVICE_NICKS.contains(&folded.as_str()) {
+        return Err(DbError::DuplicateAccount(name.to_string()));
+    }
     let hash = hash_password(password.to_string()).await?;
     let mut transaction = pool.begin().await.map_err(query_error)?;
     sqlx::query("LOCK TABLE accounts IN SHARE ROW EXCLUSIVE MODE")
@@ -1941,7 +1946,6 @@ pub struct ChannelSuccession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletedAccount {
     pub name: String,
-    pub folded: String,
     pub successions: Vec<ChannelSuccession>,
 }
 
@@ -2141,7 +2145,6 @@ pub async fn delete_account_permanently(
     transaction.commit().await.map_err(query_error)?;
     Ok(Some(DeletedAccount {
         name,
-        folded,
         successions: successions
             .into_iter()
             .map(|(channel, founder)| ChannelSuccession { channel, founder })
@@ -3259,8 +3262,9 @@ async fn handle_request(
                 }
             };
             let result = match dropped {
-                Ok(true) => crate::core::ChannelDropResult::Dropped,
-                Ok(false) => crate::core::ChannelDropResult::Missing,
+                Ok(Ok(())) => crate::core::ChannelDropResult::Dropped,
+                Ok(Err(ChannelRefusal::ChannelMissing)) => crate::core::ChannelDropResult::Missing,
+                Ok(Err(ChannelRefusal::NotFounder)) => crate::core::ChannelDropResult::NotFounder,
                 Err(e) => {
                     record_database_error(telemetry);
                     eprintln!("db: channel drop failed: {e}");
@@ -3287,17 +3291,28 @@ async fn handle_request(
         } => {
             let display = channel.clone();
             let result = match set_channel_founder(pool, &channel, &new_founder, &actor).await {
-                Ok(true) => crate::core::ChannelServicePersistence::FounderChanged {
-                    channel,
-                    account: new_founder,
-                    display,
-                    label,
-                },
-                Ok(false) => crate::core::ChannelServicePersistence::FounderMissing {
-                    channel,
-                    display,
-                    label,
-                },
+                Ok(FounderTransfer::Transferred { founder }) => {
+                    crate::core::ChannelServicePersistence::FounderChanged {
+                        channel,
+                        account: founder,
+                        display,
+                        label,
+                    }
+                }
+                Ok(FounderTransfer::AccountMissing) => {
+                    crate::core::ChannelServicePersistence::FounderMissing {
+                        channel,
+                        display,
+                        label,
+                    }
+                }
+                Ok(FounderTransfer::Refused(refusal)) => {
+                    crate::core::ChannelServicePersistence::Refused {
+                        display,
+                        refusal,
+                        label,
+                    }
+                }
                 Err(e) => {
                     record_database_error(telemetry);
                     eprintln!("db: founder transfer failed: {e}");
@@ -3489,12 +3504,16 @@ async fn handle_request(
             let result =
                 match set_channel_keeptopic(pool, &channel, keeptopic, topic.clone(), &actor).await
                 {
-                    Ok(applied) => crate::core::ChannelServicePersistence::KeeptopicSet {
+                    Ok(Ok(())) => crate::core::ChannelServicePersistence::KeeptopicSet {
                         channel,
                         display,
                         keeptopic,
                         topic,
-                        applied,
+                        label,
+                    },
+                    Ok(Err(refusal)) => crate::core::ChannelServicePersistence::Refused {
+                        display,
+                        refusal,
                         label,
                     },
                     Err(e) => {
@@ -3519,11 +3538,15 @@ async fn handle_request(
             actor,
         } => {
             let result = match set_channel_mlock(pool, &channel, mlock.clone(), &actor).await {
-                Ok(applied) => crate::core::ChannelServicePersistence::MlockSet {
+                Ok(Ok(())) => crate::core::ChannelServicePersistence::MlockSet {
                     channel,
                     display,
                     mlock,
-                    applied,
+                    label,
+                },
+                Ok(Err(refusal)) => crate::core::ChannelServicePersistence::Refused {
+                    display,
+                    refusal,
                     label,
                 },
                 Err(e) => {
@@ -3554,19 +3577,36 @@ async fn handle_request(
             // negative that was really a transient DB failure.
             let result =
                 match set_channel_access(pool, &channel, &account, flags.clone(), &actor).await {
-                    Ok(applied) => crate::core::ChannelServicePersistence::AccessSet {
-                        channel,
-                        display,
-                        account,
-                        flags,
-                        applied,
-                        frontend,
-                        label,
-                    },
-                    Err(DbError::TooManyAccessEntries) => {
+                    Ok(AccessChange::Applied { account, previous }) => {
+                        crate::core::ChannelServicePersistence::AccessSet {
+                            channel,
+                            display,
+                            account,
+                            flags,
+                            previous,
+                            frontend,
+                            label,
+                        }
+                    }
+                    Ok(AccessChange::AccountMissing) => {
+                        crate::core::ChannelServicePersistence::AccessAccountMissing {
+                            display,
+                            account,
+                            frontend,
+                            label,
+                        }
+                    }
+                    Ok(AccessChange::LimitReached) => {
                         crate::core::ChannelServicePersistence::AccessLimitReached {
                             channel,
                             display,
+                            label,
+                        }
+                    }
+                    Ok(AccessChange::Refused(refusal)) => {
+                        crate::core::ChannelServicePersistence::Refused {
+                            display,
+                            refusal,
                             label,
                         }
                     }
@@ -4573,109 +4613,204 @@ pub async fn query_targets(
 /// the persisted `channel_access` rows and the in-core map they preload into.
 const MAX_ACCESS_ENTRIES_PER_CHANNEL: i64 = 256;
 
-/// Upsert (`flags = Some`) or remove (`flags = None`) one channel-access entry.
-/// Returns whether the change was *applied to a real account*: the grant INSERT
-/// affects no rows when no `accounts` row matches (the account isn't
-/// registered), so the caller can refuse to record a phantom grant in its hot
-/// map. A removal is always considered applied — dropping a (possibly stale)
-/// entry is idempotent cleanup.
-///
-/// An applied change is audited (`CHANNEL_ACCESS`, as the owner console
-/// records it) in its own transaction, with the founder `actor`.
+/// Why a founder-only ChanServ change to a registered channel did not apply,
+/// found with the channel row locked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelRefusal {
+    /// The channel is not registered.
+    ChannelMissing,
+    /// The actor no longer founds the channel: a transfer committed between
+    /// the core's founder check and this write (a pipelined `SET FOUNDER`).
+    NotFounder,
+}
+
+/// Lock the registered channel `channel_folded` (`FOR NO KEY UPDATE`, which
+/// a concurrent founder transfer also takes) and check, inside the caller's
+/// transaction, that `actor` still founds it. Every founder-only mutation —
+/// ChanServ's and the owner console's — starts here, so none can be applied by
+/// someone the core still believed was founder when it queued the request.
+async fn lock_channel_as_founder(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    channel_folded: &str,
+    actor: &str,
+) -> Result<Result<ChannelMutationOwnerRow, ChannelRefusal>, DbError> {
+    let row: Option<ChannelMutationOwnerRow> = sqlx::query_as(
+        "SELECT c.id AS channel_id, c.founder_account_id AS founder_id,
+                a.name_folded AS founder, c.keeptopic
+         FROM channels c JOIN accounts a ON a.id = c.founder_account_id
+         WHERE c.name_folded = $1
+         FOR NO KEY UPDATE OF c",
+    )
+    .bind(channel_folded)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(query_error)?;
+    let Some(row) = row else {
+        return Ok(Err(ChannelRefusal::ChannelMissing));
+    };
+    if row.founder != CaseMapping::Rfc1459.casefold(actor) {
+        return Ok(Err(ChannelRefusal::NotFounder));
+    }
+    Ok(Ok(row))
+}
+
+/// An account a name resolves to.
+#[derive(sqlx::FromRow)]
+struct ResolvedAccount {
+    id: i64,
+    /// Display name.
+    name: String,
+    name_folded: String,
+}
+
+/// The account `name` names: the account of that name, or the account a nick
+/// of that name is grouped to (NickServ GROUP; Atheme resolves any of an
+/// account's nicks to it). The one resolution login, NickServ INFO and every
+/// ChanServ account argument share.
+async fn resolve_account<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    name: &str,
+) -> Result<Option<ResolvedAccount>, DbError> {
+    sqlx::query_as(
+        "SELECT a.id, a.name, a.name_folded
+         FROM accounts a
+         WHERE a.name_folded = $1
+            OR a.id = (SELECT account_id FROM account_nicks WHERE nick_folded = $1)",
+    )
+    .bind(CaseMapping::Rfc1459.casefold(name))
+    .fetch_optional(executor)
+    .await
+    .map_err(query_error)
+}
+
+/// What writing one channel access entry did.
+enum AccessEntryWrite {
+    /// The entry holds the flags asked for; `previous` is what it held before
+    /// (`None`: it is new).
+    Written { previous: Option<String> },
+    /// A new entry would exceed [`MAX_ACCESS_ENTRIES_PER_CHANNEL`].
+    LimitReached,
+}
+
+/// Upsert `account_id`'s access entry on the locked channel `channel_id`.
+/// Only a *new* entry counts against the cap; re-flagging an existing one is
+/// always allowed. The caller holds the channel row lock, so two grants
+/// cannot both slip past the cap.
+async fn write_access_entry(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    channel_id: i64,
+    account_id: i64,
+    flags: &str,
+) -> Result<AccessEntryWrite, DbError> {
+    let previous: Option<String> = sqlx::query_scalar(
+        "SELECT flags FROM channel_access WHERE channel_id = $1 AND account_id = $2",
+    )
+    .bind(channel_id)
+    .bind(account_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(query_error)?;
+    if previous.is_none() {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM channel_access WHERE channel_id = $1")
+                .bind(channel_id)
+                .fetch_one(&mut **transaction)
+                .await
+                .map_err(query_error)?;
+        if count >= MAX_ACCESS_ENTRIES_PER_CHANNEL {
+            return Ok(AccessEntryWrite::LimitReached);
+        }
+    }
+    sqlx::query(
+        "INSERT INTO channel_access (channel_id, account_id, flags)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (channel_id, account_id) DO UPDATE SET flags = EXCLUDED.flags",
+    )
+    .bind(channel_id)
+    .bind(account_id)
+    .bind(flags)
+    .execute(&mut **transaction)
+    .await
+    .map_err(query_error)?;
+    Ok(AccessEntryWrite::Written { previous })
+}
+
+/// What a ChanServ access change (FLAGS, ACCESS ADD/DEL) did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessChange {
+    /// The entry now holds the flags asked for (`None`: it is gone).
+    Applied {
+        /// The account the name resolved to, as its display name.
+        account: String,
+        /// The flags the entry held before (`None`: there was no entry).
+        previous: Option<String>,
+    },
+    /// No account has that name or nick.
+    AccountMissing,
+    /// A new entry would exceed the per-channel cap.
+    LimitReached,
+    Refused(ChannelRefusal),
+}
+
+/// Set (`flags = Some`) or remove (`flags = None`) the access entry of the
+/// account `account` names (its name, or a nick grouped to it) on a registered
+/// channel `actor` founds — checked with the channel row locked. A change is
+/// audited (`CHANNEL_ACCESS`, as the owner console records it) in the same
+/// transaction.
 pub async fn set_channel_access(
     pool: &PgPool,
     channel: &str,
     account: &str,
     flags: Option<String>,
     actor: &str,
-) -> Result<bool, DbError> {
+) -> Result<AccessChange, DbError> {
     let channel_folded = CaseMapping::Rfc1459.casefold(channel);
-    let account_folded = CaseMapping::Rfc1459.casefold(account);
-    let detail = format!(
-        "account={account_folded} flags={}",
-        flags.as_deref().unwrap_or("-")
-    );
-    match flags {
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    let channel = match lock_channel_as_founder(&mut transaction, &channel_folded, actor).await? {
+        Ok(channel) => channel,
+        Err(refusal) => return Ok(AccessChange::Refused(refusal)),
+    };
+    let Some(target) = resolve_account(&mut *transaction, account).await? else {
+        return Ok(AccessChange::AccountMissing);
+    };
+    let previous = match flags.as_deref() {
         Some(flags) => {
-            // Cap the access list per channel, like every sibling grant collection
-            // (app passwords, PATs, BNC networks): count + insert in one
-            // transaction with the channel row locked FOR NO KEY UPDATE, so two founders
-            // granting concurrently can't both slip past the cap. Without it the
-            // map — and its persisted rows, re-loaded into RAM on every boot by
-            // `preload_access` — grow without bound. Only a *new* (channel,
-            // account) pair counts against the cap; re-flagging an existing entry
-            // is always allowed (it replaces, it doesn't grow).
-            let mut tx = pool.begin().await.map_err(query_error)?;
-            let ids: Option<(i64, i64)> = sqlx::query_as(
-                "SELECT c.id, a.id FROM channels c, accounts a
-                 WHERE c.name_folded = $1 AND a.name_folded = $2
-                 FOR NO KEY UPDATE OF c",
-            )
-            .bind(&channel_folded)
-            .bind(&account_folded)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(query_error)?;
-            // No match → the account isn't registered (or the channel is gone);
-            // nothing granted, same as before.
-            let Some((channel_id, account_id)) = ids else {
-                return Ok(false);
-            };
-            let already: Option<i64> = sqlx::query_scalar(
-                "SELECT account_id FROM channel_access WHERE channel_id = $1 AND account_id = $2",
-            )
-            .bind(channel_id)
-            .bind(account_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(query_error)?;
-            if already.is_none() {
-                let count: i64 =
-                    sqlx::query_scalar("SELECT COUNT(*) FROM channel_access WHERE channel_id = $1")
-                        .bind(channel_id)
-                        .fetch_one(&mut *tx)
-                        .await
-                        .map_err(query_error)?;
-                if count >= MAX_ACCESS_ENTRIES_PER_CHANNEL {
-                    return Err(DbError::TooManyAccessEntries);
-                }
+            match write_access_entry(&mut transaction, channel.channel_id, target.id, flags).await?
+            {
+                AccessEntryWrite::Written { previous } => previous,
+                AccessEntryWrite::LimitReached => return Ok(AccessChange::LimitReached),
             }
-            sqlx::query(
-                "INSERT INTO channel_access (channel_id, account_id, flags)
-                 VALUES ($1, $2, $3)
-                 ON CONFLICT (channel_id, account_id) DO UPDATE SET flags = EXCLUDED.flags",
-            )
-            .bind(channel_id)
-            .bind(account_id)
-            .bind(flags)
-            .execute(&mut *tx)
-            .await
-            .map_err(query_error)?;
-            audit_channel_service(&mut tx, actor, "CHANNEL_ACCESS", &channel_folded, &detail)
-                .await?;
-            tx.commit().await.map_err(query_error)?;
-            Ok(true)
         }
-        None => {
-            let mut tx = pool.begin().await.map_err(query_error)?;
-            let removed = sqlx::query(
-                "DELETE FROM channel_access ca USING channels c, accounts a
-                 WHERE ca.channel_id = c.id AND ca.account_id = a.id
-                   AND c.name_folded = $1 AND a.name_folded = $2",
-            )
-            .bind(&channel_folded)
-            .bind(&account_folded)
-            .execute(&mut *tx)
-            .await
-            .map_err(query_error)?;
-            if removed.rows_affected() > 0 {
-                audit_channel_service(&mut tx, actor, "CHANNEL_ACCESS", &channel_folded, &detail)
-                    .await?;
-            }
-            tx.commit().await.map_err(query_error)?;
-            Ok(true)
-        }
+        None => sqlx::query_scalar(
+            "DELETE FROM channel_access WHERE channel_id = $1 AND account_id = $2
+             RETURNING flags",
+        )
+        .bind(channel.channel_id)
+        .bind(target.id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(query_error)?,
+    };
+    if previous != flags {
+        let detail = format!(
+            "account={} flags={}",
+            target.name_folded,
+            flags.as_deref().unwrap_or("-")
+        );
+        audit_channel_service(
+            &mut transaction,
+            actor,
+            "CHANNEL_ACCESS",
+            &channel_folded,
+            &detail,
+        )
+        .await?;
     }
+    transaction.commit().await.map_err(query_error)?;
+    Ok(AccessChange::Applied {
+        account: target.name,
+        previous,
+    })
 }
 
 /// Record one change of a registered channel inside its transaction — target
@@ -4698,9 +4833,13 @@ async fn audit_channel_service(
     .await
 }
 
+/// A registered channel row locked for a founder-only change (see
+/// [`lock_channel_as_founder`]).
 #[derive(sqlx::FromRow)]
 struct ChannelMutationOwnerRow {
     channel_id: i64,
+    founder_id: i64,
+    /// The founder's folded account name.
     founder: String,
     keeptopic: bool,
 }
@@ -4717,27 +4856,14 @@ pub async fn persist_owned_channel_mutation(
     let channel_folded = CaseMapping::Rfc1459.casefold(channel);
     let actor_folded = CaseMapping::Rfc1459.casefold(actor);
     let mut transaction = pool.begin().await.map_err(query_error)?;
-    let row: Option<ChannelMutationOwnerRow> = sqlx::query_as(
-        "SELECT c.id AS channel_id, a.name_folded AS founder, c.keeptopic
-         FROM channels c JOIN accounts a ON a.id = c.founder_account_id
-         WHERE c.name_folded = $1
-         FOR NO KEY UPDATE OF c",
-    )
-    .bind(&channel_folded)
-    .fetch_optional(&mut *transaction)
-    .await
-    .map_err(query_error)?;
-    let Some(ChannelMutationOwnerRow {
+    let Ok(ChannelMutationOwnerRow {
         channel_id,
-        founder,
         keeptopic,
-    }) = row
+        ..
+    }) = lock_channel_as_founder(&mut transaction, &channel_folded, actor).await?
     else {
         return Ok(ChannelControlResult::MissingOrNotOwner);
     };
-    if founder != actor_folded {
-        return Ok(ChannelControlResult::MissingOrNotOwner);
-    }
 
     let (action, detail) = match mutation {
         PersistedChannelMutation::SetTopic { topic } => {
@@ -4831,39 +4957,11 @@ pub async fn persist_owned_channel_mutation(
                 let Some(account_id) = account_id else {
                     return Ok(ChannelControlResult::AccountMissing);
                 };
-                let already: Option<i64> = sqlx::query_scalar(
-                    "SELECT account_id FROM channel_access
-                     WHERE channel_id = $1 AND account_id = $2",
-                )
-                .bind(channel_id)
-                .bind(account_id)
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(query_error)?;
-                if already.is_none() {
-                    let count: i64 = sqlx::query_scalar(
-                        "SELECT COUNT(*) FROM channel_access WHERE channel_id = $1",
-                    )
-                    .bind(channel_id)
-                    .fetch_one(&mut *transaction)
-                    .await
-                    .map_err(query_error)?;
-                    if count >= MAX_ACCESS_ENTRIES_PER_CHANNEL {
-                        return Ok(ChannelControlResult::AccessLimitReached);
-                    }
+                if let AccessEntryWrite::LimitReached =
+                    write_access_entry(&mut transaction, channel_id, account_id, flags).await?
+                {
+                    return Ok(ChannelControlResult::AccessLimitReached);
                 }
-                sqlx::query(
-                    "INSERT INTO channel_access (channel_id, account_id, flags)
-                     VALUES ($1, $2, $3)
-                     ON CONFLICT (channel_id, account_id)
-                     DO UPDATE SET flags = EXCLUDED.flags",
-                )
-                .bind(channel_id)
-                .bind(account_id)
-                .bind(flags)
-                .execute(&mut *transaction)
-                .await
-                .map_err(query_error)?;
             } else {
                 sqlx::query(
                     "DELETE FROM channel_access ca USING accounts a
@@ -4894,12 +4992,7 @@ pub async fn persist_owned_channel_mutation(
             let Some(account_id) = account_id else {
                 return Ok(ChannelControlResult::AccountMissing);
             };
-            sqlx::query("UPDATE channels SET founder_account_id = $2 WHERE id = $1")
-                .bind(channel_id)
-                .bind(account_id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(query_error)?;
+            transfer_channel_founder(&mut transaction, channel_id, account_id).await?;
             ("CHANNEL_FOUNDER", account.clone())
         }
         PersistedChannelMutation::Drop => {
@@ -4963,102 +5056,132 @@ pub async fn list_channel_access(pool: &PgPool) -> Result<Vec<(String, String, S
     .map_err(query_error)
 }
 
-/// Transfer a channel's founder to `new_founder_folded`. Returns whether
-/// a row was updated (false = no such channel or account).
-/// Transfer a channel's founder. `Ok(true)` = a row was updated, `Ok(false)` =
-/// no such channel/account (a definitive negative), `Err` = the store failed.
-/// The caller must keep these distinct: reporting a DB fault as "no such
-/// account" would tell the founder a lie they might act on.
-/// A transfer is audited (`CHANNEL_FOUNDER`) in its own transaction, with the
-/// outgoing founder `actor`.
+/// Whether a founder transfer (ChanServ `SET FOUNDER`, the owner console's
+/// transfer) keeps the channel's successor. A successor that becomes the
+/// founder stops being the successor either way (migration 0075's trigger;
+/// the core's founder mirror follows the same two rules).
+pub const FOUNDER_TRANSFER_KEEPS_SUCCESSOR: bool = true;
+
+/// Make `founder_id` the founder of the locked channel `channel_id`, applying
+/// [`FOUNDER_TRANSFER_KEEPS_SUCCESSOR`]; a transfer to the founder it already
+/// has changes nothing. The one founder transfer both ChanServ and the owner
+/// console run.
+async fn transfer_channel_founder(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    channel_id: i64,
+    founder_id: i64,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "UPDATE channels
+         SET founder_account_id = $2,
+             successor_account_id = CASE
+                 WHEN $3 OR founder_account_id = $2 THEN successor_account_id
+             END
+         WHERE id = $1",
+    )
+    .bind(channel_id)
+    .bind(founder_id)
+    .bind(FOUNDER_TRANSFER_KEEPS_SUCCESSOR)
+    .execute(&mut **transaction)
+    .await
+    .map(|_| ())
+    .map_err(query_error)
+}
+
+/// What ChanServ `SET FOUNDER` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FounderTransfer {
+    /// The channel now belongs to `founder` (the account's display name).
+    Transferred {
+        founder: String,
+    },
+    /// No account has that name or nick.
+    AccountMissing,
+    Refused(ChannelRefusal),
+}
+
+/// Transfer a channel `actor` founds — checked with its row locked — to the
+/// account `new_founder` names (its name, or a nick grouped to it). Audited
+/// (`CHANNEL_FOUNDER`) in the same transaction, with the outgoing founder
+/// `actor`. A store failure is an `Err`, never "no such account": that would
+/// tell the founder a lie they might act on.
 pub async fn set_channel_founder(
     pool: &PgPool,
     channel: &str,
-    new_founder_folded: &str,
+    new_founder: &str,
     actor: &str,
-) -> Result<bool, DbError> {
+) -> Result<FounderTransfer, DbError> {
     let channel_folded = CaseMapping::Rfc1459.casefold(channel);
     let mut transaction = pool.begin().await.map_err(query_error)?;
-    let res = sqlx::query(
-        "UPDATE channels SET founder_account_id = a.id
-         FROM accounts a
-         WHERE channels.name_folded = $1 AND a.name_folded = $2",
-    )
-    .bind(&channel_folded)
-    .bind(new_founder_folded)
-    .execute(&mut *transaction)
-    .await
-    .map_err(query_error)?;
-    if res.rows_affected() == 0 {
-        return Ok(false);
-    }
+    let channel = match lock_channel_as_founder(&mut transaction, &channel_folded, actor).await? {
+        Ok(channel) => channel,
+        Err(refusal) => return Ok(FounderTransfer::Refused(refusal)),
+    };
+    let Some(founder) = resolve_account(&mut *transaction, new_founder).await? else {
+        return Ok(FounderTransfer::AccountMissing);
+    };
+    transfer_channel_founder(&mut transaction, channel.channel_id, founder.id).await?;
     audit_channel_service(
         &mut transaction,
         actor,
         "CHANNEL_FOUNDER",
         &channel_folded,
-        new_founder_folded,
+        &founder.name_folded,
     )
     .await?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(true)
+    Ok(FounderTransfer::Transferred {
+        founder: founder.name,
+    })
 }
 
 /// What naming a channel's successor did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SuccessorChange {
-    /// The successor was set (or cleared) as asked.
-    Applied,
-    /// The channel is not registered.
-    ChannelMissing,
-    /// No account has the successor's name.
+    /// The successor was set as asked: the account's display name, or `None`
+    /// once cleared.
+    Applied {
+        successor: Option<String>,
+    },
+    /// No account has the successor's name or nick.
     AccountMissing,
     /// The named account founds the channel; a founder cannot also succeed it.
     IsFounder,
+    Refused(ChannelRefusal),
 }
 
-/// Name `successor_folded` as the account a registered channel passes to when
-/// its founder's account is deleted (ChanServ SET SUCCESSOR), or clear it with
-/// `None`. Audited (`CHANNEL_SUCCESSOR`) with the founder `actor` in the same
-/// transaction. The channel row is locked first, so a concurrent founder
-/// transfer is either seen or waits.
+/// Name the account `successor` names (its name, or a nick grouped to it) as
+/// the one a registered channel passes to when its founder's account is
+/// deleted (ChanServ SET SUCCESSOR), or clear it with `None`. The channel row
+/// is locked and `actor` checked to still found it first, so a founder
+/// transfer committed after the core's check refuses this rather than let a
+/// former founder pick the heir. Audited (`CHANNEL_SUCCESSOR`) with `actor` in
+/// the same transaction.
 pub async fn set_channel_successor(
     pool: &PgPool,
     channel: &str,
-    successor_folded: Option<&str>,
+    successor: Option<&str>,
     actor: &str,
 ) -> Result<SuccessorChange, DbError> {
     let channel_folded = CaseMapping::Rfc1459.casefold(channel);
     let mut transaction = pool.begin().await.map_err(query_error)?;
-    let channel_row: Option<(i64, i64)> = sqlx::query_as(
-        "SELECT id, founder_account_id FROM channels WHERE name_folded = $1 FOR NO KEY UPDATE",
-    )
-    .bind(&channel_folded)
-    .fetch_optional(&mut *transaction)
-    .await
-    .map_err(query_error)?;
-    let Some((channel_id, founder_id)) = channel_row else {
-        return Ok(SuccessorChange::ChannelMissing);
+    let channel = match lock_channel_as_founder(&mut transaction, &channel_folded, actor).await? {
+        Ok(channel) => channel,
+        Err(refusal) => return Ok(SuccessorChange::Refused(refusal)),
     };
-    let successor_id = match successor_folded {
-        Some(successor) => {
-            let id: Option<i64> =
-                sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1")
-                    .bind(successor)
-                    .fetch_optional(&mut *transaction)
-                    .await
-                    .map_err(query_error)?;
-            match id {
-                None => return Ok(SuccessorChange::AccountMissing),
-                Some(id) if id == founder_id => return Ok(SuccessorChange::IsFounder),
-                Some(id) => Some(id),
+    let successor = match successor {
+        Some(successor) => match resolve_account(&mut *transaction, successor).await? {
+            None => return Ok(SuccessorChange::AccountMissing),
+            Some(account) if account.id == channel.founder_id => {
+                return Ok(SuccessorChange::IsFounder);
             }
-        }
+            Some(account) => Some(account),
+        },
         None => None,
     };
     sqlx::query("UPDATE channels SET successor_account_id = $2 WHERE id = $1")
-        .bind(channel_id)
-        .bind(successor_id)
+        .bind(channel.channel_id)
+        .bind(successor.as_ref().map(|account| account.id))
         .execute(&mut *transaction)
         .await
         .map_err(query_error)?;
@@ -5067,11 +5190,27 @@ pub async fn set_channel_successor(
         actor,
         "CHANNEL_SUCCESSOR",
         &channel_folded,
-        successor_folded.unwrap_or("-"),
+        successor
+            .as_ref()
+            .map_or("-", |account| account.name_folded.as_str()),
     )
     .await?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(SuccessorChange::Applied)
+    Ok(SuccessorChange::Applied {
+        successor: successor.map(|account| account.name),
+    })
+}
+
+/// Every registered channel's successor, as `(channel name_folded, successor
+/// name_folded)` — boot-loaded into the founder mirror.
+pub async fn list_channel_successors(pool: &PgPool) -> Result<Vec<(String, String)>, DbError> {
+    sqlx::query_as(
+        "SELECT c.name_folded, a.name_folded
+         FROM channels c JOIN accounts a ON a.id = c.successor_account_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(query_error)
 }
 
 /// Most nicks one account may hold, its own name included (Atheme's
@@ -5901,30 +6040,46 @@ pub enum ChannelDropper<'a> {
 }
 
 /// Unregister a channel by its casefolded name, audited in the same
-/// transaction with the dropping account as the actor. Returns whether a row
-/// was removed (nothing is recorded when none was).
+/// transaction with the dropping account as the actor. A founder's drop is
+/// refused unless the founder still founds the channel, checked with its row
+/// locked; nothing is recorded when nothing was removed.
 pub async fn drop_channel(
     pool: &PgPool,
     channel_folded: &str,
     dropper: ChannelDropper<'_>,
-) -> Result<bool, DbError> {
-    let (actor, action) = match dropper {
-        ChannelDropper::Founder(actor) => (actor, "CHANNEL_DROP"),
-        ChannelDropper::Administrator(actor) => (actor, "DROPCHAN"),
-    };
+) -> Result<Result<(), ChannelRefusal>, DbError> {
     let mut transaction = pool.begin().await.map_err(query_error)?;
-    let dropped = sqlx::query("DELETE FROM channels WHERE name_folded = $1")
-        .bind(channel_folded)
-        .execute(&mut *transaction)
-        .await
-        .map_err(query_error)?
-        .rows_affected()
-        == 1;
-    if dropped {
-        audit_channel_service(&mut transaction, actor, action, channel_folded, "").await?;
+    let (actor, action, dropped) = match dropper {
+        ChannelDropper::Founder(actor) => {
+            let channel =
+                match lock_channel_as_founder(&mut transaction, channel_folded, actor).await? {
+                    Ok(channel) => channel,
+                    Err(refusal) => return Ok(Err(refusal)),
+                };
+            let dropped = sqlx::query("DELETE FROM channels WHERE id = $1")
+                .bind(channel.channel_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(query_error)?
+                .rows_affected();
+            (actor, "CHANNEL_DROP", dropped)
+        }
+        ChannelDropper::Administrator(actor) => {
+            let dropped = sqlx::query("DELETE FROM channels WHERE name_folded = $1")
+                .bind(channel_folded)
+                .execute(&mut *transaction)
+                .await
+                .map_err(query_error)?
+                .rows_affected();
+            (actor, "DROPCHAN", dropped)
+        }
+    };
+    if dropped != 1 {
+        return Ok(Err(ChannelRefusal::ChannelMissing));
     }
+    audit_channel_service(&mut transaction, actor, action, channel_folded, "").await?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(dropped)
+    Ok(Ok(()))
 }
 
 /// Insert one registered channel with its initial retained topic and audit
@@ -6390,6 +6545,8 @@ pub struct RegisteredChannelDirectoryRow {
     pub id: i64,
     pub name: String,
     pub founder: String,
+    /// The account the channel passes to if the founder's is deleted.
+    pub successor: Option<String>,
     pub created_at: String,
     pub keeptopic: bool,
     pub topic_retained: bool,
@@ -6426,7 +6583,7 @@ pub async fn query_registered_channel_directory(
     let page_size = filter.page_size.value();
     let fetch_limit = page_size + 1;
     let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-        "SELECT c.id, c.name, a.name AS founder,
+        "SELECT c.id, c.name, a.name AS founder, successor.name AS successor,
                 to_char(c.created_at AT TIME ZONE 'UTC',
                         'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
                 c.keeptopic, c.topic IS NOT NULL AS topic_retained, c.mlock,
@@ -6434,6 +6591,7 @@ pub async fn query_registered_channel_directory(
                  WHERE ca.channel_id = c.id) AS access_entries
          FROM channels c
          JOIN accounts a ON a.id = c.founder_account_id
+         LEFT JOIN accounts successor ON successor.id = c.successor_account_id
          WHERE TRUE",
     );
     if let Some(before_id) = filter.before_id {
@@ -7342,6 +7500,8 @@ pub struct ChannelAccessEntry {
 pub struct OwnedChannel {
     pub name: String,
     pub founder: String,
+    /// The account the channel passes to if the founder's is deleted.
+    pub successor: Option<String>,
     pub keeptopic: bool,
     pub topic: Option<String>,
     pub topic_setter: Option<String>,
@@ -7354,6 +7514,7 @@ pub struct OwnedChannel {
 struct OwnedChannelRow {
     name: String,
     founder: String,
+    successor: Option<String>,
     keeptopic: bool,
     topic: Option<String>,
     topic_setter: Option<String>,
@@ -7375,6 +7536,7 @@ pub async fn list_owned_channels(
     let rows: Vec<OwnedChannelRow> = sqlx::query_as(
         "SELECT c.name,
                 founder.name AS founder,
+                successor.name AS successor,
                 c.keeptopic,
                 c.topic,
                 c.topic_setter,
@@ -7385,6 +7547,7 @@ pub async fn list_owned_channels(
                 ca.flags AS access_flags
          FROM channels c
          JOIN accounts founder ON founder.id = c.founder_account_id
+         LEFT JOIN accounts successor ON successor.id = c.successor_account_id
          LEFT JOIN channel_access ca ON ca.channel_id = c.id
          LEFT JOIN accounts access_account ON access_account.id = ca.account_id
          WHERE founder.name_folded = $1
@@ -7404,6 +7567,7 @@ pub async fn list_owned_channels(
             channels.push(OwnedChannel {
                 name: row.name.clone(),
                 founder: row.founder,
+                successor: row.successor,
                 keeptopic: row.keeptopic,
                 topic: row.topic,
                 topic_setter: row.topic_setter,
@@ -7460,7 +7624,8 @@ pub async fn list_channel_topics(
         .collect()
 }
 
-/// Persist a registered channel's KEEPTOPIC option on its `channels` row.
+/// Persist the KEEPTOPIC option of a registered channel `actor` founds —
+/// checked with its row locked — on its `channels` row.
 ///
 /// An applied change is audited (`CHANNEL_KEEPTOPIC`) in the same transaction
 /// with the founder `actor`.
@@ -7470,7 +7635,7 @@ pub async fn set_channel_keeptopic(
     keeptopic: bool,
     topic: Option<(String, String, u64)>,
     actor: &str,
-) -> Result<bool, DbError> {
+) -> Result<Result<(), ChannelRefusal>, DbError> {
     let (text, setter, set_at) = match topic {
         Some((text, setter, set_at)) if keeptopic => (
             Some(text),
@@ -7480,7 +7645,11 @@ pub async fn set_channel_keeptopic(
         _ => (None, None, None),
     };
     let mut transaction = pool.begin().await.map_err(query_error)?;
-    let applied = sqlx::query(
+    let channel = match lock_channel_as_founder(&mut transaction, channel_folded, actor).await? {
+        Ok(channel) => channel,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+    sqlx::query(
         "UPDATE channels
          SET keeptopic = $2,
              topic = $3,
@@ -7490,30 +7659,26 @@ pub async fn set_channel_keeptopic(
                  THEN NULL
                  ELSE to_timestamp($5::double precision)
              END
-         WHERE name_folded = $1",
+         WHERE id = $1",
     )
-    .bind(channel_folded)
+    .bind(channel.channel_id)
     .bind(keeptopic)
     .bind(text)
     .bind(setter)
     .bind(set_at)
     .execute(&mut *transaction)
     .await
-    .map_err(query_error)?
-    .rows_affected()
-        == 1;
-    if applied {
-        audit_channel_service(
-            &mut transaction,
-            actor,
-            "CHANNEL_KEEPTOPIC",
-            channel_folded,
-            if keeptopic { "on" } else { "off" },
-        )
-        .await?;
-    }
+    .map_err(query_error)?;
+    audit_channel_service(
+        &mut transaction,
+        actor,
+        "CHANNEL_KEEPTOPIC",
+        channel_folded,
+        if keeptopic { "on" } else { "off" },
+    )
+    .await?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(applied)
+    Ok(Ok(()))
 }
 
 /// The folded names of registered channels whose KEEPTOPIC is OFF — the
@@ -7525,36 +7690,36 @@ pub async fn list_keeptopic_off(pool: &PgPool) -> Result<Vec<String>, DbError> {
         .map_err(query_error)
 }
 
-/// Persist a registered channel's mode lock on its `channels` row (`None`
-/// clears it), audited (`CHANNEL_MLOCK`) in the same transaction with the
-/// founder `actor`.
+/// Persist the mode lock of a registered channel `actor` founds — checked
+/// with its row locked — on its `channels` row (`None` clears it), audited
+/// (`CHANNEL_MLOCK`) in the same transaction with the founder `actor`.
 pub async fn set_channel_mlock(
     pool: &PgPool,
     channel_folded: &str,
     mlock: Option<String>,
     actor: &str,
-) -> Result<bool, DbError> {
+) -> Result<Result<(), ChannelRefusal>, DbError> {
     let mut transaction = pool.begin().await.map_err(query_error)?;
-    let applied = sqlx::query("UPDATE channels SET mlock = $2 WHERE name_folded = $1")
-        .bind(channel_folded)
+    let channel = match lock_channel_as_founder(&mut transaction, channel_folded, actor).await? {
+        Ok(channel) => channel,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+    sqlx::query("UPDATE channels SET mlock = $2 WHERE id = $1")
+        .bind(channel.channel_id)
         .bind(&mlock)
         .execute(&mut *transaction)
         .await
-        .map_err(query_error)?
-        .rows_affected()
-        == 1;
-    if applied {
-        audit_channel_service(
-            &mut transaction,
-            actor,
-            "CHANNEL_MLOCK",
-            channel_folded,
-            mlock.as_deref().unwrap_or("cleared"),
-        )
-        .await?;
-    }
+        .map_err(query_error)?;
+    audit_channel_service(
+        &mut transaction,
+        actor,
+        "CHANNEL_MLOCK",
+        channel_folded,
+        mlock.as_deref().unwrap_or("cleared"),
+    )
+    .await?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(applied)
+    Ok(Ok(()))
 }
 
 /// Registered channels with a mode lock, as `(name_folded, spec)` —

@@ -25,13 +25,30 @@ impl CredentialAttemptBudget {
     }
 }
 
-/// Account names that only privileged flows may bring into being: the
-/// configured administrators (`http.admin_accounts` / `E6IRC_ADMIN_ACCOUNTS`).
-/// Such a name carries administrator authority the moment an account holds it,
-/// so whoever registered it first — over NickServ `REGISTER`, the IRCv3
-/// `REGISTER` command, or an account invitation — would be an administrator.
-/// Only OIDC provisioning and the bootstrap/recovery flows may create one.
-/// Names are held casefolded, so no spelling of one slips past.
+/// Casefolded nicks the built-in services pseudo-clients occupy. No session may
+/// take one (NICK refuses it, and PRIVMSG to it is intercepted), and no account
+/// may be named after one.
+pub(crate) const SERVICE_NICKS: [&str; 2] = ["nickserv", "chanserv"];
+
+/// Why a name cannot become an account's (see
+/// [`ReservedAccountNames::claimable`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameClaimRefusal {
+    /// A services pseudo-client's nick.
+    ServiceNick,
+    /// A configured administrator's name, which only a privileged flow creates.
+    ConfiguredAdministrator,
+}
+
+/// The configured administrators (`http.admin_accounts` /
+/// `E6IRC_ADMIN_ACCOUNTS`), and so the account names only privileged flows may
+/// bring into being. Such a name carries administrator authority the moment an
+/// account holds it, so whoever claimed it first — over NickServ `REGISTER` or
+/// `GROUP`, the IRCv3 `REGISTER` command, or an account invitation — would be
+/// an administrator. Only OIDC provisioning and the bootstrap/recovery flows
+/// may create one. Names are held casefolded, so no spelling of one slips past.
+/// Built once from the configuration and shared by the core, the HTTP state,
+/// and the deletion procedure.
 #[derive(Debug, Clone, Default)]
 pub struct ReservedAccountNames(std::sync::Arc<std::collections::HashSet<String>>);
 
@@ -45,10 +62,31 @@ impl ReservedAccountNames {
         ))
     }
 
-    /// Whether `name`, in any spelling, is reserved.
+    /// Whether `name`, in any spelling, is a configured administrator.
     pub fn reserves(&self, name: &str) -> bool {
         self.0
             .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(name))
+    }
+
+    /// The configured administrators, casefolded, for storage queries.
+    pub fn folded_names(&self) -> Vec<String> {
+        self.0.iter().cloned().collect()
+    }
+
+    /// The one answer to "may an ordinary claim make `name` an account's name
+    /// or nick?" — NickServ `REGISTER` and `GROUP`, the IRCv3 `REGISTER`
+    /// command, an account an administrator creates, and an invitation all ask
+    /// it, so a new claim path cannot forget one of the rules. (Storage refuses
+    /// a services nick to every creation path, the privileged ones included.)
+    pub fn claimable(&self, name: &str) -> Result<(), NameClaimRefusal> {
+        let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(name);
+        if SERVICE_NICKS.contains(&folded.as_str()) {
+            return Err(NameClaimRefusal::ServiceNick);
+        }
+        if self.0.contains(&folded) {
+            return Err(NameClaimRefusal::ConfiguredAdministrator);
+        }
+        Ok(())
     }
 }
 

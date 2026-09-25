@@ -134,7 +134,8 @@ pub struct AppState {
     /// grant made outside this process needs no restart; these are the grants
     /// only configuration knows about, kept apart so revoking a durable grant
     /// cannot revoke authority configuration still gives (or pretend it did).
-    pub configured_admin_accounts: std::collections::HashSet<String>,
+    /// The same set the core refuses as account names.
+    pub configured_admin_accounts: crate::identity::ReservedAccountNames,
     /// Per-startup key for deriving CSRF tokens for cookie-authenticated
     /// form posts from the server-rendered pages.
     pub csrf_key: [u8; 32],
@@ -654,8 +655,7 @@ async fn account_suspension_in_lane(
         prepared
     };
 
-    let configured_administrators: Vec<String> =
-        state.configured_admin_accounts.iter().cloned().collect();
+    let configured_administrators: Vec<String> = state.configured_admin_accounts.folded_names();
     let change = crate::db::set_account_suspended(
         pool,
         account_id,
@@ -729,8 +729,7 @@ pub(super) async fn mutate_account_administrator(
     administrator: bool,
 ) -> Result<String, (StatusCode, String)> {
     let pool = account_mutation_pool(state, account_id)?;
-    let configured_administrators: Vec<String> =
-        state.configured_admin_accounts.iter().cloned().collect();
+    let configured_administrators: Vec<String> = state.configured_admin_accounts.folded_names();
     let change = crate::db::set_account_administrator(
         pool,
         account_id,
@@ -741,7 +740,7 @@ pub(super) async fn mutate_account_administrator(
     .await
     .map_err(|error| authority_error_status("account authority mutation", error))?
     .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
-    let configured = state.configured_admin_accounts.contains(&change.folded);
+    let configured = state.configured_admin_accounts.reserves(&change.folded);
     Ok(if administrator {
         format!(
             "Granted durable administrator authority to {}.",
@@ -760,17 +759,31 @@ pub(super) async fn mutate_account_administrator(
     })
 }
 
-/// Why an account-creation surface refused a configured administrator's name.
-pub(super) const RESERVED_ACCOUNT_NAME_DETAIL: &str = "The name is a configured administrator account; only OIDC sign-in or the \
-     bootstrap/recovery flows can create it.";
-
 impl AppState {
-    /// Whether `account` is a configured administrator's name, which only OIDC
-    /// provisioning and the bootstrap/recovery flows may create (see
-    /// [`crate::identity::ReservedAccountNames`]).
-    pub(super) fn account_name_reserved(&self, account: &str) -> bool {
+    /// Why an ordinary account-creation surface (an administrator creating an
+    /// account, an invitation) may not give an account `account`'s name, if
+    /// it may not: the one rule every claim path shares (see
+    /// [`crate::identity::ReservedAccountNames::claimable`]).
+    pub(super) fn unclaimable_account_name(&self, account: &str) -> Option<&'static str> {
         self.configured_admin_accounts
-            .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account))
+            .claimable(account)
+            .err()
+            .map(account_name_refusal_detail)
+    }
+}
+
+/// What an account-creation surface tells the requester about a refused name.
+pub(super) fn account_name_refusal_detail(
+    refusal: crate::identity::NameClaimRefusal,
+) -> &'static str {
+    match refusal {
+        crate::identity::NameClaimRefusal::ServiceNick => {
+            "The name belongs to a services pseudo-client (NickServ or ChanServ)."
+        }
+        crate::identity::NameClaimRefusal::ConfiguredAdministrator => {
+            "The name is a configured administrator account; only OIDC sign-in or the \
+             bootstrap/recovery flows can create it."
+        }
     }
 }
 
@@ -791,8 +804,8 @@ pub(super) async fn create_account_lifecycle(
     if let Some(detail) = password_input_error(password) {
         return Err((StatusCode::BAD_REQUEST, detail.into()));
     }
-    if state.account_name_reserved(account) {
-        return Err((StatusCode::CONFLICT, RESERVED_ACCOUNT_NAME_DETAIL.into()));
+    if let Some(detail) = state.unclaimable_account_name(account) {
+        return Err((StatusCode::CONFLICT, detail.into()));
     }
     let contact_email = contact_email
         .map(crate::identity::ContactEmail::parse)
@@ -863,7 +876,7 @@ impl AppState {
             registry,
             secret_key: self.secret_key.clone(),
             internal_upstreams: self.internal_upstreams,
-            configured_administrators: self.configured_admin_accounts.iter().cloned().collect(),
+            configured_administrators: self.configured_admin_accounts.clone(),
         })
     }
 }
@@ -2233,6 +2246,21 @@ mod pages {
                 StatusCode::BAD_REQUEST,
             );
         }
+        if let Err(crate::identity::NameClaimRefusal::ServiceNick) =
+            state.configured_admin_accounts.claimable(&form.account)
+        {
+            return bootstrap_response(
+                &state,
+                form.account,
+                Some(
+                    super::account_name_refusal_detail(
+                        crate::identity::NameClaimRefusal::ServiceNick,
+                    )
+                    .into(),
+                ),
+                StatusCode::BAD_REQUEST,
+            );
+        }
         match crate::db::bootstrap_first_admin(pool, &form.account, &form.password).await {
             Ok(_account_id) => {}
             Err(crate::db::DbError::AlreadyInitialized) => {
@@ -2418,8 +2446,7 @@ mod pages {
                 StatusCode::BAD_REQUEST,
             );
         }
-        let configured_administrators: Vec<String> =
-            state.configured_admin_accounts.iter().cloned().collect();
+        let configured_administrators: Vec<String> = state.configured_admin_accounts.folded_names();
         let account = match crate::db::accept_account_invitation(
             pool,
             &token,
@@ -2456,10 +2483,8 @@ mod pages {
         };
         // The console overview is administrators' only; anyone else would land
         // on "Admin only" as the first page of their new account.
-        let administrator = preview.administrator
-            || state
-                .configured_admin_accounts
-                .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account));
+        let administrator =
+            preview.administrator || state.configured_admin_accounts.reserves(&account);
         authenticated_redirect(
             &session,
             if administrator {

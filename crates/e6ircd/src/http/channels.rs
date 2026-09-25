@@ -8,6 +8,7 @@ use super::*;
 struct OwnedChannelResponse {
     name: String,
     founder: String,
+    successor: Option<String>,
     keeptopic: bool,
     topic: Option<String>,
     topic_setter: Option<String>,
@@ -48,6 +49,7 @@ fn channel_response(channel: crate::db::OwnedChannel) -> OwnedChannelResponse {
     OwnedChannelResponse {
         name: channel.name,
         founder: channel.founder,
+        successor: channel.successor,
         keeptopic: channel.keeptopic,
         topic: channel.topic,
         topic_setter: channel.topic_setter,

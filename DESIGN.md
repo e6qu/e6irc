@@ -1073,7 +1073,13 @@ subset's exact behavior.
   `STATS d` and `STATS x` (either case) are that operator listing in Solanum's
   numerics — `216 K <host> * <user>`, `225 D <address>`, `247 X 0 <mask>`,
   each with the whole reason, then 219; a non-operator gets 481 and the 219
-  terminator, as Solanum's stats access table answers.
+  terminator, as Solanum's stats access table answers. A mask part is spelled
+  as Solanum spells it so it stays one middle parameter
+  (`sanitize::mask_middle`): a space (X-line masks hold them) as `\s`, and a
+  leading `:` (an IPv6 address such as `::1`) with a `0` in front. A session's
+  shown host goes through the same spelling when it connects (`0::1`), and
+  `SETHOST` refuses a host starting with `:`, so WHO, WHOIS, CHGHOST and 396
+  always carry the host itself.
 - **Integrated services** (no separate Atheme process): `NickServ` and
   `ChanServ` pseudo-clients whose command surfaces
   (`REGISTER`, `IDENTIFY`, `GHOST`, `ACCESS`/`FLAGS`, `OP`, topic retention,
@@ -1102,19 +1108,46 @@ subset's exact behavior.
     deletes the account when repeated with it, after verifying the primary
     password, through the same deletion procedure as the console (§9.1) — so
     the account's sessions, the dropping one included, are disconnected by
-    its live gate. Deliberate differences from Atheme (maintainer decisions):
-    only a protected nick's user is warned, since the core mirrors grouped
-    and protected nicks, not every account name; `GHOST`/`REGAIN` take no
-    password argument (identify first); `SET` takes only `ENFORCE`, since
-    passwords and contacts are changed in the web console; and a successor is set with `SET SUCCESSOR`, not `FLAGS +S`.
+    its live gate. A user whose `IDENTIFY` or SASL verification is still
+    running at the deadline keeps the nick until the verdict: the rename is
+    rechecked on the next tick. `GROUP` claims a nick for an account as
+    `REGISTER` does, so both refuse what any account claim refuses — a
+    services nick or a configured administrator's name (one predicate,
+    `ReservedAccountNames::claimable`, §9.1). The mirror takes storage's
+    idempotent answers too ("already yours" groups, "not yours" ungroups), and
+    a verdict that arrives after its account was deleted adds nothing back.
+    Deliberate differences from Atheme (maintainer decisions): only a
+    protected nick's user is warned, since the core mirrors grouped and
+    protected nicks, not every account name; `GHOST`/`REGAIN` take no password
+    argument (identify first); `SET` takes only `ENFORCE`, since passwords and
+    contacts are changed in the web console; a successor is set with
+    `SET SUCCESSOR`, not `FLAGS +S`; `DROP` hands out its confirmation key
+    before checking the password (the password is checked once, when the key
+    comes back) and the key is random per session rather than derived from the
+    account; and a `VOP` may `VOICE`/`DEVOICE` (Atheme's `VOP` template, `+AV`,
+    grants auto-voice only).
   - ChanServ: `REGISTER`, `DROP`, `FLAGS`; `ACCESS <#channel> LIST|ADD|DEL` is
     the role front end over the same access entries (`AOP` = `+o`, `VOP` = `+v`,
     `VOP` by default); anyone on the list may `LIST` it, only the founder
-    changes it. `OP`/`DEOP` need op access and `VOICE`/`DEVOICE` voice or op
-    access (the founder has both). `SET` takes `FOUNDER`, `SUCCESSOR`,
-    `KEEPTOPIC` and `MLOCK`; the successor is the account the channel passes to
-    when the founder's account is deleted (§9.1), is never the founder, and is
-    cleared when it becomes founder or its own account is deleted.
+    changes it, and an `ADD` for an account that already has an entry says it
+    changed (or already had) the role rather than that it added one. Wherever
+    ChanServ takes an account, any of the account's nicks names it (Atheme
+    resolves a grouped nick to its account), and the reply names the account.
+    `OP`/`DEOP` need op access and `VOICE`/`DEVOICE` voice or op access (the
+    founder has both); the `MODE` line names the member by the nick the
+    channel knows. `SET` takes `FOUNDER`, `SUCCESSOR`, `KEEPTOPIC` and `MLOCK`;
+    the successor is the account the channel passes to when the founder's
+    account is deleted (§9.1), is never the founder, and is cleared when it
+    becomes founder or its own account is deleted. Whether a transfer to anyone
+    else keeps it is one constant (`FOUNDER_TRANSFER_KEEPS_SUCCESSOR`, today:
+    it is kept) that storage and the core's mirror both follow. The successor
+    is shown wherever a channel's holders are: `FLAGS` and `ACCESS LIST`, the
+    owner console, and the administrators' channel directory. Every
+    founder-only change — ChanServ's `FLAGS`/`ACCESS`, `SET`, `DROP`, and the
+    owner console's — locks the channel row and re-checks, in the same
+    transaction, that its requester still founds the channel, so a request the
+    core queued before a transfer committed is refused rather than applied by a
+    former founder.
 
 ### 7.7 Libera.Chat compatibility contract
 
@@ -1366,6 +1399,16 @@ one local password, N app passwords, and N OIDC identities. A partial unique
 index makes a second primary password unrepresentable in storage. The web
 "user section" manages all of them. NickServ `REGISTER` creates the same kind
 of account the OIDC first-login path creates.
+
+Which names an account may take is answered once. The configured
+administrators are computed once at startup (`ReservedAccountNames`) and shared
+by the core, the HTTP state and the deletion procedure; its `claimable` is the
+one predicate every ordinary claim asks — NickServ `REGISTER` and `GROUP`, the
+IRCv3 `REGISTER` command, an administrator-created account and an invitation —
+and it refuses a services nick and a configured administrator's name. Storage
+refuses a services nick to every creation path (`account_name_is_unavailable`,
+and the bootstrap), OpenID Connect provisioning included, which alone with the
+bootstrap/recovery flows may create an administrator's name.
 
 An empty database can expose a one-time browser bootstrap only when
 `[bootstrap].token`, PostgreSQL, and HTTP are all configured. `GET /bootstrap`
