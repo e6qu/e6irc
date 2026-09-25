@@ -45,8 +45,8 @@ pub use irc_driver::{
 pub use local_driver::{CoreHandles, LocalDriver};
 #[cfg(feature = "matrix")]
 pub use matrix::{MatrixConfig, MatrixDevice, MatrixDriver};
+pub use serve::{DriverStops, NetworkStatus, Registry, bnc_serve};
 pub(crate) use serve::{MutationLane, UnwrittenLines};
-pub use serve::{NetworkStatus, Registry, bnc_serve};
 #[cfg(feature = "slack")]
 pub use slack::{SlackConfig, SlackDriver};
 pub use upstream_identity::{

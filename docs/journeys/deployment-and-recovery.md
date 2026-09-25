@@ -15,7 +15,8 @@ credential is required for these deliberately public endpoints.
    supported entry-point information used by clients.
 2. `GET /healthz` reports that the process and HTTP loop are alive.
 3. `GET /readyz` checks the core heartbeat and performs a real,
-   deadline-bounded PostgreSQL query when a database is configured.
+   deadline-bounded PostgreSQL query when a database is configured; concurrent
+   requests share one probe, whose answer is reused for one second.
 4. A human opens `/login` to discover enabled local and OpenID Connect sign-in
    choices; automation can read `/api/v1/openapi.json` before obtaining a
    token.
@@ -32,7 +33,8 @@ Probe latency/status use fixed telemetry dimensions, and authentication is
 still mandatory on every private resource regardless of service discovery.
 
 **Evidence.** `server_info_endpoint`, `healthz_is_public_and_ok`,
-`readyz_reports_core_and_optional_database_state`, `login_page_renders`, and
+`readyz_reports_core_and_optional_database_state`,
+`concurrent_readiness_requests_share_one_database_probe`, `login_page_renders`, and
 the exact router/OpenAPI catalog test exercise these unauthenticated boundaries
 over real HTTP.
 
@@ -190,7 +192,9 @@ with the configured external key and never logs them. Shutdown and boot stages,
 flush failures, driver reconnects, readiness, and new runtime timestamps make
 the transition visible without pretending ephemeral sessions survived.
 
-**Evidence.** Graceful shutdown, critical-task outcome provenance, worker
+**Evidence.** `a_process_shutdown_writes_the_last_backlog_lines` and
+`a_wedged_backlog_write_is_aborted_at_the_shutdown_deadline` prove the BNC
+backlog flush and its bound; graceful shutdown, critical-task outcome provenance, worker
 flush behavior, managed retention validation, and exact PostgreSQL maintenance
 deletions are unit/integration tested; BNC backlog, read markers, channels,
 bans, browser sessions, and history each have restart/boot-load PostgreSQL

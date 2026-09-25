@@ -1780,7 +1780,10 @@ transition half made (a driver stopped whose replacement never starts, a
 suspension committed that the core never heard about). An account's drivers
 stop concurrently. A stopping network's persistence task writes the lines its
 driver said last (its goodbye among them) unless the network's rows are about
-to be deleted.
+to be deleted. A process shutdown keeps the rows, so it writes them too: the
+driver's release and that final write share the one driver-stop deadline, and
+only a write still in progress when it passes (a wedged database) is abandoned
+and reported.
 The registry refuses to register over a live driver *before* the second driver
 starts, so two upstream sessions can never race for one network, and each
 caller states what it means: create and edit **supersede** (stop the
@@ -2566,7 +2569,10 @@ Surface (initial):
   heartbeat is within 45 s; database-free, so a database outage shows on
   `readyz` and never restart-loops the container, while a stalled shard is a
   503 the health check acts on. It used to be a constant.
-- `readyz` (the same core check plus configured-PostgreSQL readiness; no auth)
+- `readyz` (the same core check plus configured-PostgreSQL readiness; no auth).
+  The database probe is shared: one request at a time runs it and its answer
+  is reused for one second, so a flood of this unauthenticated route, which
+  bypasses admission, holds at most one pool connection.
 
 The OpenAPI 3.1 document at `/api/v1/openapi.json` is hand-authored for
 request/response semantics and always served (no feature gate, no utoipa
@@ -3063,9 +3069,14 @@ but the CLI, TUI, and BNC must surface the rejection.
   removed only after that command commits. A corrupt, plaintext, or unreadable
   value rolls the entire operation back.
 - TLS ≥ 1.2 everywhere (rustls). Server certificates are reloaded on SIGHUP
-  and when their files change; a failed reload keeps the served certificate
-  and logs an error once per broken file state, and a key that does not match
-  its certificate is refused. Responses carry HSTS (`max-age=31536000`)
+  and when their files change (modification and status-change times, length,
+  and inode, so a time-preserving rewrite is still a change); a failed reload
+  keeps the served certificate, logs an error once per distinct failure, and
+  is retried at every check until it loads, since a fix need not change what a
+  stamp can see. A key that does not match its certificate is refused. The
+  SIGHUP handler is installed first thing at start, before the database wait:
+  the signal's default action is to terminate, and a service manager does not
+  restart a unit that died of it. Responses carry HSTS (`max-age=31536000`)
   whenever the validated public origin is HTTPS (never on an explicitly plain
   development origin); `includeSubDomains` only with
   `[http].hsts_include_subdomains`, which forces every sibling host of the
@@ -3201,7 +3212,7 @@ The snapshot is the sole source for:
   (`core_heartbeat_age_ms` is the stalest shard's age, so a silent shard is not
   masked by a healthy one) or
   configured PostgreSQL cannot answer `SELECT 1` within a separate two-second
-  query deadline.
+  query deadline (one shared probe, its answer reused for a second).
 
 The production image carries no HTTP client, so a container `HEALTHCHECK`
 cannot be a `curl`. `e6ircd healthcheck [--ready]
@@ -3210,7 +3221,11 @@ cannot be a `curl`. `e6ircd healthcheck [--ready]
 that variable's default (`environment_config::DEFAULT_HTTP_ADDR`); an unspecified listener address is probed on loopback of the
 same family. It exits 0 only on a `200` within three seconds, 1 with the reason
 otherwise, and 2 on a usage error, and the image's `HEALTHCHECK` is that
-command.
+command. Its start period outlasts the default startup budget (the 300 s
+database wait plus the migration lock retries; a unit test derives the sum from
+the constants), because `/healthz` is bound only once startup has reached
+PostgreSQL: liveness speaks for a running core, which a process still in its
+bounded, self-terminating database wait does not have yet.
 
 When PostgreSQL is configured, a sampler stores the typed JSON snapshot in
 `observability_samples`. The UI-managed `[observability]` interval (5–300
@@ -3443,9 +3458,18 @@ Layers, bottom to top:
   `E6IRC_BINARY`) is refused rather than ignored. Every subcommand that needs
   the configuration (`check-config`, `rotate-secrets`,
   `recover-administrator`) takes the same flag, so it runs by `docker exec` in
-  a container that has no file to point at.
+  a container that has no file to point at. `check-config` judges everything
+  start would refuse that needs neither the network nor the database, through
+  the functions start itself uses (`net::check_offline`): parse and
+  validation, the `E6IRC_MONITORING_TOKEN` rule, and every configured TLS
+  certificate/key pair read and matched. Every environment read in the daemon
+  goes through `environment_config`'s one rule (set-but-empty is unset; a
+  control character is refused by name), `E6IRC_SECRET_KEY` and
+  `E6IRC_PREVIOUS_SECRET_KEYS` included; a source test refuses a
+  `std::env` read anywhere else in the daemon.
   The systemd stop budget mechanically exceeds the daemon's bounded shutdown
-  — the core drain followed by the PostgreSQL flush; the guard sums both
+  — the bouncer drivers' stop (their goodbye and their last backlog write),
+  then the core drain, then the PostgreSQL flush; the guard sums the three
   constants. The unit sets `StartLimitIntervalSec=0` (asserted by the same
   guard): a refused first database connection fails the daemon in
   milliseconds, and systemd's default limit of five starts in ten seconds

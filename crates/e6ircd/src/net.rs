@@ -96,9 +96,11 @@ const SHUTDOWN_DB_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from
 const SHUTDOWN_CORE_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long graceful shutdown waits for every bouncer driver to say goodbye
-/// and release its upstream. The drivers stop concurrently, so this is the
+/// and release its upstream, and then for its persistence task to write the
+/// backlog lines it still holds. The networks stop concurrently, so this is the
 /// slowest one's budget, not a sum: a healthy IRC driver needs one bounded
-/// write (`QUIT`, 2 s at most); a Matrix driver logs its device out. Without
+/// write (`QUIT`, 2 s at most); a Matrix driver logs its device out; the
+/// backlog write is a few INSERTs. Without
 /// this step a restart met its own ghost on every network (433, then the
 /// refusal schedule). `tools/check-systemd-unit.sh` sums it with the core and
 /// database budgets for the unit's stop timeout.
@@ -237,12 +239,22 @@ impl ShutdownHandle {
         //    own bounded writes make this finite; the deadline only bounds a
         //    wedged one, and the stop stands either way.
         if let Some(registry) = self.bnc_registry.take() {
-            let (released, running) = registry.stop_all_within(driver_stop_timeout).await;
-            if released < running {
+            let stops = registry.stop_all_within(driver_stop_timeout).await;
+            if stops.released < stops.running {
                 eprintln!(
-                    "e6ircd: {} of {running} bouncer drivers did not release their upstream \
+                    "e6ircd: {} of {} bouncer drivers did not release their upstream \
                      within {}s of the stop; proceeding without them",
-                    running - released,
+                    stops.running - stops.released,
+                    stops.running,
+                    driver_stop_timeout.as_secs()
+                );
+            }
+            if stops.backlog_written < stops.running {
+                eprintln!(
+                    "e6ircd: {} of {} bouncer networks did not finish writing their last \
+                     backlog lines within {}s of the stop; those lines are lost",
+                    stops.running - stops.backlog_written,
+                    stops.running,
                     driver_stop_timeout.as_secs()
                 );
             }
@@ -581,8 +593,38 @@ pub fn install_crypto_provider() {
     });
 }
 
+/// Whether the process serves HTTP: the `[http]` listener, or a WebSocket IRC
+/// listener, which is served by the same application state.
+fn serves_http(config: &Config) -> bool {
+    config.http.is_some() || config.listeners.iter().any(|listener| listener.websocket)
+}
+
+/// What [`start`] reads from outside the configuration document that needs
+/// neither the network nor the database, judged by the very functions `start`
+/// uses: the monitoring token from the environment and every TLS certificate
+/// and key pair the configuration names. `e6ircd check-config` runs this after
+/// the parse-and-validate [`Config::load`] does, so a configuration it passes
+/// cannot fail `start` over a malformed variable or an unreadable key file.
+/// (With a database, the listeners and `[bnc]` in force come from the stored
+/// revision once one exists; this judges the configuration as stated.)
+pub fn check_offline(config: &Config) -> io::Result<()> {
+    if serves_http(config) {
+        crate::http::monitoring_token_digest_from_env().map_err(io::Error::other)?;
+    }
+    let listener_files = config.listeners.iter().filter_map(|l| l.tls.as_ref());
+    let bnc_files = config.bnc.iter().filter_map(|bnc| bnc.tls.as_ref());
+    for files in listener_files.chain(bnc_files) {
+        crate::certificate::ReloadingCertificate::load(files)?;
+    }
+    Ok(())
+}
+
 /// Bind listeners, spawn core workers, and start acceptors.
 pub async fn start(mut config: Config) -> io::Result<Running> {
+    // First, before anything that can wait: a SIGHUP sent to reload
+    // certificates during the database wait must not be the default action,
+    // which terminates the process.
+    let hangups = crate::certificate::Hangups::install()?;
     install_crypto_provider();
     // Resolve once and reuse for the control-plane import plus BNC secrets.
     // UI-managed OIDC/operator credentials are always sealed in PostgreSQL.
@@ -804,7 +846,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     let certificates = CertificateReloads::default();
     listeners.push(supervise_listener(
         "TLS certificate reloader",
-        tokio::spawn(certificates.clone().run()),
+        tokio::spawn(certificates.clone().run(hangups)),
         critical_tx.clone(),
     ));
     let bnc_listener = match (&pool, &bnc_registry) {
@@ -855,9 +897,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     // core, per-IP limiter and sendq. A websocket listener with no `[http]`
     // section still gets a state (with HTTP-UI fields defaulted — they are
     // unused by the WS-IRC router).
-    let any_ws_listener = config.listeners.iter().any(|l| l.websocket);
-    let app_state: Option<Arc<crate::http::AppState>> = if config.http.is_some() || any_ws_listener
-    {
+    let app_state: Option<Arc<crate::http::AppState>> = if serves_http(&config) {
         let bootstrap_available = if config.bootstrap.is_some() {
             let pool = pool
                 .as_ref()
@@ -934,6 +974,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             ui_sockets: crate::http::UiSocketLimiter::new(),
             account_exports: crate::http::AccountExportSlots::new(),
             conn_limiter: limiter.clone(),
+            database_readiness: crate::http::DatabaseReadiness::default(),
             request_admission: Arc::new(crate::http::RequestAdmission::new(
                 trusted_proxies.clone(),
                 MAX_HTTP_REQUESTS_IN_FLIGHT_PER_IP,
@@ -2220,15 +2261,12 @@ mod tests {
     fn write_certificate(
         dir: &std::path::Path,
     ) -> (TlsConfig, rustls_pki_types::CertificateDer<'static>) {
-        let generated =
-            rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("certificate");
         let files = TlsConfig {
             cert_path: dir.join("cert.pem"),
             key_path: dir.join("key.pem"),
         };
-        std::fs::write(&files.cert_path, generated.cert.pem()).expect("write certificate");
-        std::fs::write(&files.key_path, generated.signing_key.serialize_pem()).expect("write key");
-        (files, generated.cert.der().clone())
+        let trusted = crate::certificate::write_self_signed(&files);
+        (files, trusted)
     }
 
     /// The certificate a TLS client is shown by `acceptor`.

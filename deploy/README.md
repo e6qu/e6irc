@@ -110,14 +110,18 @@ neither a core file nor a same-user debugger may read them.
 
 A `[[listeners]]` entry with `tls` and the BNC attach listener's certificate
 (`[bnc].tls`, or the console's BNC TLS paths) are read from their PEM files at
-start and again whenever they change: the daemon compares the files'
-modification times every 60 seconds, and reloads at once on `SIGHUP`
+start and again whenever they change: every 60 seconds the daemon compares
+the files' identities (modification and status-change times, length, inode)
+with those it read, and it reloads at once on `SIGHUP`
 (`systemctl kill -s HUP e6ircd`). A renewal hook therefore needs no restart.
+The `SIGHUP` handler is installed before the database wait, so a renewal hook
+that fires while the daemon is still starting cannot kill it.
 A reload that fails — a half-written file, a key that does not belong to the
 certificate — keeps the certificate already being served and logs
-`ERROR: TLS certificate … could not be reloaded` with the reason; fix the
-files and send `SIGHUP` (or wait for the next check). Each successful reload is
-a log line naming the files.
+`ERROR: TLS certificate … could not be reloaded` with the reason, once per
+distinct failure; the files are then read again at every check until they load,
+so a fix is picked up within a minute however it was written (`SIGHUP` retries
+at once). Each successful reload is a log line naming the files.
 
 ### BNC attach listener
 
@@ -151,7 +155,9 @@ to find. A host that prefers a file mounts one and replaces the command with
 `E6IRC_HTTP_ADDR` to the file's `[http].addr` (or override the health check
 with `e6ircd healthcheck --addr ip:port`), because the probe reads the
 environment, not the file. `e6ircd check-config --config-from-environment`
-validates the environment and exits. Missing required values fail the
+validates the environment and exits; it checks everything start would refuse
+short of reaching the network or PostgreSQL, `E6IRC_MONITORING_TOKEN` and every
+configured TLS certificate/key pair included. Missing required values fail the
 container loudly rather than starting half-configured, and so do two kinds of
 malformed value, each refused by variable name without printing the value: a
 control character anywhere in a variable (typically the carriage return or
@@ -201,7 +207,7 @@ configured, the next start seals and imports them atomically.
 | `E6IRC_MONITORING_TOKEN` | no (secret; at least 32 non-whitespace characters) | Bearer for the read-only `/api/v1/monitoring/observation` endpoint; unset, the endpoint is closed |
 | `E6IRC_ADMIN_ACCOUNTS` | no | Comma-separated admin account names; empty fields are ignored |
 | `E6IRC_BOOTSTRAP_TOKEN` | no (secret; 32–512 bytes) | One-time browser token for creating the first durable administrator on an empty account store |
-| `E6IRC_DATABASE_MAX_CONNECTIONS` | no (sized to the host) | Most connections the shared PostgreSQL pool opens, 2–200 (`[database] max_connections` in a configuration file). The default is 1 (the serial database worker) + 4 (concurrent Argon2 verifications) + 2 × the host's CPU threads; size the PostgreSQL server's `max_connections` for every replica's pool plus your own sessions. The pool's size, idle count and acquire timeouts are on `/metrics` (`e6irc_database_pool_*`) |
+| `E6IRC_DATABASE_MAX_CONNECTIONS` | no (sized to the host) | Most connections the shared PostgreSQL pool opens, 2–200 (`[database] max_connections` in a configuration file). The default is 1 (the serial database worker) + 4 (concurrent Argon2 verifications) + 2 × the host's CPU threads; size the PostgreSQL server's `max_connections` for every replica's pool plus your own sessions. The pool's size, idle count and acquire timeouts are on `/api/v1/admin/metrics` (`e6irc_database_pool_*`; administrator authentication required) |
 | `E6IRC_OIDC_ISSUER` | no | Shauth issuer, e.g. `https://auth.dev.e6qu.dev` (enables SSO) |
 | `E6IRC_OIDC_CLIENT_ID` | with issuer | Shauth OIDC client id, e.g. `e6irc-dev` |
 | `E6IRC_OIDC_CLIENT_SECRET` | with issuer (secret) | Shauth OIDC client secret |
@@ -304,7 +310,11 @@ Any host that runs an OCI image can run e6irc. It has to provide:
   HTTP client, so its `HEALTHCHECK` is the daemon probing itself: `e6ircd
   healthcheck [--ready] [--addr ip:port]` reads the same `E6IRC_HTTP_ADDR` the
   server binds (no configuration file needed), exits 0 only on HTTP 200,
-  and finishes within three seconds. A host that prefers its own probe can
+  and finishes within three seconds. `/healthz` is bound once startup has
+  reached PostgreSQL, migrated, and loaded its state, so the image's
+  `HEALTHCHECK` start period (420 s) outlasts the default 300 s database wait
+  plus the migration lock retries; an orchestrator's own liveness probe needs
+  the same initial delay (or a startup probe). A host that prefers its own probe can
   still use the two endpoints directly. The probes bypass the service's
   admission bounds, so they answer while it is saturated: one client address
   may hold 128 connections (a trusted proxy is exempt; its clients are
