@@ -1102,7 +1102,11 @@ subset's exact behavior.
     deletes the account when repeated with it, after verifying the primary
     password, through the same deletion procedure as the console (§9.1) — so
     the account's sessions, the dropping one included, are disconnected by
-    its live gate.
+    its live gate. Deliberate differences from Atheme (maintainer decisions):
+    only a protected nick's user is warned, since the core mirrors grouped
+    and protected nicks, not every account name; `GHOST`/`REGAIN` take no
+    password argument (identify first); `SET` takes only `ENFORCE`, since
+    passwords and contacts are changed in the web console; and a successor is set with `SET SUCCESSOR`, not `FLAGS +S`.
   - ChanServ: `REGISTER`, `DROP`, `FLAGS`; `ACCESS <#channel> LIST|ADD|DEL` is
     the role front end over the same access entries (`AOP` = `+o`, `VOP` = `+v`,
     `VOP` by default); anyone on the list may `LIST` it, only the founder
