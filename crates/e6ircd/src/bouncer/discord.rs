@@ -76,12 +76,14 @@ struct ResumeState {
 }
 
 /// What one Discord driver keeps across its sessions: the gateway session to
-/// resume. Replaced by each READY, advanced by every sequenced dispatch, and
+/// resume — replaced by each READY, advanced by every sequenced dispatch, and
 /// forgotten when the gateway says it cannot be resumed (op 9 with `d:false`,
-/// or a close code that ends it).
+/// or a close code that ends it) — and the outbound deliveries, which are REST
+/// posts that need no gateway and so outlive the socket that queued them.
 struct Shared {
     config: DiscordConfig,
     resume: std::sync::Mutex<Option<ResumeState>>,
+    deliveries: super::CarriedDeliveries,
 }
 
 impl Shared {
@@ -89,6 +91,7 @@ impl Shared {
         Self {
             config,
             resume: std::sync::Mutex::new(None),
+            deliveries: super::CarriedDeliveries::new("Discord"),
         }
     }
 
@@ -123,10 +126,28 @@ impl Shared {
 
 async fn run(config: DiscordConfig, mut ends: DriverEnds) {
     let shared = std::sync::Arc::new(Shared::new(config));
-    super::run_with_backoff(shared, &mut ends, |shared, ends| {
-        Box::pin(session_once(shared, ends))
-    })
+    super::run_with_backoff_carrying(
+        shared,
+        &mut ends,
+        |shared, ends| Box::pin(session_once(shared, ends)),
+        Some(|shared| Box::pin(shared.deliveries.next_report())),
+    )
     .await;
+}
+
+/// How long to wait after an op 9 before the next connection identifies:
+/// Discord asks for a random one to five seconds, so the bots it invalidated
+/// together do not all identify again at once.
+fn invalid_session_wait() -> Duration {
+    use aws_lc_rs::rand::SecureRandom;
+    let mut bytes = [0u8; 2];
+    match aws_lc_rs::rand::SystemRandom::new().fill(&mut bytes) {
+        Ok(()) => Duration::from_millis(1_000 + u64::from(u16::from_le_bytes(bytes)) % 4_001),
+        Err(_) => {
+            eprintln!("discord: the system RNG failed; waiting the longest op 9 wait, 5 s");
+            Duration::from_secs(5)
+        }
+    }
 }
 
 /// What a gateway close code means for this driver. Codes 4004 and
@@ -169,134 +190,53 @@ fn close_outcome(shared: &Shared, code: Option<u16>) -> super::SessionOutcome {
     }
 }
 
+/// A gateway connection that said HELLO and was sent its IDENTIFY or RESUME,
+/// with everything the session learned on the way.
+struct OpenedGateway {
+    http: super::BridgeHttp,
+    base: String,
+    id_to_channel: std::collections::HashMap<String, String>,
+    channel_to_id: std::collections::HashMap<String, String>,
+    me: Me,
+    senders: super::BridgedSenders,
+    write: GatewaySink,
+    read: futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+    hb_interval: u64,
+    last_seq: Option<u64>,
+}
+
 async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionOutcome {
     use super::NetworkFailure;
     use super::SessionOutcome::Dropped;
-    let config = &shared.config;
-    let http = match super::bridge_http_or_outcome(
-        "discord",
-        Duration::from_secs(30),
-        config.internal_upstreams,
-    ) {
-        Ok(c) => c,
-        Err(outcome) => return outcome,
-    };
-    let base = super::bridge_api_base(&config.api_base, DEFAULT_API);
-
-    let (id_to_channel, channel_to_id) = match super::resolve_bridge_channels(
-        "discord",
-        &config.channels,
-        |id| {
-            let http = &http;
-            let base = &base;
-            let token = &config.token;
-            async move { fetch_channel_name(http, base, token, &id).await }
-        },
-        |id, error: super::ConnectFail| error.into_outcome(&format!("discord channel {id}")),
+    // Connecting needs nothing of `ends`, and can take a request timeout or
+    // three: the deliveries the driver carries keep finishing meanwhile.
+    let opened = super::while_carrying(
+        ends,
+        || shared.deliveries.next_report(),
+        open_gateway(shared),
     )
-    .await
-    {
-        Ok(maps) => maps,
+    .await;
+    let OpenedGateway {
+        http,
+        base,
+        id_to_channel,
+        channel_to_id,
+        me,
+        mut senders,
+        mut write,
+        mut read,
+        hb_interval,
+        mut last_seq,
+    } = match opened {
+        Ok(opened) => opened,
         Err(outcome) => return outcome,
     };
-
-    // Who the bot is, before anything is sent as it: its own posts come back
-    // on the gateway and are dropped there, and each delivered message is
-    // echoed under its name instead.
-    let me = match fetch_self(&http, &base, &config.token).await {
-        Ok(me) => me,
-        Err(error) => return error.into_outcome("discord bot user"),
-    };
-    // Every sender is keyed by its user id: a username is not the account (a
-    // webhook posts under any name it likes, the bot's own included).
-    let mut senders = super::BridgedSenders::new(super::ProviderAccount {
-        id: &me.id,
-        name: &me.username,
-        user: &me.id,
-        host: "discord",
-    });
+    let config = &shared.config;
     let identity = senders.own().clone();
-
-    let resume = shared.resume_state();
-    let gateway = match &resume {
-        Some(resume) => resume.resume_url.clone(),
-        None => match gateway_url(&http, &base).await {
-            Ok(u) => u,
-            Err(e) => {
-                eprintln!("discord: gateway discovery failed: {e}");
-                return Dropped(NetworkFailure::UpstreamRequestFailed);
-            }
-        },
-    };
-    let url = match gateway_connection_url(&gateway) {
-        Ok(url) => url,
-        Err(error) => {
-            eprintln!("discord: invalid gateway URL: {error}");
-            shared.forget("its resume URL is invalid");
-            return Dropped(NetworkFailure::UpstreamProtocolFailed);
-        }
-    };
-    let ws =
-        match super::bridge_ws_open(&url, "discord", "gateway", &base, config.internal_upstreams)
-            .await
-        {
-            Ok(ws) => ws,
-            Err(outcome) => return outcome,
-        };
-    let (mut write, mut read) = ws.split();
-
-    let hb_interval = match tokio::time::timeout(Duration::from_secs(30), read.next()).await {
-        Ok(Some(Ok(Ws::Text(t)))) => match parse_frame(t.as_str()) {
-            Ok(Frame {
-                event: Event::Hello(ms),
-                ..
-            }) => ms,
-            Ok(_) => {
-                eprintln!("discord: first gateway frame was not HELLO");
-                return Dropped(NetworkFailure::UpstreamProtocolFailed);
-            }
-            Err(e) => {
-                eprintln!("discord: malformed HELLO frame: {e}");
-                return Dropped(NetworkFailure::UpstreamProtocolFailed);
-            }
-        },
-        Err(_) => {
-            eprintln!("discord: HELLO timed out");
-            return Dropped(NetworkFailure::ConnectionTimedOut);
-        }
-        Ok(Some(Err(e))) => {
-            eprintln!("discord: gateway read error before HELLO: {e}");
-            return Dropped(NetworkFailure::ConnectionLost);
-        }
-        Ok(Some(Ok(Ws::Close(frame)))) => {
-            return close_outcome(shared, frame.as_ref().map(|f| u16::from(f.code)));
-        }
-        Ok(None) => {
-            eprintln!("discord: gateway closed before HELLO");
-            return Dropped(NetworkFailure::ConnectionLost);
-        }
-        Ok(Some(Ok(_))) => {
-            eprintln!("discord: no HELLO from gateway");
-            return Dropped(NetworkFailure::UpstreamProtocolFailed);
-        }
-    };
-
-    let mut last_seq: Option<u64> = None;
-    let opened = match &resume {
-        Some(resume) => {
-            last_seq = resume.seq;
-            send_gateway(
-                &mut write,
-                &ResumeFrame::new(&config.token, &resume.session_id, resume.seq),
-                "RESUME",
-            )
-            .await
-        }
-        None => send_gateway(&mut write, &IdentifyFrame::new(&config.token), "IDENTIFY").await,
-    };
-    if let Err(outcome) = opened {
-        return outcome;
-    }
     if let Err(outcome) = ends.begin_bridge_session(&identity, id_to_channel.values()) {
         return outcome;
     }
@@ -314,7 +254,6 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
     let mut silence = super::SilenceDeadline::new(Duration::from_millis(
         hb_interval.saturating_mul(2).max(60_000),
     ));
-    let mut deliveries = super::DeliveryQueue::new(super::DELIVERY_QUEUE_CAPACITY);
 
     loop {
         tokio::select! {
@@ -368,29 +307,17 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
                         if !resumable {
                             shared.forget("op 9");
                         }
-                        return Dropped(NetworkFailure::ConnectionLost);
+                        return super::SessionOutcome::DroppedFor {
+                            failure: NetworkFailure::ConnectionLost,
+                            at_least: invalid_session_wait(),
+                        };
                     }
-                    Event::Message { channel_id, author_id, author, content, attachments } => {
-                        if author_id == me.id {
+                    Event::Message(message) => {
+                        if message.author_id == me.id {
                             continue;
                         }
-                        let body = if !content.is_empty() {
-                            content
-                        } else if !attachments.is_empty() {
-                            attachments.join(" ")
-                        } else {
-                            continue;
-                        };
-                        if let Some(channel) = id_to_channel.get(&channel_id) {
-                            let who = senders.identity(super::ProviderAccount {
-                                id: &author_id,
-                                name: &author,
-                                user: &author_id,
-                                host: "discord",
-                            });
-                            for line in super::render_bridged(
-                                &who, channel, &super::Inbound::message(&body),
-                            ) {
+                        if let Some(channel) = id_to_channel.get(&message.channel_id) {
+                            for line in message.lines(channel, &id_to_channel, &mut senders) {
                                 ends.emit_line(line);
                             }
                         }
@@ -398,7 +325,7 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
                     Event::Hello(_) | Event::Ignore => {}
                 }
             }
-            outcome = deliveries.next() => super::report_delivery(ends, "Discord", "channel", outcome),
+            report = shared.deliveries.next_report() => report(ends),
             cmd = ends.next_command() => {
                 let deliver = {
                     let (http, base, token) = (http.clone(), base.clone(), config.token.clone());
@@ -407,7 +334,10 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
                         async move { send_message(&http, &base, &token, &id, &text).await }
                     }
                 };
-                if super::queue_channel_command(ends, cmd, &channel_to_id, &identity, "Discord", &mut deliveries, deliver)
+                if shared
+                    .deliveries
+                    .queue_command(ends, cmd, &channel_to_id, &identity, deliver)
+                    .await
                     .is_none()
                 {
                     return super::SessionOutcome::Stopped;
@@ -415,6 +345,139 @@ async fn session_once(shared: &Shared, ends: &mut DriverEnds) -> super::SessionO
             }
         }
     }
+}
+
+/// Everything before the gateway session begins: the channel lookups, the
+/// bot's own account, the gateway's address, the socket, its HELLO, and the
+/// IDENTIFY (or the RESUME of a session the driver kept).
+async fn open_gateway(shared: &Shared) -> Result<OpenedGateway, super::SessionOutcome> {
+    use super::NetworkFailure;
+    use super::SessionOutcome::Dropped;
+    let config = &shared.config;
+    let http = super::bridge_http_or_outcome(
+        "discord",
+        Duration::from_secs(30),
+        config.internal_upstreams,
+    )?;
+    let base = super::bridge_api_base(&config.api_base, DEFAULT_API);
+
+    let (id_to_channel, channel_to_id) = super::resolve_bridge_channels(
+        "discord",
+        &config.channels,
+        |id| {
+            let http = &http;
+            let base = &base;
+            let token = &config.token;
+            async move { fetch_channel_name(http, base, token, &id).await }
+        },
+        |id, error: super::ConnectFail| error.into_outcome(&format!("discord channel {id}")),
+    )
+    .await?;
+
+    // Who the bot is, before anything is sent as it: its own posts come back
+    // on the gateway and are dropped there, and each delivered message is
+    // echoed under its name instead.
+    let me = fetch_self(&http, &base, &config.token)
+        .await
+        .map_err(|error| error.into_outcome("discord bot user"))?;
+    // Every sender is keyed by its user id: a username is not the account (a
+    // webhook posts under any name it likes, the bot's own included).
+    let senders = super::BridgedSenders::new(super::ProviderAccount {
+        id: &me.id,
+        name: &me.username,
+        user: &me.id,
+        host: "discord",
+    });
+
+    let resume = shared.resume_state();
+    let gateway = match &resume {
+        Some(resume) => resume.resume_url.clone(),
+        None => match gateway_url(&http, &base).await {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("discord: gateway discovery failed: {e}");
+                return Err(Dropped(NetworkFailure::UpstreamRequestFailed));
+            }
+        },
+    };
+    let url = match gateway_connection_url(&gateway) {
+        Ok(url) => url,
+        Err(error) => {
+            eprintln!("discord: invalid gateway URL: {error}");
+            shared.forget("its resume URL is invalid");
+            return Err(Dropped(NetworkFailure::UpstreamProtocolFailed));
+        }
+    };
+    let ws =
+        super::bridge_ws_open(&url, "discord", "gateway", &base, config.internal_upstreams).await?;
+    let (mut write, mut read) = ws.split();
+
+    let hb_interval = match tokio::time::timeout(Duration::from_secs(30), read.next()).await {
+        Ok(Some(Ok(Ws::Text(t)))) => match parse_frame(t.as_str()) {
+            Ok(Frame {
+                event: Event::Hello(ms),
+                ..
+            }) => ms,
+            Ok(_) => {
+                eprintln!("discord: first gateway frame was not HELLO");
+                return Err(Dropped(NetworkFailure::UpstreamProtocolFailed));
+            }
+            Err(e) => {
+                eprintln!("discord: malformed HELLO frame: {e}");
+                return Err(Dropped(NetworkFailure::UpstreamProtocolFailed));
+            }
+        },
+        Err(_) => {
+            eprintln!("discord: HELLO timed out");
+            return Err(Dropped(NetworkFailure::ConnectionTimedOut));
+        }
+        Ok(Some(Err(e))) => {
+            eprintln!("discord: gateway read error before HELLO: {e}");
+            return Err(Dropped(NetworkFailure::ConnectionLost));
+        }
+        Ok(Some(Ok(Ws::Close(frame)))) => {
+            return Err(close_outcome(
+                shared,
+                frame.as_ref().map(|f| u16::from(f.code)),
+            ));
+        }
+        Ok(None) => {
+            eprintln!("discord: gateway closed before HELLO");
+            return Err(Dropped(NetworkFailure::ConnectionLost));
+        }
+        Ok(Some(Ok(_))) => {
+            eprintln!("discord: no HELLO from gateway");
+            return Err(Dropped(NetworkFailure::UpstreamProtocolFailed));
+        }
+    };
+
+    let last_seq = match &resume {
+        Some(resume) => {
+            send_gateway(
+                &mut write,
+                &ResumeFrame::new(&config.token, &resume.session_id, resume.seq),
+                "RESUME",
+            )
+            .await?;
+            resume.seq
+        }
+        None => {
+            send_gateway(&mut write, &IdentifyFrame::new(&config.token), "IDENTIFY").await?;
+            None
+        }
+    };
+    Ok(OpenedGateway {
+        http,
+        base,
+        id_to_channel,
+        channel_to_id,
+        me,
+        senders,
+        write,
+        read,
+        hb_interval,
+        last_seq,
+    })
 }
 
 struct Frame {
@@ -429,13 +492,7 @@ enum Event {
         resume_url: String,
     },
     Resumed,
-    Message {
-        channel_id: String,
-        author_id: String,
-        author: String,
-        content: String,
-        attachments: Vec<String>,
-    },
+    Message(DiscordMessage),
     HeartbeatRequest,
     Ack,
     /// Op 7: the gateway wants this connection replaced (and resumed).
@@ -445,6 +502,125 @@ enum Event {
         resumable: bool,
     },
     Ignore,
+}
+
+/// One `MESSAGE_CREATE`, as the bridge relays it.
+#[derive(Debug)]
+struct DiscordMessage {
+    channel_id: String,
+    author_id: String,
+    author: String,
+    content: String,
+    /// Each attachment's URL, in order.
+    attachments: Vec<String>,
+    /// The users the content mentions, by id: Discord sends the names beside
+    /// the `<@id>` markup that names them.
+    mentions: std::collections::HashMap<String, String>,
+    /// What the message is called when it carries nothing the bridge can
+    /// show (a sticker, an embed, a system message).
+    unrelayable: String,
+}
+
+impl DiscordMessage {
+    /// What the message says on IRC: its content, markup decoded, then each
+    /// attachment's URL on a line of its own (like a Slack file share);
+    /// `None` when there is neither.
+    fn body(&self, channels: &std::collections::HashMap<String, String>) -> Option<String> {
+        let mut body = decode_markup(&self.content, &self.mentions, channels);
+        for url in &self.attachments {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(url);
+        }
+        (!body.is_empty()).then_some(body)
+    }
+
+    /// The IRC lines for this message in `channel`: what it says, or — when
+    /// it carries nothing the bridge can show — one notice naming what it
+    /// was, never nothing at all.
+    fn lines(
+        &self,
+        channel: &str,
+        channels: &std::collections::HashMap<String, String>,
+        senders: &mut super::BridgedSenders,
+    ) -> Vec<String> {
+        let who = senders.identity(super::ProviderAccount {
+            id: &self.author_id,
+            name: &self.author,
+            user: &self.author_id,
+            host: "discord",
+        });
+        match self.body(channels) {
+            Some(body) => super::render_bridged(&who, channel, &super::Inbound::message(&body)),
+            None => vec![super::unrelayed_notice(
+                "discord",
+                channel,
+                &self.unrelayable,
+                Some(&who.nick),
+            )],
+        }
+    }
+}
+
+/// Discord's message markup as IRC reads it: a user mention `<@id>` or
+/// `<@!id>` is `@name` (named by the message's own `mentions`, else by the
+/// id), a channel `<#id>` is its bridged channel's name (else `#id`), and a
+/// custom emoji `<:name:id>` or `<a:name:id>` is `:name:`. Any other `<…>` —
+/// a role mention, a timestamp, a link that suppresses its embed — stays as
+/// written.
+fn decode_markup(
+    text: &str,
+    mentions: &std::collections::HashMap<String, String>,
+    channels: &std::collections::HashMap<String, String>,
+) -> String {
+    fn snowflake(id: &str) -> Option<&str> {
+        (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some(id)
+    }
+    let token = |inner: &str| -> Option<String> {
+        if let Some(id) = inner
+            .strip_prefix("@!")
+            .or_else(|| inner.strip_prefix('@'))
+            .and_then(snowflake)
+        {
+            return Some(format!("@{}", mentions.get(id).map_or(id, String::as_str)));
+        }
+        if let Some(id) = inner.strip_prefix('#').and_then(snowflake) {
+            return Some(
+                channels
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("#{id}")),
+            );
+        }
+        let (name, id) = inner
+            .strip_prefix("a:")
+            .or_else(|| inner.strip_prefix(':'))?
+            .rsplit_once(':')?;
+        let named = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        (named && snowflake(id).is_some()).then(|| format!(":{name}:"))
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        match after
+            .find('>')
+            .and_then(|close| Some((token(&after[..close])?, close)))
+        {
+            Some((decoded, close)) => {
+                out.push_str(&decoded);
+                rest = &after[close + 1..];
+            }
+            None => {
+                out.push('<');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[derive(serde::Serialize)]
@@ -556,14 +732,38 @@ struct ReadyData {
 #[derive(serde::Deserialize)]
 struct MessageData {
     channel_id: String,
-    author: MessageAuthor,
+    author: DiscordUser,
     content: String,
     #[serde(default)]
     attachments: Vec<MessageAttachment>,
+    #[serde(default)]
+    mentions: Vec<DiscordUser>,
+    #[serde(default)]
+    sticker_items: Vec<serde::de::IgnoredAny>,
+    #[serde(default)]
+    embeds: Vec<serde::de::IgnoredAny>,
+    /// The message type: 0 a message, 19 a reply, others system messages.
+    #[serde(default, rename = "type")]
+    kind: u64,
+}
+
+impl MessageData {
+    /// What this message is called when nothing in it can be shown.
+    fn unrelayable(&self) -> String {
+        if !self.sticker_items.is_empty() {
+            "sticker".into()
+        } else if !self.embeds.is_empty() {
+            "embed".into()
+        } else if matches!(self.kind, 0 | 19) {
+            "empty".into()
+        } else {
+            format!("type-{}", self.kind)
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
-struct MessageAuthor {
+struct DiscordUser {
     id: String,
     username: String,
 }
@@ -619,7 +819,8 @@ fn parse_frame(text: &str) -> Result<Frame, String> {
                 "RESUMED" => Event::Resumed,
                 "MESSAGE_CREATE" => {
                     let message: MessageData = decode_data(text, "MESSAGE_CREATE")?;
-                    Event::Message {
+                    let unrelayable = message.unrelayable();
+                    Event::Message(DiscordMessage {
                         channel_id: message.channel_id,
                         author_id: message.author.id,
                         author: message.author.username,
@@ -629,7 +830,13 @@ fn parse_frame(text: &str) -> Result<Frame, String> {
                             .into_iter()
                             .map(|attachment| attachment.url)
                             .collect(),
-                    }
+                        mentions: message
+                            .mentions
+                            .into_iter()
+                            .map(|user| (user.id, user.username))
+                            .collect(),
+                        unrelayable,
+                    })
                 }
                 _ => Event::Ignore,
             }
@@ -698,7 +905,7 @@ async fn fetch_self(
     let me: Me = super::bridge_send_credentials(
         http.get(&format!("{base}/users/@me"))?
             .header("Authorization", format!("Bot {token}")),
-        "bot user lookup",
+        super::CredentialRequest::Identity("bot user lookup"),
     )
     .await?
     .bounded_json()
@@ -726,7 +933,7 @@ async fn fetch_channel_name(
     let response: ChannelResponse = super::bridge_send_credentials(
         http.get(&format!("{base}/channels/{id}"))?
             .header("Authorization", format!("Bot {token}")),
-        "channel lookup",
+        super::CredentialRequest::DiscordChannel(id),
     )
     .await?
     .bounded_json()
@@ -801,19 +1008,93 @@ mod tests {
         .expect("MESSAGE_CREATE");
         assert_eq!(f.seq, Some(8));
         match f.event {
-            Event::Message {
-                channel_id,
-                author_id,
-                author,
-                content,
-                attachments: _,
-            } => {
-                assert_eq!(channel_id, "42");
-                assert_eq!(author_id, "7");
-                assert_eq!(author, "alice");
-                assert_eq!(content, "hi");
+            Event::Message(message) => {
+                assert_eq!(message.channel_id, "42");
+                assert_eq!(message.author_id, "7");
+                assert_eq!(message.author, "alice");
+                assert_eq!(message.content, "hi");
             }
             _ => panic!("expected Message"),
+        }
+    }
+
+    /// Discord's markup read the way an IRC user reads text.
+    #[test]
+    fn inbound_markup_decodes_mentions_channels_and_custom_emoji() {
+        let mentions = HashMap::from([("7".to_string(), "bob".to_string())]);
+        let channels = HashMap::from([("42".to_string(), "#general".to_string())]);
+        for (markup, plain) in [
+            ("<@7> hi", "@bob hi"),
+            ("<@!7> hi", "@bob hi"),
+            ("<@9> hi", "@9 hi"),
+            ("in <#42> and <#99>", "in #general and #99"),
+            ("<:blob:123> <a:party_parrot:456>", ":blob: :party_parrot:"),
+            // A role, a timestamp, an embed-suppressed link: as written.
+            (
+                "<@&5> <t:1700000000:R> <https://x.example>",
+                "<@&5> <t:1700000000:R> <https://x.example>",
+            ),
+            ("a < b <@7>", "a < b @bob"),
+            ("unclosed <@7", "unclosed <@7"),
+            ("<@7x> <:bad name:1>", "<@7x> <:bad name:1>"),
+        ] {
+            assert_eq!(
+                decode_markup(markup, &mentions, &channels),
+                plain,
+                "{markup}"
+            );
+        }
+    }
+
+    /// A message with text and files is both, one link a line; one with
+    /// neither is named by what it carried.
+    #[test]
+    fn a_message_body_is_its_text_then_its_attachments() {
+        let message = |content: &str, attachments: &[&str], data: &str| {
+            let frame = format!(
+                r#"{{"op":0,"s":8,"t":"MESSAGE_CREATE","d":{{"channel_id":"42","content":{},
+                   "author":{{"id":"7","username":"alice"}},"attachments":[{}]{data}}}}}"#,
+                serde_json::json!(content),
+                attachments
+                    .iter()
+                    .map(|url| format!(r#"{{"url":"{url}"}}"#))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            match parse_frame(&frame).expect("MESSAGE_CREATE").event {
+                Event::Message(message) => message,
+                _ => panic!("expected Message"),
+            }
+        };
+        let channels = HashMap::new();
+        assert_eq!(
+            message("look", &["https://a", "https://b"], "").body(&channels),
+            Some("look\nhttps://a\nhttps://b".into())
+        );
+        assert_eq!(
+            message("", &["https://a"], "").body(&channels),
+            Some("https://a".into())
+        );
+        for (data, what) in [
+            (r#","sticker_items":[{"id":"1","name":"wave"}]"#, "sticker"),
+            (r#","embeds":[{"title":"x"}]"#, "embed"),
+            (r#","type":7"#, "type-7"),
+            ("", "empty"),
+        ] {
+            let message = message("", &[], data);
+            assert_eq!(message.body(&channels), None);
+            assert_eq!(message.unrelayable, what);
+        }
+    }
+
+    #[test]
+    fn the_op_9_wait_is_one_to_five_seconds() {
+        for _ in 0..200 {
+            let wait = invalid_session_wait();
+            assert!(
+                (Duration::from_secs(1)..=Duration::from_secs(5)).contains(&wait),
+                "{wait:?}"
+            );
         }
     }
 
@@ -1088,16 +1369,51 @@ mod tests {
 
         /// After op 9 the gateway keeps acknowledging heartbeats, so a driver
         /// that ignored it stayed Connected and received nothing, forever.
+        /// Discord asks for a random one to five seconds before the next
+        /// IDENTIFY; the transient schedule alone re-dialled in 200 ms.
         #[tokio::test]
-        async fn an_invalid_session_ends_the_session() {
+        async fn an_invalid_session_ends_the_session_and_waits_before_identifying() {
             let mut oracle = manual(Options::default()).await;
             let (_handle, session) = spawn_session(&oracle);
             identify(&mut oracle, 0, 60_000).await;
             oracle.send(0, json!({ "op": 9, "d": false }));
-            assert!(matches!(
-                outcome_within(session, std::time::Duration::from_secs(2)).await,
-                SessionOutcome::Dropped(_)
-            ));
+            match outcome_within(session, std::time::Duration::from_secs(2)).await {
+                SessionOutcome::DroppedFor { failure, at_least } => {
+                    assert_eq!(failure, crate::bouncer::NetworkFailure::ConnectionLost);
+                    assert!(
+                        (std::time::Duration::from_secs(1)..=std::time::Duration::from_secs(5))
+                            .contains(&at_least),
+                        "{at_least:?}"
+                    );
+                }
+                _ => panic!("op 9 did not end the session with its wait"),
+            }
+        }
+
+        /// The runner honours the wait: the next connection comes no sooner
+        /// than a second after the op 9, even though the session held.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_driver_redials_no_sooner_than_the_op_9_wait() {
+            let mut oracle = manual(Options::default()).await;
+            let handle = Box::new(DiscordDriver::new(config(&oracle))).start();
+            identify(&mut oracle, 0, 60_000).await;
+            let invalidated = tokio::time::Instant::now();
+            oracle.send(0, json!({ "op": 9, "d": false }));
+            tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                loop {
+                    if let Some(OracleEvent::Connected(1)) = oracle.events.recv().await {
+                        return;
+                    }
+                }
+            })
+            .await
+            .expect("the driver never reconnected");
+            assert!(
+                invalidated.elapsed() >= std::time::Duration::from_secs(1),
+                "re-dialled {:?} after op 9",
+                invalidated.elapsed()
+            );
+            handle.shutdown_and_wait().await;
         }
 
         /// Op 7 asks for a new connection; it is not a failure.
@@ -1339,6 +1655,176 @@ mod tests {
                     assert!(!line.line.contains("not delivered"), "{}", line.line);
                 }
             }
+        }
+
+        /// The echo of `text`, sent through the handle, once the provider
+        /// accepted it; panics after `within`.
+        async fn echo_of(
+            events: &mut tokio::sync::broadcast::Receiver<DriverEvent>,
+            text: &str,
+            within: std::time::Duration,
+        ) {
+            tokio::time::timeout(within, async {
+                loop {
+                    match events.recv().await {
+                        Ok(DriverEvent::Echo { line, .. }) if line.line.ends_with(text) => return,
+                        Ok(DriverEvent::Line(line)) => {
+                            assert!(!line.line.contains("not delivered"), "{}", line.line);
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{text:?} was never delivered"));
+        }
+
+        /// A post is REST and needs no gateway: a client's message accepted
+        /// before the connection dropped is still delivered — and echoed —
+        /// after it. The queue was the session's, and a drop took every
+        /// accepted message with it, unsaid.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_message_queued_before_a_drop_is_delivered_after_it() {
+            let mut oracle = manual(Options {
+                post_delay: std::time::Duration::from_millis(600),
+                ..Options::default()
+            })
+            .await;
+            let handle = Box::new(DiscordDriver::new(config(&oracle))).start();
+            let mut events = handle.subscribe();
+            identify(&mut oracle, 0, 60_000).await;
+            line_containing(&mut events, "component connected").await;
+            assert_eq!(
+                handle.send("PRIVMSG #general :sent before the drop"),
+                crate::bouncer::SendOutcome::Sent
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            oracle.close(0, 4000);
+            echo_of(
+                &mut events,
+                ":sent before the drop",
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+            handle.shutdown_and_wait().await;
+        }
+
+        /// A parked driver still finishes what it accepted: the delivery is
+        /// made (or said to have failed), not held for as long as the park.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_parked_driver_still_finishes_its_queued_deliveries() {
+            let mut oracle = manual(Options {
+                post_delay: std::time::Duration::from_millis(600),
+                ..Options::default()
+            })
+            .await;
+            let handle = Box::new(DiscordDriver::new(config(&oracle))).start();
+            let mut events = handle.subscribe();
+            identify(&mut oracle, 0, 60_000).await;
+            line_containing(&mut events, "component connected").await;
+            assert_eq!(
+                handle.send("PRIVMSG #general :sent before the park"),
+                crate::bouncer::SendOutcome::Sent
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            oracle.close(0, 4012);
+            echo_of(
+                &mut events,
+                ":sent before the park",
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+            assert_eq!(
+                handle.runtime_snapshot().lifecycle,
+                crate::bouncer::NetworkLifecycle::RegistrationFailed
+            );
+            handle.shutdown_and_wait().await;
+        }
+
+        /// A 403 on the channel lookup is a channel the bot cannot see, and a
+        /// 404 one that does not exist: both are about the configuration and
+        /// name the channel. The 403 used to park the network as a refused
+        /// token; the 404 was retried forever.
+        #[tokio::test]
+        async fn a_channel_the_bot_cannot_see_or_that_does_not_exist_is_a_mapping_refusal() {
+            for (channel, says) in [
+                (bridge_oracle::DISCORD_HIDDEN_CHANNEL, "cannot see"),
+                ("44", "has no channel"),
+            ] {
+                let oracle = manual(Options::default()).await;
+                let config = DiscordConfig {
+                    channels: vec![channel.into()],
+                    ..config(&oracle)
+                };
+                let (_handle, mut ends) = NetworkHandle::channels(10);
+                match session_once(&Shared::new(config), &mut ends).await {
+                    SessionOutcome::ConfigurationRejected(refusal) => {
+                        assert_eq!(
+                            refusal.failure(),
+                            crate::bouncer::NetworkFailure::ChannelMappingFailed
+                        );
+                        assert!(
+                            refusal.diagnostic().contains(says)
+                                && refusal.diagnostic().contains(channel),
+                            "{refusal:?}"
+                        );
+                    }
+                    _ => panic!("channel {channel} was not a mapping refusal"),
+                }
+            }
+        }
+
+        /// Attachments ride with the text, one link a line; a mention, a
+        /// channel and a custom emoji read as IRC reads them; a message with
+        /// nothing to show is said, not skipped.
+        #[tokio::test]
+        async fn inbound_attachments_markup_and_unshowable_messages() {
+            let mut oracle = manual(Options::default()).await;
+            let (handle, _session) = spawn_session(&oracle);
+            let mut events = handle.subscribe();
+            identify(&mut oracle, 0, 60_000).await;
+            let message = |sequence: u64, data: serde_json::Value| {
+                let mut frame = discord_message_frame(sequence, "");
+                for (key, value) in data.as_object().expect("message fields") {
+                    frame["d"][key] = value.clone();
+                }
+                frame
+            };
+            oracle.send(
+                0,
+                message(
+                    2,
+                    json!({
+                        "content": "look <@7> in <#42> <:blob:123>",
+                        "mentions": [{ "id": "7", "username": "bob" }],
+                        "attachments": [{ "url": "https://cdn.example/a.png" },
+                                        { "url": "https://cdn.example/b.png" }],
+                    }),
+                ),
+            );
+            assert_eq!(
+                line_containing(&mut events, "look").await,
+                ":alice!user@discord PRIVMSG #general :look @bob in #general :blob:"
+            );
+            assert_eq!(
+                line_containing(&mut events, "a.png").await,
+                ":alice!user@discord PRIVMSG #general :https://cdn.example/a.png"
+            );
+            assert_eq!(
+                line_containing(&mut events, "b.png").await,
+                ":alice!user@discord PRIVMSG #general :https://cdn.example/b.png"
+            );
+            oracle.send(
+                0,
+                message(
+                    3,
+                    json!({ "sticker_items": [{ "id": "1", "name": "wave" }] }),
+                ),
+            );
+            assert_eq!(
+                line_containing(&mut events, "sticker").await,
+                ":*bnc* NOTICE #general :discord: a sticker message from alice was not relayed"
+            );
         }
 
         /// Remote text never reaches an IRC client as a CTCP request.

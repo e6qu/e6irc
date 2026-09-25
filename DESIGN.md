@@ -2243,8 +2243,28 @@ Design constraints recorded now:
   then parks (a room join refused before an invitation arrives, a channel name
   the provider side can rename). The diagnostic is e6irc's own sentence naming
   the room or channel; provider response text is deliberately never carried.
-  A 401/403 on Discord's channel lookup is about the token, so it is
-  `AuthRejected` and parks at once.
+  What a refusal of a credentialed request means depends on what it asked
+  about (`CredentialRequest`): a login or the bot's own account
+  (`GET /users/@me`, Matrix `/login`) refused with 401 or 403 is the
+  credentials, `AuthRejected`, parked at once; on Discord's channel lookup
+  only a 401 is the token — a 403 (Missing Access: the bot is not in that
+  channel's server, or may not view it) and a 404 (Unknown Channel) are
+  `ChannelMappingFailed` refusals naming the channel id, on the refusal
+  schedule. Slack's `conversations.info` answers `channel_not_found`,
+  `not_in_channel` and `is_archived` the same way. (A 403 used to park the
+  network as a bad token; a 404 was retried forever.)
+- A bridge's work that needs no socket belongs to the driver, not the
+  session. Discord's and Slack's outbound deliveries (`CarriedDeliveries`,
+  REST posts in a bounded serial queue) and Slack's acknowledged inbound
+  messages waiting on their name lookups, its display-name cache and its
+  envelope re-delivery memory all live in the driver's shared state. Each
+  session drains the queues in its loop and while it connects
+  (`while_carrying`); between sessions — the backoff, a refusal's schedule,
+  a park — the runner does (`run_with_backoff_carrying`). A reconnect used to
+  drop every accepted post and up to 256 acked Slack messages (which Slack
+  never sends again), without a word, and an envelope re-delivered on the
+  next socket was relayed twice. A parked driver still finishes what it
+  accepted: each delivery ends in its echo or its undelivered notice.
 - A Matrix password login creates a device on the homeserver that only
   `/logout` removes, so the login belongs to the driver, not to the session:
   made once, reused by every reconnect, replaced only when the homeserver
@@ -2268,6 +2288,16 @@ Design constraints recorded now:
   room with `m.room.encryption` state (checked after each join) or an
   encrypted event mid-session is `ConfigurationRejected(room_encrypted)`: the
   bridge holds no device keys and would otherwise relay nothing, silently.
+  The sync's `rooms.leave` is read too: a bridged room the account was kicked
+  or banned from (or left from another client) has what was said before the
+  leave relayed, then a notice in its channel, the position forgotten, and
+  the session ended as `ConfigurationRejected(channel_join_refused)` on the
+  refusal schedule — the next session joins afresh, a kick clears, and a ban
+  answers the join with a 403 until the network parks. Reading only `join`
+  kept syncing a room the bridge would never hear again. Every message the
+  bridge sends carries `"m.mentions": {}`: without it clients fall back to
+  the body-matching push rules, and an IRC line saying `@room` paged the
+  whole room.
   `m.emote` becomes a CTCP ACTION, `m.notice` a NOTICE, media its body plus the
   spec's `/_matrix/media/v3/download` link (homeservers that enforce
   authenticated media will not open it), `m.location` its body plus a geo URI;
@@ -2284,18 +2314,35 @@ Design constraints recorded now:
   IDENTIFY budget is not spent; op 9 (invalid session) ends the session — it
   used to be ignored while the gateway kept ACKing heartbeats, leaving the
   network "connected" and deaf — and op 9 `d:false` and close codes
-  4004/4007/4009/4010–4014 forget the session. A heartbeat that finds the
-  previous one unacknowledged drops the zombie connection; op 7 reconnects
-  without recording a failure. 4004 is `AuthRejected`; 4010–4014 are
+  4004/4007/4009/4010–4014 forget the session. After op 9 the next connection
+  waits a random one to five seconds, as Discord requires, before it
+  identifies (`SessionOutcome::DroppedFor`: the runner waits the longer of
+  that and its backoff, which alone re-dialled in 200 ms). A heartbeat that
+  finds the previous one unacknowledged drops the zombie connection; op 7
+  reconnects without recording a failure. A `MESSAGE_CREATE` is its content
+  followed by each attachment's URL on a line of its own (attachments used to
+  be dropped whenever there was text); user mentions `<@id>`/`<@!id>` read as
+  `@username` from the message's own `mentions`, channel mentions `<#id>` as
+  the bridged channel's name, custom emoji `<:name:id>`/`<a:name:id>` as
+  `:name:`; a message with nothing to show (a sticker, an embed, a system
+  message) is one bounded "not relayed" notice naming what it was, never a
+  silent skip. 4004 is `AuthRejected`; 4010–4014 are
   configuration refusals that park at once with a code-specific diagnostic
   (4014 names the Message Content intent). Posts send
   `allowed_mentions: {parse: []}`, so an IRC line can never page a guild.
 - Slack reads `disconnect.reason`: `warning` and `refresh_requested` open the
   next socket inside the session while the retiring one is still read and
   acked (no failure recorded); `link_disabled` is a configuration refusal.
-  Envelopes are acked before any HTTP work, deliveries and name lookups run in
-  bounded serial queues beside the socket, a re-delivered envelope id is acked
-  and not relayed twice, and the socket is pinged every 30 s. Outbound text
+  Envelopes are acked before any HTTP work — and before they are read: only a
+  frame that is not JSON ends the session, while anything JSON is acked by its
+  `envelope_id` first, and an event that cannot be read is one "malformed"
+  not-relayed notice in its channel when that channel is bridged (logged
+  otherwise). Parsing before the ack used to fail the session on one bad
+  event, which Slack then re-sent forever, relaying nothing else — the rule
+  Matrix follows for timeline events. Deliveries and name lookups run in
+  bounded serial queues beside the socket (driver-owned, above), a
+  re-delivered envelope id is acked and not relayed twice, and the socket is
+  pinged every 30 s. Outbound text
   escapes `& < >` (which also neutralises `<!channel>`); inbound entities and
   markup are decoded (`<@U…>` to `@name`, `<#C…|n>` to `#n`, links to
   `label (url)`). Message subtypes are a whitelist (file shares, thread

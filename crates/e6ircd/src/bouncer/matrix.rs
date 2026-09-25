@@ -209,7 +209,7 @@ impl Shared {
         let response: LoginResponse = super::bridge_send_credentials(
             http.post(&format!("{}/_matrix/client/v3/login", self.base()))?
                 .json(&LoginRequest::password(&self.config)),
-            "login",
+            super::CredentialRequest::Identity("login"),
         )
         .await?
         .bounded_json()
@@ -406,6 +406,13 @@ fn relay_batch(
             ends.emit_line(line);
         }
     }
+    if let Some(room_id) = batch
+        .left
+        .into_iter()
+        .find(|room| session.rooms.room_to_channel.contains_key(room))
+    {
+        return Some(left_room_refusal(shared, session, ends, &room_id));
+    }
     let room_id = batch
         .encrypted
         .into_iter()
@@ -422,6 +429,37 @@ fn relay_batch(
     ));
     shared.forget_position();
     Some(encrypted_room_refusal(alias).into_outcome("matrix"))
+}
+
+/// The account is no longer in a bridged room — kicked, banned, or left from
+/// another client. A session that went on syncing would never hear the room
+/// again, and say nothing about it. So it is said in the channel, the
+/// position is forgotten (the next session joins every room afresh, and a
+/// ban answers that join with a 403), and the session ends as a join refusal
+/// on the refusal schedule: a kick clears on the rejoin, an invitation clears
+/// an invite-only room, and what does neither parks the network.
+fn left_room_refusal(
+    shared: &Shared,
+    session: &Session,
+    ends: &DriverEnds,
+    room_id: &str,
+) -> super::SessionOutcome {
+    let channel = &session.rooms.room_to_channel[room_id];
+    let alias = session
+        .rooms
+        .room_to_alias
+        .get(room_id)
+        .map_or(room_id, String::as_str);
+    ends.emit_line(format!(
+        ":*bnc* NOTICE {channel} :matrix: the bridge account is no longer in this room \
+         (kicked, banned, or left elsewhere); rejoining"
+    ));
+    shared.forget_position();
+    super::ConnectFail::Configuration(super::ConfigurationRefusal::new(
+        super::NetworkFailure::ChannelJoinRefused,
+        &format!("the bridge account was removed from {alias} (kicked, banned, or left)"),
+    ))
+    .into_outcome("matrix")
 }
 
 fn encrypted_room_refusal(alias: &str) -> super::ConnectFail {
@@ -640,20 +678,25 @@ struct EmptyObject {}
 struct MatrixMessageRequest<'a> {
     msgtype: &'static str,
     body: &'a str,
+    /// Always empty: the message mentions no one. Without it a client falls
+    /// back to the legacy push rules, which match the body — so an IRC line
+    /// saying `@room` paged the whole room, and one naming a member pinged
+    /// them.
+    #[serde(rename = "m.mentions")]
+    mentions: EmptyObject,
 }
 
 impl<'a> MatrixMessageRequest<'a> {
     /// An IRC `/me` is an `m.emote`; anything else an `m.text`.
     fn new(text: &'a super::BridgeText) -> Self {
-        match text {
-            super::BridgeText::Text(body) => Self {
-                msgtype: "m.text",
-                body,
-            },
-            super::BridgeText::Action(body) => Self {
-                msgtype: "m.emote",
-                body,
-            },
+        let (msgtype, body) = match text {
+            super::BridgeText::Text(body) => ("m.text", body),
+            super::BridgeText::Action(body) => ("m.emote", body),
+        };
+        Self {
+            msgtype,
+            body,
+            mentions: EmptyObject {},
         }
     }
 }
@@ -717,11 +760,16 @@ struct SyncResponse {
 #[derive(Default, serde::Deserialize)]
 struct SyncRooms {
     #[serde(default)]
-    join: HashMap<String, JoinedRoom>,
+    join: HashMap<String, SyncedRoom>,
+    /// Rooms the account left since the last sync — kicked, banned, or left
+    /// from another client. Their timeline runs up to the leave.
+    #[serde(default)]
+    leave: HashMap<String, SyncedRoom>,
 }
 
+/// A joined or just-left room in one sync.
 #[derive(serde::Deserialize)]
-struct JoinedRoom {
+struct SyncedRoom {
     /// Absent when a filtered sync has nothing new for the room.
     #[serde(default)]
     timeline: Timeline,
@@ -792,12 +840,14 @@ struct MessageContent {
 }
 
 /// One sync's worth: where to continue from, the messages, the rooms whose
-/// timeline the homeserver cut short, and the rooms that showed encryption.
+/// timeline the homeserver cut short, the rooms that showed encryption, and
+/// the rooms the account is no longer in.
 struct SyncBatch {
     next: String,
     messages: Vec<Incoming>,
     truncated: Vec<String>,
     encrypted: Vec<String>,
+    left: Vec<String>,
 }
 
 /// The HTTP address of `mxc://server/media-id` on `homeserver`, or `None`
@@ -935,7 +985,10 @@ fn collect_sync_messages(homeserver: &str, body: SyncResponse) -> Result<SyncBat
     let mut messages = Vec::new();
     let mut truncated = Vec::new();
     let mut encrypted = Vec::new();
-    for (room_id, room) in body.rooms.join {
+    let left: Vec<String> = body.rooms.leave.keys().cloned().collect();
+    // What was said in a room before the account left it is relayed like
+    // any other timeline; the leave itself is the caller's to act on.
+    for (room_id, room) in body.rooms.join.into_iter().chain(body.rooms.leave) {
         if room.timeline.limited {
             truncated.push(room_id.clone());
         }
@@ -959,6 +1012,7 @@ fn collect_sync_messages(homeserver: &str, body: SyncResponse) -> Result<SyncBat
         messages,
         truncated,
         encrypted,
+        left,
     })
 }
 
@@ -1408,9 +1462,12 @@ mod tests {
         }
     }
 
-    /// An IRC `/me` is an `m.emote`, and IRC formatting stays behind.
+    /// An IRC `/me` is an `m.emote`, and IRC formatting stays behind. Every
+    /// message says it mentions no one: without `m.mentions` a client falls
+    /// back to the body-matching push rules, and an IRC line saying `@room`
+    /// paged the whole room.
     #[tokio::test]
-    async fn an_action_is_sent_as_an_emote_without_irc_formatting() {
+    async fn an_action_is_sent_as_an_emote_without_irc_formatting_or_mentions() {
         let (server, base) = Homeserver::start().await;
         let shared = Shared::new(config(&base, &["#room:hs.example"]));
         let (_handle, ends) = NetworkHandle::channels(8);
@@ -1418,15 +1475,73 @@ mod tests {
         for line in [
             "PRIVMSG #room :\u{1}ACTION waves\u{1}",
             "PRIVMSG #room :\u{2}bold\u{2}",
+            "PRIVMSG #room :@room look",
         ] {
             handle_command(&mut session, &shared, &ends, &command(line)).await;
         }
         assert_eq!(
             server.0.lock().unwrap().sent_messages,
             [
-                serde_json::json!({ "msgtype": "m.emote", "body": "waves" }),
-                serde_json::json!({ "msgtype": "m.text", "body": "bold" }),
+                serde_json::json!({ "msgtype": "m.emote", "body": "waves", "m.mentions": {} }),
+                serde_json::json!({ "msgtype": "m.text", "body": "bold", "m.mentions": {} }),
+                serde_json::json!({ "msgtype": "m.text", "body": "@room look", "m.mentions": {} }),
             ]
+        );
+    }
+
+    /// A kick, a ban, or a leave from another client puts the room in the
+    /// sync's `leave` section, and a bridge that read only `join` went on
+    /// syncing a room it would never hear again, saying nothing. What was
+    /// said before the leave is relayed; the leave is said in the channel and
+    /// ends the session as a join refusal, with the position forgotten so the
+    /// next session joins afresh.
+    #[tokio::test]
+    async fn a_kick_or_ban_is_said_and_refused_as_a_join_not_ignored() {
+        use crate::bouncer::{NetworkFailure, SessionOutcome};
+        let (server, base) = Homeserver::start().await;
+        server.script([(
+            200,
+            serde_json::json!({
+                "next_batch": "s2",
+                "rooms": { "leave": { "!room:hs.example": { "timeline": { "events": [
+                    { "type": "m.room.message", "sender": "@alice:hs.example",
+                      "content": { "msgtype": "m.text", "body": "said before the kick" } },
+                    { "type": "m.room.member", "sender": "@alice:hs.example",
+                      "state_key": "@bot:hs.example", "content": { "membership": "leave" } },
+                ] } } } },
+            }),
+        )]);
+        let shared = Shared::new(config(&base, &["#room:hs.example"]));
+        let (handle, mut ends) = NetworkHandle::channels(8);
+        let mut events = handle.subscribe();
+        let SessionOutcome::ConfigurationRejected(refusal) = session_once(&shared, &mut ends).await
+        else {
+            panic!("leaving a bridged room did not end the session as a refusal");
+        };
+        assert_eq!(refusal.failure(), NetworkFailure::ChannelJoinRefused);
+        assert!(
+            refusal.diagnostic().contains("#room:hs.example"),
+            "{refusal:?}"
+        );
+        let lines = lines(&mut events);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == ":alice!alice@hs.example PRIVMSG #room :said before the kick"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with(":*bnc* NOTICE #room :")
+                    && line.contains("no longer in this room"))
+                .count(),
+            1,
+            "{lines:?}"
+        );
+        assert!(
+            shared.position().is_none(),
+            "the next session would resume a room it is not in"
         );
     }
 

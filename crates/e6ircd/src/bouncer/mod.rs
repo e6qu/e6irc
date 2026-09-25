@@ -640,8 +640,9 @@ pub(crate) fn rotate_addresses(
 /// A session never ends the driver: the task dying on the first disconnect
 /// would silently drop all later upstream traffic. What a driver carries
 /// across sessions is its own (Matrix its login and sync position, Discord
-/// its resumable gateway session), so an outage's messages are delivered
-/// after it rather than skipped.
+/// its resumable gateway session, Discord and Slack their outbound deliveries
+/// and Slack its acked inbound messages — see [`run_with_backoff_carrying`]),
+/// so an outage's messages are delivered after it rather than skipped.
 pub(crate) enum SessionOutcome {
     Stopped,
     /// A transient session failure that is safe to retry. Carrying the closed,
@@ -676,6 +677,15 @@ pub(crate) enum SessionOutcome {
     /// again after [`RECONNECT_REQUEST_PAUSE`], without the failure schedule.
     #[cfg(feature = "discord")]
     ReconnectRequested,
+    /// [`Self::Dropped`], and the upstream named how long the next attempt
+    /// must wait at the least (Discord's op 9: a fresh IDENTIFY only after a
+    /// random one to five seconds). The runner waits the longer of that and
+    /// its own backoff.
+    #[cfg(feature = "discord")]
+    DroppedFor {
+        failure: NetworkFailure,
+        at_least: std::time::Duration,
+    },
 }
 
 /// How long the runner waits before answering an upstream's request to
@@ -719,10 +729,12 @@ impl ConfigurationRefusal {
     ///   encryption off again — park now.
     /// - [`NetworkFailure::ChannelJoinRefused`]: "not invited" ends when an
     ///   invitation arrives upstream, which the homeserver may be catching up
-    ///   on — the schedule.
+    ///   on, and a room the account was kicked from ends when the rejoin
+    ///   succeeds — the schedule.
     /// - [`NetworkFailure::ChannelMappingFailed`]: a Discord or Slack channel
     ///   name comes from the upstream, and renaming it there clears the
-    ///   refusal — the schedule.
+    ///   refusal; a channel the bot cannot see, is not in, or that is
+    ///   archived clears when that changes upstream — the schedule.
     pub fn retry_policy(&self) -> e6irc_client::RefusalRetry {
         use e6irc_client::RefusalRetry;
         match self.failure {
@@ -866,11 +878,9 @@ const BNC_COMMAND_QUEUE: usize = 256;
 pub(crate) enum ConnectFail {
     Auth(String),
     Transient(String),
-    /// The upstream will not serve what the configuration asks for. Only
-    /// Matrix learns that while connecting (a forbidden join); the WebSocket
-    /// bridges learn it from `resolve_bridge_channels`, which answers with the
-    /// session outcome directly.
-    #[cfg(feature = "matrix")]
+    /// The upstream will not serve what the configuration asks for: a Matrix
+    /// room join it forbids, a Discord channel the bot cannot see or that
+    /// does not exist (see [`CredentialRequest`]).
     Configuration(ConfigurationRefusal),
 }
 
@@ -886,7 +896,6 @@ impl ConnectFail {
                 eprintln!("{who}: connect failed: {e}");
                 SessionOutcome::Dropped(NetworkFailure::UpstreamRequestFailed)
             }
-            #[cfg(feature = "matrix")]
             Self::Configuration(refusal) => {
                 eprintln!("{who}: configuration refused: {}", refusal.diagnostic());
                 SessionOutcome::ConfigurationRejected(refusal)
@@ -934,32 +943,83 @@ pub(crate) type DriverSession<C> =
 /// until then. `upstream_reason` is the upstream's own text for an event that
 /// does not carry one (a registered session it closed with a stated reason).
 /// Returns `false` when the network was stopped while waiting.
-async fn wait_for_reconnect(
-    ends: &mut DriverEnds,
+async fn wait_for_reconnect<C>(
+    ends: &DriverEnds,
+    carried: Carried<'_, C>,
     event: ConnectionEvent,
     upstream_reason: Option<&str>,
     delay: std::time::Duration,
     sleep: impl Future<Output = ()>,
 ) -> bool {
     ends.publish(event, Some(delay), upstream_reason);
-    tokio::select! {
-        biased;
-        _ = ends.shutdown_signalled() => false,
-        _ = sleep => true,
-    }
+    idle_until(ends, carried, sleep).await
 }
 
 /// Park a driver the upstream will keep refusing: publish the terminal state,
 /// say so in the buffer, and hold the task until the network is reconfigured
-/// (which drops the handle).
-async fn park(ends: &mut DriverEnds, event: ConnectionEvent) {
+/// (which drops the handle). Work the driver carries keeps finishing while it
+/// is parked: a message already accepted for delivery is delivered or said to
+/// be undelivered, never held without a word for as long as the park lasts.
+async fn park<C>(ends: &DriverEnds, carried: Carried<'_, C>, event: ConnectionEvent) {
     ends.emit(event);
     ends.emit_line(
         ":*bnc* NOTICE * :upstream rejected this network's credentials or registration; \
          not reconnecting until this network is reconfigured"
             .to_string(),
     );
-    ends.shutdown_signalled().await;
+    idle_until(ends, carried, std::future::pending()).await;
+}
+
+/// What one piece of carried work came to, told to the network once it is
+/// done: a delivery's echo or undelivered notice, a relayed message's lines.
+pub(crate) type CarriedReport = Box<dyn FnOnce(&DriverEnds) + Send>;
+
+/// The next finished piece of the work a driver carries across its sessions
+/// (see [`run_with_backoff_carrying`]); pending forever while there is none.
+pub(crate) type CarriedNext<C> =
+    for<'a> fn(&'a C) -> std::pin::Pin<Box<dyn Future<Output = CarriedReport> + Send + 'a>>;
+
+/// A driver's carried work as the runner holds it: its state, and how to wait
+/// for the next finished piece — `None` for a driver that carries nothing.
+struct Carried<'a, C> {
+    config: &'a C,
+    next: Option<CarriedNext<C>>,
+}
+
+impl<C> Clone for Carried<'_, C> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<C> Copy for Carried<'_, C> {}
+
+impl<C> Carried<'_, C> {
+    async fn next(self) -> CarriedReport {
+        match self.next {
+            Some(next) => next(self.config).await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+/// Wait for `until` while telling the network what the carried work finishes;
+/// `false` when the network was stopped first.
+async fn idle_until<C>(
+    ends: &DriverEnds,
+    carried: Carried<'_, C>,
+    until: impl Future<Output = ()>,
+) -> bool {
+    let mut stop = std::pin::pin!(ends.stop_signal());
+    let mut until = std::pin::pin!(until);
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut stop => return false,
+            () = &mut until => return true,
+            report = carried.next() => report(ends),
+        }
+    }
 }
 
 pub(crate) async fn run_with_backoff<C>(
@@ -967,6 +1027,27 @@ pub(crate) async fn run_with_backoff<C>(
     ends: &mut DriverEnds,
     session: DriverSession<C>,
 ) {
+    run_with_backoff_carrying(config, ends, session, None).await;
+}
+
+/// [`run_with_backoff`] for a driver whose sessions leave work behind them
+/// that needs no connection of its own to finish — a bridge's REST deliveries,
+/// an inbound message waiting on a name lookup. That work belongs to the
+/// driver, not the session: a session that ended with it queued dropped it —
+/// messages already accepted from a client, or acknowledged to the provider,
+/// that nothing would ever deliver or relay. Each session drains it in its
+/// own loop; between sessions (the backoff, a refusal's schedule, a park) the
+/// runner does, through `carried`.
+pub(crate) async fn run_with_backoff_carrying<C>(
+    config: C,
+    ends: &mut DriverEnds,
+    session: DriverSession<C>,
+    carried_next: Option<CarriedNext<C>>,
+) {
+    let carried = Carried {
+        config: &config,
+        next: carried_next,
+    };
     let mut backoff = Backoff::new(ends.reconnect_seed);
     // A driver started at boot holds its first dial back so a restart's worth
     // of drivers reach one round robin spread out, not in a burst.
@@ -990,16 +1071,22 @@ pub(crate) async fn run_with_backoff<C>(
         }
         ends.begin_attempt();
         let started = tokio::time::Instant::now();
-        let (failure, upstream_reason) = match session(&config, ends).await {
+        let (failure, upstream_reason, at_least) = match session(&config, ends).await {
             SessionOutcome::Stopped => return,
             SessionOutcome::AuthRejected(rejection) => {
-                park(ends, ConnectionEvent::AuthenticationFailed(rejection)).await;
+                park(
+                    ends,
+                    carried,
+                    ConnectionEvent::AuthenticationFailed(rejection),
+                )
+                .await;
                 return;
             }
             SessionOutcome::RegistrationRejected(rejection) => {
                 let refusal = Refusal::Registration(rejection);
                 match retry_refusal(
                     ends,
+                    carried,
                     &backoff,
                     refusal,
                     &mut consecutive_rejections,
@@ -1016,6 +1103,7 @@ pub(crate) async fn run_with_backoff<C>(
                 let refusal = Refusal::Configuration(refusal);
                 match retry_refusal(
                     ends,
+                    carried,
                     &backoff,
                     refusal,
                     &mut consecutive_rejections,
@@ -1029,16 +1117,19 @@ pub(crate) async fn run_with_backoff<C>(
             }
             #[cfg(feature = "discord")]
             SessionOutcome::ReconnectRequested => {
-                tokio::select! {
-                    biased;
-                    _ = ends.shutdown_signalled() => return,
-                    _ = tokio::time::sleep(RECONNECT_REQUEST_PAUSE) => continue,
+                if idle_until(ends, carried, tokio::time::sleep(RECONNECT_REQUEST_PAUSE)).await {
+                    continue;
                 }
+                return;
             }
-            SessionOutcome::Dropped(failure) => (failure, None),
-            SessionOutcome::ClosedByUpstream(closed) => {
-                (NetworkFailure::ConnectionLost, Some(closed))
-            }
+            SessionOutcome::Dropped(failure) => (failure, None, std::time::Duration::ZERO),
+            #[cfg(feature = "discord")]
+            SessionOutcome::DroppedFor { failure, at_least } => (failure, None, at_least),
+            SessionOutcome::ClosedByUpstream(closed) => (
+                NetworkFailure::ConnectionLost,
+                Some(closed),
+                std::time::Duration::ZERO,
+            ),
         };
         // Only a session that actually registered proves the upstream accepts
         // this configuration. A drop *before* that (a throttled dial between
@@ -1051,18 +1142,13 @@ pub(crate) async fn run_with_backoff<C>(
             last_refusal = None;
         }
         let session_held = Backoff::session_held(connected, started.elapsed());
-        let delay = backoff.next_delay(session_held);
+        let delay = backoff.next_delay(session_held).max(at_least);
         let reconnecting = ConnectionEvent::Reconnecting(failure);
         let reason = upstream_reason.as_ref().map(LinkClosed::diagnostic);
-        if !wait_for_reconnect(
-            ends,
-            reconnecting,
-            reason,
-            delay,
-            backoff.wait(session_held),
-        )
-        .await
-        {
+        let wait = async {
+            tokio::join!(backoff.wait(session_held), tokio::time::sleep(at_least));
+        };
+        if !wait_for_reconnect(ends, carried, reconnecting, reason, delay, wait).await {
             return;
         }
     }
@@ -1076,8 +1162,9 @@ enum RefusalHandled {
 }
 
 /// Count `refusal` against the run of its kind and act on its retry policy.
-async fn retry_refusal(
-    ends: &mut DriverEnds,
+async fn retry_refusal<C>(
+    ends: &DriverEnds,
+    carried: Carried<'_, C>,
     backoff: &Backoff,
     refusal: Refusal,
     consecutive_rejections: &mut u32,
@@ -1096,12 +1183,13 @@ async fn retry_refusal(
         RefusalRetry::UntilItClears => false,
     };
     if parks {
-        park(ends, refusal.parked()).await;
+        park(ends, carried, refusal.parked()).await;
         return RefusalHandled::Ended;
     }
     let delay = backoff.rejection_delay(ends.rejection_retry_floor, *consecutive_rejections);
     if wait_for_reconnect(
         ends,
+        carried,
         refusal.retrying(),
         None,
         delay,
@@ -1559,6 +1647,85 @@ pub(crate) const DELIVERY_QUEUE_CAPACITY: usize = 8;
 
 #[cfg(any(feature = "discord", feature = "slack"))]
 pub(crate) type DeliveryQueue = SerialQueue<DeliveryOutcome>;
+
+/// Run `work` — the part of a session that needs nothing of `ends`, such as
+/// connecting — while telling the network what the driver's carried work
+/// (`next`) finishes meanwhile. Connecting can take several request timeouts;
+/// the carried work does not wait for it.
+#[cfg(any(feature = "discord", feature = "slack"))]
+pub(crate) async fn while_carrying<T, F, Fut>(
+    ends: &DriverEnds,
+    mut next: F,
+    work: impl Future<Output = T>,
+) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = CarriedReport>,
+{
+    let mut work = std::pin::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut work => return out,
+            report = next() => report(ends),
+        }
+    }
+}
+
+/// A WebSocket bridge's outbound deliveries, which belong to the driver and
+/// not to one socket: a REST post needs no gateway, so a reconnect is no
+/// reason to lose what a client already had accepted. A session queues into
+/// it and reports what finishes while it runs; between sessions the runner
+/// does (see [`run_with_backoff_carrying`]), so each delivery ends in its echo
+/// or its undelivered notice whatever the socket is doing.
+#[cfg(any(feature = "discord", feature = "slack"))]
+pub(crate) struct CarriedDeliveries {
+    platform: &'static str,
+    queue: tokio::sync::Mutex<DeliveryQueue>,
+}
+
+#[cfg(any(feature = "discord", feature = "slack"))]
+impl CarriedDeliveries {
+    pub(crate) fn new(platform: &'static str) -> Self {
+        Self {
+            platform,
+            queue: tokio::sync::Mutex::new(DeliveryQueue::new(DELIVERY_QUEUE_CAPACITY)),
+        }
+    }
+
+    /// The next finished delivery, as what it tells the network. Cancel-safe
+    /// like [`SerialQueue::next`]: the delivery in progress stays queued.
+    pub(crate) async fn next_report(&self) -> CarriedReport {
+        let outcome = self.queue.lock().await.next().await;
+        let platform = self.platform;
+        Box::new(move |ends: &DriverEnds| report_delivery(ends, platform, "channel", outcome))
+    }
+
+    /// [`queue_channel_command`] into this queue.
+    pub(crate) async fn queue_command<F, Fut>(
+        &self,
+        ends: &DriverEnds,
+        command: Option<ClientCommand>,
+        channel_to_id: &HashMap<String, String>,
+        identity: &irc_driver::SelfIdentity,
+        deliver: F,
+    ) -> Option<()>
+    where
+        F: FnMut(String, BridgeText) -> Fut + Clone + Send + 'static,
+        Fut: Future<Output = Result<(), BridgeFailure>> + Send + 'static,
+    {
+        let mut queue = self.queue.lock().await;
+        queue_channel_command(
+            ends,
+            command,
+            channel_to_id,
+            identity,
+            self.platform,
+            &mut queue,
+            deliver,
+        )
+    }
+}
 
 /// A reqwest DNS resolver that vets every resolved address and drops the ones a
 /// bridge may not dial — the same control the IRC driver applies at connect
@@ -2213,29 +2380,71 @@ pub(crate) async fn bridge_response_status(
     }
 }
 
-/// [`bridge_send`] for a request that presents the network's credentials: a
-/// 401/403 means the upstream rejected *them*, which no retry can fix. Written
-/// once so every bridge reads the same statuses the same way — the Discord
-/// channel lookup used to call a refused token a transient failure while the
-/// gateway's refusal of the same token parked the network.
+/// What a request that presents the network's credentials asks about, which
+/// decides what a refusal of it means (see [`bridge_send_credentials`]).
+#[cfg(any(feature = "matrix", feature = "discord"))]
+pub(crate) enum CredentialRequest<'a> {
+    /// The credentials themselves (a login, the bot's own account): a 401 or
+    /// a 403 refuses *them*, which no retry can fix.
+    Identity(&'a str),
+    /// A Discord channel the configuration names, looked up by id with the
+    /// token. Only a 401 refuses the token; a 403 is a channel the bot cannot
+    /// see (not in its server, or no View Channel permission) and a 404 one
+    /// that does not exist — answers about the configuration, a mapping
+    /// refusal naming the channel, rather than a good token called bad or a
+    /// missing channel retried forever.
+    #[cfg(feature = "discord")]
+    DiscordChannel(&'a str),
+}
+
+/// [`bridge_send`] for a request that presents the network's credentials,
+/// classified by what it asks about. Written once so every bridge reads the
+/// same statuses the same way — the Discord channel lookup used to call a
+/// refused token a transient failure while the gateway's refusal of the same
+/// token parked the network, and then called a channel the bot could not see
+/// a refused token.
 #[cfg(any(feature = "matrix", feature = "discord"))]
 pub(crate) async fn bridge_send_credentials(
     req: reqwest::RequestBuilder,
-    what: &str,
+    request: CredentialRequest<'_>,
 ) -> Result<reqwest::Response, ConnectFail> {
+    use reqwest::StatusCode;
     let response = req.send().await.map_err(|e| e.to_string())?;
     let status = response.status();
-    bridge_response_status(response).await.map_err(|failure| {
-        let detail = format!("{what} rejected: {failure}");
-        if matches!(
-            status,
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-        ) {
-            ConnectFail::Auth(detail)
-        } else {
-            ConnectFail::Transient(detail)
-        }
-    })
+    bridge_response_status(response)
+        .await
+        .map_err(|failure| match request {
+            CredentialRequest::Identity(what) => {
+                let detail = format!("{what} rejected: {failure}");
+                if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                    ConnectFail::Auth(detail)
+                } else {
+                    ConnectFail::Transient(detail)
+                }
+            }
+            #[cfg(feature = "discord")]
+            CredentialRequest::DiscordChannel(id) => {
+                let unmappable = |detail: String| {
+                    ConnectFail::Configuration(ConfigurationRefusal::new(
+                        NetworkFailure::ChannelMappingFailed,
+                        &detail,
+                    ))
+                };
+                match status {
+                    StatusCode::UNAUTHORIZED => {
+                        ConnectFail::Auth(format!("channel {id} lookup rejected: {failure}"))
+                    }
+                    StatusCode::FORBIDDEN => unmappable(format!(
+                        "the bot cannot see Discord channel {id} (HTTP 403): it is not in that \
+                         channel's server, or may not view the channel"
+                    )),
+                    StatusCode::NOT_FOUND => {
+                        unmappable(format!("Discord has no channel {id} (HTTP 404)"))
+                    }
+                    _ => ConnectFail::Transient(format!("channel {id} lookup failed: {failure}")),
+                }
+            }
+        })
 }
 
 /// A WebSocket bridge's whole downstream arm: route the client's command to its
@@ -2246,7 +2455,7 @@ pub(crate) async fn bridge_send_credentials(
 /// sent, which is `deliver`; the loop reports each finished delivery — and
 /// emits its echo, as `identity` says it — with [`report_delivery`].
 #[cfg(any(feature = "discord", feature = "slack"))]
-pub(crate) fn queue_channel_command<F, Fut>(
+fn queue_channel_command<F, Fut>(
     ends: &DriverEnds,
     command: Option<ClientCommand>,
     channel_to_id: &HashMap<String, String>,
@@ -3782,7 +3991,7 @@ pub(crate) fn render_bridged(
 /// characters, so it can carry neither controls nor a line's worth of bytes.
 /// A message too malformed to name its sender is said to be from an unknown
 /// one rather than dropped.
-#[cfg(any(feature = "matrix", feature = "slack"))]
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 pub(crate) fn unrelayed_notice(
     platform: &str,
     channel: &str,
@@ -7547,7 +7756,7 @@ mod tests {
     /// network was "reconnecting" after a failure with no next attempt at all.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_retry_is_published_with_its_next_attempt_time_in_one_step() {
-        let (handle, mut ends) = NetworkHandle::channels(4);
+        let (handle, ends) = NetworkHandle::channels(4);
         let handle = std::sync::Arc::new(handle);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader = std::thread::spawn({
@@ -7568,7 +7777,11 @@ mod tests {
         });
         for _ in 0..20_000 {
             let waited = wait_for_reconnect(
-                &mut ends,
+                &ends,
+                Carried::<()> {
+                    config: &(),
+                    next: None,
+                },
                 ConnectionEvent::Reconnecting(NetworkFailure::ConnectionLost),
                 None,
                 std::time::Duration::from_secs(30),
