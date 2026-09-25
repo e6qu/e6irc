@@ -328,7 +328,13 @@ These are project-wide rules, enforced in review and (where possible) CI:
   - One worker and N workers give the same answers by construction. The
     session's shard counts the JOINs it has routed to another shard
     (`Session::pending_joins`) from the moment they are sent, so a pipelined
-    burst meets the channel limit exactly as on one worker. What a
+    burst meets the channel limit exactly as on one worker. A change to the
+    user while such a JOIN is in flight (NICK, AWAY, SETNAME, CHGHOST, QUIT)
+    is sent to that channel's owner too: owner queues are FIFO, so it lands
+    after the JOIN and corrects the member the JOIN's snapshot created (an
+    owner that refused the JOIN has no member and tells no one). `JOIN 0`
+    parts every channel whichever shard owns it, and parts an in-flight JOIN
+    as soon as it is answered (`Session::part_on_join`). What a
     command needs to know about a user or channel on another shard (WHOIS,
     ISON, USERHOST, MONITOR, WHOWAS, LUSERS, a labeled away reply) is read
     from process-wide directories that every shard — including a lone one —
@@ -1006,6 +1012,35 @@ subset's exact behavior.
   the advertisements cannot disagree. A `+k` key or list-mode mask that could
   not stand as a middle parameter (a leading `:`, a space or control byte, and
   for a key a `,`, which would split JOIN's key list) is refused, not rewritten.
+  Implemented today: lists `+b +q +e +I`, `+k`, `+l`, and the flags
+  `+g +i +m +n +s +t +C` (`ChanModes::FLAGS` is the one flag table; MLOCK can
+  lock each); the rest of Solanum's set answers 472.
+- List-mode masks follow Solanum's `pretty_mask`: `nick` → `nick!*@*`, and a
+  bare token with a `.` or `:` (a host or an address) → `*!*@token`. A host
+  that is an address or a CIDR range (`*!*@203.0.113.0/24`,
+  `*!*@2001:db8::/32`) matches the address the connection came from — fixed
+  at connect as the session's `real_ip`, so a `SETHOST` cloak is no way out
+  of it — and a glob is tried against both the shown host and that address.
+  The account extban `$a` / `$a:<glob>` / `$~a…` (Solanum `extb_account`)
+  works on all four lists; ISUPPORT advertises exactly that
+  (`EXTBAN=$,a`, `ACCOUNTEXTBAN=a`). A mask that could never match as written
+  — another extban type, a CIDR prefix out of range — is refused with 696,
+  never stored. What a mask means is decided once when it is stored
+  (`core/banmask.rs`), not on every match.
+- JOIN admission runs Solanum's `can_join` order: ban, key (compared
+  casefolded, in constant time), `+i` (an invite or `+I` passes), `+l` (an
+  invite passes). INVITE takes channel-operator status unless the channel is
+  `+g`; an invite is recorded only while the channel is `+i` or `+l`, the
+  modes it lets its holder past. `+k` on a keyed channel replaces the key.
+  A STATUSMSG (`@#c`/`+#c`) — PRIVMSG, NOTICE, TAGMSG or multiline — needs
+  op or voice in the channel (482 otherwise). A PART reason is dropped
+  whenever the member could not say it as a message (banned, quieted, or
+  unvoiced under `+m`). KNOCK is for a channel that is `+i`, keyed or full;
+  the banned and the quieted are refused, and each user may knock once per
+  five minutes and each channel be knocked on once per minute (712,
+  Solanum's `knock_delay` / `knock_delay_channel`). `QUIT` with no comment
+  leaves as `Quit: <nick>`, `QUIT :` with an empty reason. PART of a channel
+  that does not exist (or is secret and not joined) is 403.
 - A plain member (no op or voice) banned or quieted in any channel it is in
   cannot change nick (Solanum `ERR_BANNICKCHANGE` 435) — renaming would escape a
   `nick!*@*` mask. The check spans core shards through the published channel
@@ -1019,7 +1054,12 @@ subset's exact behavior.
 - An over-long `USER` name is truncated to `USERLEN`, never refused (Modern
   IRC); only a character the source prefix cannot carry is refused (468).
 - Oper system: config-defined opers, privileges (kline/dline/xline-style
-  bans, SETHOST, global notices), all actions audit-logged.
+  bans, SETHOST, global notices), all actions audit-logged. A K-line host
+  that is an address or CIDR range matches the connection's real address; a
+  D-line must be an IP address, CIDR range or address glob (anything else is
+  refused) and matches only that address; so a SETHOST lifts neither. A
+  reason `public|private` shows the banned user and their peers only the
+  public part; the operator listing and the audit trail keep both.
 - **Integrated services** (no separate Atheme process): `NickServ` and
   `ChanServ` pseudo-clients whose command surfaces
   (`REGISTER`, `IDENTIFY`, `GHOST`, `ACCESS`/`FLAGS`, `OP`, topic retention,

@@ -555,6 +555,23 @@ pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
         ],
         Some("are supported by this server"),
     );
+    // A line of its own: a 005 carries at most 13 tokens, and both lines above
+    // are full. The extban types are exactly those the list-mode parser
+    // accepts (`MaskShape::parse`), so a client is never told a ban works
+    // that the server would refuse.
+    state.numeric(
+        conn,
+        RPL_ISUPPORT,
+        &[
+            &format!(
+                "EXTBAN={},{}",
+                crate::core::banmask::EXTBAN_PREFIX,
+                crate::core::banmask::EXTBAN_TYPES
+            ),
+            &format!("ACCOUNTEXTBAN={}", crate::core::banmask::ACCOUNT_EXTBAN),
+        ],
+        Some("are supported by this server"),
+    );
 }
 
 pub(super) fn cmd_version(state: &mut ServerState, conn: ConnId) {
@@ -766,7 +783,7 @@ pub(super) const HELP_TOPICS: &[HelpTopic] = &[
         oper: false,
         lines: &[
             "MODE <target> [<modes> [<parameters>]]",
-            "Query or change channel modes (bqeI lists, k/l parameters, imnstC flags, o/v prefixes) or your user modes (iwB).",
+            "Query or change channel modes (bqeI lists, k/l parameters, gimnstC flags, o/v prefixes) or your user modes (iwB).",
         ],
     },
     HelpTopic {
@@ -806,7 +823,7 @@ pub(super) const HELP_TOPICS: &[HelpTopic] = &[
         oper: false,
         lines: &[
             "INVITE <nick> <channel>",
-            "Invite a user to a channel; on an invite-only channel only operators may invite.",
+            "Invite a user to a channel; only operators may invite unless the channel is +g.",
         ],
     },
     HelpTopic {
@@ -932,7 +949,7 @@ pub(super) const HELP_TOPICS: &[HelpTopic] = &[
         oper: false,
         lines: &[
             "KNOCK <channel>",
-            "Request an invitation to an invite-only channel.",
+            "Ask the operators of a channel closed to you (invite-only, keyed or full) to let you in.",
         ],
     },
     HelpTopic {

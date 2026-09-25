@@ -1,6 +1,7 @@
 //! PRIVMSG/NOTICE/TAGMSG delivery, including multiline batches.
 
 use super::*;
+use crate::core::state::SpeakRefusal;
 
 // ---- messaging ----------------------------------------------------------
 
@@ -207,6 +208,49 @@ impl StatusSigil {
     }
 }
 
+/// The one gate every channel message passes — PRIVMSG/NOTICE, a multiline
+/// batch, TAGMSG — on whichever shard it is decided, so a ban, `+m`, `+n`, `+C`
+/// or the STATUSMSG privilege cannot be evaded by choosing a different way to
+/// send the same thing. `None` admits the message.
+///
+/// A STATUSMSG (`@#c`, `+#c`) may only be sent by a member holding op or voice
+/// in that channel, whichever sigil it carries (Solanum's `is_chanop_voiced`
+/// check, answered with ERR_CHANOPRIVSNEEDED): a plain member or an outsider
+/// could otherwise page the channel's operators past `+m` and `+n`.
+fn speak_refusal(
+    chan: &crate::core::state::Channel,
+    conn: ConnId,
+    casemap: e6irc_proto::casemap::CaseMapping,
+    subject: &crate::core::banmask::MaskSubject<'_>,
+    status: Option<StatusSigil>,
+    carries_blocked_ctcp: bool,
+) -> Option<SpeakRefusal> {
+    let member = chan.member(conn);
+    if status.is_some() && !member.is_some_and(|m| m.op || m.voice) {
+        return Some(SpeakRefusal::NotPrivileged);
+    }
+    if !chan.may_speak(member, casemap, subject) {
+        return Some(SpeakRefusal::CannotSend);
+    }
+    // +C blocks CTCP (\x01-wrapped) except ACTION. The caller says whether the
+    // body carries one in any form a recipient can receive it — see
+    // `multiline_carries_blocked_ctcp` for why a batch has more than one form.
+    if chan.modes.no_ctcp && carries_blocked_ctcp {
+        return Some(SpeakRefusal::NoCtcp);
+    }
+    None
+}
+
+/// Tell the sender why [`speak_refusal`] refused its message to `target`.
+fn emit_speak_refusal(state: &mut ServerState, conn: ConnId, target: &str, why: SpeakRefusal) {
+    let (numeric, text) = match why {
+        SpeakRefusal::NotPrivileged => (ERR_CHANOPRIVSNEEDED, "You're not a channel operator"),
+        SpeakRefusal::CannotSend => (ERR_CANNOTSENDTOCHAN, "Cannot send to channel"),
+        SpeakRefusal::NoCtcp => (ERR_CANNOTSENDTOCHAN, "Cannot send to channel (+C, no CTCP)"),
+    };
+    state.numeric(conn, numeric, &[target], Some(text));
+}
+
 /// What a message target resolved to, once the sender was allowed to speak.
 pub(super) enum ResolvedKind {
     Channel {
@@ -264,29 +308,18 @@ pub(super) fn resolve_message_target(
         }
         return None;
     };
-    let may_speak = chan.may_speak(chan.member(conn), state.casemap, &prefix);
-    if !may_speak {
+    let subject = state.sessions[&conn].mask_subject(&prefix);
+    let refusal = speak_refusal(
+        chan,
+        conn,
+        state.casemap,
+        &subject,
+        status_prefix,
+        carries_blocked_ctcp,
+    );
+    if let Some(why) = refusal {
         if loud {
-            state.numeric(
-                conn,
-                ERR_CANNOTSENDTOCHAN,
-                &[target],
-                Some("Cannot send to channel"),
-            );
-        }
-        return None;
-    }
-    // +C blocks CTCP (\x01-wrapped) except ACTION. The caller says whether the
-    // body carries one in any form a recipient can receive it — see
-    // `multiline_carries_blocked_ctcp` for why a batch has more than one form.
-    if chan.modes.no_ctcp && carries_blocked_ctcp {
-        if loud {
-            state.numeric(
-                conn,
-                ERR_CANNOTSENDTOCHAN,
-                &[target],
-                Some("Cannot send to channel (+C, no CTCP)"),
-            );
+            emit_speak_refusal(state, conn, target, why);
         }
         return None;
     }
@@ -463,21 +496,17 @@ pub(super) fn message_on_owner(
             loud: kind.is_loud(),
         };
     };
-    if !channel.may_speak(
-        channel.member(actor.recipient.conn()),
+    if let Some(why) = speak_refusal(
+        channel,
+        actor.recipient.conn(),
         state.casemap,
-        &actor.identity.prefix,
+        &actor.mask_subject(),
+        status_prefix,
+        is_blocked_ctcp(&message_text),
     ) {
         return crate::core::state::ChannelMessageResult::CannotSend {
             target,
-            no_ctcp: false,
-            loud: kind.is_loud(),
-        };
-    }
-    if channel.modes.no_ctcp && is_blocked_ctcp(&message_text) {
-        return crate::core::state::ChannelMessageResult::CannotSend {
-            target,
-            no_ctcp: true,
+            why,
             loud: kind.is_loud(),
         };
     }
@@ -536,22 +565,9 @@ pub(super) fn emit_message_result(
                 state.err_nosuchchannel(conn, &target);
             }
         }
-        crate::core::state::ChannelMessageResult::CannotSend {
-            target,
-            no_ctcp,
-            loud,
-        } => {
+        crate::core::state::ChannelMessageResult::CannotSend { target, why, loud } => {
             if loud {
-                state.numeric(
-                    conn,
-                    ERR_CANNOTSENDTOCHAN,
-                    &[&target],
-                    Some(if no_ctcp {
-                        "Cannot send to channel (+C, no CTCP)"
-                    } else {
-                        "Cannot send to channel"
-                    }),
-                );
+                emit_speak_refusal(state, conn, &target, why);
             }
         }
     });
@@ -671,13 +687,10 @@ fn deliver_one_tagmsg(state: &mut ServerState, conn: ConnId, target: &str, clien
         };
         // The same gate PRIVMSG/NOTICE use, so a banned or quieted member can't
         // relay TAGMSG (typing/reaction tags) it couldn't relay as text.
-        if !chan.may_speak(chan.member(conn), state.casemap, &prefix) {
-            state.numeric(
-                conn,
-                ERR_CANNOTSENDTOCHAN,
-                &[target],
-                Some("Cannot send to channel"),
-            );
+        let subject = state.sessions[&conn].mask_subject(&prefix);
+        if let Some(why) = speak_refusal(chan, conn, state.casemap, &subject, status_prefix, false)
+        {
+            emit_speak_refusal(state, conn, target, why);
             return;
         }
         chan.recipients_where(|member, modes| {
@@ -724,12 +737,15 @@ pub(super) fn tagmsg_on_owner(
     let Some(channel) = state.channels.get(&key) else {
         return crate::core::state::ChannelTagmsgResult::NoSuchChannel { target };
     };
-    if !channel.may_speak(
-        channel.member(actor.recipient.conn()),
+    if let Some(why) = speak_refusal(
+        channel,
+        actor.recipient.conn(),
         state.casemap,
-        &actor.identity.prefix,
+        &actor.mask_subject(),
+        status_prefix,
+        false,
     ) {
-        return crate::core::state::ChannelTagmsgResult::CannotSend { target };
+        return crate::core::state::ChannelTagmsgResult::CannotSend { target, why };
     }
     let recipients = channel.recipients_where(|member, modes| {
         member != actor.recipient.conn() && status_prefix.is_none_or(|sig| sig.admits(modes))
@@ -792,13 +808,8 @@ pub(super) fn emit_tagmsg_result(
         crate::core::state::ChannelTagmsgResult::NoSuchChannel { target } => {
             state.err_nosuchchannel(conn, &target);
         }
-        crate::core::state::ChannelTagmsgResult::CannotSend { target } => {
-            state.numeric(
-                conn,
-                ERR_CANNOTSENDTOCHAN,
-                &[&target],
-                Some("Cannot send to channel"),
-            );
+        crate::core::state::ChannelTagmsgResult::CannotSend { target, why } => {
+            emit_speak_refusal(state, conn, &target, why);
         }
     });
 }
@@ -1265,22 +1276,17 @@ pub(super) fn multiline_on_owner(
             label: batch.label,
         };
     };
-    if !channel.may_speak(
-        channel.member(actor.recipient.conn()),
+    if let Some(why) = speak_refusal(
+        channel,
+        actor.recipient.conn(),
         state.casemap,
-        &actor.identity.prefix,
+        &actor.mask_subject(),
+        status,
+        multiline_carries_blocked_ctcp(&batch.lines),
     ) {
         return crate::core::state::ChannelMultilineResult::CannotSend {
             target: batch.target,
-            no_ctcp: false,
-            loud: kind.is_loud(),
-            label: batch.label,
-        };
-    }
-    if channel.modes.no_ctcp && multiline_carries_blocked_ctcp(&batch.lines) {
-        return crate::core::state::ChannelMultilineResult::CannotSend {
-            target: batch.target,
-            no_ctcp: true,
+            why,
             loud: kind.is_loud(),
             label: batch.label,
         };
@@ -1473,21 +1479,12 @@ pub(super) fn emit_multiline_result(
         }
         crate::core::state::ChannelMultilineResult::CannotSend {
             target,
-            no_ctcp,
+            why,
             loud,
             label,
         } => {
             if loud {
-                state.numeric(
-                    conn,
-                    ERR_CANNOTSENDTOCHAN,
-                    &[&target],
-                    Some(if no_ctcp {
-                        "Cannot send to channel (+C, no CTCP)"
-                    } else {
-                        "Cannot send to channel"
-                    }),
-                );
+                emit_speak_refusal(state, conn, &target, why);
             }
             ack_multiline_label(state, conn, label.as_deref());
         }

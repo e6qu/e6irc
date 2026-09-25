@@ -135,7 +135,7 @@ pub(super) const CHANMODES_ALWAYS_PARAM: &str = "k";
 /// Type C: takes a parameter only when set (`+l 10`, `-l`).
 pub(super) const CHANMODES_SET_PARAM: &str = "l";
 /// Type D: flags, never a parameter. Exactly the chars [`chan_bool_mode`] knows.
-pub(super) const CHANMODES_FLAGS: &str = "imnstC";
+pub(super) const CHANMODES_FLAGS: &str = crate::core::state::ChanModes::FLAGS;
 /// Membership prefix modes, in rank order, with their `PREFIX` sigils.
 pub(super) const PREFIX_MODES: &str = "ov";
 pub(super) const PREFIX_SIGILS: &str = "@+";
@@ -180,9 +180,13 @@ pub(super) fn myinfo_param_channel_modes() -> String {
 }
 
 /// Canonicalize a channel list-mode (+b/+q/+e/+I) mask to `nick!user@host`,
-/// filling missing components with `*` (Solanum's `clean_ban_mask`). Without
-/// this a bare `nick` is stored verbatim and never matches `nick!user@host`,
-/// so the ban is silently ineffective.
+/// filling missing components with `*` (Solanum's `clean_ban_mask` /
+/// `pretty_mask`). Without this a bare `nick` is stored verbatim and never
+/// matches `nick!user@host`, so the ban is silently ineffective. A bare token
+/// with a `.` or `:` in it is a host or an address (`evil.example`,
+/// `203.0.113.0/24`, `2001:db8::1`) — a nick can hold neither — so it becomes
+/// `*!*@token`, not the nick mask `token!*@*` that no one could ever match. An
+/// extended ban (`$a:name`) is not a hostmask and is kept as written.
 pub(super) fn normalize_ban_mask(mask: &str) -> String {
     fn star(s: &str) -> &str {
         if s.is_empty() { "*" } else { s }
@@ -192,6 +196,9 @@ pub(super) fn normalize_ban_mask(mask: &str) -> String {
     // both, yet has no `@` after the `!`, so splitting on the strength of the
     // `contains` answer found nothing there and panicked — reachable by any
     // user, since creating a channel makes you its operator.
+    if mask.starts_with(crate::core::banmask::EXTBAN_PREFIX) {
+        return mask.to_string();
+    }
     match mask.split_once('!') {
         Some((nick, rest)) => match rest.split_once('@') {
             Some((user, host)) => format!("{}!{}@{}", star(nick), star(user), star(host)),
@@ -199,6 +206,7 @@ pub(super) fn normalize_ban_mask(mask: &str) -> String {
         },
         None => match mask.split_once('@') {
             Some((user, host)) => format!("*!{}@{}", star(user), star(host)),
+            None if mask.contains(['.', ':']) => format!("*!*@{mask}"),
             None => format!("{}!*@*", star(mask)),
         },
     }
@@ -221,8 +229,13 @@ pub(super) fn truncate_chars(s: &str, max: usize) -> &str {
 /// `MODE #c +b :a b`) would split the mask across two tokens in both the MODE
 /// broadcast and the RPL_BANLIST middle, and a leading `:` (`MODE #c +b ::x`)
 /// would open the trailing early in both — so copying the displayed form into
-/// `-b` could never remove it. Removals (`adding == false`) never reject, so a
-/// legacy mask stays removable via the same form that set it.
+/// `-b` could never remove it. So is a mask that could never match as written
+/// ([`MaskShape::parse`]: an extban type this server does not implement, a
+/// CIDR prefix out of range): stored, it would read as a ban in force that
+/// bans no one. Removals (`adding == false`) never reject, so a legacy mask
+/// stays removable via the same form that set it.
+///
+/// [`MaskShape::parse`]: crate::core::banmask::MaskShape::parse
 pub(super) fn channel_list_mask(
     raw: &str,
     adding: bool,
@@ -234,9 +247,12 @@ pub(super) fn channel_list_mask(
         if mask.bytes().any(|b| b <= b' ' || b == 0x7f) {
             return Err("Mask contains a space or control character");
         }
-        if mask.starts_with(':') {
+        // Checked on what was typed too: a bare `:x` is a host by its `:`, so
+        // normalizing it would hide the leading colon rather than refuse it.
+        if raw.starts_with(':') || mask.starts_with(':') {
             return Err("Mask may not start with ':'");
         }
+        crate::core::banmask::MaskShape::parse(mask).map_err(|error| error.describe())?;
     }
     Ok(crate::core::state::MaskKey::new(mask, casemap))
 }
@@ -255,6 +271,20 @@ pub(super) fn valid_channel_key(key: &str) -> bool {
         && !key.bytes().any(|b| b <= b' ' || b == b',' || b == 0x7f)
 }
 
+/// Whether `supplied` opens a channel whose key is `key`. Keys compare under
+/// the server casemapping, as Solanum's `irccmp` does, and in constant time so
+/// the key cannot be recovered by timing the comparison.
+pub(super) fn channel_key_matches(
+    casemap: e6irc_proto::casemap::CaseMapping,
+    key: &str,
+    supplied: &str,
+) -> bool {
+    constant_time_eq(
+        casemap.casefold(key).as_bytes(),
+        casemap.casefold(supplied).as_bytes(),
+    )
+}
+
 pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // A target list with no non-empty entry (`JOIN`, `JOIN :`, `JOIN ,`) must be
     // ERR_NEEDMOREPARAMS, not a silent no-op: a bare presence check passes an
@@ -267,12 +297,18 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     // Modern IRC: "JOIN 0" is a special form meaning "part every channel".
+    //
+    // Every channel the session is in, whichever shard owns it — named by its
+    // key, which routes and parts the same channel (the PART line carries the
+    // channel's own display name). A JOIN still on its way to another shard is
+    // not a channel the session is in yet, but it was sent first: it is parted
+    // the moment it is answered (`emit_join_result`), so the sequence reads as
+    // the client wrote it, the JOIN and then its PART.
     if targets == "0" {
-        let names: Vec<String> = state.sessions[&conn]
-            .channels
-            .iter()
-            .filter_map(|k| state.channels.get(k).map(|c| c.name.clone()))
-            .collect();
+        let session = state.sessions.get_mut(&conn).expect("dispatching session");
+        let pending: Vec<ChanKey> = session.pending_joins.iter().cloned().collect();
+        session.part_on_join.extend(pending);
+        let names: Vec<&str> = session.channels.iter().map(ChanKey::as_str).collect();
         if !names.is_empty() {
             let joined = names.join(",");
             cmd_part(state, conn, &[joined.as_str()]);
@@ -341,7 +377,6 @@ pub(super) fn join_on_owner(
     }
     let key = state.chan_key(name);
     let now = (state.config.clock)();
-    let user_prefix = &actor.identity.prefix;
     let casemap = state.casemap;
     // A registered channel being (re)created restores its retained topic.
     let newly_created = !state.channels.contains_key(&key);
@@ -368,8 +403,10 @@ pub(super) fn join_on_owner(
         // repeated JOIN of a large channel an output multiplier.
         return ChannelJoinResult::AlreadyMember;
     }
-    // Admission checks, Solanum order. The invite lives on the channel, so it
-    // can only ever admit into the incarnation whose op granted it.
+    // Admission checks, in Solanum's `can_join` order: ban, key, invite-only,
+    // limit. The order is visible — a banned user at a keyed channel is told it
+    // is banned, not that its key is wrong. The invite lives on the channel, so
+    // it can only ever admit into the incarnation whose op granted it.
     let was_invited = chan.invited.contains(&conn);
     // A registered channel's founder is opped on join, even when not the
     // first to arrive.
@@ -384,26 +421,29 @@ pub(super) fn join_on_owner(
         .map(|a| state.access_modes(&key, a))
         .unwrap_or((false, false));
     let chan = state.channels.get_mut(&key).expect("just inserted");
-    if chan.modes.invite_only && !was_invited && !chan.is_invite_excepted(casemap, user_prefix) {
-        return ChannelJoinResult::Rejected(ChannelJoinFailure::InviteOnly {
-            name: name.to_string(),
-        });
-    }
-    if chan.is_banned(casemap, user_prefix) {
+    let subject = actor.mask_subject();
+    if chan.is_banned(casemap, &subject) {
         return ChannelJoinResult::Rejected(ChannelJoinFailure::Banned {
             name: name.to_string(),
         });
     }
     if let Some(chan_key) = &chan.modes.key
-        && !join_key.is_some_and(|k| constant_time_eq(k.as_bytes(), chan_key.as_bytes()))
+        && !join_key.is_some_and(|k| channel_key_matches(casemap, chan_key, k))
     {
-        // Constant-time so the key isn't recoverable by timing the compare.
         return ChannelJoinResult::Rejected(ChannelJoinFailure::BadKey {
             name: name.to_string(),
         });
     }
+    if chan.modes.invite_only && !was_invited && !chan.is_invite_excepted(casemap, &subject) {
+        return ChannelJoinResult::Rejected(ChannelJoinFailure::InviteOnly {
+            name: name.to_string(),
+        });
+    }
+    // An invitation also admits past `+l` (Solanum: "allow /invite to override
+    // +l"), which is why one is recorded while the channel has a limit.
     if let Some(limit) = chan.modes.limit
         && chan.member_count() >= limit as usize
+        && !was_invited
     {
         return ChannelJoinResult::Rejected(ChannelJoinFailure::Full {
             name: name.to_string(),
@@ -525,12 +565,24 @@ pub(super) fn emit_join_result(
     // Answered, whichever way: the place `cmd_join` held for this request
     // under the channel limit is given back. A session that has since left
     // took its reservations with it.
-    if let Some(session) = state.sessions.get_mut(&conn) {
-        session.pending_joins.remove(&requested);
-    }
+    let part_now = match state.sessions.get_mut(&conn) {
+        Some(session) => {
+            session.pending_joins.remove(&requested);
+            session.part_on_join.remove(&requested)
+        }
+        None => false,
+    };
+    let joined = match &result {
+        ChannelJoinResult::Joined(success) => Some(success.key.clone()),
+        _ => None,
+    };
     state.emit_deferred_labeled(conn, label, |state| {
         emit_join_response(state, conn, result);
     });
+    // A `JOIN 0` sent after this JOIN parts what it admitted (see `cmd_join`).
+    if part_now && let Some(key) = joined {
+        cmd_part(state, conn, &[key.as_str()]);
+    }
 }
 
 fn emit_join_response(state: &mut ServerState, conn: ConnId, result: ChannelJoinResult) {
@@ -669,11 +721,19 @@ pub(super) fn part_on_owner(
 ) -> ChannelPartResult {
     let conn = actor.recipient.conn();
     let key = state.chan_key(name);
+    // No such channel is ERR_NOSUCHCHANNEL (Solanum), and so is a secret one
+    // the parter is not in: answering 442 there would confirm it exists.
     let Some(channel) = state.channels.get(&key) else {
-        return ChannelPartResult::NotOnChannel {
+        return ChannelPartResult::NoSuchChannel {
             name: name.to_string(),
         };
     };
+    if let Some(proof) = channel.hidden_from(conn) {
+        return ChannelPartResult::Hidden {
+            name: name.to_string(),
+            proof,
+        };
+    }
     if !channel.is_member(conn) {
         return ChannelPartResult::NotOnChannel {
             name: name.to_string(),
@@ -681,14 +741,11 @@ pub(super) fn part_on_owner(
     }
     let display = channel.name.clone();
     let prefix = actor.identity.prefix.clone();
-    // A quieted or banned member can't broadcast a PART reason (which would
-    // evade the quiet), unless op/voice — same speak-gate as messages.
-    let exempt = state.channels[&key]
-        .member(conn)
-        .is_some_and(|m| m.op || m.voice);
-    let suppress_reason = !exempt
-        && (state.channels[&key].is_banned(state.casemap, &prefix)
-            || state.channels[&key].is_quieted(state.casemap, &prefix));
+    // A member that could not say the reason as a message cannot broadcast it
+    // as a PART reason either — banned, quieted, or unvoiced under `+m`
+    // (Solanum's `can_send` gate on the part message). The one speak gate.
+    let suppress_reason =
+        !channel.may_speak(channel.member(conn), state.casemap, &actor.mask_subject());
     let line = match reason {
         Some(r) if !suppress_reason => {
             let head = format!(":{prefix} PART {display} :");
@@ -719,6 +776,8 @@ pub(super) fn emit_part_result(
 fn emit_part_response(state: &mut ServerState, conn: ConnId, result: ChannelPartResult) {
     match result {
         ChannelPartResult::NotOnChannel { name } => state.err_notonchannel(conn, &name),
+        ChannelPartResult::NoSuchChannel { name } => state.err_nosuchchannel(conn, &name),
+        ChannelPartResult::Hidden { name, proof } => deny_hidden(state, conn, &name, proof),
         ChannelPartResult::Parted { key, line } => {
             state.send_event(conn, &line);
             if let Some(session) = state.sessions.get_mut(&conn) {
@@ -1044,11 +1103,7 @@ fn topic_set_on_owner(
     // in here — a regular member of a +m, -t channel may still set the topic.
     let exempt = member.op || member.voice;
     if !exempt {
-        let prefix = &actor.identity.prefix;
-        let blocked = {
-            let chan = &state.channels[&key];
-            chan.is_banned(state.casemap, prefix) || chan.is_quieted(state.casemap, prefix)
-        };
+        let blocked = state.channels[&key].is_silenced(state.casemap, &actor.mask_subject());
         if blocked {
             return Some(crate::core::state::ChannelTopicResult::CannotSend { target });
         }
@@ -1690,28 +1745,15 @@ fn emit_mode_list_query_result_now(
 
 /// Read a boolean channel mode by its mode char (`None` for non-boolean).
 pub(super) fn chan_bool_mode(modes: &crate::core::state::ChanModes, c: char) -> Option<bool> {
-    Some(match c {
-        'i' => modes.invite_only,
-        'm' => modes.moderated,
-        'n' => modes.no_external,
-        's' => modes.secret,
-        't' => modes.topic_ops_only,
-        'C' => modes.no_ctcp,
-        _ => return None,
-    })
+    modes.flag(c)
 }
 
-/// Set a boolean channel mode by its mode char.
-pub(super) fn set_chan_bool_mode(modes: &mut crate::core::state::ChanModes, c: char, v: bool) {
-    match c {
-        'i' => modes.invite_only = v,
-        'm' => modes.moderated = v,
-        'n' => modes.no_external = v,
-        's' => modes.secret = v,
-        't' => modes.topic_ops_only = v,
-        'C' => modes.no_ctcp = v,
-        _ => {}
-    }
+/// Set a boolean channel mode by its mode char. Only a mode lock calls this,
+/// and a lock holds only flags ([`crate::core::state::MlockModes::LOCKABLE`]).
+fn set_chan_bool_mode(modes: &mut crate::core::state::ChanModes, c: char, v: bool) {
+    *modes
+        .flag_mut(c)
+        .expect("a mode lock holds only flag modes") = v;
 }
 
 /// Enforce `key`'s mode lock on the live channel: change only the modes
@@ -2036,7 +2078,7 @@ fn channel_mode_by(
         match c {
             '+' => adding = true,
             '-' => adding = false,
-            'i' | 'm' | 'n' | 's' | 't' | 'C' => {
+            c if CHANMODES_FLAGS.contains(c) => {
                 // A ChanServ mode lock forbids changing a locked mode the wrong
                 // way. Refuse it *loudly* (DESIGN §2): a bare `continue` left the
                 // client unable to tell its command was rejected from lost —
@@ -2064,15 +2106,10 @@ fn channel_mode_by(
                     continue;
                 }
                 let chan = state.channels.get_mut(&key).expect("checked");
-                let field = match c {
-                    'i' => &mut chan.modes.invite_only,
-                    'm' => &mut chan.modes.moderated,
-                    'n' => &mut chan.modes.no_external,
-                    's' => &mut chan.modes.secret,
-                    't' => &mut chan.modes.topic_ops_only,
-                    'C' => &mut chan.modes.no_ctcp,
-                    _ => unreachable!("outer arm matched only these mode chars"),
-                };
+                let field = chan
+                    .modes
+                    .flag_mut(c)
+                    .expect("the arm matched only flag mode chars");
                 // Announce only a real transition: re-setting a mode already in
                 // that state must not broadcast a phantom `+n`/`-s` that desyncs
                 // state-tracking clients (Solanum suppresses these no-ops).
@@ -2102,24 +2139,18 @@ fn channel_mode_by(
                         );
                         continue;
                     }
-                    // A key already set is not silently overwritten: reply
-                    // ERR_KEYSET and leave the existing key in place (Solanum).
-                    if chan.modes.key.is_some() {
-                        state.numeric(
-                            conn,
-                            ERR_KEYSET,
-                            &[&display],
-                            Some("Channel key already set"),
-                        );
-                        continue;
-                    }
                     // Clip to KEYLEN at the store, so the +k broadcast and
                     // RPL_CHANNELMODEIS fit the wire by construction (see KEYLEN).
                     // The echo below uses the same clipped value, so what clients
-                    // see is exactly what is enforced.
+                    // see is exactly what is enforced. A key already set is
+                    // replaced (Solanum's `chm_key` copies the new key over the
+                    // old); setting the key it already has changes nothing and
+                    // is not announced.
                     let k = truncate_chars(k, KEYLEN);
-                    chan.modes.key = Some(k.to_string());
-                    changes.push((true, 'k', Some(k.to_string())));
+                    if chan.modes.key.as_deref() != Some(k) {
+                        chan.modes.key = Some(k.to_string());
+                        changes.push((true, 'k', Some(k.to_string())));
+                    }
                 } else {
                     // -k conventionally carries a placeholder arg ("*");
                     // consume it so later modes get the right params, whether or

@@ -955,25 +955,6 @@ fn whois_channels_split_to_respect_512_byte_limit() {
 }
 
 #[test]
-fn mode_key_already_set_is_rejected_with_467() {
-    let mut s = TestServer::new();
-    let alice = s.register(1, "alice");
-    s.line(alice, "JOIN #k");
-    s.drain(alice);
-    s.line(alice, "MODE #k +k secret");
-    s.drain(alice);
-    // A second +k must not silently overwrite: reply 467 and keep the old key.
-    s.line(alice, "MODE #k +k other");
-    let out = s.drain(alice);
-    assert!(has_numeric(&out, "467"), "expected ERR_KEYSET: {out:#?}");
-    assert!(
-        !out.iter()
-            .any(|l| l.contains("MODE") && l.contains("other")),
-        "key must not change: {out:#?}"
-    );
-}
-
-#[test]
 fn overlong_channel_key_is_clipped_not_a_wire_overflow() {
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
@@ -4335,11 +4316,12 @@ fn invite_notify_to_ops() {
     let bob = s.register(2, "bob");
     let carol = s.register(3, "carol");
     s.line(alice, "JOIN #in");
+    s.line(alice, "MODE #in +g");
     s.drain(alice);
     s.line(bob, "JOIN #in");
     s.drain(bob);
     s.drain(alice);
-    // bob (non-op, but +i off so members may invite) invites carol
+    // bob (non-op, but the channel is +g so members may invite) invites carol
     s.line(bob, "INVITE carol #in");
     s.drain(bob);
     s.drain(carol);
@@ -5737,17 +5719,21 @@ fn statusmsg_targets_ops_only() {
     for c in [alice, bob, carol] {
         s.drain(c);
     }
-    // @#st: only alice (op) receives
-    s.line(carol, "PRIVMSG @#st :ops only");
+    // @#st from voiced bob: only alice (op) receives
+    s.line(bob, "PRIVMSG @#st :ops only");
     assert_eq!(
         s.drain(alice),
-        vec![":carol!carol@host3.example PRIVMSG @#st :ops only"]
+        vec![":bob!bob@host2.example PRIVMSG @#st :ops only"]
     );
-    assert!(s.drain(bob).is_empty(), "voiced bob is not an op");
-    // +#st: alice (op) and bob (voice) receive
-    s.line(carol, "PRIVMSG +#st :ops and voice");
-    assert_eq!(s.drain(alice).len(), 1);
+    assert!(s.drain(carol).is_empty(), "plain carol is not an op");
+    // +#st from alice: bob (voice) receives, plain carol does not
+    s.line(alice, "PRIVMSG +#st :ops and voice");
     assert_eq!(s.drain(bob).len(), 1);
+    assert!(s.drain(carol).is_empty());
+    // plain carol may not send a STATUSMSG at all (Solanum: 482)
+    s.line(carol, "PRIVMSG @#st :let me in");
+    assert!(has_numeric(&s.drain(carol), "482"));
+    assert!(s.drain(alice).is_empty());
 }
 
 #[test]
@@ -9451,25 +9437,25 @@ fn self_matching_kline_confirms_before_disconnecting_the_setter() {
     );
 }
 
-// D-lines ban by host/IP; X-lines ban by realname (gecos). Same machinery
-// as K-lines, differing only in the session field the mask tests against.
+// D-lines ban by address (an IP, a CIDR range or an address glob, matched
+// against the address the user connected from); X-lines ban by realname.
 
 #[test]
-fn oper_dline_bans_by_host() {
+fn oper_dline_bans_by_address() {
     let mut s = TestServer::new();
     let op = s.register(1, "god");
     s.line(op, "OPER god letmein");
     s.drain(op);
 
-    s.line(op, "DLINE host7.example :bad netblock");
+    s.line(op, "DLINE 192.0.2.7 :bad netblock");
     commit_server_ban(&mut s);
     assert!(
         s.drain(op).iter().any(|l| l.contains("Added D-Line")),
         "no dline confirmation"
     );
 
-    // A registration from the banned host is refused (465 + D-Lined ERROR).
-    let banned = s.connect(7); // host7.example
+    // A registration from the banned address is refused (465 + D-Lined ERROR).
+    let banned = s.connect_from(7, "192.0.2.7", e6ircd::core::ConnectionTransport::Tcp);
     s.line(banned, "NICK joe");
     s.line(banned, "USER joe 0 * :Joe");
     let out = s.drain(banned);
@@ -9479,8 +9465,8 @@ fn oper_dline_bans_by_host() {
         "not D-Lined: {out:#?}"
     );
 
-    // A different host is unaffected.
-    let ok = s.connect(8); // host8.example
+    // A different address is unaffected.
+    let ok = s.connect_from(8, "192.0.2.8", e6ircd::core::ConnectionTransport::Tcp);
     s.line(ok, "NICK ann");
     s.line(ok, "USER ann 0 * :Ann");
     assert!(
@@ -9488,7 +9474,7 @@ fn oper_dline_bans_by_host() {
         "clean host refused"
     );
 
-    s.line(op, "UNDLINE host7.example");
+    s.line(op, "UNDLINE 192.0.2.7");
     commit_server_ban(&mut s);
     assert!(
         s.drain(op).iter().any(|l| l.contains("Removed D-Line")),
@@ -11973,9 +11959,9 @@ fn secret_channel_is_indistinguishable_from_no_channel_on_topic_kick_and_invite(
 }
 
 /// An invitation is a pass through `+i`. Recorded while the channel is open
-/// it would be a pass nobody with authority issued: on an open channel any
-/// member may INVITE, so a member could stock invitations for later and have
-/// them honoured once operators lock the channel.
+/// it would be a pass that outlives the reason for it: an operator's
+/// invitation into an open channel must not be honoured once the channel is
+/// later locked. And a plain member may not invite at all without `+g`.
 #[test]
 fn an_invite_sent_while_the_channel_is_open_does_not_pass_a_later_invite_only() {
     let mut s = TestServer::new();
@@ -11987,9 +11973,14 @@ fn an_invite_sent_while_the_channel_is_open_does_not_pass_a_later_invite_only() 
     s.drain(op);
     s.drain(member);
 
-    // A regular member invites while the channel is open: delivered, as ever.
+    // A regular member may not invite (Solanum: ops only unless +g).
     s.line(member, "INVITE puppet #raid");
-    assert!(has_numeric(&s.drain(member), "341"));
+    assert!(has_numeric(&s.drain(member), "482"));
+    assert!(s.drain(puppet).is_empty(), "nothing was delivered");
+
+    // An operator invites while the channel is open: delivered, not recorded.
+    s.line(op, "INVITE puppet #raid");
+    assert!(has_numeric(&s.drain(op), "341"));
     assert!(
         s.drain(puppet).iter().any(|line| line.contains(" INVITE ")),
         "the invitation itself is still delivered"
@@ -12841,7 +12832,7 @@ fn myinfo_mode_lists_agree_with_isupport() {
         )),
         "channel modes with a parameter: {myinfo:?}"
     );
-    assert_eq!(sorted(myinfo[6]), sorted("beIqimnstklCov"));
+    assert_eq!(sorted(myinfo[6]), sorted("beIqgimnstklCov"));
     assert_eq!(sorted(myinfo[7]), sorted("beIqklov"));
 }
 
@@ -13332,5 +13323,545 @@ fn founder_and_access_list_keep_a_registered_channels_whole_history() {
             })
             .expect("a targets query");
         assert_eq!(channels, [("#reg".to_string(), floor)], "{conn:?}");
+    }
+}
+
+// ---- Solanum/Libera divergences: masks, bans, invites, knocks ----------------
+
+/// Register connection `id` as `nick`, connecting from the address `address`
+/// (the test harness otherwise gives every connection a host name, which has
+/// no address to ban).
+fn register_from(s: &mut TestServer, id: u64, nick: &str, address: &str) -> ConnId {
+    let conn = s.connect_from(id, address, e6ircd::core::ConnectionTransport::Tcp);
+    s.line(conn, &format!("NICK {nick}"));
+    s.line(conn, &format!("USER {nick} 0 * :Real {nick}"));
+    s.drain(conn);
+    conn
+}
+
+/// An op in `#c` and a registered outsider `bob` from `bob_address`.
+fn op_and_outsider(s: &mut TestServer, bob_address: &str) -> (ConnId, ConnId) {
+    let op = s.register(1, "op");
+    s.line(op, "JOIN #c");
+    s.drain(op);
+    let bob = register_from(s, 2, "bob", bob_address);
+    (op, bob)
+}
+
+/// A bare token with a `.` or `:` is a host (a nick can hold neither), so it
+/// becomes `*!*@token` — Solanum's `pretty_mask` — not the nick mask
+/// `token!*@*` nobody could match.
+#[test]
+fn a_bare_host_ban_mask_bans_the_host() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "op");
+    s.line(op, "JOIN #c");
+    s.drain(op);
+    for (typed, stored) in [
+        ("evil.example", "*!*@evil.example"),
+        ("2001:db8::1", "*!*@2001:db8::1"),
+        ("nick", "nick!*@*"),
+    ] {
+        s.line(op, &format!("MODE #c +b {typed}"));
+        let out = s.drain(op);
+        assert!(
+            out.iter()
+                .any(|l| l.ends_with(&format!("MODE #c +b {stored}"))),
+            "{typed}: {out:#?}"
+        );
+    }
+    let evil = s.connect_from(3, "evil.example", e6ircd::core::ConnectionTransport::Tcp);
+    s.line(evil, "NICK mallory");
+    s.line(evil, "USER mallory 0 * :M");
+    s.drain(evil);
+    s.line(evil, "JOIN #c");
+    assert!(has_numeric(&s.drain(evil), "474"), "the host ban holds");
+}
+
+/// A CIDR host mask bans an address range, IPv4 and IPv6, and is matched
+/// against the address the user connected from — a SETHOST cloak does not
+/// lift it, and neither does it lift a ban on the address itself.
+#[test]
+fn a_cidr_channel_ban_matches_the_real_address_through_a_cloak() {
+    let mut s = TestServer::new();
+    let (op, bob) = op_and_outsider(&mut s, "203.0.113.9");
+    let carol = register_from(&mut s, 3, "carol", "2001:db8:1::7");
+    let dave = register_from(&mut s, 4, "dave", "198.51.100.1");
+    s.line(op, "MODE #c +b *!*@203.0.113.0/24");
+    s.line(op, "MODE #c +b *!*@2001:db8::/32");
+    s.drain(op);
+    // Cloak bob first: the ban is on the address, not on what is shown.
+    s.line(op, "OPER god letmein");
+    s.line(op, "SETHOST bob cloaked.example");
+    s.drain(op);
+    s.drain(bob);
+    for (who, banned) in [(bob, true), (carol, true), (dave, false)] {
+        s.line(who, "JOIN #c");
+        let out = s.drain(who);
+        assert_eq!(has_numeric(&out, "474"), banned, "{who:?}: {out:#?}");
+    }
+    // A quiet on the bare address (any spelling) silences the cloaked member.
+    s.line(op, "MODE #c -b *!*@203.0.113.0/24");
+    s.line(op, "MODE #c +q 203.0.113.9");
+    s.drain(op);
+    s.line(bob, "JOIN #c");
+    s.drain(bob);
+    s.line(bob, "PRIVMSG #c :hello");
+    assert!(has_numeric(&s.drain(bob), "404"), "quieted by address");
+}
+
+/// A mask that could never match as written — an extban type this server does
+/// not implement, a CIDR prefix out of range — is refused with
+/// ERR_INVALIDMODEPARAM, never stored as a ban that bans no one.
+#[test]
+fn an_unmatchable_list_mask_is_refused_with_696() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "op");
+    s.line(op, "JOIN #c");
+    s.drain(op);
+    for mask in [
+        "$x:foo",
+        "$j:#other",
+        "$a:",
+        "*!*@203.0.113.0/33",
+        "*!*@::/200",
+    ] {
+        for mode in ['b', 'q', 'e', 'I'] {
+            s.line(op, &format!("MODE #c +{mode} {mask}"));
+            let out = s.drain(op);
+            assert!(has_numeric(&out, "696"), "+{mode} {mask}: {out:#?}");
+            assert!(!out.iter().any(|l| l.contains(" MODE #c ")), "{out:#?}");
+        }
+    }
+    s.line(op, "MODE #c +b");
+    let out = s.drain(op);
+    assert!(!has_numeric(&out, "367"), "nothing was stored: {out:#?}");
+}
+
+/// `$a` bans any logged-in user, `$a:<mask>` an account matching the mask,
+/// `$~a` anyone not logged in (Solanum `extb_account`), on every list mode.
+#[test]
+fn the_account_extban_follows_solanum() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "op");
+    s.line(op, "JOIN #c");
+    s.drain(op);
+    let alice = s.register(2, "alice");
+    identify(&mut s, alice, "Alice");
+    let anon = s.register(3, "anon");
+
+    s.line(op, "MODE #c +b $a:ali*");
+    assert!(
+        s.drain(op)
+            .iter()
+            .any(|l| l.ends_with("MODE #c +b $a:ali*")),
+        "an extban is stored as written, not as a nick mask"
+    );
+    s.line(alice, "JOIN #c");
+    assert!(has_numeric(&s.drain(alice), "474"), "banned by account");
+    s.line(anon, "JOIN #c");
+    assert!(!has_numeric(&s.drain(anon), "474"), "not logged in");
+
+    // An exception by account lets alice in; `$~a` then bans the anonymous.
+    s.line(op, "MODE #c +e $a");
+    s.line(op, "MODE #c +b $~a");
+    s.drain(op);
+    s.line(alice, "JOIN #c");
+    assert!(!has_numeric(&s.drain(alice), "474"), "excepted by account");
+    let anon2 = s.register(4, "anon2");
+    s.line(anon2, "JOIN #c");
+    assert!(
+        has_numeric(&s.drain(anon2), "474"),
+        "$~a bans the anonymous"
+    );
+
+    // +I by account admits past +i.
+    s.line(op, "MODE #c +iI $a:alice");
+    s.drain(op);
+    s.line(alice, "PART #c");
+    s.line(alice, "JOIN #c");
+    assert!(
+        s.drain(alice).iter().any(|l| l.contains(" JOIN #c")),
+        "invite exception by account"
+    );
+}
+
+/// EXTBAN advertises exactly the extban types the list modes accept.
+#[test]
+fn extban_isupport_advertises_what_is_implemented() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "NICK alice");
+    s.line(c, "USER alice 0 * :Alice");
+    let burst = s.drain(c);
+    let tokens: Vec<&str> = burst
+        .iter()
+        .filter(|l| l.split(' ').nth(1) == Some("005"))
+        .flat_map(|l| l.split(' '))
+        .collect();
+    assert!(tokens.contains(&"EXTBAN=$,a"), "{burst:#?}");
+    assert!(tokens.contains(&"ACCOUNTEXTBAN=a"), "{burst:#?}");
+    for line in burst.iter().filter(|l| l.split(' ').nth(1) == Some("005")) {
+        let params = line.split(" :").next().expect("line").split(' ').count() - 3;
+        assert!(params <= 13, "a 005 carries at most 13 tokens: {line}");
+    }
+}
+
+/// A D-line is an address, a CIDR range or an address glob, matched against
+/// the address a user connected from — so it holds through a SETHOST cloak —
+/// and a D-line on anything else (a host name) is refused, not stored as a
+/// ban that could never match.
+#[test]
+fn a_dline_matches_the_real_address_by_cidr_and_refuses_a_host_name() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    s.db_requests();
+    s.line(op, "DLINE host7.example :not an address");
+    let out = s.drain(op);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("Refusing D-Line for host7.example")),
+        "{out:#?}"
+    );
+    assert!(s.db_requests().is_empty(), "nothing was queued");
+
+    let bob = register_from(&mut s, 2, "bob", "192.0.2.77");
+    s.line(op, "SETHOST bob cloaked.example");
+    s.drain(op);
+    s.drain(bob);
+    s.line(op, "DLINE 192.0.2.0/24 :bad netblock|seen spraying #help");
+    commit_server_ban(&mut s);
+    assert!(s.drain(op).iter().any(|l| l.contains("Added D-Line")));
+    let out = s.drain(bob);
+    assert!(
+        out.iter()
+            .any(|l| l == "ERROR :Closing Link: (D-Lined: bad netblock)"),
+        "the cloaked user is D-lined, told only the public reason: {out:#?}"
+    );
+    // A new connection from the range is refused; one outside it is not.
+    for (id, address, refused) in [(3, "192.0.2.200", true), (4, "192.0.3.1", false)] {
+        let conn = s.connect_from(id, address, e6ircd::core::ConnectionTransport::Tcp);
+        s.line(conn, "NICK joe");
+        s.line(conn, "USER joe 0 * :Joe");
+        let out = s.drain(conn);
+        assert_eq!(has_numeric(&out, "465"), refused, "{address}: {out:#?}");
+        assert!(
+            !out.iter().any(|l| l.contains("seen spraying")),
+            "the operators' half of the reason is theirs: {out:#?}"
+        );
+    }
+    // The operator listing keeps the whole reason.
+    s.line(op, "DLINE");
+    assert!(
+        s.drain(op)
+            .iter()
+            .any(|l| l.contains("bad netblock|seen spraying #help")),
+        "the operator listing shows the private half"
+    );
+}
+
+/// A K-line whose host is an address or a CIDR range matches the real
+/// address, so a SETHOST does not lift it; a malformed CIDR is refused.
+#[test]
+fn a_cidr_kline_matches_through_sethost() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    s.line(op, "KLINE *@10.0.0.0/33 :typo");
+    assert!(
+        s.drain(op).iter().any(|l| l.contains("Refusing K-Line")),
+        "a malformed CIDR is refused"
+    );
+    let bob = register_from(&mut s, 2, "bob", "10.1.2.3");
+    s.line(op, "SETHOST bob cloaked.example");
+    s.drain(op);
+    s.drain(bob);
+    s.line(op, "KLINE bob@10.0.0.0/8 :abuse");
+    commit_server_ban(&mut s);
+    s.drain(op);
+    assert!(
+        s.drain(bob).iter().any(|l| l.starts_with("ERROR :")),
+        "the cloaked session matches by address"
+    );
+}
+
+/// INVITE takes channel-operator status whether or not the channel is `+i`,
+/// unless it is `+g` (free invite), which Libera advertises and any member
+/// may then use (Solanum `m_invite`).
+#[test]
+fn invite_needs_op_unless_the_channel_is_free_invite() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "op");
+    let member = s.register(2, "member");
+    let guest = s.register(3, "guest");
+    s.line(op, "JOIN #c");
+    s.line(member, "JOIN #c");
+    s.drain(op);
+    s.drain(member);
+    s.line(member, "INVITE guest #c");
+    assert!(has_numeric(&s.drain(member), "482"), "open channel, no op");
+    assert!(s.drain(guest).is_empty());
+
+    s.line(op, "MODE #c +gi");
+    assert!(
+        s.drain(op).iter().any(|l| l.ends_with("MODE #c +gi")),
+        "+g is a flag mode"
+    );
+    s.line(op, "MODE #c");
+    assert!(
+        s.drain(op).iter().any(|l| l.contains(" 324 op #c +gin")),
+        "RPL_CHANNELMODEIS shows +g"
+    );
+    s.line(member, "INVITE guest #c");
+    assert!(
+        has_numeric(&s.drain(member), "341"),
+        "+g lets a member invite"
+    );
+    s.drain(guest);
+    s.line(guest, "JOIN #c");
+    assert!(
+        s.drain(guest).iter().any(|l| l.contains(" JOIN #c")),
+        "the invitation from a member of a +g channel passes +i"
+    );
+}
+
+/// An invitation passes `+l` too, so one is recorded while the channel has a
+/// limit; one sent while the channel was open passes nothing later.
+#[test]
+fn an_invite_is_recorded_under_a_limit_and_passes_it() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "op");
+    let guest = s.register(2, "guest");
+    let other = s.register(3, "other");
+    s.line(op, "JOIN #c");
+    s.line(op, "INVITE other #c");
+    s.line(op, "MODE #c +l 1");
+    s.drain(op);
+    s.drain(other);
+    s.line(op, "INVITE guest #c");
+    s.drain(op);
+    s.drain(guest);
+    s.line(guest, "JOIN #c");
+    assert!(
+        s.drain(guest).iter().any(|l| l.contains(" JOIN #c")),
+        "an invitation passes +l"
+    );
+    s.line(other, "JOIN #c");
+    assert!(
+        has_numeric(&s.drain(other), "471"),
+        "an invitation from before +l was not recorded"
+    );
+}
+
+/// Admission is checked ban, key, invite-only, limit (Solanum `can_join`):
+/// the first that applies is the one reported.
+#[test]
+fn join_admission_is_checked_ban_key_invite_limit() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "op");
+    let bob = s.register(2, "bob");
+    s.line(op, "JOIN #c");
+    s.line(op, "MODE #c +bkil bob!*@* key 1");
+    s.drain(op);
+    // Each refusal is the first check that applies; then that barrier is
+    // lifted and the next one is reported.
+    for (join, expected, then_lift) in [
+        ("JOIN #c key", "474", "-b bob!*@*"),
+        ("JOIN #c", "475", "+n"),
+        ("JOIN #c key", "473", "-i"),
+        ("JOIN #c key", "471", "-l"),
+    ] {
+        s.line(bob, join);
+        let out = s.drain(bob);
+        assert!(has_numeric(&out, expected), "{join}: {out:#?}");
+        s.line(op, &format!("MODE #c {then_lift}"));
+        s.drain(op);
+    }
+    s.line(bob, "JOIN #c key");
+    assert!(s.drain(bob).iter().any(|l| l.contains(" JOIN #c")));
+}
+
+/// A channel key compares under the casemapping (Solanum `irccmp`).
+#[test]
+fn a_channel_key_compares_case_insensitively() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "op");
+    let bob = s.register(2, "bob");
+    s.line(op, "JOIN #c");
+    s.line(op, "MODE #c +k Sesame");
+    s.drain(op);
+    s.line(bob, "JOIN #c wrong");
+    assert!(has_numeric(&s.drain(bob), "475"));
+    s.line(bob, "JOIN #c sESAME");
+    assert!(s.drain(bob).iter().any(|l| l.contains(" JOIN #c")));
+}
+
+/// A STATUSMSG may only be sent by a member holding op or voice there,
+/// whichever sigil (Solanum): a plain member or an outsider gets 482, on
+/// PRIVMSG, TAGMSG and a multiline batch alike.
+#[test]
+fn statusmsg_needs_op_or_voice() {
+    let mut s = TestServer::new();
+    let op = register_with_caps(&mut s, 1, "op", "message-tags");
+    let plain = register_with_caps(&mut s, 2, "plain", "message-tags batch draft/multiline");
+    let outsider = register_with_caps(&mut s, 3, "outsider", "message-tags");
+    s.line(op, "JOIN #c");
+    s.line(plain, "JOIN #c");
+    s.line(op, "MODE #c -n");
+    s.drain(op);
+    s.drain(plain);
+    for (who, line) in [
+        (plain, "PRIVMSG @#c :hi ops"),
+        (plain, "PRIVMSG +#c :hi voices"),
+        (plain, "@+typing=active TAGMSG @#c"),
+        (outsider, "PRIVMSG @#c :from outside"),
+    ] {
+        s.line(who, line);
+        assert!(has_numeric(&s.drain(who), "482"), "{line}");
+    }
+    s.line(plain, "BATCH +ml draft/multiline @#c");
+    s.line(plain, "@batch=ml PRIVMSG @#c :one");
+    s.line(plain, "BATCH -ml");
+    assert!(has_numeric(&s.drain(plain), "482"), "multiline");
+    assert!(s.drain(op).is_empty(), "nothing reached the op");
+    // A voiced member may.
+    s.line(op, "MODE #c +v plain");
+    s.drain(op);
+    s.drain(plain);
+    s.line(plain, "PRIVMSG @#c :now voiced");
+    assert!(s.drain(plain).is_empty());
+    assert!(
+        s.drain(op)
+            .iter()
+            .any(|l| l.ends_with("PRIVMSG @#c :now voiced"))
+    );
+}
+
+/// A member who could not say the reason as a message cannot say it as a PART
+/// reason: an unvoiced member of a `+m` channel parts without one.
+#[test]
+fn part_reason_is_dropped_when_the_member_cannot_speak() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "op");
+    let bob = s.register(2, "bob");
+    s.line(op, "JOIN #c");
+    s.line(bob, "JOIN #c");
+    s.line(op, "MODE #c +m");
+    s.drain(op);
+    s.drain(bob);
+    s.line(bob, "PART #c :buy my stuff");
+    assert_eq!(s.drain(op), [":bob!bob@host2.example PART #c"]);
+}
+
+/// PART of a channel that does not exist is ERR_NOSUCHCHANNEL (Solanum); of a
+/// secret one the parter is not in, too — 442 would confirm it exists.
+#[test]
+fn part_of_a_missing_or_hidden_channel_is_403() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "op");
+    let bob = s.register(2, "bob");
+    s.line(op, "JOIN #secret");
+    s.line(op, "MODE #secret +s");
+    s.line(op, "JOIN #open");
+    s.drain(op);
+    for (channel, numeric) in [("#nowhere", "403"), ("#secret", "403"), ("#open", "442")] {
+        s.line(bob, &format!("PART {channel}"));
+        assert!(has_numeric(&s.drain(bob), numeric), "{channel}");
+    }
+}
+
+/// `+k` on a keyed channel replaces the key (Solanum `chm_key`); re-setting
+/// the same key is not announced.
+#[test]
+fn mode_key_replaces_a_key_already_set() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #k");
+    s.line(alice, "MODE #k +k secret");
+    s.drain(alice);
+    s.line(alice, "MODE #k +k other");
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|l| l.ends_with("MODE #k +k other")),
+        "{out:#?}"
+    );
+    s.line(alice, "MODE #k +k other");
+    assert!(s.drain(alice).is_empty(), "no phantom +k");
+    let bob = s.register(2, "bob");
+    s.line(bob, "JOIN #k secret");
+    assert!(has_numeric(&s.drain(bob), "475"), "the old key is gone");
+    s.line(bob, "JOIN #k other");
+    assert!(s.drain(bob).iter().any(|l| l.contains(" JOIN #k")));
+}
+
+/// KNOCK is for a channel closed some way an op can open — `+i`, a key, or
+/// full — and is refused to the banned and the quieted; each user may knock
+/// once per delay and each channel be knocked on once per delay (712).
+#[test]
+fn knock_follows_solanum() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "op");
+    s.line(op, "JOIN #keyed");
+    s.line(op, "MODE #keyed +k door");
+    s.line(op, "JOIN #full");
+    s.line(op, "MODE #full +l 1");
+    s.line(op, "JOIN #quiet");
+    s.line(op, "MODE #quiet +iq bob!*@*");
+    s.drain(op);
+    let bob = s.register(2, "bob");
+    s.line(bob, "KNOCK #quiet");
+    assert!(has_numeric(&s.drain(bob), "404"), "a quieted user");
+    s.line(bob, "KNOCK #keyed");
+    assert!(has_numeric(&s.drain(bob), "711"), "a keyed channel");
+    s.line(bob, "KNOCK #full");
+    let out = s.drain(bob);
+    assert!(
+        out.iter()
+            .any(|l| l.contains(" 712 bob #full :Too many KNOCKs (user).")),
+        "bob's own delay: {out:#?}"
+    );
+    let carol = s.register(3, "carol");
+    s.line(carol, "KNOCK #full");
+    assert!(has_numeric(&s.drain(carol), "711"), "a full channel");
+    let dave = s.register(4, "dave");
+    s.line(dave, "KNOCK #full");
+    let out = s.drain(dave);
+    assert!(
+        out.iter()
+            .any(|l| l.contains(" 712 dave #full :Too many KNOCKs (channel).")),
+        "the channel's delay: {out:#?}"
+    );
+    assert_eq!(
+        s.drain(op).iter().filter(|l| l.contains(" 710 ")).count(),
+        2,
+        "the op was paged once per delivered knock"
+    );
+}
+
+/// QUIT's reason is Solanum's: `Quit: <comment>`, the nick when none was
+/// given, and nothing at all for an empty comment.
+#[test]
+fn quit_reason_follows_solanum() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "op");
+    s.line(op, "JOIN #c");
+    for (id, nick, quit, seen) in [
+        (2, "bob", "QUIT", ":bob!bob@host2.example QUIT :Quit: bob"),
+        (3, "carol", "QUIT :", ":carol!carol@host3.example QUIT :"),
+        (
+            4,
+            "dave",
+            "QUIT :later",
+            ":dave!dave@host4.example QUIT :Quit: later",
+        ),
+    ] {
+        let who = s.register(id, nick);
+        s.line(who, "JOIN #c");
+        s.drain(op);
+        s.line(who, quit);
+        assert_eq!(s.drain(op), [seen], "{quit}");
     }
 }

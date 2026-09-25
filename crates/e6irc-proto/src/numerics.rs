@@ -136,6 +136,8 @@ numerics! {
     RPL_ENDOFHELP = 706,
     RPL_KNOCK = 710,
     RPL_KNOCKDLVR = 711,
+    // Solanum: a KNOCK inside the per-user or per-channel knock delay.
+    ERR_TOOMANYKNOCK = 712,
     ERR_CHANOPEN = 713,
     ERR_KNOCKONCHAN = 714,
     RPL_MONONLINE = 730,

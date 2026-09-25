@@ -374,6 +374,40 @@ pub(super) enum BanReject {
     /// The normalized mask matches every user; refused to prevent a netban from
     /// a slipped glob. Carries the offending display mask for the notice.
     MatchesEveryone(String),
+    /// The mask could never match as written: a D-line that is not an address,
+    /// a CIDR range or an address glob (a D-line matches only the address a
+    /// user connected from), or a CIDR host whose prefix is out of range.
+    /// Carries the display mask and why.
+    Invalid(String, &'static str),
+}
+
+impl BanReject {
+    /// The refusal as the operator is told it, for a ban of kind `label`.
+    pub(super) fn describe(&self, label: &str) -> String {
+        match self {
+            Self::MatchesEveryone(mask) => format!(
+                "Refusing {label} for {mask}: it matches every user (use a more specific mask)"
+            ),
+            Self::Invalid(mask, why) => format!("Refusing {label} for {mask}: {why}"),
+        }
+    }
+}
+
+/// Whether `mask` can be a D-line: an address or a CIDR range, or a glob made
+/// only of address characters (`203.0.113.*`, `2001:db8:*`). A D-line is
+/// matched against the address the user connected from and nothing else, so
+/// a host name or a `user@host` could never match anyone.
+fn valid_dline(mask: &str) -> bool {
+    match crate::core::banmask::MaskShape::parse(mask) {
+        Ok(crate::core::banmask::MaskShape::Cidr { head: None, .. }) => true,
+        Ok(crate::core::banmask::MaskShape::Glob) => {
+            mask.contains(['*', '?'])
+                && mask
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || matches!(c, '.' | ':' | '*' | '?'))
+        }
+        _ => false,
+    }
 }
 
 impl BanMask {
@@ -418,6 +452,20 @@ impl BanMask {
         };
         if matches_everyone {
             return Err(BanReject::MatchesEveryone(display));
+        }
+        match kind {
+            BanKind::Dline if !valid_dline(&display) => {
+                return Err(BanReject::Invalid(
+                    display,
+                    "a D-line is an IP address, a CIDR range, or an IP glob",
+                ));
+            }
+            BanKind::Kline => {
+                if let Err(error) = crate::core::banmask::MaskShape::parse(&display) {
+                    return Err(BanReject::Invalid(display, error.describe()));
+                }
+            }
+            BanKind::Dline | BanKind::Xline => {}
         }
         Ok((BanMask(display), reason))
     }
@@ -483,14 +531,9 @@ pub(super) fn cmd_add_ban(
     // netban mask. A rejection is reported loudly, never silently narrowed.
     let (parsed_mask, reason) = match BanMask::parse(kind, p, has_trailing) {
         Ok(parsed) => parsed,
-        Err(BanReject::MatchesEveryone(attempted)) => {
-            state.send(
-                conn,
-                &format!(
-                    ":{server} NOTICE {nick} :Refusing {label} for {attempted}: it matches every \
-                     user (use a more specific mask)"
-                ),
-            );
+        Err(reject) => {
+            let refusal = reject.describe(label);
+            state.send(conn, &format!(":{server} NOTICE {nick} :{refusal}"));
             return;
         }
     };
@@ -605,21 +648,17 @@ pub(crate) fn apply_server_ban_hot(
     });
     // Disconnect any matching registered sessions (possibly including the setter
     // when driven by an oper).
+    let ban = state.server_bans.last().expect("pushed above").clone();
     let victims: Vec<ConnId> = state
         .sessions
         .iter()
         .filter(|(_, s)| s.is_registered())
-        .filter_map(|(&c, s)| {
-            let subject = ServerState::ban_subject(
-                kind,
-                s.user().unwrap_or("*"),
-                &s.host,
-                s.realname().unwrap_or(""),
-            );
-            e6irc_proto::mask::matches(casemap, mask.as_str(), &subject).then_some(c)
-        })
+        .filter_map(|(&c, s)| ban.matches(casemap, &s.server_ban_subject()).then_some(c))
         .collect();
     let disconnected = victims.len();
+    // The victim, and the peers its QUIT reaches, see only the public half of
+    // a `public|private` reason.
+    let reason = crate::core::state::public_ban_reason(reason);
     for victim in victims {
         state.send(
             victim,
