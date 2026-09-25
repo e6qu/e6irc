@@ -10194,3 +10194,112 @@ async fn configured_administrator_names_are_not_claimable_by_invitation() {
         ["Root"]
     );
 }
+
+/// The console owns the settings the first database-backed start imports. A
+/// later start whose configuration states one of them with another value is
+/// refused naming it — never applying the stored value over it in silence, the
+/// way a name removed from `http.admin_accounts` once kept its authority and a
+/// rotated client secret was never used — and a setting it does not state is
+/// the console's alone.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_stated_console_setting_must_agree_with_the_stored_revision() {
+    let url =
+        support::test_db("a_stated_console_setting_must_agree_with_the_stored_revision").await;
+    let key_path =
+        std::env::temp_dir().join(format!("e6irc-db-managed-drift-key-{}", std::process::id()));
+    std::fs::write(&key_path, e6ircd::secret::SecretKey::generate().to_base64())
+        .expect("write key");
+    let document = |admin_accounts: Option<&str>, client_secret: &str| -> Config {
+        let admin_accounts = admin_accounts
+            .map(|accounts| format!("admin_accounts = {accounts}"))
+            .unwrap_or_default();
+        let text = format!(
+            r#"
+            server_name = "irc.drift.example"
+            network_name = "DriftNet"
+            [[listeners]]
+            addr = "127.0.0.1:0"
+            [database]
+            url = {url:?}
+            [secrets]
+            key_file = {key_path:?}
+            [http]
+            addr = "127.0.0.1:0"
+            public_url = "http://irc.drift.example"
+            secure_cookies = false
+            {admin_accounts}
+            [[oidc]]
+            name = "idp"
+            issuer_url = "https://idp.drift.example"
+            client_id = "e6irc"
+            client_secret = "{client_secret}"
+            account_claim = "preferred_username"
+            token_endpoint_auth_method = "client_secret_post"
+            "#
+        );
+        Config::from_table(toml::from_str(&text).expect("document"), &[]).expect("valid")
+    };
+    let refusal = |config: Config| async move {
+        match net::start(config).await {
+            Ok(_) => panic!("a conflicting start was not refused"),
+            Err(error) => error.to_string(),
+        }
+    };
+    const ADMINS: &str = r#"["alice", "bob"]"#;
+
+    // First start: the stated values are imported, the secret sealed.
+    let running = net::start(document(Some(ADMINS), "first-client-secret"))
+        .await
+        .expect("first start");
+    running.shutdown.run().await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    let imported = db::load_managed_config(&pool).await.expect("imported");
+    assert_eq!(imported.revision, 1);
+    assert_eq!(imported.settings.admin_accounts, ["alice", "bob"]);
+    assert!(e6ircd::secret::is_sealed(
+        &imported.settings.oidc_providers[0].client_secret
+    ));
+
+    // The same statement again agrees with what it imported.
+    let running = net::start(document(Some(ADMINS), "first-client-secret"))
+        .await
+        .expect("unchanged restart");
+    running.shutdown.run().await;
+
+    // Removing an administrator from the statement cannot quietly keep them.
+    let refused = refusal(document(Some(r#"["alice"]"#), "first-client-secret")).await;
+    assert!(refused.contains("http.admin_accounts"), "{refused}");
+    assert!(!refused.contains("oidc"), "{refused}");
+
+    // A rotated client secret is named, and neither value is printed.
+    let refused = refusal(document(Some(ADMINS), "second-client-secret")).await;
+    assert!(refused.contains("oidc[0].client_secret"), "{refused}");
+    assert!(
+        !refused.contains("first-client") && !refused.contains("second-client"),
+        "{refused}"
+    );
+    assert!(!refused.contains("http.admin_accounts"), "{refused}");
+
+    // The console changes the list; a configuration that no longer states it
+    // starts, and the console's list is the one in force.
+    let mut edited = imported.settings.clone();
+    edited.admin_accounts = vec!["carol".into()];
+    db::save_managed_config(&pool, imported.revision, &edited, "alice", "admins")
+        .await
+        .expect("console edit");
+    let refused = refusal(document(Some(ADMINS), "first-client-secret")).await;
+    assert!(refused.contains("http.admin_accounts"), "{refused}");
+    let running = net::start(document(None, "first-client-secret"))
+        .await
+        .expect("an unstated setting is not a conflict");
+    running.shutdown.run().await;
+    let current = db::load_managed_config(&pool).await.expect("current");
+    assert_eq!(current.settings.admin_accounts, ["carol"]);
+    assert_eq!(
+        current.revision,
+        imported.revision + 1,
+        "nothing was rewritten"
+    );
+    std::fs::remove_file(&key_path).ok();
+}

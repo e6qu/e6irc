@@ -44,6 +44,14 @@ fn report(output: &Output) -> String {
 fn the_environment_alone_states_a_valid_configuration() {
     let output = e6ircd(&["check-config", "--config-from-environment"], &minimal());
     assert!(output.status.success(), "{}", report(&output));
+    // Agreement with the settings the console stores needs the database, which
+    // the check does not reach: its success says so rather than implying it.
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Not checked, because it needs the database"),
+        "{}",
+        report(&output)
+    );
 
     let mut with_oidc = minimal();
     with_oidc.extend([

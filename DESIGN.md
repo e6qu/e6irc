@@ -1630,12 +1630,15 @@ The shell also contains `/console/configuration`, the database-backed operationa
 plane. Its singleton `server_settings` row is a typed JSON document with an
 optimistic-concurrency revision, actor, and timestamp; every committed revision
 also writes a redacted `CONFIG` audit entry in the same transaction. The
-database URL, master-key source, HTTP bind, configured administrator grants,
-and optional one-time first-administrator token remain bootstrap values
-because they are prerequisites for reaching the console.
-Identity, MOTD, IRC listeners, public URL/cookie policy, administrator grants,
-OIDC providers, operators, registration policy, resource limits, trusted
-proxies, server-level networks, and the BNC attach address are UI-managed.
+database URL, master-key source, HTTP bind, release revision, and optional
+one-time first-administrator token remain bootstrap values because they are
+prerequisites for reaching the console; the console cannot edit them.
+Everything else is console-owned: identity, MOTD, IRC listeners, public
+URL/cookie policy, administrator grants (`http.admin_accounts`), OIDC
+providers, operators, registration policy, resource limits, trusted proxies,
+server-level networks, and the BNC attach address. The rule for a console-owned
+setting the bootstrap configuration also states is stated once, in §18
+("Operational configuration").
 Credential-bearing values are sealed before entering PostgreSQL and are never
 rendered back. Existing
 plaintext bootstrap credentials remain authoritative until a master key is
@@ -3481,7 +3484,9 @@ Layers, bottom to top:
   console does not edit them.
 - A minimal `e6irc.toml`/environment bootstrap supplies the PostgreSQL URL,
   secrets-key source, HTTP bind, immutable release revision, and either
-  existing administrator authority or a one-time first-administrator token.
+  initial administrator grants (imported on the first start, console-owned
+  afterwards, like every operational setting below) or a one-time
+  first-administrator token.
   Unknown keys are a **startup error**. The token is accepted only with
   PostgreSQL and HTTP configured, is 32–512 control-free bytes, and is
   permanently unusable after the first account exists.
@@ -3489,7 +3494,29 @@ Layers, bottom to top:
   at `/console/configuration`. On first start after migration, validated
   bootstrap values are imported once with provenance. Later starts load the
   persisted revision before constructing the core or listeners, so the UI is
-  authoritative. Writes use compare-and-swap revisions and a same-transaction
+  authoritative. **A console-owned setting the file or environment still
+  states must agree with the stored value, or start fails**
+  (`ManagedConfig::bootstrap_drift`, run in `net::start` before anything is
+  built): the refusal names every differing setting by its bootstrap key
+  (`http.admin_accounts`, `oidc[0].client_secret`) and prints no value, since
+  any may be a secret; stored secrets are opened with the keyring and compared
+  in constant time. Applying the stored revision over a different stated value
+  would ignore it in silence — a name removed from `E6IRC_ADMIN_ACCOUNTS` kept
+  its authority, a rotated `E6IRC_OIDC_CLIENT_SECRET` was never used. The
+  operator resolves it by removing the setting from the bootstrap (the stored
+  value then applies), aligning it with the stored value, or changing it in the
+  console first. A setting the bootstrap does not state is never a conflict: a
+  file's absent key, or an environment variable left unset whose default the
+  environment reader fills in (`E6IRC_NETWORK_NAME`, `E6IRC_IRC_ADDR`,
+  `E6IRC_SECURE_COOKIES`; `EnvironmentDocument::defaulted`). A configuration
+  built in code rather than read from a document counts as stating everything.
+  The comparison is between what is stated and what start would run with after
+  applying the revision (`apply_to`), so it cannot disagree with what is
+  applied. Plaintext credentials still authoritative for want of a master key
+  (below) are the bootstrap's, not the console's, and are not compared. The
+  drift check needs the database, so `check-config` cannot make it and its
+  success report says so; `recover-administrator` does not start the server
+  and is unaffected. Writes use compare-and-swap revisions and a same-transaction
   redacted audit entry; stale writers fail visibly. The write takes the scalar
   settings only: the collections that hold secrets (OIDC providers, operators,
   server-level networks) are kept from the current revision and changed through
@@ -3591,7 +3618,10 @@ Layers, bottom to top:
   start would refuse that needs neither the network nor the database, through
   the functions start itself uses (`net::check_offline`): parse and
   validation, the `E6IRC_MONITORING_TOKEN` rule, and every configured TLS
-  certificate/key pair read and matched. Every environment read in the daemon
+  certificate/key pair read and matched. Agreement with the stored
+  console-owned settings needs the database and is judged by start alone; a
+  passing `check-config` of a database-backed configuration says so on stderr
+  rather than implying it. Every environment read in the daemon
   goes through `environment_config`'s one rule (set-but-empty is unset; a
   control character is refused by name), `E6IRC_SECRET_KEY` and
   `E6IRC_PREVIOUS_SECRET_KEYS` included; a source test refuses a

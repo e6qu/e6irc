@@ -98,10 +98,12 @@ const upstream = await startIrcUpstream();
 await writeFile(secretKeyPath, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n", {
   mode: 0o600,
 });
-await writeFile(
-  configPath,
-  `server_name = "irc.browser.example"
-network_name = "BrowserNet"
+// The file the daemon starts from. After the journey renames the server in the
+// console, a restart must state the console's names: the console owns them, and
+// a stated value that differs is refused rather than ignored.
+const applicationConfiguration = ({ serverName, networkName }) =>
+  `server_name = "${serverName}"
+network_name = "${networkName}"
 # The journey's mock upstream listens on loopback, which the daemon refuses to
 # dial by default.
 internal_upstreams = "allow"
@@ -133,7 +135,10 @@ client_id = "e6irc-test"
 client_secret = "e6irc-test-secret"
 account_claim = "email"
 token_endpoint_auth_method = "client_secret_basic"
-`,
+`;
+await writeFile(
+  configPath,
+  applicationConfiguration({ serverName: "irc.browser.example", networkName: "BrowserNet" }),
 );
 
 const binary = resolve(repositoryRoot, required("E6IRC_TEST_SERVER_BINARY"));
@@ -1499,6 +1504,22 @@ try {
   // domains are wired together in the shipped process.
   await page.goto("about:blank");
   await stopApplicationServer({ requireGraceful: true });
+  // The file still states the names the console replaced. Starting would
+  // either apply the console's and ignore the file's in silence or the
+  // reverse; it is refused instead, naming both settings and neither value.
+  server = startApplicationServer();
+  const refusal = await waitForRefusedStart();
+  for (const setting of ["server_name", "network_name"]) {
+    assert.match(refusal, new RegExp(`${setting}: the stated value differs`), refusal);
+  }
+  assert.equal(refusal.includes("BrowserNet"), false, refusal);
+  await writeFile(
+    configPath,
+    applicationConfiguration({
+      serverName: "irc.browser-managed.example",
+      networkName: "ManagedBrowserNet",
+    }),
+  );
   server = startApplicationServer();
   await waitForHealthyServer();
   await page.goto(`${applicationOrigin}/console/networks/journey`);
@@ -2260,6 +2281,7 @@ function startApplicationServer() {
     stream.setEncoding("utf8");
     stream.on("data", (chunk) => serverOutput.push(chunk));
   }
+  child.closed = new Promise((resolveClose) => child.once("close", (code) => resolveClose(code)));
   return child;
 }
 
@@ -2282,6 +2304,24 @@ async function stopApplicationServer({ requireGraceful }) {
       `e6ircd did not complete graceful shutdown:\n${serverOutput.join("")}`,
     );
   }
+}
+
+// Wait for the start just begun, which must be refused; answers what it
+// printed. Called right after `startApplicationServer`, before any of the new
+// process's output can have arrived.
+async function waitForRefusedStart() {
+  const outputStart = serverOutput.length;
+  // `closed` settles once the process has exited and its output streams have
+  // ended, so everything it printed is in `serverOutput`.
+  const code = await Promise.race([
+    server.closed,
+    new Promise((_, rejectTimeout) =>
+      setTimeout(() => rejectTimeout(new Error("e6ircd started instead of refusing")), 30_000),
+    ),
+  ]);
+  const printed = serverOutput.slice(outputStart).join("");
+  assert.notEqual(code, 0, `e6ircd exited successfully instead of refusing:\n${printed}`);
+  return printed;
 }
 
 async function waitForHealthyServer() {

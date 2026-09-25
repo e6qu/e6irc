@@ -157,7 +157,9 @@ with `e6ircd healthcheck --addr ip:port`), because the probe reads the
 environment, not the file. `e6ircd check-config --config-from-environment`
 validates the environment and exits; it checks everything start would refuse
 short of reaching the network or PostgreSQL, `E6IRC_MONITORING_TOKEN` and every
-configured TLS certificate/key pair included. Missing required values fail the
+configured TLS certificate/key pair included. It cannot check agreement with
+the settings the console stores (below), which needs PostgreSQL, and says so
+when it passes. Missing required values fail the
 container loudly rather than starting half-configured, and so do two kinds of
 malformed value, each refused by variable name without printing the value: a
 control character anywhere in a variable (typically the carriage return or
@@ -169,10 +171,23 @@ nothing left to mean and are refused rather than ignored. A configuration *file*
 that does not parse is reported by line, column, and reason, never by quoting
 the line, which may hold a secret. On the first database-backed start,
 operational values are imported into the revisioned `server_settings` row.
-After that, administrators manage them at `/console/configuration`; the
-database URL, secrets-key source, HTTP bind, immutable release revision, and
-optional static administrator grants or the one-time first-administrator token
-stay in bootstrap because the console depends on them. On an empty account
+After that the console owns them and administrators manage them at
+`/console/configuration`: the server name, network name, IRC address, public
+URL, cookie policy, administrator accounts (`E6IRC_ADMIN_ACCOUNTS`) and the
+OpenID Connect provider (client secret included). Only the database URL,
+secrets-key source, HTTP bind, immutable release revision, and the one-time
+first-administrator token stay bootstrap-only, because the console depends on
+them. A variable that still states a console-owned setting must agree with the
+stored value: if it differs, the container fails to start and names each such
+setting (`http.admin_accounts`, `oidc[0].client_secret`) without printing
+either value. Resolve it by unsetting the variable (the stored value applies;
+`E6IRC_SERVER_NAME` and `E6IRC_PUBLIC_URL` are required, so align those),
+setting it to the stored value, or changing the setting in the console first.
+So removing a name from `E6IRC_ADMIN_ACCOUNTS` or rotating
+`E6IRC_OIDC_CLIENT_SECRET` is done in the console (then the variable is
+aligned or unset) — never silently ignored. A variable left unset is not a
+conflict, and neither is the default put in its place. An administrator locked
+out of the console uses `e6ircd recover-administrator`. On an empty account
 store, set `E6IRC_BOOTSTRAP_TOKEN`, open `/bootstrap`, and create the first
 durable administrator. The route closes permanently as soon as any account
 exists; remove the environment secret after successful initialization.
@@ -205,7 +220,7 @@ configured, the next start seals and imports them atomically.
 | `E6IRC_SECURE_COOKIES` | no (`true`) | Mark session cookies `Secure`; exactly `true` or `false` |
 | `E6IRC_HSTS_INCLUDE_SUBDOMAINS` | no (`false`) | Add `includeSubDomains` to the HSTS header, forcing every sibling host of the domain onto HTTPS for a year; exactly `true` or `false`, and `true` needs an `https://` `E6IRC_PUBLIC_URL` |
 | `E6IRC_MONITORING_TOKEN` | no (secret; at least 32 non-whitespace characters) | Bearer for the read-only `/api/v1/monitoring/observation` endpoint; unset, the endpoint is closed |
-| `E6IRC_ADMIN_ACCOUNTS` | no | Comma-separated admin account names; empty fields are ignored |
+| `E6IRC_ADMIN_ACCOUNTS` | no | Comma-separated administrator account names, imported on the first start and console-owned afterwards (see above); empty fields name no account |
 | `E6IRC_BOOTSTRAP_TOKEN` | no (secret; 32–512 bytes) | One-time browser token for creating the first durable administrator on an empty account store |
 | `E6IRC_DATABASE_MAX_CONNECTIONS` | no (sized to the host) | Most connections the shared PostgreSQL pool opens, 2–200 (`[database] max_connections` in a configuration file). The default is 1 (the serial database worker) + 4 (concurrent Argon2 verifications) + 2 × the host's CPU threads; size the PostgreSQL server's `max_connections` for every replica's pool plus your own sessions. The pool's size, idle count and acquire timeouts are on `/api/v1/admin/metrics` (`e6irc_database_pool_*`; administrator authentication required) |
 | `E6IRC_OIDC_ISSUER` | no | Shauth issuer, e.g. `https://auth.dev.e6qu.dev` (enables SSO) |
