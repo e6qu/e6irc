@@ -208,8 +208,8 @@ async fn full_oidc_login_provisions_account_and_session() {
         .expect("logout");
     assert_eq!(
         resp.status(),
-        303,
-        "a local sign-out lands on /auth/signed-out"
+        204,
+        "a script's sign-out ends this application's session only"
     );
     let resp = client
         .get(format!("{base}/api/v1/me"))
@@ -512,7 +512,11 @@ async fn oidc_silent_sso_reuses_provider_session() {
             client_secret: "e6irc-test-secret".into(),
             account_claim: e6ircd::config::OidcAccountClaim::Email,
             scopes: vec![],
-            allowed_email_domains: vec![],
+            allowed_email_domains: vec![
+                // An email names a new account only under a domain policy:
+                // dex's mock user is kilgore@kilgore.trout.
+                e6ircd::identity::EmailDomain::parse("kilgore.trout").expect("test domain"),
+            ],
             end_session_endpoint: None,
             token_endpoint_auth_method: e6ircd::config::TokenEndpointAuthMethod::ClientSecretBasic,
         }],
