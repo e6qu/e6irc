@@ -1571,7 +1571,14 @@ try {
   // loading survives, NAMES replaces stale membership, DMs close locally, and
   // a confirmed self-PART removes the channel.
   const networkURL = `${applicationOrigin}/api/v1/me/networks`;
-  const historyURL = `${applicationOrigin}/api/v1/me/networks/demo/buffer?limit=1000`;
+  // The client reads history through its oldest row's ring position
+  // (`&through=`) whenever it has one, so the double matches the page with or
+  // without that bound. An exact URL let the bounded read slip past to the real
+  // daemon, where `demo` does not exist.
+  const historyURL = (url) =>
+    url.origin === applicationOrigin &&
+    url.pathname === "/api/v1/me/networks/demo/buffer" &&
+    url.searchParams.get("limit") === "1000";
   await page.route(networkURL, async (route) => {
     await route.fulfill({
       status: 200,
