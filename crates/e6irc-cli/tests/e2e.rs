@@ -1379,19 +1379,29 @@ async fn cli_tail_ends_cleanly_when_its_reader_goes_away() {
     .await
     .unwrap();
     assert!(first.contains("first"), "{first}");
-    for text in ["second", "third", "fourth"] {
-        sender
-            .send_line(&format!("PRIVMSG #pipe :{text}"))
-            .await
-            .unwrap();
-    }
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        tokio::task::spawn_blocking(move || child.wait_with_output().expect("wait")),
-    )
+    // The reader is gone, but another test in this process may be spawning a
+    // child at this moment, and until that child execs it holds a copy of the
+    // pipe's read end: a line written then fills the pipe instead of failing.
+    // So the channel keeps talking until tail meets the closed pipe, rather
+    // than saying a fixed number of lines that may all land in that window.
+    let mut exited = tokio::task::spawn_blocking(move || child.wait_with_output().expect("wait"));
+    let output = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let mut said = 0u32;
+        loop {
+            tokio::select! {
+                output = &mut exited => return output.unwrap(),
+                () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                    said += 1;
+                    sender
+                        .send_line(&format!("PRIVMSG #pipe :after {said}"))
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+    })
     .await
-    .expect("tail kept running with nobody reading")
-    .unwrap();
+    .expect("tail kept running with nobody reading");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("panicked"), "{stderr}");
     assert!(output.status.success(), "{stderr}");
