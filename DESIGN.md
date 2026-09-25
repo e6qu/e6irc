@@ -2959,7 +2959,14 @@ Design constraints recorded now:
   mapping — stored before the network said, or before it changed — are
   re-keyed from their spelling by the persistence task before it writes, and
   a restarted network compares names under the mapping its newest rows were
-  keyed with until the network says again. TARGETS names each conversation as
+  keyed with until the network says again. The account's read markers on the
+  network (`bnc_read_markers`) are keyed the same way and keep the same two
+  facts beside the key (the name as MARKREAD spelled it and the mapping it was
+  folded under, migration 0083); every marker read or write names the
+  network's current mapping and first re-keys, under the account's row lock,
+  what was folded under another — two names the new mapping makes one merge at
+  the later position — so an `ascii` network's `#a[` keeps its marker across a
+  mapping change. TARGETS names each conversation as
   spelled, never by its key, which on another mapping can name someone else;
   CHATHISTORY accepts any target structurally (one parameter of at most 200
   bytes), since nick grammar, channel types and lengths are the network's.

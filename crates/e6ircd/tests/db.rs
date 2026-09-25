@@ -3317,8 +3317,9 @@ async fn concurrent_bnc_read_markers_cannot_exceed_the_account_cap() {
         .expect("account");
     for index in 0..250 {
         sqlx::query(
-            "INSERT INTO bnc_read_markers (account_id, network, target, timestamp)
-             SELECT id, 'net', $1, '2026-01-01T00:00:00.000Z'
+            "INSERT INTO bnc_read_markers
+                 (account_id, network, target, timestamp, target_display, target_casemapping)
+             SELECT id, 'net', $1, '2026-01-01T00:00:00.000Z', $1, 'rfc1459'
              FROM accounts WHERE name_folded = 'alice'",
         )
         .bind(format!("#existing{index}"))
@@ -3572,6 +3573,143 @@ async fn bnc_conversations_are_keyed_the_networks_way_and_named_as_spelled() {
             .await
             .expect("stored mapping"),
         Some(e6irc_proto::casemap::CaseMapping::Ascii)
+    );
+}
+
+/// A read marker is keyed like the backlog it marks, and follows the network's
+/// mapping the same way: markers set before an `ascii` network said so (folded
+/// the RFC 1459 way, `#dev[m]` as `#dev{m}`) are found under the network's own
+/// keys afterwards, `#a[` and `#a{` keep two positions there, and a change back
+/// to RFC 1459 makes the two one conversation at the later position.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn bnc_read_markers_follow_the_networks_case_mapping() {
+    use e6irc_proto::casemap::CaseMapping;
+    let pool = db::connect_and_migrate(&support::test_db("bnc_read_marker_casemapping").await)
+        .await
+        .expect("connect");
+    db::create_account_with_contact(&pool, "alice", "password", None)
+        .await
+        .expect("account");
+    let set = async |target: &str, mapping: CaseMapping, stamp: &str| {
+        let stored = db::set_bnc_read_marker(&pool, "alice", "unreal", target, mapping, stamp)
+            .await
+            .expect("set marker");
+        assert!(matches!(stored, db::BncReadMarkerWrite::Stored(_)));
+    };
+    let get = async |target: &str, mapping: CaseMapping| {
+        db::get_bnc_read_marker(&pool, "alice", "unreal", target, mapping)
+            .await
+            .expect("get marker")
+    };
+    // Before the network's 005, as the first attach of a restart is.
+    set("#Dev[m]", CaseMapping::Rfc1459, "2026-01-01T00:00:01.000Z").await;
+    set("Guest\\~", CaseMapping::Rfc1459, "2026-01-01T00:00:02.000Z").await;
+    // The network says it is `ascii`: the markers are its keys now.
+    assert_eq!(
+        get("#dev[m]", CaseMapping::Ascii).await.as_deref(),
+        Some("2026-01-01T00:00:01.000Z")
+    );
+    assert_eq!(get("#dev{m}", CaseMapping::Ascii).await, None);
+    assert_eq!(
+        get("GUEST\\~", CaseMapping::Ascii).await.as_deref(),
+        Some("2026-01-01T00:00:02.000Z")
+    );
+    set("#a[", CaseMapping::Ascii, "2026-01-01T00:00:03.000Z").await;
+    set("#a{", CaseMapping::Ascii, "2026-01-01T00:00:04.000Z").await;
+    let mut listed = db::bnc_read_markers(&pool, "alice", "unreal", CaseMapping::Ascii)
+        .await
+        .expect("list markers");
+    listed.sort();
+    assert_eq!(
+        listed,
+        [
+            ("#a[".to_string(), "2026-01-01T00:00:03.000Z".to_string()),
+            ("#a{".to_string(), "2026-01-01T00:00:04.000Z".to_string()),
+            ("#dev[m]".to_string(), "2026-01-01T00:00:01.000Z".to_string()),
+            ("guest\\~".to_string(), "2026-01-01T00:00:02.000Z".to_string()),
+        ]
+    );
+    // Back to RFC 1459: `#a[` and `#a{` are one channel, read to the later
+    // of the two positions, and nothing is lost or left under an old key.
+    let mut listed = db::bnc_read_markers(&pool, "alice", "unreal", CaseMapping::Rfc1459)
+        .await
+        .expect("list markers");
+    listed.sort();
+    assert_eq!(
+        listed,
+        [
+            ("#a{".to_string(), "2026-01-01T00:00:04.000Z".to_string()),
+            ("#dev{m}".to_string(), "2026-01-01T00:00:01.000Z".to_string()),
+            ("guest|^".to_string(), "2026-01-01T00:00:02.000Z".to_string()),
+        ]
+    );
+    assert_eq!(
+        get("#DEV[M]", CaseMapping::Rfc1459).await.as_deref(),
+        Some("2026-01-01T00:00:01.000Z")
+    );
+}
+
+/// Migration 0083 names every stored read marker from what the backlog knows:
+/// the spelling and mapping of the newest stored line of its conversation, or,
+/// with none left, its own key under the mapping the network last used.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn read_marker_display_migration_backfills_from_the_backlog() {
+    let url = support::test_db("read_marker_display_migration").await;
+    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    MIGRATIONS
+        .run_to(81, &pool)
+        .await
+        .expect("migrate through 0081");
+    let account: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (name, name_folded) VALUES ('alice', 'alice') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("account");
+    sqlx::query(
+        "INSERT INTO bnc_buffer (owner, network, line, target, sent_at, target_display,
+                                 target_casemapping)
+         VALUES ('alice', 'unreal', ':x!u@h PRIVMSG #Dev[m] :hi', '#dev[m]',
+                 '2026-01-01T00:00:00.000Z', '#Dev[m]', 'ascii'),
+                ('*', 'shared', ':x!u@h PRIVMSG #Ops :hi', '#ops',
+                 '2026-01-01T00:00:00.000Z', '#Ops', 'rfc1459')",
+    )
+    .execute(&pool)
+    .await
+    .expect("buffer");
+    sqlx::query(
+        "INSERT INTO bnc_read_markers (account_id, network, target, timestamp)
+         VALUES ($1, 'unreal', '#dev[m]', '2026-01-01T00:00:01.000Z'),
+                ($1, 'unreal', '#gone[', '2026-01-01T00:00:02.000Z'),
+                ($1, 'shared', '#ops', '2026-01-01T00:00:03.000Z'),
+                ($1, 'quiet', '#none', '2026-01-01T00:00:04.000Z')",
+    )
+    .bind(account)
+    .execute(&pool)
+    .await
+    .expect("markers");
+    MIGRATIONS.run(&pool).await.expect("migrate");
+    let named: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT target, target_display, target_casemapping FROM bnc_read_markers
+         ORDER BY network, target",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("markers");
+    let named: Vec<(&str, &str, &str)> = named
+        .iter()
+        .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
+        .collect();
+    assert_eq!(
+        named,
+        [
+            ("#none", "#none", "rfc1459"),
+            ("#ops", "#Ops", "rfc1459"),
+            ("#dev[m]", "#Dev[m]", "ascii"),
+            ("#gone[", "#gone[", "ascii"),
+        ]
     );
 }
 
@@ -7640,8 +7778,9 @@ async fn permanent_account_deletion_requires_succession_purges_and_retires() {
     .expect("buffer");
     // A BNC MARKREAD leaves a marker row that references the account.
     sqlx::query(
-        "INSERT INTO bnc_read_markers (account_id, network, target, timestamp)
-         VALUES ($1, 'libera', '#rust', '2026-01-01T00:00:00.000Z')",
+        "INSERT INTO bnc_read_markers
+             (account_id, network, target, timestamp, target_display, target_casemapping)
+         VALUES ($1, 'libera', '#rust', '2026-01-01T00:00:00.000Z', '#rust', 'rfc1459')",
     )
     .bind(bob_id)
     .execute(&pool)
@@ -7788,8 +7927,9 @@ async fn account_export_and_security_activity_are_owner_scoped_and_secret_free()
     .await
     .expect("network");
     sqlx::query(
-        "INSERT INTO bnc_read_markers (account_id, network, target, timestamp)
-         VALUES ($1, 'libera', '#rust', '2026-01-01T00:00:00.000Z')",
+        "INSERT INTO bnc_read_markers
+             (account_id, network, target, timestamp, target_display, target_casemapping)
+         VALUES ($1, 'libera', '#rust', '2026-01-01T00:00:00.000Z', '#rust', 'rfc1459')",
     )
     .bind(alice_id)
     .execute(&pool)
@@ -8087,13 +8227,14 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     .await
     .expect("read markers");
     sqlx::query(
-        "INSERT INTO bnc_read_markers (account_id, network, target, timestamp)
+        "INSERT INTO bnc_read_markers
+             (account_id, network, target, timestamp, target_display, target_casemapping)
          VALUES ($1, 'libera', '#old',
                  to_char((now() - interval '31 days') AT TIME ZONE 'UTC',
-                         'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')),
+                         'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), '#old', 'rfc1459'),
                 ($1, 'libera', '#new',
                  to_char(now() AT TIME ZONE 'UTC',
-                         'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))",
+                         'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), '#new', 'rfc1459')",
     )
     .bind(account_id)
     .execute(&pool)
@@ -11990,8 +12131,9 @@ async fn storage_constrains_bnc_names_and_timestamps() {
         let pool = pool.clone();
         async move {
             sqlx::query(
-                "INSERT INTO bnc_read_markers (account_id, network, target, timestamp)
-                 VALUES ($1, 'libera', $2, $2)",
+                "INSERT INTO bnc_read_markers
+                     (account_id, network, target, timestamp, target_display, target_casemapping)
+                 VALUES ($1, 'libera', $2, $2, $2, 'rfc1459')",
             )
             .bind(account)
             .bind(stamp)

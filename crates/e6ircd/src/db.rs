@@ -8246,6 +8246,16 @@ pub async fn persist_bnc_line(
     Ok(())
 }
 
+/// `casemapping`'s fold as the two arguments of a SQL `translate()`: every
+/// byte the mapping lowers, and what to. The one rendering of a mapping in
+/// SQL, so stored lines and read markers are re-keyed by the same fold.
+fn fold_translation(casemapping: CaseMapping) -> (String, String) {
+    (0u8..128)
+        .filter(|byte| casemapping.lower(*byte) != *byte)
+        .map(|byte| (char::from(byte), char::from(casemapping.lower(byte))))
+        .unzip()
+}
+
 /// Re-key every stored conversation of one buffer that was folded under
 /// another case mapping than `casemapping` — rows stored before the network
 /// said how it compares names, or before it changed — from the name as the
@@ -8256,11 +8266,7 @@ pub async fn rekey_bnc_targets(
     buffer: &BncBuffer,
     casemapping: CaseMapping,
 ) -> Result<u64, DbError> {
-    // The fold as a `translate()`: every byte the mapping lowers, and what to.
-    let (upper, lower): (String, String) = (0u8..128)
-        .filter(|byte| casemapping.lower(*byte) != *byte)
-        .map(|byte| (char::from(byte), char::from(casemapping.lower(byte))))
-        .unzip();
+    let (upper, lower) = fold_translation(casemapping);
     sqlx::query(
         "UPDATE bnc_buffer
          SET target = translate(target_display, $3, $4), target_casemapping = $5
@@ -8809,6 +8815,75 @@ pub async fn bnc_history_targets(
 }
 
 // ---- BNC read markers -----------------------------------------------------
+//
+// A marker is keyed like the backlog it marks: its conversation folded the
+// network's way, with the name as spelled (`target_display`) and the mapping
+// the key was folded under (`target_casemapping`) beside it. Every access
+// names the network's current mapping and first re-keys what was folded under
+// another, so no read can miss a marker because the network changed how it
+// compares names.
+
+/// Lock `account`'s row for a read-marker operation and bring its markers on
+/// `network` (folded) under `casemapping`. Every marker operation starts here:
+/// the lock orders the re-key against concurrent writers and the per-account
+/// cap, and a caller cannot reach a marker still keyed the old way. `None`
+/// when the account does not exist.
+async fn lock_bnc_read_markers(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account: &str,
+    network: &str,
+    casemapping: CaseMapping,
+) -> Result<Option<i64>, DbError> {
+    let account_id: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR NO KEY UPDATE")
+            .bind(CaseMapping::Rfc1459.casefold(account))
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(query_error)?;
+    let Some(account_id) = account_id else {
+        return Ok(None);
+    };
+    let mapping = casemapping.isupport_token();
+    let moved: Vec<(String, String)> = sqlx::query_as(
+        "DELETE FROM bnc_read_markers
+         WHERE account_id = $1 AND network = $2 AND target_casemapping <> $3
+         RETURNING target_display, timestamp",
+    )
+    .bind(account_id)
+    .bind(network)
+    .bind(mapping)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(query_error)?;
+    if moved.is_empty() {
+        return Ok(Some(account_id));
+    }
+    // Two names one mapping told apart may be one name under the next
+    // (`#a[` and `#a{` under RFC 1459): they become one marker, at the later
+    // of their positions, as they are one conversation now.
+    let (displays, stamps): (Vec<String>, Vec<String>) = moved.into_iter().unzip();
+    let (upper, lower) = fold_translation(casemapping);
+    sqlx::query(
+        "INSERT INTO bnc_read_markers
+             (account_id, network, target, timestamp, target_display, target_casemapping)
+         SELECT $1, $2, translate(display, $4, $5), max(stamp), min(display), $3
+         FROM unnest($6::text[], $7::text[]) AS moved(display, stamp)
+         GROUP BY translate(display, $4, $5)
+         ON CONFLICT (account_id, network, target)
+         DO UPDATE SET timestamp = GREATEST(bnc_read_markers.timestamp, EXCLUDED.timestamp)",
+    )
+    .bind(account_id)
+    .bind(network)
+    .bind(mapping)
+    .bind(upper)
+    .bind(lower)
+    .bind(&displays)
+    .bind(&stamps)
+    .execute(&mut **tx)
+    .await
+    .map_err(query_error)?;
+    Ok(Some(account_id))
+}
 
 /// Get one per-network, per-target read marker, or `None` if unset.
 ///
@@ -8820,39 +8895,52 @@ pub async fn get_bnc_read_marker(
     target: &str,
     casemapping: CaseMapping,
 ) -> Result<Option<String>, DbError> {
-    let folded = CaseMapping::Rfc1459.casefold(account);
     let net_folded = CaseMapping::Rfc1459.casefold(network);
-    let target_folded = casemapping.casefold(target);
-    sqlx::query_scalar(
+    let mut tx = pool.begin().await.map_err(query_error)?;
+    let Some(account_id) = lock_bnc_read_markers(&mut tx, account, &net_folded, casemapping).await?
+    else {
+        return Ok(None);
+    };
+    let stored = sqlx::query_scalar(
         "SELECT timestamp FROM bnc_read_markers
-         WHERE account_id = (SELECT id FROM accounts WHERE name_folded = $1)
-           AND network = $2 AND target = $3",
+         WHERE account_id = $1 AND network = $2 AND target = $3",
     )
-    .bind(&folded)
+    .bind(account_id)
     .bind(&net_folded)
-    .bind(&target_folded)
-    .fetch_optional(pool)
+    .bind(casemapping.casefold(target))
+    .fetch_optional(&mut *tx)
     .await
-    .map_err(query_error)
+    .map_err(query_error)?;
+    tx.commit().await.map_err(query_error)?;
+    Ok(stored)
 }
 
-/// Every read marker `account` keeps on `network`, as (folded target,
-/// timestamp): where an attaching client's replay of each conversation starts.
+/// Every read marker `account` keeps on `network`, as (target folded under
+/// `casemapping`, timestamp): where an attaching client's replay of each
+/// conversation starts.
 pub async fn bnc_read_markers(
     pool: &PgPool,
     account: &str,
     network: &str,
+    casemapping: CaseMapping,
 ) -> Result<Vec<(String, String)>, DbError> {
-    sqlx::query_as(
+    let net_folded = CaseMapping::Rfc1459.casefold(network);
+    let mut tx = pool.begin().await.map_err(query_error)?;
+    let Some(account_id) = lock_bnc_read_markers(&mut tx, account, &net_folded, casemapping).await?
+    else {
+        return Ok(Vec::new());
+    };
+    let markers = sqlx::query_as(
         "SELECT target, timestamp FROM bnc_read_markers
-         WHERE account_id = (SELECT id FROM accounts WHERE name_folded = $1)
-           AND network = $2",
+         WHERE account_id = $1 AND network = $2",
     )
-    .bind(CaseMapping::Rfc1459.casefold(account))
-    .bind(CaseMapping::Rfc1459.casefold(network))
-    .fetch_all(pool)
+    .bind(account_id)
+    .bind(&net_folded)
+    .fetch_all(&mut *tx)
     .await
-    .map_err(query_error)
+    .map_err(query_error)?;
+    tx.commit().await.map_err(query_error)?;
+    Ok(markers)
 }
 
 /// Set (upsert) one per-network, per-target read marker.
@@ -8874,24 +8962,16 @@ pub async fn set_bnc_read_marker(
     casemapping: CaseMapping,
     timestamp: &str,
 ) -> Result<BncReadMarkerWrite, DbError> {
-    let folded = CaseMapping::Rfc1459.casefold(account);
     let net_folded = CaseMapping::Rfc1459.casefold(network);
     let target_folded = casemapping.casefold(target);
     let mut tx = pool.begin().await.map_err(query_error)?;
-    // Lock the durable account row while checking and consuming marker
-    // capacity. This both serializes concurrent writers for the same account
-    // and keeps the identifier at its schema-native BIGINT width.
-    let account_id: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR NO KEY UPDATE")
-            .bind(&folded)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(query_error)?;
-    let Some(account_id) = account_id else {
+    // The account row lock taken here serializes concurrent writers for the
+    // same account, so two attaches cannot both see 255 rows and commit the
+    // 256th/257th.
+    let Some(account_id) = lock_bnc_read_markers(&mut tx, account, &net_folded, casemapping).await?
+    else {
         return Err(DbError::UnknownAccount(account.to_string()));
     };
-    // Without the account row lock above, two attaches can both see 255 rows
-    // and commit the 256th/257th concurrently.
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1 FROM bnc_read_markers
@@ -8916,16 +8996,20 @@ pub async fn set_bnc_read_marker(
         }
     }
     let stored: String = sqlx::query_scalar(
-        "INSERT INTO bnc_read_markers (account_id, network, target, timestamp)
-         VALUES ($1, $2, $3, $4)
+        "INSERT INTO bnc_read_markers
+             (account_id, network, target, timestamp, target_display, target_casemapping)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (account_id, network, target)
-         DO UPDATE SET timestamp = GREATEST(bnc_read_markers.timestamp, EXCLUDED.timestamp)
+         DO UPDATE SET timestamp = GREATEST(bnc_read_markers.timestamp, EXCLUDED.timestamp),
+                       target_display = EXCLUDED.target_display
          RETURNING timestamp",
     )
     .bind(account_id)
     .bind(&net_folded)
     .bind(&target_folded)
     .bind(timestamp)
+    .bind(target)
+    .bind(casemapping.isupport_token())
     .fetch_one(&mut *tx)
     .await
     .map_err(query_error)?;

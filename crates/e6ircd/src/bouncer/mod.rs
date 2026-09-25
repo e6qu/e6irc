@@ -1753,41 +1753,9 @@ impl CarriedDeliveries {
     }
 }
 
-/// A reqwest DNS resolver that vets every resolved address and drops the ones a
-/// bridge may not dial — the same control the IRC driver applies at connect
-/// time (`crate::egress`: never an upstream, or internal under the server's
-/// policy). Resolution happens per request, so a host that resolves to a
-/// refused address — now or after a DNS rebind — is refused at dial time, not
-/// just at config time.
-#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-struct VettingResolver(crate::egress::InternalUpstreams);
-
-#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
-impl reqwest::dns::Resolve for VettingResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let policy = self.0;
-        Box::pin(async move {
-            let host = name.as_str().to_string();
-            let resolved = tokio::net::lookup_host((host.as_str(), 0)).await?;
-            let vetted: Vec<std::net::SocketAddr> =
-                resolved.filter(|sa| policy.permits(sa.ip())).collect();
-            if vetted.is_empty() {
-                // Either DNS returned nothing or every address was blocked; both
-                // are a refusal, not a silent fall-through to the OS resolver.
-                return Err(format!(
-                    "{host}: no permitted address (every resolved address is internal or \
-                     never an upstream)"
-                )
-                .into());
-            }
-            Ok(Box::new(vetted.into_iter()) as reqwest::dns::Addrs)
-        })
-    }
-}
-
 /// The HTTP client every bridge uses for its REST calls. Bounds each request by
 /// `timeout`, refuses redirects (an upstream 3xx can't re-target an internal
-/// address), and vets every resolved IP via [`VettingResolver`] — so a bridge's
+/// address), and vets every resolved IP via [`crate::egress::VettingResolver`] — so a bridge's
 /// configured host can't point an HTTP call at a cloud-metadata endpoint. One
 /// constructor so all three bridges share the discipline rather than each
 /// rebuilding it (and drifting).
@@ -1819,7 +1787,9 @@ impl BridgeHttp {
             // cleartext (see `BridgeHttp::request`), so the client refuses it
             // outright as well.
             .https_only(internal_upstreams == crate::egress::InternalUpstreams::Refuse)
-            .dns_resolver(std::sync::Arc::new(VettingResolver(internal_upstreams)))
+            .dns_resolver(std::sync::Arc::new(crate::egress::VettingResolver::new(
+                internal_upstreams,
+            )))
             .build()?;
         Ok(Self {
             client,
@@ -2084,7 +2054,7 @@ macro_rules! bridge_start {
 pub(crate) use bridge_start;
 
 /// Open a bridge gateway WebSocket to `url`, vetting the resolved IP the same way
-/// [`VettingResolver`] vets HTTP dials. The gateway URL comes from an upstream
+/// [`crate::egress::VettingResolver`] vets HTTP dials. The gateway URL comes from an upstream
 /// REST response, so a hostile/compromised provider could point it at an internal
 /// address; `connect_async` would resolve and dial it blind. Instead we resolve
 /// the host ourselves, dial a *vetted* address directly, and hand that stream to
@@ -6431,7 +6401,10 @@ impl ReadPositions {
         let Some(history) = handle.history() else {
             return Self::None;
         };
-        match crate::db::bnc_read_markers(&history.pool, account, &history.network).await {
+        let casemapping = handle.names().casemapping();
+        match crate::db::bnc_read_markers(&history.pool, account, &history.network, casemapping)
+            .await
+        {
             Ok(markers) => Self::Known(
                 markers
                     .into_iter()

@@ -776,7 +776,8 @@ attached clients found, and this change fixes:
   history filing read the network's `CASEMAPPING`, `CHANTYPES` and
   `STATUSMSG`; stored conversations keep their spelling and are keyed and
   re-keyed under the network's mapping (migration 0076), and TARGETS names them
-  as spelled.
+  as spelled. Read markers keep their spelling and mapping too and are re-keyed
+  the same way (migration 0083).
 - **Replay and CHATHISTORY disagreed on time** on networks without
   `server-time`: every line is stamped when it is taken in.
 - **Echoes**: a message to several targets is echoed per target, an echo the
