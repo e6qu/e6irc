@@ -46,183 +46,15 @@ pub(super) fn services_dispatch(
 
 pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, args: &[&str]) {
     match command {
-        "REGISTER" => {
-            let (password, contact_email) = match args {
-                [password] if !state.config.registration_require_email => (*password, None),
-                [password, email] => match crate::identity::ContactEmail::parse(email) {
-                    Ok(email) => (*password, Some(email)),
-                    Err(_) => {
-                        state.service_notice(
-                            conn,
-                            "NickServ",
-                            "Invalid email address. Syntax: REGISTER <password> [email]",
-                        );
-                        return;
-                    }
-                },
-                _ => {
-                    state.service_notice(conn, "NickServ", "Syntax: REGISTER <password> [email]");
-                    return;
-                }
-            };
-            if state.sessions[&conn].account().is_some() {
-                state.service_notice(conn, "NickServ", "You are already logged in.");
-                return;
-            }
-            let name = state.sessions[&conn]
-                .nick()
-                .map(String::from)
-                .expect("registered");
-            if state.config.reserved_account_names.reserves(&name) {
-                state.service_notice(
-                    conn,
-                    "NickServ",
-                    &format!(
-                        "\x02{name}\x02 is reserved for a server administrator and cannot be \
-                         registered."
-                    ),
-                );
-                return;
-            }
-            // Per-IP account-creation throttle (mirrors the REGISTER path): the
-            // per-connection budget alone doesn't stop one address minting
-            // accounts across a churn of short-lived connections.
-            if !state.registration_rate_ok(conn) {
-                state.service_notice(
-                    conn,
-                    "NickServ",
-                    "Too many account registrations from your address. Try again later.",
-                );
-                return;
-            }
-            // Account creation runs argon2 (a full hash even when the account
-            // already exists, via ON CONFLICT), so it must spend from the shared
-            // per-connection credential budget — otherwise a loop of REGISTER
-            // drives unbounded argon2 work, bypassing the SASL cap. Closes the
-            // connection when the budget is exhausted.
-            if !credential_attempt_ok(state, conn) {
-                return;
-            }
-            let request = crate::core::DbRequest::CreateAccount {
-                conn,
-                name,
-                contact_email,
-                password: password.to_string(),
-                origin: crate::core::AccountOrigin::NickServ,
-            };
-            if state.db_tx.try_push(request).is_err() {
-                state.service_notice(
-                    conn,
-                    "NickServ",
-                    "Services are temporarily unavailable. Try again later.",
-                );
-            }
-        }
-        "IDENTIFY" => {
-            // IDENTIFY <password> | IDENTIFY <account> <password>
-            let (account, password) = match args {
-                [password] => (
-                    state.sessions[&conn]
-                        .nick()
-                        .map(String::from)
-                        .expect("registered"),
-                    *password,
-                ),
-                [account, password] => (account.to_string(), *password),
-                _ => {
-                    state.service_notice(conn, "NickServ", "Syntax: IDENTIFY [account] <password>");
-                    return;
-                }
-            };
-            // One credential verification may be in flight per connection.
-            if state.sessions[&conn].sasl_verify_pending
-                || state.sessions[&conn].pending_identify.is_some()
-            {
-                state.service_notice(
-                    conn,
-                    "NickServ",
-                    "An authentication is already in progress. Try again in a moment.",
-                );
-                return;
-            }
-            // Password verification runs argon2 (even a nonexistent account
-            // spends a dummy verify to avoid a timing oracle), so it spends from
-            // the shared per-connection credential budget — the same cap SASL
-            // enforces, so IDENTIFY can't be looped to brute-force or burn CPU.
-            if !credential_attempt_ok(state, conn) {
-                return;
-            }
-            let request = crate::core::DbRequest::VerifyPassword {
-                conn,
-                account,
-                password: password.to_string(),
-                origin: crate::core::CredentialOrigin::NickServIdentify,
-            };
-            if state.db_tx.try_push(request).is_err() {
-                // Synchronous failure: the normal dispatch capture frames this
-                // under the command's label, so no deferred hold is set up.
-                state.service_notice(
-                    conn,
-                    "NickServ",
-                    "Services are temporarily unavailable. Try again later.",
-                );
-            } else {
-                let label = state.capture.as_mut().and_then(|cap| {
-                    cap.label.clone().inspect(|_| {
-                        cap.deferred = true;
-                    })
-                });
-                state
-                    .sessions
-                    .get_mut(&conn)
-                    .expect("checked")
-                    .pending_identify = Some(crate::core::state::PendingServiceReply::new(label));
-            }
-        }
-        "GHOST" => {
-            // GHOST <nick>: disconnect a lingering session holding a nick
-            // you own, so you can reclaim it. An account owns the nick of
-            // the same name (nick registration model).
-            let Some(&nick) = args.first() else {
-                state.service_notice(conn, "NickServ", "Syntax: GHOST <nick>");
-                return;
-            };
-            let Some(account) = require_identified(
-                state,
-                conn,
-                "NickServ",
-                "You must identify to services before using GHOST.",
-            ) else {
-                return;
-            };
-            if state.casemap.casefold(&account) != state.casemap.casefold(nick) {
-                state.service_notice(conn, "NickServ", &format!("You do not own \x02{nick}\x02."));
-                return;
-            }
-            let key = state.nick_key(nick);
-            let Some(victim) = state.nick_reservation(&key).map(|owner| owner.conn()) else {
-                state.service_notice(conn, "NickServ", &format!("\x02{nick}\x02 is not online."));
-                return;
-            };
-            if victim == conn {
-                state.service_notice(conn, "NickServ", "You cannot ghost yourself.");
-                return;
-            }
-            let by = state.sessions[&conn]
-                .nick()
-                .map(String::from)
-                .unwrap_or_default();
-            super::session_action(
-                state,
-                victim,
-                crate::core::state::SessionAction::Ghost { by },
-            );
-            state.service_notice(
-                conn,
-                "NickServ",
-                &format!("\x02{nick}\x02 has been ghosted."),
-            );
-        }
+        "REGISTER" => nickserv_register(state, conn, args),
+        "IDENTIFY" => nickserv_identify(state, conn, args),
+        "GHOST" => nickserv_ghost(state, conn, args),
+        "REGAIN" => nickserv_regain(state, conn, args),
+        "GROUP" => nickserv_group(state, conn),
+        "UNGROUP" => nickserv_ungroup(state, conn, args),
+        "INFO" => nickserv_info(state, conn, args),
+        "SET" => nickserv_set(state, conn, args),
+        "DROP" => nickserv_drop(state, conn, args),
         "LOGOUT" => {
             // De-identify: clear the account and tell account-notify peers the
             // session is now unauthenticated (`ACCOUNT *`). Founder/access
@@ -242,7 +74,13 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 "REGISTER <password> [email] - Register your current nick",
                 "IDENTIFY [account] <password> - Log in to your account",
                 "LOGOUT - Log out of your account (de-identify)",
-                "GHOST <nick> - Disconnect a lingering session on your nick",
+                "GHOST <nick> - Disconnect a lingering session on a nick you own",
+                "REGAIN <nick> - Take back a nick you own from whoever holds it",
+                "GROUP - Add your current nick to your account",
+                "UNGROUP [nick] - Remove a grouped nick from your account",
+                "INFO [nick] - Show information about a registered nick or account",
+                "SET ENFORCE <ON|OFF> - Rename unidentified users of your nicks",
+                "DROP <account> <password> - Permanently delete your account",
                 "***** End of Help *****",
             ] {
                 state.service_notice(conn, "NickServ", line);
@@ -256,6 +94,848 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
             );
         }
     }
+}
+
+fn nickserv_register(state: &mut ServerState, conn: ConnId, args: &[&str]) {
+    let (password, contact_email) = match args {
+        [password] if !state.config.registration_require_email => (*password, None),
+        [password, email] => match crate::identity::ContactEmail::parse(email) {
+            Ok(email) => (*password, Some(email)),
+            Err(_) => {
+                state.service_notice(
+                    conn,
+                    "NickServ",
+                    "Invalid email address. Syntax: REGISTER <password> [email]",
+                );
+                return;
+            }
+        },
+        _ => {
+            state.service_notice(conn, "NickServ", "Syntax: REGISTER <password> [email]");
+            return;
+        }
+    };
+    if state.sessions[&conn].account().is_some() {
+        state.service_notice(conn, "NickServ", "You are already logged in.");
+        return;
+    }
+    let name = registered_nick(state, conn);
+    if state.config.reserved_account_names.reserves(&name) {
+        state.service_notice(
+            conn,
+            "NickServ",
+            &format!(
+                "\x02{name}\x02 is reserved for a server administrator and cannot be registered."
+            ),
+        );
+        return;
+    }
+    // Per-IP account-creation throttle (mirrors the REGISTER path): the
+    // per-connection budget alone doesn't stop one address minting
+    // accounts across a churn of short-lived connections.
+    if !state.registration_rate_ok(conn) {
+        state.service_notice(
+            conn,
+            "NickServ",
+            "Too many account registrations from your address. Try again later.",
+        );
+        return;
+    }
+    // Account creation runs argon2 (a full hash even when the account
+    // already exists, via ON CONFLICT), so it must spend from the shared
+    // per-connection credential budget — otherwise a loop of REGISTER
+    // drives unbounded argon2 work, bypassing the SASL cap. Closes the
+    // connection when the budget is exhausted.
+    if !credential_attempt_ok(state, conn) {
+        return;
+    }
+    let request = crate::core::DbRequest::CreateAccount {
+        conn,
+        name,
+        contact_email,
+        password: password.to_string(),
+        origin: crate::core::AccountOrigin::NickServ,
+    };
+    if state.db_tx.try_push(request).is_err() {
+        services_unavailable(state, conn, "NickServ");
+    }
+}
+
+fn nickserv_identify(state: &mut ServerState, conn: ConnId, args: &[&str]) {
+    // IDENTIFY <password> | IDENTIFY <account> <password>
+    let (account, password) = match args {
+        [password] => (registered_nick(state, conn), *password),
+        [account, password] => (account.to_string(), *password),
+        _ => {
+            state.service_notice(conn, "NickServ", "Syntax: IDENTIFY [account] <password>");
+            return;
+        }
+    };
+    // One credential verification may be in flight per connection.
+    if state.sessions[&conn].sasl_verify_pending || state.sessions[&conn].pending_identify.is_some()
+    {
+        state.service_notice(
+            conn,
+            "NickServ",
+            "An authentication is already in progress. Try again in a moment.",
+        );
+        return;
+    }
+    // Password verification runs argon2 (even a nonexistent account
+    // spends a dummy verify to avoid a timing oracle), so it spends from
+    // the shared per-connection credential budget — the same cap SASL
+    // enforces, so IDENTIFY can't be looped to brute-force or burn CPU.
+    if !credential_attempt_ok(state, conn) {
+        return;
+    }
+    let request = crate::core::DbRequest::VerifyPassword {
+        conn,
+        account,
+        password: password.to_string(),
+        origin: crate::core::CredentialOrigin::NickServIdentify,
+    };
+    if state.db_tx.try_push(request).is_err() {
+        // Synchronous failure: the normal dispatch capture frames this
+        // under the command's label, so no deferred hold is set up.
+        services_unavailable(state, conn, "NickServ");
+    } else {
+        let label = state.capture.as_mut().and_then(|cap| {
+            cap.label.clone().inspect(|_| {
+                cap.deferred = true;
+            })
+        });
+        state
+            .sessions
+            .get_mut(&conn)
+            .expect("checked")
+            .pending_identify = Some(crate::core::state::PendingServiceReply::new(label));
+    }
+}
+
+/// The nick of a session that sent a services command: it is registered.
+fn registered_nick(state: &ServerState, conn: ConnId) -> String {
+    state.sessions[&conn]
+        .nick()
+        .map(String::from)
+        .expect("a services command comes from a registered session")
+}
+
+/// GHOST and REGAIN act on a nick the caller owns that another session holds.
+/// Returns that session, or `None` once the caller has been told why not.
+fn owned_nick_holder(
+    state: &mut ServerState,
+    conn: ConnId,
+    command: &str,
+    args: &[&str],
+) -> Option<(String, ConnId)> {
+    let Some(&nick) = args.first() else {
+        state.service_notice(conn, "NickServ", &format!("Syntax: {command} <nick>"));
+        return None;
+    };
+    let account = require_identified(
+        state,
+        conn,
+        "NickServ",
+        &format!("You must identify to services before using {command}."),
+    )?;
+    let key = state.nick_key(nick);
+    if !state.nick_owned_by(&key, &account) {
+        state.service_notice(conn, "NickServ", &format!("You do not own \x02{nick}\x02."));
+        return None;
+    }
+    let Some(holder) = state.nick_reservation(&key).map(|owner| owner.conn()) else {
+        state.service_notice(conn, "NickServ", &format!("\x02{nick}\x02 is not online."));
+        return None;
+    };
+    if holder == conn {
+        let verb = command.to_ascii_lowercase();
+        state.service_notice(conn, "NickServ", &format!("You may not {verb} yourself."));
+        return None;
+    }
+    Some((nick.to_string(), holder))
+}
+
+fn nickserv_ghost(state: &mut ServerState, conn: ConnId, args: &[&str]) {
+    // GHOST <nick>: disconnect a lingering session holding a nick you own
+    // (the account's name, or a nick grouped to it), so you can reclaim it.
+    let Some((nick, victim)) = owned_nick_holder(state, conn, "GHOST", args) else {
+        return;
+    };
+    let by = registered_nick(state, conn);
+    super::session_action(
+        state,
+        victim,
+        crate::core::state::SessionAction::Ghost { by },
+    );
+    state.service_notice(
+        conn,
+        "NickServ",
+        &format!("\x02{nick}\x02 has been ghosted."),
+    );
+}
+
+fn nickserv_regain(state: &mut ServerState, conn: ConnId, args: &[&str]) {
+    // REGAIN <nick> (Atheme): the session holding a nick you own is renamed to
+    // a Guest nick, and you take the nick. The holder may live on another
+    // shard: its shard renames it, then hands the nick to this session's.
+    let Some((nick, holder)) = owned_nick_holder(state, conn, "REGAIN", args) else {
+        return;
+    };
+    let by_mask = state.sessions[&conn].prefix();
+    let by = state.session_shard(conn);
+    super::session_action(
+        state,
+        holder,
+        crate::core::state::SessionAction::Regain { nick, by, by_mask },
+    );
+}
+
+/// On the shard holding a regained nick: rename its holder to a Guest nick,
+/// then give the nick to the session that regained it.
+pub(crate) fn regain_nick_from(
+    state: &mut ServerState,
+    holder: ConnId,
+    nick: String,
+    by: crate::core::SessionOwner,
+    by_mask: &str,
+) {
+    let key = state.nick_key(&nick);
+    let holds = state
+        .sessions
+        .get(&holder)
+        .and_then(|session| session.nick())
+        .is_some_and(|held| state.nick_key(held) == key);
+    if holds {
+        state.service_notice(
+            holder,
+            "NickServ",
+            &format!("{by_mask} has regained your nickname."),
+        );
+        rename_to_guest(state, holder);
+    }
+    super::session_action(
+        state,
+        by.conn(),
+        crate::core::state::SessionAction::TakeNick { nick },
+    );
+}
+
+/// On the shard of a session that regained `nick`: take it, now that its
+/// holder has let it go.
+pub(crate) fn take_regained_nick(state: &mut ServerState, conn: ConnId, nick: &str) {
+    if !state.sessions.contains_key(&conn) {
+        return;
+    }
+    if super::force_nick(state, conn, nick) {
+        state.service_notice(
+            conn,
+            "NickServ",
+            &format!("\x02{nick}\x02 has been regained."),
+        );
+    } else {
+        state.service_notice(
+            conn,
+            "NickServ",
+            &format!("\x02{nick}\x02 could not be regained: someone else took it first."),
+        );
+    }
+}
+
+fn nickserv_group(state: &mut ServerState, conn: ConnId) {
+    // GROUP: add the nick in use to the account identified to.
+    let Some(account) = require_identified(
+        state,
+        conn,
+        "NickServ",
+        "You must identify to services before using GROUP.",
+    ) else {
+        return;
+    };
+    let nick = registered_nick(state, conn);
+    if state.nick_owned_by(&state.nick_key(&nick), &account) {
+        state.service_notice(
+            conn,
+            "NickServ",
+            &format!("Nick \x02{nick}\x02 is already registered to your account."),
+        );
+        return;
+    }
+    let label = captured_label(state, conn);
+    let request = crate::core::DbRequest::GroupNick {
+        conn,
+        account,
+        nick,
+        label,
+    };
+    queue_service_verdict(state, conn, "NickServ", request);
+}
+
+fn nickserv_ungroup(state: &mut ServerState, conn: ConnId, args: &[&str]) {
+    // UNGROUP [nick]: remove a grouped nick (the current one by default).
+    let Some(account) = require_identified(
+        state,
+        conn,
+        "NickServ",
+        "You must identify to services before using UNGROUP.",
+    ) else {
+        return;
+    };
+    let nick = match args.first() {
+        Some(&nick) => nick.to_string(),
+        None => registered_nick(state, conn),
+    };
+    let key = state.nick_key(&nick);
+    if state.account_key(key.as_str()) == state.account_key(&account) {
+        state.service_notice(
+            conn,
+            "NickServ",
+            &format!("Nick \x02{nick}\x02 is your account name; you may not remove it."),
+        );
+        return;
+    }
+    if !state.nick_owned_by(&key, &account) {
+        state.service_notice(
+            conn,
+            "NickServ",
+            &format!("Nick \x02{nick}\x02 is not registered to your account."),
+        );
+        return;
+    }
+    let label = captured_label(state, conn);
+    let request = crate::core::DbRequest::UngroupNick {
+        conn,
+        account,
+        nick,
+        label,
+    };
+    queue_service_verdict(state, conn, "NickServ", request);
+}
+
+fn nickserv_info(state: &mut ServerState, conn: ConnId, args: &[&str]) {
+    // INFO <nick|account>; with no argument, the caller's own account.
+    let target = match (args.first(), state.sessions[&conn].account()) {
+        (Some(&target), _) => target.to_string(),
+        (None, Some(account)) => account.to_string(),
+        (None, None) => {
+            state.service_notice(conn, "NickServ", "Syntax: INFO <nick>");
+            return;
+        }
+    };
+    let label = captured_label(state, conn);
+    let request = crate::core::DbRequest::AccountInfo {
+        conn,
+        target,
+        label,
+    };
+    queue_service_verdict(state, conn, "NickServ", request);
+}
+
+fn nickserv_set(state: &mut ServerState, conn: ConnId, args: &[&str]) {
+    let Some(&option) = args.first() else {
+        state.service_notice(conn, "NickServ", "Syntax: SET <option> <value>");
+        return;
+    };
+    let Some(account) = require_identified(
+        state,
+        conn,
+        "NickServ",
+        "You must identify to services before using SET.",
+    ) else {
+        return;
+    };
+    match option.to_ascii_uppercase().as_str() {
+        "ENFORCE" => {
+            let enforce = match args.get(1).map(|value| value.to_ascii_uppercase()) {
+                Some(value) if value == "ON" => true,
+                Some(value) if value == "OFF" => false,
+                _ => {
+                    state.service_notice(conn, "NickServ", "Syntax: SET ENFORCE <ON|OFF>");
+                    return;
+                }
+            };
+            let label = captured_label(state, conn);
+            let request = crate::core::DbRequest::SetNickEnforce {
+                conn,
+                account,
+                enforce,
+                label,
+            };
+            queue_service_verdict(state, conn, "NickServ", request);
+        }
+        other => state.service_notice(
+            conn,
+            "NickServ",
+            &format!("Unknown SET option \x02{other}\x02. Available: ENFORCE."),
+        ),
+    }
+}
+
+fn nickserv_drop(state: &mut ServerState, conn: ConnId, args: &[&str]) {
+    // DROP <account> <password> [key]: permanently delete the account the
+    // caller is identified to. The first form hands out a confirmation key;
+    // repeating the command with it does the deletion (Atheme).
+    let (target, password, key) = match args {
+        [target, password] => (*target, *password, None),
+        [target, password, key] => (*target, *password, Some(*key)),
+        _ => {
+            state.service_notice(conn, "NickServ", "Syntax: DROP <account> <password>");
+            return;
+        }
+    };
+    let Some(account) = require_identified(
+        state,
+        conn,
+        "NickServ",
+        "You must identify to services before using DROP.",
+    ) else {
+        return;
+    };
+    let account_key = state.account_key(&account);
+    if state.account_key(target) != account_key {
+        state.service_notice(
+            conn,
+            "NickServ",
+            &format!("You may only drop the account you are identified to, \x02{account}\x02."),
+        );
+        return;
+    }
+    let Some(key) = key else {
+        let key: String = crate::secret::random_url_safe_token()
+            .chars()
+            .take(DROP_KEY_LEN)
+            .collect();
+        state
+            .sessions
+            .get_mut(&conn)
+            .expect("checked")
+            .drop_confirmation = Some((account_key, key.clone()));
+        state.service_notice(
+            conn,
+            "NickServ",
+            &format!(
+                "This is a friendly reminder that you are about to \x02destroy\x02 the account \
+                 \x02{account}\x02."
+            ),
+        );
+        state.service_notice(
+            conn,
+            "NickServ",
+            &format!(
+                "To avoid accidental use of this command, this operation has to be confirmed. \
+                 Please confirm by replying with \x02/msg NickServ DROP {target} <password> \
+                 {key}\x02"
+            ),
+        );
+        return;
+    };
+    let confirmed = state.sessions[&conn]
+        .drop_confirmation
+        .as_ref()
+        .is_some_and(|(confirmed, expected)| *confirmed == account_key && expected == key);
+    if !confirmed {
+        state.service_notice(
+            conn,
+            "NickServ",
+            &format!("Invalid key for \x02{account}\x02."),
+        );
+        return;
+    }
+    state
+        .sessions
+        .get_mut(&conn)
+        .expect("checked")
+        .drop_confirmation = None;
+    // The password is verified with argon2: it spends from the connection's
+    // credential budget like IDENTIFY.
+    if !credential_attempt_ok(state, conn) {
+        return;
+    }
+    let label = captured_label(state, conn);
+    let request = crate::core::DbRequest::DropAccount {
+        conn,
+        account,
+        password: password.to_string(),
+        label,
+    };
+    queue_service_verdict(state, conn, "NickServ", request);
+}
+
+/// Length of the NickServ DROP confirmation key: it guards against a mistyped
+/// command, not an attacker (the password does that).
+const DROP_KEY_LEN: usize = 8;
+
+/// The label of the command being handled for `conn`, carried onto a deferred
+/// services verdict.
+fn captured_label(state: &ServerState, conn: ConnId) -> Option<String> {
+    state
+        .capture
+        .as_ref()
+        .filter(|capture| capture.conn == conn)
+        .and_then(|capture| capture.label.clone())
+}
+
+fn services_unavailable(state: &mut ServerState, conn: ConnId, service: &str) {
+    state.service_notice(conn, service, SERVICES_UNAVAILABLE);
+}
+
+/// A NickServ verdict from PostgreSQL. What it confirms is applied to the
+/// process-wide mirror even when the requester has gone: the database has
+/// committed it.
+pub(crate) fn nickserv_db_reply(
+    state: &mut ServerState,
+    conn: ConnId,
+    reply: crate::core::DbReply,
+) {
+    use crate::db::{NickEnforceChange, NickGroupOutcome};
+    let (label, text): (Option<String>, Vec<String>) = match reply {
+        crate::core::DbReply::NickGroup {
+            account,
+            nick,
+            outcome,
+            label,
+        } => {
+            let text = match outcome {
+                Some(NickGroupOutcome::Grouped) => {
+                    let (nick_key, account_key) =
+                        (state.nick_key(&nick), state.account_key(&account));
+                    state.nick_registrations.group(nick_key, account_key);
+                    format!("Nick \x02{nick}\x02 is now registered to your account.")
+                }
+                Some(NickGroupOutcome::AlreadyYours) => {
+                    format!("Nick \x02{nick}\x02 is already registered to your account.")
+                }
+                Some(NickGroupOutcome::Taken) => {
+                    format!("Nick \x02{nick}\x02 is already registered to another account.")
+                }
+                Some(NickGroupOutcome::TooMany) => format!(
+                    "You have too many nicks registered: an account holds at most {}.",
+                    crate::db::MAX_NICKS_PER_ACCOUNT
+                ),
+                Some(NickGroupOutcome::AccountMissing) => {
+                    format!("Your account \x02{account}\x02 no longer exists.")
+                }
+                None => SERVICES_UNAVAILABLE.to_string(),
+            };
+            (label, vec![text])
+        }
+        crate::core::DbReply::NickUngroup {
+            account: _,
+            nick,
+            removed,
+            label,
+        } => {
+            let text = match removed {
+                Some(true) => {
+                    let key = state.nick_key(&nick);
+                    state.nick_registrations.ungroup(&key);
+                    format!("Nick \x02{nick}\x02 has been removed from your account.")
+                }
+                Some(false) => format!("Nick \x02{nick}\x02 is not registered to your account."),
+                None => SERVICES_UNAVAILABLE.to_string(),
+            };
+            (label, vec![text])
+        }
+        crate::core::DbReply::NickEnforce {
+            account,
+            enforce,
+            outcome,
+            label,
+        } => {
+            if matches!(
+                outcome,
+                Some(NickEnforceChange::Changed | NickEnforceChange::Unchanged)
+            ) {
+                let key = state.account_key(&account);
+                state.nick_registrations.set_enforce(key, enforce);
+            }
+            let text = match (outcome, enforce) {
+                (Some(NickEnforceChange::Changed), true) => {
+                    format!("The \x02ENFORCE\x02 flag has been set for account \x02{account}\x02.")
+                }
+                (Some(NickEnforceChange::Changed), false) => format!(
+                    "The \x02ENFORCE\x02 flag has been removed for account \x02{account}\x02."
+                ),
+                (Some(NickEnforceChange::Unchanged), true) => format!(
+                    "The \x02ENFORCE\x02 flag is already set for account \x02{account}\x02."
+                ),
+                (Some(NickEnforceChange::Unchanged), false) => {
+                    format!("The \x02ENFORCE\x02 flag is not set for account \x02{account}\x02.")
+                }
+                (Some(NickEnforceChange::AccountMissing), _) => {
+                    format!("Your account \x02{account}\x02 no longer exists.")
+                }
+                (None, _) => SERVICES_UNAVAILABLE.to_string(),
+            };
+            (label, vec![text])
+        }
+        crate::core::DbReply::AccountInfo {
+            target,
+            info,
+            label,
+        } => {
+            let text = match info {
+                // Nothing to show to a requester that has gone.
+                Ok(Some(_)) if !state.sessions.contains_key(&conn) => Vec::new(),
+                Ok(Some(info)) => account_info_lines(state, conn, &target, info),
+                Ok(None) => vec![format!("\x02{target}\x02 is not registered.")],
+                Err(()) => vec![SERVICES_UNAVAILABLE.to_string()],
+            };
+            (label, text)
+        }
+        crate::core::DbReply::AccountDrop {
+            account,
+            outcome,
+            label,
+        } => {
+            let text = match outcome {
+                crate::core::AccountDropOutcome::Dropped => {
+                    format!("The account \x02{account}\x02 has been dropped.")
+                }
+                crate::core::AccountDropOutcome::Rejected => {
+                    format!("Invalid password for \x02{account}\x02.")
+                }
+                crate::core::AccountDropOutcome::Throttled(retry_after) => format!(
+                    "Too many password attempts for \x02{account}\x02; try again in {} seconds.",
+                    retry_after.seconds()
+                ),
+                crate::core::AccountDropOutcome::Refused(reason) => {
+                    format!("\x02{account}\x02 cannot be dropped: {reason}.")
+                }
+                crate::core::AccountDropOutcome::Unavailable => SERVICES_UNAVAILABLE.to_string(),
+            };
+            (label, vec![text])
+        }
+        other => unreachable!("not a NickServ verdict: {other:?}"),
+    };
+    if state.sessions.contains_key(&conn) {
+        state.emit_deferred_labeled(conn, label, |state| {
+            for line in &text {
+                state.service_notice(conn, "NickServ", line);
+            }
+        });
+    }
+}
+
+const SERVICES_UNAVAILABLE: &str = "Services are temporarily unavailable. Try again later.";
+
+/// NickServ INFO, in Atheme's layout. The account's nicks are shown to the
+/// account itself and to operators only.
+fn account_info_lines(
+    state: &ServerState,
+    conn: ConnId,
+    target: &str,
+    info: crate::db::NickServAccountInfo,
+) -> Vec<String> {
+    let session = &state.sessions[&conn];
+    let account_key = state.account_key(&info.name);
+    let privileged = session.oper.is_some()
+        || session
+            .account()
+            .is_some_and(|own| state.account_key(own) == account_key);
+    let now = (state.config.clock)();
+    let mut lines = vec![
+        format!(
+            "Information on \x02{target}\x02 (account \x02{}\x02):",
+            info.name
+        ),
+        format!(
+            "Registered : {} ({} ago)",
+            atheme_time(info.registered_at),
+            time_ago(now.saturating_sub(info.registered_at).as_secs())
+        ),
+    ];
+    if state.account_online(&account_key) {
+        lines.push("Last seen  : now".to_string());
+    }
+    if privileged {
+        lines.push(format!("Nicks      : {}", info.nicks.join(" ")));
+    }
+    if info.enforce {
+        lines.push("Flags      : Enforce".to_string());
+    }
+    lines.push("*** \x02End of Info\x02 ***".to_string());
+    lines
+}
+
+/// `Mon DD HH:MM:SS YYYY` (UTC), the timestamp Atheme's INFO prints.
+fn atheme_time(at: e6irc_proto::time::Millis) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    // `YYYY-MM-DDThh:mm:ss.sssZ`
+    let iso = e6irc_proto::time::server_time(at);
+    let month = iso[5..7]
+        .parse::<usize>()
+        .expect("server-time month is two digits");
+    format!(
+        "{} {} {} {}",
+        MONTHS[month - 1],
+        &iso[8..10],
+        &iso[11..19],
+        &iso[0..4]
+    )
+}
+
+/// An elapsed time as Atheme's `time_ago` spells it: the two or three largest
+/// units, e.g. `1y 2w 3d`, `3d 4h 5m`, `5m 6s`.
+fn time_ago(seconds: u64) -> String {
+    let (years, rest) = (seconds / 31_536_000, seconds % 31_536_000);
+    let (weeks, rest) = (rest / 604_800, rest % 604_800);
+    let (days, rest) = (rest / 86_400, rest % 86_400);
+    let (hours, rest) = (rest / 3_600, rest % 3_600);
+    let (minutes, secs) = (rest / 60, rest % 60);
+    if years > 0 {
+        format!("{years}y {weeks}w {days}d")
+    } else if weeks > 0 {
+        format!("{weeks}w {days}d {hours}h")
+    } else if days > 0 {
+        format!("{days}d {hours}h {minutes}m")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m {secs}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {secs}s")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+// ---- nick protection (NickServ ENFORCE) ----------------------------------
+
+/// How long a user holding a protected nick has to identify before it is
+/// renamed to a Guest nick (Atheme's default enforcement delay). The rename
+/// runs on the first reaper tick at or after the deadline.
+pub(crate) const NICK_ENFORCE_DELAY_MS: u64 = 30_000;
+
+/// Guest nicks are `Guest` and a number of at most this many digits: every
+/// one fits a `NICKLEN` of [`crate::config::MIN_NICKLEN`].
+const GUEST_NICK_DIGITS: u32 = 5;
+const GUEST_NICK_SPACE: u64 = 10u64.pow(GUEST_NICK_DIGITS);
+const _: () = assert!(
+    "Guest".len() + GUEST_NICK_DIGITS as usize <= crate::config::MIN_NICKLEN,
+    "the longest Guest nick must fit the shortest NICKLEN"
+);
+
+/// Check the nick `conn` holds against nick protection: warn and start the
+/// clock when it is protected and the session is not identified to the
+/// account protecting it; otherwise clear any enforcement in progress.
+pub(super) fn check_nick_protection(state: &mut ServerState, conn: ConnId) {
+    let Some(session) = state.sessions.get(&conn) else {
+        return;
+    };
+    let Some(nick) = session.nick().map(str::to_owned) else {
+        return;
+    };
+    let key = state.nick_key(&nick);
+    let identified = session.account().map(|account| state.account_key(account));
+    let protector = state
+        .nick_protector(&key)
+        .filter(|protector| identified.as_ref() != Some(protector));
+    let Some(protector) = protector else {
+        state
+            .sessions
+            .get_mut(&conn)
+            .expect("checked")
+            .nick_enforcement = None;
+        return;
+    };
+    if state.sessions[&conn]
+        .nick_enforcement
+        .as_ref()
+        .is_some_and(|enforcement| enforcement.nick == key)
+    {
+        return; // a case change of a nick already being enforced
+    }
+    let deadline = (state.config.mono_clock)().saturating_add_millis(NICK_ENFORCE_DELAY_MS);
+    state
+        .sessions
+        .get_mut(&conn)
+        .expect("checked")
+        .nick_enforcement = Some(crate::core::state::NickEnforcement {
+        nick: key,
+        deadline,
+    });
+    state.service_notice(
+        conn,
+        "NickServ",
+        &format!(
+            "This nickname is registered. Please choose a different nickname, or identify via \
+             \x02/msg NickServ IDENTIFY {} <password>\x02.",
+            protector.as_str()
+        ),
+    );
+    state.service_notice(
+        conn,
+        "NickServ",
+        &format!(
+            "You have {} seconds to identify to your nickname before it is changed.",
+            NICK_ENFORCE_DELAY_MS / 1000
+        ),
+    );
+}
+
+/// Rename every session of this shard whose enforcement deadline has passed
+/// and that still holds the protected nick unidentified. Driven by the
+/// periodic [`crate::core::Input::Tick`].
+pub(crate) fn enforce_nick_protection(state: &mut ServerState, now: e6irc_proto::time::MonoMillis) {
+    let due: Vec<(ConnId, crate::core::state::NickKey)> = state
+        .sessions
+        .iter()
+        .filter_map(|(&conn, session)| {
+            session
+                .nick_enforcement
+                .as_ref()
+                .filter(|enforcement| enforcement.deadline <= now)
+                .map(|enforcement| (conn, enforcement.nick.clone()))
+        })
+        .collect();
+    for (conn, key) in due {
+        state
+            .sessions
+            .get_mut(&conn)
+            .expect("listed above")
+            .nick_enforcement = None;
+        let session = &state.sessions[&conn];
+        let Some(nick) = session.nick().map(str::to_owned) else {
+            continue;
+        };
+        if state.nick_key(&nick) != key {
+            continue; // it moved to another nick
+        }
+        let identified = session.account().map(|account| state.account_key(account));
+        let still_protected = state
+            .nick_protector(&key)
+            .is_some_and(|protector| identified.as_ref() != Some(&protector));
+        if !still_protected {
+            continue;
+        }
+        state.service_notice(
+            conn,
+            "NickServ",
+            &format!("You failed to identify in time for the nickname {nick}"),
+        );
+        rename_to_guest(state, conn);
+    }
+}
+
+/// Rename `conn` to a free `Guest<number>` nick that no account protects,
+/// starting from a number derived from the connection. Every nick in the
+/// space being held is the one case with nowhere to put the session: it is
+/// disconnected rather than left on the protected nick.
+fn rename_to_guest(state: &mut ServerState, conn: ConnId) {
+    let start = conn.0 % GUEST_NICK_SPACE;
+    for offset in 0..GUEST_NICK_SPACE {
+        let guest = format!("Guest{}", (start + offset) % GUEST_NICK_SPACE);
+        if state.nick_protector(&state.nick_key(&guest)).is_some() {
+            continue;
+        }
+        if super::force_nick(state, conn, &guest) {
+            return;
+        }
+    }
+    let server = state.config.server_name.clone();
+    let reason = "Nickname enforcement: no Guest nick is free";
+    state.send(conn, &format!(":{server} ERROR :Closing Link: {reason}"));
+    state.close(conn, reason);
 }
 
 pub(crate) fn chanserv_register_on_owner(
@@ -484,10 +1164,14 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                     actor: account,
                 },
             };
-            queue_service_verdict(state, conn, request);
+            queue_service_verdict(state, conn, "ChanServ", request);
         }
         "FLAGS" => chanserv_flags(state, conn, args),
-        "OP" => chanserv_op(state, conn, args),
+        "ACCESS" => chanserv_access(state, conn, args),
+        "OP" => chanserv_status(state, conn, crate::core::state::StatusChange::Op, args),
+        "DEOP" => chanserv_status(state, conn, crate::core::state::StatusChange::Deop, args),
+        "VOICE" => chanserv_status(state, conn, crate::core::state::StatusChange::Voice, args),
+        "DEVOICE" => chanserv_status(state, conn, crate::core::state::StatusChange::Devoice, args),
         "SET" => chanserv_set(state, conn, args),
         "HELP" => {
             for line in [
@@ -495,8 +1179,16 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 "REGISTER <#channel> - Register a channel you operate",
                 "DROP <#channel> - Unregister a channel you founded",
                 "FLAGS <#channel> [account [+/-ov]] - List or set channel access",
-                "OP <#channel> [nick] - Op yourself or a nick (needs op access)",
+                "ACCESS <#channel> LIST - List the access list with roles",
+                "ACCESS <#channel> ADD <account> [AOP|VOP] - Grant a role (VOP by default)",
+                "ACCESS <#channel> DEL <account> - Remove an account's role",
+                "OP|DEOP <#channel> [nick] - Op or deop yourself or a nick (needs op access)",
+                "VOICE|DEVOICE <#channel> [nick] - Voice or devoice (needs voice access)",
                 "SET <#channel> FOUNDER <account> - Transfer channel ownership",
+                "SET <#channel> SUCCESSOR <account|OFF> - Who inherits the channel if the \
+                 founder's account is deleted",
+                "SET <#channel> KEEPTOPIC <ON|OFF> - Keep the topic while the channel is empty",
+                "SET <#channel> MLOCK <modes|OFF> - Lock channel modes",
                 "***** End of Help *****",
             ] {
                 state.service_notice(conn, "ChanServ", line);
@@ -540,9 +1232,6 @@ pub(super) fn apply_flag_changes(current: &str, changes: &str) -> Result<String,
     Ok(flags.into_iter().collect())
 }
 
-/// ChanServ FLAGS: list a registered channel's access entries, or (founder
-/// only) modify one account's flags. Auto-op/voice apply on the account's
-/// next join.
 /// The gate every founder-only ChanServ subcommand applies: the caller must be
 /// identified, the channel registered, and the caller its founder. Returns the
 /// channel key and the account, or `None` once the caller has been told why not.
@@ -605,6 +1294,9 @@ fn require_identified(
     Some(account)
 }
 
+/// ChanServ FLAGS: list a registered channel's access entries, or (founder
+/// only) modify one account's flags. Auto-op/voice apply on the account's
+/// next join.
 pub(super) fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str]) {
     let Some(&channel) = args.first() else {
         state.service_notice(
@@ -671,36 +1363,202 @@ pub(super) fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str
         }
     };
 
-    // Persist first; the hot map and the confirmation are applied on the
-    // `ChannelAccessSet` reply, so a grant to an *unregistered* account (which
-    // writes no row) can't leave a phantom hot entry that would auto-op a later
-    // registration of that name.
-    let request = crate::core::DbRequest::SetChannelAccess {
-        owner: state.channel_owner(channel),
-        session: state.channel_actor(conn).session_owner(),
-        channel: channel.to_string(),
-        display: channel.to_string(),
-        account: target.to_string(),
-        flags: (!new_flags.is_empty()).then_some(new_flags),
-        actor: account,
-        label: state
-            .capture
-            .as_ref()
-            .and_then(|capture| capture.label.clone()),
+    let flags = (!new_flags.is_empty()).then_some(new_flags);
+    let change = AccessChange {
+        channel,
+        target,
+        flags,
+        frontend: crate::core::AccessFrontend::Flags,
     };
-    queue_service_verdict(state, conn, request);
+    queue_access_change(state, conn, account, change);
 }
 
-pub(super) fn chanserv_op(state: &mut ServerState, conn: ConnId, args: &[&str]) {
+/// One access-list change a founder asked for, through FLAGS or ACCESS.
+struct AccessChange<'a> {
+    channel: &'a str,
+    target: &'a str,
+    /// The flags the account is to hold; `None` removes its entry.
+    flags: Option<String>,
+    frontend: crate::core::AccessFrontend,
+}
+
+/// Persist an access change. The hot map and the confirmation are applied on
+/// the verdict, so a grant to an *unregistered* account (which writes no row)
+/// can't leave a phantom hot entry that would auto-op a later registration of
+/// that name.
+fn queue_access_change(state: &mut ServerState, conn: ConnId, actor: String, change: AccessChange) {
+    let request = crate::core::DbRequest::SetChannelAccess {
+        owner: state.channel_owner(change.channel),
+        session: state.channel_actor(conn).session_owner(),
+        channel: change.channel.to_string(),
+        display: change.channel.to_string(),
+        account: change.target.to_string(),
+        flags: change.flags,
+        frontend: change.frontend,
+        actor,
+        label: captured_label(state, conn),
+    };
+    queue_service_verdict(state, conn, "ChanServ", request);
+}
+
+/// The Atheme role an access entry's flags amount to.
+fn access_role(flags: &str) -> &'static str {
+    if flags.contains('o') { "AOP" } else { "VOP" }
+}
+
+/// ChanServ ACCESS: Atheme's role front end over the same access entries
+/// FLAGS edits — AOP is auto-op (`+o`), VOP auto-voice (`+v`). Anyone on the
+/// access list may LIST it; only the founder may change it, as with FLAGS.
+fn chanserv_access(state: &mut ServerState, conn: ConnId, args: &[&str]) {
+    let (Some(&channel), Some(&subcommand)) = (args.first(), args.get(1)) else {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            "Syntax: ACCESS <#channel> <LIST|ADD|DEL> [account] [role]",
+        );
+        return;
+    };
+    let hint = "You must identify to services before using ACCESS.";
+    match subcommand.to_ascii_uppercase().as_str() {
+        "LIST" => {
+            let Some((key, account)) = chanserv_registered_gate(state, conn, channel, hint) else {
+                return;
+            };
+            let account_key = state.account_key(&account);
+            let entries = state.channel_options.access_entries(&key);
+            let founder = state.registered_founders.founder(&key);
+            if founder.as_ref() != Some(&account_key)
+                && !entries.iter().any(|(holder, _)| *holder == account_key)
+            {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    &format!(
+                        "You are not authorized to view the access list of \x02{channel}\x02."
+                    ),
+                );
+                return;
+            }
+            let mut rows: Vec<(String, &'static str)> = founder
+                .map(|founder| (founder.as_str().to_string(), "Founder"))
+                .into_iter()
+                .collect();
+            let mut granted: Vec<(String, &'static str)> = entries
+                .iter()
+                .map(|(holder, flags)| (holder.as_str().to_string(), access_role(flags)))
+                .collect();
+            granted.sort();
+            rows.extend(granted);
+            let rule = "----- ---------------------- ----";
+            state.service_notice(conn, "ChanServ", "Entry Nickname/Host          Role");
+            state.service_notice(conn, "ChanServ", rule);
+            for (index, (holder, role)) in rows.iter().enumerate() {
+                let entry = index + 1;
+                state.service_notice(conn, "ChanServ", &format!("{entry:<5} {holder:<22} {role}"));
+            }
+            state.service_notice(conn, "ChanServ", rule);
+            state.service_notice(
+                conn,
+                "ChanServ",
+                &format!("End of \x02{channel}\x02 ACCESS listing."),
+            );
+        }
+        "ADD" => {
+            let Some(&target) = args.get(2) else {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    "Syntax: ACCESS <#channel> ADD <account> [AOP|VOP]",
+                );
+                return;
+            };
+            let (role, flags) = match args.get(3).map(|role| role.to_ascii_uppercase()) {
+                None => ("VOP", "v"),
+                Some(role) if role == "VOP" || role == "VOICE" => ("VOP", "v"),
+                Some(role) if role == "AOP" || role == "OP" => ("AOP", "o"),
+                Some(role) => {
+                    state.service_notice(
+                        conn,
+                        "ChanServ",
+                        &format!(
+                            "The role \x02{role}\x02 does not exist. Roles: AOP (auto-op), VOP (auto-voice)."
+                        ),
+                    );
+                    return;
+                }
+            };
+            let Some((_, account)) = chanserv_founder_gate(state, channel, conn, hint) else {
+                return;
+            };
+            let change = AccessChange {
+                channel,
+                target,
+                flags: Some(flags.to_string()),
+                frontend: crate::core::AccessFrontend::AccessAdd { role },
+            };
+            queue_access_change(state, conn, account, change);
+        }
+        "DEL" => {
+            let Some(&target) = args.get(2) else {
+                state.service_notice(conn, "ChanServ", "Syntax: ACCESS <#channel> DEL <account>");
+                return;
+            };
+            let Some((key, account)) = chanserv_founder_gate(state, channel, conn, hint) else {
+                return;
+            };
+            let target_key = state.account_key(target);
+            let Some(current) = state.channel_options.access_flags(&key, &target_key) else {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    &format!(
+                        "\x02{target}\x02 was not found on the access list of \x02{channel}\x02."
+                    ),
+                );
+                return;
+            };
+            let change = AccessChange {
+                channel,
+                target,
+                flags: None,
+                frontend: crate::core::AccessFrontend::AccessDel {
+                    role: access_role(&current),
+                },
+            };
+            queue_access_change(state, conn, account, change);
+        }
+        other => state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("Unknown ACCESS subcommand \x02{other}\x02. Use LIST, ADD or DEL."),
+        ),
+    }
+}
+
+/// ChanServ OP, DEOP, VOICE and DEVOICE: change a member's status on a
+/// registered channel for someone whose access allows it (Atheme: `+o` for
+/// OP/DEOP, `+v` for VOICE/DEVOICE — an auto-op entry also allows voicing, as
+/// Atheme's op roles include `+v`; the founder may do all four).
+pub(super) fn chanserv_status(
+    state: &mut ServerState,
+    conn: ConnId,
+    change: crate::core::state::StatusChange,
+    args: &[&str],
+) {
+    let command = change.command();
     let Some(&channel) = args.first() else {
-        state.service_notice(conn, "ChanServ", "Syntax: OP <#channel> [nick]");
+        state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("Syntax: {command} <#channel> [nick]"),
+        );
         return;
     };
     if require_identified(
         state,
         conn,
         "ChanServ",
-        "You must identify to services before using OP.",
+        &format!("You must identify to services before using {command}."),
     )
     .is_none()
     {
@@ -708,10 +1566,7 @@ pub(super) fn chanserv_op(state: &mut ServerState, conn: ConnId, args: &[&str]) 
     }
     let target_nick = match args.get(1) {
         Some(&n) => n.to_string(),
-        None => state.sessions[&conn]
-            .nick()
-            .map(String::from)
-            .expect("registered"),
+        None => registered_nick(state, conn),
     };
     let owner = state.channel_owner(channel);
     let label = state.channel_reply_label(conn, &owner);
@@ -719,116 +1574,148 @@ pub(super) fn chanserv_op(state: &mut ServerState, conn: ConnId, args: &[&str]) 
         owner,
         state.channel_actor(conn),
         channel.to_string(),
-        crate::core::state::ChannelCommandOperation::ChanServOp { target_nick },
+        crate::core::state::ChannelCommandOperation::ChanServStatus {
+            target_nick,
+            change,
+        },
         label,
     );
     if state.owns_channel(command.owner()) {
-        let result = chanserv_op_on_owner(state, command);
-        emit_chanserv_op_result(state, conn, result);
+        let result = chanserv_status_on_owner(state, command);
+        emit_chanserv_status_result(state, conn, result);
     } else {
         state.route_channel_command(command);
     }
 }
 
-pub(crate) fn chanserv_op_on_owner(
+pub(crate) fn chanserv_status_on_owner(
     state: &mut ServerState,
     command: crate::core::state::ChannelCommand,
-) -> crate::core::state::ChanServOpResult {
+) -> crate::core::state::ChanServStatusResult {
+    use crate::core::state::ChanServStatusResult;
     let (owner, actor, target, operation) = command.into_parts();
-    let crate::core::state::ChannelCommandOperation::ChanServOp { target_nick } = operation else {
-        unreachable!("ChanServ OP command operation");
+    let crate::core::state::ChannelCommandOperation::ChanServStatus {
+        target_nick,
+        change,
+    } = operation
+    else {
+        unreachable!("ChanServ status command operation");
     };
     let key = state.chan_key(&target);
-    assert_eq!(owner.key(), &key, "ChanServ OP owner does not match target");
+    assert_eq!(
+        owner.key(),
+        &key,
+        "ChanServ status owner does not match target"
+    );
     let Some(account) = actor.account else {
         unreachable!("identified ChanServ actor has no account");
     };
-    let account = state.account_key(&account);
     if !state.is_registered(&key) {
-        return crate::core::state::ChanServOpResult::NotRegistered { channel: target };
+        return ChanServStatusResult::NotRegistered { channel: target };
     }
-    if !(state.is_founder(&key, account.as_str()) || state.access_modes(&key, account.as_str()).0) {
-        return crate::core::state::ChanServOpResult::NoAccess { channel: target };
+    let (auto_op, auto_voice) = state.access_modes(&key, &account);
+    let allowed = state.is_founder(&key, &account)
+        || if change.is_op() {
+            auto_op
+        } else {
+            auto_op || auto_voice
+        };
+    if !allowed {
+        return ChanServStatusResult::NoAccess {
+            channel: target,
+            change,
+        };
     }
     let target_key = state.nick_key(&target_nick);
     let Some(target_owner) = state.nick_reservation(&target_key) else {
-        return crate::core::state::ChanServOpResult::TargetOffline {
+        return ChanServStatusResult::TargetOffline {
             target: target_nick,
         };
     };
     let target_conn = target_owner.conn();
     let Some(channel) = state.channels.get_mut(&key) else {
-        return crate::core::state::ChanServOpResult::TargetNotOnChannel {
+        return ChanServStatusResult::TargetNotOnChannel {
             target: target_nick,
             channel: target,
         };
     };
     let display = channel.name.clone();
     let Some(member) = channel.member_mut(target_conn) else {
-        return crate::core::state::ChanServOpResult::TargetNotOnChannel {
+        return ChanServStatusResult::TargetNotOnChannel {
             target: target_nick,
             channel: display,
         };
     };
-    if member.op {
-        return crate::core::state::ChanServOpResult::AlreadyOpped {
+    let field = if change.is_op() {
+        &mut member.op
+    } else {
+        &mut member.voice
+    };
+    if *field == change.grants() {
+        return ChanServStatusResult::Unchanged {
             target: target_nick,
+            change,
         };
     }
-    member.op = true;
+    *field = change.grants();
     let line = state.server_line(format!(
-        ":{} MODE {display} +o {target_nick}",
-        state.config.server_name
+        ":{} MODE {display} {} {target_nick}",
+        state.config.server_name,
+        change.mode()
     ));
     state.broadcast_channel(&key, &line, None);
-    crate::core::state::ChanServOpResult::Opped {
+    ChanServStatusResult::Changed {
         target: target_nick,
         channel: display,
+        change,
     }
 }
 
-pub(crate) fn emit_chanserv_op_result(
+pub(crate) fn emit_chanserv_status_result(
     state: &mut ServerState,
     conn: ConnId,
-    result: crate::core::state::ChanServOpResult,
+    result: crate::core::state::ChanServStatusResult,
 ) {
-    match result {
-        crate::core::state::ChanServOpResult::NotRegistered { channel } => state.service_notice(
-            conn,
-            "ChanServ",
-            &format!("\x02{channel}\x02 is not registered."),
-        ),
-        crate::core::state::ChanServOpResult::NoAccess { channel } => state.service_notice(
-            conn,
-            "ChanServ",
-            &format!("You do not have op access on \x02{channel}\x02."),
-        ),
-        crate::core::state::ChanServOpResult::TargetOffline { target } => state.service_notice(
-            conn,
-            "ChanServ",
-            &format!("\x02{target}\x02 is not online."),
-        ),
-        crate::core::state::ChanServOpResult::TargetNotOnChannel { target, channel } => state
-            .service_notice(
-                conn,
-                "ChanServ",
-                &format!("\x02{target}\x02 is not on \x02{channel}\x02."),
-            ),
-        crate::core::state::ChanServOpResult::AlreadyOpped { target } => state.service_notice(
-            conn,
-            "ChanServ",
-            &format!("\x02{target}\x02 is already opped."),
-        ),
-        crate::core::state::ChanServOpResult::Opped { target, channel } => state.service_notice(
-            conn,
-            "ChanServ",
-            &format!("Opped \x02{target}\x02 on \x02{channel}\x02."),
-        ),
-    }
+    use crate::core::state::{ChanServStatusResult, StatusChange};
+    let text = match result {
+        ChanServStatusResult::NotRegistered { channel } => {
+            format!("\x02{channel}\x02 is not registered.")
+        }
+        ChanServStatusResult::NoAccess { channel, change } => {
+            let kind = if change.is_op() { "op" } else { "voice" };
+            format!("You do not have {kind} access on \x02{channel}\x02.")
+        }
+        ChanServStatusResult::TargetOffline { target } => {
+            format!("\x02{target}\x02 is not online.")
+        }
+        ChanServStatusResult::TargetNotOnChannel { target, channel } => {
+            format!("\x02{target}\x02 is not on \x02{channel}\x02.")
+        }
+        ChanServStatusResult::Unchanged { target, change } => match change {
+            StatusChange::Op => format!("\x02{target}\x02 is already opped."),
+            StatusChange::Deop => format!("\x02{target}\x02 is not opped."),
+            StatusChange::Voice => format!("\x02{target}\x02 is already voiced."),
+            StatusChange::Devoice => format!("\x02{target}\x02 is not voiced."),
+        },
+        ChanServStatusResult::Changed {
+            target,
+            channel,
+            change,
+        } => {
+            let done = match change {
+                StatusChange::Op => "Opped",
+                StatusChange::Deop => "Deopped",
+                StatusChange::Voice => "Voiced",
+                StatusChange::Devoice => "Devoiced",
+            };
+            format!("{done} \x02{target}\x02 on \x02{channel}\x02.")
+        }
+    };
+    state.service_notice(conn, "ChanServ", &text);
 }
 
-/// ChanServ SET: founder-only channel options. Currently FOUNDER (transfer
-/// ownership to another account, verified against the DB).
+/// ChanServ SET: founder-only channel options — FOUNDER and SUCCESSOR (both
+/// verified against the database), KEEPTOPIC and MLOCK.
 pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str]) {
     let (Some(&channel), Some(&option)) = (args.first(), args.get(1)) else {
         state.service_notice(conn, "ChanServ", "Syntax: SET <#channel> <option> <value>");
@@ -859,7 +1746,42 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
                     .as_ref()
                     .and_then(|capture| capture.label.clone()),
             };
-            queue_service_verdict(state, conn, request);
+            queue_service_verdict(state, conn, "ChanServ", request);
+        }
+        "SUCCESSOR" => {
+            let Some(&value) = args.get(2) else {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    "Syntax: SET <#channel> SUCCESSOR <account|OFF>",
+                );
+                return;
+            };
+            let successor = (!(value.eq_ignore_ascii_case("OFF") || value == "-"))
+                .then(|| state.casemap.casefold(value));
+            if successor
+                .as_deref()
+                .is_some_and(|successor| state.is_founder(&key, successor))
+            {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    &format!(
+                        "\x02{value}\x02 is the founder of \x02{channel}\x02 and cannot also be \
+                         its successor."
+                    ),
+                );
+                return;
+            }
+            let request = crate::core::DbRequest::SetChannelSuccessor {
+                owner: state.channel_owner(channel),
+                session: state.channel_actor(conn).session_owner(),
+                channel: channel.to_string(),
+                successor,
+                label: captured_label(state, conn),
+                actor: account,
+            };
+            queue_service_verdict(state, conn, "ChanServ", request);
         }
         "KEEPTOPIC" => {
             let on = match args.get(2).map(|v| v.to_ascii_uppercase()) {
@@ -894,7 +1816,7 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
                 label,
                 actor: account,
             };
-            queue_service_verdict(state, conn, request);
+            queue_service_verdict(state, conn, "ChanServ", request);
         }
         "MLOCK" => {
             let spec = args.get(2).copied().unwrap_or("");
@@ -910,7 +1832,7 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
                     label,
                     actor: account,
                 };
-                queue_service_verdict(state, conn, request);
+                queue_service_verdict(state, conn, "ChanServ", request);
                 return;
             }
             let parsed = match crate::core::state::MlockModes::parse(spec) {
@@ -946,7 +1868,7 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
                 label,
                 actor: account,
             };
-            queue_service_verdict(state, conn, request);
+            queue_service_verdict(state, conn, "ChanServ", request);
         }
         "GUARD" => {
             // GUARD keeps ChanServ in the channel so it is never destroyed
@@ -968,23 +1890,26 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
                 conn,
                 "ChanServ",
                 &format!(
-                    "Unknown SET option \x02{other}\x02. Available: FOUNDER, KEEPTOPIC, MLOCK."
+                    "Unknown SET option \x02{other}\x02. Available: FOUNDER, SUCCESSOR, \
+                     KEEPTOPIC, MLOCK."
                 ),
             );
         }
     }
 }
 
-/// Queue a ChanServ write whose verdict is the command's reply. Every verdict
-/// releases one deferred slot, so every queued write must take one here: a bare
-/// push would let the verdict release a slot some other reply is holding.
-fn queue_service_verdict(state: &mut ServerState, conn: ConnId, request: crate::core::DbRequest) {
+/// Queue a services request whose verdict is the command's reply. Every
+/// verdict releases one deferred slot, so every queued request must take one
+/// here: a bare push would let the verdict release a slot some other reply is
+/// holding. `service` is who says so when the queue is full.
+fn queue_service_verdict(
+    state: &mut ServerState,
+    conn: ConnId,
+    service: &str,
+    request: crate::core::DbRequest,
+) {
     if state.db_tx.try_push(request).is_err() {
-        state.service_notice(
-            conn,
-            "ChanServ",
-            "Services are temporarily unavailable. Try again later.",
-        );
+        services_unavailable(state, conn, service);
     } else {
         state.defer_captured_reply(conn);
     }
@@ -1138,6 +2063,7 @@ pub(crate) fn channel_service_persisted(
             account,
             flags,
             applied,
+            frontend,
             label,
         } => {
             let key = state.chan_key(&channel);
@@ -1156,6 +2082,7 @@ pub(crate) fn channel_service_persisted(
                     account,
                     flags,
                     applied,
+                    frontend,
                     label,
                 }
             }
@@ -1287,18 +2214,63 @@ pub(crate) fn channel_service_result(
             account,
             flags,
             applied,
+            frontend,
             label,
             ..
         } => state.emit_deferred_labeled(conn, label, |state| {
-            let text = if !applied {
-                format!("\x02{account}\x02 is not registered; no flags set on \x02{display}\x02.")
-            } else if let Some(flags) = flags {
-                format!("Flags for \x02{account}\x02 on \x02{display}\x02 are now +{flags}.")
-            } else {
-                format!("Cleared flags for \x02{account}\x02 on \x02{display}\x02.")
+            let text = match (applied, frontend, flags) {
+                (false, crate::core::AccessFrontend::Flags, _) => format!(
+                    "\x02{account}\x02 is not registered; no flags set on \x02{display}\x02."
+                ),
+                (false, _, _) => format!("\x02{account}\x02 is not registered."),
+                (true, crate::core::AccessFrontend::Flags, Some(flags)) => {
+                    format!("Flags for \x02{account}\x02 on \x02{display}\x02 are now +{flags}.")
+                }
+                (true, crate::core::AccessFrontend::Flags, None) => {
+                    format!("Cleared flags for \x02{account}\x02 on \x02{display}\x02.")
+                }
+                (true, crate::core::AccessFrontend::AccessAdd { role }, _) => format!(
+                    "\x02{account}\x02 was added with the \x02{role}\x02 role in \x02{display}\x02."
+                ),
+                (true, crate::core::AccessFrontend::AccessDel { role }, _) => format!(
+                    "\x02{account}\x02 was removed from the \x02{role}\x02 role in \
+                     \x02{display}\x02."
+                ),
             };
             state.service_notice(conn, "ChanServ", &text);
         }),
+        crate::core::ChannelServicePersistence::SuccessorSet {
+            display,
+            successor,
+            outcome,
+            label,
+        } => {
+            let Some(outcome) = outcome else {
+                return channel_field_unavailable(state, conn, display, label, "SUCCESSOR");
+            };
+            let successor = successor.unwrap_or_default();
+            let text = match outcome {
+                crate::db::SuccessorChange::Applied if successor.is_empty() => {
+                    format!("\x02{display}\x02 no longer has a successor.")
+                }
+                crate::db::SuccessorChange::Applied => {
+                    format!("\x02{successor}\x02 is now the successor of \x02{display}\x02.")
+                }
+                crate::db::SuccessorChange::ChannelMissing => {
+                    format!("\x02{display}\x02 is no longer registered.")
+                }
+                crate::db::SuccessorChange::AccountMissing => {
+                    format!("\x02{successor}\x02 is not registered.")
+                }
+                crate::db::SuccessorChange::IsFounder => format!(
+                    "\x02{successor}\x02 is the founder of \x02{display}\x02 and cannot also be \
+                     its successor."
+                ),
+            };
+            state.emit_deferred_labeled(conn, label, |state| {
+                state.service_notice(conn, "ChanServ", &text);
+            });
+        }
         crate::core::ChannelServicePersistence::AccessUnavailable { display, label, .. } => {
             channel_field_unavailable(state, conn, display, label, "FLAGS");
         }
@@ -1518,6 +2490,7 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
         .map(String::from)
         .expect("registered");
     monitor_notify(state, &nick, true);
+    check_nick_protection(state, conn);
 }
 
 pub(super) fn version() -> &'static str {

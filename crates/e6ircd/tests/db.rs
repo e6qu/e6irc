@@ -10303,3 +10303,523 @@ async fn a_stated_console_setting_must_agree_with_the_stored_revision() {
     );
     std::fs::remove_file(&key_path).ok();
 }
+
+// ---- NickServ nicks and the ChanServ successor (DESIGN §7.6) ---------------
+
+/// A grouped nick belongs to exactly one account: GROUP refuses another
+/// account's name or nick and a retired name, account creation refuses a
+/// grouped nick (storage refuses both even when asked directly), the group is
+/// capped, and any of an account's nicks signs in to it.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn grouped_nicks_belong_to_one_account_and_sign_in_to_it() {
+    let (pool, bob_id) =
+        alice_and_bob("grouped_nicks_belong_to_one_account_and_sign_in_to_it").await;
+    use db::NickGroupOutcome::{AlreadyYours, Grouped, Taken, TooMany};
+    let group = |account: &'static str, nick: &'static str| {
+        let pool = pool.clone();
+        async move { db::group_nick(&pool, account, nick).await.expect("group") }
+    };
+    assert_eq!(group("alice", "Alice_Away").await, Grouped);
+    assert_eq!(group("ALICE", "alice_away").await, AlreadyYours);
+    assert_eq!(group("alice", "alice").await, AlreadyYours);
+    assert_eq!(group("bob", "alice_away").await, Taken);
+    assert_eq!(group("alice", "Bob").await, Taken);
+    assert_eq!(
+        db::group_nick(&pool, "nobody", "free")
+            .await
+            .expect("group"),
+        db::NickGroupOutcome::AccountMissing
+    );
+
+    // Five nicks at most, the account's name among them.
+    for nick in ["a2", "a3", "a4"] {
+        assert_eq!(group("alice", nick).await, Grouped);
+    }
+    assert_eq!(group("alice", "a5").await, TooMany);
+
+    assert_eq!(
+        db::verify_credentials(&pool, "ALICE_AWAY", "administrator password")
+            .await
+            .expect("verify"),
+        Some("Alice".to_string())
+    );
+    assert_eq!(
+        db::verify_local_password(&pool, "a2", "administrator password")
+            .await
+            .expect("verify"),
+        Some("Alice".to_string())
+    );
+    assert!(matches!(
+        db::create_account_with_contact(&pool, "Alice_away", "pw", None).await,
+        Err(db::DbError::DuplicateAccount(_))
+    ));
+    let direct = sqlx::query("INSERT INTO accounts (name, name_folded) VALUES ('a3', 'a3')")
+        .execute(&pool)
+        .await;
+    assert!(
+        direct.is_err(),
+        "storage must refuse an account named like a grouped nick"
+    );
+    let direct = sqlx::query(
+        "INSERT INTO account_nicks (nick_folded, nick, account_id) VALUES ('bob', 'bob', $1)",
+    )
+    .bind(bob_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        direct.is_err(),
+        "storage must refuse grouping an account's name"
+    );
+
+    assert!(
+        db::ungroup_nick(&pool, "alice", "A4")
+            .await
+            .expect("ungroup")
+    );
+    assert!(
+        !db::ungroup_nick(&pool, "alice", "a4")
+            .await
+            .expect("ungroup")
+    );
+    assert!(!db::ungroup_nick(&pool, "bob", "a2").await.expect("ungroup"));
+
+    use db::NickEnforceChange::{AccountMissing, Changed, Unchanged};
+    assert_eq!(
+        db::set_nick_enforce(&pool, "ALICE", true)
+            .await
+            .expect("set"),
+        Changed
+    );
+    assert_eq!(
+        db::set_nick_enforce(&pool, "alice", true)
+            .await
+            .expect("set"),
+        Unchanged
+    );
+    assert_eq!(
+        db::set_nick_enforce(&pool, "nobody", true)
+            .await
+            .expect("set"),
+        AccountMissing
+    );
+    assert_eq!(
+        db::list_nick_registrations(&pool).await.expect("list"),
+        db::NickRegistrations {
+            grouped: vec![
+                ("a2".into(), "alice".into()),
+                ("a3".into(), "alice".into()),
+                ("alice_away".into(), "alice".into()),
+            ],
+            enforced: vec!["alice".into()],
+        }
+    );
+
+    let info = db::nickserv_account_info(&pool, "A3")
+        .await
+        .expect("info")
+        .expect("alice");
+    assert_eq!(info.name, "Alice");
+    assert_eq!(info.nicks, ["Alice", "Alice_Away", "a2", "a3"]);
+    assert!(info.enforce);
+    assert_eq!(
+        db::nickserv_account_info(&pool, "nobody")
+            .await
+            .expect("info"),
+        None
+    );
+    let audited: Vec<String> =
+        sqlx::query_scalar("SELECT action FROM audit_log WHERE action LIKE 'NICK_%' ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("audit");
+    assert_eq!(
+        audited,
+        [
+            "NICK_GROUP",
+            "NICK_GROUP",
+            "NICK_GROUP",
+            "NICK_GROUP",
+            "NICK_UNGROUP",
+            "NICK_ENFORCE"
+        ]
+    );
+
+    // A retired name cannot be grouped; a deleted account's nicks go with it.
+    db::delete_account_permanently(&pool, bob_id, "Alice", &[])
+        .await
+        .expect("delete")
+        .expect("Bob");
+    assert_eq!(group("alice", "bob").await, Taken);
+    let alice_id = db::account_id_by_name(&pool, "alice")
+        .await
+        .expect("lookup")
+        .expect("alice");
+    sqlx::query("UPDATE accounts SET flags = 0 WHERE id = $1")
+        .bind(alice_id)
+        .execute(&pool)
+        .await
+        .expect("demote");
+    db::create_account_with_contact(&pool, "Carol", "pw", None)
+        .await
+        .expect("Carol");
+    sqlx::query("UPDATE accounts SET flags = 1 WHERE name_folded = 'carol'")
+        .execute(&pool)
+        .await
+        .expect("promote");
+    db::delete_account_permanently(&pool, alice_id, "Carol", &[])
+        .await
+        .expect("delete")
+        .expect("Alice");
+    assert_eq!(
+        db::list_nick_registrations(&pool).await.expect("list"),
+        db::NickRegistrations::default()
+    );
+}
+
+/// ChanServ SET SUCCESSOR: the successor must be an account other than the
+/// founder; deleting the founder passes each channel with a successor to it
+/// (audited) and still refuses while one without a successor remains; a
+/// transfer to the successor, or the successor's own deletion, clears it.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn a_deleted_founders_channels_pass_to_their_successors() {
+    let (pool, bob_id) =
+        alice_and_bob("a_deleted_founders_channels_pass_to_their_successors").await;
+    db::create_account_with_contact(&pool, "Carol", "pw", None)
+        .await
+        .expect("Carol");
+    let dave_id = db::create_account_with_contact(&pool, "Dave", "pw", None)
+        .await
+        .expect("Dave");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT c.name, c.name, a.id FROM accounts a,
+             (VALUES ('#a', 'bob'), ('#b', 'bob'), ('#c', 'alice'), ('#d', 'alice'))
+                 AS c (name, founder)
+         WHERE a.name_folded = c.founder",
+    )
+    .execute(&pool)
+    .await
+    .expect("channels");
+    use db::SuccessorChange::{AccountMissing, Applied, ChannelMissing, IsFounder};
+    let set = |channel: &'static str, successor: Option<&'static str>| {
+        let pool = pool.clone();
+        async move {
+            db::set_channel_successor(&pool, channel, successor, "founder")
+                .await
+                .expect("successor")
+        }
+    };
+    assert_eq!(set("#A", Some("carol")).await, Applied);
+    assert_eq!(set("#a", Some("bob")).await, IsFounder);
+    assert_eq!(set("#a", Some("nobody")).await, AccountMissing);
+    assert_eq!(set("#nope", Some("carol")).await, ChannelMissing);
+    let successor = |channel: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT a.name_folded FROM channels c
+                 LEFT JOIN accounts a ON a.id = c.successor_account_id
+                 WHERE c.name_folded = $1",
+            )
+            .bind(channel)
+            .fetch_one(&pool)
+            .await
+            .expect("successor")
+        }
+    };
+    assert_eq!(successor("#a").await.as_deref(), Some("carol"));
+
+    // #b has no successor: the deletion is refused whole, #a included.
+    assert!(matches!(
+        db::account_deletion_target(&pool, bob_id, &[]).await,
+        Err(db::DbError::AccountOwnsChannels(1))
+    ));
+    assert!(matches!(
+        db::delete_account_permanently(&pool, bob_id, "Alice", &[]).await,
+        Err(db::DbError::AccountOwnsChannels(1))
+    ));
+    assert_eq!(successor("#a").await.as_deref(), Some("carol"));
+
+    assert_eq!(set("#b", Some("dave")).await, Applied);
+    let deleted = db::delete_account_permanently(&pool, bob_id, "Alice", &[])
+        .await
+        .expect("delete")
+        .expect("Bob");
+    let mut successions = deleted.successions.clone();
+    successions.sort_by(|a, b| a.channel.cmp(&b.channel));
+    assert_eq!(
+        successions,
+        [
+            db::ChannelSuccession {
+                channel: "#a".into(),
+                founder: "carol".into(),
+            },
+            db::ChannelSuccession {
+                channel: "#b".into(),
+                founder: "dave".into(),
+            },
+        ]
+    );
+    let founders: Vec<(String, String)> = sqlx::query_as(
+        "SELECT c.name_folded, a.name_folded FROM channels c
+         JOIN accounts a ON a.id = c.founder_account_id ORDER BY c.name_folded",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("founders");
+    assert_eq!(
+        founders,
+        [
+            ("#a".to_string(), "carol".to_string()),
+            ("#b".into(), "dave".into()),
+            ("#c".into(), "alice".into()),
+            ("#d".into(), "alice".into()),
+        ]
+    );
+    assert_eq!(successor("#a").await, None, "the successor became founder");
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'CHANNEL_SUCCESSION' AND actor = 'alice'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(audited, 2);
+
+    // A transfer to the successor leaves no successor; deleting a successor
+    // clears it.
+    assert_eq!(set("#c", Some("carol")).await, Applied);
+    assert!(
+        db::set_channel_founder(&pool, "#c", "carol", "alice")
+            .await
+            .expect("transfer")
+    );
+    assert_eq!(successor("#c").await, None);
+    assert_eq!(set("#d", Some("dave")).await, Applied);
+    assert!(
+        db::set_channel_founder(&pool, "#b", "alice", "dave")
+            .await
+            .expect("transfer")
+    );
+    let deleted = db::delete_account_permanently(&pool, dave_id, "Alice", &[])
+        .await
+        .expect("delete")
+        .expect("Dave");
+    assert!(deleted.successions.is_empty());
+    assert_eq!(
+        successor("#d").await,
+        None,
+        "a deleted successor is cleared"
+    );
+}
+
+/// One IRC client of a running server, for the end-to-end services tests.
+struct ServicesClient {
+    reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
+    writer: tokio::net::tcp::OwnedWriteHalf,
+}
+
+impl ServicesClient {
+    async fn register(addr: std::net::SocketAddr, nick: &str) -> Self {
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let (reader, writer) = stream.into_split();
+        let mut client = Self {
+            reader: BufReader::new(reader),
+            writer,
+        };
+        client
+            .send(&format!("NICK {nick}\r\nUSER {nick} 0 * :{nick}"))
+            .await;
+        client.expect(" 001 ").await;
+        client
+    }
+
+    async fn send(&mut self, line: &str) {
+        self.writer
+            .write_all(format!("{line}\r\n").as_bytes())
+            .await
+            .expect("write");
+    }
+
+    /// The next line containing `needle`; `None` if the server closes first.
+    async fn next_with(&mut self, needle: &str) -> Option<String> {
+        tokio::time::timeout(deadline::HANG, async {
+            loop {
+                let mut line = String::new();
+                if self.reader.read_line(&mut line).await.expect("read") == 0 {
+                    return None;
+                }
+                if line.contains(needle) {
+                    return Some(line.trim_end().to_string());
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timeout waiting for {needle}"))
+    }
+
+    async fn expect(&mut self, needle: &str) -> String {
+        self.next_with(needle)
+            .await
+            .unwrap_or_else(|| panic!("closed before {needle}"))
+    }
+}
+
+/// The services a user reaches over IRC, against real storage: a nick grouped
+/// and protected before a restart is enforced after it; GROUP and INFO read
+/// PostgreSQL; ChanServ SET SUCCESSOR persists; NickServ DROP deletes the
+/// account through the console's deletion procedure — disconnecting it,
+/// passing its channel to the successor in storage and in the live core.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn nickserv_and_chanserv_services_over_a_real_server() {
+    let url = support::test_db("nickserv_and_chanserv_services_over_a_real_server").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    db::bootstrap_first_admin(&pool, "root", "root password")
+        .await
+        .expect("root");
+    db::create_account_with_contact(&pool, "keeper", "keeper password", None)
+        .await
+        .expect("keeper");
+    assert_eq!(
+        db::group_nick(&pool, "keeper", "keeper_")
+            .await
+            .expect("group"),
+        db::NickGroupOutcome::Grouped
+    );
+    db::set_nick_enforce(&pool, "keeper", true)
+        .await
+        .expect("enforce");
+    db::create_account_with_contact(&pool, "carol", "carol-password", None)
+        .await
+        .expect("carol");
+
+    let config = Config {
+        server_name: "irc.services.example".into(),
+        network_name: "ServicesNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        database: Some(DatabaseConfig {
+            url,
+            startup_wait_seconds: e6ircd::config::DEFAULT_STARTUP_WAIT_SECONDS,
+            max_connections: None,
+        }),
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+    let addr = running.addrs[0];
+
+    // Boot-loaded protection.
+    let mut intruder = ServicesClient::register(addr, "intruder").await;
+    intruder.send("NICK Keeper_").await;
+    intruder
+        .expect("identify via \x02/msg NickServ IDENTIFY keeper <password>\x02")
+        .await;
+
+    let mut dave = ServicesClient::register(addr, "dave").await;
+    dave.send("PRIVMSG NickServ :REGISTER dave-password").await;
+    dave.expect("is now registered to your connection").await;
+    dave.send("NICK dave_away\r\nPRIVMSG NickServ :GROUP").await;
+    dave.expect("Nick \x02dave_away\x02 is now registered to your account.")
+        .await;
+    dave.send("PRIVMSG NickServ :INFO dave").await;
+    dave.expect("Nicks      : dave dave_away").await;
+    dave.expect("End of Info").await;
+    dave.send("PRIVMSG NickServ :SET ENFORCE ON").await;
+    dave.expect("The \x02ENFORCE\x02 flag has been set for account \x02dave\x02.")
+        .await;
+    dave.send("PRIVMSG NickServ :UNGROUP").await;
+    dave.expect("Nick \x02dave_away\x02 has been removed from your account.")
+        .await;
+
+    dave.send("JOIN #keep").await;
+    dave.expect(" 366 ").await;
+    dave.send("PRIVMSG ChanServ :REGISTER #keep").await;
+    dave.expect("is now registered to your account").await;
+    dave.send("PRIVMSG ChanServ :SET #keep SUCCESSOR carol")
+        .await;
+    dave.expect("\x02carol\x02 is now the successor of \x02#keep\x02.")
+        .await;
+    dave.send("PART #keep").await;
+    dave.expect(" PART #keep").await;
+
+    dave.send("PRIVMSG NickServ :DROP dave wrong-password")
+        .await;
+    let reminder = dave.expect("Please confirm by replying with").await;
+    let key = reminder
+        .trim_end_matches('\x02')
+        .rsplit(' ')
+        .next()
+        .expect("key")
+        .to_string();
+    dave.send(&format!("PRIVMSG NickServ :DROP dave wrong-password {key}"))
+        .await;
+    dave.expect("Invalid password for \x02dave\x02.").await;
+    dave.send("PRIVMSG NickServ :DROP dave dave-password").await;
+    let reminder = dave.expect("Please confirm by replying with").await;
+    let key = reminder
+        .trim_end_matches('\x02')
+        .rsplit(' ')
+        .next()
+        .expect("key")
+        .to_string();
+    dave.send(&format!("PRIVMSG NickServ :DROP dave dave-password {key}"))
+        .await;
+    dave.expect("Account permanently deleted").await;
+    assert_eq!(dave.next_with("never sent").await, None, "not disconnected");
+
+    // The live gate disconnects the account before its rows go.
+    tokio::time::timeout(deadline::HANG, async {
+        while db::account_id_by_name(&pool, "dave")
+            .await
+            .expect("lookup")
+            .is_some()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the account was deleted");
+    let founder: String = sqlx::query_scalar(
+        "SELECT a.name_folded FROM channels c JOIN accounts a ON a.id = c.founder_account_id
+         WHERE c.name_folded = '#keep'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("founder");
+    assert_eq!(founder, "carol");
+    let grouped: i64 = sqlx::query_scalar("SELECT count(*) FROM account_nicks")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(grouped, 1, "only keeper_ is left");
+
+    // The live core moved the founder too: carol's ChanServ rights are the
+    // founder's, and dave's name is gone from every mirror.
+    let mut carol = ServicesClient::register(addr, "carol").await;
+    carol
+        .send("PRIVMSG NickServ :IDENTIFY carol-password")
+        .await;
+    carol.expect("You are now identified for").await;
+    // The core hears of the deletion just after its commit.
+    tokio::time::timeout(deadline::HANG, async {
+        loop {
+            carol.send("PRIVMSG ChanServ :FLAGS #keep").await;
+            let answer = carol.expect("NOTICE carol :").await;
+            if answer.contains("Access list for \x02#keep\x02:") {
+                return;
+            }
+            assert!(answer.contains("You are not the founder"), "{answer}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("carol became founder in the live core");
+    carol.send("PRIVMSG NickServ :INFO dave").await;
+    carol.expect("\x02dave\x02 is not registered.").await;
+    running.shutdown.run().await;
+}

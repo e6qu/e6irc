@@ -781,7 +781,7 @@ fn operations() -> serde_json::Value {
             "network_name": { "type": "string" },
             "description": { "type": "string" },
             "motd": { "type": "array", "items": { "type": "string" } },
-            "nicklen": { "type": "integer", "minimum": 1, "maximum": 64 },
+            "nicklen": { "type": "integer", "minimum": 10, "maximum": 64 },
             "sendq": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_SENDQ },
             "core_queue": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_CORE_QUEUE },
             "core_workers": { "type": "integer", "minimum": 1, "maximum": crate::config::MAX_CORE_WORKERS },

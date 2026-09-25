@@ -164,9 +164,13 @@ required by the requested NickServ or ChanServ command.
 
 **Flow.**
 
-- NickServ supports REGISTER, IDENTIFY, GHOST, LOGOUT, and HELP.
-- ChanServ supports REGISTER, DROP, FLAGS, OP, SET FOUNDER, SET KEEPTOPIC,
-  and SET MLOCK.
+- NickServ supports REGISTER, IDENTIFY, LOGOUT, GHOST, REGAIN, GROUP,
+  UNGROUP, INFO, SET ENFORCE, DROP, and HELP. With ENFORCE on, a user who takes
+  one of the account's nicks without identifying to it is warned and renamed
+  to a Guest nick after 30 seconds.
+- ChanServ supports REGISTER, DROP, FLAGS, ACCESS (LIST, ADD, DEL), OP, DEOP,
+  VOICE, DEVOICE, SET FOUNDER, SET SUCCESSOR, SET KEEPTOPIC, and SET MLOCK.
+  Deleting a founder's account passes each channel with a successor to it.
 - Registered channel state persists in PostgreSQL and is boot-loaded.
   Founder status, retained topics, mode locks, and access flags are enforced
   when the channel is recreated.
@@ -182,8 +186,11 @@ verification path. Founder/access checks are repeated in the core, durable
 mutations cross the database worker, and privileged outcomes are recorded
 without credential or private-channel leakage.
 
-**Evidence.** Proven by core services tests, persistence-backed irctest account
-registration, PostgreSQL persistence tests, and console/API channel tests.
+**Evidence.** Proven by core services tests (the cross-shard REGAIN and
+enforcement rename included), persistence-backed irctest account registration,
+PostgreSQL persistence tests, a PostgreSQL-backed end-to-end test that groups,
+protects, sets a successor and drops an account over a real socket, and
+console/API channel tests.
 
 ## Operate and protect the network through IRC
 

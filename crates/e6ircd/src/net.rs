@@ -766,21 +766,8 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     let managed_config =
         managed_config.map(|snapshot| Arc::new(tokio::sync::RwLock::new(snapshot)));
     // SASL is only advertised when a database exists to answer verification
-    // requests. Keep the worker handle so graceful shutdown can guarantee its
-    // buffered `log_batch` is flushed before the process exits (DESIGN §18).
+    // requests.
     let sasl_enabled = pool.is_some();
-    let db_worker = match &pool {
-        Some(pool) => Some(tokio::spawn(crate::db::run_worker_observed(
-            pool.clone(),
-            db_rx,
-            core_tx.clone(),
-            telemetry.clone(),
-        ))),
-        None => {
-            drop(db_rx);
-            None
-        }
-    };
 
     // Accept-loop tasks, collected so shutdown can stop admitting connections.
     let mut listeners: Vec<tokio::task::AbortHandle> = Vec::new();
@@ -852,6 +839,41 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         Some(reg)
     } else {
         None
+    };
+
+    // The database worker carries out NickServ DROP through the same deletion
+    // procedure as the console, so it starts once the network registry that
+    // procedure stops an account's networks through exists. Keep the worker
+    // handle so graceful shutdown can guarantee its buffered `log_batch` is
+    // flushed before the process exits (DESIGN §18).
+    let db_worker = match (&pool, &bnc_registry) {
+        (Some(pool), Some(registry)) => {
+            let account_deletion = crate::account_deletion::AccountDeletion {
+                pool: pool.clone(),
+                core_tx: core_tx.clone(),
+                registry: registry.clone(),
+                secret_key: secret_key.clone(),
+                internal_upstreams: config.internal_upstreams,
+                configured_administrators: config
+                    .http
+                    .iter()
+                    .flat_map(|http| &http.admin_accounts)
+                    .map(|account| e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account))
+                    .collect(),
+            };
+            Some(tokio::spawn(crate::db::run_worker_observed(
+                pool.clone(),
+                db_rx,
+                core_tx.clone(),
+                telemetry.clone(),
+                account_deletion,
+            )))
+        }
+        (Some(_), None) => unreachable!("the network registry exists whenever the database does"),
+        (None, _) => {
+            drop(db_rx);
+            None
+        }
     };
 
     // One per-IP connection cap shared by the TCP IRC listeners and the
@@ -1135,6 +1157,9 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         let suspended = crate::db::list_suspended_accounts(pool)
             .await
             .map_err(io::Error::other)?;
+        let nick_registrations = crate::db::list_nick_registrations(pool)
+            .await
+            .map_err(io::Error::other)?;
         let configured_administrators = config
             .http
             .as_ref()
@@ -1160,6 +1185,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 .map_err(io::Error::other)?;
             core.preload_read_markers(read_markers.clone());
             core.preload_suspended_accounts(suspended.clone());
+            core.preload_nick_registrations(nick_registrations.clone());
         }
     }
     drop(db_tx);

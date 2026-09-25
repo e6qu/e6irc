@@ -5470,7 +5470,10 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
     };
     let (status, _, body) = request(http, &delete_bob(&bob_csrf)).await;
     assert_eq!(status, 409, "{body}");
-    assert!(body.contains("transfer or unregister"), "{body}");
+    assert!(
+        body.contains("with no successor; transfer them, name a successor, or unregister"),
+        "{body}"
+    );
     assert!(
         e6ircd::db::set_channel_founder(&pool, "#bob", "alice", "founder")
             .await

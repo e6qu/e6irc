@@ -82,7 +82,7 @@ pub(super) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Gate an oper-only command: reply `ERR_NOPRIVILEGES` and report `false`
 /// when the connection is not an IRC operator.
-fn require_oper(state: &mut ServerState, conn: ConnId) -> bool {
+pub(super) fn require_oper(state: &mut ServerState, conn: ConnId) -> bool {
     if state.sessions[&conn].oper.is_some() {
         return true;
     }
@@ -185,6 +185,12 @@ pub(crate) fn session_action(
             let reason = format!("GHOST command used by {by}");
             state.send(conn, &format!("ERROR :Closing Link: {server} ({reason})"));
             state.close(conn, &reason);
+        }
+        crate::core::state::SessionAction::Regain { nick, by, by_mask } => {
+            super::services::regain_nick_from(state, conn, nick, by, &by_mask);
+        }
+        crate::core::state::SessionAction::TakeNick { nick } => {
+            super::services::take_regained_nick(state, conn, &nick);
         }
         crate::core::state::SessionAction::SetHost {
             host,

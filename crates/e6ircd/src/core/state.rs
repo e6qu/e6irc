@@ -628,6 +628,87 @@ impl ChannelOptionsDirectory {
     }
 }
 
+/// Process-wide NickServ nick registrations the core acts on: the nicks
+/// grouped to an account (NickServ GROUP), and the accounts that protect their
+/// nicks (SET ENFORCE). An account's own name is its nick without an entry
+/// here. Boot-loaded, and changed only after PostgreSQL confirms a change, so a
+/// shard never enforces a registration storage does not hold.
+#[derive(Clone, Default)]
+pub(crate) struct NickRegistrationDirectory {
+    inner: Arc<Mutex<NickRegistrations>>,
+}
+
+#[derive(Default)]
+struct NickRegistrations {
+    grouped: HashMap<NickKey, AccountKey>,
+    enforced: HashSet<AccountKey>,
+}
+
+impl NickRegistrationDirectory {
+    fn lock(&self) -> std::sync::MutexGuard<'_, NickRegistrations> {
+        self.inner
+            .lock()
+            .expect("nick registration directory poisoned")
+    }
+
+    pub(crate) fn replace(
+        &self,
+        grouped: impl IntoIterator<Item = (NickKey, AccountKey)>,
+        enforced: impl IntoIterator<Item = AccountKey>,
+    ) {
+        let mut registrations = self.lock();
+        registrations.grouped = grouped.into_iter().collect();
+        registrations.enforced = enforced.into_iter().collect();
+    }
+
+    pub(crate) fn group(&self, nick: NickKey, account: AccountKey) {
+        self.lock().grouped.insert(nick, account);
+    }
+
+    pub(crate) fn ungroup(&self, nick: &NickKey) {
+        self.lock().grouped.remove(nick);
+    }
+
+    pub(crate) fn set_enforce(&self, account: AccountKey, enforce: bool) {
+        let mut registrations = self.lock();
+        if enforce {
+            registrations.enforced.insert(account);
+        } else {
+            registrations.enforced.remove(&account);
+        }
+    }
+
+    /// Drop every registration of a permanently deleted account: its grouped
+    /// nicks cascaded away with it.
+    pub(crate) fn forget_account(&self, account: &AccountKey) {
+        let mut registrations = self.lock();
+        registrations.grouped.retain(|_, owner| owner != account);
+        registrations.enforced.remove(account);
+    }
+
+    /// The account `nick` is grouped to, if it is a grouped nick.
+    pub(crate) fn grouped_owner(&self, nick: &NickKey) -> Option<AccountKey> {
+        self.lock().grouped.get(nick).cloned()
+    }
+
+    /// The account protecting `nick`: the one it is grouped to, or else the
+    /// account spelled like it (`named`), when that account has ENFORCE on.
+    pub(crate) fn protector(&self, nick: &NickKey, named: AccountKey) -> Option<AccountKey> {
+        let registrations = self.lock();
+        let owner = registrations.grouped.get(nick).cloned().unwrap_or(named);
+        registrations.enforced.contains(&owner).then_some(owner)
+    }
+}
+
+/// A protected nick a session holds without identifying to its account: at
+/// `deadline` (monotonic) it is renamed to a Guest nick unless it has left the
+/// nick or identified by then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NickEnforcement {
+    pub(crate) nick: NickKey,
+    pub(crate) deadline: e6irc_proto::time::MonoMillis,
+}
+
 /// What any shard may know about a registered user: the public face of a
 /// session, as WHOIS, WHO, ISON, USERHOST, MONITOR and message delivery see it.
 ///
@@ -947,6 +1028,7 @@ pub(crate) struct CoreDirectories {
     pub(crate) founders: FounderDirectory,
     pub(crate) topics: RetainedTopicDirectory,
     pub(crate) channel_options: ChannelOptionsDirectory,
+    pub(crate) nick_registrations: NickRegistrationDirectory,
 }
 
 /// A validated command-flood bucket shape: `burst` tokens at most, refilling
@@ -1419,6 +1501,12 @@ pub(crate) struct Session {
     pub pending_identify: Option<PendingServiceReply>,
     /// Deferred NickServ REGISTER reply.
     pub pending_register: Option<PendingServiceReply>,
+    /// The protected nick this session holds without having identified to
+    /// its account, and when it is renamed for it (NickServ ENFORCE).
+    pub(crate) nick_enforcement: Option<NickEnforcement>,
+    /// The confirmation key NickServ DROP last gave this session, with the
+    /// account it is for: the drop proceeds only when it is repeated.
+    pub(crate) drop_confirmation: Option<(AccountKey, String)>,
     /// Away message, when set.
     pub away: Option<String>,
     /// IRC operator (umode +o): the configured operator name the session
@@ -2172,6 +2260,16 @@ pub enum SessionAction {
     Kill { comment: String, killer: String },
     /// NickServ GHOST, by the owner of the nick's account.
     Ghost { by: String },
+    /// NickServ REGAIN of `nick`, which this session holds, by the session
+    /// `by` (whose prefix is `by_mask`): this one is renamed to a Guest nick
+    /// and `by` is then given `nick` ([`SessionAction::TakeNick`]).
+    Regain {
+        nick: String,
+        by: SessionOwner,
+        by_mask: String,
+    },
+    /// The second half of a REGAIN: take `nick`, which its holder has let go.
+    TakeNick { nick: String },
     /// Oper SETHOST; `oper` is told the outcome.
     SetHost {
         host: String,
@@ -2303,8 +2401,9 @@ pub enum ChannelCommandOperation {
     },
     Invite(ChannelInvitee),
     ChanServRegister,
-    ChanServOp {
+    ChanServStatus {
         target_nick: String,
+        change: StatusChange,
     },
     Names,
     Who(ChannelWhoQuery),
@@ -2468,7 +2567,7 @@ pub enum ChannelCommandResult {
     Knock(ChannelKnockResult),
     Invite(ChannelInviteResult),
     ChanServRegister(ChanServRegisterResult),
-    ChanServOp(ChanServOpResult),
+    ChanServStatus(ChanServStatusResult),
     Names(ChannelCommandReplies),
     Who(ChannelCommandReplies),
     History(ChannelHistoryResult),
@@ -2538,14 +2637,73 @@ pub enum ChannelInviteResult {
     UserOnChannel { invitee: String, channel: String },
 }
 
+/// The member status a ChanServ OP, DEOP, VOICE or DEVOICE changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusChange {
+    Op,
+    Deop,
+    Voice,
+    Devoice,
+}
+
+impl StatusChange {
+    /// The ChanServ command that asks for it.
+    pub(crate) fn command(self) -> &'static str {
+        match self {
+            Self::Op => "OP",
+            Self::Deop => "DEOP",
+            Self::Voice => "VOICE",
+            Self::Devoice => "DEVOICE",
+        }
+    }
+
+    /// Whether it changes operator status (rather than voice).
+    pub(crate) fn is_op(self) -> bool {
+        matches!(self, Self::Op | Self::Deop)
+    }
+
+    /// Whether the member holds the status afterwards.
+    pub(crate) fn grants(self) -> bool {
+        matches!(self, Self::Op | Self::Voice)
+    }
+
+    /// The channel mode change it announces.
+    pub(crate) fn mode(self) -> &'static str {
+        match self {
+            Self::Op => "+o",
+            Self::Deop => "-o",
+            Self::Voice => "+v",
+            Self::Devoice => "-v",
+        }
+    }
+}
+
 #[derive(Debug)]
-pub enum ChanServOpResult {
-    NotRegistered { channel: String },
-    NoAccess { channel: String },
-    TargetOffline { target: String },
-    TargetNotOnChannel { target: String, channel: String },
-    AlreadyOpped { target: String },
-    Opped { target: String, channel: String },
+pub enum ChanServStatusResult {
+    NotRegistered {
+        channel: String,
+    },
+    NoAccess {
+        channel: String,
+        change: StatusChange,
+    },
+    TargetOffline {
+        target: String,
+    },
+    TargetNotOnChannel {
+        target: String,
+        channel: String,
+    },
+    /// The member already had (or already lacked) the status.
+    Unchanged {
+        target: String,
+        change: StatusChange,
+    },
+    Changed {
+        target: String,
+        channel: String,
+        change: StatusChange,
+    },
 }
 
 #[derive(Debug)]
@@ -3832,6 +3990,9 @@ pub(crate) struct ServerState {
     pub channel_topic_revision: u64,
     /// Process-wide durable KEEPTOPIC, MLOCK, and access state.
     pub channel_options: ChannelOptionsDirectory,
+    /// Process-wide grouped nicks and nick protection (NickServ GROUP, SET
+    /// ENFORCE).
+    pub(crate) nick_registrations: NickRegistrationDirectory,
     /// Server bans (oper K/D/X-lines) refused at registration. Boot-loaded
     /// and kept in sync on KLINE/DLINE/XLINE and their removals.
     pub server_bans: Vec<ServerBan>,
@@ -4777,6 +4938,7 @@ impl ServerState {
             pending_channel_topics: HashMap::new(),
             channel_topic_revision: 0,
             channel_options: directories.channel_options,
+            nick_registrations: directories.nick_registrations,
             server_bans: Vec::new(),
             pending_server_bans: HashSet::new(),
             whowas: directories.whowas,
@@ -4979,6 +5141,11 @@ impl ServerState {
     /// (`is_founder`, `access_modes`, `identity_nick`), and a raw compare here
     /// would silently fail to sync a sibling connection (e.g. MARKREAD) if any
     /// session ever held a non-canonical account label.
+    /// Whether any session, on any shard, is logged in to `account`.
+    pub(crate) fn account_online(&self, account: &AccountKey) -> bool {
+        self.users.logged_in_as(account.as_str()).is_some()
+    }
+
     pub fn account_connections(&self, account: &str) -> Vec<ConnId> {
         self.account_sessions
             .get(&self.account_key(account))
@@ -5288,13 +5455,28 @@ impl ServerState {
     /// it sent and the conversations it took part in (the database purge took
     /// both), and its channel access entries (cascaded). Its suspension stays:
     /// that is the live authentication gate for the retired name.
-    pub(crate) fn forget_deleted_account(&mut self, account: &str) {
+    ///
+    /// The channels it founded with a successor passed to that successor in
+    /// the same transaction (`successions`, `(channel, new founder)`): the
+    /// founder mirror follows them. Its grouped nicks and nick protection went
+    /// with the account too.
+    pub(crate) fn forget_deleted_account(
+        &mut self,
+        account: &str,
+        successions: &[crate::db::ChannelSuccession],
+    ) {
         self.forget_account_read_markers(account);
         let key = self.account_key(account);
         for changed in self.history.forget_account(key.as_str(), self.casemap) {
             self.channel_ring_changed(&changed);
         }
         self.channel_options.remove_account(&key);
+        self.nick_registrations.forget_account(&key);
+        for succession in successions {
+            let channel = self.chan_key(&succession.channel);
+            let founder = self.account_key(&succession.founder);
+            self.registered_founders.set(channel, founder);
+        }
     }
 
     fn forget_account_read_markers(&mut self, account: &str) {
@@ -5353,6 +5535,36 @@ impl ServerState {
     }
 
     /// Key a nick for lookup/storage.
+    /// Seed the grouped-nick and nick-protection mirror from PostgreSQL
+    /// (see [`NickRegistrationDirectory`]).
+    pub fn preload_nick_registrations(
+        &mut self,
+        grouped: Vec<(String, String)>,
+        enforced: Vec<String>,
+    ) {
+        let grouped: Vec<(NickKey, AccountKey)> = grouped
+            .into_iter()
+            .map(|(nick, account)| (self.nick_key(&nick), self.account_key(&account)))
+            .collect();
+        let enforced: Vec<AccountKey> = enforced.iter().map(|a| self.account_key(a)).collect();
+        self.nick_registrations.replace(grouped, enforced);
+    }
+
+    /// The account whose ENFORCE protects `nick`, if any: the account it is
+    /// grouped to, or the account of the same name.
+    pub(crate) fn nick_protector(&self, nick: &NickKey) -> Option<AccountKey> {
+        self.nick_registrations
+            .protector(nick, self.account_key(nick.as_str()))
+    }
+
+    /// Whether `nick` belongs to `account`: it is the account's name, or a
+    /// nick grouped to it (GHOST and REGAIN act only on a nick one owns).
+    pub(crate) fn nick_owned_by(&self, nick: &NickKey, account: &str) -> bool {
+        let account = self.account_key(account);
+        self.account_key(nick.as_str()) == account
+            || self.nick_registrations.grouped_owner(nick) == Some(account)
+    }
+
     pub fn nick_key(&self, nick: &str) -> NickKey {
         NickKey(self.casemap.casefold(nick))
     }
@@ -5583,6 +5795,8 @@ impl ServerState {
                 credential_attempts: crate::identity::CredentialAttemptBudget::default(),
                 pending_identify: None,
                 pending_register: None,
+                nick_enforcement: None,
+                drop_confirmation: None,
                 away: None,
                 oper: None,
                 invisible: false,
@@ -6413,6 +6627,22 @@ impl ServerState {
         if let Some(previous) = previous {
             self.forget_account_session(&previous, conn);
         }
+        // Identifying to the account protecting the nick held ends its
+        // enforcement (NickServ ENFORCE); identifying to any other does not.
+        let enforced_nick = self.sessions[&conn]
+            .nick_enforcement
+            .as_ref()
+            .map(|enforcement| enforcement.nick.clone());
+        if let Some(nick) = enforced_nick
+            && self
+                .nick_protector(&nick)
+                .is_none_or(|protector| protector == key)
+        {
+            self.sessions
+                .get_mut(&conn)
+                .expect("session logging in")
+                .nick_enforcement = None;
+        }
         self.account_sessions.entry(key).or_default().insert(conn);
         if let Some(nick) = released {
             self.release_unauthenticated_identity(&nick);
@@ -7116,7 +7346,7 @@ mod session_store_tests {
         // Deleting an account forgets its confirmed markers, keeps a write in
         // flight counted, and leaves every other account alone.
         state.reserve_read_marker(key(&state, "alice", "#x"));
-        state.forget_deleted_account("ALICE");
+        state.forget_deleted_account("ALICE", &[]);
         check(&state, 1, 1);
         assert_eq!(state.read_marker(&key(&state, "alice", "#x")), None);
         assert_eq!(state.read_marker(&key(&state, "alice", "#y")), None);

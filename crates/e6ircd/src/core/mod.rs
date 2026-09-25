@@ -257,11 +257,51 @@ impl CoreIngress {
     /// history lines and conversations, channel access entries: the database
     /// purged or cascaded them away, and nothing would otherwise evict them
     /// before a restart.
-    pub(crate) async fn broadcast_account_deleted(&self, account: &str) -> Result<(), ()> {
+    pub(crate) async fn broadcast_account_deleted(
+        &self,
+        account: &str,
+        successions: &[crate::db::ChannelSuccession],
+    ) -> Result<(), ()> {
         self.broadcast(|| Input::AccountDeleted {
             account: account.to_owned(),
+            successions: successions.to_vec(),
         })
         .await
+    }
+
+    /// Put one administrative request to the core and wait for its answer,
+    /// for at most five seconds: a control-plane caller must not hang on a
+    /// wedged core.
+    pub(crate) async fn admin_reply(&self, req: AdminRequest) -> Result<AdminReply, String> {
+        const CORE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.push(Input::Admin { req, reply: tx }).await.is_err() {
+            return Err("core worker unavailable".into());
+        }
+        match tokio::time::timeout(CORE_REPLY_TIMEOUT, rx).await {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(_closed)) => Err("core worker dropped the request".into()),
+            Err(_elapsed) => Err("core worker did not answer within 5 seconds".into()),
+        }
+    }
+
+    /// [`Self::admin_reply`] for a mutation, whose answer is a confirmation
+    /// or a refusal.
+    pub(crate) async fn admin_action(&self, req: AdminRequest) -> Result<String, String> {
+        match self.admin_reply(req).await? {
+            AdminReply::Ok(message) => Ok(message),
+            AdminReply::Err(message)
+            | AdminReply::ChannelErr { message, .. }
+            | AdminReply::BanErr { message, .. } => Err(message),
+            AdminReply::Connections(_) => {
+                Err("unexpected live-connection reply for a mutation".into())
+            }
+            AdminReply::ConnectionMissing => Err("no such live connection".into()),
+            AdminReply::AuditUnavailable => Err(
+                "the action could not be recorded in the audit trail, so it was not taken".into(),
+            ),
+        }
     }
 
     /// Offer every shard its copy. One closed shard does not excuse the rest:
@@ -757,9 +797,12 @@ pub enum Input {
     },
     /// An account was permanently deleted, broadcast to every shard so it
     /// drops its mirror of the account's rows: read markers, hot history,
-    /// channel access (see [`state::ServerState::forget_deleted_account`]).
+    /// channel access, grouped nicks — and moves the founder of each channel
+    /// that passed to its successor (see
+    /// [`state::ServerState::forget_deleted_account`]).
     AccountDeleted {
         account: String,
+        successions: Vec<crate::db::ChannelSuccession>,
     },
     /// An answer from the DB worker to an earlier [`DbRequest`].
     DbReply {
@@ -1321,6 +1364,8 @@ pub enum ChannelServicePersistence {
         account: String,
         flags: Option<String>,
         applied: bool,
+        /// Which command asked, so the verdict speaks its language.
+        frontend: AccessFrontend,
         label: Option<String>,
     },
     AccessUnavailable {
@@ -1373,6 +1418,24 @@ pub enum ChannelServicePersistence {
     MlockInvalid {
         label: Option<String>,
     },
+    /// The verdict of a ChanServ SET SUCCESSOR; `outcome` is `None` when the
+    /// store failed.
+    SuccessorSet {
+        display: String,
+        successor: Option<String>,
+        outcome: Option<crate::db::SuccessorChange>,
+        label: Option<String>,
+    },
+}
+
+/// Which ChanServ command changed a channel access entry: FLAGS, or the
+/// ACCESS front end over the same flags (Atheme's role names, `role` being the
+/// role granted or removed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessFrontend {
+    Flags,
+    AccessAdd { role: &'static str },
+    AccessDel { role: &'static str },
 }
 
 /// Work the core asks the DB worker to do. The worker returns a typed core
@@ -1561,9 +1624,62 @@ pub enum DbRequest {
         display: String,
         account: String,
         flags: Option<String>,
+        frontend: AccessFrontend,
         label: Option<String>,
         /// The founder's account, recorded as the change's actor.
         actor: String,
+    },
+    /// Name (`Some`, casefolded) or clear (`None`) a registered channel's
+    /// successor (ChanServ SET SUCCESSOR).
+    SetChannelSuccessor {
+        owner: ChannelOwner,
+        session: SessionOwner,
+        /// Channel name as typed, for the verdict.
+        channel: String,
+        successor: Option<String>,
+        label: Option<String>,
+        /// The founder's account, recorded as the change's actor.
+        actor: String,
+    },
+    /// Group `nick` to `account` (NickServ GROUP). Answered with
+    /// [`DbReply::NickGroup`].
+    GroupNick {
+        conn: ConnId,
+        account: String,
+        nick: String,
+        label: Option<String>,
+    },
+    /// Remove a grouped nick from `account` (NickServ UNGROUP). Answered with
+    /// [`DbReply::NickUngroup`].
+    UngroupNick {
+        conn: ConnId,
+        account: String,
+        nick: String,
+        label: Option<String>,
+    },
+    /// Turn `account`'s nick protection on or off (NickServ SET ENFORCE).
+    /// Answered with [`DbReply::NickEnforce`].
+    SetNickEnforce {
+        conn: ConnId,
+        account: String,
+        enforce: bool,
+        label: Option<String>,
+    },
+    /// Look up the account a nick or account name belongs to (NickServ INFO).
+    /// Answered with [`DbReply::AccountInfo`].
+    AccountInfo {
+        conn: ConnId,
+        target: String,
+        label: Option<String>,
+    },
+    /// Permanently delete `account` once its primary password verifies
+    /// (NickServ DROP), through the same succession-checked deletion the
+    /// console uses. Answered with [`DbReply::AccountDrop`].
+    DropAccount {
+        conn: ConnId,
+        account: String,
+        password: String,
+        label: Option<String>,
     },
     /// Persist a founder-owned HTTP control-plane mutation. The numeric request
     /// id maps the verdict back to a core-owned oneshot sender without putting
@@ -1961,6 +2077,57 @@ pub enum DbReply {
     Unavailable {
         origin: CredentialOrigin,
     },
+    /// The verdict of a NickServ GROUP. `None` means the store failed.
+    NickGroup {
+        account: String,
+        nick: String,
+        outcome: Option<crate::db::NickGroupOutcome>,
+        label: Option<String>,
+    },
+    /// The verdict of a NickServ UNGROUP: whether the account held the nick,
+    /// or `None` when the store failed.
+    NickUngroup {
+        account: String,
+        nick: String,
+        removed: Option<bool>,
+        label: Option<String>,
+    },
+    /// The verdict of a NickServ SET ENFORCE. `None` means the store failed.
+    NickEnforce {
+        account: String,
+        enforce: bool,
+        outcome: Option<crate::db::NickEnforceChange>,
+        label: Option<String>,
+    },
+    /// The answer to a NickServ INFO: the account, `Ok(None)` when no account
+    /// holds the name, `Err` when the store failed.
+    AccountInfo {
+        target: String,
+        info: Result<Option<crate::db::NickServAccountInfo>, ()>,
+        label: Option<String>,
+    },
+    /// The verdict of a NickServ DROP.
+    AccountDrop {
+        account: String,
+        outcome: AccountDropOutcome,
+        label: Option<String>,
+    },
+}
+
+/// What became of a NickServ DROP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountDropOutcome {
+    /// The account and everything it owned are gone; its name is retired.
+    Dropped,
+    /// The password did not verify.
+    Rejected,
+    /// The account name has spent its password attempts for now.
+    Throttled(crate::db::LoginRetryAfter),
+    /// The deletion was refused, for the reason given (a founded channel with
+    /// no successor, or the last administrator).
+    Refused(String),
+    /// A store or a live component failed; nothing was deleted.
+    Unavailable,
 }
 
 /// One wire line out to a connection I/O task, CRLF included. Socket
@@ -2435,6 +2602,13 @@ impl Core {
         self.state.preload_suspended_accounts(accounts);
     }
 
+    /// Seed grouped nicks and nick protection before the worker loop starts
+    /// (see [`ServerState::preload_nick_registrations`]).
+    pub fn preload_nick_registrations(&mut self, registrations: crate::db::NickRegistrations) {
+        self.state
+            .preload_nick_registrations(registrations.grouped, registrations.enforced);
+    }
+
     /// Process one event and everything it causes on this shard. All state
     /// transitions happen here, on one thread, in queue order.
     ///
@@ -2754,9 +2928,15 @@ impl Core {
                 handler::channel_tagmsg_result(&mut self.state, session.conn(), result, label);
             }
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
-            Input::Tick { now } => handler::reap_idle(&mut self.state, now),
+            Input::Tick { now } => {
+                handler::reap_idle(&mut self.state, now);
+                handler::services::enforce_nick_protection(&mut self.state, now);
+            }
             Input::ReadMarkersExpired { markers } => self.state.expire_read_markers(&markers),
-            Input::AccountDeleted { account } => self.state.forget_deleted_account(&account),
+            Input::AccountDeleted {
+                account,
+                successions,
+            } => self.state.forget_deleted_account(&account, &successions),
             Input::DbReply { conn, reply } => handler::db_reply(&mut self.state, conn, reply),
             Input::HistoryPage {
                 conn,
@@ -3513,6 +3693,7 @@ mod ingress_tests {
                 account: "alice".into(),
                 flags: Some("o".into()),
                 applied: true,
+                frontend: super::AccessFrontend::Flags,
                 label: None,
             },
         });
@@ -4563,6 +4744,90 @@ mod ingress_tests {
     /// and leaves. A stranger takes the nick `alice` and asks for the
     /// conversation with bob. Returns what CHATHISTORY shows the stranger and
     /// the ring conversations TARGETS hands the database on their behalf.
+    /// Identify `conn` to `account` through NickServ, answering the verify.
+    fn identify_on(shards: &mut Shards, conn: u64, account: &str) {
+        shards.line(conn, &format!("PRIVMSG NickServ :IDENTIFY {account} pw"));
+        let shard = shards.shard_of(conn);
+        shards.database_request(shard, |request| {
+            matches!(request, super::DbRequest::VerifyPassword { .. }).then_some(())
+        });
+        shards.cores[shard].handle(Input::DbReply {
+            conn: ConnId(conn),
+            reply: super::DbReply::PasswordVerified {
+                account: account.into(),
+                origin: super::CredentialOrigin::NickServIdentify,
+            },
+        });
+        shards.settle();
+        shards.drain(conn);
+    }
+
+    /// REGAIN reaches a holder on another shard: its shard renames it to a
+    /// Guest nick, then hands the nick back to the regaining session's shard.
+    /// Nick protection, turned on from one shard, renames an unidentified
+    /// holder on the other when its own shard's tick finds the delay run out.
+    #[test]
+    fn regain_and_nick_protection_act_across_shards() {
+        let mut shards = Shards::with_database();
+        shards.client(1, "alice", "");
+        shards.client(2, "owner", "");
+        assert_ne!(shards.shard_of(1), shards.shard_of(2));
+        identify_on(&mut shards, 2, "alice");
+
+        shards.line(2, "PRIVMSG NickServ :REGAIN alice");
+        let holder = shards.drain(1);
+        assert_eq!(lines_with(&holder, " has regained your nickname.").len(), 1);
+        assert_eq!(
+            lines_with(&holder, ":alice!alice@host.test NICK Guest1").len(),
+            1
+        );
+        let owner = shards.drain(2);
+        assert_eq!(
+            lines_with(&owner, ":owner!owner@host.test NICK alice").len(),
+            1
+        );
+        assert_eq!(
+            lines_with(&owner, "\x02alice\x02 has been regained.").len(),
+            1
+        );
+
+        shards.line(2, "PRIVMSG NickServ :SET ENFORCE ON");
+        let shard = shards.shard_of(2);
+        shards.database_request(shard, |request| {
+            matches!(request, super::DbRequest::SetNickEnforce { .. }).then_some(())
+        });
+        shards.cores[shard].handle(Input::DbReply {
+            conn: ConnId(2),
+            reply: super::DbReply::NickEnforce {
+                account: "alice".into(),
+                enforce: true,
+                outcome: Some(crate::db::NickEnforceChange::Changed),
+                label: None,
+            },
+        });
+        shards.settle();
+        shards.line(2, "NICK owner");
+        shards.drain(2);
+
+        shards.line(1, "NICK alice");
+        assert_eq!(
+            lines_with(&shards.drain(1), "This nickname is registered.").len(),
+            1
+        );
+        Shards::advance_clock(30);
+        let now = thread_mono_clock();
+        for core in &mut shards.cores {
+            core.handle(Input::Tick { now });
+        }
+        shards.settle();
+        let renamed = shards.drain(1);
+        assert_eq!(
+            lines_with(&renamed, ":alice!alice@host.test NICK Guest1").len(),
+            1,
+            "{renamed:#?}"
+        );
+    }
+
     fn conversation_after_login_and_nick_reuse(
         mut shards: Shards,
     ) -> (Vec<String>, Vec<(String, e6irc_proto::time::Millis)>) {
@@ -5201,8 +5466,9 @@ mod ingress_tests {
                 },
             },
             target.into(),
-            ChannelCommandOperation::ChanServOp {
+            ChannelCommandOperation::ChanServStatus {
                 target_nick: "target".into(),
+                change: crate::core::state::StatusChange::Op,
             },
             None,
         );
@@ -5216,7 +5482,7 @@ mod ingress_tests {
             Input::ChannelCommand { command }
                 if matches!(
                     command.operation(),
-                    ChannelCommandOperation::ChanServOp { .. }
+                    ChannelCommandOperation::ChanServStatus { .. }
                 )
         ));
     }

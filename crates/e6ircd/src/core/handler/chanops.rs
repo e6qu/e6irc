@@ -599,6 +599,20 @@ pub(super) fn cmd_stats(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // character is multi-byte (e.g. `STATS é`), and since one worker serves
     // every connection that panic is an unauthenticated remote DoS.
     let letter = letter.chars().next().map(String::from).unwrap_or_default();
+    // The server-ban listings are operator-only (Solanum's stats access table:
+    // a refused letter is ERR_NOPRIVILEGES, and the report still terminates).
+    // They show the whole reason, the operators' note after `|` included.
+    let ban_kind = match letter.as_str() {
+        "k" | "K" => Some(crate::core::state::BanKind::Kline),
+        "d" | "D" => Some(crate::core::state::BanKind::Dline),
+        "x" | "X" => Some(crate::core::state::BanKind::Xline),
+        _ => None,
+    };
+    if let Some(kind) = ban_kind
+        && super::oper::require_oper(state, conn)
+    {
+        stats_server_bans(state, conn, kind);
+    }
     if letter == "u" {
         // The clock is milliseconds; STATS u reports whole seconds.
         let uptime = (state.config.clock)()
@@ -622,6 +636,33 @@ pub(super) fn cmd_stats(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         &[&letter],
         Some("End of /STATS report"),
     );
+}
+
+/// One STATS line per server ban of `kind`, in Solanum's shapes: a K-line is
+/// `216 K <host> * <user> :<reason>`, a D-line `225 D <address> :<reason>`, an
+/// X-line `247 X 0 <mask> :<reason>` (every ban here is permanent, so the
+/// letter is the uppercase one and the X-line hold is 0).
+fn stats_server_bans(state: &mut ServerState, conn: ConnId, kind: crate::core::state::BanKind) {
+    let bans: Vec<(String, String)> = state
+        .server_bans
+        .iter()
+        .filter(|ban| ban.kind == kind)
+        .map(|ban| (ban.mask.as_str().to_string(), ban.reason.clone()))
+        .collect();
+    for (mask, reason) in bans {
+        match kind {
+            crate::core::state::BanKind::Kline => {
+                let (user, host) = mask.split_once('@').unwrap_or(("*", mask.as_str()));
+                state.numeric(conn, RPL_STATSKLINE, &["K", host, "*", user], Some(&reason));
+            }
+            crate::core::state::BanKind::Dline => {
+                state.numeric(conn, RPL_STATSDLINE, &["D", &mask], Some(&reason));
+            }
+            crate::core::state::BanKind::Xline => {
+                state.numeric(conn, RPL_STATSXLINE, &["X", "0", &mask], Some(&reason));
+            }
+        }
+    }
 }
 
 /// How often one user may KNOCK, and how often one channel may be knocked on

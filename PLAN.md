@@ -718,6 +718,14 @@ A sweep of startup, shutdown and operations found, and this change fixes:
 - **The deployment guide pointed at a `/metrics` route that does not exist.**
   It is `/api/v1/admin/metrics`, which needs administrator authentication.
 
+The integrated services now carry the whole NickServ/ChanServ surface DESIGN
+§7.6 names: NickServ GROUP/UNGROUP, REGAIN, INFO, SET ENFORCE (nick protection
+with a cross-shard Guest rename) and DROP (the console's deletion procedure,
+now shared); ChanServ ACCESS, DEOP/VOICE/DEVOICE and SET SUCCESSOR, with
+account deletion passing founded channels to their successors in storage and
+in every shard's mirror. Operators read the server bans, private reasons
+included, with STATS k/d/x.
+
 ## Remaining qualification
 
 - Run the shipped credential-gated campaigns for Discord, Slack, and each

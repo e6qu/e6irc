@@ -524,41 +524,14 @@ pub(super) fn parse_optional_contact_email(
 /// The core owns live-state ordering and the database verdict; HTTP handlers do
 /// not write durable/live state along a second path.
 async fn core_action(state: &AppState, req: crate::core::AdminRequest) -> Result<String, String> {
-    match core_reply(state, req).await? {
-        crate::core::AdminReply::Ok(message) => Ok(message),
-        crate::core::AdminReply::Err(message)
-        | crate::core::AdminReply::ChannelErr { message, .. }
-        | crate::core::AdminReply::BanErr { message, .. } => Err(message),
-        crate::core::AdminReply::Connections(_) => {
-            Err("unexpected live-connection reply for a mutation".into())
-        }
-        crate::core::AdminReply::ConnectionMissing => Err("no such live connection".into()),
-        crate::core::AdminReply::AuditUnavailable => {
-            Err("the action could not be recorded in the audit trail, so it was not taken".into())
-        }
-    }
+    state.core_tx.admin_action(req).await
 }
 
 async fn core_reply(
     state: &AppState,
     req: crate::core::AdminRequest,
 ) -> Result<crate::core::AdminReply, String> {
-    const CORE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
-
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    if state
-        .core_tx
-        .push(crate::core::Input::Admin { req, reply: tx })
-        .await
-        .is_err()
-    {
-        return Err("core worker unavailable".into());
-    }
-    match tokio::time::timeout(CORE_REPLY_TIMEOUT, rx).await {
-        Ok(Ok(reply)) => Ok(reply),
-        Ok(Err(_closed)) => Err("core worker dropped the request".into()),
-        Err(_elapsed) => Err("core worker did not answer within 5 seconds".into()),
-    }
+    state.core_tx.admin_reply(req).await
 }
 
 fn account_mutation_pool(
@@ -606,9 +579,11 @@ async fn mutate_account_lifecycle(
                 AccountLifecycle::Suspension { suspended } => {
                     account_suspension_in_lane(&state, &lane, &actor, account_id, suspended).await
                 }
-                AccountLifecycle::Deletion { allow_self } => {
-                    delete_account_in_lane(&state, &lane, &actor, account_id, allow_self).await
-                }
+                AccountLifecycle::Deletion { allow_self } => state
+                    .account_deletion()?
+                    .delete_in_lane(&lane, &actor, account_id, allow_self)
+                    .await
+                    .map_err(account_deletion_status),
             }
         })
         .await
@@ -868,190 +843,44 @@ pub(super) async fn delete_account_lifecycle(
     mutate_account_lifecycle(state, actor, account_id, change).await
 }
 
-async fn delete_account_in_lane(
-    state: &AppState,
-    registry: &crate::bouncer::MutationLane,
-    actor: &str,
-    account_id: i64,
-    allow_self: bool,
-) -> Result<String, (StatusCode, String)> {
-    let pool = account_mutation_pool(state, account_id)?;
-    let configured_administrators: Vec<String> =
-        state.configured_admin_accounts.iter().cloned().collect();
-    let target = crate::db::account_deletion_target(pool, account_id, &configured_administrators)
-        .await
-        .map_err(account_deletion_error)?
-        .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
-    let actor_folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(actor);
-    if !allow_self && target.folded == actor_folded {
-        return Err((
+impl AppState {
+    /// The deletion procedure over this server's database, core and network
+    /// registry ([`crate::account_deletion::AccountDeletion`]).
+    fn account_deletion(
+        &self,
+    ) -> Result<crate::account_deletion::AccountDeletion, (StatusCode, String)> {
+        let pool = self.pool.clone().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No database configured".into(),
+        ))?;
+        let registry = self.bnc_registry.clone().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Network registry unavailable".into(),
+        ))?;
+        Ok(crate::account_deletion::AccountDeletion {
+            pool,
+            core_tx: self.core_tx.clone(),
+            registry,
+            secret_key: self.secret_key.clone(),
+            internal_upstreams: self.internal_upstreams,
+            configured_administrators: self.configured_admin_accounts.iter().cloned().collect(),
+        })
+    }
+}
+
+fn account_deletion_status(
+    error: crate::account_deletion::AccountDeletionError,
+) -> (StatusCode, String) {
+    use crate::account_deletion::AccountDeletionError;
+    match error {
+        AccountDeletionError::NotFound => (StatusCode::NOT_FOUND, "No such account".into()),
+        AccountDeletionError::OwnAccount => (
             StatusCode::CONFLICT,
             "Use the self-service account deletion control for your own account.".into(),
-        ));
+        ),
+        AccountDeletionError::Refused(message) => (StatusCode::CONFLICT, message),
+        AccountDeletionError::Unavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
     }
-
-    core_action(
-        state,
-        crate::core::AdminRequest::SetAccountSuspended {
-            account: target.folded.clone(),
-            suspended: true,
-            reason: "Account permanently deleted".into(),
-            actor: actor.to_string(),
-        },
-    )
-    .await
-    .map_err(|error| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("Could not establish the live authentication gate: {error}"),
-        )
-    })?;
-
-    // The owner's drivers stop before any row goes — each persistence task
-    // finishing the line it is writing — so no late backlog line can land
-    // after the deletion (and one that tried would fail the foreign key its
-    // network's row no longer satisfies). Drivers for the running networks are
-    // built first, so a deletion the database refuses restarts exactly them.
-    let restart = owner_network_restart(state, pool, registry, &target).await;
-    let stopped_networks = registry
-        .remove_owner(&target.folded, crate::bouncer::UnwrittenLines::Discard)
-        .await;
-    let deleted = match crate::db::delete_account_permanently(
-        pool,
-        account_id,
-        actor,
-        &configured_administrators,
-    )
-    .await
-    {
-        Ok(Some(deleted)) => deleted,
-        // The account is already gone: nothing of it may run again.
-        Ok(None) => {
-            undo_account_deletion_gate(state, &target, actor).await?;
-            return Err((StatusCode::NOT_FOUND, "No such account".into()));
-        }
-        Err(error) => {
-            for (name, driver) in restart {
-                registry
-                    .ensure_running(Some(&target.folded), &name, driver)
-                    .await;
-            }
-            undo_account_deletion_gate(state, &target, actor).await?;
-            return Err(account_deletion_error(error));
-        }
-    };
-    // The account's read markers and channel access cascaded away with its
-    // row, and its messages were purged; every core shard's mirror drops them
-    // too, or they would linger until a restart. The live gate stays: the
-    // name is retired.
-    if state
-        .core_tx
-        .broadcast_account_deleted(&target.folded)
-        .await
-        .is_err()
-    {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "Permanently deleted {}, but a live core shard is unavailable and still mirrors its read markers, history and channel access.",
-                deleted.name
-            ),
-        ));
-    }
-    Ok(format!(
-        "Permanently deleted {} and stopped {stopped_networks} owned network(s). The account name is retired.",
-        deleted.name
-    ))
-}
-
-/// Drivers for every network of `target` that is running now, built from the
-/// stored rows so they can be restarted if its deletion is refused. A network
-/// whose row no longer builds is named on stderr: a refused deletion leaves it
-/// stopped.
-async fn owner_network_restart(
-    state: &AppState,
-    pool: &sqlx::PgPool,
-    registry: &crate::bouncer::Registry,
-    target: &crate::db::AccountDeletionTarget,
-) -> Vec<(String, Box<dyn crate::bouncer::NetworkDriver>)> {
-    let rows = match crate::db::list_bnc_networks(pool, &target.name).await {
-        Ok(rows) => rows,
-        Err(error) => {
-            eprintln!(
-                "account deletion: networks of {} could not be listed for a restart ({error}); \
-                 a refused deletion leaves them stopped",
-                target.name
-            );
-            return Vec::new();
-        }
-    };
-    let mut restart = Vec::new();
-    for row in rows {
-        if registry.get_owned(&target.folded, &row.name).is_none() {
-            continue;
-        }
-        match crate::bouncer::driver_from_row(
-            &row,
-            state.secret_key.as_deref(),
-            &target.name,
-            state.internal_upstreams,
-            crate::bouncer::FirstDial::Immediate,
-        ) {
-            Ok(driver) => restart.push((row.name, driver)),
-            Err(error) => eprintln!(
-                "account deletion: network {}/{} cannot be rebuilt ({error}); a refused \
-                 deletion leaves it stopped",
-                target.name, row.name
-            ),
-        }
-    }
-    restart
-}
-
-fn account_deletion_error(error: crate::db::DbError) -> (StatusCode, String) {
-    match error {
-        crate::db::DbError::AccountOwnsChannels(_) | crate::db::DbError::LastAdministrator => {
-            (StatusCode::CONFLICT, error.to_string())
-        }
-        _ => {
-            eprintln!("account deletion failed: {error}");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable".into(),
-            )
-        }
-    }
-}
-
-/// Lift the live gate a deletion that did not commit installed, unless the
-/// account was already suspended: that suspension stands.
-async fn undo_account_deletion_gate(
-    state: &AppState,
-    target: &crate::db::AccountDeletionTarget,
-    actor: &str,
-) -> Result<(), (StatusCode, String)> {
-    if target.suspended {
-        return Ok(());
-    }
-    core_action(
-        state,
-        crate::core::AdminRequest::SetAccountSuspended {
-            account: target.folded.clone(),
-            suspended: false,
-            reason: "Account deletion did not commit".into(),
-            actor: actor.to_string(),
-        },
-    )
-    .await
-    .map(|_| ())
-    .map_err(|error| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "Deletion did not commit and the live authentication gate could not be removed: {error}"
-            ),
-        )
-    })
 }
 
 /// The refusals axum would answer in its own shape are each given ours in one

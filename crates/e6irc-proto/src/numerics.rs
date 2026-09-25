@@ -33,6 +33,10 @@ numerics! {
     RPL_LUSERME = 255,
     RPL_STATSUPTIME = 242,
     RPL_ENDOFSTATS = 219,
+    RPL_STATSKLINE = 216,
+    // Solanum: a D-line in a STATS d/D report.
+    RPL_STATSDLINE = 225,
+    RPL_STATSXLINE = 247,
     RPL_ADMINME = 256,
     RPL_ADMINLOC1 = 257,
     RPL_ADMINLOC2 = 258,

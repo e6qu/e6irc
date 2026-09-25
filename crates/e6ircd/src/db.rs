@@ -90,7 +90,8 @@ pub enum DbError {
     CannotDemoteSelf,
     /// At least one active effective durable-or-configured administrator must remain.
     LastAdministrator,
-    /// An account must transfer every founded channel before deletion.
+    /// An account must transfer every founded channel that has no successor
+    /// before deletion.
     AccountOwnsChannels(usize),
     /// An administrator already holds the maximum number of live invitations.
     TooManyInvitations,
@@ -168,7 +169,8 @@ impl std::fmt::Display for DbError {
             Self::AccountOwnsChannels(count) => {
                 write!(
                     f,
-                    "account still founds {count} channel(s); transfer or unregister them first"
+                    "account still founds {count} channel(s) with no successor; transfer them, \
+                     name a successor, or unregister them first"
                 )
             }
             Self::TooManyInvitations => {
@@ -1239,14 +1241,17 @@ async fn lock_account_name(
         .map_err(query_error)
 }
 
-async fn account_name_is_retired(
+/// Whether a new account may not take `folded`: the name is retired, or it is
+/// a nick grouped to another account (migration 0075's storage triggers refuse
+/// both; this answers first, so the refusal is a duplicate, not a fault).
+/// The caller holds the name's lock.
+async fn account_name_is_unavailable(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     folded: &str,
 ) -> Result<bool, DbError> {
     sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM retired_account_names WHERE name_folded = $1
-         )",
+        "SELECT EXISTS (SELECT 1 FROM retired_account_names WHERE name_folded = $1)
+             OR EXISTS (SELECT 1 FROM account_nicks WHERE nick_folded = $1)",
     )
     .bind(folded)
     .fetch_one(&mut **transaction)
@@ -1289,7 +1294,7 @@ pub async fn create_account_with_contact(
     let hash = hash_password(password.to_string()).await?;
     let mut tx = pool.begin().await.map_err(query_error)?;
     lock_account_name(&mut tx, &folded).await?;
-    if account_name_is_retired(&mut tx, &folded).await? {
+    if account_name_is_unavailable(&mut tx, &folded).await? {
         return Err(DbError::DuplicateAccount(name.to_string()));
     }
     let id: i64 = sqlx::query_scalar(
@@ -1335,7 +1340,7 @@ pub async fn create_account_by_administrator(
     let hash = hash_password(password.to_string()).await?;
     let mut transaction = pool.begin().await.map_err(query_error)?;
     lock_account_name(&mut transaction, &folded).await?;
-    if account_name_is_retired(&mut transaction, &folded).await? {
+    if account_name_is_unavailable(&mut transaction, &folded).await? {
         return Err(DbError::DuplicateAccount(name.to_string()));
     }
     let account_id: i64 = insert_account(
@@ -1440,7 +1445,7 @@ pub async fn issue_account_invitation(
     .execute(&mut *transaction)
     .await
     .map_err(query_error)?;
-    if account_name_is_retired(&mut transaction, &folded).await? {
+    if account_name_is_unavailable(&mut transaction, &folded).await? {
         return Err(DbError::DuplicateAccount(name.to_string()));
     }
     let unavailable: bool = sqlx::query_scalar(
@@ -1658,7 +1663,7 @@ pub async fn accept_account_invitation(
         }
     }
     lock_account_name(&mut transaction, &folded).await?;
-    if account_name_is_retired(&mut transaction, &folded).await? {
+    if account_name_is_unavailable(&mut transaction, &folded).await? {
         return Err(DbError::InvitationUnavailable);
     }
     let account_id: i64 = insert_account(
@@ -1923,6 +1928,23 @@ struct AccountDeletionTargetRow {
     founded_channels: i64,
 }
 
+/// One registered channel an account deletion passed to its successor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelSuccession {
+    /// Folded channel name.
+    pub channel: String,
+    /// The successor, now founder: folded account name.
+    pub founder: String,
+}
+
+/// An account permanently deleted, with the channels it passed on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedAccount {
+    pub name: String,
+    pub folded: String,
+    pub successions: Vec<ChannelSuccession>,
+}
+
 /// Resolve a deletion target before the core authentication gate.
 pub async fn account_deletion_target(
     pool: &PgPool,
@@ -1932,7 +1954,8 @@ pub async fn account_deletion_target(
     let row: Option<AccountDeletionTargetRow> = sqlx::query_as(
         "SELECT a.name, a.name_folded AS folded, a.flags,
                 (SELECT count(*) FROM channels c
-                 WHERE c.founder_account_id = a.id) AS founded_channels
+                 WHERE c.founder_account_id = a.id
+                   AND c.successor_account_id IS NULL) AS founded_channels
          FROM accounts a WHERE a.id = $1",
     )
     .bind(account_id)
@@ -1995,7 +2018,7 @@ pub async fn delete_account_permanently(
     account_id: i64,
     actor: &str,
     configured_administrators: &[String],
-) -> Result<Option<AccountDeletionTarget>, DbError> {
+) -> Result<Option<DeletedAccount>, DbError> {
     let actor_folded = CaseMapping::Rfc1459.casefold(actor);
     let mut transaction = pool.begin().await.map_err(query_error)?;
     let Some(LockedAccountState {
@@ -2012,6 +2035,20 @@ pub async fn delete_account_permanently(
         return Ok(None);
     };
     lock_account_name(&mut transaction, &folded).await?;
+    // Every founded channel with a successor passes to it (ChanServ SET
+    // SUCCESSOR, Atheme's succession); only one without a successor holds the
+    // deletion up. The successor stops being one as it becomes founder
+    // (migration 0075's trigger).
+    let successions: Vec<(String, String)> = sqlx::query_as(
+        "UPDATE channels c SET founder_account_id = c.successor_account_id
+         FROM accounts successor
+         WHERE c.founder_account_id = $1 AND successor.id = c.successor_account_id
+         RETURNING c.name_folded, successor.name_folded",
+    )
+    .bind(account_id)
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(query_error)?;
     let founded_channels: i64 =
         sqlx::query_scalar("SELECT count(*) FROM channels WHERE founder_account_id = $1")
             .bind(account_id)
@@ -2078,6 +2115,16 @@ pub async fn delete_account_permanently(
     .execute(&mut *transaction)
     .await
     .map_err(query_error)?;
+    for (channel, successor) in &successions {
+        insert_audit_log_with(
+            &mut *transaction,
+            &actor_folded,
+            "CHANNEL_SUCCESSION",
+            channel,
+            &format!("founder={folded} successor={successor}"),
+        )
+        .await?;
+    }
     insert_audit_log_with(
         &mut *transaction,
         &actor_folded,
@@ -2092,11 +2139,13 @@ pub async fn delete_account_permanently(
         .await
         .map_err(query_error)?;
     transaction.commit().await.map_err(query_error)?;
-    Ok(Some(AccountDeletionTarget {
-        id: account_id,
+    Ok(Some(DeletedAccount {
         name,
         folded,
-        suspended: flags & ACCOUNT_FLAG_SUSPENDED != 0,
+        successions: successions
+            .into_iter()
+            .map(|(channel, founder)| ChannelSuccession { channel, founder })
+            .collect(),
     }))
 }
 
@@ -2755,7 +2804,7 @@ pub async fn run_worker(
     mut rx: Receiver<DbRequest>,
     core_tx: crate::core::CoreIngress,
 ) {
-    run_worker_inner(pool, &mut rx, core_tx, None).await;
+    run_worker_inner(pool, &mut rx, core_tx, None, None).await;
 }
 
 /// Spawn one offloaded DB request: run `work` against the pool, time it into
@@ -2789,13 +2838,24 @@ fn spawn_db_offload<F>(
     });
 }
 
+/// The server's database worker. `account_deletion` carries out NickServ DROP;
+/// it exists whenever the database does (the network registry is built with
+/// it).
 pub(crate) async fn run_worker_observed(
     pool: PgPool,
     mut rx: Receiver<DbRequest>,
     core_tx: crate::core::CoreIngress,
     telemetry: Arc<Telemetry>,
+    account_deletion: crate::account_deletion::AccountDeletion,
 ) {
-    run_worker_inner(pool, &mut rx, core_tx, Some(telemetry)).await;
+    run_worker_inner(
+        pool,
+        &mut rx,
+        core_tx,
+        Some(telemetry),
+        Some(account_deletion),
+    )
+    .await;
 }
 
 async fn run_worker_inner(
@@ -2803,6 +2863,7 @@ async fn run_worker_inner(
     rx: &mut Receiver<DbRequest>,
     core_tx: crate::core::CoreIngress,
     telemetry: Option<Arc<Telemetry>>,
+    account_deletion: Option<crate::account_deletion::AccountDeletion>,
 ) {
     let mut log_batch: Vec<DbRequest> = Vec::new();
     while let Some(envelope) = rx.pop().await {
@@ -2884,6 +2945,35 @@ async fn run_worker_inner(
                         .await;
                         let unavailable =
                             matches!(&reply, DbReply::AccountRegisterUnavailable { .. });
+                        (reply, unavailable)
+                    });
+                }
+                // A drop verifies a password (argon2) and then runs the whole
+                // deletion — gate, network stop, purge, core broadcast — whose
+                // core round trips must not stall this loop: offloaded like a
+                // verify.
+                DbRequest::DropAccount {
+                    conn,
+                    account,
+                    password,
+                    label,
+                } => {
+                    let deletion = account_deletion.clone();
+                    spawn_db_offload(&pool, &core_tx, &telemetry, conn, move |pool| async move {
+                        let outcome = crate::account_deletion::nickserv_drop(
+                            &pool,
+                            deletion.as_ref(),
+                            &account,
+                            &password,
+                        )
+                        .await;
+                        let unavailable =
+                            matches!(outcome, crate::core::AccountDropOutcome::Unavailable);
+                        let reply = DbReply::AccountDrop {
+                            account,
+                            outcome,
+                            label,
+                        };
                         (reply, unavailable)
                     });
                 }
@@ -3455,6 +3545,7 @@ async fn handle_request(
             display,
             account,
             flags,
+            frontend,
             label,
             actor,
         } => {
@@ -3469,6 +3560,7 @@ async fn handle_request(
                         account,
                         flags,
                         applied,
+                        frontend,
                         label,
                     },
                     Err(DbError::TooManyAccessEntries) => {
@@ -3490,6 +3582,109 @@ async fn handle_request(
                 };
             push_channel_service_persisted(core_tx, owner, session, result).await
         }
+        DbRequest::SetChannelSuccessor {
+            owner,
+            session,
+            channel,
+            successor,
+            label,
+            actor,
+        } => {
+            let outcome = set_channel_successor(pool, &channel, successor.as_deref(), &actor)
+                .await
+                .map_err(|e| {
+                    record_database_error(telemetry);
+                    eprintln!("db: channel successor persistence failed: {e}");
+                })
+                .ok();
+            let result = crate::core::ChannelServicePersistence::SuccessorSet {
+                display: channel,
+                successor,
+                outcome,
+                label,
+            };
+            push_channel_service_persisted(core_tx, owner, session, result).await
+        }
+        DbRequest::GroupNick {
+            conn,
+            account,
+            nick,
+            label,
+        } => {
+            let outcome = group_nick(pool, &account, &nick)
+                .await
+                .map_err(|e| {
+                    record_database_error(telemetry);
+                    eprintln!("db: nick grouping failed: {e}");
+                })
+                .ok();
+            let reply = DbReply::NickGroup {
+                account,
+                nick,
+                outcome,
+                label,
+            };
+            core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
+        }
+        DbRequest::UngroupNick {
+            conn,
+            account,
+            nick,
+            label,
+        } => {
+            let removed = ungroup_nick(pool, &account, &nick)
+                .await
+                .map_err(|e| {
+                    record_database_error(telemetry);
+                    eprintln!("db: nick ungrouping failed: {e}");
+                })
+                .ok();
+            let reply = DbReply::NickUngroup {
+                account,
+                nick,
+                removed,
+                label,
+            };
+            core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
+        }
+        DbRequest::SetNickEnforce {
+            conn,
+            account,
+            enforce,
+            label,
+        } => {
+            let outcome = set_nick_enforce(pool, &account, enforce)
+                .await
+                .map_err(|e| {
+                    record_database_error(telemetry);
+                    eprintln!("db: nick protection change failed: {e}");
+                })
+                .ok();
+            let reply = DbReply::NickEnforce {
+                account,
+                enforce,
+                outcome,
+                label,
+            };
+            core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
+        }
+        DbRequest::AccountInfo {
+            conn,
+            target,
+            label,
+        } => {
+            let info = nickserv_account_info(pool, &target).await.map_err(|e| {
+                record_database_error(telemetry);
+                eprintln!("db: account information lookup failed: {e}");
+            });
+            let reply = DbReply::AccountInfo {
+                target,
+                info,
+                label,
+            };
+            core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
+        }
+        DbRequest::DropAccount { .. } => unreachable!("offloaded by run_worker"),
         DbRequest::MutateOwnedChannel {
             owner,
             request_id,
@@ -4807,6 +5002,325 @@ pub async fn set_channel_founder(
     .await?;
     transaction.commit().await.map_err(query_error)?;
     Ok(true)
+}
+
+/// What naming a channel's successor did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuccessorChange {
+    /// The successor was set (or cleared) as asked.
+    Applied,
+    /// The channel is not registered.
+    ChannelMissing,
+    /// No account has the successor's name.
+    AccountMissing,
+    /// The named account founds the channel; a founder cannot also succeed it.
+    IsFounder,
+}
+
+/// Name `successor_folded` as the account a registered channel passes to when
+/// its founder's account is deleted (ChanServ SET SUCCESSOR), or clear it with
+/// `None`. Audited (`CHANNEL_SUCCESSOR`) with the founder `actor` in the same
+/// transaction. The channel row is locked first, so a concurrent founder
+/// transfer is either seen or waits.
+pub async fn set_channel_successor(
+    pool: &PgPool,
+    channel: &str,
+    successor_folded: Option<&str>,
+    actor: &str,
+) -> Result<SuccessorChange, DbError> {
+    let channel_folded = CaseMapping::Rfc1459.casefold(channel);
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    let channel_row: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT id, founder_account_id FROM channels WHERE name_folded = $1 FOR NO KEY UPDATE",
+    )
+    .bind(&channel_folded)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    let Some((channel_id, founder_id)) = channel_row else {
+        return Ok(SuccessorChange::ChannelMissing);
+    };
+    let successor_id = match successor_folded {
+        Some(successor) => {
+            let id: Option<i64> =
+                sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1")
+                    .bind(successor)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(query_error)?;
+            match id {
+                None => return Ok(SuccessorChange::AccountMissing),
+                Some(id) if id == founder_id => return Ok(SuccessorChange::IsFounder),
+                Some(id) => Some(id),
+            }
+        }
+        None => None,
+    };
+    sqlx::query("UPDATE channels SET successor_account_id = $2 WHERE id = $1")
+        .bind(channel_id)
+        .bind(successor_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(query_error)?;
+    audit_channel_service(
+        &mut transaction,
+        actor,
+        "CHANNEL_SUCCESSOR",
+        &channel_folded,
+        successor_folded.unwrap_or("-"),
+    )
+    .await?;
+    transaction.commit().await.map_err(query_error)?;
+    Ok(SuccessorChange::Applied)
+}
+
+/// Most nicks one account may hold, its own name included (Atheme's
+/// `maxnicks`, default 5): GROUP refuses a nick beyond it.
+pub const MAX_NICKS_PER_ACCOUNT: i64 = 5;
+
+/// What NickServ GROUP did with a nick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NickGroupOutcome {
+    Grouped,
+    /// The nick already belongs to this account (its name, or grouped).
+    AlreadyYours,
+    /// Another account holds the nick, as its name or grouped — or it is a
+    /// retired account name.
+    Taken,
+    /// The account already holds [`MAX_NICKS_PER_ACCOUNT`] nicks.
+    TooMany,
+    /// The account no longer exists.
+    AccountMissing,
+}
+
+/// Group `nick` to `account` (NickServ GROUP). The nick's name lock — the one
+/// account creation and deletion take — and the account row are held while the
+/// checks and the insert run, so a racing registration of the same name or a
+/// second GROUP for the account cannot slip past them. Audited (`NICK_GROUP`).
+pub async fn group_nick(
+    pool: &PgPool,
+    account: &str,
+    nick: &str,
+) -> Result<NickGroupOutcome, DbError> {
+    let account_folded = CaseMapping::Rfc1459.casefold(account);
+    let nick_folded = CaseMapping::Rfc1459.casefold(nick);
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    lock_account_name(&mut transaction, &nick_folded).await?;
+    let Some(account_id) = lock_account_id(&mut transaction, &account_folded).await? else {
+        return Ok(NickGroupOutcome::AccountMissing);
+    };
+    if nick_folded == account_folded {
+        return Ok(NickGroupOutcome::AlreadyYours);
+    }
+    let holder: Option<i64> =
+        sqlx::query_scalar("SELECT account_id FROM account_nicks WHERE nick_folded = $1")
+            .bind(&nick_folded)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(query_error)?;
+    match holder {
+        Some(holder) if holder == account_id => return Ok(NickGroupOutcome::AlreadyYours),
+        Some(_) => return Ok(NickGroupOutcome::Taken),
+        None => {}
+    }
+    let is_account_name: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM accounts WHERE name_folded = $1)
+             OR EXISTS (SELECT 1 FROM retired_account_names WHERE name_folded = $1)",
+    )
+    .bind(&nick_folded)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    if is_account_name {
+        return Ok(NickGroupOutcome::Taken);
+    }
+    let grouped: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM account_nicks WHERE account_id = $1")
+            .bind(account_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(query_error)?;
+    // The account's own name is one of its nicks.
+    if grouped + 1 >= MAX_NICKS_PER_ACCOUNT {
+        return Ok(NickGroupOutcome::TooMany);
+    }
+    sqlx::query("INSERT INTO account_nicks (nick_folded, nick, account_id) VALUES ($1, $2, $3)")
+        .bind(&nick_folded)
+        .bind(nick)
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(query_error)?;
+    insert_audit_log_with(
+        &mut *transaction,
+        &account_folded,
+        "NICK_GROUP",
+        &account_folded,
+        &nick_folded,
+    )
+    .await?;
+    transaction.commit().await.map_err(query_error)?;
+    Ok(NickGroupOutcome::Grouped)
+}
+
+/// Remove a grouped nick from `account` (NickServ UNGROUP). Returns whether
+/// the account held it. Audited (`NICK_UNGROUP`) when it did.
+pub async fn ungroup_nick(pool: &PgPool, account: &str, nick: &str) -> Result<bool, DbError> {
+    let account_folded = CaseMapping::Rfc1459.casefold(account);
+    let nick_folded = CaseMapping::Rfc1459.casefold(nick);
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    let removed = sqlx::query(
+        "DELETE FROM account_nicks n USING accounts a
+         WHERE n.account_id = a.id AND a.name_folded = $1 AND n.nick_folded = $2",
+    )
+    .bind(&account_folded)
+    .bind(&nick_folded)
+    .execute(&mut *transaction)
+    .await
+    .map_err(query_error)?
+    .rows_affected()
+        != 0;
+    if removed {
+        insert_audit_log_with(
+            &mut *transaction,
+            &account_folded,
+            "NICK_UNGROUP",
+            &account_folded,
+            &nick_folded,
+        )
+        .await?;
+    }
+    transaction.commit().await.map_err(query_error)?;
+    Ok(removed)
+}
+
+/// What NickServ SET ENFORCE did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NickEnforceChange {
+    Changed,
+    /// The flag already had the requested value.
+    Unchanged,
+    AccountMissing,
+}
+
+/// Turn nick protection on or off for `account` (NickServ SET ENFORCE).
+/// Audited (`NICK_ENFORCE`) when it changes.
+pub async fn set_nick_enforce(
+    pool: &PgPool,
+    account: &str,
+    enforce: bool,
+) -> Result<NickEnforceChange, DbError> {
+    let account_folded = CaseMapping::Rfc1459.casefold(account);
+    let mut transaction = pool.begin().await.map_err(query_error)?;
+    let current: Option<bool> = sqlx::query_scalar(
+        "SELECT nick_enforce FROM accounts WHERE name_folded = $1 FOR NO KEY UPDATE",
+    )
+    .bind(&account_folded)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(query_error)?;
+    match current {
+        None => return Ok(NickEnforceChange::AccountMissing),
+        Some(current) if current == enforce => return Ok(NickEnforceChange::Unchanged),
+        Some(_) => {}
+    }
+    sqlx::query("UPDATE accounts SET nick_enforce = $2 WHERE name_folded = $1")
+        .bind(&account_folded)
+        .bind(enforce)
+        .execute(&mut *transaction)
+        .await
+        .map_err(query_error)?;
+    insert_audit_log_with(
+        &mut *transaction,
+        &account_folded,
+        "NICK_ENFORCE",
+        &account_folded,
+        if enforce { "on" } else { "off" },
+    )
+    .await?;
+    transaction.commit().await.map_err(query_error)?;
+    Ok(NickEnforceChange::Changed)
+}
+
+/// Every nick registration the core mirrors: grouped nicks as
+/// `(nick, account)`, and the accounts with nick protection on — all folded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NickRegistrations {
+    pub grouped: Vec<(String, String)>,
+    pub enforced: Vec<String>,
+}
+
+pub async fn list_nick_registrations(pool: &PgPool) -> Result<NickRegistrations, DbError> {
+    let grouped = sqlx::query_as(
+        "SELECT n.nick_folded, a.name_folded FROM account_nicks n
+         JOIN accounts a ON a.id = n.account_id ORDER BY n.nick_folded",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(query_error)?;
+    let enforced =
+        sqlx::query_scalar("SELECT name_folded FROM accounts WHERE nick_enforce ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .map_err(query_error)?;
+    Ok(NickRegistrations { grouped, enforced })
+}
+
+/// What NickServ INFO reports about an account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NickServAccountInfo {
+    /// Display name.
+    pub name: String,
+    pub registered_at: e6irc_proto::time::Millis,
+    /// Every nick the account holds, its name first, as registered.
+    pub nicks: Vec<String>,
+    pub enforce: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct NickServAccountRow {
+    id: i64,
+    name: String,
+    registered_ms: i64,
+    nick_enforce: bool,
+}
+
+/// The account `target` names — as its account name or a grouped nick — for
+/// NickServ INFO.
+pub async fn nickserv_account_info(
+    pool: &PgPool,
+    target: &str,
+) -> Result<Option<NickServAccountInfo>, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(target);
+    let row: Option<NickServAccountRow> = sqlx::query_as(
+        "SELECT a.id, a.name, a.nick_enforce,
+                (extract(epoch FROM a.created_at) * 1000)::bigint AS registered_ms
+         FROM accounts a
+         WHERE a.name_folded = $1
+            OR a.id = (SELECT account_id FROM account_nicks WHERE nick_folded = $1)",
+    )
+    .bind(&folded)
+    .fetch_optional(pool)
+    .await
+    .map_err(query_error)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let grouped: Vec<String> = sqlx::query_scalar(
+        "SELECT nick FROM account_nicks WHERE account_id = $1 ORDER BY registered_at, nick_folded",
+    )
+    .bind(row.id)
+    .fetch_all(pool)
+    .await
+    .map_err(query_error)?;
+    let mut nicks = vec![row.name.clone()];
+    nicks.extend(grouped);
+    Ok(Some(NickServAccountInfo {
+        name: row.name,
+        registered_at: millis_from_database(row.registered_ms, "account registration")?,
+        nicks,
+        enforce: row.nick_enforce,
+    }))
 }
 
 /// Add or remove a server ban (KLINE/DLINE/XLINE) together with its audit
@@ -6141,6 +6655,24 @@ async fn throttled_password_check<T>(
     Ok(verdict)
 }
 
+/// The folded account a login name signs in to: the account a grouped nick
+/// belongs to (NickServ GROUP — Atheme lets any of an account's nicks
+/// identify), or the name itself. Resolved before the attempt is reserved, so
+/// every nick of an account spends the one budget its name has.
+async fn login_account_folded(pool: &PgPool, login: &str) -> Result<String, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(login);
+    sqlx::query_scalar(
+        "SELECT COALESCE(
+             (SELECT a.name_folded FROM account_nicks n JOIN accounts a ON a.id = n.account_id
+              WHERE n.nick_folded = $1),
+             $1)",
+    )
+    .bind(&folded)
+    .fetch_one(pool)
+    .await
+    .map_err(query_error)
+}
+
 #[derive(sqlx::FromRow)]
 struct CredentialVerificationRow {
     display_name: String,
@@ -6159,6 +6691,7 @@ pub async fn verify_credentials(
     account: &str,
     password: &str,
 ) -> Result<Option<String>, DbError> {
+    let account = &login_account_folded(pool, account).await?;
     throttled_password_check(
         pool,
         account,
@@ -6218,6 +6751,7 @@ pub async fn verify_local_password(
     account: &str,
     password: &str,
 ) -> Result<Option<String>, DbError> {
+    let account = &login_account_folded(pool, account).await?;
     throttled_password_check(
         pool,
         account,
@@ -7855,7 +8389,7 @@ pub async fn find_or_create_oidc_account(
     if let Some(name) = linked {
         return Ok(name);
     }
-    if account_name_is_retired(&mut tx, &folded).await? {
+    if account_name_is_unavailable(&mut tx, &folded).await? {
         return Err(DbError::DuplicateAccount(account_name.to_string()));
     }
     let account_id: i64 = sqlx::query_scalar(
