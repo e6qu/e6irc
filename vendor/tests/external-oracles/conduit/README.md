@@ -16,7 +16,7 @@ Not part of the e6irc build or default CI.
 ```
 docker compose -f vendor/tests/external-oracles/conduit/docker-compose.yml up -d
 E6IRC_TEST_MATRIX_URL=http://127.0.0.1:16167 \
-  cargo test -p e6ircd --features matrix --test matrix -- --ignored --nocapture
+  cargo test --locked -p e6ircd --features matrix --test matrix -- --ignored --nocapture
 docker compose -f vendor/tests/external-oracles/conduit/docker-compose.yml down
 ```
 

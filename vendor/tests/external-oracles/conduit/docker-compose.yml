@@ -3,7 +3,7 @@
 # e6irc build or default CI — a developer/test oracle only.
 services:
   conduit:
-    image: matrixconduit/matrix-conduit:v0.9.0
+    image: matrixconduit/matrix-conduit:v0.9.0@sha256:4ae051b1b56ee9c1292ffc87653da6078a52310f71aa4fe701c66432159997dd
     environment:
       CONDUIT_CONFIG: "/etc/conduit.toml"
     volumes:

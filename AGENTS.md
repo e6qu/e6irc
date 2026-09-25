@@ -174,9 +174,9 @@ mistake, before a single line changes.
 
 - [ ] Builds green (default **and** every feature: `embed-web`, and `matrix`,
       `discord`, `slack` each on its own, as CI does).
-- [ ] `cargo test --workspace` passes; PG/feature-gated suites run where
+- [ ] `cargo test --locked --workspace` passes; PG/feature-gated suites run where
       the environment allows.
-- [ ] `cargo clippy --workspace --all-targets` clean in each feature
+- [ ] `cargo clippy --locked --workspace --all-targets` clean in each feature
       config; `cargo fmt --all --check` clean.
 - [ ] `cargo deny check` clean.
 - [ ] `tools/check-noops.sh` clean (no deferred-work markers or unmessaged
@@ -190,7 +190,7 @@ mistake, before a single line changes.
       same-named definition elsewhere is not a use).
 - [ ] `tools/check-duplication.sh` clean (copy-paste under the ratchet; the
       fix is to extract shared logic, never to raise the threshold).
-- [ ] The fuzz targets type-check: `RUSTFLAGS="--cfg fuzzing" cargo check
+- [ ] The fuzz targets type-check: `RUSTFLAGS="--cfg fuzzing" cargo check --locked
       --manifest-path fuzz/Cargo.toml --bins` (stable is enough; CI's
       `fuzz-smoke` builds them on nightly, and a struct gaining a field breaks
       every target that builds it field by field).
