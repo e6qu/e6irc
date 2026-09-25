@@ -21,3 +21,5 @@ for the Libera.Chat compatibility contract (DESIGN §7.7).
   solely as a compatibility test oracle.
 - **Refresh procedure**: re-run the capture (any unregistered nick),
   re-apply the nick normalization, update the checksum and date here.
+  `the_snapshot_matches_its_recorded_checksum` (crates/e6ircd/tests/
+  libera_compat.rs) fails while the file and this checksum disagree.

@@ -834,7 +834,9 @@ fn operations() -> serde_json::Value {
             "auth_rate_burst": { "type": ["integer", "null"], "minimum": 1 },
             "api_rate_burst": { "type": "integer", "minimum": 1 },
             "administrator_api_rate_burst": { "type": "integer", "minimum": 1 },
-            "registration_burst": { "type": ["integer", "null"], "minimum": 1 }
+            "registration_burst": { "type": ["integer", "null"], "minimum": 1 },
+            "require_sasl": { "type": "boolean" },
+            "require_sasl_from": { "type": "array", "items": { "type": "string" } }
         }
     });
     let observability_schema = serde_json::json!({

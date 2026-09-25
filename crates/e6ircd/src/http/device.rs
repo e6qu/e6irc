@@ -1206,6 +1206,8 @@ fn without_secrets(settings: crate::config::ManagedConfig) -> crate::config::Man
         api_rate_burst: _,
         administrator_api_rate_burst: _,
         registration_burst: _,
+        require_sasl: _,
+        require_sasl_from: _,
     } = &limits;
     let ObservabilityConfig {
         enabled: _,

@@ -1303,10 +1303,39 @@ async fn persisted_bnc_buffer_is_trimmed_by_its_own_traffic() {
         }
     };
 
+    // Whether `text`, a PRIVMSG the peer sent, is stored yet. One task stores
+    // a network's lines in order and trims in line, so once a line is stored,
+    // every line sent before it, and every trim they were owed, is done.
+    let stored = |text: String| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM bnc_buffer WHERE owner = 'alice' \
+                 AND network = 'up' AND line LIKE '%PRIVMSG #lobby :' || $1)",
+            )
+            .bind(text)
+            .fetch_one(&pool)
+            .await
+            .expect("stored-line query")
+        }
+    };
+    let wait_stored = |text: String| async move {
+        tokio::time::timeout(deadline::HANG, async {
+            while !stored(text.clone()).await {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{text:?} was never stored"));
+    };
+
     // Enough traffic to cross the retention cap and reach a trim beyond it.
-    // Sent in paced batches: the persistence task reads from a bounded
-    // broadcast, so an unpaced flood makes it lag and drop lines (it says so on
-    // stderr) and the test would measure the lag rather than the trim.
+    // Each batch waits for its own last line to be stored before the next is
+    // sent: the persistence task reads from a bounded broadcast, so an
+    // unpaced flood makes it lag and drop lines (it says so on stderr) and the
+    // test would measure the lag rather than the trim. Pacing on the row
+    // count, as this used to, stopped pacing at all once the count reached
+    // the cap and the trim held it there.
     let target = 5_000 + 2 * e6ircd::db::BNC_TRIM_INTERVAL as i64 + 100;
     let mut sent = 0i64;
     while sent < target {
@@ -1316,35 +1345,16 @@ async fn persisted_bnc_buffer_is_trimmed_by_its_own_traffic() {
                 .expect("send");
         }
         sent += 250;
-        // Let persistence catch up before sending more.
-        let want = sent.min(5_000);
-        tokio::time::timeout(deadline::HANG, async {
-            while rows().await < want {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("persistence fell behind at {sent} lines"));
+        wait_stored(format!("line {}", sent - 1)).await;
     }
 
-    // Everything is sent; wait for the count to stop moving before asserting.
-    // Sampling while it is still climbing would pass on a buffer that is merely
-    // *passing through* the bound on its way past it — which is exactly what an
-    // earlier version of this test did, and it stayed green with the trim
-    // disabled.
-    let settled = tokio::time::timeout(deadline::HANG, async {
-        let mut last = -1i64;
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            let n = rows().await;
-            if n == last {
-                return n;
-            }
-            last = n;
-        }
-    })
-    .await
-    .expect("the persisted buffer never stopped growing");
+    // Everything is sent and stored. Counting now, rather than while the
+    // count still climbs, is what makes this a test of the trim: a sample
+    // taken mid-flight passes on a buffer merely *passing through* the bound
+    // (an earlier version did, and stayed green with the trim disabled), and
+    // so does waiting for a quiet spell whenever persistence stalls that long
+    // on a busy runner.
+    let settled = rows().await;
     let bound = 5_000 + e6ircd::db::BNC_TRIM_INTERVAL as i64;
     assert!(
         settled > 5_000 - e6ircd::db::BNC_TRIM_INTERVAL as i64 && settled <= bound,

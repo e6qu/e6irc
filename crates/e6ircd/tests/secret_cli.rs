@@ -97,14 +97,19 @@ fn genkey_seal_and_load_round_trip() {
 
 #[test]
 fn seal_without_key_source_fails() {
-    // No --key-file and (assuming a clean env) no E6IRC_SECRET_KEY.
-    if std::env::var_os("E6IRC_SECRET_KEY").is_some() {
-        return;
-    }
+    // No --key-file, and no key in the environment whatever the test runner's
+    // own environment holds.
     let out = Command::new(env!("CARGO_BIN_EXE_e6ircd"))
         .arg("seal")
+        .env_remove("E6IRC_SECRET_KEY")
+        .env_remove("E6IRC_PREVIOUS_SECRET_KEYS")
         .stdin(Stdio::null())
         .output()
         .expect("run seal");
     assert!(!out.status.success(), "seal must fail with no key source");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("no --key-file and E6IRC_SECRET_KEY is unset"),
+        "{said}"
+    );
 }

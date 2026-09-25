@@ -28,22 +28,38 @@ elif ! printf '%s\n' "$bugs_header" | diff -u - BUGS.md; then
   fail=1
 fi
 
-# Check only newly added PLAN.md lines.
+# Check only newly added lines, in every file: a deferral note reads the same
+# in PLAN.md, DESIGN.md, a README, docs/** or a code comment. Exempt are the
+# rule's own statement (AGENTS.md, which quotes the idioms it bans) and this
+# guard and its contract test, which must spell them out.
 base="${1:-origin/main}"
 if ! git rev-parse --verify -q "$base^{commit}" >/dev/null; then
-  echo "no-defer guard: base ref '$base' does not resolve, so the PLAN.md additions"
-  echo "                cannot be examined. Fetch it, or pass one that exists"
-  echo "                (e.g. tools/check-no-defer.sh main)."
+  echo "no-defer guard: base ref '$base' does not resolve, so this change's added"
+  echo "                lines cannot be examined. Fetch it, or pass one that"
+  echo "                exists (e.g. tools/check-no-defer.sh main)."
   exit 1
 fi
-plan_diff="$(git diff "$base" -- PLAN.md)"
-added="$(printf '%s\n' "$plan_diff" | grep '^+' | grep -v '^+++' || true)"
-banned='surfaced, not (done|changed)|deferred to a (dedicated|future|later) (pass|sweep)|noted for a (dedicated|future|later) (pass|sweep)|left (for|to) a (later|future) (pass|sweep)|considered non-change|gold-plat'
-hits="$(printf '%s\n' "$added" | grep -niE "$banned" || true)"
+added="$(git diff --no-color --unified=0 "$base" -- . \
+  ':(exclude)AGENTS.md' ':(exclude)tools/check-no-defer.sh' \
+  ':(exclude)tools/test-check-no-defer.sh' |
+  awk '/^\+\+\+ /{file=substr($0,7); next} /^\+/{print file ": " substr($0,2)}' || true)"
+# What the rest of the work is put off to.
+later='(dedicated|future|later|next|separate|subsequent|follow-?up) '
+unit='(pass|sweep|pr|pull request|change|commit|round|iteration|follow-?up)'
+banned="surfaced,? (but )?not (yet )?(done|changed|fixed|addressed|handled|implemented|resolved|acted on)"
+banned="$banned|defer(s|red|ring)? ((it|this|that|them|these|those) )?(to|until|for) (a|an|the) ($later)*$unit"
+banned="$banned|(left|noted|parked|kept|saved|filed|punted) ((it|this|that) )?(for|to|until) (a|an|the) ($later)*$unit"
+banned="$banned|(dedicated|future|later|separate|subsequent|follow-?up) (pass|sweep|pr|pull request)([^a-z]|$)"
+banned="$banned|next (sweep|pr|pull request)([^a-z]|$)"
+banned="$banned|follow-?up (pr|pull request|change|commit|sweep|pass|task|ticket|issue)"
+banned="$banned|revisit(ed)? ((it|this|that) )?(later|when|once|after|in a)"
+banned="$banned|out of scope for this (change|sweep|pr|pull request|pass|review)"
+banned="$banned|considered non-change|gold-plat"
+hits="$(printf '%s\n' "$added" | grep -iE "$banned" || true)"
 if [ -n "$hits" ]; then
-  echo "no-defer guard: this change adds a deferral idiom to PLAN.md. Address the"
-  echo "                item, or escalate it to the human as an explicit decision —"
-  echo "                do not file it as done-later:"
+  echo "no-defer guard: this change adds a deferral idiom. Address the item, or"
+  echo "                escalate it to the human as an explicit decision — do not"
+  echo "                file it as done-later:"
   printf '%s\n' "$hits"
   fail=1
 fi

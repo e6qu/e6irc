@@ -1348,6 +1348,9 @@ pub struct CoreConfig {
     /// rare per real client, so a small burst suffices to blunt bulk-account
     /// abuse without hindering a genuine sign-up).
     pub registration_burst: Option<usize>,
+    /// Which clients must have logged in by the end of registration
+    /// (`limits.require_sasl`, `limits.require_sasl_from`).
+    pub sasl_requirement: crate::config::SaslRequirement,
     /// Account names account registration refuses: the configured
     /// administrators (see [`crate::identity::ReservedAccountNames`]).
     pub reserved_account_names: crate::identity::ReservedAccountNames,
@@ -6787,6 +6790,34 @@ impl ServerState {
         self.send_event(conn, &line);
     }
 
+    /// Refuse `conn` at the end of registration when the SASL requirement
+    /// covers it and it has not logged in ([`crate::config::SaslRequirement`]),
+    /// as Libera refuses its SASL-only ranges: 465 saying why, then
+    /// `ERROR :Closing Link: <host> (SASL access only)`. Returns whether it
+    /// was refused.
+    pub(crate) fn refuse_unauthenticated(&mut self, conn: ConnId) -> bool {
+        let session = &self.sessions[&conn];
+        if session.account().is_some()
+            || session.transport == crate::core::ConnectionTransport::Local
+            || !self.config.sasl_requirement.covers(session.real_ip)
+        {
+            return false;
+        }
+        let host = session.host.clone();
+        self.numeric(
+            conn,
+            e6irc_proto::numerics::ERR_YOUREBANNEDCREEP,
+            &[],
+            Some("You need to identify via SASL to use this server"),
+        );
+        self.send(
+            conn,
+            &format!("ERROR :Closing Link: {host} (SASL access only)"),
+        );
+        self.close(conn, "SASL access only");
+        true
+    }
+
     // ---- teardown -------------------------------------------------------
 
     /// Remove a session: broadcast QUIT to channel peers, free the nick,
@@ -7199,6 +7230,7 @@ mod session_store_tests {
                 mono_clock,
                 command_flood: None,
                 registration_burst: None,
+                sasl_requirement: Default::default(),
                 reserved_account_names: crate::identity::ReservedAccountNames::default(),
             },
             db_tx,

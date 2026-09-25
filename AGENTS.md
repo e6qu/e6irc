@@ -119,9 +119,9 @@ Because it already regressed. Sweep after sweep, with an explicit "do not
 defer" instruction standing, the agent kept coining "surfaced, not done"
 sections and moving on — treating "surface, don't swallow" as permission
 to swallow-by-documenting. `tools/check-no-defer.sh` now fails the gate on
-the known vehicles (an open `BUGS.md` entry, a new deferral idiom added to
-`PLAN.md`), so the regression is caught mechanically and not left to
-memory.
+the known vehicles (an open `BUGS.md` entry, a deferral idiom added to any
+file — `PLAN.md`, `DESIGN.md`, docs, a code comment), so the regression is
+caught mechanically and not left to memory.
 
 ---
 
@@ -174,9 +174,9 @@ mistake, before a single line changes.
 
 - [ ] Builds green (default **and** every feature: `embed-web`, and `matrix`,
       `discord`, `slack` each on its own, as CI does).
-- [ ] `cargo test --workspace` passes; PG/feature-gated suites run where
+- [ ] `cargo test --locked --workspace` passes; PG/feature-gated suites run where
       the environment allows.
-- [ ] `cargo clippy --workspace --all-targets` clean in each feature
+- [ ] `cargo clippy --locked --workspace --all-targets` clean in each feature
       config; `cargo fmt --all --check` clean.
 - [ ] `cargo deny check` clean.
 - [ ] `tools/check-noops.sh` clean (no deferred-work markers or unmessaged
@@ -184,18 +184,19 @@ mistake, before a single line changes.
 - [ ] `tools/check-dead-code.sh` clean (no code kept alive only by tests —
       it builds the shipped artifacts with `cfg(test)` off).
 - [ ] `tools/check-dead-pub.sh` clean (no fully-`pub` item referenced only by
-      tests: an integration test, or inline `#[cfg(test)]` code, which it
-      blanks out before counting — the compiler's dead-code lint sees
-      neither for a `pub` item).
+      tests: an integration test, a fuzz target, or inline `#[cfg(test)]` /
+      `#[cfg(fuzzing)]` code, which it blanks out before counting — the
+      compiler's dead-code lint sees none of them for a `pub` item. A
+      same-named definition elsewhere is not a use).
 - [ ] `tools/check-duplication.sh` clean (copy-paste under the ratchet; the
       fix is to extract shared logic, never to raise the threshold).
-- [ ] The fuzz targets type-check: `RUSTFLAGS="--cfg fuzzing" cargo check
+- [ ] The fuzz targets type-check: `RUSTFLAGS="--cfg fuzzing" cargo check --locked
       --manifest-path fuzz/Cargo.toml --bins` (stable is enough; CI's
       `fuzz-smoke` builds them on nightly, and a struct gaining a field breaks
       every target that builds it field by field).
 - [ ] `tools/check-no-defer.sh` clean (no deferral vehicle in use — see the
       No-Deferral Rule above: `BUGS.md` empty, no new "surfaced, not
-      done"-style note in `PLAN.md`).
+      done"-style note added to any file).
 - [ ] Anything you moved/renamed: all references updated.
 - [ ] Anything broken you noticed on the way: **fixed**, or escalated to the
       human as an explicit decision — never filed away for later.

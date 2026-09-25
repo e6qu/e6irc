@@ -281,6 +281,15 @@ impl RequestObservation {
 }
 
 impl AppState {
+    /// Where this server's identity providers' calls may go, and over which
+    /// schemes: `https` only when its cookies are `Secure`.
+    pub(crate) fn provider_rules(&self) -> oidc_provider::ProviderRules {
+        oidc_provider::ProviderRules {
+            egress: self.internal_upstreams,
+            schemes: oidc_provider::EndpointSchemes::for_secure_cookies(self.secure_cookies),
+        }
+    }
+
     /// The bootstrap values a managed-settings revision is judged against.
     pub(crate) fn bootstrap_context(&self) -> crate::config::BootstrapContext {
         crate::config::BootstrapContext {
@@ -4372,7 +4381,10 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
     #[tokio::test]
     async fn a_logout_token_signed_by_a_rotated_key_verifies_after_one_refresh() {
         use super::oidc_provider::tests::{age_for_refresh, provider, provider_config};
-        let policy = crate::egress::InternalUpstreams::Refuse;
+        let policy = super::oidc_provider::ProviderRules {
+            egress: crate::egress::InternalUpstreams::Refuse,
+            schemes: super::oidc_provider::EndpointSchemes::HttpOrHttps,
+        };
         let key_set = |kid: &str, key: &openidconnect::core::CoreJsonWebKey| {
             let mut key = serde_json::to_value(key).expect("key JSON");
             key["kid"] = serde_json::Value::String(kid.into());

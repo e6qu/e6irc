@@ -351,9 +351,13 @@ connection loss uses the shorter reconnect backoff instead.
 
 **Parked** — a driver that has stopped re-dialing and stays stopped until its
 network is reconfigured. Rejected credentials park on the first rejection,
-because every further attempt counts against the account upstream; any other
-registration refusal parks on the fifth in a row, after the refusal schedule
-is exhausted. A parked network shows why and what repairs it.
+because every further attempt counts against the account upstream, and so does
+a welcome under another nickname. A refusal that may be a configuration fault
+(a held nickname, one the network will not take, a server password) parks on
+the fifth of its kind in a row, after the refusal schedule is exhausted. A
+capacity or policy answer (a throttle, a ban, "SASL access only") never parks:
+it is retried every four minutes for as long as it lasts. DESIGN §10.3 is the
+full statement. A parked network shows why and what repairs it.
 
 **Supersede** and **ensure-running** — the two ways the registry starts a
 driver for a network that may already have one (`bouncer/serve.rs`).

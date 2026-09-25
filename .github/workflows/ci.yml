@@ -63,8 +63,16 @@ jobs:
       - run: tools/test-check-migration-integrity.sh
       - run: tools/test-check-no-defer.sh
       - run: tools/test-check-dead-pub.sh
-      # fuzz/Cargo.lock resolves on its own; keep it on the workspace's versions.
+      - run: tools/test-check-locked-builds.sh
+      - run: tools/test-check-noops.sh
+      - run: python3 vendor/tests/irctest/test_check_skips.py
+      # fuzz/Cargo.lock resolves on its own; keep it on the workspace's versions,
+      # and current for fuzz/Cargo.toml (`cargo fuzz` has no `--locked`, and
+      # would re-resolve a stale lock without a word).
       - run: python3 tools/check-fuzz-lock.py
+      - run: cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
+      # Every service and tool image is pinned by the one digest CI uses.
+      - run: python3 tools/check-image-pins.py
       - name: Migration integrity
         run: |
           git fetch --no-tags --depth=1 origin main
@@ -74,6 +82,9 @@ jobs:
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web test && pnpm -C web build
       - run: cargo fmt --all --check
       - run: rustfmt --edition 2024 --check crates/e6irc-qualification/tests/support/native.rs
+      # fuzz/ is outside the workspace, so neither `cargo fmt --all` nor the
+      # workspace clippy reaches its targets.
+      - run: rustfmt --edition 2024 --check fuzz/fuzz_targets/*.rs
       - run: cargo clippy --locked --workspace --all-targets --all-features
       # `--all-features` is the union, so it never compiles a feature on its
       # own. Code behind `cfg(feature = "discord")` that happens to depend on
@@ -97,14 +108,15 @@ jobs:
       # with -D warnings, so code kept alive solely by tests is caught as dead.
       - run: tools/check-dead-code.sh
       # Dead-pub guard: the cross-crate case the compiler can't see — a `pub`
-      # item referenced only by an integration test (a separate crate) or by
-      # inline `#[cfg(test)]` code.
+      # item referenced only by an integration test (a separate crate), a fuzz
+      # target, or inline `#[cfg(test)]` / `#[cfg(fuzzing)]` code.
       - run: tools/check-dead-pub.sh
       # Copy-paste guard: fail if duplicated Rust source exceeds the ratchet.
       - run: tools/check-duplication.sh
       # Journey guard: every user-facing outcome carries the same complete
       # contract and has exactly one row using the defined evidence vocabulary.
       - run: python3 tools/check-journeys.py
+      - run: python3 tools/test-check-journeys.py
       - run: python3 tools/check-client-capabilities.py
       # Structural server-rendered accessibility: every data table keeps an
       # accessible caption and every navigation landmark keeps a name.
@@ -112,9 +124,9 @@ jobs:
       # API-first guard: console forms may not bypass the public API.
       - run: python3 tools/check-api-first-inventory.py
       # No-deferral guard (AGENTS.md): BUGS.md must stay empty and no
-      # file-it-for-later idiom may be added to PLAN.md. The checkout is
-      # shallow, so fetch main to diff the PLAN.md additions against. A failed
-      # fetch fails the step: without the base the additions go unexamined.
+      # file-it-for-later idiom may be added to any file. The checkout is
+      # shallow, so fetch main to diff the additions against. A failed fetch
+      # fails the step: without the base the additions go unexamined.
       - name: No-deferral guard
         run: |
           git fetch --no-tags --depth=1 origin main
@@ -474,7 +486,7 @@ jobs:
   # Protocol conformance against the pinned irctest suite (vendored
   # hookup in vendor/tests/irctest/) with the standard irctest marker
   # filter. Grow the file list as surface lands; removing a file needs a
-  # written reason.
+  # written reason. run.sh holds the skipped tests to expected-skips.txt.
   irctest:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -552,6 +564,7 @@ jobs:
           PYTHONPATH="$GITHUB_WORKSPACE/vendor/tests/irctest" \
           E6IRC_IRCTEST_DB="postgres://postgres:test@127.0.0.1:5432/irctest" \
           pytest --controller=e6ircd_controller --timeout=20 \
+            -rs --junitxml=irctest-services.xml \
             -m 'not implementation-specific and not deprecated and not strict' \
             `# irctest registers accounts over a normal PRIVMSG, so a 592-byte` \
             `# password cannot fit the 512-byte line limit; e6ircd correctly` \
@@ -577,6 +590,12 @@ jobs:
             irctest/server_tests/read_marker.py \
             irctest/server_tests/who.py \
             irctest/server_tests/whois.py
+      # irctest skips what a server does not advertise, so a lost capability
+      # would otherwise stay green: every skip is listed, with its reason.
+      - name: Hold the skipped tests to the committed list
+        run: |
+          python vendor/tests/irctest/check_skips.py ../irctest/irctest-services.xml \
+            vendor/tests/irctest/expected-skips-services.txt
 
   # Matrix bridge (feature-gated) against a pinned Conduit homeserver.
   # Conduit v0.9.0 needs a config file, so it is started with docker run
@@ -647,6 +666,9 @@ jobs:
         with:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      # `cargo fuzz` takes no `--locked`: refuse a lock that is stale for
+      # fuzz/Cargo.toml before it can re-resolve.
+      - run: cargo +nightly-2026-07-23 metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
       - name: Fuzz each target briefly
         working-directory: fuzz
         # Enumerate targets from cargo-fuzz itself (the Cargo.toml [[bin]] set)

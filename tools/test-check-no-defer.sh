@@ -39,6 +39,40 @@ printf '%s\n' 'The cleanup is deferred to a future sweep.' >> PLAN.md
 expect_fail 'deferral idiom added to PLAN.md'
 printf '%s\n' 'The rename is deferred to a later pass.' >> PLAN.md
 expect_fail 'deferred to a later pass added to PLAN.md'
+# Ordinary rewordings of the same move, each of which once passed.
+for phrase in \
+    'Deferred to a follow-up PR.' \
+    'Left for a later change.' \
+    'Out of scope for this sweep; revisit later.' \
+    'Surfaced, not fixed.' \
+    'The tidy-up is deferred to the next sweep.' \
+    'Parked for a separate commit.' \
+    'Worth a follow-up issue.' \
+    'Revisit this once the parser lands.' \
+    'That belongs in a future PR.'; do
+    printf '%s\n' "$phrase" >> PLAN.md
+    expect_fail "\"$phrase\" added to PLAN.md"
+done
+# Every file's added lines are read, not PLAN.md's alone.
+for file in DESIGN.md README.md docs/guide.md src/lib.rs; do
+    mkdir -p "$(dirname "$file")"
+    printf '%s\n' '// The retry cap is deferred to a follow-up change.' >> "$file"
+    git add "$file"
+    expect_fail "deferral note added to $file"
+done
+# The rule's own statement quotes the idioms it bans.
+printf '%s\n' 'It has shown up as "surfaced, not done" and "deferred to a dedicated pass".' > AGENTS.md
+git add AGENTS.md
+tools/check-no-defer.sh "$base" >/dev/null
+git reset --hard -q "$base"
+git clean -fdq
+# Plain technical prose that shares a word is not a deferral.
+printf '%s\n' 'An error is surfaced, not silently dropped.' \
+    'The reply is deferred until the database answers.' >> DESIGN.md
+git add DESIGN.md
+tools/check-no-defer.sh "$base" >/dev/null
+git reset --hard -q "$base"
+git clean -fdq
 # A base that does not resolve leaves the PLAN.md additions unexamined; that
 # is a failed check, not a clean one. The same holds for the default base.
 expect_fail 'unresolvable base ref' refs/heads/no-such-branch

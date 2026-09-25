@@ -38,11 +38,21 @@ expect_clean() { # REASON
     reset
 }
 
-expect_fail() { # REASON
-    if run; then
-        echo "expected dead-pub guard failure: $1" >&2
+# The guard must fail and name NAMED in its report: a crash fails too, and
+# must not pass for the refusal a case is about.
+expect_fail() { # NAMED REASON
+    if out=$(cd "$work" && tools/check-dead-pub.sh 2>&1); then
+        echo "expected dead-pub guard failure: $2" >&2
         exit 1
     fi
+    case "$out" in
+        *"$1"*) ;;
+        *)
+            echo "dead-pub guard failed without naming $1: $2" >&2
+            echo "$out" >&2
+            exit 1
+            ;;
+    esac
     reset
 }
 
@@ -57,14 +67,14 @@ mod tests {
     fn t() { super::only_tested(); let _ = '}'; }
 }
 RS
-expect_fail 'pub fn used only by an inline #[cfg(test)] module'
+expect_fail '  only_tested  ' 'pub fn used only by an inline #[cfg(test)] module'
 
 cat >> "$src/lib.rs" <<'RS'
 pub struct OnlyTested;
 #[cfg(all(test, feature = "x"))]
 fn helper() -> OnlyTested { OnlyTested }
 RS
-expect_fail 'pub item used only under cfg(all(test, ..))'
+expect_fail '  OnlyTested  ' 'pub item used only under cfg(all(test, ..))'
 
 cat >> "$src/lib.rs" <<'RS'
 pub fn only_in_test_file() {}
@@ -73,7 +83,7 @@ pub fn only_in_test_file() {}
 mod test_support;
 RS
 printf '%s\n' 'fn t() { crate::only_in_test_file() }' > "$src/sub/test_support.rs"
-expect_fail 'pub fn used only by a test-only `mod x;` file'
+expect_fail '  only_in_test_file  ' 'pub fn used only by a test-only `mod x;` file'
 
 cat >> "$src/lib.rs" <<'RS'
 pub fn used_under_any() {}
@@ -86,7 +96,60 @@ cat >> "$src/lib.rs" <<'RS'
 #[cfg(test)]
 mod missing;
 RS
-expect_fail 'an unresolvable test-only `mod x;` fails loudly'
+expect_fail 'cannot resolve test-only' 'an unresolvable test-only `mod x;` fails loudly'
+
+cat >> "$src/lib.rs" <<'RS'
+pub fn serialize() {}
+struct Unrelated;
+impl Unrelated { fn serialize(&self) {} }
+#[cfg(test)]
+mod tests { fn t() { super::serialize() } }
+RS
+expect_fail '  serialize  ' 'an unrelated definition of the same name is not a use'
+
+cat >> "$src/lib.rs" <<'RS'
+pub fn only_fuzzed() {}
+#[cfg(fuzzing)]
+pub mod fuzz { pub fn reach() { super::only_fuzzed() } }
+RS
+expect_fail '  only_fuzzed  ' 'pub fn used only by #[cfg(fuzzing)] code'
+
+cat >> "$src/lib.rs" <<'RS'
+pub mod unused_module {}
+RS
+expect_fail '  unused_module  ' 'pub mod nothing names'
+
+cat >> "$src/lib.rs" <<'RS'
+pub use sub::in_sub as reexported;
+RS
+expect_fail '  reexported  ' 'pub use whose name nothing uses'
+
+cat >> "$src/lib.rs" <<'RS'
+pub use sub::{sub_caller as first, in_sub as second};
+fn shipped() { first(); }
+RS
+expect_fail '  second  ' 'one unused name in a pub use list'
+
+cat >> "$src/lib.rs" <<'RS'
+pub use sub::in_sub as reexported;
+fn shipped() { reexported() }
+RS
+expect_clean 'pub use used by shipped code'
+
+cat >> "$src/lib.rs" <<'RS'
+pub unsafe trait Untouched {}
+RS
+expect_fail '  Untouched  ' 'pub unsafe trait'
+
+cat >> "$src/lib.rs" <<'RS'
+pub extern "C" fn untouched_abi() {}
+RS
+expect_fail '  untouched_abi  ' 'pub extern "C" fn'
+
+cat >> "$src/lib.rs" <<'RS'
+pub union Untouched { a: u8 }
+RS
+expect_fail '  Untouched  ' 'pub union'
 
 cat >> "$src/lib.rs" <<'RS'
 // dead-pub-allow: exercised by the contract test

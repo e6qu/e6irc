@@ -561,8 +561,8 @@ e6irc/
 │   │                         #   communication primitive (§7.3); loom-verified,
 │   │                         #   step-schedulable for deterministic tests
 │   ├── e6ircd/               # the monolithic server binary
-│   ├── e6irc-client/         # client library: connection, TLS, SASL (PLAIN +
-│   │                         #   OAUTHBEARER), chathistory helpers
+│   ├── e6irc-client/         # client library: connection, TLS, SASL (SCRAM-
+│   │                         #   SHA-512/256, PLAIN, OAUTHBEARER), chathistory helpers
 │   ├── e6irc-cli/            # scripting-oriented CLI client binary
 │   ├── e6irc-tui/            # ratatui TUI client binary
 │   ├── e6irc-load/           # load generator binary: many concurrent clients,
@@ -602,7 +602,7 @@ both native clients — one parser to fuzz, one behavior everywhere.
 | Queues | **custom `e6irc-queue`** | The core↔DB and per-connection SendQ primitive; built in-repo so it can be step-scheduled, traced, and loom-verified (§7.3). The always-on driver/attach layer (§10) additionally uses tokio `broadcast`/`mpsc` for event fan-out and command delivery. |
 | TLS | **rustls** (default `aws-lc-rs` provider) | No OpenSSL anywhere in the tree (enforced by `cargo-deny`); one TLS stack for listeners, upstream BNC connections, Postgres, and HTTP clients. |
 | HTTP | **axum** + tower | Thin over hyper, tower middleware for auth/rate limits; no needless layers. |
-| Database | **sqlx** (postgres + rustls features only) | Async, compile-time-checked queries, embedded migrations. |
+| Database | **sqlx** (`runtime-tokio`, `postgres`, `tls-rustls-aws-lc-rs`, `migrate`, `macros`; no default features) | Async; queries are runtime-checked (`sqlx::query`/`query_as` with bound parameters, no `query!` macros — the `macros` feature is there for `migrate!`), and migrations are embedded. |
 | Templates | **askama** | Compile-time templates → fast, no runtime template engine in the binary. |
 | Web client | **askama + standard forms** for server-rendered management; a small first-party runtime for confirmation/copy/refresh; vanilla-JS live chat bundled by **Vite** | No SPA framework or production package dependency; server-rendered where state is the server's, client-parsed where it is the client's (chat buffers/nick lists). |
 | TUI | **ratatui** + crossterm | Standard, portable. |
@@ -619,15 +619,26 @@ both native clients — one parser to fuzz, one behavior everywhere.
   tokio / an already-present dependency cannot, and why hand-rolling it
   in-repo is worse. Small utilities (a left-pad, a tiny format helper, a
   simple backoff) are written in-repo, never imported.
-- `default-features = false` on every dependency; features are enabled
-  individually and each enabled feature must be used.
+- `default-features = false` wherever a dependency's defaults bring more than
+  is used; features are then enabled individually and each enabled feature
+  must be used. Kept on their defaults, because the default set is what is
+  used: `url`, `socket2`, `http-body`, `ipnet` (plus `serde`) and `argon2`
+  (plus `std`) in e6ircd, and `unicode-width` in e6irc-tui. The test and
+  tooling binaries, e6irc-load and e6irc-qualification, take their
+  dependencies' defaults (serde, serde_json, sha2, url, futures-util, and
+  e6irc-qualification's tokio and axum); they never ship.
 - Every dependency must build and pass tests on the full target matrix
   (Linux, macOS, Windows × amd64, arm64); arch- or OS-specific code paths
   (SIMD, intrinsics, platform APIs) need an equivalent path on the other
   targets — no x86-only or Unix-only crates without a gated alternative.
-- The transitive tree is part of the review surface: CI posts a
-  `cargo tree` diff on PRs that change `Cargo.lock`, and `cargo-deny` gates
-  licenses (AGPL-compat), duplicate major versions, and known advisories.
+- The transitive tree is part of the review surface: a change to
+  `Cargo.lock` is reviewed in its diff, and `cargo-deny` gates licenses
+  (AGPL-compat), banned crates (OpenSSL and native-tls: rustls is the one
+  TLS stack), and known advisories (`deny.toml`). Duplicate versions of a
+  crate are a warning in general — sqlx, openidconnect and argon2 pull
+  differing versions of shared low-level crates — and a failure for the
+  network stack that must exist once: tokio, hyper, axum, rustls,
+  tokio-rustls, tungstenite, tokio-tungstenite, reqwest and sqlx.
 - Periodic pruning: a dependency whose justification no longer holds is
   removed, not kept out of inertia.
 - **Up-to-date, with a 24-hour cooldown**: dependencies are kept current,
@@ -638,9 +649,13 @@ both native clients — one parser to fuzz, one behavior everywhere.
   the same rule.
 - **GitHub Actions follow the same rule**: the latest release of each
   action is looked up via the GitHub API (never guessed), adopted only
-  if published ≥ 24 hours ago, and pinned to the exact release tag —
-  except where an action's documented interface is a rolling tag (e.g.
-  `dtolnay/rust-toolchain@stable`).
+  if published ≥ 24 hours ago, and pinned to the full commit SHA that
+  release tag names, with the tag in a trailing comment: a tag can be moved
+  to other code, a commit cannot. One version per action across ci.yml,
+  release.yml and qualification.yml. `dtolnay/rust-toolchain` has no
+  releases and picks the toolchain from the ref it is called by, so it is
+  pinned to a commit of its `master` branch and always given the toolchain
+  as its `toolchain` input. The header of ci.yml has the refresh recipe.
 
 ---
 
@@ -769,12 +784,15 @@ strip = "symbols"
 - RecvQ/flood control: a token bucket per connection, on by default with
   Solanum's shape (`limits.command_burst = 40` tokens, `limits.command_rate =
   20` per second; a registered non-oper session spends one per command, PING
-  and PONG exempt, and is closed with Excess Flood when the bucket is empty),
-  plus per-IP connection throttle and registration throttle. It used to be off
-  by default with a fixed one-token-per-second refill, which left every
-  output-amplifying command class — repeated JOIN/NAMES targets, repeated list
-  modes — unbounded for anyone who never turned it on, and made any burst that
-  was turned on flood-kill an ordinary autojoin storm.
+  and PONG exempt, and is closed with Excess Flood when the bucket is empty).
+  It used to be off by default with a fixed one-token-per-second refill, which
+  left every output-amplifying command class — repeated JOIN/NAMES targets,
+  repeated list modes — unbounded for anyone who never turned it on, and made
+  any burst that was turned on flood-kill an ordinary autojoin storm. Two
+  per-address bounds are off unless configured: `limits.max_connections_per_ip`
+  caps simultaneous connections from one address (the excess is refused at
+  accept), and `limits.registration_burst` throttles account creation
+  (REGISTER and NickServ REGISTER) per address.
 - JOIN, PART and NAMES target lists are casefold-deduplicated and bounded by
   the advertised `TARGMAX` (`JOIN:250`, `PART:250` — the channel limit — and
   `NAMES:1`, as on Libera); the first target past the bound is refused with
@@ -785,8 +803,26 @@ strip = "symbols"
   however it is framed (`TOPIC :#c` used to clear the topic). Every echo of
   client text, PONG included, is fitted to the 512-byte wire limit.
 - Registration pipeline: `CAP LS 302` → (SASL) → NICK/USER → welcome burst
-  (001–005 with ISUPPORT, LUSERS, MOTD). SASL-required mode configurable
-  globally and per-IP-range.
+  (001–005 with ISUPPORT, LUSERS, MOTD).
+- SASL-required mode, globally (`limits.require_sasl = true`) or for clients
+  connecting from listed address ranges (`limits.require_sasl_from`, CIDRs; an
+  IPv4-mapped IPv6 peer is matched as IPv4). A client it covers that has not
+  logged in to an account when registration would complete — after NICK, USER
+  and CAP END, and after any SASL verdict in flight — is refused as Libera and
+  Solanum refuse a SASL-only range: `465 :You need to identify via SASL to use
+  this server`, then `ERROR :Closing Link: <host> (SASL access only)`, and the
+  connection closes (a server ban is checked, and reported, first). Logged in
+  means SASL, or a `draft/account-registration` REGISTER before connect, which
+  logs the new account in and which `registration.before_connect` enables
+  separately (bounded by `limits.registration_burst`). The bouncer's in-process
+  `local` sessions (§10.2) are exempt: their owner authenticated to the
+  bouncer. There is no WebIRC gateway to exempt: `/ws/irc` clients are judged
+  by the address `limits.trusted_proxies` resolves for them. Both settings are
+  console-owned limits (§18), and configuration validation — `check-config`,
+  start, and a console save — refuses a range that is not a CIDR, either
+  setting without `[database]` (no client could log in), and ranges listed
+  while `require_sasl` already covers everyone. The refusal is 465, which
+  e6irc-client reads as a policy refusal that never parks (§10.3).
 
 ### 7.3 Queue-based core: state model at 100k+ connections
 
@@ -1665,7 +1701,18 @@ provider-verified email claim.
   may only advertise endpoints outside, so neither the provider nor whoever
   controls its discovery document can aim this server's token and key
   requests at internal infrastructure. A literal address is judged before each
-  request and every resolved address at connect time. First login
+  request and every resolved address at connect time. When the server's
+  cookies are `Secure` (`secure_cookies`, which also requires an `https`
+  public URL) every provider endpoint is HTTPS: configuration validation
+  refuses an `http` `issuer_url` or `end_session_endpoint`, a discovery
+  document that advertises a plaintext `authorization_endpoint`,
+  `token_endpoint`, `jwks_uri` or `userinfo_endpoint` is refused as a whole
+  (the login answers `502`, and the refusal is cached like any failed
+  discovery), and each provider call judges its URL's scheme again before it
+  is sent. Plaintext there would let an on-path attacker supply signing keys
+  and forge ID tokens, or read authorization codes and the client secret. A
+  development server (`secure_cookies = false`) may talk to a local provider
+  over `http`. First login
   auto-provisions an account named exactly by the provider's configured
   claim (`preferred_username`, or an email's local part); a name already in
   use or retired is a `409` (§12) — the server never picks or invents a name,
@@ -3973,8 +4020,8 @@ Layers, bottom to top:
    direct real-server integration tests. The matrix identifies partial
    journeys where adjacent layers are proven separately.
 7. **e2e (API & network)**: REST `/api/v1` exercised over HTTP against a
-   running `e6ircd` + Postgres (docker-composed in CI); IRC flows exercised
-   over real sockets, including TLS.
+   running `e6ircd` + Postgres (in CI, a GitHub Actions `postgres` service
+   container); IRC flows exercised over real sockets, including TLS.
 8. **Released settings rows**: `tests/fixtures/server_settings/` holds the
    managed configuration each release stored, captured by that release's own
    code and named `<its last migration>-<release>.json`; a PostgreSQL test

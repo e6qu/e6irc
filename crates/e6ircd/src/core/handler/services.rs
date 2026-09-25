@@ -2620,6 +2620,9 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
             return;
         }
     }
+    if state.refuse_unauthenticated(conn) {
+        return;
+    }
     // `signon` is a real timestamp (WHOIS reports the wall-clock time the
     // client connected); `last_active` seeds the idle/reaper clock and is
     // monotonic.

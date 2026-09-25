@@ -956,16 +956,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         } else {
             false
         };
-        let trusted_proxies = config
-            .limits
-            .trusted_proxies
-            .iter()
-            .map(|s| {
-                s.parse::<ipnet::IpNet>().map_err(|e| {
-                    io::Error::other(format!("invalid trusted_proxies CIDR {s:?}: {e}"))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let trusted_proxies = config.limits.trusted_proxies.clone();
         let (public_url, secure_cookies) = match &config.http {
             Some(h) => (h.public_url.clone(), h.secure_cookies),
             None => (None, false),
@@ -1119,6 +1110,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 .map_err(io::Error::other)?,
         ),
         registration_burst: config.limits.registration_burst,
+        sasl_requirement: config.limits.sasl_requirement(),
         reserved_account_names: configured_administrators.clone(),
     };
     let shard_count = core_tx.shard_count();
@@ -2716,6 +2708,7 @@ mod tests {
             mono_clock,
             command_flood: None,
             registration_burst: None,
+            sasl_requirement: Default::default(),
             reserved_account_names: crate::identity::ReservedAccountNames::default(),
         }
     }

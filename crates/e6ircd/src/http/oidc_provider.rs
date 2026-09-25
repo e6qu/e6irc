@@ -33,14 +33,52 @@ const KEY_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// whoever controls its document names — must be outside as well. Addresses
 /// that are never a network (the cloud metadata endpoint among them) are
 /// refused either way.
+/// Its endpoints' schemes are judged per request too ([`EndpointSchemes`]).
 #[derive(Clone)]
 pub(super) struct ProviderHttp {
     client: reqwest::Client,
     policy: crate::egress::InternalUpstreams,
+    schemes: EndpointSchemes,
+}
+
+/// Which URL schemes a server lets its identity providers' endpoints use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum EndpointSchemes {
+    /// `https` only: the server's cookies are `Secure` (`secure_cookies`), so
+    /// it is served over HTTPS, and a plaintext discovery document, key set or
+    /// token exchange would let an on-path attacker forge ID tokens or read
+    /// authorization codes and the client secret.
+    HttpsOnly,
+    /// `http` too: a development server talking to a local provider.
+    HttpOrHttps,
+}
+
+impl EndpointSchemes {
+    pub(crate) const fn for_secure_cookies(secure_cookies: bool) -> Self {
+        if secure_cookies {
+            Self::HttpsOnly
+        } else {
+            Self::HttpOrHttps
+        }
+    }
+
+    /// Why `url` may not be the provider's `what`, if it may not.
+    fn refusal(self, what: &str, url: &url::Url) -> Option<String> {
+        (self == Self::HttpsOnly && url.scheme() != "https")
+            .then(|| format!("the provider's {what} must be https, not {}", url.scheme()))
+    }
+}
+
+/// Where a server lets its identity providers' calls go: its egress rule and
+/// the schemes their endpoints may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ProviderRules {
+    pub(crate) egress: crate::egress::InternalUpstreams,
+    pub(crate) schemes: EndpointSchemes,
 }
 
 impl ProviderHttp {
-    fn new(policy: crate::egress::InternalUpstreams) -> Self {
+    fn new(policy: crate::egress::InternalUpstreams, schemes: EndpointSchemes) -> Self {
         // No redirect following: a provider endpoint must answer directly,
         // and a 3xx cannot re-target an address the rule refuses. Timeouts
         // bound each call so an unresponsive provider (reached from
@@ -52,7 +90,11 @@ impl ProviderHttp {
             .dns_resolver(Arc::new(crate::egress::VettingResolver::new(policy)))
             .build()
             .expect("reqwest client");
-        Self { client, policy }
+        Self {
+            client,
+            policy,
+            schemes,
+        }
     }
 }
 
@@ -70,10 +112,14 @@ impl<'c> openidconnect::AsyncHttpClient<'c> for ProviderHttp {
     fn call(&'c self, request: openidconnect::HttpRequest) -> Self::Future {
         // A URL whose host is an address literal never reaches the resolver:
         // the connector dials it directly. So the literal is judged here,
-        // before the client sees it.
+        // before the client sees it. The scheme is judged with it: the key set
+        // and the token endpoint are fetched through here.
         let refusal = url::Url::parse(&request.uri().to_string())
             .map_err(|_| "provider URL does not parse".to_string())
             .and_then(|url| {
+                if let Some(refusal) = self.schemes.refusal("endpoint", &url) {
+                    return Err(refusal);
+                }
                 self.policy
                     .refusal_for_url(&url)
                     .map_or(Ok(()), |refusal| Err(refusal.reason().to_string()))
@@ -141,9 +187,9 @@ enum CachedDiscovery {
     },
 }
 
-/// Cache key: the issuer, and the server's egress policy (tests run servers
-/// with different policies in one process).
-type DiscoveryKey = (String, crate::egress::InternalUpstreams);
+/// Cache key: the issuer, and the server's rules for providers (tests run
+/// servers with different rules in one process).
+type DiscoveryKey = (String, ProviderRules);
 
 fn discovery_cache() -> &'static std::sync::Mutex<HashMap<DiscoveryKey, CachedDiscovery>> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<DiscoveryKey, CachedDiscovery>>> =
@@ -179,16 +225,42 @@ fn cached(
     }
 }
 
-async fn fetch(
-    issuer: &str,
-    policy: crate::egress::InternalUpstreams,
-) -> Result<ProviderDiscovery, String> {
-    let http = ProviderHttp::new(provider_policy(issuer, policy).await?);
+async fn fetch(issuer: &str, rules: ProviderRules) -> Result<ProviderDiscovery, String> {
+    let http = ProviderHttp::new(provider_policy(issuer, rules.egress).await?, rules.schemes);
     let issuer = openidconnect::IssuerUrl::new(issuer.to_string()).map_err(|e| e.to_string())?;
     let metadata = openidconnect::core::CoreProviderMetadata::discover_async(issuer, &http)
         .await
         .map_err(|error| format!("discovery failed: {}", discovery_error(&error)))?;
+    advertised_endpoint_refusal(&metadata, rules.schemes).map_or(Ok(()), Err)?;
     Ok(ProviderDiscovery { metadata, http })
+}
+
+/// Why the endpoints a discovery document advertises may not be used under
+/// `schemes`, if they may not. The browser is sent to the authorization
+/// endpoint, so it is judged here, where it is learned; the others are also
+/// judged on every call ([`ProviderHttp`]), but a document that names one
+/// in plaintext is refused whole rather than failing a login halfway.
+fn advertised_endpoint_refusal(
+    metadata: &openidconnect::core::CoreProviderMetadata,
+    schemes: EndpointSchemes,
+) -> Option<String> {
+    [
+        (
+            "authorization_endpoint",
+            Some(metadata.authorization_endpoint().url()),
+        ),
+        (
+            "token_endpoint",
+            metadata.token_endpoint().map(|url| url.url()),
+        ),
+        ("jwks_uri", Some(metadata.jwks_uri().url())),
+        (
+            "userinfo_endpoint",
+            metadata.userinfo_endpoint().map(|url| url.url()),
+        ),
+    ]
+    .into_iter()
+    .find_map(|(what, url)| url.and_then(|url| schemes.refusal(what, url)))
 }
 
 async fn fetch_and_cache(key: DiscoveryKey) -> Result<ProviderDiscovery, String> {
@@ -223,10 +295,10 @@ fn discovery_error(error: &(dyn std::error::Error + 'static)) -> String {
 
 /// The provider's discovery document and keys, from the cache when fresh.
 pub(super) async fn discover(
-    policy: crate::egress::InternalUpstreams,
+    rules: ProviderRules,
     provider: &OidcProviderConfig,
 ) -> Result<ProviderDiscovery, String> {
-    let key = (provider.issuer_url.clone(), policy);
+    let key = (provider.issuer_url.clone(), rules);
     if let Some(answer) = cached(&key, DISCOVERY_TTL) {
         return answer;
     }
@@ -239,10 +311,10 @@ pub(super) async fn discover(
 /// [`KEY_REFRESH_INTERVAL`] ago is answered from the cache, so tokens naming
 /// unknown keys cannot drive a fetch each.
 pub(super) async fn refresh(
-    policy: crate::egress::InternalUpstreams,
+    rules: ProviderRules,
     provider: &OidcProviderConfig,
 ) -> Result<ProviderDiscovery, String> {
-    let key = (provider.issuer_url.clone(), policy);
+    let key = (provider.issuer_url.clone(), rules);
     let _single = refresh_lock().lock().await;
     if let Some(answer) = cached(&key, KEY_REFRESH_INTERVAL) {
         return answer;
@@ -298,7 +370,7 @@ pub(super) mod tests {
     use crate::egress::InternalUpstreams;
 
     /// Make `issuer`'s cached document old enough for a key refresh to fetch.
-    pub(in crate::http) fn age_for_refresh(issuer: &str, policy: InternalUpstreams) {
+    pub(in crate::http) fn age_for_refresh(issuer: &str, policy: ProviderRules) {
         if let Some(CachedDiscovery::Found { fetched, .. }) = discovery_cache()
             .lock()
             .expect("cache")
@@ -335,8 +407,8 @@ pub(super) mod tests {
     #[tokio::test]
     async fn a_request_to_a_refused_address_is_never_sent() {
         use openidconnect::AsyncHttpClient;
-        let outside = ProviderHttp::new(InternalUpstreams::Refuse);
-        let inside = ProviderHttp::new(InternalUpstreams::Allow);
+        let outside = ProviderHttp::new(InternalUpstreams::Refuse, EndpointSchemes::HttpOrHttps);
+        let inside = ProviderHttp::new(InternalUpstreams::Allow, EndpointSchemes::HttpOrHttps);
         for (http, url) in [
             (&outside, "http://169.254.169.254/latest/meta-data/"),
             (&inside, "http://169.254.169.254/latest/meta-data/"),
@@ -351,6 +423,74 @@ pub(super) mod tests {
             assert!(
                 matches!(&error, openidconnect::HttpClientError::Other(reason) if reason.contains("must not")),
                 "{url}: {error}"
+            );
+        }
+    }
+
+    /// Under `secure_cookies`, no provider endpoint is reached over plaintext:
+    /// the request is refused before it is sent, whatever the address.
+    #[tokio::test]
+    async fn a_plaintext_endpoint_is_never_called_when_https_is_required() {
+        use openidconnect::AsyncHttpClient;
+        let https_only = ProviderHttp::new(InternalUpstreams::Allow, EndpointSchemes::HttpsOnly);
+        let request = openidconnect::http::Request::builder()
+            .uri("http://127.0.0.1:9/keys")
+            .body(Vec::new())
+            .expect("request");
+        let error = https_only.call(request).await.expect_err("plaintext");
+        assert!(
+            matches!(&error, openidconnect::HttpClientError::Other(reason)
+                if reason.contains("must be https")),
+            "{error}"
+        );
+    }
+
+    /// A discovery document fetched over https that advertises a plaintext
+    /// endpoint is refused under `secure_cookies`, naming the endpoint, and
+    /// used as it is by a development server.
+    #[test]
+    fn a_document_advertising_a_plaintext_endpoint_is_refused_when_https_is_required() {
+        let document = |authorization: &str, token: &str, keys: &str, userinfo: &str| {
+            serde_json::from_value::<openidconnect::core::CoreProviderMetadata>(serde_json::json!({
+                "issuer": "https://id.example",
+                "authorization_endpoint": authorization,
+                "token_endpoint": token,
+                "jwks_uri": keys,
+                "userinfo_endpoint": userinfo,
+                "response_types_supported": ["code"],
+                "subject_types_supported": ["public"],
+                "id_token_signing_alg_values_supported": ["RS256"],
+            }))
+            .expect("discovery document")
+        };
+        let https = "https://id.example/x";
+        let plain = "http://id.example/x";
+        assert_eq!(
+            advertised_endpoint_refusal(
+                &document(https, https, https, https),
+                EndpointSchemes::HttpsOnly
+            ),
+            None
+        );
+        for (metadata, named) in [
+            (
+                document(plain, https, https, https),
+                "authorization_endpoint",
+            ),
+            (document(https, plain, https, https), "token_endpoint"),
+            (document(https, https, plain, https), "jwks_uri"),
+            (document(https, https, https, plain), "userinfo_endpoint"),
+        ] {
+            let refusal = advertised_endpoint_refusal(&metadata, EndpointSchemes::HttpsOnly)
+                .expect("a plaintext endpoint is refused");
+            assert!(
+                refusal.contains(named) && refusal.contains("https"),
+                "{refusal}"
+            );
+            assert_eq!(
+                advertised_endpoint_refusal(&metadata, EndpointSchemes::HttpOrHttps),
+                None,
+                "a development server may use {named} over http"
             );
         }
     }
@@ -435,7 +575,10 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn a_key_refresh_is_throttled_and_a_failed_discovery_is_remembered_briefly() {
-        let policy = InternalUpstreams::Refuse;
+        let policy = ProviderRules {
+            egress: InternalUpstreams::Refuse,
+            schemes: EndpointSchemes::HttpOrHttps,
+        };
         let keys = Arc::new(std::sync::Mutex::new(key_set("old")));
         let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = |fetches: &std::sync::atomic::AtomicUsize| {

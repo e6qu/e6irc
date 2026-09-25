@@ -3440,6 +3440,7 @@ mod ingress_tests {
             mono_clock,
             command_flood: None,
             registration_burst: None,
+            sasl_requirement: Default::default(),
             reserved_account_names: crate::identity::ReservedAccountNames::default(),
         }
     }
@@ -4026,6 +4027,12 @@ mod ingress_tests {
     #[test]
     fn invitation_for_a_session_that_has_closed_is_dropped() {
         let mut core = single_core();
+        let (bob, mut bob_rx) = register_on_first(&mut core, "bob");
+        core.handle(Input::Closed {
+            conn: bob,
+            reason: "gone".into(),
+        });
+        while bob_rx.try_pop().is_some() {}
         // The invitee disconnected while the invitation crossed shards.
         core.handle(Input::ChannelSessionEvent {
             session: SessionOwner::new(ConnId(2), CoreShardId(0)),
@@ -4036,6 +4043,21 @@ mod ingress_tests {
                 channel: "#chat".into(),
             },
         });
+        assert!(
+            bob_rx.try_pop().is_none(),
+            "nothing is written for a closed session"
+        );
+        assert!(
+            core.state.sessions.get(&bob).is_none(),
+            "the invitation does not bring the session back"
+        );
+        assert!(
+            core.state
+                .channels
+                .get(&core.state.chan_key("#chat"))
+                .is_none(),
+            "nor does it create the channel or an invitation to it"
+        );
     }
 
     #[test]

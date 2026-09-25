@@ -21,6 +21,32 @@ fn reference() -> String {
     std::fs::read_to_string(path).expect("vendored Libera snapshot present")
 }
 
+/// The snapshot is the file its provenance record describes (DESIGN §2): an
+/// edit to it without a new capture, date and checksum fails here.
+#[test]
+fn the_snapshot_matches_its_recorded_checksum() {
+    let provenance = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../vendor/tests/libera-snapshot/PROVENANCE.md"
+    ))
+    .expect("vendored provenance record present");
+    let recorded = provenance
+        .lines()
+        .find_map(|line| line.strip_prefix("- **sha256**: `"))
+        .and_then(|rest| rest.strip_suffix('`'))
+        .expect("PROVENANCE.md records the snapshot's sha256");
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, reference().as_bytes());
+    let actual: String = digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        actual, recorded,
+        "libera-greeting.txt changed without its record"
+    );
+}
+
 /// Tokens where divergence is deliberate and documented — additions
 /// need a reason in the comment.
 const WHITELIST: &[&str] = &[
@@ -103,6 +129,7 @@ fn our_isupport() -> HashMap<String, String> {
             mono_clock: || e6irc_proto::time::MonoMillis::from_millis(0),
             command_flood: None,
             registration_burst: None,
+            sasl_requirement: Default::default(),
             reserved_account_names: e6ircd::identity::ReservedAccountNames::default(),
         },
         db_tx,

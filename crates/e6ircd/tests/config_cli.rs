@@ -296,3 +296,51 @@ fn every_configured_certificate_pair_is_read_by_the_check() {
     }
     std::fs::remove_dir_all(dir).expect("remove the scratch directory");
 }
+
+/// `check-config` refuses a SASL requirement start would refuse — one no
+/// client could meet without accounts, or an address range that is not one —
+/// and passes one start would run with.
+#[test]
+fn check_config_judges_the_sasl_requirement_as_start_does() {
+    let path = std::env::temp_dir().join(format!("e6irc-require-sasl-{}.toml", std::process::id()));
+    let check = |database: bool, limits: &str| {
+        let database = if database {
+            "[database]\nurl = \"postgres://e6irc@db.example.invalid/e6irc\"\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "server_name = \"irc.example.test\"\nnetwork_name = \"Example\"\n\
+                 application_release_revision = {REVISION:?}\n\
+                 [[listeners]]\naddr = \"127.0.0.1:6667\"\n{database}[limits]\n{limits}\n"
+            ),
+        )
+        .expect("write the configuration");
+        e6ircd(
+            &[
+                "check-config",
+                "--config",
+                path.to_str().expect("UTF-8 path"),
+            ],
+            &[],
+        )
+    };
+    let valid = check(true, "require_sasl_from = [\"192.0.2.0/24\"]");
+    assert!(valid.status.success(), "{}", report(&valid));
+    for (database, limits, named) in [
+        (false, "require_sasl = true", "require [database]"),
+        (
+            true,
+            "require_sasl_from = [\"192.0.2.0/33\"]",
+            "require_sasl_from",
+        ),
+    ] {
+        let output = check(database, limits);
+        let said = report(&output);
+        assert!(!output.status.success(), "{limits}: {said}");
+        assert!(said.contains(named), "{limits}: {said}");
+    }
+    std::fs::remove_file(&path).expect("remove the configuration");
+}

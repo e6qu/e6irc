@@ -692,7 +692,6 @@ mod tests {
             files.contains(&this_module),
             "the walk sees the daemon's sources"
         );
-        let readers = ["env::var(", "env::var_os(", "env::vars(", "env::vars_os("];
         let offenders: Vec<String> = files
             .iter()
             .filter(|path| **path != this_module)
@@ -700,7 +699,7 @@ mod tests {
                 let text = std::fs::read_to_string(path).expect("read a source file");
                 text.lines()
                     .enumerate()
-                    .filter(|(_, line)| readers.iter().any(|reader| line.contains(reader)))
+                    .filter(|(_, line)| names_an_environment_reader(line))
                     .map(|(number, line)| {
                         format!("{}:{}: {}", path.display(), number + 1, line.trim())
                     })
@@ -712,5 +711,54 @@ mod tests {
             "read the environment through environment_config::optional:\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// Whether `line` names one of `std::env`'s variable readers: called
+    /// (`env::var(`), imported (`use std::env::var;`, `env::{self, vars}`)
+    /// or renamed (`env::var_os as read`). An import is a reader too: after
+    /// `use std::env::var;` a bare `var("X")` reads the environment.
+    fn names_an_environment_reader(line: &str) -> bool {
+        const READERS: [&str; 4] = ["var", "var_os", "vars", "vars_os"];
+        line.match_indices("env::").any(|(at, _)| {
+            let rest = &line[at + "env::".len()..];
+            let named = |text: &str| {
+                let word: String = text
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                READERS.contains(&word.as_str())
+            };
+            match rest.strip_prefix('{') {
+                Some(list) => list
+                    .split('}')
+                    .next()
+                    .is_some_and(|items| items.split(',').any(|item| named(item.trim()))),
+                None => named(rest),
+            }
+        })
+    }
+
+    #[test]
+    fn every_way_to_name_an_environment_reader_is_seen() {
+        for line in [
+            "let key = std::env::var(\"E6IRC_SECRET_KEY\");",
+            "std::env::var_os(name)",
+            "for (name, value) in env::vars() {",
+            "use std::env::var;",
+            "use std::env::{self, var_os};",
+            "use std::env::{args, vars_os as all};",
+            "use std::env::var as read;",
+        ] {
+            assert!(names_an_environment_reader(line), "{line}");
+        }
+        for line in [
+            "use std::env;",
+            "let path = std::env::current_dir();",
+            "std::env::args().nth(1)",
+            "let variance = env::variance();",
+            "use std::env::{args, current_exe};",
+        ] {
+            assert!(!names_an_environment_reader(line), "{line}");
+        }
     }
 }

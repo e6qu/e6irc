@@ -21,7 +21,11 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 SERVER = pathlib.Path(
     os.environ.get("E6IRC_TEST_SERVER_BINARY", ROOT / "target/debug/e6ircd")
 ).resolve()
-POSTGRES_IMAGE = os.environ.get("E6IRC_TEST_POSTGRES_IMAGE", "postgres:18-alpine")
+# The digest CI pins (tools/check-image-pins.py holds every reference equal).
+POSTGRES_IMAGE = os.environ.get(
+    "E6IRC_TEST_POSTGRES_IMAGE",
+    "postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873",
+)
 # Every reserved URL delimiter appears in the password, so a consumer that
 # forgets to percent-decode it (or that splits the URL on the wrong `@`, `:` or
 # `/`) cannot authenticate.

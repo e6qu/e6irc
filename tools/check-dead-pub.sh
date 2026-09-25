@@ -2,10 +2,15 @@
 # Catch fully public items kept alive only by tests.
 # Use `dead-pub-allow: reason` on a justified exception.
 #
-# "Only by tests" covers both integration tests (`crates/*/tests/`, never read)
-# and inline `#[cfg(test)]` items in shipped source, which are blanked out
-# before references are counted: a use inside `mod tests { .. }` keeps nothing
-# alive in the shipped binary. tools/test-check-dead-pub.sh holds the contract.
+# "Only by tests" covers integration tests (`crates/*/tests/`) and fuzz
+# targets (`fuzz/`), neither of which is read, and inline `#[cfg(test)]` and
+# `#[cfg(fuzzing)]` items in shipped source, which are blanked out before
+# references are counted: a use inside `mod tests { .. }` keeps nothing alive
+# in the shipped binary. An occurrence shaped like a definition (`fn NAME`)
+# is not a use either, so an unrelated item of the same name keeps nothing
+# alive. Every fully public item is checked: fn (with any qualifiers and
+# ABI), struct, enum, union, const, static, type, trait, mod, and each name
+# a `pub use` exports. tools/test-check-dead-pub.sh holds the contract.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -99,11 +104,12 @@ def split_top(args: str):
 
 
 def test_only(pred: str) -> bool:
-    """True when PRED can hold only under `cfg(test)`: `test` itself, or an
+    """True when PRED can hold only in a test harness: `test` itself, cargo-
+    fuzz's `fuzzing` (the fuzz targets are tests that are never shipped), or an
     `all(..)` with a test-only member. `any(test, ..)` and `not(test)` are
     shipped code and stay counted."""
     pred = re.sub(r"\s+", "", pred)
-    if pred == "test":
+    if pred in ("test", "fuzzing"):
         return True
     if pred.startswith("all(") and pred.endswith(")"):
         return any(test_only(p) for p in split_top(pred[4:-1]))
@@ -216,23 +222,65 @@ shipped = {os.path.normpath(f): s for f, s in shipped.items()}
 allsrc = "\n".join(shipped.values())
 
 # `fn` takes its qualifiers with it: without them `pub async fn run` was never
-# looked at, and `pub const fn new` was read as a constant named `fn`.
-defre = re.compile(r'\bpub\s+(?:(?:(?:const|async|unsafe)\s+)*fn|struct|enum|const|static|type|trait)'
-                   r'\s+([A-Za-z_][A-Za-z0-9_]*)')
+# looked at, and `pub const fn new` was read as a constant named `fn`. An ABI
+# string (`pub extern "C" fn`) was blanked with the other strings above.
+IDENT = r'([A-Za-z_][A-Za-z0-9_]*)'
+defre = re.compile(r'\bpub\s+(?:(?:(?:const|async|unsafe|extern)\s+)*fn'
+                   r'|struct|enum|union|const|static|type|(?:unsafe\s+)?trait|mod)'
+                   r'\s+' + IDENT)
+# `pub use path::Name;`, `pub use path::{A, B as C};`: each name it exports.
+USE = re.compile(r'\bpub\s+use\s+([^;]*);')
+
+
+def use_names(code: str):
+    """(offset, name) for every name a `pub use` in `code` exports. A glob
+    exports no name of its own; `self` re-exports a module already counted
+    under its own name, and `as _` exports nothing nameable."""
+    for m in USE.finditer(code):
+        body, base = m.group(1), m.start(1)
+        for part in re.finditer(r'[^,{}]+', body):
+            words = part.group().split()
+            if not words:
+                continue
+            name = words[2] if len(words) == 3 and words[1] == "as" else \
+                words[-1].rsplit("::", 1)[-1]
+            if re.fullmatch(IDENT, name) and name not in ("_", "self", "crate", "super"):
+                yield base + part.start() + part.group().rindex(name), name
+
+
+# An occurrence shaped like a definition (`fn NAME`, `struct NAME`, ...)
+# declares something, it does not use it: an unrelated `fn serialize` in a
+# serde impl must not keep a dead `pub fn serialize` alive.
+from collections import Counter
+# A name's occurrences are its `\w+` runs, exactly what `\bNAME\b` matches.
+occurrences = Counter(re.findall(r'\w+', allsrc))
+definitions = Counter(re.findall(
+    r'\b(?:fn|struct|enum|union|const|static|type|trait|mod|macro_rules!)\s+(\w+)', allsrc))
+
+
+def uses(name: str) -> int:
+    return occurrences[name] - definitions[name]
+
+
 allow = "dead-pub-allow"
+
+
+def allowed(lines, i: int) -> bool:
+    return allow in lines[i] or (i > 0 and allow in lines[i - 1])
+
 
 dead = []
 for f, t in texts.items():
     lines = t.splitlines()
-    code_lines = shipped[os.path.normpath(f)].splitlines()
-    for i, line in enumerate(code_lines):
+    code = shipped[os.path.normpath(f)]
+    for i, line in enumerate(code.splitlines()):
         m = defre.search(line)
-        if not m:
-            continue
-        name = m.group(1)
-        if allow in lines[i] or (i > 0 and allow in lines[i - 1]):
-            continue
-        if len(re.findall(r'\b' + re.escape(name) + r'\b', allsrc)) <= 1:
+        if m and not allowed(lines, i) and uses(m.group(1)) == 0:
+            dead.append((f, i + 1, m.group(1)))
+    # A re-export's own line names it once: a use beyond that is needed.
+    for at, name in use_names(code):
+        i = code.count("\n", 0, at)
+        if not allowed(lines, i) and uses(name) <= 1:
             dead.append((f, i + 1, name))
 
 if dead:
