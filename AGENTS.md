@@ -119,9 +119,9 @@ Because it already regressed. Sweep after sweep, with an explicit "do not
 defer" instruction standing, the agent kept coining "surfaced, not done"
 sections and moving on — treating "surface, don't swallow" as permission
 to swallow-by-documenting. `tools/check-no-defer.sh` now fails the gate on
-the known vehicles (an open `BUGS.md` entry, a new deferral idiom added to
-`PLAN.md`), so the regression is caught mechanically and not left to
-memory.
+the known vehicles (an open `BUGS.md` entry, a deferral idiom added to any
+file — `PLAN.md`, `DESIGN.md`, docs, a code comment), so the regression is
+caught mechanically and not left to memory.
 
 ---
 
@@ -196,7 +196,7 @@ mistake, before a single line changes.
       every target that builds it field by field).
 - [ ] `tools/check-no-defer.sh` clean (no deferral vehicle in use — see the
       No-Deferral Rule above: `BUGS.md` empty, no new "surfaced, not
-      done"-style note in `PLAN.md`).
+      done"-style note added to any file).
 - [ ] Anything you moved/renamed: all references updated.
 - [ ] Anything broken you noticed on the way: **fixed**, or escalated to the
       human as an explicit decision — never filed away for later.
