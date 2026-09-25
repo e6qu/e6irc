@@ -176,16 +176,7 @@ impl<'a> Message<'a> {
         let mut tags = Vec::new();
         if let Some(after_at) = rest.strip_prefix('@') {
             let (raw_tags, after) = after_at.split_once(' ').ok_or(ParseError::Truncated)?;
-            for item in raw_tags.split(';') {
-                let (key, value) = match item.split_once('=') {
-                    Some((k, v)) => (k, Some(unescape_tag_value(v))),
-                    None => (item, None),
-                };
-                if key.is_empty() {
-                    return Err(ParseError::BadTag);
-                }
-                tags.push(Tag { key, value });
-            }
+            tags = parse_tag_section(raw_tags)?;
             rest = after;
         }
 
@@ -265,6 +256,46 @@ impl<'a> Message<'a> {
     pub fn tag(&self, key: &str) -> Option<&Tag<'a>> {
         self.tags.iter().rev().find(|t| t.key == key)
     }
+}
+
+/// The tags of a tag section (the text between the leading `@` and the first
+/// space), in wire order.
+fn parse_tag_section(raw_tags: &str) -> Result<Vec<Tag<'_>>, ParseError> {
+    raw_tags
+        .split(';')
+        .map(|item| {
+            let (key, value) = match item.split_once('=') {
+                Some((k, v)) => (k, Some(unescape_tag_value(v))),
+                None => (item, None),
+            };
+            if key.is_empty() {
+                Err(ParseError::BadTag)
+            } else {
+                Ok(Tag { key, value })
+            }
+        })
+        .collect()
+}
+
+/// The unescaped value of tag `key` on a line that is refused before it can be
+/// parsed whole — not UTF-8, over the length limits, or malformed after its
+/// tag section — read from the tag section alone, exactly as
+/// [`Message::tag`] would read it (the last occurrence wins). A server answers
+/// such a line under its `label`, which the client is waiting on. `None` when
+/// the line has no well-formed tag section, or the tag no value.
+pub fn tag_section_value(line: &[u8], key: &str) -> Option<String> {
+    let rest = line.strip_prefix(b"@")?;
+    let end = rest.iter().position(|&b| b == b' ')?;
+    let section = std::str::from_utf8(&rest[..end]).ok()?;
+    if contains_illegal_byte(section) {
+        return None;
+    }
+    let tags = parse_tag_section(section).ok()?;
+    tags.into_iter()
+        .rev()
+        .find(|tag| tag.key == key)?
+        .value
+        .map(Cow::into_owned)
 }
 
 /// Unescape a raw tag value per the message-tags spec: `\:` `\s` `\\`

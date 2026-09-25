@@ -261,15 +261,15 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     // `*` means "my current nick". Without a nick there is nothing to name the
-    // account after — which is the case when the nick the client wanted was
-    // already taken, so it is reported as the name being unavailable.
+    // account after — the case the spec's NEED_NICK is for (the nick the client
+    // wanted may have been taken).
     let Some(nick) = nick else {
         register_fail(
             state,
             conn,
-            "ACCOUNT_EXISTS",
+            "NEED_NICK",
             "*",
-            "That nickname is already in use, so it cannot be registered",
+            "You must hold a nickname before registering an account",
         );
         return;
     };
@@ -322,6 +322,17 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             }
         }
     };
+    let password = match crate::identity::NewPassword::parse(password) {
+        Ok(password) => password,
+        Err(refusal) => {
+            let code = match refusal {
+                crate::identity::PasswordRefusal::Empty => "WEAK_PASSWORD",
+                crate::identity::PasswordRefusal::TooLong => "UNACCEPTABLE_PASSWORD",
+            };
+            register_fail(state, conn, code, &nick, refusal.explanation());
+            return;
+        }
+    };
     if state.sessions[&conn].account().is_some() {
         register_fail(
             state,
@@ -369,7 +380,7 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         conn,
         name: nick.clone(),
         contact_email,
-        password: password.to_string(),
+        password,
         origin: crate::core::AccountOrigin::RegisterCommand,
     };
     if state.db_tx.try_push(request).is_err() {
@@ -382,12 +393,7 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
     } else {
         // Hold later output until the database replies.
-        state.defer_reply(conn);
-        let label = state.capture.as_mut().and_then(|cap| {
-            cap.label.clone().inspect(|_| {
-                cap.deferred = true;
-            })
-        });
+        let label = state.defer_captured_reply(conn);
         state
             .sessions
             .get_mut(&conn)

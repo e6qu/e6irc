@@ -9,6 +9,7 @@ use bytes::Bytes;
 use e6irc_proto::casemap::CaseMapping;
 use e6irc_proto::numerics::{
     ERR_NEEDMOREPARAMS, ERR_NOSUCHCHANNEL, ERR_NOSUCHNICK, ERR_NOTONCHANNEL, ERR_USERNOTINCHANNEL,
+    RPL_LOGGEDIN, RPL_LOGGEDOUT,
 };
 use e6irc_queue::Sender;
 
@@ -198,9 +199,15 @@ impl MembershipDirectory {
         channels.get(key).map(|channel| channel.created_at)
     }
 
-    /// `target`'s channels as WHOIS shows them to `requester`: rank sigil and
-    /// display name, sorted, without the secret channels the two do not share.
-    pub(crate) fn whois_channels(&self, target: ConnId, requester: ConnId) -> Vec<String> {
+    /// `target`'s channels as WHOIS shows them to `requester`: rank sigils (all
+    /// of them for a `multi_prefix` requester) and display name, sorted,
+    /// without the secret channels the two do not share.
+    pub(crate) fn whois_channels(
+        &self,
+        target: ConnId,
+        requester: ConnId,
+        multi_prefix: bool,
+    ) -> Vec<String> {
         let by_conn = self.by_conn.lock().expect("membership directory poisoned");
         let channels = self.channels.lock().expect("membership directory poisoned");
         let shared = by_conn.get(&requester);
@@ -216,11 +223,10 @@ impl MembershipDirectory {
                 if channel.secret && !shared.is_some_and(|shared| shared.contains(key)) {
                     return None;
                 }
-                let sigil = match channel.ranks.get(&target) {
-                    Some(modes) if modes.op => "@",
-                    Some(modes) if modes.voice => "+",
-                    _ => "",
-                };
+                let sigil = channel
+                    .ranks
+                    .get(&target)
+                    .map_or("", |modes| modes.sigils(multi_prefix));
                 Some(format!("{sigil}{}", channel.name))
             })
             .collect();
@@ -1654,8 +1660,10 @@ pub(crate) struct Session {
     /// abort — the abort clears the state machine but cannot un-send the DB
     /// request, so the reply still comes. It gates a *new* SASL verify and an
     /// IDENTIFY until that stale reply is drained, so a reply can never be
-    /// attributed to a different attempt than the one that produced it.
-    pub sasl_verify_pending: bool,
+    /// attributed to a different attempt than the one that produced it. It
+    /// carries the label of the `AUTHENTICATE` that completed the payload: the
+    /// verdict is that command's labeled response.
+    pub sasl_verify: Option<PendingServiceReply>,
     /// Accumulates 400-byte AUTHENTICATE continuation chunks (SASL spec)
     /// until a short line completes the payload.
     pub sasl_buf: String,
@@ -2098,12 +2106,39 @@ impl Session {
             }
         }
     }
+
+    /// `nick!user@host` as far as it is known — `*` for a part a registering
+    /// session has not sent yet — for RPL_LOGGEDIN and RPL_LOGGEDOUT, which a
+    /// connect-time SASL login reaches before registration completes.
+    pub(crate) fn login_mask(&self) -> String {
+        format!(
+            "{}!{}@{}",
+            self.nick().unwrap_or("*"),
+            self.user().unwrap_or("*"),
+            self.host
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MemberModes {
     pub op: bool,
     pub voice: bool,
+}
+
+impl MemberModes {
+    /// The rank sigils NAMES, WHO and WHOIS show for this member: every rank
+    /// held, highest first, to a requester that negotiated `multi-prefix`;
+    /// the highest alone to any other. The one renderer, so no reply can
+    /// honour the capability where another ignores it.
+    pub(crate) fn sigils(&self, multi_prefix: bool) -> &'static str {
+        match (self.op, self.voice, multi_prefix) {
+            (true, true, true) => "@+",
+            (true, _, _) => "@",
+            (false, true, _) => "+",
+            (false, false, _) => "",
+        }
+    }
 }
 
 /// A channel recipient and the worker that owns its session.
@@ -3395,31 +3430,10 @@ impl MlockModes {
     }
 }
 
-/// One line of channel history in the hot ring.
-#[derive(Debug, Clone)]
-pub struct HistoryEntry {
-    pub msgid: String,
-    /// Unix **milliseconds** (see `Config::clock`): CHATHISTORY pages by this,
-    /// so second granularity would make same-second messages unorderable.
-    pub ts: e6irc_proto::time::Millis,
-    pub sender_prefix: String,
-    /// The sender's account at send time (`None` if unauthenticated); lets DM
-    /// replay re-address by stable identity rather than by the sender's nick.
-    pub sender_account: Option<String>,
-    /// "PRIVMSG" or "NOTICE" as sent on the wire.
-    pub kind: crate::core::MessageKind,
-    pub body: String,
-    /// The sender was a bot (+B) at send time, so replay re-emits the `bot`
-    /// message tag a message-tags recipient saw live.
-    pub sender_is_bot: bool,
-    /// For a `draft/multiline` message: its lines encoded as one string
-    /// (`crate::core::handler::message::encode_multiline`), so the whole message
-    /// is one history entry with one msgid — not one row per line with fresh,
-    /// never-delivered msgids. `None` for an ordinary single-line message;
-    /// `body` then holds the text. On replay a `Some` reconstructs the multiline
-    /// batch (or flattens) reusing the single msgid, as live delivery did.
-    pub multiline: Option<String>,
-}
+/// One entry of history in the hot ring: the same record a database row
+/// decodes to, so the ring and the database cannot keep different facts about
+/// a message.
+pub type HistoryEntry = crate::core::HistoryRow;
 
 /// The storage key and participants for the direct-message conversation between
 /// two identities, from already-casefolded inputs.
@@ -4260,13 +4274,42 @@ pub(crate) struct Capture {
     /// asynchronously (CHATHISTORY falling back to PostgreSQL) can carry the
     /// label into that deferred reply instead of losing it.
     pub label: Option<String>,
-    /// Set by a handler that defers its response to an async path. Whoever
-    /// reads the capture must not take "no lines" for the answer: the
-    /// labeled-response framer must not ACK the command as empty, and a channel
-    /// owner must not release the requester — the deferred reply does both.
-    pub deferred: bool,
-    /// How many separate answers the command left to asynchronous paths.
-    pub deferrals: usize,
+    /// How many separate answers the command left to asynchronous paths. Only
+    /// [`Capture::defer`] raises it, so "the command is deferred" and "how many
+    /// answers it awaits" are one value: no path can mark a capture deferred
+    /// without counting the answer it awaits.
+    deferrals: usize,
+}
+
+impl Capture {
+    pub(crate) fn new(
+        conn: ConnId,
+        label: Option<String>,
+        reply_target: Option<String>,
+        reply_caps: Option<Caps>,
+    ) -> Self {
+        Self {
+            conn,
+            lines: Vec::new(),
+            reply_target,
+            reply_caps,
+            label,
+            deferrals: 0,
+        }
+    }
+
+    /// One answer to this command will arrive asynchronously; returns the
+    /// label it must carry. Whoever reads the capture then must not take "no
+    /// lines" for the answer: the labeled-response framer must not ACK the
+    /// command as empty, and a channel owner must not release the requester.
+    fn defer(&mut self) -> Option<String> {
+        self.deferrals += 1;
+        self.label.clone()
+    }
+
+    pub(crate) fn is_deferred(&self) -> bool {
+        self.deferrals > 0
+    }
 }
 
 /// A historical nick record for WHOWAS.
@@ -4342,7 +4385,7 @@ impl ServerState {
                 .as_ref()
                 .and_then(|capture| capture.label.clone())
         } else {
-            self.defer_channel_reply(conn)
+            self.defer_captured_reply(conn)
         }
     }
 
@@ -5862,7 +5905,12 @@ impl ServerState {
 
     /// `target`'s channels as WHOIS shows them to `requester`.
     pub(crate) fn whois_channels(&self, target: ConnId, requester: ConnId) -> Vec<String> {
-        self.memberships.whois_channels(target, requester)
+        let multi_prefix = self
+            .sessions
+            .get(&requester)
+            .is_some_and(|session| session.caps.multi_prefix);
+        self.memberships
+            .whois_channels(target, requester, multi_prefix)
     }
 
     /// A channel, on any shard, where `conn` is a plain member banned or
@@ -6010,7 +6058,7 @@ impl ServerState {
                 caps: Caps::default(),
                 account: None,
                 sasl: SaslState::default(),
-                sasl_verify_pending: false,
+                sasl_verify: None,
                 sasl_buf: String::new(),
                 credential_attempts: crate::identity::CredentialAttemptBudget::default(),
                 pending_identify: None,
@@ -6113,9 +6161,8 @@ impl ServerState {
     /// client, so a production panic here would be worse than the over-long
     /// line it flags. Tests and fuzzers are where the invariant bites.
     #[cfg(debug_assertions)]
-    fn debug_check_wire_line(&self, conn: ConnId, bytes: &Bytes) {
-        let multiline = self.sessions.get(&conn).is_some_and(|s| s.caps.multiline);
-        if let Some(violation) = wire_line_violation(bytes, multiline) {
+    fn debug_check_wire_line(&self, bytes: &Bytes) {
+        if let Some(violation) = wire_line_violation(bytes) {
             panic!("{violation}: {:?}", String::from_utf8_lossy(bytes));
         }
     }
@@ -6125,7 +6172,7 @@ impl ServerState {
     /// labeled response to its own command — only direct replies are.
     pub fn send_bytes_uncaptured(&mut self, conn: ConnId, bytes: Bytes) {
         #[cfg(debug_assertions)]
-        self.debug_check_wire_line(conn, &bytes);
+        self.debug_check_wire_line(&bytes);
         // Hold this line behind an in-flight deferred reply, unless it *is*
         // that reply being emitted right now. Held output is bounded exactly
         // like the queue it is waiting to enter: overflowing it is a SendQ
@@ -6185,26 +6232,24 @@ impl ServerState {
 
     /// Hold later output behind an asynchronous verdict and tell the capture
     /// collecting this command's replies that the verdict will answer it.
-    pub fn defer_captured_reply(&mut self, conn: ConnId) {
+    /// Returns the label the reply must carry: a cross-shard command's result,
+    /// or a database verdict, owns the deferred slot and the captured label.
+    pub fn defer_captured_reply(&mut self, conn: ConnId) -> Option<String> {
         self.defer_reply(conn);
-        if let Some(capture) = self.capture.as_mut()
-            && capture.conn == conn
-        {
-            capture.deferred = true;
-            capture.deferrals += 1;
-        }
+        self.defer_captured_label(conn)
     }
 
-    /// Start a cross-shard command. Its result owns the deferred slot and,
-    /// when present, the captured label.
-    pub fn defer_channel_reply(&mut self, conn: ConnId) -> Option<String> {
-        let label = self.capture.as_ref().and_then(|capture| {
-            (capture.conn == conn)
-                .then(|| capture.label.clone())
-                .flatten()
-        });
-        self.defer_captured_reply(conn);
-        label
+    /// Tell the capture collecting this command's replies that an answer will
+    /// arrive asynchronously *without* holding the connection's later output
+    /// behind it (a NickServ verdict, a multiline batch's close), and return
+    /// the label that answer must carry. A NickServ verdict is emitted through
+    /// [`Self::emit_labeled_unheld`], which gathers it with whatever the
+    /// command answered on the spot.
+    pub fn defer_captured_label(&mut self, conn: ConnId) -> Option<String> {
+        self.capture
+            .as_mut()
+            .filter(|capture| capture.conn == conn)
+            .and_then(Capture::defer)
     }
 
     /// Emit a reply the connection has been waiting on: it bypasses that
@@ -6232,26 +6277,38 @@ impl ServerState {
         let Some(label) = label else {
             return self.emit_deferred(conn, emit);
         };
-        let mut captured = self.capture_lines(conn, &label, emit);
-        // One of several answers to one labeled command: it waits for the rest.
-        if let Some(session) = self.sessions.output_mut(&conn)
-            && let Some(group) = session.label_groups.get_mut(&label)
-        {
-            group.lines.append(&mut captured);
-            group.outstanding -= 1;
-            if group.outstanding > 0 {
-                // This answer's hold is released; the response is not complete.
-                return self.release_deferred(conn);
-            }
-            captured = session
-                .label_groups
-                .remove(&label)
-                .expect("present above")
-                .lines;
+        let captured = self.capture_lines(conn, &label, emit);
+        match self.gather_labeled_answer(conn, &label, captured) {
+            // This answer's hold is released; the response is not complete.
+            None => self.release_deferred(conn),
+            Some(lines) => self.emit_deferred(conn, |state| {
+                super::handler::frame_labeled(state, conn, &label, lines);
+            }),
         }
-        self.emit_deferred(conn, |state| {
-            super::handler::frame_labeled(state, conn, &label, captured);
-        });
+    }
+
+    /// One asynchronous answer to a labeled command arrived. When the command
+    /// left its answer to several paths, or answered part of it on the spot
+    /// (see [`Self::await_labeled_answers`]), the pieces are gathered: `None`
+    /// while others are outstanding, then every piece in arrival order.
+    fn gather_labeled_answer(
+        &mut self,
+        conn: ConnId,
+        label: &str,
+        mut captured: Vec<Bytes>,
+    ) -> Option<Vec<Bytes>> {
+        let Some(session) = self.sessions.output_mut(&conn) else {
+            return Some(captured);
+        };
+        let Some(group) = session.label_groups.get_mut(label) else {
+            return Some(captured);
+        };
+        group.lines.append(&mut captured);
+        group.outstanding -= 1;
+        if group.outstanding > 0 {
+            return None;
+        }
+        session.label_groups.remove(label).map(|group| group.lines)
     }
 
     /// A labeled command left `capture`'s answer to asynchronous paths. If it
@@ -6286,15 +6343,7 @@ impl ServerState {
         emit: impl FnOnce(&mut Self),
     ) -> Vec<Bytes> {
         debug_assert!(self.capture.is_none(), "deferred reply nested in a capture");
-        self.capture = Some(Capture {
-            conn,
-            lines: Vec::new(),
-            reply_target: None,
-            reply_caps: None,
-            label: Some(label.to_string()),
-            deferred: false,
-            deferrals: 0,
-        });
+        self.capture = Some(Capture::new(conn, Some(label.to_string()), None, None));
         emit(self);
         self.capture.take().map(|c| c.lines).unwrap_or_default()
     }
@@ -6351,22 +6400,10 @@ impl ServerState {
         match label {
             None => emit(self),
             Some(label) => {
-                debug_assert!(
-                    self.capture.is_none(),
-                    "labeled verdict nested in a capture"
-                );
-                self.capture = Some(Capture {
-                    conn,
-                    lines: Vec::new(),
-                    reply_target: None,
-                    reply_caps: None,
-                    label: Some(label.clone()),
-                    deferred: false,
-                    deferrals: 0,
-                });
-                emit(self);
-                let captured = self.capture.take().map(|c| c.lines).unwrap_or_default();
-                super::handler::frame_labeled(self, conn, &label, captured);
+                let captured = self.capture_lines(conn, &label, emit);
+                if let Some(lines) = self.gather_labeled_answer(conn, &label, captured) {
+                    super::handler::frame_labeled(self, conn, &label, lines);
+                }
             }
         }
         self.emitting_deferred = previous;
@@ -6828,6 +6865,11 @@ impl ServerState {
 
     /// Log `conn` in to `account` — the one way a session gains an account.
     ///
+    /// It is also the one place the client is told: RPL_LOGGEDIN (900) is
+    /// "sent when the user's account name is set (whether by SASL or
+    /// otherwise)", so SASL, NickServ IDENTIFY and account registration all
+    /// announce the login the same way by passing through here.
+    ///
     /// Its identity changes with it: it was `~nick`, the identity of whoever
     /// holds the nick without an account, and is the account from here on.
     /// `~nick` is therefore let go now, exactly as when an unauthenticated
@@ -6843,10 +6885,17 @@ impl ServerState {
             .is_none()
             .then(|| session.nick().map(str::to_owned))
             .flatten();
-        let previous = session.account.replace(account);
+        let mask = session.login_mask();
+        let previous = session.account.replace(account.clone());
         if let Some(previous) = previous {
             self.forget_account_session(&previous, conn);
         }
+        self.numeric(
+            conn,
+            RPL_LOGGEDIN,
+            &[&mask, &account],
+            Some(&format!("You are now logged in as {account}")),
+        );
         // Identifying to the account protecting a nick settles its clock
         // (NickServ ENFORCE) — the held one's enforcement ends; identifying
         // to any other account settles nothing.
@@ -6873,17 +6922,22 @@ impl ServerState {
         }
     }
 
-    /// Log `conn` out: it is `~nick` again from here on.
+    /// Log `conn` out: it is `~nick` again from here on. The client is told
+    /// with RPL_LOGGEDOUT (901), sent "when the account name is unset (whether
+    /// by SASL or otherwise)".
     pub(crate) fn clear_account(&mut self, conn: ConnId) {
-        let previous = self
-            .sessions
-            .get_mut(&conn)
-            .expect("session logging out")
-            .account
-            .take();
-        if let Some(previous) = previous {
-            self.forget_account_session(&previous, conn);
-        }
+        let session = self.sessions.get_mut(&conn).expect("session logging out");
+        let mask = session.login_mask();
+        let Some(previous) = session.account.take() else {
+            return;
+        };
+        self.forget_account_session(&previous, conn);
+        self.numeric(
+            conn,
+            RPL_LOGGEDOUT,
+            &[&mask],
+            Some("You are now logged out"),
+        );
     }
 
     /// An unauthenticated session has let go of `nick` — by leaving, by
@@ -6966,12 +7020,11 @@ fn numeric_middle_violation(middle: &str) -> Option<&'static str> {
 
 /// The wire-limit rule behind [`ServerState::debug_check_wire_line`], pure so
 /// it can be pinned by unit tests: `Some(description)` when `line` (CRLF
-/// included) would be discarded by the recipient's framing. A recipient that
-/// negotiated `draft/multiline` accepts the batch form's longer inner lines —
-/// that is the capability's whole point — so its traditional-part budget grows
-/// by the multiline byte cap.
+/// included) would be discarded by the recipient's framing. Every recipient
+/// holds every line to it — `draft/multiline` does not relax the per-line
+/// limit; a long line inside a batch is split with `draft/multiline-concat`.
 #[cfg(debug_assertions)]
-fn wire_line_violation(line: &[u8], multiline_capable: bool) -> Option<String> {
+fn wire_line_violation(line: &[u8]) -> Option<String> {
     use e6irc_proto::message::{MAX_LINE_LEN, MAX_SERVER_TAGS_LEN};
     let (tags_len, body) = match line.first() {
         Some(b'@') => match line.iter().position(|&b| b == b' ') {
@@ -6985,14 +7038,9 @@ fn wire_line_violation(line: &[u8], multiline_capable: bool) -> Option<String> {
             "outbound tag section is {tags_len} bytes (limit {MAX_SERVER_TAGS_LEN})"
         ));
     }
-    let budget = if multiline_capable {
-        MAX_LINE_LEN + crate::core::handler::message::MULTILINE_MAX_BYTES
-    } else {
-        MAX_LINE_LEN
-    };
-    if body.len() > budget {
+    if body.len() > MAX_LINE_LEN {
         return Some(format!(
-            "outbound line's traditional part is {} bytes (limit {budget}) — a client's \
+            "outbound line's traditional part is {} bytes (limit {MAX_LINE_LEN}) — a client's \
              framing discards over-long lines whole",
             body.len()
         ));
@@ -7057,22 +7105,20 @@ mod wire_line_tests {
     use super::wire_line_violation;
 
     #[test]
-    fn holds_the_traditional_limit_and_the_multiline_allowance() {
+    fn holds_the_traditional_limit() {
         let fits = format!(":s PRIVMSG #c :{}\r\n", "x".repeat(490));
         assert!(fits.len() <= 512);
-        assert!(wire_line_violation(fits.as_bytes(), false).is_none());
+        assert!(wire_line_violation(fits.as_bytes()).is_none());
 
         let over = format!(":s PRIVMSG #c :{}\r\n", "x".repeat(500));
         assert!(over.len() > 512);
-        assert!(wire_line_violation(over.as_bytes(), false).is_some());
-        // The same line is legal for a recipient that negotiated multiline.
-        assert!(wire_line_violation(over.as_bytes(), true).is_none());
+        assert!(wire_line_violation(over.as_bytes()).is_some());
 
         // Tags spend the tag budget, not the traditional one.
         let tagged = format!("@time=x;msgid=y :s PRIVMSG #c :{}\r\n", "x".repeat(490));
-        assert!(wire_line_violation(tagged.as_bytes(), false).is_none());
+        assert!(wire_line_violation(tagged.as_bytes()).is_none());
         let huge_tags = format!("@a={} :s PING\r\n", "t".repeat(9000));
-        assert!(wire_line_violation(huge_tags.as_bytes(), false).is_some());
+        assert!(wire_line_violation(huge_tags.as_bytes()).is_some());
     }
 }
 

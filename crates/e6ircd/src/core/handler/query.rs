@@ -168,12 +168,7 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     })
                     .filter(|(_, _, _, profile)| !opers_only || profile.oper)
                     .map(|(_, modes, identity, profile)| {
-                        let sigil = match (modes.op, modes.voice, requester_multi_prefix) {
-                            (true, true, true) => "@+",
-                            (true, _, _) => "@",
-                            (false, true, _) => "+",
-                            _ => "",
-                        };
+                        let sigil = modes.sigils(requester_multi_prefix);
                         WhoRowData {
                             user: profile.user.clone(),
                             host: profile.host.clone(),
@@ -407,8 +402,24 @@ pub(super) fn cmd_setname(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
+    // setname has its own refusal for a realname the server will not take,
+    // and NAMELEN told the client the bound: a longer one is refused, never
+    // cut to something the client did not ask for.
+    if new_name.len() > REALLEN {
+        let server = state.config.server_name.clone();
+        state.send(
+            conn,
+            &super::fail_line(
+                &server,
+                "SETNAME",
+                "INVALID_REALNAME",
+                &[],
+                &format!("Realname is longer than {REALLEN} bytes (NAMELEN)"),
+            ),
+        );
+        return;
+    }
     let prefix = state.sessions[&conn].prefix();
-    let new_name = truncate_chars(new_name, REALLEN);
     state
         .sessions
         .get_mut(&conn)
@@ -544,6 +555,7 @@ pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
             &format!("MONITOR={MONITOR_LIMIT}"),
             &format!("CHATHISTORY={CHATHISTORY_MAX}"),
             "MSGREFTYPES=msgid,timestamp",
+            &format!("NAMELEN={REALLEN}"),
             &format!("MAXLIST=bqeI:{MAXLIST}"),
             &format!("CHANLIMIT=#:{MAX_CHANNELS_PER_SESSION}"),
             // Every command that bounds its target list, at the bound it keeps
@@ -569,6 +581,8 @@ pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
                 crate::core::banmask::EXTBAN_TYPES
             ),
             &format!("ACCOUNTEXTBAN={}", crate::core::banmask::ACCOUNT_EXTBAN),
+            // Enforced by the MODE parser (`channel_mode_by`).
+            &format!("MODES={MODES}"),
         ],
         Some("are supported by this server"),
     );

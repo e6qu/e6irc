@@ -61,18 +61,16 @@ fn verify_denied(
     state: &mut ServerState,
     conn: ConnId,
     origin: crate::core::CredentialOrigin,
+    sasl_label: Option<String>,
     denial: Denial,
 ) {
     match origin {
         crate::core::CredentialOrigin::Sasl => {
-            if state.sessions[&conn].sasl == crate::core::state::SaslState::Verifying {
-                match denial {
-                    Denial::Rejected => sasl_fail(state, conn),
-                    Denial::Throttled(retry_after) => sasl_throttled(state, conn, retry_after),
-                    Denial::Unavailable => sasl_unavailable(state, conn),
-                }
-            }
-            // else: stale reply for an aborted SASL attempt — drop it.
+            sasl_verdict(state, conn, sasl_label, move |state| match denial {
+                Denial::Rejected => sasl_fail(state, conn),
+                Denial::Throttled(retry_after) => sasl_throttled(state, conn, retry_after),
+                Denial::Unavailable => sasl_unavailable(state, conn),
+            });
         }
         crate::core::CredentialOrigin::NickServIdentify => {
             let Some(label) = take_identify_label(state, conn) else {
@@ -126,6 +124,24 @@ pub(super) fn credential_attempt_ok(state: &mut ServerState, conn: ConnId) -> bo
         return false;
     }
     true
+}
+
+/// Answer a SASL verification verdict as the labeled response of the
+/// `AUTHENTICATE` that completed the payload. A verdict for an attempt that was
+/// aborted meanwhile (`AUTHENTICATE *`, or a line sent mid-verify) is not
+/// delivered — the abort was the attempt's answer — but its command's label is
+/// still owed a response, so it is answered empty (`ACK`).
+fn sasl_verdict(
+    state: &mut ServerState,
+    conn: ConnId,
+    label: Option<String>,
+    emit: impl FnOnce(&mut ServerState),
+) {
+    if state.sessions[&conn].sasl == crate::core::state::SaslState::Verifying {
+        state.emit_labeled_unheld(conn, label, emit);
+    } else {
+        state.emit_labeled_unheld(conn, label, |_| {});
+    }
 }
 
 /// Take the pending NickServ IDENTIFY label.
@@ -275,7 +291,7 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
             // abort (which can't un-send the DB request), so re-auth waits for
             // that stale reply to drain rather than racing it.
             if state.sessions[&conn].pending_identify.is_some()
-                || state.sessions[&conn].sasl_verify_pending
+                || state.sessions[&conn].sasl_verify.is_some()
             {
                 sasl_fail(state, conn);
                 return;
@@ -304,11 +320,7 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
                     // it only *after* the push means the flag can never outlive a
                     // request that was never sent — the state that otherwise
                     // locked the connection out of auth for good.
-                    state
-                        .sessions
-                        .get_mut(&conn)
-                        .expect("checked")
-                        .sasl_verify_pending = true;
+                    sasl_verify_queued(state, conn);
                 }
             } else {
                 // RFC 7628: gs2-header then \x01-separated key=value fields;
@@ -336,23 +348,32 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
                     // true and locked the connection out of all auth for good).
                     sasl_fail(state, conn);
                 } else {
-                    state
-                        .sessions
-                        .get_mut(&conn)
-                        .expect("checked")
-                        .sasl_verify_pending = true;
+                    sasl_verify_queued(state, conn);
                 }
             }
         }
         SaslState::Verifying => {
+            // Nothing is awaited from the client while its credentials are
+            // checked, so a line now abandons the attempt. It ends here, for
+            // real: this 904 is the attempt's only verdict, and the one still
+            // in flight is dropped when it lands (`sasl_verdict`).
+            state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Idle;
             state.numeric(
                 conn,
                 ERR_SASLFAIL,
                 &[],
-                Some("SASL authentication in progress"),
+                Some("SASL authentication abandoned while it was being verified"),
             );
         }
     }
+}
+
+/// A SASL credential verify was queued: remember it, with the label of the
+/// command that completed the payload, until its verdict lands.
+fn sasl_verify_queued(state: &mut ServerState, conn: ConnId) {
+    let label = state.defer_captured_label(conn);
+    state.sessions.get_mut(&conn).expect("checked").sasl_verify =
+        Some(crate::core::state::PendingServiceReply::new(label));
 }
 
 pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core::DbReply) {
@@ -387,10 +408,10 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             | crate::core::DbReply::Unavailable { .. }
     );
     // A SASL verify reply (even one for an aborted attempt) clears the
-    // outstanding-verify marker so a queued re-auth can proceed. Only SASL
-    // sets the flag, so gate the clear on the SASL origin — a NickServ IDENTIFY
-    // verdict must not touch it.
-    if matches!(
+    // outstanding-verify marker so a queued re-auth can proceed, and yields the
+    // label its verdict answers. Only SASL sets the marker, so gate the clear
+    // on the SASL origin — a NickServ IDENTIFY verdict must not touch it.
+    let sasl_label = if matches!(
         reply,
         crate::core::DbReply::PasswordVerified {
             origin: crate::core::CredentialOrigin::Sasl,
@@ -403,10 +424,15 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
         } | crate::core::DbReply::Unavailable {
             origin: crate::core::CredentialOrigin::Sasl,
         }
-    ) && let Some(s) = state.sessions.get_mut(&conn)
-    {
-        s.sasl_verify_pending = false;
-    }
+    ) {
+        state
+            .sessions
+            .get_mut(&conn)
+            .and_then(|session| session.sasl_verify.take())
+            .and_then(crate::core::state::PendingServiceReply::into_label)
+    } else {
+        None
+    };
     // Suspension and credential replies are serialized through the core. Once
     // the administrative event installs this deny gate, even a successful DB
     // verification that was already in flight is converted to a denial rather
@@ -414,7 +440,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
     if let crate::core::DbReply::PasswordVerified { account, origin } = &reply
         && state.is_account_suspended(account)
     {
-        verify_denied(state, conn, *origin, Denial::Rejected);
+        verify_denied(state, conn, *origin, sasl_label, Denial::Rejected);
         return;
     }
     match reply {
@@ -424,32 +450,21 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             origin: crate::core::CredentialOrigin::Sasl,
         } => {
             if state.sessions[&conn].sasl != SaslState::Verifying {
-                return; // stale SASL reply (the attempt was aborted)
+                // Stale: the attempt was aborted. Its label still gets an answer.
+                return sasl_verdict(state, conn, sasl_label, |_| {});
             }
-            state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Idle;
-            state.set_account(conn, account.clone());
-            let session = &state.sessions[&conn];
-            let nick = session
-                .nick()
-                .map(String::from)
-                .unwrap_or_else(|| "*".into());
-            let user = session
-                .user()
-                .map(String::from)
-                .unwrap_or_else(|| "*".into());
-            let host = session.host.clone();
-            state.numeric(
-                conn,
-                RPL_LOGGEDIN,
-                &[&format!("{nick}!{user}@{host}"), &account],
-                Some(&format!("You are now logged in as {account}")),
-            );
-            state.numeric(
-                conn,
-                RPL_SASLSUCCESS,
-                &[],
-                Some("SASL authentication successful"),
-            );
+            let logged_in = account.clone();
+            sasl_verdict(state, conn, sasl_label, move |state| {
+                state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Idle;
+                // RPL_LOGGEDIN comes from `set_account`, the one login path.
+                state.set_account(conn, logged_in);
+                state.numeric(
+                    conn,
+                    RPL_SASLSUCCESS,
+                    &[],
+                    Some("SASL authentication successful"),
+                );
+            });
             // A registered client can re-authenticate mid-session (cap-notify
             // allows `CAP REQ :sasl` after registration); account-notify peers
             // must learn of the login like any other. For connect-time SASL
@@ -464,12 +479,13 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             let Some(label) = take_identify_label(state, conn) else {
                 return; // stale IDENTIFY reply (superseded/aborted)
             };
-            state.set_account(conn, account.clone());
-            // Frame the verdict under the IDENTIFY's label (if any) so a labeled
-            // client can correlate the result; an unlabeled one just gets the
-            // NOTICE. Unheld — it interleaves with other output like a real server.
+            // Frame the verdict — RPL_LOGGEDIN from `set_account`, then the
+            // NOTICE — under the IDENTIFY's label (if any) so a labeled client
+            // can correlate the result. Unheld — it interleaves with other
+            // output like a real server.
             let account_for_notice = account.clone();
             state.emit_labeled_unheld(conn, label, move |state| {
+                state.set_account(conn, account_for_notice.clone());
                 state.service_notice(
                     conn,
                     "NickServ",
@@ -479,16 +495,22 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             notify_account_change(state, conn, &account);
         }
         crate::core::DbReply::PasswordRejected { origin } => {
-            verify_denied(state, conn, origin, Denial::Rejected);
+            verify_denied(state, conn, origin, sasl_label, Denial::Rejected);
         }
         crate::core::DbReply::PasswordThrottled {
             origin,
             retry_after,
         } => {
-            verify_denied(state, conn, origin, Denial::Throttled(retry_after));
+            verify_denied(
+                state,
+                conn,
+                origin,
+                sasl_label,
+                Denial::Throttled(retry_after),
+            );
         }
         crate::core::DbReply::Unavailable { origin } => {
-            verify_denied(state, conn, origin, Denial::Unavailable);
+            verify_denied(state, conn, origin, sasl_label, Denial::Unavailable);
         }
         crate::core::DbReply::AccountRegisterUnavailable { origin } => {
             // A registration whose persist failed. Answer the way the client
@@ -519,18 +541,21 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             }
         }
         crate::core::DbReply::AccountCreated { account, origin } => {
-            state.set_account(conn, account.clone());
             match origin {
-                crate::core::AccountOrigin::NickServ => state.service_notice(
-                    conn,
-                    "NickServ",
-                    &format!("\x02{account}\x02 is now registered to your connection."),
-                ),
+                crate::core::AccountOrigin::NickServ => {
+                    state.set_account(conn, account.clone());
+                    state.service_notice(
+                        conn,
+                        "NickServ",
+                        &format!("\x02{account}\x02 is now registered to your connection."),
+                    );
+                }
                 crate::core::AccountOrigin::RegisterCommand => {
                     let label = take_register_label(state, conn);
                     let server = state.config.server_name.clone();
                     let account = account.clone();
                     state.emit_deferred_labeled(conn, label, move |state| {
+                        state.set_account(conn, account.clone());
                         state.send(
                             conn,
                             &format!(

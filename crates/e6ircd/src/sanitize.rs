@@ -254,6 +254,37 @@ pub(crate) fn client_tag_string(msg: &e6irc_proto::message::Message<'_>) -> Stri
         .join(";")
 }
 
+/// Client-only tags that describe a moment rather than a message — a typing
+/// indicator — and so never enter history: replayed, they would announce
+/// someone typing long after they stopped, and stored as TAGMSGs they would
+/// crowd real messages out of the bounded hot ring.
+const EPHEMERAL_CLIENT_TAGS: &[&str] = &["+typing", "+draft/typing"];
+
+/// The part of a relayed client tag string ([`client_tag_string`]) that
+/// history keeps with the message: every tag but the ephemeral ones. Empty when
+/// nothing is left, which for a TAGMSG means there is nothing to store.
+pub(crate) fn history_client_tags(relayed: &str) -> String {
+    relayed
+        .split(';')
+        .filter(|tag| {
+            let key = tag.split_once('=').map_or(*tag, |(key, _)| key);
+            !key.is_empty() && !EPHEMERAL_CLIENT_TAGS.contains(&key)
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// Whether `line` is a TAGMSG that history keeps nothing of (only ephemeral
+/// client-only tags, or none): it is told live and never enters a backlog or
+/// the stored history — the rule the core's history applies, applied to the
+/// bouncer's raw lines.
+pub(crate) fn is_ephemeral_tagmsg(line: &str) -> bool {
+    e6irc_proto::message::Message::parse(line).is_ok_and(|message| {
+        message.command.eq_ignore_ascii_case("TAGMSG")
+            && history_client_tags(&client_tag_string(&message)).is_empty()
+    })
+}
+
 /// Whether `nick` is a legal nickname: it starts with a letter or one of the
 /// RFC1459 "special" characters and continues with those plus digits and `-`,
 /// within `nicklen`. A NickServ-registered account name inherits exactly this

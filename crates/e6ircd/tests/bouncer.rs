@@ -4048,8 +4048,9 @@ async fn bnc_attach_refuses_a_throttled_account_with_the_wait() {
     })
     .await
     .expect("timed out waiting for the SASL verdict");
+    // Addressed to the nick the client gave, like every other attach verdict.
     assert!(
-        verdict.contains(" 904 * :Too many failed login attempts"),
+        verdict.contains(" 904 alice/up :Too many failed login attempts"),
         "{verdict}"
     );
 }

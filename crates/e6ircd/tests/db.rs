@@ -758,10 +758,11 @@ async fn buffered_history_flushes_when_the_sender_is_dropped() {
                 dm_peers: Vec::new(),
                 sender_prefix: "alice!a@host".into(),
                 sender_account: None,
-                kind: e6ircd::core::MessageKind::Privmsg,
+                kind: e6ircd::core::HistoryKind::Privmsg,
                 body: format!("line {i}"),
                 sender_is_bot: false,
                 multiline: None,
+                client_tags: String::new(),
                 ts: e6irc_proto::time::Millis::from_millis(1_700_000_000_000 + i),
             })
             .await
@@ -821,10 +822,11 @@ async fn a_flood_of_messages_is_written_in_bounded_batches() {
                 dm_peers: Vec::new(),
                 sender_prefix: "alice!a@host".into(),
                 sender_account: None,
-                kind: e6ircd::core::MessageKind::Privmsg,
+                kind: e6ircd::core::HistoryKind::Privmsg,
                 body: format!("line {i}"),
                 sender_is_bot: false,
                 multiline: None,
+                client_tags: String::new(),
                 ts: e6irc_proto::time::Millis::from_millis(1_700_000_000_000 + i as u64),
             })
             .await
@@ -916,6 +918,146 @@ async fn history_worker_tells_an_unknown_msgid_from_an_empty_page() {
         };
         assert_eq!(rows, expected, "{msgid}");
     }
+}
+
+/// Client-only tags and TAGMSG reactions are stored with history, and a page
+/// is cut in its reader's scope: a `message-tags` reader pages through them, one
+/// without (and the REST API, which serves text) gets full pages of text.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn history_keeps_client_tags_and_reactions_in_each_readers_scope() {
+    let pool = db::connect_and_migrate(&support::test_db("history_keeps_client_tags").await)
+        .await
+        .expect("connect");
+    let (request_tx, request_rx) = queue::<DbRequest>(QueueConfig {
+        name: "history-tags-request",
+        capacity: 16,
+        policy: Policy::Fifo,
+    });
+    let (core_tx, mut core_rx) = queue::<Input>(QueueConfig {
+        name: "history-tags-reply",
+        capacity: 8,
+        policy: Policy::Fifo,
+    });
+    tokio::spawn(db::run_worker(
+        pool.clone(),
+        request_rx,
+        CoreIngress::single(core_tx),
+    ));
+    let rows = [
+        ("t-parent", e6ircd::core::HistoryKind::Privmsg, "parent", ""),
+        (
+            "t-child",
+            e6ircd::core::HistoryKind::Privmsg,
+            "child",
+            "+draft/reply=t-parent",
+        ),
+        (
+            "t-react",
+            e6ircd::core::HistoryKind::Tagmsg,
+            "",
+            "+draft/react=\\s;+draft/reply=t-child",
+        ),
+    ];
+    for (i, (msgid, kind, body, client_tags)) in rows.into_iter().enumerate() {
+        request_tx
+            .push(DbRequest::LogMessage {
+                msgid: msgid.into(),
+                target: "#tags".into(),
+                dm_peers: Vec::new(),
+                sender_prefix: "alice!a@host".into(),
+                sender_account: None,
+                kind,
+                body: body.into(),
+                sender_is_bot: false,
+                multiline: None,
+                client_tags: client_tags.into(),
+                ts: e6irc_proto::time::Millis::from_millis(1_700_000_000_000 + i as u64),
+            })
+            .await
+            .expect("enqueue log");
+    }
+    let mut page = async |message_tags: bool| {
+        request_tx
+            .push(DbRequest::QueryHistory {
+                conn: e6ircd::core::ConnId(9),
+                target: "#tags".into(),
+                floor: e6ircd::core::HistoryFloor::Whole,
+                display: "#tags".into(),
+                batch_ref: "batch".into(),
+                caps: e6ircd::core::HistoryResponseCaps {
+                    batch: true,
+                    message_tags,
+                    ..Default::default()
+                },
+                query: e6ircd::core::HistoryQuery::Latest { limit: 2 },
+                label: None,
+            })
+            .await
+            .expect("enqueue query");
+        let Some(reply) = core_rx.pop().await else {
+            panic!("worker stopped before replying")
+        };
+        let Input::HistoryPage { rows, .. } = reply.payload else {
+            panic!("unexpected worker reply")
+        };
+        rows.expect("history page")
+            .into_iter()
+            .map(|row| (row.msgid, row.kind, row.client_tags))
+            .collect::<Vec<_>>()
+    };
+    // The worker writes messages in batches; the reply is behind them.
+    assert_eq!(
+        page(true).await,
+        [
+            (
+                "t-child".to_string(),
+                e6ircd::core::HistoryKind::Privmsg,
+                "+draft/reply=t-parent".to_string()
+            ),
+            (
+                "t-react".to_string(),
+                e6ircd::core::HistoryKind::Tagmsg,
+                "+draft/react=\\s;+draft/reply=t-child".to_string()
+            ),
+        ]
+    );
+    let text_only = [
+        (
+            "t-parent".to_string(),
+            e6ircd::core::HistoryKind::Privmsg,
+            String::new(),
+        ),
+        (
+            "t-child".to_string(),
+            e6ircd::core::HistoryKind::Privmsg,
+            "+draft/reply=t-parent".to_string(),
+        ),
+    ];
+    assert_eq!(
+        page(false).await,
+        text_only,
+        "the TAGMSG is cut before the limit"
+    );
+    let rest: Vec<_> = hist(
+        &pool,
+        "#tags",
+        e6ircd::core::HistoryQuery::Latest { limit: 2 },
+    )
+    .await
+    .into_iter()
+    .map(|row| (row.msgid, row.kind, row.client_tags))
+    .collect();
+    assert_eq!(rest, text_only, "REST serves text");
+
+    // A TAGMSG row is tags and nothing else.
+    let malformed = sqlx::query(
+        "INSERT INTO messages (msgid, target, sender_prefix, kind, body, ts, client_tags)
+         VALUES ('bad', '#tags', 'a!a@h', 'tagmsg', 'text', now(), '+draft/react=x')",
+    )
+    .execute(&pool)
+    .await;
+    assert!(malformed.is_err(), "a TAGMSG with text is refused");
 }
 
 #[tokio::test]

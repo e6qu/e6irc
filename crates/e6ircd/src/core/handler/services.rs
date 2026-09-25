@@ -113,6 +113,13 @@ fn nickserv_register(state: &mut ServerState, conn: ConnId, args: &[&str]) {
             return;
         }
     };
+    let password = match crate::identity::NewPassword::parse(password) {
+        Ok(password) => password,
+        Err(refusal) => {
+            state.service_notice(conn, "NickServ", refusal.explanation());
+            return;
+        }
+    };
     if state.sessions[&conn].account().is_some() {
         state.service_notice(conn, "NickServ", "You are already logged in.");
         return;
@@ -144,7 +151,7 @@ fn nickserv_register(state: &mut ServerState, conn: ConnId, args: &[&str]) {
         conn,
         name,
         contact_email,
-        password: password.to_string(),
+        password,
         origin: crate::core::AccountOrigin::NickServ,
     };
     if state.db_tx.try_push(request).is_err() {
@@ -185,7 +192,8 @@ fn nickserv_identify(state: &mut ServerState, conn: ConnId, args: &[&str]) {
         }
     };
     // One credential verification may be in flight per connection.
-    if state.sessions[&conn].sasl_verify_pending || state.sessions[&conn].pending_identify.is_some()
+    if state.sessions[&conn].sasl_verify.is_some()
+        || state.sessions[&conn].pending_identify.is_some()
     {
         state.service_notice(
             conn,
@@ -212,11 +220,9 @@ fn nickserv_identify(state: &mut ServerState, conn: ConnId, args: &[&str]) {
         // under the command's label, so no deferred hold is set up.
         services_unavailable(state, conn, "NickServ");
     } else {
-        let label = state.capture.as_mut().and_then(|cap| {
-            cap.label.clone().inspect(|_| {
-                cap.deferred = true;
-            })
-        });
+        // The verdict answers this command, gathered with the echo (if any)
+        // already captured for it, but does not hold the connection's output.
+        let label = state.defer_captured_label(conn);
         state
             .sessions
             .get_mut(&conn)
@@ -907,7 +913,7 @@ fn enforced_protector(
 /// waits for it rather than racing it.
 fn verification_in_flight(state: &ServerState, conn: ConnId) -> bool {
     let session = &state.sessions[&conn];
-    session.sasl_verify_pending || session.pending_identify.is_some()
+    session.sasl_verify.is_some() || session.pending_identify.is_some()
 }
 
 /// Check the nick `conn` holds against nick protection. When it is protected
@@ -968,7 +974,7 @@ pub(crate) fn enforce_nick_protection(state: &mut ServerState, now: e6irc_proto:
     let due: Vec<ConnId> = state
         .sessions
         .iter()
-        .filter(|(_, session)| !session.sasl_verify_pending && session.pending_identify.is_none())
+        .filter(|(_, session)| session.sasl_verify.is_none() && session.pending_identify.is_none())
         .filter(|(_, session)| session.nick_enforcement.due(now).is_some())
         .map(|(&conn, _)| conn)
         .collect();
@@ -1239,7 +1245,9 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
             // database write leaves a verdict for the connection to wait on.
             match chanserv_register_on_owner(state, command) {
                 Some(result) => emit_chanserv_register_result_now(state, conn, result),
-                None => state.defer_captured_reply(conn),
+                None => {
+                    state.defer_captured_reply(conn);
+                }
             }
         }
         "DROP" => {
@@ -2565,7 +2573,7 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
             // a client that sends CAP END before the verdict lands must still
             // see the login result during registration, not out of order. The
             // verify reply re-invokes this once it resolves (`db_reply`).
-            || session.sasl_verify_pending
+            || session.sasl_verify.is_some()
         {
             return;
         }

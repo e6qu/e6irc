@@ -246,10 +246,32 @@ These are project-wide rules, enforced in review and (where possible) CI:
     and `CAP LIST` derive from one closed set. An attach cannot use SASL without
     negotiating it, and a new capability cannot be accepted but omitted from
     discovery or state reporting.
-  - `MessageKind` (PRIVMSG/NOTICE) — one type with `wire()`, `db()` and
-    `is_loud()`, so the uppercase verb, the lowercase storage token, and the
-    "does it auto-reply" rule cannot drift; before, the ring and the database
-    stored different casings of the same message.
+  - `MessageKind` (PRIVMSG/NOTICE) — one type with `wire()` and `is_loud()`,
+    and `HistoryKind` (PRIVMSG/NOTICE/TAGMSG) with `wire()` and `db()`, so the
+    uppercase verb, the lowercase storage token, and the "does it auto-reply"
+    rule cannot drift; before, the ring and the database stored different
+    casings of the same message. The ring's `HistoryEntry` *is* the database's
+    `HistoryRow`, so the two cannot keep different facts about a message, and a
+    history read is cut in the reader's `HistoryScope` (§11.3).
+  - `Capture` — a labeled command's capture counts the answers it left to
+    asynchronous paths in one private field, raised only by `defer`; "deferred"
+    is that count being non-zero. A NickServ IDENTIFY once marked its capture
+    deferred through a separate flag without counting, so the echo captured
+    before the verdict was dropped when the verdict framed itself. Every
+    asynchronous answer — held (`emit_deferred_labeled`) or not
+    (`emit_labeled_unheld`) — is gathered with what the command answered on the
+    spot into the one labeled response.
+  - `NewPassword` — a password an account may be given (1–512 bytes) is parsed
+    once; account creation takes only this type, and the REST/web validators
+    call the same parser, so IRC `REGISTER`, NickServ `REGISTER` and the web
+    cannot store a password another surface refuses to verify (an empty one
+    was storable through `REGISTER` and could then never be logged in to).
+  - `MemberModes::sigils` — the one renderer of a member's rank sigils,
+    honouring `multi-prefix`, shared by NAMES, WHO and WHOIS; WHOIS had its own
+    copy that ignored the capability.
+  - `render_multiline` — one renderer for a multiline message's delivered
+    forms, used by local delivery, the channel owner and CHATHISTORY replay,
+    so the three cannot frame, tag or fit it differently.
   - `StatusSigil` — the STATUSMSG `@`/`+` target sigil is `Option<enum>`, so
     "does this enter history / narrow the audience" is `is_none()` and a
     method, not a byte compared against `0`.
@@ -949,7 +971,13 @@ its labeled batch.
 
 Recipients that negotiated the capability receive the batch as sent, blank lines
 and `draft/multiline-concat` tags intact, because those are what the sender
-wrote. Everyone else receives one message per non-blank line: a PRIVMSG has no
+wrote. The capability does not relax the per-line limit: every line in the
+batch is an ordinary IRC line within 512 bytes, so a line the relay's source
+prefix pushes past it is split on a character boundary into lines whose
+continuations carry `draft/multiline-concat` (for a recipient without
+`message-tags`, which cannot be told a line continues, it is trimmed as the
+flattened form is). A batch closed with no lines at all is refused with
+`FAIL BATCH MULTILINE_INVALID`, like any other malformed batch. Everyone else receives one message per non-blank line: a PRIVMSG has no
 way to carry a line break, and a blank line would be an empty message. A batch
 whose lines are *all* blank therefore has no text in it, and is refused with
 `ERR_NOTEXTTOSEND` exactly as an empty PRIVMSG is -- delivered, it would reach
@@ -1010,6 +1038,29 @@ with 906 and the client registered without an account. A line that is not
 UTF-8 (`UTF8ONLY`) is refused with `FAIL <command> INVALID_UTF8`, naming the
 command read from a lossy decoding of the line (`*` when none is readable), on
 the core and the attach listener alike.
+
+The account a session is logged in to changes in exactly two places,
+`ServerState::set_account` and `clear_account`, and they send RPL_LOGGEDIN (900)
+and RPL_LOGGEDOUT (901) to the session — the SASL spec's "whether by SASL or
+otherwise" — so SASL, NickServ IDENTIFY, NickServ REGISTER, `REGISTER` and
+LOGOUT all tell the client its own state the same way (account-notify tells
+only its peers). A labeled `AUTHENTICATE` that completes the payload is answered
+by the verdict (900/903 or 904) as its labeled response, not with an early
+`ACK`; an attempt aborted meanwhile answers that label with `ACK` when its stale
+verdict lands. A line sent while the credentials are being verified abandons
+the attempt: its 904 is the attempt's only verdict and the verdict still in
+flight is dropped. The attach listener answers `AUTHENTICATE *` with 906
+whether or not an exchange is open, as the core does.
+
+A line refused before it could be parsed whole — not UTF-8, over the length
+limits, malformed after its tags — is still answered under the `label` its tag
+section carries, when that section can be read. SETNAME refuses a realname
+longer than `NAMELEN` (advertised; 150 bytes, the bound USER applies by cutting)
+with `FAIL SETNAME INVALID_REALNAME` rather than cutting it. `MODES=4` is
+advertised and enforced: a MODE changes at most four parameter-taking modes, and
+names the rest back in `FAIL MODE TOO_MANY_MODES <channel> <modes>`.
+invite-notify reaches the members who could have sent the invitation — channel
+operators, or every member of a `+g` channel — as Solanum sends it.
 
 This is a **superset of Libera's advertised set** (Libera does not offer
 chathistory/multiline); the Libera-compat contract (§7.7) governs the shared
@@ -1569,7 +1620,11 @@ channel that passed to its successor. No shipped creation path—or
 the account-table trigger—can assign a retired name to somebody else.
 
 The `draft/account-registration` `REGISTER` command creates that same account,
-so the two entry points cannot diverge; the capability's advertised value states
+so the two entry points cannot diverge — including the password rule
+(`NewPassword`, 1–512 bytes, which the web and REST API apply too): `REGISTER`
+refuses an empty password with `FAIL REGISTER WEAK_PASSWORD` and an over-long
+one with `UNACCEPTABLE_PASSWORD`, and a connection with no nick to name the
+account after with `NEED_NICK`; the capability's advertised value states
 the policy (`before-connect`, `email-required`) so a client knows the rules
 before it tries. `custom-account-name` is deliberately **not** advertised: an
 account always takes the registering nick's name, which keeps "the account you
@@ -2848,6 +2903,18 @@ Design constraints recorded now:
   could repeat would silently lose history; naming the shard and the boot makes
   a repeat impossible by construction. Every reader — CHATHISTORY pivots, the
   bouncer, clients — treats the id as opaque.
+  A message keeps the client-only tags it was relayed with (`+draft/reply`,
+  `+draft/react`, …: whatever the relay policy passes — the core relays every
+  valid `+` tag, and bounds them with the client's 4094-byte tag section), in
+  the ring and in `messages.client_tags` (migration 0081), and a `TAGMSG` is
+  history too — a reaction is part of the conversation — stored as a row of
+  kind `tagmsg` with no text. Replay gives a `message-tags` reader both exactly
+  as they were delivered, so a threaded reply keeps its parent and a reaction
+  what it reacts to. A typing indicator (`+typing`, `+draft/typing`) describes
+  a moment, not a message: it is never stored, a TAGMSG carrying nothing else
+  does not enter history, and the bouncer tells such a TAGMSG live without
+  retaining it in its ring or `bnc_buffer` (whose raw lines otherwise keep every
+  tag, so its CHATHISTORY replays the same client-only tags).
 - **11.1.1 Conversations**: a direct message is stored **once**, under a key
   built from both participants' *identities* sorted and joined by `!`. Sorting
   makes the key symmetric, so both sides read the same thread from the single
@@ -2947,8 +3014,12 @@ Design constraints recorded now:
   stored `TAGMSG` is nothing but tags, so a client that did not negotiate
   `message-tags` cannot receive one at all, and excluding those rows after the
   `LIMIT` returned fewer lines than asked for — indistinguishable from the end
-  of the buffer. `BncHistoryScope` is built from that one capability and rides
-  into the query, so the `LIMIT` counts only deliverable lines, and TARGETS
+  of the buffer. The core cuts its pages the same way: a `HistoryScope` built
+  from the reader's `message-tags` excludes stored TAGMSG rows in the ring
+  filter and in the SQL before the `LIMIT` (the REST API, which serves text,
+  reads in the text scope; the core's TARGETS still dates a buffer by its
+  newest entry of either kind). `BncHistoryScope` is built from that one capability
+  and rides into the query, so the `LIMIT` counts only deliverable lines, and TARGETS
   answers in the same scope rather than naming a conversation whose page comes
   back empty. What decides it is `bnc_buffer.command`, a column generated from
   the line (migration 0069) rather than written beside it: it cannot disagree

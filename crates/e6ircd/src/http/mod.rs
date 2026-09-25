@@ -316,7 +316,6 @@ impl AppState {
 /// 64/128/255) rather than accepting a multi-megabyte JSON body into storage.
 pub(super) const MAX_LABEL_LEN: usize = 64;
 pub(super) const MAX_ACCOUNT_LEN: usize = crate::config::MAX_ACCOUNT_NAME_LEN;
-pub(super) const MAX_PASSWORD_LEN: usize = 512;
 
 /// A problem response carried through an internal fallible helper. Boxing the
 /// response keeps every `Result` small while preserving the exact status,
@@ -377,18 +376,15 @@ pub(super) fn credential_input_error(account: &str, password: &str) -> Option<&'
     if account.is_empty() || account.len() > MAX_ACCOUNT_LEN {
         return Some("Account names must contain 1–64 bytes.");
     }
-    if password.is_empty() || password.len() > MAX_PASSWORD_LEN {
-        return Some("Passwords must contain 1–512 bytes.");
-    }
-    None
+    password_input_error(password)
 }
 
+/// The password rule IRC `REGISTER` and NickServ `REGISTER` apply too
+/// ([`crate::identity::NewPassword`]).
 pub(super) fn password_input_error(password: &str) -> Option<&'static str> {
-    if password.is_empty() || password.len() > MAX_PASSWORD_LEN {
-        Some("Passwords must contain 1–512 bytes.")
-    } else {
-        None
-    }
+    crate::identity::NewPassword::parse(password)
+        .err()
+        .map(crate::identity::PasswordRefusal::explanation)
 }
 
 /// Resolve a bounded integer query parameter without silently changing the

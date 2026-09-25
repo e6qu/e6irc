@@ -269,10 +269,11 @@ mod tests {
             ts: Millis::from_millis(ts),
             sender_prefix: "n!u@h".into(),
             sender_account: account.map(str::to_owned),
-            kind: crate::core::MessageKind::Privmsg,
+            kind: crate::core::HistoryKind::Privmsg,
             body: "x".into(),
             sender_is_bot: false,
             multiline: None,
+            client_tags: String::new(),
         }
     }
 
