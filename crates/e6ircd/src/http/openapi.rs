@@ -1330,14 +1330,15 @@ fn operations() -> serde_json::Value {
             },
             "/api/v1/auth/logout": {
                 "post": { "summary": "Sign out: end the e6irc session and, for a provider session, the provider's SSO session",
-                    "description": "Ends the browser session named by the session cookie, then redirects the browser to the OIDC provider's end-session endpoint (id_token_hint + post_logout_redirect_uri) when an identity provider asserted the session, so the provider's SSO session is ended too; a local session goes to /auth/signed-out. Incomplete OIDC logout configuration fails closed and keeps the session. A request that carries a session cookie must prove its session's CSRF value in the `X-E6IRC-CSRF` header (a script) or the `csrf` form field (a sign-out form, which the browser then follows as a navigation); never in the URL. A request with no session has nothing to end.",
+                    "description": "Ends the browser session named by the session cookie, then redirects the browser to the OIDC provider's end-session endpoint (id_token_hint + post_logout_redirect_uri) when an identity provider asserted the session, so the provider's SSO session is ended too; a local session goes to /auth/signed-out. Incomplete OIDC logout configuration fails closed and keeps the session. A request that carries a session cookie must prove its session's CSRF value, never in the URL: in the `csrf` form field, a sign-out form the browser follows as a navigation, which performs the coordinated logout above; or in the `X-E6IRC-CSRF` header, a script's call, which ends this application's session only and answers 204. A request with no session has nothing to end.",
                     "requestBody": { "required": false, "content": {
                         "application/x-www-form-urlencoded": { "schema": {
                             "type": "object", "additionalProperties": false, "required": ["csrf"],
                             "properties": { "csrf": { "type": "string" } }
                         } }
                     } },
-                    "responses": { "303": { "description": "session cleared (or none was presented): redirect to the provider's end-session endpoint, or to /auth/signed-out" },
+                    "responses": { "204": { "description": "a script's call (CSRF header): this application's session is ended; the provider's is untouched" },
+                        "303": { "description": "a sign-out form's navigation (or no session was presented): session cleared, redirect to the provider's end-session endpoint, or to /auth/signed-out" },
                         "403": { "description": "session cookie presented without its CSRF value" },
                         "503": { "description": "database unavailable, or the OIDC provider or public URL is not configured for coordinated logout" } } }
             },

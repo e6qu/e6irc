@@ -10053,13 +10053,46 @@ async fn logout_post_requires_the_session_csrf_value() {
         "a request without the CSRF value logged the owner out"
     );
 
+    // A script's call (the header) ends this application's session only.
     let owner = session_headers(http, &session).await;
     let (status, headers, body) = request(
         http,
         &api_request("POST", "/api/v1/auth/logout", &owner, None),
     )
     .await;
-    assert_eq!(status, 303, "{body}");
+    assert_eq!(status, 204, "{body}");
+    assert!(headers.contains("e6irc_session=;"), "{headers}");
+    assert_eq!(
+        e6ircd::db::session_account(&pool, &session)
+            .await
+            .expect("session lookup"),
+        None
+    );
+
+    // A sign-out form (the value in its body) is a navigation: it ends the
+    // session and sends the browser on — here, a local session, to the
+    // signed-out page.
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("second session");
+    let owner = session_headers(http, &session).await;
+    let csrf = owner
+        .split("X-E6IRC-CSRF: ")
+        .nth(1)
+        .and_then(|rest| rest.split("\r\n").next())
+        .expect("CSRF value");
+    let body = format!("csrf={csrf}");
+    let (status, headers, _) = request(
+        http,
+        &format!(
+            "POST /api/v1/auth/logout HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await;
+    assert_eq!(status, 303, "{headers}");
     assert!(headers.contains("e6irc_session=;"), "{headers}");
     assert!(
         headers

@@ -2883,8 +2883,23 @@ pub(super) async fn logout(
     let form_csrf_valid = form
         .ok()
         .is_some_and(|Form(form)| state.csrf_valid(&token, &form.csrf));
-    if !form_csrf_valid && !csrf_header_valid(&state, &token, &headers) {
-        return csrf_refusal();
+    if !form_csrf_valid {
+        if !csrf_header_valid(&state, &token, &headers) {
+            return csrf_refusal();
+        }
+        // A script's call (the header) ends this application's session and
+        // nothing else: it cannot be a navigation to the provider, so it has
+        // no provider session to end. Only a sign-out form — a navigation the
+        // browser follows — performs coordinated logout below.
+        if let Err(e) = crate::db::delete_web_session(pool, &token).await {
+            eprintln!("http: logout failed: {e}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            );
+        }
+        return (StatusCode::NO_CONTENT, [(header::SET_COOKIE, clear)]).into_response();
     }
     let crate::db::SessionLogoutHint { id_token, provider } =
         match crate::db::session_logout_hint(pool, &token).await {

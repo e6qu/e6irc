@@ -1702,8 +1702,9 @@ provider-verified email claim.
   identity is a `POST` carrying the `X-E6IRC-CSRF` header like every other
   unsafe API method; it answers the provider URL, and the page navigates
   there. Signing out is a form `POST` (the value in its body) that the browser
-  follows as a navigation to the provider's end-session endpoint; a script may
-  send the header instead. Browsers hold every redirect of a form submission to
+  follows as a navigation to the provider's end-session endpoint. A script's
+  call carries the header instead and ends this application's session only
+  (`204`): it is not a navigation, so it cannot end the provider's. Browsers hold every redirect of a form submission to
   the page's `form-action`, so each configured provider's end-session origin
   is added to `form-action 'self'` on every page (one layer over the router);
   `'self'` alone blocked coordinated logout. The `GET` forms of both, which took the value as a
