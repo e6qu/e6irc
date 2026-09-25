@@ -53,6 +53,7 @@ async fn add_server_ban(
             set_by: set_by.into(),
             kind: kind.into(),
         },
+        &e6ircd::db::AuditPrincipal::operator(set_by),
     )
     .await
     .map(|_| ())
@@ -4971,12 +4972,15 @@ async fn server_ban_worker_mutates_and_audits_atomically() {
         mask: "baddie@*".into(),
         mask_display: "Baddie@*".into(),
         reason: "spam".into(),
-        set_by: "god".into(),
+        set_by: "godnick".into(),
         kind: "kline".into(),
     };
+    // The operator block `god`, using the nick `godnick`: STATS shows the
+    // nick, the audit trail the operator.
     let requester = e6ircd::core::ServerBanRequester::Oper {
         session: e6ircd::core::CoreShardCount::single().session_owner(conn),
         label: None,
+        operator: "god".into(),
     };
     request_tx
         .push(DbRequest::MutateServerBan {
@@ -5001,10 +5005,16 @@ async fn server_ban_worker_mutates_and_audits_atomically() {
         vec![(
             "Baddie@*".to_string(),
             "spam".to_string(),
-            "god".to_string(),
+            "godnick".to_string(),
             "kline".to_string(),
         )]
     );
+    let kinds: (String, String) =
+        sqlx::query_as("SELECT actor_kind, target_kind FROM audit_log WHERE action = 'KLINE'")
+            .fetch_one(&pool)
+            .await
+            .expect("kinds");
+    assert_eq!(kinds, ("operator".to_string(), "mask".to_string()));
     let audit = list_audit_log(&pool, audit_page_size(10))
         .await
         .expect("audit");
@@ -5138,6 +5148,7 @@ async fn server_bans_persist_and_load() {
                 kind: "kline".into(),
                 actor: "god".into(),
             },
+            &e6ircd::db::AuditPrincipal::operator("god"),
         )
         .await
         .expect("remove"),
@@ -5170,12 +5181,24 @@ async fn audit_log_records_and_lists() {
     let pool = db::connect_and_migrate(&support::test_db("audit_log_records_and_lists").await)
         .await
         .expect("connect");
-    db::insert_audit_log(&pool, "god", "OPER", "god", "")
-        .await
-        .expect("a1");
-    db::insert_audit_log(&pool, "god", "KLINE", "baddie@*", "spam")
-        .await
-        .expect("a2");
+    db::insert_audit_log(
+        &pool,
+        &e6ircd::db::AuditPrincipal::operator("god"),
+        "OPER",
+        &e6ircd::db::AuditPrincipal::operator("god"),
+        "",
+    )
+    .await
+    .expect("a1");
+    db::insert_audit_log(
+        &pool,
+        &e6ircd::db::AuditPrincipal::account("god"),
+        "KLINE",
+        &e6ircd::db::AuditPrincipal::mask("baddie@*"),
+        "spam",
+    )
+    .await
+    .expect("a2");
     let list = list_audit_log(&pool, audit_page_size(10))
         .await
         .expect("list");
@@ -5508,9 +5531,15 @@ async fn audit_log_filters_and_cursor_pages_are_stable() {
         ("alice", "KLINE", "second@host", "abuse"),
         ("alice", "CONFIG", "server", "revision 2"),
     ] {
-        db::insert_audit_log(&pool, actor, action, target, detail)
-            .await
-            .expect("seed audit entry");
+        db::insert_audit_log(
+            &pool,
+            &e6ircd::db::AuditPrincipal::account(actor),
+            action,
+            &seeded_target(action, target),
+            detail,
+        )
+        .await
+        .expect("seed audit entry");
     }
 
     let first = db::query_audit_log(
@@ -5529,9 +5558,15 @@ async fn audit_log_filters_and_cursor_pages_are_stable() {
     let cursor = first.next_before_id.expect("older page cursor");
     assert_eq!(cursor, first.entries[1].id);
 
-    db::insert_audit_log(&pool, "bob", "OPER", "bob", "concurrent")
-        .await
-        .expect("concurrent append");
+    db::insert_audit_log(
+        &pool,
+        &e6ircd::db::AuditPrincipal::operator("bob"),
+        "OPER",
+        &e6ircd::db::AuditPrincipal::operator("bob"),
+        "concurrent",
+    )
+    .await
+    .expect("concurrent append");
     let second = db::query_audit_log(
         &pool,
         db::AuditLogFilter {
@@ -5589,14 +5624,20 @@ async fn managed_configuration_rejects_stale_writes_without_auditing_them() {
     let mut changed = initial.settings.clone();
     changed.description = "saved revision".into();
 
-    let saved = db::save_managed_config(&pool, initial.revision, &changed, "alice", "first update")
-        .await
-        .expect("save current revision");
+    let saved = db::save_managed_config(
+        &pool,
+        initial.revision,
+        &changed,
+        &db::AuditPrincipal::account("alice"),
+        "first update",
+    )
+    .await
+    .expect("save current revision");
     let stale = db::save_managed_config(
         &pool,
         initial.revision,
         &initial.settings,
-        "bob",
+        &db::AuditPrincipal::account("bob"),
         "stale update",
     )
     .await;
@@ -7413,12 +7454,24 @@ async fn account_export_and_security_activity_are_owner_scoped_and_secret_free()
     .execute(&pool)
     .await
     .expect("message");
-    db::insert_audit_log(&pool, "bob", "ACCOUNT_SUSPEND", "alice", "")
-        .await
-        .expect("admin event");
-    db::insert_audit_log(&pool, "bob", "OTHER_EVENT", "bob", "private to Bob")
-        .await
-        .expect("other event");
+    db::insert_audit_log(
+        &pool,
+        &e6ircd::db::AuditPrincipal::account("bob"),
+        "ACCOUNT_SUSPEND",
+        &e6ircd::db::AuditPrincipal::account("alice"),
+        "",
+    )
+    .await
+    .expect("admin event");
+    db::insert_audit_log(
+        &pool,
+        &e6ircd::db::AuditPrincipal::account("bob"),
+        "OTHER_EVENT",
+        &e6ircd::db::AuditPrincipal::account("bob"),
+        "private to Bob",
+    )
+    .await
+    .expect("other event");
 
     let export = export_account(&pool, "ALICE").await.expect("Alice");
     let value: serde_json::Value = serde_json::from_str(&export).expect("valid JSON");
@@ -7471,6 +7524,98 @@ async fn account_export_and_security_activity_are_owner_scoped_and_secret_free()
     );
 }
 
+/// An operator block, a nick, or a reserved name can be spelled like an
+/// account. Their rows are not the account's: registering `root` must not
+/// reveal what the operator `root` did, nor whom it killed, nor what someone
+/// using the nick `root` was subjected to.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn an_account_sees_only_rows_naming_it_as_an_account() {
+    use e6ircd::db::AuditPrincipal;
+    let pool = db::connect_and_migrate(
+        &support::test_db("an_account_sees_only_rows_naming_it_as_an_account").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account_with_contact(&pool, "Root", "s3cr3t", None)
+        .await
+        .expect("root");
+    for (actor, action, target, detail) in [
+        (
+            AuditPrincipal::operator("root"),
+            "OPER",
+            AuditPrincipal::operator("root"),
+            "operator block",
+        ),
+        (
+            AuditPrincipal::operator("root"),
+            "KILL",
+            AuditPrincipal::nick("victim"),
+            "operator kill",
+        ),
+        (
+            AuditPrincipal::operator("root"),
+            "KLINE",
+            AuditPrincipal::mask("*@198.51.100.7"),
+            "operator ban",
+        ),
+        (
+            AuditPrincipal::operator("oper2"),
+            "SETHOST",
+            AuditPrincipal::nick("root"),
+            "someone using the nick",
+        ),
+        (
+            AuditPrincipal::account("admin"),
+            "ACCOUNT_INVITATION_CREATE",
+            AuditPrincipal::invitation("root"),
+            "reserved before the account existed",
+        ),
+        (
+            AuditPrincipal::account("admin"),
+            "ACCOUNT_SUSPEND",
+            AuditPrincipal::account("ROOT"),
+            "about the account",
+        ),
+    ] {
+        db::insert_audit_log(&pool, &actor, action, &target, detail)
+            .await
+            .expect("seed");
+    }
+    // A row written before principals were recorded, whose name cannot be
+    // proven to be the account's.
+    sqlx::query(
+        "INSERT INTO audit_log (actor, actor_kind, action, target, target_kind, detail)
+         VALUES ('root', 'legacy', 'KLINE', '*@203.0.113.9', 'mask', 'legacy ban')",
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy row");
+
+    let activity = db::query_account_security_activity(&pool, "root", None, audit_page_size(100))
+        .await
+        .expect("activity");
+    let details: Vec<&str> = activity
+        .entries
+        .iter()
+        .map(|entry| entry.detail.as_str())
+        .collect();
+    assert!(details.contains(&"about the account"), "{details:?}");
+    let export = export_account(&pool, "root").await.expect("root");
+    for foreign in [
+        "operator block",
+        "operator kill",
+        "operator ban",
+        "someone using the nick",
+        "reserved before the account existed",
+        "legacy ban",
+    ] {
+        assert!(!details.contains(&foreign), "activity leaked {foreign}");
+        assert!(!export.contains(foreign), "export leaked {foreign}");
+    }
+    assert!(export.contains("about the account"));
+}
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
@@ -7492,10 +7637,10 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     .await
     .expect("messages");
     sqlx::query(
-        "INSERT INTO audit_log (actor, action, target, detail, created_at)
+        "INSERT INTO audit_log (actor, actor_kind, action, target, target_kind, detail, created_at)
          VALUES
-           ('alice', 'OLD', 'server', '', now() - interval '366 days'),
-           ('alice', 'NEW', 'server', '', now())",
+           ('alice', 'account', 'OLD', 'server', 'server', '', now() - interval '366 days'),
+           ('alice', 'account', 'NEW', 'server', 'server', '', now())",
     )
     .execute(&pool)
     .await
@@ -8373,11 +8518,14 @@ async fn migration_0059_revokes_app_passwords_it_cannot_name_and_says_so() {
              DROP CONSTRAINT account_credentials_lookup_names_app_passwords,
              DROP COLUMN secret_lookup;
          INSERT INTO account_credentials (account_id, kind, argon2_hash, label)
-         SELECT id, 'app_password', 'unused-hash', 'old laptop' FROM accounts;",
+         SELECT id, 'app_password', 'unused-hash', 'old laptop' FROM accounts;
+         ALTER TABLE audit_log
+             DROP COLUMN actor_kind,
+             DROP COLUMN target_kind;",
     )
     .execute(&pool)
     .await
-    .expect("restore the earlier table");
+    .expect("restore the earlier tables");
 
     sqlx::raw_sql(include_str!(
         "../../../migrations/0059_app_password_lookup.sql"
@@ -8385,6 +8533,23 @@ async fn migration_0059_revokes_app_passwords_it_cannot_name_and_says_so() {
     .execute(&pool)
     .await
     .expect("migration 0059");
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0077_audit_principal_kinds.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("migration 0077");
+    let classified: Vec<(String, String)> = sqlx::query_as(
+        "SELECT actor_kind, target_kind FROM audit_log WHERE actor = 'migration:0059'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("classified audit");
+    assert_eq!(
+        classified,
+        [("host".to_string(), "account".to_string())],
+        "a migration's row is the host's, about an account"
+    );
 
     let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM account_credentials")
         .fetch_all(&pool)
@@ -10285,9 +10450,15 @@ async fn a_stated_console_setting_must_agree_with_the_stored_revision() {
     // starts, and the console's list is the one in force.
     let mut edited = imported.settings.clone();
     edited.admin_accounts = vec!["carol".into()];
-    db::save_managed_config(&pool, imported.revision, &edited, "alice", "admins")
-        .await
-        .expect("console edit");
+    db::save_managed_config(
+        &pool,
+        imported.revision,
+        &edited,
+        &db::AuditPrincipal::account("alice"),
+        "admins",
+    )
+    .await
+    .expect("console edit");
     let refused = refusal(document(Some(ADMINS), "first-client-secret")).await;
     assert!(refused.contains("http.admin_accounts"), "{refused}");
     let running = net::start(document(None, "first-client-secret"))
@@ -10822,4 +10993,15 @@ async fn nickserv_and_chanserv_services_over_a_real_server() {
     carol.send("PRIVMSG NickServ :INFO dave").await;
     carol.expect("\x02dave\x02 is not registered.").await;
     running.shutdown.run().await;
+}
+
+/// The target principal a seeded audit row names, by the kind its action
+/// records: a ban's mask, the server's configuration, or an account.
+fn seeded_target(action: &str, target: &str) -> e6ircd::db::AuditPrincipal {
+    match action {
+        "KLINE" => e6ircd::db::AuditPrincipal::mask(target),
+        "CONFIG" => e6ircd::db::AuditPrincipal::server(),
+        "OPER" => e6ircd::db::AuditPrincipal::operator(target),
+        _ => e6ircd::db::AuditPrincipal::account(target),
+    }
 }

@@ -715,7 +715,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                     &pool,
                     snapshot.revision,
                     &upgraded,
-                    "bootstrap",
+                    &crate::db::AuditPrincipal::host("bootstrap"),
                     "sealed credential import after master key became available",
                 )
                 .await

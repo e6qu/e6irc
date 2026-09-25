@@ -1724,6 +1724,19 @@ digests, plaintext bearer values, provider identity tokens/session IDs, device
 codes, and sealed upstream credentials are absent. Credential, token, identity,
 browser-session, login/logout, provider-logout, invitation, account-state, and
 deletion transitions emit redacted account-visible audit events.
+An audit row records which namespace its actor and its target belong to
+(`actor_kind`/`target_kind`, migration 0077: account, operator, nick, channel,
+network, mask, server, provider, host, invitation), because the same spelling
+can be an account, a configured operator block, a nick anyone may hold, or a
+name an invitation reserves. The account's activity and export select only
+rows naming it *as an account*; registering `root` shows nothing the operator
+`root` did, and a KILL or SETHOST of the nick `eve` is not the account `eve`'s.
+Every writer states the kind through a typed `AuditPrincipal`, whose account
+constructor folds the name. Rows written before 0077 were classified where the
+writing code proves the kind; a name it cannot prove — the actor of an older
+KILL or K/D/X-line (IRC wrote the operator's name or nick, HTTP the
+administrator's account, under one action) or a `CONFIG` by `bootstrap` — is
+`legacy`, shown to administrators as before and never to an account.
 
 `/console/accounts` additionally owns immediate local account creation,
 single-use invitation issuance/revocation, and permanent deletion with exact
@@ -3273,7 +3286,9 @@ but the CLI, TUI, and BNC must surface the rejection.
   each channel succession) and server bans; an upstream account command is recorded before it is sent,
   and a 503 answers when it cannot be. OPER, KILL and SETHOST are recorded under
   the operator name and refused with a NOTICE when the audit row cannot be
-  queued; an HTTP disconnect whose audit cannot be written is a 503. A
+  queued; an IRC-issued K/D/X-line's row is recorded under the operator name
+  too (the `set_by` STATS shows stays the nick); an HTTP disconnect whose audit
+  cannot be written is a 503. A
   suspension's disconnect is not refusable, because `ACCOUNT_SUSPEND` has
   already committed.
 - Administrator authority is read from the account row on every request

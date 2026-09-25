@@ -1153,7 +1153,7 @@ pub async fn save_managed_config(
     pool: &PgPool,
     expected_revision: i64,
     settings: &crate::config::ManagedConfig,
-    actor: &str,
+    actor: &AuditPrincipal,
     audit_detail: &str,
 ) -> Result<ManagedConfigSnapshot, DbError> {
     let value = serde_json::to_value(settings)
@@ -1169,19 +1169,26 @@ pub async fn save_managed_config(
     )
     .bind(expected_revision)
     .bind(value)
-    .bind(actor)
+    .bind(actor.name())
     .fetch_optional(&mut *tx)
     .await
     .map_err(query_error)?;
     let Some((revision, updated_at)) = next else {
         return Err(DbError::StaleServerSettings);
     };
-    insert_audit_log_with(&mut *tx, actor, "CONFIG", "server", audit_detail).await?;
+    insert_audit_log_with(
+        &mut *tx,
+        actor,
+        "CONFIG",
+        &AuditPrincipal::server(),
+        audit_detail,
+    )
+    .await?;
     tx.commit().await.map_err(query_error)?;
     Ok(ManagedConfigSnapshot {
         revision,
         settings: settings.clone(),
-        updated_by: actor.to_string(),
+        updated_by: actor.name().to_string(),
         updated_at,
     })
 }
@@ -1317,9 +1324,9 @@ pub async fn create_account_with_contact(
     // to exist (administrator, invitation, bootstrap); the actor is the account.
     insert_audit_log_with(
         &mut *tx,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_CREATE",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "self-registered over IRC",
     )
     .await?;
@@ -1359,9 +1366,9 @@ pub async fn create_account_by_administrator(
     insert_primary_password(&mut transaction, account_id, &hash).await?;
     insert_audit_log_with(
         &mut *transaction,
-        &actor_folded,
+        &AuditPrincipal::account(&actor_folded),
         "ACCOUNT_CREATE",
-        &folded,
+        &AuditPrincipal::account(&folded),
         if administrator {
             "local account created with durable administrator authority"
         } else {
@@ -1495,9 +1502,9 @@ pub async fn issue_account_invitation(
     .map_err(query_error)?;
     insert_audit_log_with(
         &mut *transaction,
-        &actor_folded,
+        &AuditPrincipal::account(&actor_folded),
         "ACCOUNT_INVITATION_CREATE",
-        &folded,
+        &AuditPrincipal::invitation(&folded),
         if administrator {
             "single-use local account invitation issued with durable administrator authority"
         } else {
@@ -1565,9 +1572,9 @@ pub async fn revoke_account_invitation(
     };
     insert_audit_log_with(
         &mut *transaction,
-        &actor_folded,
+        &AuditPrincipal::account(&actor_folded),
         "ACCOUNT_INVITATION_REVOKE",
-        &target,
+        &AuditPrincipal::invitation(&target),
         "",
     )
     .await?;
@@ -1692,9 +1699,9 @@ pub async fn accept_account_invitation(
     .map_err(query_error)?;
     insert_audit_log_with(
         &mut *transaction,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_INVITATION_ACCEPT",
-        &folded,
+        &AuditPrincipal::account(&folded),
         if administrator {
             "local account created from invitation with durable administrator authority"
         } else {
@@ -1745,9 +1752,9 @@ pub async fn set_account_contact_email(
     }
     insert_audit_log_with(
         &mut *transaction,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_CONTACT_UPDATE",
-        &folded,
+        &AuditPrincipal::account(&folded),
         if contact_email.is_some() {
             "contact email replaced"
         } else {
@@ -1809,9 +1816,9 @@ pub async fn bootstrap_first_admin(
     insert_primary_password(&mut transaction, account_id, &hash).await?;
     insert_audit_log_with(
         &mut *transaction,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_BOOTSTRAP",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "first administrator created through one-time browser bootstrap",
     )
     .await?;
@@ -1888,7 +1895,7 @@ pub async fn recover_administrator(
     revoke_issued_invitations(
         &mut transaction,
         &folded,
-        ADMINISTRATOR_RECOVERY_ACTOR,
+        &AuditPrincipal::host(ADMINISTRATOR_RECOVERY_ACTOR),
         "issuer's credentials were recovered from the host",
     )
     .await?;
@@ -1901,9 +1908,9 @@ pub async fn recover_administrator(
         .map_err(query_error)?;
     insert_audit_log_with(
         &mut *transaction,
-        ADMINISTRATOR_RECOVERY_ACTOR,
+        &AuditPrincipal::host(ADMINISTRATOR_RECOVERY_ACTOR),
         "ADMINISTRATOR_RECOVERY",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "every credential revoked (local and app passwords, personal access tokens, device grants, browser sessions) with every invitation the account issued, local password replaced, and administrator authority granted from the host",
     )
     .await?;
@@ -2122,18 +2129,18 @@ pub async fn delete_account_permanently(
     for (channel, successor) in &successions {
         insert_audit_log_with(
             &mut *transaction,
-            &actor_folded,
+            &AuditPrincipal::account(&actor_folded),
             "CHANNEL_SUCCESSION",
-            channel,
+            &AuditPrincipal::channel(channel),
             &format!("founder={folded} successor={successor}"),
         )
         .await?;
     }
     insert_audit_log_with(
         &mut *transaction,
-        &actor_folded,
+        &AuditPrincipal::account(&actor_folded),
         "ACCOUNT_DELETE",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "account and account-owned data permanently removed; name retired",
     )
     .await?;
@@ -2391,7 +2398,7 @@ pub async fn set_account_administrator(
         revoke_issued_invitations(
             &mut transaction,
             &folded,
-            &actor_folded,
+            &AuditPrincipal::account(&actor_folded),
             "issuer's administrator authority was revoked",
         )
         .await?;
@@ -2401,7 +2408,14 @@ pub async fn set_account_administrator(
     } else {
         "ACCOUNT_ADMIN_REVOKE"
     };
-    insert_audit_log_with(&mut *transaction, &actor_folded, action, &folded, "").await?;
+    insert_audit_log_with(
+        &mut *transaction,
+        &AuditPrincipal::account(&actor_folded),
+        action,
+        &AuditPrincipal::account(&folded),
+        "",
+    )
+    .await?;
     transaction.commit().await.map_err(query_error)?;
     Ok(Some(AccountAuthorityChange {
         name,
@@ -2453,7 +2467,7 @@ pub async fn set_account_suspended(
         revoke_issued_invitations(
             &mut transaction,
             &folded,
-            &actor_folded,
+            &AuditPrincipal::account(&actor_folded),
             "issuer was suspended",
         )
         .await?;
@@ -2463,7 +2477,14 @@ pub async fn set_account_suspended(
     } else {
         "ACCOUNT_REACTIVATE"
     };
-    insert_audit_log_with(&mut *transaction, &actor_folded, action, &folded, "").await?;
+    insert_audit_log_with(
+        &mut *transaction,
+        &AuditPrincipal::account(&actor_folded),
+        action,
+        &AuditPrincipal::account(&folded),
+        "",
+    )
+    .await?;
     transaction.commit().await.map_err(query_error)?;
     Ok(Some(AccountStateChange {
         name,
@@ -2508,7 +2529,7 @@ async fn revoke_account_bearers(
 async fn revoke_issued_invitations(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     issuer: &str,
-    actor: &str,
+    actor: &AuditPrincipal,
     reason: &str,
 ) -> Result<(), DbError> {
     let revoked: Vec<String> = sqlx::query_scalar(
@@ -2526,7 +2547,7 @@ async fn revoke_issued_invitations(
             &mut **transaction,
             actor,
             "ACCOUNT_INVITATION_REVOKE",
-            &invited,
+            &AuditPrincipal::invitation(&invited),
             reason,
         )
         .await?;
@@ -2790,9 +2811,9 @@ pub async fn issue_app_password_for_account(
     .map_err(query_error)?;
     insert_audit_log_with(
         &mut *tx,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_APP_PASSWORD_CREATE",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "app password created",
     )
     .await?;
@@ -3718,15 +3739,16 @@ async fn handle_request(
             mutation,
             requester,
         } => {
-            let result = match mutate_server_ban_audited(pool, &mutation).await {
-                Ok(true) => crate::core::ServerBanResult::Stored,
-                Ok(false) => crate::core::ServerBanResult::Missing,
-                Err(e) => {
-                    record_database_error(telemetry);
-                    eprintln!("db: audited server-ban mutation failed: {e}");
-                    crate::core::ServerBanResult::Unavailable
-                }
-            };
+            let result =
+                match mutate_server_ban_audited(pool, &mutation, &requester.audit_actor()).await {
+                    Ok(true) => crate::core::ServerBanResult::Stored,
+                    Ok(false) => crate::core::ServerBanResult::Missing,
+                    Err(e) => {
+                        record_database_error(telemetry);
+                        eprintln!("db: audited server-ban mutation failed: {e}");
+                        crate::core::ServerBanResult::Unavailable
+                    }
+                };
             core_tx
                 .push(Input::ServerBanResult {
                     mutation,
@@ -3979,9 +4001,9 @@ pub async fn unlink_oidc_identity(
     .map_err(query_error)?;
     insert_audit_log_with(
         &mut *tx,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_IDENTITY_UNLINK",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "OpenID Connect identity unlinked and correlated sessions revoked",
     )
     .await?;
@@ -4016,9 +4038,9 @@ pub async fn link_oidc_identity(
     if inserted.is_some() {
         insert_audit_log_with(
             &mut *transaction,
-            &folded,
+            &AuditPrincipal::account(&folded),
             "ACCOUNT_IDENTITY_LINK",
-            &folded,
+            &AuditPrincipal::account(&folded),
             "OpenID Connect identity linked",
         )
         .await?;
@@ -4694,9 +4716,9 @@ async fn audit_channel_service(
 ) -> Result<(), DbError> {
     insert_audit_log_with(
         &mut **transaction,
-        &CaseMapping::Rfc1459.casefold(actor),
+        &AuditPrincipal::account(&CaseMapping::Rfc1459.casefold(actor)),
         action,
-        channel_folded,
+        &AuditPrincipal::channel(channel_folded),
         detail,
     )
     .await
@@ -4917,9 +4939,9 @@ pub async fn persist_owned_channel_mutation(
     };
     insert_audit_log_with(
         &mut *transaction,
-        &actor_folded,
+        &AuditPrincipal::account(&actor_folded),
         action,
-        &channel_folded,
+        &AuditPrincipal::channel(&channel_folded),
         &detail,
     )
     .await?;
@@ -5157,9 +5179,9 @@ pub async fn group_nick(
         .map_err(query_error)?;
     insert_audit_log_with(
         &mut *transaction,
-        &account_folded,
+        &AuditPrincipal::account(&account_folded),
         "NICK_GROUP",
-        &account_folded,
+        &AuditPrincipal::account(&account_folded),
         &nick_folded,
     )
     .await?;
@@ -5187,9 +5209,9 @@ pub async fn ungroup_nick(pool: &PgPool, account: &str, nick: &str) -> Result<bo
     if removed {
         insert_audit_log_with(
             &mut *transaction,
-            &account_folded,
+            &AuditPrincipal::account(&account_folded),
             "NICK_UNGROUP",
-            &account_folded,
+            &AuditPrincipal::account(&account_folded),
             &nick_folded,
         )
         .await?;
@@ -5236,9 +5258,9 @@ pub async fn set_nick_enforce(
         .map_err(query_error)?;
     insert_audit_log_with(
         &mut *transaction,
-        &account_folded,
+        &AuditPrincipal::account(&account_folded),
         "NICK_ENFORCE",
-        &account_folded,
+        &AuditPrincipal::account(&account_folded),
         if enforce { "on" } else { "off" },
     )
     .await?;
@@ -5335,9 +5357,10 @@ pub async fn nickserv_account_info(
 pub async fn mutate_server_ban_audited(
     pool: &PgPool,
     mutation: &crate::core::ServerBanMutation,
+    actor: &AuditPrincipal,
 ) -> Result<bool, DbError> {
     let mut transaction = pool.begin().await.map_err(query_error)?;
-    let (actor, action, target, detail) = match mutation {
+    let (action, target, detail) = match mutation {
         crate::core::ServerBanMutation::Add {
             mask,
             mask_display,
@@ -5362,7 +5385,6 @@ pub async fn mutate_server_ban_audited(
             .await
             .map_err(query_error)?;
             (
-                set_by.as_str(),
                 kind.to_ascii_uppercase(),
                 mask_display.as_str(),
                 reason.as_str(),
@@ -5373,7 +5395,7 @@ pub async fn mutate_server_ban_audited(
             mask,
             mask_display,
             kind,
-            actor,
+            ..
         } => {
             let mut delete =
                 sqlx::QueryBuilder::<sqlx::Postgres>::new("DELETE FROM server_bans WHERE mask = ");
@@ -5391,42 +5413,166 @@ pub async fn mutate_server_ban_audited(
                 return Ok(false);
             }
             (
-                actor.as_str(),
                 format!("UN{}", kind.to_ascii_uppercase()),
                 mask_display.as_str(),
                 "",
             )
         }
     };
-    insert_audit_log_with(&mut *transaction, actor, &action, target, detail).await?;
+    insert_audit_log_with(
+        &mut *transaction,
+        actor,
+        &action,
+        &AuditPrincipal::mask(target),
+        detail,
+    )
+    .await?;
     transaction.commit().await.map_err(query_error)?;
     Ok(true)
 }
 
+/// What kind of name an audit row's actor or target is. Account names,
+/// operator names, nicknames, channels, and masks are different namespaces
+/// that can hold the same spelling — an operator block named `root` beside an
+/// account named `root`, a nick `eve` beside the account `eve` — so a row
+/// records which one it means, and an account's own view selects only rows
+/// that name it *as an account*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuditPrincipalKind {
+    /// A folded account name.
+    Account,
+    /// A configured IRC operator name (the `OPER` block), not an account.
+    Operator,
+    /// An IRC nickname, which any connection may hold.
+    Nick,
+    Channel,
+    /// An account's network, as `owner/network`.
+    Network,
+    /// A server-ban mask.
+    Mask,
+    /// The server itself (its configuration and keys).
+    Server,
+    /// An identity provider, as `oidc:<issuer>`.
+    Provider,
+    /// A command run on the host (`host:recover-administrator`, the secret
+    /// rotation, the bootstrap import), which no account performed.
+    Host,
+    /// A name reserved by an invitation, which no account holds yet.
+    Invitation,
+}
+
+impl AuditPrincipalKind {
+    /// The stored spelling, constrained by migration 0077.
+    const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Account => "account",
+            Self::Operator => "operator",
+            Self::Nick => "nick",
+            Self::Channel => "channel",
+            Self::Network => "network",
+            Self::Mask => "mask",
+            Self::Server => "server",
+            Self::Provider => "provider",
+            Self::Host => "host",
+            Self::Invitation => "invitation",
+        }
+    }
+}
+
+/// An audit row's actor or target: a name and the namespace it belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditPrincipal {
+    kind: AuditPrincipalKind,
+    name: String,
+}
+
+impl AuditPrincipal {
+    fn new(kind: AuditPrincipalKind, name: &str) -> Self {
+        Self {
+            kind,
+            name: name.to_owned(),
+        }
+    }
+
+    /// An account, by its folded name — the account namespace's key, so an
+    /// account's own view matches it whatever spelling the caller held.
+    pub fn account(name: &str) -> Self {
+        Self::new(
+            AuditPrincipalKind::Account,
+            &CaseMapping::Rfc1459.casefold(name),
+        )
+    }
+
+    pub fn operator(name: &str) -> Self {
+        Self::new(AuditPrincipalKind::Operator, name)
+    }
+
+    pub fn nick(name: &str) -> Self {
+        Self::new(AuditPrincipalKind::Nick, name)
+    }
+
+    pub fn channel(name: &str) -> Self {
+        Self::new(AuditPrincipalKind::Channel, name)
+    }
+
+    pub fn network(name: &str) -> Self {
+        Self::new(AuditPrincipalKind::Network, name)
+    }
+
+    pub fn mask(name: &str) -> Self {
+        Self::new(AuditPrincipalKind::Mask, name)
+    }
+
+    pub fn server() -> Self {
+        Self::new(AuditPrincipalKind::Server, "server")
+    }
+
+    pub fn provider(name: &str) -> Self {
+        Self::new(AuditPrincipalKind::Provider, name)
+    }
+
+    pub fn host(name: &str) -> Self {
+        Self::new(AuditPrincipalKind::Host, name)
+    }
+
+    pub fn invitation(name: &str) -> Self {
+        Self::new(AuditPrincipalKind::Invitation, name)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 async fn insert_audit_log_with<'executor>(
     executor: impl sqlx::Executor<'executor, Database = sqlx::Postgres>,
-    actor: &str,
+    actor: &AuditPrincipal,
     action: &str,
-    target: &str,
+    target: &AuditPrincipal,
     detail: &str,
 ) -> Result<(), DbError> {
-    sqlx::query("INSERT INTO audit_log (actor, action, target, detail) VALUES ($1, $2, $3, $4)")
-        .bind(actor)
-        .bind(action)
-        .bind(target)
-        .bind(detail)
-        .execute(executor)
-        .await
-        .map_err(query_error)?;
+    sqlx::query(
+        "INSERT INTO audit_log (actor, actor_kind, action, target, target_kind, detail)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(&actor.name)
+    .bind(actor.kind.as_db_str())
+    .bind(action)
+    .bind(&target.name)
+    .bind(target.kind.as_db_str())
+    .bind(detail)
+    .execute(executor)
+    .await
+    .map_err(query_error)?;
     Ok(())
 }
 
 /// Record one privileged action in the audit trail.
 pub async fn insert_audit_log(
     pool: &PgPool,
-    actor: &str,
+    actor: &AuditPrincipal,
     action: &str,
-    target: &str,
+    target: &AuditPrincipal,
     detail: &str,
 ) -> Result<(), DbError> {
     insert_audit_log_with(pool, actor, action, target, detail).await
@@ -5540,10 +5686,23 @@ pub async fn query_audit_log(
     })
 }
 
-/// Query the security-relevant activity visible to one account. Actor matches
-/// include the account's own mutations; target matches include administrator
-/// actions taken against it. Exact RFC1459 folding prevents one account from
-/// observing a similarly named account's events.
+/// The SQL condition selecting the audit rows (alias `log`) an account sees as
+/// its own activity, the account's folded name being the SQL expression
+/// `name`: the rows naming it *as an account*, as actor (its own mutations) or
+/// target (administrator actions taken against it). An operator, nick, or
+/// reserved name spelled like the account is another principal, and its rows
+/// are not the account's. The account's view and its export share this one
+/// predicate so they cannot select different rows.
+fn account_audit_predicate(log: &str, name: &str) -> String {
+    format!(
+        "(({log}.actor_kind = 'account' AND {log}.actor = {name}) \
+         OR ({log}.target_kind = 'account' AND {log}.target = {name}))"
+    )
+}
+
+/// Query the security-relevant activity visible to one account
+/// ([`account_audit_predicate`]). Exact RFC1459 folding prevents one account
+/// from observing a similarly named account's events.
 pub async fn query_account_security_activity(
     pool: &PgPool,
     account: &str,
@@ -5552,20 +5711,18 @@ pub async fn query_account_security_activity(
 ) -> Result<AuditLogPage, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let fetch_limit = page_size.value() + 1;
-    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-        "SELECT id, actor, action, target, detail,
-                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new("WITH me AS (SELECT ");
+    query.push_bind(&folded).push(
+        "::text AS name)
+         SELECT log.id, log.actor, log.action, log.target, log.detail,
+                to_char(log.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
                     AS created_at
-         FROM audit_log
-         WHERE (actor = ",
+         FROM audit_log log, me
+         WHERE ",
     );
-    query
-        .push_bind(&folded)
-        .push(" OR target = ")
-        .push_bind(&folded)
-        .push(")");
+    query.push(account_audit_predicate("log", "me.name"));
     if let Some(before_id) = before_id {
-        query.push(" AND id < ").push_bind(before_id);
+        query.push(" AND log.id < ").push_bind(before_id);
     }
     query
         .push(" ORDER BY id DESC LIMIT ")
@@ -5626,7 +5783,9 @@ pub async fn begin_account_export(
         .execute(&mut *transaction)
         .await
         .map_err(query_error)?;
-    let head: Option<(String, String)> = sqlx::query_as(
+    // Every interpolated piece is built from constants of this module.
+    let account_activity = account_audit_predicate("log", "a.name_folded");
+    let head: Option<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         r#"
         WITH owner AS (
             SELECT id, name, name_folded, contact_email, flags, created_at
@@ -5757,12 +5916,12 @@ pub async fn begin_account_export(
                         'YYYY-MM-DD"T"HH24:MI:SS"Z"')
                 ) ORDER BY log.id)
                 FROM audit_log log
-                WHERE log.actor = a.name_folded OR log.target = a.name_folded
+                WHERE {account_activity}
             ), '[]'::jsonb)
         )::text
         FROM owner a
         "#,
-    )
+    )))
     .bind(&folded)
     .fetch_optional(&mut *transaction)
     .await
@@ -5978,9 +6137,9 @@ pub async fn persist_channel_registration(
     let result = if inserted.is_some() {
         insert_audit_log_with(
             &mut *transaction,
-            &founder_folded,
+            &AuditPrincipal::account(&founder_folded),
             "CHANNEL_REGISTER",
-            &chan_folded,
+            &AuditPrincipal::channel(&chan_folded),
             "",
         )
         .await?;
@@ -6239,9 +6398,9 @@ pub async fn poll_device_grant(
             Err(refusal @ (DbError::TooManyCredentials | DbError::BadCredentials)) => {
                 insert_audit_log_with(
                     &mut *tx,
-                    &folded,
+                    &AuditPrincipal::account(&folded),
                     "ACCOUNT_DEVICE_TOKEN_DENIED",
-                    &folded,
+                    &AuditPrincipal::account(&folded),
                     match refusal {
                         DbError::TooManyCredentials => {
                             "approved device grant denied: personal access token limit reached"
@@ -6257,9 +6416,9 @@ pub async fn poll_device_grant(
         };
         insert_audit_log_with(
             &mut *tx,
-            &folded,
+            &AuditPrincipal::account(&folded),
             "ACCOUNT_DEVICE_TOKEN_CREATE",
-            &folded,
+            &AuditPrincipal::account(&folded),
             "personal access token created from an approved device grant",
         )
         .await?;
@@ -6932,9 +7091,9 @@ pub async fn change_local_password(
     delete_other_web_sessions_in(&mut transaction, &folded, current_session).await?;
     insert_audit_log_with(
         &mut *transaction,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_PASSWORD_CHANGE",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "primary password changed; other browser sessions ended",
     )
     .await?;
@@ -6980,9 +7139,9 @@ pub async fn set_local_password(
     delete_other_web_sessions_in(&mut transaction, &folded, current_session).await?;
     insert_audit_log_with(
         &mut *transaction,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_PASSWORD_ADD",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "primary password added; other browser sessions ended",
     )
     .await?;
@@ -7076,9 +7235,9 @@ async fn audit_network_mutation(
 ) -> Result<(), DbError> {
     insert_audit_log_with(
         &mut **transaction,
-        &CaseMapping::Rfc1459.casefold(audit.actor),
+        &AuditPrincipal::account(&CaseMapping::Rfc1459.casefold(audit.actor)),
         action,
-        &format!("{owner_folded}/{network}"),
+        &AuditPrincipal::network(&format!("{owner_folded}/{network}")),
         audit.detail,
     )
     .await
@@ -8435,9 +8594,9 @@ pub async fn find_or_create_oidc_account(
     }
     insert_audit_log_with(
         &mut *tx,
-        &format!("oidc:{issuer}"),
+        &AuditPrincipal::provider(&format!("oidc:{issuer}")),
         "ACCOUNT_CREATE",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "provisioned from OpenID Connect",
     )
     .await?;
@@ -8597,9 +8756,9 @@ pub async fn create_web_session_with_identity(
     .map_err(query_error)?;
     insert_audit_log_with(
         &mut *tx,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_LOGIN",
-        &folded,
+        &AuditPrincipal::account(&folded),
         if provider.is_some() {
             "browser session created through OpenID Connect"
         } else {
@@ -8710,9 +8869,9 @@ pub async fn consume_oidc_backchannel_logout(
     for account in affected_accounts {
         insert_audit_log_with(
             &mut *tx,
-            &account,
+            &AuditPrincipal::account(&account),
             "ACCOUNT_OIDC_LOGOUT",
-            &account,
+            &AuditPrincipal::account(&account),
             "browser sessions revoked by OpenID Connect back-channel logout",
         )
         .await?;
@@ -8763,9 +8922,9 @@ pub async fn revoke_oidc_frontchannel_sessions(
     for account in affected_accounts {
         insert_audit_log_with(
             &mut *transaction,
-            &account,
+            &AuditPrincipal::account(&account),
             "ACCOUNT_OIDC_LOGOUT",
-            &account,
+            &AuditPrincipal::account(&account),
             "browser sessions revoked by OpenID Connect front-channel logout",
         )
         .await?;
@@ -8830,9 +8989,9 @@ pub async fn delete_web_session(pool: &PgPool, token: &str) -> Result<(), DbErro
     if let Some(owner) = owner {
         insert_audit_log_with(
             &mut *transaction,
-            &owner,
+            &AuditPrincipal::account(&owner),
             "ACCOUNT_LOGOUT",
-            &owner,
+            &AuditPrincipal::account(&owner),
             "browser session ended",
         )
         .await?;
@@ -8913,9 +9072,9 @@ pub async fn delete_web_session_by_id(
         let folded = CaseMapping::Rfc1459.casefold(account);
         insert_audit_log_with(
             &mut *transaction,
-            &folded,
+            &AuditPrincipal::account(&folded),
             "ACCOUNT_SESSION_REVOKE",
-            &folded,
+            &AuditPrincipal::account(&folded),
             "browser session revoked",
         )
         .await?;
@@ -8957,9 +9116,9 @@ pub async fn delete_other_web_sessions(
     if deleted != 0 {
         insert_audit_log_with(
             &mut *transaction,
-            &folded,
+            &AuditPrincipal::account(&folded),
             "ACCOUNT_SESSIONS_REVOKE",
-            &folded,
+            &AuditPrincipal::account(&folded),
             "other browser sessions revoked",
         )
         .await?;
@@ -8988,9 +9147,9 @@ pub async fn issue_scoped_api_token(
     let token = mint_api_token_under_cap(&mut tx, account, label, scopes, lifetime).await?;
     insert_audit_log_with(
         &mut *tx,
-        &folded,
+        &AuditPrincipal::account(&folded),
         "ACCOUNT_TOKEN_CREATE",
-        &folded,
+        &AuditPrincipal::account(&folded),
         "personal access token created",
     )
     .await?;
@@ -9172,7 +9331,14 @@ async fn commit_credential_revocation(
     if result.rows_affected() == 0 {
         return Ok(false);
     }
-    insert_audit_log_with(&mut *transaction, folded, action, folded, detail).await?;
+    insert_audit_log_with(
+        &mut *transaction,
+        &AuditPrincipal::account(folded),
+        action,
+        &AuditPrincipal::account(folded),
+        detail,
+    )
+    .await?;
     transaction.commit().await.map_err(query_error)?;
     Ok(true)
 }

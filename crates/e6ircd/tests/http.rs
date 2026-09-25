@@ -50,6 +50,7 @@ async fn add_server_ban(
             set_by: set_by.into(),
             kind: kind.into(),
         },
+        &e6ircd::db::AuditPrincipal::account(set_by),
     )
     .await
     .map(|_| ())
@@ -4561,9 +4562,15 @@ async fn admin_accounts_endpoint_is_gated() {
     add_server_ban(&pool, "spammer@*", "spammer@*", "spam", "alice", "kline")
         .await
         .expect("kline");
-    e6ircd::db::insert_audit_log(&pool, "alice", "KLINE", "spammer@*", "spam")
-        .await
-        .expect("audit");
+    e6ircd::db::insert_audit_log(
+        &pool,
+        &e6ircd::db::AuditPrincipal::account("alice"),
+        "KLINE",
+        &e6ircd::db::AuditPrincipal::mask("spammer@*"),
+        "spam",
+    )
+    .await
+    .expect("audit");
     sqlx::query(
         "INSERT INTO channels (name, name_folded, founder_account_id)
          SELECT '#lounge', '#lounge', id FROM accounts WHERE name_folded = 'alice'",
@@ -4748,9 +4755,15 @@ async fn admin_console_page_is_api_hydrated_and_admin_only() {
     add_server_ban(&pool, "spammer@*", "spammer@*", "spam", "alice", "kline")
         .await
         .expect("kline");
-    e6ircd::db::insert_audit_log(&pool, "alice", "KLINE", "spammer@*", "spam")
-        .await
-        .expect("audit");
+    e6ircd::db::insert_audit_log(
+        &pool,
+        &e6ircd::db::AuditPrincipal::account("alice"),
+        "KLINE",
+        &e6ircd::db::AuditPrincipal::mask("spammer@*"),
+        "spam",
+    )
+    .await
+    .expect("audit");
     sqlx::query(
         "INSERT INTO channels (name, name_folded, founder_account_id)
          SELECT '#lounge', '#lounge', id FROM accounts WHERE name_folded = 'alice'",
@@ -5815,9 +5828,15 @@ async fn audit_explorer_filters_pages_and_escapes_for_admins_only() {
         ("alice", "CONFIG", "server", "revision 2"),
         ("bob", "KLINE", "third@host", "spam"),
     ] {
-        e6ircd::db::insert_audit_log(&pool, actor, action, target, detail)
-            .await
-            .expect("seed audit entry");
+        e6ircd::db::insert_audit_log(
+            &pool,
+            &e6ircd::db::AuditPrincipal::account(actor),
+            action,
+            &seeded_target(action, target),
+            detail,
+        )
+        .await
+        .expect("seed audit entry");
     }
 
     let config = Config {
@@ -5870,9 +5889,15 @@ async fn audit_explorer_filters_pages_and_escapes_for_admins_only() {
     assert!(first["audit"][0]["id"].as_i64().is_some(), "{body}");
     let cursor = first["next_before_id"].as_i64().expect("next page cursor");
 
-    e6ircd::db::insert_audit_log(&pool, "alice", "OPER", "alice", "concurrent")
-        .await
-        .expect("concurrent audit append");
+    e6ircd::db::insert_audit_log(
+        &pool,
+        &e6ircd::db::AuditPrincipal::operator("alice"),
+        "OPER",
+        &e6ircd::db::AuditPrincipal::operator("alice"),
+        "concurrent",
+    )
+    .await
+    .expect("concurrent audit append");
     let older_path = format!("/api/v1/admin/audit?limit=2&before_id={cursor}");
     let (status, _, older_body) = request(http, &cookie_get(&older_path, &alice_session)).await;
     assert_eq!(status, 200, "{older_body}");
@@ -10623,4 +10648,15 @@ async fn frontchannel_logout_clears_only_a_revoked_sessions_cookie() {
     let (status, headers, _) = request(http, &logout("bob-sid", &sessions[1])).await;
     assert_eq!(status, 200, "{headers}");
     assert!(headers.contains("e6irc_session=;"), "{headers}");
+}
+
+/// The target principal a seeded audit row names, by the kind its action
+/// records: a ban's mask, the server's configuration, or an account.
+fn seeded_target(action: &str, target: &str) -> e6ircd::db::AuditPrincipal {
+    match action {
+        "KLINE" => e6ircd::db::AuditPrincipal::mask(target),
+        "CONFIG" => e6ircd::db::AuditPrincipal::server(),
+        "OPER" => e6ircd::db::AuditPrincipal::operator(target),
+        _ => e6ircd::db::AuditPrincipal::account(target),
+    }
 }

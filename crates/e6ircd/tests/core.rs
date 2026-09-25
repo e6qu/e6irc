@@ -10566,6 +10566,7 @@ fn server_ban_store_failure_is_loud_labeled_and_non_mutating() {
                     requester @ e6ircd::core::ServerBanRequester::Oper {
                         session,
                         label: Some(label),
+                        ..
                     },
             },
         ] if session.connection_id() == op && label == "ban7" => {
@@ -10642,7 +10643,9 @@ fn oper_actions_are_audited() {
         s.db_requests()
             .into_iter()
             .filter_map(|r| match r {
-                e6ircd::core::DbRequest::AuditLog { action, target, .. } => Some((action, target)),
+                e6ircd::core::DbRequest::AuditLog { action, target, .. } => {
+                    Some((action, target.name().to_string()))
+                }
                 _ => None,
             })
             .collect()
@@ -10708,7 +10711,11 @@ fn self_kill_audit_row_names_the_actor() {
             _ => None,
         })
         .expect("KILL not audited");
-    assert_eq!(actor, "god", "self-KILL audit row lost its actor");
+    assert_eq!(
+        actor,
+        e6ircd::db::AuditPrincipal::operator("god"),
+        "self-KILL audit row lost its actor"
+    );
 }
 
 fn audit_rows(s: &mut TestServer) -> Vec<(String, String, String)> {
@@ -10720,7 +10727,7 @@ fn audit_rows(s: &mut TestServer) -> Vec<(String, String, String)> {
                 action,
                 target,
                 ..
-            } => Some((actor, action, target)),
+            } => Some((actor.name().to_string(), action, target.name().to_string())),
             _ => None,
         })
         .collect()

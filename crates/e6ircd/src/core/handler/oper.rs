@@ -46,7 +46,8 @@ pub(super) fn cmd_oper(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .expect("registered");
     // The grant is recorded before it takes effect; one that cannot be
     // recorded does not happen.
-    if queue_audit(state, name, "OPER", name, &format!("nick {nick}")).is_err() {
+    let operator = crate::db::AuditPrincipal::operator(&state.casemap.casefold(name));
+    if queue_audit(state, &operator, "OPER", &operator, &format!("nick {nick}")).is_err() {
         let server = state.config.server_name.clone();
         state.send(
             conn,
@@ -127,7 +128,15 @@ pub(super) fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // Recorded here, where the operator is, before the kill is carried out on
     // whichever shard holds the victim; a kill that cannot be recorded is not
     // carried out.
-    if queue_audit(state, &operator, "KILL", &victim.nick, &comment).is_err() {
+    if queue_audit(
+        state,
+        &crate::db::AuditPrincipal::operator(&state.casemap.casefold(&operator)),
+        "KILL",
+        &crate::db::AuditPrincipal::nick(&victim.nick),
+        &comment,
+    )
+    .is_err()
+    {
         refuse_unaudited(state, conn, "KILL");
         return;
     }
@@ -224,7 +233,15 @@ pub(crate) fn kill_connection(
     let Some(target) = registered_nick(state, victim) else {
         return KillOutcome::Missing;
     };
-    if queue_audit(state, actor, "KILL", &target, comment).is_err() {
+    if queue_audit(
+        state,
+        &crate::db::AuditPrincipal::account(&state.casemap.casefold(actor)),
+        "KILL",
+        &crate::db::AuditPrincipal::nick(&target),
+        comment,
+    )
+    .is_err()
+    {
         return KillOutcome::AuditUnavailable;
     }
     close_killed(state, victim, comment, actor);
@@ -293,18 +310,18 @@ pub(crate) struct AuditUnavailable;
 /// trail to write, so there is nothing to refuse for.
 pub(crate) fn queue_audit(
     state: &mut ServerState,
-    actor: &str,
+    actor: &crate::db::AuditPrincipal,
     action: &str,
-    target: &str,
+    target: &crate::db::AuditPrincipal,
     detail: &str,
 ) -> Result<(), AuditUnavailable> {
     if !state.config.sasl_enabled {
         return Ok(());
     }
     let request = crate::core::DbRequest::AuditLog {
-        actor: state.casemap.casefold(actor),
+        actor: actor.clone(),
         action: action.to_string(),
-        target: target.to_string(),
+        target: target.clone(),
         detail: detail.to_string(),
     };
     state.db_tx.try_push(request).map(|_| ()).map_err(|_| {
@@ -612,6 +629,7 @@ fn begin_oper_server_ban(
     let requester = crate::core::ServerBanRequester::Oper {
         session: state.session_owner(conn),
         label: response_label,
+        operator: operator_name(state, conn),
     };
     match queue_server_ban_mutation(state, mutation, requester) {
         Ok(()) => state.defer_captured_reply(conn),
@@ -796,7 +814,7 @@ fn finish_server_ban(
     admin_reply: crate::core::AdminReply,
 ) {
     match requester {
-        crate::core::ServerBanRequester::Oper { session, label } => {
+        crate::core::ServerBanRequester::Oper { session, label, .. } => {
             server_ban_oper_verdict(state, session.conn(), label, operator_text);
         }
         crate::core::ServerBanRequester::Admin { request_id, .. } => {
@@ -1012,7 +1030,15 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     let operator = operator_name(state, conn);
-    if queue_audit(state, &operator, "SETHOST", nick, newhost).is_err() {
+    if queue_audit(
+        state,
+        &crate::db::AuditPrincipal::operator(&state.casemap.casefold(&operator)),
+        "SETHOST",
+        &crate::db::AuditPrincipal::nick(nick),
+        newhost,
+    )
+    .is_err()
+    {
         refuse_unaudited(state, conn, "SETHOST");
         return;
     }

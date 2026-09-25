@@ -67,9 +67,9 @@ async fn audit_network_command(
     let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account);
     crate::db::insert_audit_log(
         pool_of(state),
-        &folded,
+        &crate::db::AuditPrincipal::account(&folded),
         "NETWORK_ACCOUNT_COMMAND",
-        &format!("{folded}/{network}"),
+        &crate::db::AuditPrincipal::network(&format!("{folded}/{network}")),
         command,
     )
     .await

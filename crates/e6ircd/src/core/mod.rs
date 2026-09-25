@@ -1232,11 +1232,25 @@ pub enum ServerBanRequester {
     Oper {
         session: SessionOwner,
         label: Option<String>,
+        /// The configured operator name the session opered up as — who the
+        /// audit row records, whatever nick the session holds.
+        operator: String,
     },
     Admin {
         request_id: u64,
         actor: String,
     },
+}
+
+impl ServerBanRequester {
+    /// Who the audit trail records as having made the change: an operator
+    /// by its configured name, an administrator by account.
+    pub fn audit_actor(&self) -> crate::db::AuditPrincipal {
+        match self {
+            Self::Oper { operator, .. } => crate::db::AuditPrincipal::operator(operator),
+            Self::Admin { actor, .. } => crate::db::AuditPrincipal::account(actor),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1699,9 +1713,9 @@ pub enum DbRequest {
     },
     /// Record a privileged (oper) action in the audit log. Fire-and-forget.
     AuditLog {
-        actor: String,
+        actor: crate::db::AuditPrincipal,
         action: String,
-        target: String,
+        target: crate::db::AuditPrincipal,
         detail: String,
     },
     /// Append one chat message to history. Fire-and-forget: no reply.

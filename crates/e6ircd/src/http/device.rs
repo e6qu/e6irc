@@ -1362,7 +1362,7 @@ pub(super) async fn admin_patch_configuration(
         pool_of(&state),
         current.revision,
         &settings,
-        &actor,
+        &crate::db::AuditPrincipal::account(&actor),
         &detail,
     )
     .await
@@ -1784,7 +1784,7 @@ async fn mutate_managed_configuration(
         pool_of(state),
         revision,
         &settings,
-        actor,
+        &crate::db::AuditPrincipal::account(actor),
         &format!("{detail}; restart required"),
     )
     .await

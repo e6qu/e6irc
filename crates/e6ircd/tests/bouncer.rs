@@ -1062,9 +1062,15 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
         .expect("stored settings");
     let mut moved = stored.settings.clone();
     moved.networks[0].addr = UNREACHABLE.into();
-    e6ircd::db::save_managed_config(&pool, stored.revision, &moved, "test", "move up")
-        .await
-        .expect("move the network");
+    e6ircd::db::save_managed_config(
+        &pool,
+        stored.revision,
+        &moved,
+        &e6ircd::db::AuditPrincipal::account("test"),
+        "move up",
+    )
+    .await
+    .expect("move the network");
     drop(pool);
     let mut config_b = bnc_config(up, url.clone());
     config_b.networks[0].addr = UNREACHABLE.into();
