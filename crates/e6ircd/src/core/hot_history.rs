@@ -8,14 +8,16 @@
 //!   list of keys on every message);
 //! - which conversations an identity takes part in comes from `conversations`
 //!   (not a split of every key on every disconnect or CHATHISTORY TARGETS);
-//! - a ring's newest timestamp comes from its running window maximum (not a
-//!   pass over its entries each time a channel is published).
+//! - a ring's newest timestamp, in each [`HistoryScope`], comes from a running
+//!   window maximum (not a pass over its entries each time a channel is
+//!   published or CHATHISTORY TARGETS asks).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use e6irc_proto::casemap::CaseMapping;
 use e6irc_proto::time::Millis;
 
+use super::HistoryScope;
 use super::state::{HistoryEntry, HistoryKey};
 use crate::recency::Recency;
 
@@ -32,11 +34,93 @@ pub(crate) struct HistoryRing {
     /// Position of `entries.front()` in the sequence of entries this ring has
     /// held since it was last rebuilt; `entries[i]` is at `first + i`.
     first: u64,
-    /// The sliding-window maximum of `entries`' timestamps: `(position, ts)`
-    /// with strictly decreasing `ts`, front the newest timestamp still held.
-    /// Timestamps come from wall clocks (and from other shards'), so arrival
-    /// order is not timestamp order and the back entry is not the newest.
-    maxima: VecDeque<(u64, Millis)>,
+    /// The newest timestamp of the entries held, in every scope.
+    maxima: ScopedMaxima,
+}
+
+/// A buffer's newest activity as each [`HistoryScope`] sees it: a reader
+/// without `message-tags` cannot be sent a TAGMSG, so a buffer whose newest
+/// entry is one is dated by its newest *text* entry for them — and a buffer
+/// holding only TAGMSGs has no activity at all in their scope.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Latest {
+    text: Option<Millis>,
+    text_and_tags: Option<Millis>,
+}
+
+impl Latest {
+    /// The newest entry a reader in `scope` can be sent, if any.
+    pub(crate) fn in_scope(self, scope: HistoryScope) -> Option<Millis> {
+        match scope {
+            HistoryScope::Text => self.text,
+            HistoryScope::TextAndTags => self.text_and_tags,
+        }
+    }
+}
+
+/// The sliding-window maximum of some of a ring's timestamps: `(position,
+/// ts)` with strictly decreasing `ts`, front the newest timestamp still held.
+/// Timestamps come from wall clocks (and from other shards'), so arrival
+/// order is not timestamp order and the back entry is not the newest.
+#[derive(Default)]
+struct WindowMax(VecDeque<(u64, Millis)>);
+
+impl WindowMax {
+    fn newest(&self) -> Option<Millis> {
+        self.0.front().map(|&(_, ts)| ts)
+    }
+
+    fn push(&mut self, at: u64, ts: Millis) {
+        while self.0.back().is_some_and(|&(_, newer)| newer <= ts) {
+            self.0.pop_back();
+        }
+        self.0.push_back((at, ts));
+    }
+
+    /// The entry at position `at` left the front of the ring.
+    fn expire(&mut self, at: u64) {
+        if self.0.front().is_some_and(|&(front, _)| front == at) {
+            self.0.pop_front();
+        }
+    }
+}
+
+/// One [`WindowMax`] per [`HistoryScope`], each over the entries that scope
+/// admits, so every scope's newest entry is a constant-time read.
+#[derive(Default)]
+struct ScopedMaxima {
+    text: WindowMax,
+    text_and_tags: WindowMax,
+}
+
+impl ScopedMaxima {
+    fn scopes(&mut self) -> [(HistoryScope, &mut WindowMax); 2] {
+        [
+            (HistoryScope::Text, &mut self.text),
+            (HistoryScope::TextAndTags, &mut self.text_and_tags),
+        ]
+    }
+
+    fn push(&mut self, at: u64, entry: &HistoryEntry) {
+        for (scope, maxima) in self.scopes() {
+            if scope.admits(entry.kind) {
+                maxima.push(at, entry.ts);
+            }
+        }
+    }
+
+    fn expire(&mut self, at: u64) {
+        for (_, maxima) in self.scopes() {
+            maxima.expire(at);
+        }
+    }
+
+    fn latest(&self) -> Latest {
+        Latest {
+            text: self.text.newest(),
+            text_and_tags: self.text_and_tags.newest(),
+        }
+    }
 }
 
 impl HistoryRing {
@@ -45,7 +129,7 @@ impl HistoryRing {
             entries: VecDeque::new(),
             complete,
             first: 0,
-            maxima: VecDeque::new(),
+            maxima: ScopedMaxima::default(),
         }
     }
 
@@ -57,25 +141,21 @@ impl HistoryRing {
         self.complete
     }
 
-    /// The newest timestamp among the entries held, in constant time.
-    pub(crate) fn latest(&self) -> Option<Millis> {
-        self.maxima.front().map(|&(_, ts)| ts)
+    /// The newest timestamp among the entries held, in every scope, in
+    /// constant time.
+    pub(crate) fn latest(&self) -> Latest {
+        self.maxima.latest()
     }
 
     fn push(&mut self, entry: HistoryEntry) {
         if self.entries.len() == HISTORY_RING_CAP {
             self.entries.pop_front();
-            if self.maxima.front().is_some_and(|&(at, _)| at == self.first) {
-                self.maxima.pop_front();
-            }
+            self.maxima.expire(self.first);
             self.first += 1;
             self.complete = false;
         }
         let at = self.first + self.entries.len() as u64;
-        while self.maxima.back().is_some_and(|&(_, ts)| ts <= entry.ts) {
-            self.maxima.pop_back();
-        }
-        self.maxima.push_back((at, entry.ts));
+        self.maxima.push(at, &entry);
         self.entries.push_back(entry);
     }
 
@@ -245,11 +325,17 @@ impl HotHistory {
         assert_eq!(self.recency.len(), self.rings.len());
         assert_eq!(self.conversations, conversations);
         for (key, ring) in &self.rings {
-            assert_eq!(
-                ring.latest(),
-                ring.entries.iter().map(|entry| entry.ts).max(),
-                "{key:?}'s running maximum"
-            );
+            for scope in [HistoryScope::Text, HistoryScope::TextAndTags] {
+                assert_eq!(
+                    ring.latest().in_scope(scope),
+                    ring.entries
+                        .iter()
+                        .filter(|entry| scope.admits(entry.kind))
+                        .map(|entry| entry.ts)
+                        .max(),
+                    "{key:?}'s running maximum in {scope:?}"
+                );
+            }
         }
     }
 
@@ -277,8 +363,18 @@ mod tests {
         }
     }
 
-    /// Timestamps out of arrival order, and entries overflowing off the
-    /// front, keep the running maximum equal to a recount.
+    fn reaction(ts: u64) -> HistoryEntry {
+        HistoryEntry {
+            kind: crate::core::HistoryKind::Tagmsg,
+            body: String::new(),
+            client_tags: "+draft/react=x".into(),
+            ..entry(ts, None)
+        }
+    }
+
+    /// Timestamps out of arrival order, TAGMSGs among the text, and entries
+    /// overflowing off the front keep every scope's running maximum equal to a
+    /// recount.
     #[test]
     fn running_maximum_matches_a_recount() {
         let mut history = HotHistory::default();
@@ -286,10 +382,43 @@ mod tests {
         let mut seed = 7u64;
         for _ in 0..3 * HISTORY_RING_CAP {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            history.push(&key, entry(seed >> 54, None), true, 8);
+            let ts = seed >> 54;
+            let pushed = if seed & (1 << 40) == 0 {
+                entry(ts, None)
+            } else {
+                reaction(ts)
+            };
+            history.push(&key, pushed, true, 8);
             history.assert_consistent();
         }
         assert!(!history.get(&key).expect("ring").complete());
+    }
+
+    /// A reader without `message-tags` dates a ring by its newest text entry,
+    /// and a ring holding only TAGMSGs has no activity in that scope.
+    #[test]
+    fn a_tagmsg_dates_a_ring_only_for_a_reader_in_its_scope() {
+        let mut history = HotHistory::default();
+        let key = HistoryKey::channel_for_test("#c");
+        history.push(&key, reaction(5), true, 8);
+        let latest = history.get(&key).expect("ring").latest();
+        assert_eq!(latest.in_scope(HistoryScope::Text), None);
+        assert_eq!(
+            latest.in_scope(HistoryScope::TextAndTags),
+            Some(Millis::from_millis(5))
+        );
+        history.push(&key, entry(7, None), true, 8);
+        history.push(&key, reaction(9), true, 8);
+        let latest = history.get(&key).expect("ring").latest();
+        assert_eq!(
+            latest.in_scope(HistoryScope::Text),
+            Some(Millis::from_millis(7))
+        );
+        assert_eq!(
+            latest.in_scope(HistoryScope::TextAndTags),
+            Some(Millis::from_millis(9))
+        );
+        history.assert_consistent();
     }
 
     /// Every way a ring comes and goes — creation, eviction, removal,
@@ -333,7 +462,10 @@ mod tests {
         assert!(changed.contains(&keys[1]));
         let ring = history.get(&keys[1]).expect("#b kept");
         assert_eq!(ring.entries().len(), 1);
-        assert_eq!(ring.latest(), Some(Millis::from_millis(10)));
+        assert_eq!(
+            ring.latest().in_scope(HistoryScope::TextAndTags),
+            Some(Millis::from_millis(10))
+        );
         // The conversation between two others lost the account's line too.
         assert!(changed.contains(&keys[5]));
         assert!(history.get(&keys[5]).expect("kept").entries().is_empty());

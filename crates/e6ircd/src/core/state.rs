@@ -126,10 +126,10 @@ pub(crate) struct PublicChannel {
     secret: bool,
     /// Members holding op or voice. Everyone else is a plain member.
     ranks: HashMap<ConnId, MemberModes>,
-    /// The newest message in the channel's history ring, if it has one. The
+    /// The newest entry in the channel's history ring, in every scope. The
     /// ring lives with the channel's owner; with no database it is the whole
     /// record, and CHATHISTORY TARGETS is answered from this on every shard.
-    latest_message: Option<e6irc_proto::time::Millis>,
+    latest_message: crate::core::hot_history::Latest,
     /// When this incarnation was created ([`Channel::created_at`]), so a
     /// shard that does not own the channel bounds its history the same way.
     created_at: e6irc_proto::time::Millis,
@@ -170,7 +170,7 @@ impl MembershipDirectory {
     fn publish_latest_message(
         &self,
         key: &ChanKey,
-        latest: Option<e6irc_proto::time::Millis>,
+        latest: crate::core::hot_history::Latest,
     ) -> bool {
         let mut channels = self.channels.lock().expect("membership directory poisoned");
         match channels.get_mut(key) {
@@ -182,15 +182,19 @@ impl MembershipDirectory {
         }
     }
 
-    /// A channel's display name and the time of the newest message in its
-    /// history ring, when it has one.
+    /// A channel's display name and the time of the newest entry in its
+    /// history ring a reader in `scope` can be sent, when it has one.
     pub(crate) fn channel_activity(
         &self,
         key: &ChanKey,
+        scope: crate::core::HistoryScope,
     ) -> Option<(String, e6irc_proto::time::Millis)> {
         let channels = self.channels.lock().expect("membership directory poisoned");
         let channel = channels.get(key)?;
-        Some((channel.name.clone(), channel.latest_message?))
+        Some((
+            channel.name.clone(),
+            channel.latest_message.in_scope(scope)?,
+        ))
     }
 
     /// When a channel's current incarnation was created.
@@ -4812,9 +4816,13 @@ impl ServerState {
         }
     }
 
-    /// The newest message time in channel `key`'s ring, if it holds one.
-    fn latest_channel_message(&self, key: &ChanKey) -> Option<e6irc_proto::time::Millis> {
-        self.history.get(&HistoryKey::from(key))?.latest()
+    /// The newest entry time in channel `key`'s ring, in every scope (none
+    /// when it has no ring).
+    fn latest_channel_message(&self, key: &ChanKey) -> crate::core::hot_history::Latest {
+        self.history
+            .get(&HistoryKey::from(key))
+            .map(crate::core::hot_history::HistoryRing::latest)
+            .unwrap_or_default()
     }
 
     /// Bring the rest of the server up to date with every session this event
@@ -5857,13 +5865,15 @@ impl ServerState {
         self.users.counts()
     }
 
-    /// A channel's display name and when its history ring last saw a message,
-    /// whichever shard owns the channel (and so holds the ring).
+    /// A channel's display name and when its history ring last saw an entry a
+    /// reader in `scope` can be sent, whichever shard owns the channel (and so
+    /// holds the ring).
     pub(crate) fn channel_activity(
         &self,
         key: &ChanKey,
+        scope: crate::core::HistoryScope,
     ) -> Option<(String, e6irc_proto::time::Millis)> {
-        self.memberships.channel_activity(key)
+        self.memberships.channel_activity(key, scope)
     }
 
     /// The oldest history of channel `key` that `account` may read, or `None`
@@ -7793,7 +7803,8 @@ mod session_store_tests {
         crate::core::handler::dispatch(&mut state, ConnId(1), b"JOIN #c");
         state.publish_changed_channels();
         let key = state.chan_key("#c");
-        assert_eq!(state.channel_activity(&key), None, "no message yet");
+        let text = crate::core::HistoryScope::Text;
+        assert_eq!(state.channel_activity(&key, text), None, "no message yet");
         crate::core::handler::dispatch(&mut state, ConnId(1), b"PRIVMSG #c :hi");
         assert!(
             state.channels.touched.is_empty(),
@@ -7804,9 +7815,9 @@ mod session_store_tests {
         let latest = state
             .history
             .get(&HistoryKey::from(&key))
-            .and_then(crate::core::hot_history::HistoryRing::latest);
+            .and_then(|ring| ring.latest().in_scope(text));
         assert!(latest.is_some());
-        assert_eq!(state.channel_activity(&key).map(|(_, ts)| ts), latest);
+        assert_eq!(state.channel_activity(&key, text).map(|(_, ts)| ts), latest);
         state.history.assert_consistent();
     }
 }

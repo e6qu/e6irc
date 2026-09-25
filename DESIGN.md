@@ -1359,16 +1359,19 @@ Principal tables (columns abridged):
   trigger (migration 0072) refuses any row naming — as sender or direct-message
   peer — an account that is retired or being deleted, so an asynchronously
   written message can never outlive account deletion's purge (§9.1).
-- `dm_conversations` (account, peer, latest_ts) — one row per participant of
-  each stored direct-message conversation (folded identities; a conversation
-  with oneself is `(me, me)`), holding its newest message time, indexed
-  `(account, latest_ts)`. CHATHISTORY TARGETS reads its conversation half here,
-  at most the request's limit of rows (§11.1.1). It is a function of
-  `messages` kept by that table's statement triggers (migration 0080): an insert
-  advances it, and a delete that removed a conversation's newest message
-  recomputes it from what remains or forgets the conversation. Every writer —
-  the history flush, retention, account deletion's purge — therefore keeps it
-  exact without knowing it exists.
+- `dm_conversations` (account, peer, latest_ts, latest_text_ts) — one row per
+  participant of each stored direct-message conversation (folded identities; a
+  conversation with oneself is `(me, me)`), holding its newest entry time of
+  any kind and its newest PRIVMSG/NOTICE time (NULL while it holds only
+  `TAGMSG`s; migration 0085), each indexed `(account, <time>)`. CHATHISTORY
+  TARGETS reads its conversation half here, from the column of the reader's
+  `HistoryScope`, at most the request's limit of rows (§11.1.1, §11.3). It is a
+  function of `messages` kept by that table's statement triggers (migrations
+  0080, 0085): an insert advances each time it is newer than, and a delete that
+  removed a conversation's newest entry in either scope recomputes both from
+  what remains or forgets the conversation. Every writer — the history flush,
+  retention, account deletion's purge — therefore keeps it exact without
+  knowing it exists.
 - `bnc_networks` (account_id, name, addr, tls, nick, realname, autojoin,
   sasl_account, `sasl_password_sealed` — **sealed** (`enc:v1:`) with the
   server master key (§15), `server_password_sealed` (IRC only, a table CHECK;
@@ -2944,8 +2947,9 @@ Design constraints recorded now:
   session gains an account — the field is write-private — and it performs the
   release. An authenticated participant keeps such a conversation for
   exactly as long as the other party holds the nick; CHATHISTORY TARGETS finds
-  each channel's newest message with one backward index probe (LATERAL
-  `max(ts)`) and each stored conversation's from `dm_conversations` (§8), reading
+  each channel's newest entry in the reader's scope (§11.3) with one backward
+  index scan (LATERAL `max(ts)`, stepping over the `TAGMSG`s a text-scope reader
+  cannot be sent) and each stored conversation's from `dm_conversations` (§8), reading
   at most the request's limit of summary rows rather than every stored direct
   message of the requester, and lists
   it from the ring alongside what the database returns. Only a conversation
@@ -3021,11 +3025,17 @@ Design constraints recorded now:
   of the buffer. The core cuts its pages the same way: a `HistoryScope` built
   from the reader's `message-tags` excludes stored TAGMSG rows in the ring
   filter and in the SQL before the `LIMIT` (the REST API, which serves text,
-  reads in the text scope; the core's TARGETS still dates a buffer by its
-  newest entry of either kind). `BncHistoryScope` is built from that one capability
+  reads in the text scope). TARGETS answers in the reader's scope too: a
+  buffer is dated by its newest entry the reader can be sent, and one whose
+  only activity in the window is `TAGMSG`s is not listed for a reader without
+  `message-tags` — naming it would promise a page that comes back empty. The
+  ring keeps its newest time per scope, the channel query cuts by kind, and a
+  conversation's summary keeps both times (§8, migration 0085); one
+  `by_history_scope!` in `db.rs` spells what a scope means in SQL for pages,
+  windows and TARGETS alike. The bouncer does the same:
+  `BncHistoryScope` is built from that one capability
   and rides into the query, so the `LIMIT` counts only deliverable lines, and TARGETS
-  answers in the same scope rather than naming a conversation whose page comes
-  back empty. What decides it is `bnc_buffer.command`, a column generated from
+  answers in the same scope. What decides it is `bnc_buffer.command`, a column generated from
   the line (migration 0069) rather than written beside it: it cannot disagree
   with the line it describes, it covers rows stored before it existed, and it
   reads the frame — a message whose *body* mentions `TAGMSG` still arrives. A session may have at most 8 history requests waiting on the
@@ -3058,9 +3068,10 @@ Design constraints recorded now:
   O(targets)); an identity → conversations index answers "free this `~nick`'s
   conversations" on every unauthenticated disconnect or nick change, and
   CHATHISTORY TARGETS' conversation list, without visiting any other ring; and
-  each ring keeps its newest timestamp as a sliding-window maximum (entries
-  arrive in wall-clock order from several clocks, so the back entry is not
-  necessarily the newest). A permanently deleted account's hot copy follows
+  each ring keeps its newest timestamp in each `HistoryScope` as a
+  sliding-window maximum over the entries that scope admits (entries arrive in
+  wall-clock order from several clocks, so the back entry is not necessarily
+  the newest), which a channel's owner publishes for TARGETS on every shard. A permanently deleted account's hot copy follows
   the database purge: its lines and its conversations leave the rings, and
   its entries leave every channel's access list, on every shard.
 

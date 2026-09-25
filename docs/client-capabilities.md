@@ -23,7 +23,9 @@ CHATHISTORY replays a message with the client-only tags it was delivered with
 (`+draft/reply`, `+draft/react`, …) and replays reactions and other `TAGMSG`s,
 to a client that negotiated `message-tags` — on the server and, from the raw
 lines it stores, on the bouncer. A client without `message-tags` receives
-neither, and its pages count only the lines it can receive. Typing indicators
+neither, and its pages count only the lines it can receive; `CHATHISTORY
+TARGETS` dates each buffer for it by the newest line it can receive, and leaves
+out a buffer whose only activity in the window is `TAGMSG`s. Typing indicators
 (`+typing`, `+draft/typing`) are live only: they are never replayed. REST
 history serves text messages only.
 
