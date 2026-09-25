@@ -3288,7 +3288,8 @@ membership sigils and which modes take a parameter from the network's own
 the ring; RFC-style defaults until the network sends them), and the
 client offers a join-channel input and click-to-query on nicks. On phone widths
 the member list is a header-toggled panel mirroring the conversation rail. The
-sign-out link exists only once `/me` has supplied its CSRF-bearing URL.
+sign-out control, a form POST carrying the session's CSRF value in its body,
+exists only once `/me` has supplied that value and the sign-out URL.
 
 ### 13.2 Live chat over WebSocket
 
@@ -3971,7 +3972,13 @@ Layers, bottom to top:
    off: pages send `Cross-Origin-Opener-Policy: same-origin`, and the context
    swap it causes makes Playwright's Firefox driver lose a page's events
    (microsoft/playwright#42731), so a reload hung about one run in five. Focused replay/race/membership cases use
-   browser-side network/history/WebSocket doubles. A separate full-stack case
+   browser-side network/history/WebSocket doubles. Those doubles stub
+   responses, never the contract: `web/test/visual.spec.js` answers
+   `/api/v1/openapi.json` with `web/test/fixtures/openapi.json`, a checked-in
+   copy of the served document that a unit test in `http/openapi.rs` keeps
+   equal to it (a stale copy fails the test and is rewritten in place), and the
+   console runtime's `/console-contract.js` double re-exports the real module,
+   replacing only its two network functions. A separate full-stack case
    edits every managed-configuration subsection and credential collection,
    proves persisted themes and the desktop-notification boundary, creates a
    network through the console, crosses real PostgreSQL, registry, IRC-driver,

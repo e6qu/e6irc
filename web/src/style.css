@@ -79,6 +79,10 @@
 }
 
 * { box-sizing: border-box; }
+/* The hidden attribute always wins: any rule below that sets `display` on an
+   element would otherwise show it while hidden (the console's stylesheet
+   holds the same rule). */
+[hidden] { display: none !important; }
 html, body { height: 100%; margin: 0; }
 body {
   font: 14px/1.55 var(--font-body);
@@ -315,10 +319,9 @@ body {
   font-size: 0.75rem;
 }
 #buffer-action:hover { border-color: var(--accent); color: var(--accent); }
-/* The member-list toggle exists for the phone layout only; `hidden` (no
-   channel open) must still win there, hence :not([hidden]). */
-#members-toggle { display: none; }
-#members-toggle:not([hidden]) {
+/* The member-list toggle exists for the phone layout only. */
+#members-toggle {
+  display: none;
   flex: 0 0 auto;
   margin-left: auto;
   padding: 0.15rem 0.55rem;
@@ -543,9 +546,9 @@ body {
   #sidebar { display: none; flex: 0 0 auto; max-height: 38vh; width: 100%; border-right: none;
     border-bottom: 1px solid var(--border); }
   body.sidebar-open #sidebar { display: block; }
-  #members-toggle:not([hidden]) { display: inline-block; }
+  #members-toggle { display: inline-block; }
   #nicklist { display: none; }
-  body.members-open #nicklist:not([hidden]) {
+  body.members-open #nicklist {
     display: block; flex: 0 0 auto; order: -1; max-height: 38vh; width: 100%;
     border-left: none; border-bottom: 1px solid var(--border);
   }
@@ -658,10 +661,6 @@ dialog details > summary { width: max-content; cursor: pointer; color: var(--acc
 dialog legend em { color: var(--muted); font-style: normal; font-weight: 400; }
 dialog fieldset { border: 1px solid var(--border); border-radius: 0.4rem; padding: 0.5rem 0.7rem 0.7rem; margin: 0.9rem 0; }
 dialog legend { font-size: 0.8rem; padding: 0 0.3rem; }
-/* After the rows above on purpose: they set their own display at the same
-   specificity, which otherwise beats the hidden attribute and offers "Remove
-   the stored account and password" on a network that does not exist yet. */
-dialog [hidden] { display: none; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.9rem; }
 /* The destructive action sits away from the ones that are safe to hit. */
 .dialog-actions #nf-remove { margin-right: auto; }

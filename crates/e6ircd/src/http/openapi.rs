@@ -3047,4 +3047,30 @@ mod tests {
                 .is_some_and(|values| values.contains(&serde_json::json!("local")))
         );
     }
+
+    /// The browser suites (web/test/visual.spec.js) answer
+    /// `/api/v1/openapi.json` with this checked-in copy of the served
+    /// document, so a mock can no longer drift from the contract the server
+    /// actually serves. A stale copy fails here and is rewritten in place;
+    /// commit the rewritten file.
+    #[test]
+    fn browser_suite_contract_fixture_is_the_served_document() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/test/fixtures/openapi.json");
+        let served = super::document();
+        let checked_in = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        if checked_in.as_ref() == Some(&served) {
+            return;
+        }
+        let mut rendered = serde_json::to_string_pretty(&served).expect("serialize the contract");
+        rendered.push('\n');
+        std::fs::write(&path, rendered)
+            .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+        panic!(
+            "{} was not the served OpenAPI document; it has been regenerated, commit it",
+            path.display()
+        );
+    }
 }
