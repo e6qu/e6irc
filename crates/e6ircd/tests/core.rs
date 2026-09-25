@@ -16172,6 +16172,42 @@ fn register_without_a_nick_needs_one() {
     );
 }
 
+/// A client whose NICK was refused because another session holds it asks to
+/// register "my nick": that name is not available as an account, and it is
+/// told so (ACCOUNT_EXISTS, as Ergo and irctest's RegisterNoLandGrabs expect),
+/// not that it never chose one.
+#[test]
+fn register_after_a_refused_nick_says_the_name_is_taken() {
+    let mut s = TestServer::configured(
+        true,
+        || Millis::from_millis(1_000_000_000),
+        |config| {
+            config.registration_before_connect = true;
+        },
+    );
+    s.register(1, "root");
+    let c = s.connect(2);
+    s.line(c, "CAP LS 302");
+    s.line(c, "CAP REQ :draft/account-registration");
+    s.line(c, "NICK root");
+    s.drain(c);
+    s.line(c, "REGISTER * * hunter2");
+    let out = s.drain(c);
+    assert_eq!(
+        out,
+        [":irc.test.example FAIL REGISTER ACCOUNT_EXISTS root :That name is held by another user"]
+    );
+    // Taking a nick settles it: the refusal no longer names the old one.
+    s.line(c, "NICK other");
+    s.drain(c);
+    s.line(c, "REGISTER * * hunter2");
+    assert!(
+        !s.drain(c)
+            .iter()
+            .any(|line| line.contains("ACCOUNT_EXISTS root")),
+    );
+}
+
 /// invite-notify reaches the members who could have invited: operators, or
 /// everyone on a `+g` channel — never a plain member of a `-g` channel.
 #[test]

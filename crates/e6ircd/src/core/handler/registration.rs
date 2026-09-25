@@ -58,6 +58,11 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     if !state.claim_nick(key.clone(), conn) {
+        state
+            .sessions
+            .get_mut(&conn)
+            .expect("checked")
+            .note_nick_in_use(nick);
         state.numeric(
             conn,
             ERR_NICKNAMEINUSE,
@@ -260,17 +265,28 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
-    // `*` means "my current nick". Without a nick there is nothing to name the
-    // account after — the case the spec's NEED_NICK is for (the nick the client
-    // wanted may have been taken).
+    // `*` means "my current nick". Without one there is nothing to name the
+    // account after (NEED_NICK) — unless the nick the client asked for was
+    // refused because another session holds it: that name is not available as
+    // an account either, which is what the client needs to hear (Ergo and
+    // irctest's RegisterNoLandGrabs answer ACCOUNT_EXISTS).
     let Some(nick) = nick else {
-        register_fail(
-            state,
-            conn,
-            "NEED_NICK",
-            "*",
-            "You must hold a nickname before registering an account",
-        );
+        match state.sessions[&conn].refused_nick().map(String::from) {
+            Some(taken) => register_fail(
+                state,
+                conn,
+                "ACCOUNT_EXISTS",
+                &taken,
+                "That name is held by another user",
+            ),
+            None => register_fail(
+                state,
+                conn,
+                "NEED_NICK",
+                "*",
+                "You must hold a nickname before registering an account",
+            ),
+        }
         return;
     };
     if *account != "*" && !state.casemap.eq(account, &nick) {

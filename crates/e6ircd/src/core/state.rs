@@ -1609,6 +1609,9 @@ pub(crate) enum Registration {
         nick: Option<String>,
         user: Option<String>,
         realname: Option<String>,
+        /// The nick last refused because another session holds it, while no
+        /// nick has been taken since: what `REGISTER *` would have named.
+        refused_nick: Option<String>,
     },
     /// Registration complete: the connection has a nick, user, and realname.
     Registered {
@@ -2039,8 +2042,30 @@ impl Session {
     /// NICK rename happens after registration too.
     pub fn set_nick(&mut self, value: String) {
         match &mut self.reg {
-            Registration::Registering { nick, .. } => *nick = Some(value),
+            Registration::Registering {
+                nick, refused_nick, ..
+            } => {
+                *nick = Some(value);
+                *refused_nick = None;
+            }
             Registration::Registered { nick, .. } => *nick = value,
+        }
+    }
+
+    /// Remember, before registration, that `value` was refused because another
+    /// session holds it (see [`Registration::Registering::refused_nick`]).
+    pub(crate) fn note_nick_in_use(&mut self, value: &str) {
+        if let Registration::Registering { refused_nick, .. } = &mut self.reg {
+            *refused_nick = Some(value.to_string());
+        }
+    }
+
+    /// The nick refused as in use before registration, if no nick was taken
+    /// since.
+    pub(crate) fn refused_nick(&self) -> Option<&str> {
+        match &self.reg {
+            Registration::Registering { refused_nick, .. } => refused_nick.as_deref(),
+            Registration::Registered { .. } => None,
         }
     }
 
@@ -2069,12 +2094,14 @@ impl Session {
             nick: None,
             user: None,
             realname: None,
+            refused_nick: None,
         };
         self.reg = match std::mem::replace(&mut self.reg, placeholder) {
             Registration::Registering {
                 nick: Some(nick),
                 user: Some(user),
                 realname,
+                ..
             } => Registration::Registered {
                 nick,
                 user,
@@ -6065,6 +6092,7 @@ impl ServerState {
                     nick: None,
                     user: None,
                     realname: None,
+                    refused_nick: None,
                 },
                 cap_negotiating: false,
                 cap_302: false,
