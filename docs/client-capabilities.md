@@ -35,6 +35,15 @@ names are the same from the network's `005`: `CHANTYPES` (default `#&`) and
 `strict-rfc1459`) and `ascii` are known; any other mapping (`rfc7613`, …) is
 compared as `ascii` — the letters every mapping folds — and the client says so.
 
+`LIST` takes Libera's conditions (`ELIST=CMNTU`): `>n` / `<n` members,
+`C<n` / `C>n` and `T<n` / `T>n` for a channel created, or its topic set, less
+or more than `n` minutes ago, a channel-name glob such as `#rust*` or `*bot*`,
+and `!glob` to leave names out — comma-separated, up to seven, all of which
+must hold (`LIST #rust*,>10,!*-offtopic`). A secret channel is listed only to
+its members. The reply is paced to the client's send queue (`SAFELIST`), so a
+client that lists every channel is never disconnected for it; a second `LIST`
+while one is still arriving aborts the first with a `/LIST aborted` notice.
+
 ## Qualification boundary
 
 The server is tested against the Libera-compatible protocol surface, not against

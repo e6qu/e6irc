@@ -4406,6 +4406,322 @@ fn list_hides_secret_channels() {
     assert!(out.iter().any(|l| l.contains("#sec")));
 }
 
+/// The channel names `out`'s RPL_LIST rows name, in order, after checking the
+/// reply is whole: one RPL_LISTSTART, then the rows, then RPL_LISTEND.
+fn list_reply(out: &[String]) -> Vec<String> {
+    let lines: Vec<&str> = out
+        .iter()
+        .map(|line| traditional_part(line))
+        .filter(|line| [Some("321"), Some("322"), Some("323")].contains(&line.split(' ').nth(1)))
+        .collect();
+    assert!(
+        lines
+            .first()
+            .is_some_and(|l| l.split(' ').nth(1) == Some("321"))
+            && lines
+                .last()
+                .is_some_and(|l| l.split(' ').nth(1) == Some("323")),
+        "a whole LIST reply: {out:#?}"
+    );
+    lines[1..lines.len() - 1]
+        .iter()
+        .map(|line| {
+            assert_eq!(line.split(' ').nth(1), Some("322"), "{out:#?}");
+            line.split(' ')
+                .nth(3)
+                .expect("RPL_LIST channel")
+                .to_string()
+        })
+        .collect()
+}
+
+fn list(s: &mut TestServer, conn: ConnId, command: &str) -> Vec<String> {
+    s.line(conn, command);
+    list_reply(&s.drain(conn))
+}
+
+/// `#chan1` (alice) and `#chan2` (alice and bob), as irctest's LIST cases
+/// build them, plus carol who is in neither.
+fn two_listed_channels(s: &mut TestServer) -> (ConnId, ConnId, ConnId) {
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    let carol = s.register(3, "carol");
+    s.line(alice, "JOIN #chan1");
+    s.line(alice, "JOIN #chan2");
+    s.line(bob, "JOIN #chan2");
+    s.drain(alice);
+    s.drain(bob);
+    (alice, bob, carol)
+}
+
+#[test]
+fn isupport_advertises_safelist_and_the_elist_conditions() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "NICK alice");
+    s.line(c, "USER alice 0 * :Real");
+    let out = s.drain(c);
+    let tokens: Vec<&str> = out
+        .iter()
+        .filter(|l| l.split(' ').nth(1) == Some("005"))
+        .flat_map(|l| l.split(" :").next().expect("head").split(' ').skip(3))
+        .collect();
+    assert!(tokens.contains(&"SAFELIST"), "{out:#?}");
+    assert!(tokens.contains(&"ELIST=CMNTU"), "{out:#?}");
+}
+
+#[test]
+fn list_masks_select_channels_by_casemapped_glob() {
+    let mut s = TestServer::new();
+    let (_, _, carol) = two_listed_channels(&mut s);
+    assert_eq!(list(&mut s, carol, "LIST *an1"), ["#chan1"]);
+    assert_eq!(list(&mut s, carol, "LIST *an2"), ["#chan2"]);
+    assert_eq!(list(&mut s, carol, "LIST #c*n2"), ["#chan2"]);
+    assert!(list(&mut s, carol, "LIST *an3").is_empty());
+    assert_eq!(list(&mut s, carol, "LIST #ch*"), ["#chan1", "#chan2"]);
+    assert_eq!(list(&mut s, carol, "LIST #CH?N1"), ["#chan1"]);
+    // A plain name is the exact channel, and several masks list what any
+    // of them matches.
+    assert_eq!(list(&mut s, carol, "LIST #CHAN2"), ["#chan2"]);
+    assert_eq!(
+        list(&mut s, carol, "LIST #chan1,#chan2"),
+        ["#chan1", "#chan2"]
+    );
+    assert!(list(&mut s, carol, "LIST #nonexistent").is_empty());
+}
+
+#[test]
+fn list_negated_masks_exclude_what_they_match() {
+    let mut s = TestServer::new();
+    let (_, _, carol) = two_listed_channels(&mut s);
+    assert_eq!(list(&mut s, carol, "LIST !*an1"), ["#chan2"]);
+    assert_eq!(list(&mut s, carol, "LIST !#c*n2"), ["#chan1"]);
+    assert_eq!(list(&mut s, carol, "LIST !*an3"), ["#chan1", "#chan2"]);
+    assert!(list(&mut s, carol, "LIST !#ch*").is_empty());
+}
+
+#[test]
+fn list_user_counts_are_strict_bounds() {
+    let mut s = TestServer::new();
+    let (_, _, carol) = two_listed_channels(&mut s);
+    assert_eq!(list(&mut s, carol, "LIST >0"), ["#chan1", "#chan2"]);
+    assert!(list(&mut s, carol, "LIST <1").is_empty());
+    assert_eq!(list(&mut s, carol, "LIST <100"), ["#chan1", "#chan2"]);
+    assert_eq!(list(&mut s, carol, "LIST >1"), ["#chan2"]);
+    assert_eq!(list(&mut s, carol, "LIST <2"), ["#chan1"]);
+    assert_eq!(list(&mut s, carol, "LIST <0"), ["#chan1", "#chan2"]);
+}
+
+static LIST_CLOCK_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1_000_000_000);
+
+fn list_clock() -> Millis {
+    Millis::from_millis(LIST_CLOCK_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn list_clock_advance_minutes(minutes: u64) {
+    LIST_CLOCK_MS.fetch_add(minutes * 60_000, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// irctest's FaketimeListTestCase, with the server's clock moved by hand:
+/// `C<n` is "created less than n minutes ago", `C>n` "more than", and the
+/// same for `T` and the time the topic was set. One test, since the clock
+/// is shared.
+#[test]
+fn list_creation_and_topic_times_are_minutes_ago() {
+    let mut s = TestServer::configured(false, list_clock, |_| {});
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    s.line(alice, "JOIN #chan1");
+    s.line(alice, "TOPIC #chan1 :First channel");
+    s.line(alice, "JOIN #quiet");
+    s.drain(alice);
+    list_clock_advance_minutes(2);
+    s.line(alice, "JOIN #chan2");
+    s.line(alice, "TOPIC #chan2 :Second channel");
+    s.drain(alice);
+    list_clock_advance_minutes(1);
+
+    assert_eq!(list(&mut s, bob, "LIST C>2"), ["#chan1", "#quiet"]);
+    assert_eq!(list(&mut s, bob, "LIST C<2"), ["#chan2"]);
+    assert!(list(&mut s, bob, "LIST C<0").is_empty());
+    assert_eq!(
+        list(&mut s, bob, "LIST C>0"),
+        ["#chan1", "#chan2", "#quiet"]
+    );
+    assert_eq!(
+        list(&mut s, bob, "LIST C<10"),
+        ["#chan1", "#chan2", "#quiet"]
+    );
+    // A channel with no topic meets no topic-time condition.
+    assert_eq!(list(&mut s, bob, "LIST T>2"), ["#chan1"]);
+    assert_eq!(list(&mut s, bob, "LIST T<2"), ["#chan2"]);
+    assert!(list(&mut s, bob, "LIST T<0").is_empty());
+    assert_eq!(list(&mut s, bob, "LIST T>0"), ["#chan1", "#chan2"]);
+    assert_eq!(list(&mut s, bob, "LIST t<10"), ["#chan1", "#chan2"]);
+}
+
+#[test]
+fn list_conditions_combine_and_all_must_hold() {
+    let mut s = TestServer::new();
+    let (alice, _, carol) = two_listed_channels(&mut s);
+    s.line(alice, "JOIN #other");
+    s.line(carol, "JOIN #other");
+    s.drain(alice);
+    s.drain(carol);
+    assert_eq!(list(&mut s, carol, "LIST >1"), ["#chan2", "#other"]);
+    assert_eq!(list(&mut s, carol, "LIST >1,#ch*"), ["#chan2"]);
+    assert_eq!(list(&mut s, carol, "LIST #ch*,!*2"), ["#chan1"]);
+    assert!(list(&mut s, carol, "LIST >1,<2").is_empty());
+    assert_eq!(list(&mut s, carol, "LIST >1,!#chan2,"), ["#other"]);
+}
+
+#[test]
+fn a_malformed_list_parameter_is_refused_whole() {
+    let mut s = TestServer::new();
+    let (_, _, carol) = two_listed_channels(&mut s);
+    for parameter in [
+        "LIST foo",
+        "LIST >1,bar",
+        "LIST <x",
+        "LIST C5",
+        "LIST >1,,<5",
+    ] {
+        s.line(carol, parameter);
+        let out = s.drain(carol);
+        assert_eq!(
+            out,
+            [
+                ":irc.test.example 321 carol Channel :Users  Name",
+                ":irc.test.example NOTICE carol :Invalid parameters for /LIST",
+                ":irc.test.example 323 carol :End of /LIST",
+            ],
+            "{parameter}"
+        );
+    }
+}
+
+#[test]
+fn list_conditions_never_reveal_a_secret_channel() {
+    let mut s = TestServer::new();
+    let (alice, bob, carol) = two_listed_channels(&mut s);
+    s.line(alice, "JOIN #hidden");
+    s.line(alice, "MODE #hidden +s");
+    s.drain(alice);
+    for command in [
+        "LIST",
+        "LIST #hidden",
+        "LIST #h*",
+        "LIST !#chan*",
+        "LIST >0,<5",
+    ] {
+        let listed = list(&mut s, carol, command);
+        assert!(
+            !listed.contains(&"#hidden".to_string()),
+            "{command}: {listed:?}"
+        );
+    }
+    // Its member sees it, under the same conditions as any channel.
+    assert_eq!(list(&mut s, alice, "LIST #h*"), ["#hidden"]);
+    assert_eq!(list(&mut s, alice, "LIST <2"), ["#chan1", "#hidden"]);
+    assert!(list(&mut s, alice, "LIST >1,#h*").is_empty());
+    assert_eq!(list(&mut s, bob, "LIST !#chan*"), Vec::<String>::new());
+}
+
+/// Channels enough that one LIST fills more than half of a test connection's
+/// 256-line send queue: `count` of them, `#room000` on, across three members.
+fn many_channels(s: &mut TestServer, count: usize) -> ConnId {
+    let members: Vec<ConnId> = (0..3)
+        .map(|index| s.register(10 + index, &format!("member{index}")))
+        .collect();
+    for room in 0..count {
+        let member = members[room % members.len()];
+        s.line(member, &format!("JOIN #room{room:03}"));
+        s.drain(member);
+    }
+    s.register(20, "lister")
+}
+
+#[test]
+fn a_large_list_is_paced_to_half_the_send_queue_and_never_overflows_it() {
+    let mut s = TestServer::new();
+    let lister = many_channels(&mut s, 300);
+    s.line(lister, "LIST");
+    let mut out = s.drain(lister);
+    // Half of the 256-line queue: the RPL_LISTSTART and 127 rows.
+    assert_eq!(out.len(), 128, "{out:#?}");
+    assert!(!has_numeric(&out, "323"), "{out:#?}");
+    // Each turn sends what the client's queue has room for now: the drained
+    // queue takes another half.
+    s.core.handle(Input::PaceChannelLists);
+    // Other traffic keeps flowing meanwhile, beside the rows.
+    s.line(lister, "PING mid-list");
+    let next = s.drain(lister);
+    assert!(
+        next.iter()
+            .any(|l| l.contains("PONG") && l.contains("mid-list")),
+        "{next:#?}"
+    );
+    assert!(next.len() <= 129, "{next:#?}");
+    out.extend(next.into_iter().filter(|l| !l.contains("PONG")));
+    while !has_numeric(&out, "323") {
+        s.core.handle(Input::PaceChannelLists);
+        let more = s.drain(lister);
+        assert!(!more.is_empty() && more.len() <= 129, "{more:#?}");
+        out.extend(more);
+    }
+    let listed = list_reply(&out);
+    let expected: Vec<String> = (0..300).map(|room| format!("#room{room:03}")).collect();
+    assert_eq!(listed, expected);
+    assert_answers_ping(&mut s, lister, "after a paced LIST");
+}
+
+#[test]
+fn a_paced_labeled_list_stays_one_batch_across_its_turns() {
+    let mut s = TestServer::new_no_persistence();
+    let lister = register_with_caps(&mut s, 20, "lister", "batch labeled-response");
+    let members: Vec<ConnId> = (0..3)
+        .map(|index| s.register(10 + index, &format!("member{index}")))
+        .collect();
+    for room in 0..200 {
+        let member = members[room % members.len()];
+        s.line(member, &format!("JOIN #room{room:03}"));
+        s.drain(member);
+    }
+    s.line(lister, "@label=big LIST");
+    let mut out = s.drain(lister);
+    while !out.last().is_some_and(|l| l.contains(" BATCH -")) {
+        s.core.handle(Input::PaceChannelLists);
+        out.extend(s.drain(lister));
+    }
+    let inside = labeled_response(&out, "big");
+    assert_eq!(inside.len(), 202, "LISTSTART, 200 rows, LISTEND: {out:#?}");
+    assert_eq!(list_reply(&inside).len(), 200);
+    assert_eq!(out.len(), 204, "the batch and nothing else: {out:#?}");
+}
+
+#[test]
+fn a_list_sent_during_a_paced_list_aborts_it() {
+    let mut s = TestServer::new();
+    let lister = many_channels(&mut s, 300);
+    s.line(lister, "LIST");
+    assert_eq!(s.drain(lister).len(), 128);
+    s.line(lister, "LIST");
+    let out = s.drain(lister);
+    assert_eq!(
+        out,
+        [
+            ":irc.test.example NOTICE lister :/LIST aborted",
+            ":irc.test.example 323 lister :End of /LIST",
+        ]
+    );
+    // Aborted means gone: nothing more of it is paced out, and the next LIST
+    // is a new one.
+    s.core.handle(Input::PaceChannelLists);
+    assert!(s.drain(lister).is_empty());
+    assert_eq!(list(&mut s, lister, "LIST #room001"), ["#room001"]);
+}
+
 #[test]
 fn userhost_reply() {
     let mut s = TestServer::new();

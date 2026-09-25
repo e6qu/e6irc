@@ -654,6 +654,11 @@ fn inject_tag(line: &[u8], tag: &str) -> bytes::Bytes {
 
 /// Frame captured direct responses per the labeled-response spec:
 /// zero lines → ACK; one → label-tagged; many → labeled batch.
+/// The line that opens the `labeled-response` batch answering `label`.
+fn labeled_batch_open(server: &str, label: &str, batch_ref: &str) -> String {
+    format!("@label={label} :{server} BATCH +{batch_ref} labeled-response")
+}
+
 pub(crate) fn frame_labeled(
     state: &mut ServerState,
     conn: ConnId,
@@ -680,10 +685,7 @@ pub(crate) fn frame_labeled(
         }
         _ => {
             let batch_ref = state.next_msgid();
-            state.send(
-                conn,
-                &format!("@label={label} :{server} BATCH +{batch_ref} labeled-response"),
-            );
+            state.send(conn, &labeled_batch_open(&server, label, &batch_ref));
             for line in lines {
                 let tagged = inject_tag(&line, &format!("batch={batch_ref}"));
                 state.send_bytes(conn, tagged);

@@ -7,9 +7,26 @@ use crate::casemap::CaseMapping;
 /// Does `mask` (e.g. `*!*@*.example.com`) match `subject`
 /// (e.g. `nick!user@host.example.com`)?
 pub fn matches(casemap: CaseMapping, mask: &str, subject: &str) -> bool {
-    let mask: Vec<u8> = mask.bytes().map(|b| casemap.lower(b)).collect();
     let subject: Vec<u8> = subject.bytes().map(|b| casemap.lower(b)).collect();
-    glob(&mask, &subject)
+    FoldedMask::new(casemap, mask).matches_folded(&subject)
+}
+
+/// A mask folded once under the casemapping, for matching many subjects that
+/// are already folded (casefolded channel keys, say) without re-folding either
+/// side per comparison. [`matches`] is this with the subject folded too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldedMask(Vec<u8>);
+
+impl FoldedMask {
+    pub fn new(casemap: CaseMapping, mask: &str) -> Self {
+        Self(mask.bytes().map(|b| casemap.lower(b)).collect())
+    }
+
+    /// Does the mask match `subject`, which the caller has already folded
+    /// under the same casemapping?
+    pub fn matches_folded(&self, subject: &[u8]) -> bool {
+        glob(&self.0, subject)
+    }
 }
 
 /// Iterative wildcard match with backtracking over the last `*`.

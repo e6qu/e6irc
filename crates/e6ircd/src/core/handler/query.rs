@@ -583,6 +583,10 @@ pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
             &format!("ACCOUNTEXTBAN={}", crate::core::banmask::ACCOUNT_EXTBAN),
             // Enforced by the MODE parser (`channel_mode_by`).
             &format!("MODES={MODES}"),
+            // LIST paces its reply to the client's send queue, and takes
+            // exactly the conditions its parser (`ListFilter::parse`) does.
+            "SAFELIST",
+            &format!("ELIST={}", crate::core::list::ELIST),
         ],
         Some("are supported by this server"),
     );

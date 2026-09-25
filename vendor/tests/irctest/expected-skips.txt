@@ -20,12 +20,6 @@ irctest.server_tests.isupport.IsupportTestCase::testValues
 irctest.server_tests.list.FaketimeListTestCase::testListCreationTime
 irctest.server_tests.list.FaketimeListTestCase::testListTopicTime
 
-# e6ircd advertises no ELIST token, so LIST takes no mask or user-count
-# filter (Libera advertises ELIST=CMNTU).
-irctest.server_tests.list.ListTestCase::testListMask
-irctest.server_tests.list.ListTestCase::testListNotMask
-irctest.server_tests.list.ListTestCase::testListUsers
-
 # NAMES takes one channel (TARGMAX NAMES:1, as on Libera).
 irctest.server_tests.names.NamesTestCase::testNamesMultipleChannels2812
 
